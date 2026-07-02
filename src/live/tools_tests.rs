@@ -1,0 +1,344 @@
+use super::link::{Capabilities, EmulatorIdentity, EmulatorLink, FakeLink, LinkError};
+use super::tools::*;
+use serde_json::{json, Value};
+
+/// 모든 호출을 기록하고 status/read_memory를 스크립트로 돌려주는 가짜 링크(다중 호출 검증용).
+struct Rec {
+    calls: Vec<(String, Value)>,
+    state: String,      // status가 돌려줄 state
+    reads: Vec<String>, // read_memory가 차례로 돌려줄 hex(끝나면 마지막 값 반복)
+    read_i: usize,
+    caps: Capabilities,
+}
+impl Rec {
+    fn new(state: &str, reads: &[&str]) -> Self {
+        Rec {
+            calls: vec![],
+            state: state.into(),
+            reads: reads.iter().map(|s| s.to_string()).collect(),
+            read_i: 0,
+            caps: Capabilities {
+                protocol_version: 1,
+                methods: vec![],
+                memory_types: vec![],
+                identity: EmulatorIdentity::default(),
+            },
+        }
+    }
+    fn methods(&self) -> Vec<&str> {
+        self.calls.iter().map(|(m, _)| m.as_str()).collect()
+    }
+}
+impl EmulatorLink for Rec {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        self.calls.push((method.to_string(), params));
+        // Mesen처럼: resume은 frozen에서만 허용(running에서 부르면 not_paused 에러).
+        if method == "resume" && self.state != "frozen" {
+            return Err(LinkError::Emulator {
+                kind: "not_paused".into(),
+                message: "resume은 frozen에서만".into(),
+            });
+        }
+        Ok(match method {
+            "status" => json!({ "state": self.state, "frame": 0 }),
+            "read_memory" => {
+                let h = self
+                    .reads
+                    .get(self.read_i)
+                    .or_else(|| self.reads.last())
+                    .cloned()
+                    .unwrap_or_default();
+                self.read_i += 1;
+                json!({ "hex": h })
+            }
+            _ => json!({}),
+        })
+    }
+}
+
+#[test]
+fn tap_sequence_does_each_tap_in_one_call() {
+    let mut l = Rec::new("frozen", &[]);
+    let steps = vec![vec!["down".to_string()], vec!["a".to_string()]];
+    tap_sequence(&mut l, 0, &steps, 2).unwrap();
+    // pause, 그 다음 탭마다 set_input·step·set_input·step
+    assert_eq!(
+        l.methods(),
+        vec![
+            "pause",
+            "set_input",
+            "step",
+            "set_input",
+            "step",
+            "set_input",
+            "step",
+            "set_input",
+            "step"
+        ]
+    );
+    assert_eq!(l.calls[1].1["buttons"], json!(["down"])); // 첫 탭 누름
+    assert_eq!(l.calls[5].1["buttons"], json!(["a"])); // 둘째 탭 누름
+}
+
+#[test]
+fn run_frames_no_separate_resume_when_frozen() {
+    // frozen이어도 어댑터 run_frames 핸들러가 원자적으로 resume하므로, Rust는 별도 resume을 보내지 않는다
+    // (별도 resume은 명령 도착 전 free-run으로 watch/BP를 조기 소진시키는 레이스다).
+    let mut l = Rec::new("frozen", &[]);
+    run_frames(&mut l, 5).unwrap();
+    let m = l.methods();
+    assert!(
+        !m.contains(&"resume"),
+        "별도 resume 금지(어댑터가 원자 처리): {m:?}"
+    );
+    assert_eq!(*m.last().unwrap(), "run_frames");
+}
+
+#[test]
+fn press_buttons_no_separate_resume_when_frozen() {
+    // press_buttons도 어댑터가 원자 resume — Rust는 별도 resume 없이 명령만 보낸다.
+    let mut l = Rec::new("frozen", &[]);
+    press_buttons(&mut l, 0, &["start".into()], 10).unwrap();
+    let m = l.methods();
+    assert!(
+        !m.contains(&"resume"),
+        "별도 resume 금지(어댑터가 원자 처리): {m:?}"
+    );
+    assert_eq!(*m.last().unwrap(), "press_buttons");
+}
+
+#[test]
+fn run_frames_no_resume_when_running() {
+    // running이면 resume를 부르면 안 된다(Mesen resume은 running에서 에러) → Rec가 에러로 잡는다.
+    let mut l = Rec::new("running", &[]);
+    run_frames(&mut l, 5).unwrap();
+    assert!(
+        !l.methods().contains(&"resume"),
+        "running이면 resume 금지: {:?}",
+        l.methods()
+    );
+}
+
+#[test]
+fn press_buttons_no_resume_when_running() {
+    let mut l = Rec::new("running", &[]);
+    press_buttons(&mut l, 0, &["start".into()], 10).unwrap();
+    assert!(
+        !l.methods().contains(&"resume"),
+        "running이면 resume 금지: {:?}",
+        l.methods()
+    );
+}
+
+#[test]
+fn tap_after_frames_advances_at_end() {
+    let mut l = Rec::new("frozen", &[]);
+    tap(&mut l, 0, &["a".into()], 2, 10).unwrap();
+    let last = l.calls.last().unwrap();
+    assert_eq!(last.0, "step");
+    assert_eq!(last.1["frames"], 10); // 떼고 after_frames만큼 진행
+}
+
+#[test]
+fn hold_until_stops_on_change() {
+    // before=aa, 한 step 후 aa(불변), 또 step 후 bb(변함) → frames=2
+    let mut l = Rec::new("frozen", &["aa", "aa", "bb"]);
+    let out = hold_until(&mut l, 0, &["down".to_string()], "workraml", 0x1000, 1, 100).unwrap();
+    match out {
+        ToolOutput::Json(v) => {
+            assert_eq!(v["changed"], true);
+            assert_eq!(v["frames"], 2);
+            assert_eq!(v["before"], "aa");
+            assert_eq!(v["after"], "bb");
+        }
+        _ => panic!("Json 기대"),
+    }
+}
+
+#[test]
+fn hold_until_max_frames_when_no_change() {
+    let mut l = Rec::new("frozen", &["aa"]); // 항상 aa
+    let out = hold_until(&mut l, 0, &["down".to_string()], "workraml", 0x1000, 1, 3).unwrap();
+    match out {
+        ToolOutput::Json(v) => {
+            assert_eq!(v["changed"], false);
+            assert_eq!(v["frames"], 3);
+        }
+        _ => panic!("Json 기대"),
+    }
+}
+
+#[test]
+fn read_memory_forwards_params_and_returns_json() {
+    let mut link = FakeLink::ok(json!({ "hex": "00ff" }));
+    let out = read_memory(&mut link, "snesWorkRam", 0, 2).unwrap();
+    match out {
+        ToolOutput::Json(v) => assert_eq!(v["hex"], "00ff"),
+        _ => panic!("Json 기대"),
+    }
+    assert_eq!(link.last_method.as_deref(), Some("read_memory"));
+    let p = link.last_params.unwrap();
+    assert_eq!(p["memory_type"], "snesWorkRam");
+    assert_eq!(p["length"], 2);
+}
+
+#[test]
+fn probe_forwards_params_and_returns_json() {
+    let mut link = FakeLink::ok(json!({ "hex": "11223344", "frame": 3 }));
+    let out = probe(&mut link, "/tmp/base.mst", 3, "vram", 0x4000, 8).unwrap();
+    match out {
+        ToolOutput::Json(v) => {
+            assert_eq!(v["hex"], "11223344");
+            assert_eq!(v["frame"], 3);
+        }
+        _ => panic!("Json 기대"),
+    }
+    assert_eq!(link.last_method.as_deref(), Some("probe"));
+    let p = link.last_params.unwrap();
+    assert_eq!(p["state"], "/tmp/base.mst");
+    assert_eq!(p["frame"], 3);
+    assert_eq!(p["memory_type"], "vram");
+    assert_eq!(p["address"], 0x4000);
+    assert_eq!(p["length"], 8);
+}
+
+#[test]
+fn write_memory_forwards() {
+    let mut link = FakeLink::ok(json!({"written":4}));
+    let out = write_memory(&mut link, "snesWorkRam", 16, "deadbeef").unwrap();
+    assert!(matches!(out, ToolOutput::Json(_)));
+    let p = link.last_params.unwrap();
+    assert_eq!(p["memory_type"], "snesWorkRam");
+    assert_eq!(p["address"], 16);
+    assert_eq!(p["hex"], "deadbeef");
+}
+
+#[test]
+fn press_buttons_forwards_list_and_frames() {
+    let mut link = FakeLink::ok(json!({"status":"completed"}));
+    press_buttons(&mut link, 0, &["a".into(), "start".into()], 10).unwrap();
+    let p = link.last_params.unwrap();
+    assert_eq!(p["buttons"], json!(["a", "start"]));
+    assert_eq!(p["frames"], 10);
+    assert_eq!(link.last_method.as_deref(), Some("press_buttons"));
+}
+
+#[test]
+fn run_frames_passes_interrupted_through() {
+    let mut link = FakeLink::ok(json!({"status":"interrupted","reason":"breakpoint"}));
+    let out = run_frames(&mut link, 100).unwrap();
+    match out {
+        ToolOutput::Json(v) => assert_eq!(v["status"], "interrupted"),
+        _ => panic!("Json 기대"),
+    }
+}
+
+#[test]
+fn probe_passes_interrupted_through() {
+    // 진행 중 pause_on_hit BP가 끼면 어댑터가 hex 대신 interrupted를 돌려준다 — 링크가 그대로 통과시켜
+    // 에이전트가 받아야 한다(working만 건너뛰고 interrupted는 정상 result).
+    let mut link = FakeLink::ok(json!({"status":"interrupted","reason":"breakpoint","pc":196624}));
+    let out = probe(&mut link, "/tmp/s.mss", 60, "cpu", 0x1000, 4).unwrap();
+    match out {
+        ToolOutput::Json(v) => {
+            assert_eq!(v["status"], "interrupted");
+            assert_eq!(v["reason"], "breakpoint");
+        }
+        _ => panic!("Json 기대"),
+    }
+}
+
+#[test]
+fn set_breakpoint_forwards_all_fields() {
+    let mut link = FakeLink::ok(json!({"id":3}));
+    set_breakpoint(
+        &mut link,
+        "exec",
+        "snesMemory",
+        0x8000,
+        0x8000,
+        true,
+        true,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
+    let p = link.last_params.unwrap();
+    assert_eq!(p["kind"], "exec");
+    assert_eq!(p["start"], 0x8000);
+    assert_eq!(p["pause_on_hit"], true);
+    assert_eq!(p["auto_savestate"], true);
+    assert!(p.get("snapshot").is_none(), "빈 snapshot은 전송 안 함");
+
+    // snapshot 스펙은 그대로 리스트로 전달
+    let mut link2 = FakeLink::ok(json!({"id":4}));
+    let snap = vec!["snesWorkRam:0x68:3".to_string()];
+    set_breakpoint(
+        &mut link2,
+        "write",
+        "snesMemory",
+        0x2118,
+        0x2118,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &snap,
+    )
+    .unwrap();
+    let p2 = link2.last_params.unwrap();
+    assert_eq!(p2["snapshot"][0], "snesWorkRam:0x68:3");
+}
+
+#[test]
+fn step_and_poll_events_forward() {
+    let mut link = FakeLink::ok(json!({"events":[],"dropped":0}));
+    let out = poll_events(&mut link).unwrap();
+    match out {
+        ToolOutput::Json(v) => assert_eq!(v["dropped"], 0),
+        _ => panic!("Json 기대"),
+    }
+    assert_eq!(link.last_method.as_deref(), Some("poll_events"));
+}
+
+#[test]
+fn screenshot_returns_image_without_save() {
+    let mut link = FakeLink::ok(json!({ "png_base64": "QUJD" }));
+    let out = screenshot(&mut link, None).unwrap();
+    match out {
+        ToolOutput::Image {
+            png_base64,
+            saved_path,
+        } => {
+            assert_eq!(png_base64, "QUJD");
+            assert!(saved_path.is_none());
+        }
+        _ => panic!("Image 기대"),
+    }
+}
+
+#[test]
+fn screenshot_saves_to_path_when_given() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("shot.png");
+    // "QUJD" = base64("ABC")
+    let mut link = FakeLink::ok(json!({ "png_base64": "QUJD" }));
+    let out = screenshot(&mut link, Some(&path)).unwrap();
+    match out {
+        ToolOutput::Image { saved_path, .. } => {
+            assert_eq!(saved_path.as_deref(), Some(path.to_str().unwrap()))
+        }
+        _ => panic!("Image 기대"),
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
+}

@@ -1,0 +1,9 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+emucap.cpp / emucap.h in this directory are copied into the Flycast source tree
+(core/) and compiled into the Flycast binary by build.sh. They are a derivative
+work of Flycast (GPL-2.0-or-later) and are licensed GPL-2.0-or-later.
+See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

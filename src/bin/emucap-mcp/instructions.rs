@@ -1,0 +1,34 @@
+/// MCP 서버 사용 가이드. 에이전트가 항상 보는 유일한 문서이므로 자기완결적이어야 한다
+/// (저장소 README는 다른 프로젝트에서 안 보인다). 소스를 뒤지지 않게 하는 것이 목적.
+pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis), Flycast(Dreamcast), MAME PC-98 PoC.
+
+**[정본] 도구 가용성은 연결 후 `status.methods`, read/write_memory의 유효 memory_type은 `status.memory_types`가 정본이다 — 어댑터가 advertise한 실제 런타임 capability이니 정적 추측 말 것. 런타임 디버거 강등(예: PCE가 pce_fast로 잡히면 메모리/BP 불가)도 prune되어 반영된다(보강 신호: Mednafen `status.debugger`[PCE가 pce_fast로 잡혀 강등됐으면 `force_module=pce`로 재기동해 디버거 확보], PC-98 `status.backend`·`status.capability_notes`; Mesen은 강등 개념 없어 미해당). 플랫폼×도구 가용성은 status.methods/status.memory_types가 정본이고, per-system memory_type·버튼명·BP 심화·launch 트러블슈팅은 각 `adapters/*/README.md`를 본다. hello는 어댑터→서버 handshake라 직접 호출 대상이 아니다.**
+
+[연결] 에뮬레이터가 *이 서버의 listening_port*로 떠 있어야 한다(서버가 포트 자동선택 — 47800 하드코딩·캐시 금지).
+  0) 새 emucap 작업은 `bootstrap()`이 첫 도구다 — 에뮬이 없어도 listener를 세우고 listening_port·runtime_paths·지원 시스템·물어볼 질문을 준다. content_path가 있으면 `launch_plan(content_path, system?)`(CUE/CHD처럼 애매한 media는 추측 말고 시스템을 묻는 결과를 준다). 로컬 디렉터리를 find로 찾기 전에 runtime_paths를 정본으로.
+  1) launch *직전* status를 다시 조회해 그때의 listening_port를 쓴다(포트는 세션 중에도 재연결·타 세션 점유로 바뀐다).
+  2) `launch(content_path, system?, name?)` 도구로 띄운다 — Rust launcher가 macOS/Linux/Windows 공통 경로이며 emucap 소유 config/data 루트를 사용한다. launch_plan/runtime_paths의 legacy fallback은 `available_on_this_host=true`이고 Rust launch가 해당 호스트에서 막힐 때만 쓴다. 5~8초 후 status 재확인(같은 포트 재기동은 자동 재연결).
+  ⚠ 다중세션 안전: `pkill -i mesen`·`killall` 같은 광역 종료 절대 금지 — 자기 포트 인스턴스만 정리한다. 직접 nohup 조립 금지; Rust launch 또는 legacy launcher만 사용한다.
+  identity_guard: direct 모드는 포트별 토큰으로 죽은/다른 세션 연결을 새 세션이 조용히 이어받는 것을 막는다(경로는 `status.identity_guard.session_token_file.path`/`runtime_paths.token_file`이 정본이고 OS별 temp를 따른다). launch 도구/legacy launcher가 전달한다. "MCP listener 없음"이면 에뮬을 다시 띄우지 말고 status를 먼저 다시 호출한다.
+
+[연결 모드] 직접(기본): 세션마다 포트 자동격리, 다중 세션 공존. broker(EMUCAP_BROKER=1): 상주 broker가 연결을 소유해 여러 세션이 EMUCAP_NAME으로 공유·재attach 복귀(세션이 죽어도 freeze 유지). (Mednafen 다중 인스턴스는 launch 도구가 기본 허용 — MEDNAFEN_ALLOWMULTI 기본 1.)
+
+[숫자] 주소·값·범위·길이는 10진 정수 또는 '0x'/'$' 접두 16진 문자열 모두 수용(예 address "0x2117"·"$802117", value "0x60"). 16진으로 생각하는 주소는 문자열로 줘 10진 변환 실수를 막는다. write_memory의 hex는 바이트 hex("aa"·"deadbeef").
+
+[상태기계] pause→frozen, resume→running. step(frames)는 frozen N프레임, step_instructions(count)는 명령 단위. run_frames(n)은 frozen이면 자동 resume 후 진행(=running 자유진행, "최소 n프레임"이라 정밀 시점 캡처엔 부적합 — 정확 N프레임은 pause→step). **정확한 N프레임 제어·정밀 시점 관측은 frozen에서만 결정론적**. save/load_state는 frozen에서 거부될 수 있다(가용 타이밍은 거부 에러가 알려줌). ⚠ 에뮬 GUI의 Pause 버튼 금지 — emucap pause 도구나 호스트 hotkey(EMUCAP_FREEZE_KEY)로 얼린다(GUI Pause는 백엔드 스레드를 멈춰 read/screenshot이 timeout→not connected로 보일 수 있다). freeze 드리프트·hotkey 무기한 hold·데드맨 동작에 유의한다.
+
+[입력] 버튼명은 status.input_buttons, 동사 가용성은 status.methods가 정본(예: press_buttons 미advertise면 set_input+tap). 입력 동사 3부류: set_input(buttons)=패드 상태 설정(유지). press_buttons(buttons, frames)=N프레임 *실시간* 누름·뗌 — **frozen이면 자동 resume(freeze 풀림); 길게 누르면 auto-repeat**. **frozen 유지 결정론 입력은 freeze-tap**: tap(buttons, press_frames=2, after_frames=0)=auto-repeat 없이 1탭(after_frames>0=떼고 그만큼 진행, 호출 후 frozen 유지), tap_sequence(steps)=여러 탭 한 콜(메뉴 네비), hold_until(buttons, memory_type, address, length, max_frames)=watch 메모리 변할 때까지 frozen hold 후 뗌(반환 {changed,frames,before,after}). 즉 frozen 결정론 1칸=tap, 실시간=press_buttons.
+
+[find_pattern] memory_type 영역을 어댑터가 내부 스캔해 매칭 오프셋만 반환(frozen 권장) — 큰 영역을 read로 뜨는 것보다 토큰·지연이 훨씬 적다. length 생략 시 region 끝까지(한 호출 스캔 상한은 백엔드별 — 빠른 read는 region 전체 1콜, 초과 시 truncated → start 옮겨 청크). 매치가 많으면 output_path로 파일에 받는다. 런타임-빌드 문자열/버퍼/테이블 위치 특정의 1순위(찾은 주소에 write BP로 누가 쓰는지 추적).
+
+[브레이크포인트] set_breakpoint(kind: exec|read|write|nmi|irq|dma, memory_type, start, end, pause_on_hit, value?/value_mask?/value_len?, pc_min?/pc_max?, snapshot?) — 지원 kind·memory_type은 어댑터별이라 미지원이면 거부 에러가 알려준다(memory_type 거부는 `supported` 목록 동반). pause_on_hit이면 히트 시 freeze(status 폴링으로 감지 — 푸시 없음), poll_events로 히트 드레인. list/clear_breakpoint/clear_all_breakpoints. value 필터=그 값이 쓰일/읽힐 때만(주입 불가 영역은 거부 에러). pc_min/max=그 접근을 일으킨 명령 pc가 범위일 때만. snapshot=["mt:addr:len"]=히트 순간 atomic 캡처(워치독 드리프트 회피). ⚠ "exec BP 미발화 = 코드 안 탐"으로 단정 말 것(WRAM 상주 실행·콜백 갭 사례 — 빌드 바이섹트나 인접 BP로 교차검증). 플랫폼별 BP 심화·옵션은 각 어댑터 README. disassemble(addr,count)=연결된 코어의 ISA.
+
+[레지스터워치·실행추적] watch_register(register, min, max)=레지스터가 범위를 벗어나는 명령에서 freeze(SP 폭주 등 derail 포착). set_trace(true)+call_stack()/get_trace(count)=호출체인·최근 실행 명령(크래시 직전 경로). break_on_reset=리셋 핸들러 진입 감지. (가용성 status.methods — 없는 플랫폼은 status.capability_notes가 대체[exec BP 콜체인 역추적+step+disasm]를 안내한다.)
+
+[Saturn 비디오] get_video_state(VDP2 per-NBG 디코드 — 유효 charno 비트폭·셀크기·플레인[네임테이블] 베이스 주소·BGON)·resolve_tile(화면좌표→char 데이터 주소; 게임별 char-base 보정은 에이전트 RE)·set_layer_enable(레이어 토글로 라우팅 판정·클린플레이트)은 Saturn 폰트 역공학에 직결(가용성 status.methods). 글리프 예산 공식·NBG 선택·레이어 조합 절차는 get_video_state/resolve_tile 반환 필드로 확인한다.
+
+[분석] dump_memory(path)=디버거 AddressSpace를 .bin+regions.json+state.json으로 벌크 export(거대 메모리는 인라인 말고 이걸로; 합성 full-bus는 cap-skip 정직보고). diff=셸 CLI `emucap diff <A> <B>`(최초 분기점, --baseline/--ignore로 예상차 제외). bisect(state, lo, hi, memory_type, address, op, value)=타깃이 처음 술어를 만족하는 프레임을 결정론 재생으로 이분. regression_run·verify_determinism=케이스 재생 결과를 *반환만* 한다(원장에 안 씀). **거대 결과가 예상되는 도구엔 output_path를 줘 파일+요약만 받는다(컨텍스트 절약).**
+
+[두-MCP 조립] 실험 원장(run/log/query)은 별도 추적 MCP(`emucap-track-mcp`)가 단일-writer로 소유한다 — 이 제어 MCP는 `.emucap/`에 쓰지 않는다. 추적 MCP는 자기 bootstrap으로 시작한다. 조립: `get_rom_info`의 균일 `rom_sha1` 필드를 추적 MCP `run_start(rom_sha1)`에 넘긴다(어댑터가 어떤 해시를 쓰든 canonical로 정규화돼 나온다). `rom_sha1`이 없는 백엔드(콘텐츠 해시 미반환)만 `shasum -a1 <content>` 폴백 / 분석 verb 결과는 추적 MCP `log_gate`로 / write_memory·load_state·reset 등 상태변경은 자동 기록 안 되니 추적 MCP `log_intervention(op, args)`으로 명시 기록(재현 충실도).
+
+[교차-ROM diff] 원본·패치본을 같은 앵커에서 비교해 패치가 깨뜨린 것을 격리: 양쪽에 같은 로직주소 exec BP(pause_on_hit)→각자 freeze→dump_memory→`emucap diff`(예상차 제외, 로직 상태 차이=버그 신호). broker면 단일 세션 순차(attach→앵커→dump→detach→다른 ROM), 아니면 2세션 병렬."#;

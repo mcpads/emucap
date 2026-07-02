@@ -1,0 +1,9 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+patches/ modify MAME source and are a derivative work of MAME (GPL-2.0-or-later).
+The Lua plugin (plugins/) and the Python GDB bridge (emucap-gdb-bridge.py) are
+loaded at runtime / run as a separate process and are not derivatives, but are
+licensed GPL-2.0-or-later to keep the project uniform. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

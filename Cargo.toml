@@ -1,0 +1,59 @@
+[package]
+name = "emucap"
+version = "0.1.0"
+edition = "2021"
+authors = ["mcpads"]
+# GPL-2.0-or-later is compatible with the adapters' upstream licenses — GPLv2 (Mednafen/Flycast),
+# GPLv2+ (MAME), GPLv3 (Mesen). See NOTICE for upstream attributions.
+license = "GPL-2.0-or-later"
+
+[lib]
+name = "emucap"
+path = "src/lib.rs"
+
+[[bin]]
+name = "emucap"
+path = "src/main.rs"
+
+[[bin]]
+name = "emucap-mcp"
+path = "src/bin/emucap-mcp.rs"
+
+[[bin]]
+name = "emucap-broker"
+path = "src/bin/emucap-broker.rs"
+
+[[bin]]
+name = "emucap-track-mcp"
+path = "src/bin/emucap-track-mcp.rs"
+
+[[bin]]
+name = "emucap-mame-pc98-bridge"
+path = "src/bin/emucap-mame-pc98-bridge.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+rmcp = { version = "1.8.0", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std"] }
+schemars = "1.2.1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ulid = "1"
+time = { version = "0.3", features = ["formatting"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# setsid() for detached emulator launch; Unix only (Windows uses creation_flags).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"

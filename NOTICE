@@ -1,0 +1,39 @@
+emucap — third-party attributions
+==================================
+
+emucap integrates with, patches, or loads code into the retro-emulators below.
+emucap does NOT redistribute these emulators; each adapter's build.sh downloads
+the pinned upstream release and builds it on your machine. The attributions are
+provided because emucap's adapter code is a derivative of, or a plugin for, these
+projects. Each project remains under its own copyright and license.
+
+Mednafen
+  Upstream: https://mednafen.github.io/
+  License:  GPL-2.0-or-later (per source-file headers)
+  Used by:  adapters/mednafen (emucap.cpp compiled in; also drives Saturn/PSX/PCE/MD)
+  Bundles third-party code under GPL-2.0+/LGPL (e.g. hq2x/3x/4x = LGPL).
+
+Flycast
+  Upstream: https://github.com/flyinghead/flycast
+  License:  GPL-2.0-or-later (Reicast/nullDC lineage)
+  Used by:  adapters/flycast (emucap.cpp compiled in; Dreamcast)
+  Bundles MIT/BSD/zlib deps (imgui, xxHash, libchdr, ...).
+
+MAME
+  Upstream: https://github.com/mamedev/mame
+  License:  GPL-2.0-or-later as a whole (majority of files BSD-3-Clause)
+  Used by:  adapters/mame-pc98 (patches + Lua plugin + GDB bridge; PC-98)
+  Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
+
+Mesen2
+  Upstream: https://github.com/SourMesen/Mesen2
+  License:  GPL-3.0-or-later
+  Used by:  adapters/mesen2 (runtime Lua script; SNES)
+
+PCSX-Redux
+  Upstream: https://github.com/grumpycoders/pcsx-redux
+  License:  GPL-2.0-or-later overall, with MIT subtrees (OpenBIOS/nugget)
+  Used by:  the PSX/PCSX-Redux adapter path
+
+Upstream license determinations were made from each project's source-file SPDX
+headers and README, not from the bare COPYING boilerplate.

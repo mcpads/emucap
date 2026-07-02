@@ -1,0 +1,10 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+emucap-live.lua is a Lua script loaded at runtime by Mesen2 (via a command-line
+argument); it is not compiled or linked into the Mesen2 binary, so under the
+interpreter rule it is not a derivative of Mesen2 (GPL-3.0). It is licensed as the
+project default, GPL-2.0-or-later. If a "bindings"-based derivative reading were
+adopted, this single adapter would instead be GPL-3.0. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

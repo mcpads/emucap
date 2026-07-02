@@ -1,0 +1,10 @@
+{
+  "plugin": {
+    "name": "emucap_gdbstub",
+    "description": "emucap PC-98 GDB bridge helper",
+    "version": "0.1.0",
+    "author": "emucap",
+    "type": "plugin",
+    "start": "false"
+  }
+}

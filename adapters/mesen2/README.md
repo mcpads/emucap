@@ -1,0 +1,209 @@
+# emucap — Mesen2 adapter
+
+> 한국어: [README.ko.md](README.ko.md)
+
+## For the agent — you are the user's interface
+
+The user is likely not a developer and will not read this file — you read it and walk them through each
+step. Do the terminal/technical work yourself. For any GUI step, tell the user exactly which menu to
+click and where it is (e.g. "the menu bar along the very top of the window"), the exact button/checkbox
+label in quotes, and confirm they did it before moving on. The steps below assume Windows; only mention
+the macOS/Linux difference if that is the user's system.
+
+## 1. Install Mesen2
+
+- **Windows**: open the maintained MesenCE releases page,
+  <https://github.com/nesdev-org/MesenCE/releases>, and download `Mesen_<version>_Windows.zip`.
+  Extract it — inside is a single file, `Mesen.exe` (there is no installer to run). Double-click
+  `Mesen.exe`. On the first launch it shows a "Select Data Storage Folder" dialog; either option is
+  fine — accept it.
+- **macOS/Linux**: download the matching build from the same Releases page.
+
+## 2. One-time setup — let the adapter script save and connect
+
+The adapter is a Lua script that Mesen runs. Mesen blocks scripts from disk and network by default, so
+two checkboxes must be turned on once (Mesen remembers them — only needed the first time):
+
+1. Load any SNES ROM: top menu bar → **File → Open**, pick the ROM file. (The next step stays greyed
+   out until a game is loaded.)
+2. Top menu bar → **Debug → Script Window** (shortcut Ctrl+N). A new window opens.
+3. In that Script Window's own menu bar (inside the window) → **Script → Settings**. A "Debugger
+   Settings" window opens on the "Script Window" tab.
+4. Under the **Restrictions** heading: first check **"Allow access to I/O and OS functions"** — that
+   makes **"Allow network access"** become clickable, so check it too.
+5. Click **OK**.
+
+## 3. Load and run the adapter
+
+In the Script Window → **File → Open** (Ctrl+O) → choose `adapters/mesen2/emucap-live.lua` (live agent
+control) or `emucap.lua` (retrospective-bundle capture). It runs automatically; the log pane at the
+bottom should print `emucap: ROM 경로 = …` with no I/O warning. (To re-run manually: **Script → Run
+Script**, F5.)
+
+The ROM path is auto-inferred via `getRomInfo`; if inference is off, fix the `ROM_PATH` fallback at the
+top of `emucap.lua`, or override it when finalizing with `emucap finalize --rom`.
+
+## Launch internals & macOS caveats
+
+### Launching — crash-cascade caveat
+
+If a crashed or stuck Mesen is left around, the next Mesen can crash-cascade
+(Avalonia RenderTimer -6661). Also, if the macOS "quit unexpectedly" dialog is up
+after a crash, new launches are blocked until it is dismissed.
+
+- ⚠ **Do not broadly kill** leftover instances (`pkill -i mesen` / `killall Mesen`
+  kill the Mesen of other sessions). Leave cleanup to `launch.sh` — it cleans up
+  only the orphan instance on that port, and refuses if a connected instance exists.
+
+Recommended path: call the MCP `launch` tool. It copies Mesen into an emucap-owned portable directory,
+writes `settings.json` next to that copy, and leaves the user's default Mesen settings/app state alone.
+The legacy `adapters/mesen2/launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME]` helper follows the same portable
+copy rule and remains a fallback when the MCP tool is unavailable.
+
+## Retrospective capture (emucap.lua)
+- During play, pressing **Ctrl+Shift+C** drops a slice of roughly the last
+  `DEPTH × INTERVAL` frames (save-states · screenshots) and the input movie into
+  `bundles/<time>-retrospective/`. "EMUCAP CAPTURED" flashes briefly on screen.
+
+## Finalize · analyze
+```
+emucap finalize bundles/<timestamp>-retrospective
+emucap inspect  bundles/<timestamp>-retrospective
+```
+Then write up the problem in `note.md` and have Claude Code analyze the bundle
+directory.
+
+## Tuning
+Adjust `INTERVAL` (sample interval), `DEPTH` (ring depth), and `TRIGGER_KEYS` (key
+combo) at the top of the script.
+
+## Live MCP mode — agent operation
+
+A separate script `emucap-live.lua` lets the agent read and control the running game.
+The MCP server `emucap-mcp` comes up over stdio, and the Lua connects to that server's
+TCP port (default 47800).
+
+- Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
+  matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
+- Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`tap_sequence`/`hold_until`/`save_state`/`load_state`/
+  `run_frames`/`pause`/`step`/`step_instructions`/`resume`/`reset`/`probe`.
+  (⚠ save_state/load_state work **only in running** (frozen is rejected — an exec
+  callback context is required). A set_input hold persists until explicitly released
+  with an empty set_input (resume/step do not release it).)
+- Breakpoints · tracing: `set_breakpoint` (kind **exec/read/write/nmi/irq/dma**;
+  pc_min/pc_max conditions, **value/value_mask/value_len value-conditions**; a write BP
+  includes the $2118/$2119→**vram_addr** · $2122→cgram_addr · $2104→oam_addr destination
+  in the event) · `clear_breakpoint`/`list_breakpoints`/`clear_all_breakpoints`/`poll_events` ·
+  `watch_register` · `set_trace`/`get_trace`/`call_stack` · `break_on_reset`.
+- Disassembly: `disassemble(address, count)` → `[{addr,text,bytes}]`. Mesen2 Lua has no
+  disassembly API, so a 65816 decoder is implemented directly in the adapter (M/X flags
+  start from `cpu.ps` and track REP/SEP).
+- Analysis: `dump_memory`/`bisect`/`regression_run`.
+- `verify_determinism` — measures reproducibility by replaying a reproduction recipe N
+  times and matching hashes (determinism_replay gate).
+- **Note**: of the above, `tap`/`tap_sequence`/`hold_until`/`step_instructions`/`bisect`/`regression_run`/
+  `verify_determinism` are not adapter-native — the MCP server (`emucap-mcp`) synthesizes
+  them from primitive tools (set_input · step · read_memory, etc.). The native methods the
+  adapter advertises directly are canonically listed in `hello.methods`.
+
+### The agent launches Mesen
+
+Get the port from `status`'s `listening_port` — never hardcode 47800. Prefer the MCP `launch` tool:
+
+```json
+{"content_path": "/path/to/game.sfc", "system": "snes", "name": "snes_session"}
+```
+
+The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
+data root. It writes only that copy's `settings.json`; fallback pidfiles and logs also stay under that
+per-port directory unless `EMUCAP_LOG` overrides the log path.
+
+**macOS / Linux fallback** — use `launch.sh` only when the MCP `launch` tool is unavailable:
+
+```bash
+REPO=/path/to/emu-monitor-hitl-adaptor
+"$REPO/adapters/mesen2/launch.sh" "/path/to/game.sfc" <listening_port> [name]
+# launch.sh prints "연결됨" (connected) and returns only after it confirms the TCP
+# connection (ESTABLISHED + post-connect grace) — no separate sleep is needed.
+```
+
+`launch.sh` checks `MESEN_BIN`, the macOS app default, then PATH (`Mesen`/`mesen`) and still runs an
+emucap-owned portable copy rather than the source install in place.
+
+**Windows fallback** — use **`launch.ps1`** only when the MCP `launch` tool is unavailable. It copies
+`Mesen.exe` into `%LOCALAPPDATA%\emucap\mesen2\<port>\portable`, writes settings there, and launches
+that copy. It refuses to start unless the MCP listener is already on `<listening_port>`, refuses a port
+that already has an emulator connection, writes `mesen.pid`/`mesen.log` under the per-port directory,
+and returns only after Mesen connects. It checks `MESEN_BIN`, common user/program-files install paths,
+then PATH. Set `MESEN_BIN` to the path of `Mesen.exe` when needed.
+The script reads the MCP session token from the OS temp directory when `EMUCAP_SESSION_TOKEN` is not
+already set.
+
+```powershell
+$env:MESEN_BIN = "C:\path\to\Mesen.exe"
+powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:\path\to\game.sfc" <listening_port> [name]
+```
+
+- The agent knows the ROM path (the user tells it, or it is a build-output path).
+- If `launch.sh` reports "no MCP listener", do not relaunch the emulator — call `status`
+  again first. A log that looks like a shutdown right after renderer/video init may just
+  be the launcher timeout cleaning up with SIGTERM.
+- If no new Mesen window appears on macOS, or launch.sh fails right after "연결됨",
+  first suspect a blocked macOS dialog or display-sleep renderer failure. The fallback launcher defaults
+  to direct execution of the portable copy and uses `caffeinate` when available. If it still recurs,
+  check the Mesen window/dialog directly and relaunch.
+- To let a human freeze a transient moment (a sprite popup, etc.) on the spot, press the
+  **freeze hotkey `Home`** in the Mesen window (change with `EMUCAP_FREEZE_KEY`; the same
+  key toggles resume) — it is a codeBreak freeze, so emucap freezes indefinitely while
+  keeping responses alive (`status.reason="hotkey"`). ⚠ **Do not use Mesen's GUI Pause** —
+  it drops the connection to 'not connected' and does not recover until you resume from the GUI.
+- Environment variables: `MESEN_BIN` (path to the source Mesen executable or macOS app bundle; when
+  unset, the launcher checks common install paths and PATH), `EMUCAP_EMU_HOME` (portable copy root),
+  `EMUCAP_LAUNCH_WAIT` (seconds to wait for connection, default 20),
+  `EMUCAP_POST_CONNECT_GRACE` (grace seconds after connection, default 2), `EMUCAP_LOG`
+  (log path), `EMUCAP_DEADMAN_MS` (if the step interval is long, the deadman auto-resumes —
+  default 30000, 0 disables), `EMUCAP_RECONNECT_GIVEUP_MS` (upper bound on waiting for MCP
+  reconnect, default 600000, 0 for indefinite).
+- `EMUCAP_PREARM` pre-arms a DMA write BP right after cold boot (form `dma` | `dma:<dest>` |
+  `dma:<dest>:<vmin>-<vmax>`). When an agent round-trip cannot catch a DMA write that
+  vanishes in an instant during boot (e.g. initialization before the attract), arm it ahead
+  at launch time so it freezes on the first hit.
+
+### Verify the connection
+Call the `status` tool → `{"connected":true,"frame":…,"state":"running"}` means it is
+ready. The first call right after boot may return `emulator not connected`, so retry a few
+seconds later. The MCP server binds lazily, so even before Mesen exists, tool calls respond
+gracefully with "not connected".
+
+### (Alternative) Load via the GUI
+If Mesen is already up, you can also load `emucap-live.lua` from Debug → Script Window.
+
+Server and client match ports via `EMUCAP_PORT`.
+
+## Cross-ROM diff (original vs patched)
+
+Find what the patch broke — drive both ROMs to the same logical moment and compare state.
+
+1. Bring up two emucap-mcp sessions and launch two instances via launch.sh, each with its
+   session's `status` `listening_port`:
+   - `launch.sh "<JP.sfc>" <portA> emucap-a`
+   - `launch.sh "<KR.sfc>" <portB> emucap-b`
+   - Use the port each session's status reports (never hardcode). For a single-session
+     sequential run, use broker mode.
+2. **Align**: `set_breakpoint(..., pause_on_hit=true)` at the *same game-logic address* in
+   both instances. Advancing both makes each freeze at that event (aligned by logic, not
+   frame count — robust even if the patch changes timing). A text patch does not change
+   logic addresses, so both hit the same BP.
+3. **Dump**: while frozen, `dump_memory(dirA)` · `dump_memory(dirB)` (memory + state.json).
+4. **Compare**: `emucap diff dirA dirB`.
+   - Differences the patch changed intentionally (translated text · fonts) show up all over.
+     To separate those out:
+     - **Baseline subtraction**: at a good point,
+       `emucap diff A_good B_good --json > baseline.json`; at the bug point,
+       `emucap diff A_bug B_bug --baseline baseline.json` → only new differences.
+     - **State diff**: registers/DMA/PPU should not be touched by a text patch → a difference
+       there is a bug signal. Add noise keys to exclude with `--ignore-key`.
+
+## Caveat
+The call context of `createSavestate` and the return keys of `getInput` may differ by Mesen2
+version. On first use, confirm the behavior empirically before relying on it.

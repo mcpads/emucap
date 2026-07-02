@@ -1,0 +1,31 @@
+# 출력 케이스 번들 — ROM 파생·대용량, 절대 커밋 금지
+bundles/
+
+# 실험 추적 루트 — ROM 파생·대용량 아티팩트, 정본은 FS·DB는 재구축 인덱스
+.emucap/
+
+# 원본·출력 이미지
+roms/
+out/
+
+# 캡처 산출물 (혹시 루트에 떨어질 경우)
+*.mss
+*.bin
+*.sfc
+*.smc
+*.nes
+*.gb
+*.gbc
+*.gba
+
+# MAME runtime state when probing from repo root
+cfg/
+nvram/
+snap/
+
+# 회귀 케이스 세이브스테이트 — SHA-1로만 참조, 본체는 커밋 제외
+regression/**/*.mss
+
+# Rust
+/target
+__pycache__/
