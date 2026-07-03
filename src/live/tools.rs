@@ -161,7 +161,12 @@ fn one_tap(
 ) -> Result<(), LinkError> {
     let empty: [String; 0] = [];
     link.call("set_input", json!({ "port": port, "buttons": buttons }))?;
-    link.call("step", json!({ "frames": press_frames.max(1) }))?;
+    // press step이 실패(timeout 등)하면 `?`로 바로 반환돼 버튼이 눌린 채 남는다 — 에러를 전파하기 전에
+    // best-effort로 입력을 해제한다(에뮬 상태가 눌린 채 계속 진행하는 것 방지).
+    if let Err(e) = link.call("step", json!({ "frames": press_frames.max(1) })) {
+        let _ = link.call("set_input", json!({ "port": port, "buttons": empty }));
+        return Err(e);
+    }
     link.call("set_input", json!({ "port": port, "buttons": empty }))?; // 해제
     link.call("step", json!({ "frames": 1 }))?; // 해제 에지
     Ok(())
@@ -187,6 +192,11 @@ pub fn tap(
     })))
 }
 
+/// tap_sequence 총 프레임 상한. per-field cap(steps 4096 × press_frames 1M)을 각각 통과한 유효 요청이
+/// 곱으로 팽창해 SharedLink 뮤텍스를 쥔 채 수십억 프레임을 도는 것을 막는 집계 상한(args.rs MAX_FRAME_ARG
+/// 동취지).
+const MAX_TAP_SEQUENCE_FRAMES: u64 = 1_000_000;
+
 /// 여러 탭을 한 콜에 순차로(메뉴 네비게이션 왕복 절감). steps의 각 원소가 한 탭의 버튼셋이다.
 /// 예: [["down"],["down"],["a"]] = down·down·a 세 탭. 전부 frozen에서 결정론적. 호출 후 frozen 유지.
 pub fn tap_sequence(
@@ -195,6 +205,18 @@ pub fn tap_sequence(
     steps: &[Vec<String>],
     press_frames: u64,
 ) -> Result<ToolOutput, LinkError> {
+    // 탭 하나 = press_frames + 해제 1 + 해제에지 1. 집계가 상한을 넘으면 실행 전에 거부한다(뮤텍스 점유 폭주 방지).
+    let per_tap = press_frames.saturating_add(2);
+    let total = (steps.len() as u64).saturating_mul(per_tap);
+    if total > MAX_TAP_SEQUENCE_FRAMES {
+        return Err(LinkError::Emulator {
+            kind: "bad_params".into(),
+            message: format!(
+                "tap_sequence 총 프레임 {total}(steps {} × {per_tap})이 상한 {MAX_TAP_SEQUENCE_FRAMES} 초과 — 나눠 호출하라",
+                steps.len()
+            ),
+        });
+    }
     link.call("pause", json!({}))?; // 멱등
     for step in steps {
         one_tap(link, port, step, press_frames)?;
@@ -229,22 +251,28 @@ pub fn hold_until(
     };
     link.call("pause", json!({}))?; // 멱등
     link.call("set_input", json!({ "port": port, "buttons": buttons }))?;
-    let before = read(link)?;
-    let mut frames = 0u64;
-    let mut after = before.clone();
-    let mut changed = false;
-    while frames < max_frames {
-        link.call("step", json!({ "frames": 1 }))?;
-        frames += 1;
-        after = read(link)?;
-        if after != before {
-            changed = true;
-            break;
+    // 코어 루프를 돌리되 성패 무관하게 입력을 해제한다 — step/read 에러로 중간 종료해도 버튼이 눌린 채
+    // 남지 않게(에뮬 상태가 입력받은 채 진행 방지).
+    let outcome: Result<(bool, u64, String, String), LinkError> = (|| {
+        let before = read(link)?;
+        let mut frames = 0u64;
+        let mut after = before.clone();
+        let mut changed = false;
+        while frames < max_frames {
+            link.call("step", json!({ "frames": 1 }))?;
+            frames += 1;
+            after = read(link)?;
+            if after != before {
+                changed = true;
+                break;
+            }
         }
-    }
+        Ok((changed, frames, before, after))
+    })();
     let empty: [String; 0] = [];
-    link.call("set_input", json!({ "port": port, "buttons": empty }))?; // 해제
-    link.call("step", json!({ "frames": 1 }))?;
+    let _ = link.call("set_input", json!({ "port": port, "buttons": empty })); // best-effort 해제
+    let (changed, frames, before, after) = outcome?;
+    link.call("step", json!({ "frames": 1 }))?; // 해제 에지
     Ok(ToolOutput::Json(json!({
         "changed": changed, "frames": frames, "before": before, "after": after, "state": "frozen"
     })))
@@ -358,15 +386,31 @@ pub fn disassemble(
 /// 레지스터 범위 워치: register가 허용 범위 [min,max]를 벗어나는 명령에서 freeze한다(SP 폭주 등
 /// derail을 그 명령에서 포착). register는 get_state의 cpu.* 이름(sp/pc/k/a/x/y/ps…). 매 명령 검사라
 /// 느리니(실측 ~1fps) hunting 전용으로 쓰고 끝나면 clear한다.
+/// watch_register 자동해제 예산 상한(명령 수). 이보다 크면 거부한다 — 무기한에 가까운 예산은 매 명령
+/// getState 플러드로 emu 스레드를 오래 굶긴다. 기본(어댑터의 1M)의 여러 배까지 확장은 허용한다.
+const MAX_WATCH_INSTRUCTIONS: u64 = 50_000_000;
+
 pub fn watch_register(
     link: &mut dyn EmulatorLink,
     register: &str,
     min: u64,
     max: u64,
     pause_on_hit: bool,
+    max_instructions: Option<u64>,
 ) -> Result<ToolOutput, LinkError> {
-    let params =
+    let mut params =
         json!({ "register": register, "min": min, "max": max, "pause_on_hit": pause_on_hit });
+    if let Some(budget) = max_instructions {
+        if budget > MAX_WATCH_INSTRUCTIONS {
+            return Err(LinkError::Emulator {
+                kind: "bad_params".into(),
+                message: format!(
+                    "watch_register max_instructions {budget}이 상한 {MAX_WATCH_INSTRUCTIONS} 초과"
+                ),
+            });
+        }
+        params["max_instructions"] = json!(budget);
+    }
     Ok(ToolOutput::Json(link.call("watch_register", params)?))
 }
 
@@ -455,4 +499,54 @@ pub fn screenshot(
         png_base64: b64,
         saved_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tap_sequence, watch_register, LinkError};
+    use crate::live::link::FakeLink;
+    use serde_json::json;
+
+    #[test]
+    fn watch_register_rejects_over_budget() {
+        // 과대 max_instructions는 매 명령 getState 플러드를 오래 돌려 emu 스레드를 굶긴다 — 실행 전 거부.
+        let mut link = FakeLink::ok(json!({ "id": 1 }));
+        let r = watch_register(&mut link, "sp", 0, 0xffff, true, Some(u64::MAX));
+        assert!(
+            matches!(r, Err(LinkError::Emulator { ref kind, .. }) if kind == "bad_params"),
+            "과대 max_instructions는 bad_params로 거부해야: {r:?}"
+        );
+        let mut link2 = FakeLink::ok(json!({ "id": 1 }));
+        assert!(
+            watch_register(&mut link2, "sp", 0, 0xffff, true, Some(1000)).is_ok(),
+            "상한 이내 예산은 통과해야"
+        );
+    }
+
+    #[test]
+    fn tap_sequence_rejects_over_aggregate_budget() {
+        // per-field cap을 통과해도(steps ≤ 4096, press_frames ≤ 1M) 곱이 상한(1M)을 넘으면 실행 전에
+        // 거부해야 한다 — 유효 요청이 뮤텍스를 쥔 채 수십억 프레임으로 팽창하는 것 방지.
+        let mut link = FakeLink::ok(json!({}));
+        let steps: Vec<Vec<String>> = vec![vec!["a".to_string()]; 4000];
+        let r = tap_sequence(&mut link, 0, &steps, 1000); // 4000 × 1002 ≈ 4M > 1M
+        assert!(
+            matches!(r, Err(LinkError::Emulator { ref kind, .. }) if kind == "bad_params"),
+            "집계 예산 초과는 bad_params로 거부해야: {r:?}"
+        );
+        assert!(
+            link.last_method.is_none(),
+            "예산 초과는 어떤 링크 호출(pause 포함)도 하기 전에 거부해야"
+        );
+    }
+
+    #[test]
+    fn tap_sequence_accepts_within_budget() {
+        let mut link = FakeLink::ok(json!({}));
+        let steps: Vec<Vec<String>> = vec![vec!["a".to_string()]; 10];
+        assert!(
+            tap_sequence(&mut link, 0, &steps, 2).is_ok(),
+            "예산 이내는 통과해야"
+        );
+    }
 }

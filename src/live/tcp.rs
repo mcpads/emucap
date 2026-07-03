@@ -20,12 +20,22 @@ pub struct TcpLink {
     preaccept: Option<Preaccept>,
     /// 연속 요청 타임아웃 횟수. 1회 타임아웃은 느리지만 살아있는 어댑터(큰 read·NMI 장면)일 수 있어
     /// 연결을 끊지 않는다. 응답을 한 번이라도 받으면 0으로 리셋. 임계치 연속이면 진짜 행으로 보고 드롭한다.
+    /// 쓰기 타임아웃(플러드된 emu가 recv를 안 비움)도 읽기 타임아웃과 동일하게 여기 편입된다(비치명).
     consecutive_timeouts: u32,
+    /// 한 deferred 명령(working keepalive 반복)이 점유할 수 있는 전체 벽시계 상한. working 프레임이 매번
+    /// consecutive_timeouts를 리셋해 3-timeout 안전장치가 안 걸리므로, 버그·악성 어댑터가 working을 무한히
+    /// 흘리면 raw_call이 이 상한만큼만 대기하고 드롭한다(SharedLink mutex 영구 wedge 방지).
+    deferred_deadline: Duration,
 }
 
 /// 연속 타임아웃이 이 횟수에 도달하면 행으로 간주해 연결을 드롭한다(재수락 유도). 단발 타임아웃은
-/// 무시해 slow-but-alive 어댑터를 죽이지 않는다.
+/// 무시해 slow-but-alive 어댑터를 죽이지 않는다. 읽기·쓰기 타임아웃이 함께 이 카운터에 쌓인다.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
+/// 한 deferred 명령의 전체 대기 상한(기본값). working keepalive가 매번 consecutive_timeouts를 리셋하므로
+/// 개별 read timeout·3-timeout 가드로는 무한 working 플러드를 못 끊는다 — 이 상한이 총 대기를 유한하게
+/// 만든다. 정상 대용량 step/run_frames(프레임 인자 상한 안)엔 넉넉하고, 무한 플러드만 끊는다.
+const DEFAULT_DEFERRED_DEADLINE: Duration = Duration::from_secs(300);
 
 struct Conn {
     reader: BufReader<TcpStream>,
@@ -54,6 +64,7 @@ fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLin
         next_id: 1,
         preaccept: None,
         consecutive_timeouts: 0,
+        deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
     }
 }
 
@@ -174,6 +185,10 @@ fn handshake_stream(
     expected_session_token: Option<&str>,
 ) -> Result<(Conn, Capabilities), LinkError> {
     stream.set_read_timeout(Some(timeout)).map_err(io_to_link)?;
+    // 쓰기에도 같은 상한을 건다 — 플러드된 emu가 recv를 안 비우면 write_all이 영원히 블록해
+    // raw_call(및 그것이 쥔 SharedLink mutex)이 통째 wedge된다. 소켓 옵션이라 try_clone한 writer에도
+    // 적용된다(hello write·이후 raw_call write 모두 이 상한을 받는다).
+    stream.set_write_timeout(Some(timeout)).map_err(io_to_link)?;
     stream.set_nonblocking(false).map_err(io_to_link)?;
 
     let mut writer = stream.try_clone().map_err(io_to_link)?;
@@ -271,6 +286,12 @@ impl TcpLink {
             .expect("바인드된 리스너")
             .local_addr()
             .expect("로컬 주소")
+    }
+
+    /// 테스트 관측용 — 현재 활성 연결 보유 여부(쓰기 타임아웃 poison 후 conn이 버려졌는지 검증).
+    #[cfg(test)]
+    pub(crate) fn has_conn(&self) -> bool {
+        self.conn.is_some()
     }
 
     /// 현재 연결을 버린다. 다음 `ensure_connected`가 새 클라이언트를 재수락한다. 죽은·행된
@@ -505,6 +526,9 @@ impl TcpLink {
         };
         self.conn = Some(conn);
         self.caps = caps;
+        // 새 클라이언트를 갓 채택했으니 이전 죽은 conn에서 누적된 타임아웃 카운트를 지운다(try_adopt_
+        // pending_client와 동일). 안 그러면 stale 카운트가 신규 conn 첫 타임아웃에 그대로 이어져 조기 드롭.
+        self.consecutive_timeouts = 0;
         Ok(())
     }
 
@@ -518,12 +542,22 @@ impl TcpLink {
         {
             let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
             if let Err(e) = conn.writer.write_all(to_line(&req).as_bytes()) {
-                // 쓰기 실패(broken pipe 등) = 죽은 연결. 비워서 다음 호출이 새 클라이언트를
-                // 수락하게 한다(안 비우면 죽은 연결을 영영 붙들어 재연결 불가).
+                // 쓰기 실패는 타임아웃이든 broken pipe든 conn을 버린다. 쓰기 타임아웃은 요청 라인의 일부만
+                // 전송됐을 수 있어(대용량 params), 같은 conn에 다음 요청을 이어붙이면 상대 NDJSON 프레이밍이
+                // 오염된다 — 부분 송신은 복구 불가다. 읽기 타임아웃은 conn.pending으로 부분 수신을 보존해
+                // 유지하지만, 송신은 그럴 수 없으므로 버려서 다음 호출이 새 클라이언트를 재수락하게 한다
+                // (부분 프레임에 새 요청이 이어붙지 못하게).
                 self.drop_conn();
+                if is_timeout(&e) {
+                    return Err(LinkError::Timeout);
+                }
                 return Err(io_to_link(e));
             }
         }
+
+        // deferred(working keepalive) 명령의 전체 벽시계 데드라인. working은 id가 일치해 매 Ok read가
+        // consecutive_timeouts를 리셋하므로 3-timeout 가드가 못 끊는다 — 이 상한으로 총 대기를 유한하게.
+        let deadline = std::time::Instant::now() + self.deferred_deadline;
 
         // id 불일치(늦은 응답·desync) 프레임은 버리고 계속 읽되, 한도를 둔다 — 끝없이
         // 오면 raw_call이 무한 점유되므로 desync로 간주해 빠르게 실패한다. working
@@ -531,6 +565,13 @@ impl TcpLink {
         const MAX_ID_MISMATCH: u32 = 256;
         let mut mismatch = 0u32;
         loop {
+            // deferred 데드라인 초과 = working이 끝없이 오거나 id 불일치가 오래 이어짐. 진짜 완료가 안
+            // 오는 것으로 보고 드롭+Timeout(무한 점유 금지). 개별 read 타임아웃은 아래 arm이 처리한다.
+            if std::time::Instant::now() >= deadline {
+                self.consecutive_timeouts = 0;
+                self.drop_conn();
+                return Err(LinkError::Timeout);
+            }
             // 영속 버퍼(conn.pending)로 읽는다 — 타임아웃이 줄 중간에 걸려도 이미 읽은 바이트가 보존돼
             // 다음 호출이 이어 읽는다. read_line 결과만 받고 conn 빌림을 끝내(아래 drop_conn과 충돌 방지).
             let read_result = {
@@ -579,10 +620,7 @@ impl TcpLink {
                     }
                     return Ok(result);
                 }
-                Err(ref e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
+                Err(ref e) if is_timeout(e) => {
                     // 요청 타임아웃은 단발이면 연결을 끊지 '않는다'. 느리지만 살아있는 어댑터(큰 VRAM/OAM
                     // read, NMI 빈번 장면, frozen 캡처 등)를 죽이면 공들인 게임 상태가 날아간다. 부분 수신한
                     // 줄은 conn.pending에 남아 다음 호출이 이어 읽으므로 스트림 desync도 없다(늦은 응답은
@@ -601,6 +639,12 @@ impl TcpLink {
                 }
             }
         }
+    }
+
+    /// deferred 데드라인을 짧게 바꿔 테스트에서 working 플러드 컷오프를 빠르게 검증한다(프로덕션 미포함).
+    #[cfg(test)]
+    pub(crate) fn set_deferred_deadline(&mut self, d: Duration) {
+        self.deferred_deadline = d;
     }
 }
 
@@ -622,6 +666,15 @@ impl EmulatorLink for TcpLink {
     fn session_token(&self) -> Option<&str> {
         Some(&self.session_token)
     }
+}
+
+/// read/write가 설정된 상한 안에 진행하지 못했을 때의 타임아웃(SO_RCVTIMEO/SO_SNDTIMEO). 블로킹
+/// 소켓에서 OS는 EAGAIN(WouldBlock) 또는 ETIMEDOUT(TimedOut) 중 하나로 알린다 — 둘 다 비치명 타임아웃.
+fn is_timeout(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 fn io_to_link(e: std::io::Error) -> LinkError {

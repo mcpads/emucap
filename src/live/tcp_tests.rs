@@ -682,3 +682,103 @@ fn reusable_session_token_reuses_own_mints_for_foreign() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// hello만 답하고 이후 소켓에서 절대 read하지 않는 클라이언트 — 서버 송신 버퍼를 채워 큰 요청의
+/// write_all이 스톨→타임아웃되게 한다. release까지 소켓을 연 채 둔다(EOF 아님 → 진짜 write timeout).
+fn fake_lua_hello_then_never_read(
+    addr: String,
+    ready: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    let stream = TcpStream::connect(addr).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut w = stream;
+    ready.send(()).unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap(); // hello
+    write_hello_response(&mut w, &line, &[]);
+    // 이후 요청을 절대 읽지 않는다 — 서버 송신 버퍼가 차 큰 요청 write_all이 스톨한다.
+    let _ = release.recv();
+}
+
+// write_all이 타임아웃되면(플러드된 emu가 recv를 안 비움) 요청 라인의 일부만 전송됐을 수 있다. 같은
+// conn을 재사용하면 다음 요청이 그 부분 프레임 뒤에 이어붙어 상대 NDJSON 파서가 오염된다. 그래서
+// 쓰기 타임아웃은 비치명 Timeout을 반환하되 conn을 poison(drop)해 다음 호출이 새 클라이언트를
+// 재수락하게 한다(부분 송신은 복구 불가 — 읽기 타임아웃의 conn.pending 보존과 대비).
+#[test]
+fn tcp_link_write_timeout_poisons_conn() {
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_millis(200)).unwrap();
+    let addr = link.local_addr().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (rel_tx, rel_rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || fake_lua_hello_then_never_read(addr, tx, rel_rx));
+    rx.recv().unwrap();
+    // 큰 params로 요청 한 줄을 수십 MB로 만들어 송신 버퍼(+peer recv 버퍼)를 넘긴다 → write_all 스톨.
+    let big = "x".repeat(32 * 1024 * 1024);
+    let r = link.call("read_memory", serde_json::json!({ "blob": big }));
+    assert!(
+        matches!(r, Err(LinkError::Timeout)),
+        "쓰기 타임아웃은 비치명 Timeout이어야(Protocol 아님): {:?}",
+        r.map(|_| "ok")
+    );
+    // 핵심: 부분 송신된 conn은 버려져야 한다 — 다음 호출이 부분 프레임에 이어붙지 않고 재연결하도록.
+    assert!(
+        !link.has_conn(),
+        "쓰기 타임아웃 후 conn은 poison(drop)돼야 — 부분 프레임에 다음 요청이 이어붙으면 프레이밍 오염"
+    );
+    rel_tx.send(()).ok();
+    h.join().unwrap();
+}
+
+/// hello 후 run_frames에 완료 프레임 없이 working keepalive를 무한히 흘리는 클라이언트(deferred flood).
+/// working은 id가 일치해 매번 consecutive_timeouts를 리셋하므로 3-timeout 가드로는 못 끊는다.
+fn fake_lua_working_flood(addr: String, ready: std::sync::mpsc::Sender<()>) {
+    let stream = TcpStream::connect(addr).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut w = stream;
+    ready.send(()).unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap(); // hello
+    write_hello_response(&mut w, &line, &["run_frames"]);
+    let mut l2 = String::new();
+    reader.read_line(&mut l2).unwrap(); // run_frames
+    let id2 = serde_json::from_str::<serde_json::Value>(l2.trim()).unwrap()["id"].clone();
+    // 완료를 절대 안 보내고 working만 계속. 서버가 데드라인으로 conn을 드롭하면 write가 실패해 종료.
+    for _ in 0..100_000 {
+        if writeln!(
+            w,
+            r#"{{"id":{id2},"ok":true,"result":{{"status":"working"}}}}"#
+        )
+        .is_err()
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// working keepalive가 끝없이 와도(매번 타임아웃 카운터 리셋) raw_call은 deferred 데드라인으로
+// 끊고 Timeout을 내야 한다 — 안 그러면 SharedLink mutex를 쥔 채 영구 wedge된다.
+#[test]
+fn tcp_link_bails_on_working_flood_past_deadline() {
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    link.set_deferred_deadline(Duration::from_millis(300));
+    let addr = link.local_addr().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || fake_lua_working_flood(addr, tx));
+    rx.recv().unwrap();
+    let start = std::time::Instant::now();
+    let r = link.call("run_frames", serde_json::json!({ "n": 5 }));
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(r, Err(LinkError::Timeout)),
+        "working 플러드는 데드라인으로 Timeout이어야(무한 점유 금지): {r:?}"
+    );
+    // 데드라인(300ms)이 read timeout(2s)보다 먼저 끊어야 — read timeout이었다면 working이 계속 와서
+    // 아예 끊기지도 않는다. 넉넉한 상한으로 판정.
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "deferred 데드라인이 개별 read timeout보다 먼저 컷오프해야: {elapsed:?}"
+    );
+    h.join().unwrap();
+}

@@ -4,7 +4,7 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -17,6 +17,15 @@ use super::protocol::{
 /// 충분히 짧아야 한다(여기선 3회 여유).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// 연속 read 타임아웃이 이 횟수면 broker가 행된 것으로 보고 NotConnected를 올린다 — LazyBrokerLink가
+/// inner를 버리고 재connect+attach하게 해 자가복구시킨다(TcpLink의 drop+재accept에 대응).
+const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
+/// deferred(working keepalive) 명령의 총 벽시계 상한. working은 성공 read라 consecutive_timeouts를 매번
+/// 리셋해 3-timeout 가드로는 못 끊는다 — 이 상한 초과면 NotConnected로 poison해 LazyBrokerLink가 재attach
+/// 하게 한다(TcpLink의 deferred_deadline 동형).
+const DEFAULT_DEFERRED_DEADLINE: Duration = Duration::from_secs(300);
+
 #[derive(Debug)]
 pub struct BrokerLink {
     reader: BufReader<TcpStream>,
@@ -26,6 +35,14 @@ pub struct BrokerLink {
     next_id: u64,
     hb_stop: Arc<AtomicBool>,
     hb_handle: Option<JoinHandle<()>>,
+    /// 부분 수신한 응답 줄(영속). read 타임아웃이 줄 중간에 걸려도 여기 남겨 다음 호출이 이어 읽어
+    /// 스트림 desync를 막는다(TcpLink.Conn.pending과 동일 — 호출마다 새 String을 쓰면 타임아웃 시
+    /// 이미 읽은 바이트를 잃는다). 한 줄(끝 \n)이 완성되면 비운다.
+    pending: String,
+    /// 연속 read 타임아웃 횟수. Ok read 하나로 0 리셋, 임계치면 hung broker로 보고 NotConnected.
+    consecutive_timeouts: u32,
+    /// deferred 명령의 총 벽시계 상한(working keepalive가 끝없이 와도 유한하게 끊기 위함).
+    deferred_deadline: Duration,
 }
 
 impl Drop for BrokerLink {
@@ -45,6 +62,9 @@ pub fn connect(
 ) -> Result<BrokerLink, LinkError> {
     let stream = TcpStream::connect(session_addr).map_err(|_| LinkError::NotConnected)?;
     stream.set_read_timeout(Some(timeout)).map_err(io_e)?;
+    // 쓰기 타임아웃도 건다. 없으면 broker가 recv를 안 비우는(백프레셔) 대량 요청에서 write_all이 영원히
+    // 블록해 링크 뮤텍스를 쥔 채 MCP를 wedge한다. 쓰기 실패는 poison → NotConnected로 처리한다.
+    stream.set_write_timeout(Some(timeout)).map_err(io_e)?;
     let reader = BufReader::new(stream.try_clone().map_err(io_e)?);
     let mut link = BrokerLink {
         reader,
@@ -58,6 +78,9 @@ pub fn connect(
         next_id: 1,
         hb_stop: Arc::new(AtomicBool::new(false)),
         hb_handle: None,
+        pending: String::new(),
+        consecutive_timeouts: 0,
+        deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
     };
     let params = match name {
         Some(n) => json!({ "name": n }),
@@ -97,6 +120,12 @@ fn io_e(e: std::io::Error) -> LinkError {
 }
 
 impl BrokerLink {
+    /// 테스트용 — deferred 데드라인을 짧게 설정한다(working-flood 컷오프 검증).
+    #[cfg(test)]
+    pub(crate) fn set_deferred_deadline(&mut self, d: Duration) {
+        self.deferred_deadline = d;
+    }
+
     /// write-only heartbeat 스레드를 시작한다 — broker가 idle 세션을 hang으로 오판해 steal하지
     /// 않도록 주기적으로 `_ping`을 보낸다(응답 불필요). stop 플래그로 drop 시 종료한다.
     fn start_heartbeat(&mut self) {
@@ -138,11 +167,23 @@ impl BrokerLink {
                 .map_err(|_| LinkError::NotConnected)?;
         }
         let mut mismatches = 0u32;
+        // deferred(working) 응답이 끝없이 와도 매 성공 read가 consecutive_timeouts를 리셋해 3-timeout
+        // 가드가 못 끊는다 — 총 벽시계 데드라인으로 유한하게 끊는다. 초과면 NotConnected로 poison해
+        // LazyBrokerLink가 inner를 버리고 재attach하게 한다(SharedLink mutex 무한 wedge 방지).
+        let deadline = Instant::now() + self.deferred_deadline;
         loop {
-            let mut line = String::new();
-            match self.reader.read_line(&mut line) {
+            if Instant::now() > deadline {
+                return Err(LinkError::NotConnected);
+            }
+            // 영속 버퍼(self.pending)로 읽는다 — 타임아웃이 줄 중간에 걸려도 이미 읽은 바이트가 보존돼
+            // 다음 호출이 이어 읽으므로 응답이 read 경계에 쪼개져도 desync가 없다(reader·pending은
+            // 서로 다른 필드라 disjoint borrow 허용).
+            match self.reader.read_line(&mut self.pending) {
                 Ok(0) => return Err(LinkError::NotConnected),
                 Ok(_) => {
+                    // read_line은 첫 \n까지 — pending에 완성된 한 줄. 꺼내 비운다(다음 줄 대비).
+                    let line = std::mem::take(&mut self.pending);
+                    self.consecutive_timeouts = 0; // 응답 수신 = broker 살아있음 → 카운터 리셋
                     let resp = parse_response(line.trim())
                         .map_err(|e| LinkError::Protocol(e.to_string()))?;
                     if resp.id != id {
@@ -172,6 +213,14 @@ impl BrokerLink {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
+                    // 단발 타임아웃은 비치명(느린 op일 수 있음). 부분 수신 줄은 pending에 보존된다.
+                    // 연속 임계치면 hung broker로 보고 NotConnected를 올려 LazyBrokerLink가 재attach하게
+                    // 한다 — 안 그러면 행된 broker에 영구 Timeout으로 wedge된다(M3 self-heal).
+                    self.consecutive_timeouts += 1;
+                    if self.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                        self.consecutive_timeouts = 0;
+                        return Err(LinkError::NotConnected);
+                    }
                     return Err(LinkError::Timeout);
                 }
                 Err(_) => return Err(LinkError::NotConnected),
