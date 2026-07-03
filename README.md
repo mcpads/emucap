@@ -9,7 +9,7 @@ adapters supports several emulators — Mesen2 (SNES · Game Gear), a Mednafen f
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis), Flycast (Dreamcast),
 and MAME (PC-98).
 
-**v0.1.0 — beta.** This repository is under active, continuous development;
+**v0.2.0 — beta.** This repository is under active, continuous development;
 interfaces and behavior may still change between updates.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
