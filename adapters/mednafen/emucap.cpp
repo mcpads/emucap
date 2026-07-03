@@ -1,5 +1,5 @@
 // Mednafen 포크의 라이브 제어 소켓 클라이언트(우리 IP). emucap-mcp(서버)에 접속해 NDJSON
-// 프로토콜을 서비스한다 — Mesen의 emucap-live.lua에 대응하는 C++판. Rust 측(TcpLink·tools·
+// 프로토콜을 서비스한다 — Mesen의 emucap-core.lua에 대응하는 C++판. Rust 측(TcpLink·tools·
 // MCP)은 그대로 동작한다. 대상은 Saturn(ss), PSX(psx), PC Engine(pce), Mega Drive(md)이다.
 //
 // 빌드 통합: src/drivers/로 복사 + Makefile.am에 추가 + main.cpp 프레임 루프에서 호출.
@@ -648,6 +648,10 @@ std::string capture_registers_json() {
 }
 
 void enqueue_bp_hit(const BPHit& hit_in, bool should_freeze) {
+  // 버퍼가 가득 찼고 non-freezing이면 비싼 capture_registers_json() 앞에서 즉시 드롭한다 — 핫 exec BP가
+  // 드롭될 이벤트에도 매 히트 full-register JSON을 빌드하면 게임 스레드가 굶어 소켓이 링크 타임아웃(5s) 안에
+  // 서비스되지 못하고 연결이 끊긴다. freezing BP(should_freeze)는 첫 히트에서 멈추므로 영향 없다.
+  if (g_bp_hits.size() >= EVENT_CAP && !should_freeze) { g_bp_dropped++; return; }
   BPHit hit = hit_in;
   // exec BP는 pc만이라 D0 등을 못 본다 — 히트 순간 CPU 레지스터를 캡처한다. access BP는 addr/value가 이미
   // 있고 write-BP firehose 증폭을 피하려 제외. 히트는 이산 이벤트라 비용 낮음.
@@ -815,6 +819,14 @@ void handle_read_memory(long id, const std::string& line) {
   long addr = 0, len = 0;
   json_num(line, "address", addr);
   json_num(line, "length", len);
+  // Saturn "physical"(합성 128MB SH-2 버스)은 미구현이라 read가 조용히 0을 준다 — advertise되는데도
+  // silent-wrong이므로 명확히 거부하고 구체 region memory_type을 쓰게 한다(가치-조건 BP가 kSSBusRegions로
+  // 하듯 SH-2 버스주소를 workraml/workramh/vdp2vram/cram 등으로 지정).
+  if (is_ss() && mt == "physical") {
+    reply_err(id, "unsupported",
+              "Mednafen Saturn physical address space is unimplemented (reads 0); use a specific region memory_type (workraml/workramh/scspram/vdp1vram/vdp2vram/cram)");
+    return;
+  }
   std::string hex;
   if (!read_aspace_hex(mt, addr, len, hex)) {
     reply_err(id, "bad_params", "알 수 없는 memory_type 또는 address/length 범위 초과");
@@ -832,6 +844,13 @@ void handle_write_memory(long id, const std::string& line) {
   if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
   if (is_md() && mt == "cpu") {
     reply_err(id, "unsupported", "Mednafen MD cpu address space write is a no-op; use memory_type=ram");
+    return;
+  }
+  // Saturn "physical"(합성 128MB SH-2 버스)은 미구현이라 write가 조용히 no-op이 된다 — MD cpu와 같이
+  // 명확히 거부하고 구체 region memory_type을 쓰게 한다(silent-wrong 제거).
+  if (is_ss() && mt == "physical") {
+    reply_err(id, "unsupported",
+              "Mednafen Saturn physical address space write is a no-op; use a specific region memory_type (workraml/workramh/scspram/vdp1vram/vdp2vram/cram)");
     return;
   }
   if (addr < 0 || addr > 0xFFFFFFFFL) { reply_err(id, "bad_params", "address 범위 초과"); return; }
@@ -877,7 +896,7 @@ bool mkdir_p(const std::string& path) {
 
 // 벌크 메모리 덤프(emucap diff·교차-ROM 키-값 디프 입력). 각 debugger AddressSpace를 <dir>/<name>.bin으로
 // 64KB 청크로 직접 기록하고, regions.json([{name,memory_type,base_address,size}])을 같은 디렉터리에 쓴다 —
-// Mesen(emucap-live.lua)·PC-98(emucap-gdb-bridge.py) dump_memory 출력 형태와 일치해 Rust analysis::dump이
+// Mesen(emucap-core.lua)·PC-98(emucap-gdb-bridge.py) dump_memory 출력 형태와 일치해 Rust analysis::dump이
 // 그대로 읽고 `emucap diff`가 동작한다. state.json은 MCP(tools::dump_memory)가 get_state로 따로 기록하므로
 // (Mesen/PC-98 어댑터도 안 쓴다) 여기서 쓰지 않는다. 거대 hex 와이어 전송 없이 어댑터가 파일에 직접 써서
 // 512KB+ VRAM 등 벌크를 한 번에 export한다(read_memory 인라인 hex 한계 우회). base_address는 명명 공간 내
@@ -2686,6 +2705,10 @@ extern "C" void emucap_md_vdp_write(const char* memory_type, unsigned address, u
     if (b.pause_on_hit) should_freeze = true;
   }
   if (!matched) return;
+
+  // 버퍼가 가득 찼고 non-freezing이면 힙 std::string(memory_type/source)을 빌드하기 전에 드롭한다 —
+  // DMA 중 프레임당 수만 write가 매번 문자열 할당하는 것을 막는다(enqueue_bp_hit의 push/drop 가드와 이중).
+  if (g_bp_hits.size() >= EVENT_CAP && !should_freeze) { g_bp_dropped++; return; }
 
   BPHit hit{};
   hit.pc = pc;

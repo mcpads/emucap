@@ -3,7 +3,7 @@
 > English: [README.md](README.md)
 
 Mednafen에는 Mesen 같은 Lua가 없어, **Mednafen을 패치해 소켓 클라이언트(`emucap.cpp`)를
-넣는다** — Mesen `emucap-live.lua`의 C++판. emucap-mcp에 접속해 같은 NDJSON 프로토콜을
+넣는다** — Mesen `emucap-core.lua`의 C++판. emucap-mcp에 접속해 같은 NDJSON 프로토콜을
 서비스하므로 Rust 측(TcpLink·tools·MCP)은 그대로다.
 
 **한 바이너리가 Saturn(ss)·PlayStation(psx)·PC Engine(pce)·Mega Drive(md)를 모두 처리한다.** Mednafen이 로드 디스크/ROM으로

@@ -1,4 +1,4 @@
-// Mednafen 포크의 라이브 제어 소켓 서비스(우리 IP). Mesen의 emucap-live.lua에 대응하는
+// Mednafen 포크의 라이브 제어 소켓 서비스(우리 IP). Mesen의 emucap-core.lua에 대응하는
 // C++판. main.cpp의 프레임 루프에서 매 프레임 호출한다(에뮬레이션 스레드, 락 불필요).
 #ifndef EMUCAP_H
 #define EMUCAP_H
