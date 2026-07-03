@@ -162,6 +162,21 @@ BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/core/emucap_build.h"
 
+# 1b. 줄끝 정규화(LF). 아래 perl 앵커는 `..."\n`처럼 LF를 가정하는데, Windows에서 core.autocrlf=true로
+#     클론한 트리는 CRLF라 `\r`이 앵커 매치를 깨뜨려 주입이 실패한다(inject_check가 잡지만 빌드 중단).
+#     패치 대상 파일만 CRLF→LF로 바꿔 모든 앵커를 한 번에 방어한다(컴파일러는 CRLF도 받으므로 대상만).
+for f in \
+  core/emulator.cpp \
+  core/hw/maple/maple_cfg.cpp \
+  core/hw/sh4/interpr/sh4_interpreter.cpp \
+  core/ui/gui.cpp \
+  core/ui/mainui.cpp \
+  core/cfg/option.h \
+  shell/apple/emulator-osx/emulator-osx/osx-main.mm \
+  CMakeLists.txt; do
+  [ -f "$SRC/$f" ] && perl -i -pe 's/\r\n/\n/g' "$SRC/$f"
+done
+
 # 2. emulator.cpp 훅: emucap.h include + vblank()에 emucap_service() 호출(Event::VBlank 직후).
 #    근거: vblank()는 emu 스레드에서 프레임당 1회.
 perl -0777 -pi -e 's/(#include "emulator\.h"\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
@@ -234,6 +249,8 @@ perl -0777 -pi -e 's{set\(ZLIB_LIBRARY "-lz"}{set(ZLIB_LIBRARY "/Library/Develop
   "$SRC/CMakeLists.txt"
 perl -0777 -pi -e 's/(set\(ZLIB_LIBRARY [^\n]*\n)/${1}\tenable_language(OBJC)\n/ unless m{enable_language\(OBJC\)}' \
   "$SRC/CMakeLists.txt"
+# 두 주입은 앵커가 다르니 각각 검증한다(공유 토큰 하나로 묶으면 한쪽 앵커 드리프트가 조용히 통과).
+inject_check 'libz.tbd' "$SRC/CMakeLists.txt"
 inject_check 'enable_language(OBJC)' "$SRC/CMakeLists.txt"
 echo "→ CMakeLists.txt macOS 빌드 픽스(enable_language OBJC + zlib)"
 
@@ -244,11 +261,17 @@ perl -0777 -pi -e 's/(add_subdirectory\(core\/deps\/Syphon\))/if(FALSE) # emucap
   "$SRC/CMakeLists.txt"
 perl -0777 -pi -e 's/(target_compile_definitions\(\$\{PROJECT_NAME\} PRIVATE VIDEO_ROUTING\)\n)(\s*\n\s*target_sources)/${1}\t\t\tendif() # emucap: Syphon off\n${2}/ unless m{endif\(\) # emucap: Syphon off}' \
   "$SRC/CMakeLists.txt"
-inject_check 'emucap: Syphon off' "$SRC/CMakeLists.txt"
+# if(FALSE)/endif() 짝을 각각 검증한다 — 공유 토큰 'emucap: Syphon off' 하나면 endif 앵커가
+# 드리프트해 unbalanced if(FALSE)가 돼도 첫 코멘트에 토큰이 남아 조용히 통과한다(나중에 CMake 에러).
+inject_check 'if(FALSE) # emucap: Syphon off' "$SRC/CMakeLists.txt"
+inject_check 'endif() # emucap: Syphon off' "$SRC/CMakeLists.txt"
 OSXMAIN="$SRC/shell/apple/emulator-osx/emulator-osx/osx-main.mm"
 perl -0777 -pi -e 's/(#import <Syphon\/Syphon\.h>)/#if 0 \/\/ emucap: Syphon 비활성\n$1/ unless m{emucap: Syphon 비활성}' "$OSXMAIN"
 perl -0777 -pi -e 's/(syphonGLServer = NULL;\n\})/$1\n#endif \/\/ emucap: Syphon 비활성/ unless m{#endif \/\/ emucap: Syphon 비활성}' "$OSXMAIN"
-inject_check 'emucap: Syphon 비활성' "$OSXMAIN"
+# #if 0/#endif 짝을 각각 검증한다 — 공유 토큰 하나면 #endif 앵커 드리프트가 unbalanced #if 0를
+# 남겨도 첫 코멘트에 토큰이 있어 조용히 통과한다(나중에 컴파일 에러).
+inject_check '#if 0 // emucap: Syphon 비활성' "$OSXMAIN"
+inject_check '#endif // emucap: Syphon 비활성' "$OSXMAIN"
 echo "→ Syphon 비활성(CMake if(FALSE) + osx-main.mm #if 0)"
 
 # 3d. upstream(dev) 이식성 버그 우회: core/cfg/option.h의 calcDbPower가 std::min(double,float)로 호출돼
@@ -257,7 +280,9 @@ perl -0777 -pi -e 's/std::min\(std::exp\(4\.605f/std::min<float>(std::exp(4.605f
   "$SRC/core/cfg/option.h"
 perl -0777 -pi -e 's/(#include <type_traits>\n)/${1}#include <algorithm>\n/ unless m{#include <algorithm>}' \
   "$SRC/core/cfg/option.h"
+# 두 주입은 앵커가 다르니 각각 검증한다(std::min<float> 캐스트 + <algorithm> include).
 inject_check 'std::min<float>(std::exp' "$SRC/core/cfg/option.h"
+inject_check '#include <algorithm>' "$SRC/core/cfg/option.h"
 echo "→ option.h upstream min() 이식성 버그 우회"
 
 # 3e. MoltenVK post-build 복사 가드: USE_VULKAN=OFF인데도 post-build가 "$VULKAN_SDK/lib/libMoltenVK.dylib"

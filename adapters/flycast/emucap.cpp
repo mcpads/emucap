@@ -281,8 +281,9 @@ bool json_num_from(const std::string& s, const char* key, long& out, size_t from
 	if (c == std::string::npos) return false;
 	size_t i = c + 1;
 	while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '"')) i++;
-	// strtol saturates at LONG_MAX on 32-bit long (Windows), corrupting DC addresses >= 0x80000000.
-	// Parse as u64 and keep the low 32 bits round-trippable through (uint32_t) casts at call sites.
+	// Windows(LLP64)는 long이 32비트라 strtol이 0x80000000 이상 DC 주소(0x8Cxxxxxx 캐시 미러)를
+	// LONG_MAX로 saturate시킨다 — BP가 엉뚱한 주소에 걸리고 disasm이 딴 영역을 푼다. u64로 파싱해
+	// 하위 32비트만 남기면 call site의 (uint32_t) 캐스트로 원값이 통과한다(64비트 long은 불변).
 	out = (long)strtoull(s.c_str() + i, nullptr, 0);
 	return true;
 }
