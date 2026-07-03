@@ -21,7 +21,8 @@ Beta software — interfaces may still change.
 - Mednafen Saturn rejects the unimplemented `physical` address space instead of silent 0-reads / no-op writes.
 - TCP and broker links: poison on partial write, deferred deadline against endless `working` keepalives, and split-reply demux.
 - `track` observe rejects truncated reads (a hashed prefix could give a false pass/fail).
+- Flycast: Dreamcast addresses at or above `0x80000000` no longer truncate on a 32-bit `long` (Windows) — JSON numbers parse via `strtoull` ([#1](https://github.com/mcpads/emucap/pull/1), thanks @UzuCore). Build-hook injection is idempotent and CRLF-normalized.
 
 ## 0.1.0
 
-Initial public snapshot (includes PR #1: Flycast JSON numbers parsed with `strtoull` to survive 32-bit `long`).
+Initial public snapshot.
