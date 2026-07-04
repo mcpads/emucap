@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use emucap::launch::{
-    flycast as flycast_launch, mame as mame_launch, mednafen as mednafen_launch,
-    mesen as mesen_launch,
+    desmume_nds as desmume_nds_launch, flycast as flycast_launch, mame as mame_launch,
+    mednafen as mednafen_launch, mesen as mesen_launch,
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};
 
@@ -22,6 +22,7 @@ fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
         "mednafen" => "adapters/mednafen",
         "mame_pc98" => "adapters/mame-pc98",
         "flycast" => "adapters/flycast",
+        "desmume_nds" => "adapters/desmume-nds",
         _ => return root.join("adapters"),
     };
     let ps1 = root.join(dir).join("launch.ps1");
@@ -221,6 +222,32 @@ fn mame_binary_precondition(root: &Path) -> serde_json::Value {
     mame_binary_precondition_from(root, mame_launch::resolve_binary(root))
 }
 
+/// DeSmuME/NDS needs two binaries — headless desmume-cli and the emucap NDS GDB bridge. Both must
+/// resolve for the launcher to run, so the precondition is available only when both are present and
+/// reports which one is missing otherwise.
+fn desmume_nds_binary_precondition(root: &Path) -> serde_json::Value {
+    let cli = desmume_nds_launch::resolve_binary(root);
+    let bridge = desmume_nds_launch::resolve_bridge(root);
+    match (cli, bridge) {
+        (Some(cli), Some(bridge)) => serde_json::json!({
+            "available": true,
+            "path": cli.display().to_string(),
+            "bridge": bridge.display().to_string(),
+            "source": if std::env::var_os("EMUCAP_DESMUME_BIN").is_some() {
+                "EMUCAP_DESMUME_BIN"
+            } else {
+                "repo_build"
+            },
+        }),
+        (cli, bridge) => serde_json::json!({
+            "available": false,
+            "source": null,
+            "desmume_cli_available": cli.is_some(),
+            "bridge_available": bridge.is_some(),
+        }),
+    }
+}
+
 fn mame_bridge_precondition(root: &Path) -> serde_json::Value {
     match mame_launch::resolve_bridge_runtime(root) {
         Ok(runtime) => serde_json::json!({
@@ -243,6 +270,7 @@ fn adapter_binary_precondition(adapter: &str, root: &Path) -> serde_json::Value 
         "mednafen" => mednafen_binary_precondition(root),
         "flycast" => flycast_binary_precondition(),
         "mame_pc98" => mame_binary_precondition(root),
+        "desmume_nds" => desmume_nds_binary_precondition(root),
         _ => serde_json::Value::Null,
     }
 }
@@ -276,6 +304,12 @@ fn build_required_precondition(
         )),
         "mame_pc98" => serde_json::json!(format!(
             "{} 선행 빌드 또는 MAME_BIN/default install/PATH의 MAME 바이너리 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapter build.sh")
+        )),
+        "desmume_nds" => serde_json::json!(format!(
+            "{} 선행 빌드(desmume-cli) + emucap-desmume-nds-bridge(cargo build --release) 필요 — 미충족이면 launcher가 binary-not-found로 실패",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
@@ -359,6 +393,10 @@ fn normalize_system(system: &str) -> Option<&'static str> {
         "snes" | "super-famicom" | "super-nintendo" | "mesen" | "mesen2" => Some("snes"),
         "gamegear" | "gg" | "game-gear" | "sms" | "mastersystem" | "master-system"
         | "sega-mastersystem" => Some("gamegear"),
+        "gb" | "gameboy" | "game-boy" | "dmg" => Some("gb"),
+        "gbc" | "gbcolor" | "gameboycolor" | "game-boy-color" | "cgb" => Some("gbc"),
+        "gba" | "gameboyadvance" | "game-boy-advance" | "agb" => Some("gba"),
+        "nes" | "nintendo" | "famicom" | "fc" => Some("nes"),
         "saturn" | "ss" | "sega-saturn" => Some("saturn"),
         "psx" | "ps1" | "playstation" | "playstation1" => Some("psx"),
         "pce" | "pcengine" | "pc-engine" | "pce-cd" | "pc-engine-cd" => Some("pce"),
@@ -367,6 +405,7 @@ fn normalize_system(system: &str) -> Option<&'static str> {
         }
         "pc98" | "pc-98" | "mame-pc98" | "pc9801" | "pc9821" => Some("pc98"),
         "dc" | "dreamcast" | "flycast" | "sega-dreamcast" => Some("dc"),
+        "nds" | "ds" | "nintendo-ds" | "nintendods" | "desmume" => Some("nds"),
         _ => None,
     }
 }
@@ -557,6 +596,34 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("gb") => serde_json::json!({
+            "system": "gb",
+            "confidence": "extension",
+            "reason": "Game Boy ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
+        Some("gbc") => serde_json::json!({
+            "system": "gbc",
+            "confidence": "extension",
+            "reason": "Game Boy Color ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
+        Some("gba") => serde_json::json!({
+            "system": "gba",
+            "confidence": "extension",
+            "reason": "Game Boy Advance ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
+        Some("nes") => serde_json::json!({
+            "system": "nes",
+            "confidence": "extension",
+            "reason": "NES/Famicom ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("hdi" | "hdm" | "d88") => serde_json::json!({
             "system": "pc98",
             "confidence": "extension",
@@ -585,6 +652,13 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("nds") => serde_json::json!({
+            "system": "nds",
+            "confidence": "extension",
+            "reason": "Nintendo DS ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("cue" | "chd" | "bin" | "iso" | "img" | "ccd") => serde_json::json!({
             "system": null,
             "confidence": "ambiguous_media",
@@ -609,12 +683,17 @@ fn adapter_for_system(system: &str) -> (&'static str, Option<&'static str>) {
     match system {
         "snes" => ("mesen2", None),
         "gamegear" => ("mesen2", None),
+        "gb" => ("mesen2", None),
+        "gbc" => ("mesen2", None),
+        "gba" => ("mesen2", None),
+        "nes" => ("mesen2", None),
         "saturn" => ("mednafen", Some("ss")),
         "psx" => ("mednafen", Some("psx")),
         "pce" => ("mednafen", Some("pce")),
         "md" => ("mednafen", Some("md")),
         "pc98" => ("mame_pc98", None),
         "dc" => ("flycast", None),
+        "nds" => ("desmume_nds", None),
         _ => ("", None),
     }
 }
@@ -889,6 +968,7 @@ pub(crate) fn make_launch(
         "mednafen" => launch_mednafen(port, token.as_deref(), module, a),
         "flycast" => launch_flycast(port, token.as_deref(), a),
         "mame_pc98" => launch_mame(port, token.as_deref(), a),
+        "desmume_nds" => launch_desmume_nds(port, token.as_deref(), a),
         _ => serde_json::json!({
             "launched": false,
             "reason": format!("{system} 시스템은 Rust 런처 대상이 아니다"),
@@ -936,6 +1016,51 @@ fn launch_mame(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Va
     }
 }
 
+/// DeSmuME/NDS leg of `make_launch`: spawn headless desmume-cli (ARM9/ARM7 GDB stubs) + the NDS GDB
+/// bridge; a 2-process launch like MAME PC-98. Mirrors adapters/desmume-nds/launch.sh.
+fn launch_desmume_nds(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+    let Some(root) = find_repo_root() else {
+        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+    };
+    let Some(binary) = desmume_nds_launch::resolve_binary(&root) else {
+        return serde_json::json!({ "launched": false, "reason": "desmume-cli 바이너리 미발견 — adapters/desmume-nds/build.sh로 빌드하거나 EMUCAP_DESMUME_BIN을 설정하라" });
+    };
+    let Some(bridge) = desmume_nds_launch::resolve_bridge(&root) else {
+        return serde_json::json!({ "launched": false, "reason": "NDS bridge 바이너리 미발견 — cargo build --release --bin emucap-desmume-nds-bridge 하거나 EMUCAP_NDS_BRIDGE_BIN을 설정하라" });
+    };
+    let log = adapter_log_path("desmume-nds", port, "desmume-nds.log");
+    let display = a.display.unwrap_or(false);
+    let spec = desmume_nds_launch::Launch {
+        binary: &binary,
+        bridge: &bridge,
+        content: &a.content_path,
+        log_path: &log,
+        port,
+        name: a.name.as_deref(),
+        session_token: token,
+        display,
+    };
+    match desmume_nds_launch::launch(&spec) {
+        Ok(launched) => serde_json::json!({
+            "launched": true,
+            "adapter": "desmume_nds",
+            "pid": launched.desmume_pid,
+            "desmume_pid": launched.desmume_pid,
+            "bridge_pid": launched.bridge_pid,
+            "arm9_gdb_port": launched.arm9_gdb_port,
+            "arm7_gdb_port": launched.arm7_gdb_port,
+            "display": display,
+            "port": port,
+            "binary": binary.display().to_string(),
+            "bridge": bridge.display().to_string(),
+            "log": log.display().to_string(),
+            "note": "DeSmuME + NDS GDB bridge 2-process launch. If the bridge spawn fails after DeSmuME spawn, the Rust launcher terminates DeSmuME.",
+            "next_action": "5~8초 뒤 status로 connected=true를 확인하라(미연결이면 desmume-nds.log의 GDB/bridge 연결을 의심)",
+        }),
+        Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
+    }
+}
+
 /// Flycast leg of `make_launch` (Dreamcast): resolve the built app and hand off with the isolated
 /// config seeding. Mute defaults on and the GDB stub off (the exec-BP path enables it explicitly).
 fn launch_flycast(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
@@ -975,11 +1100,13 @@ fn launch_mesen(port: u16, token: Option<&str>, system: &str, a: &LaunchArgs) ->
     let Some(binary) = emucap::launch::mesen::resolve_binary() else {
         return serde_json::json!({ "launched": false, "reason": "Mesen 바이너리 미발견 — MESEN_BIN을 Mesen 실행파일 또는 macOS Mesen.app 경로로 설정하라" });
     };
-    // 시스템별 얇은 엔트리 스크립트(SYS config 설정 후 emucap-core.lua를 require). Mesen은 SNES/GG 둘 다 처리.
-    let entry = if system == "gamegear" {
-        "adapters/mesen2/emucap-sms.lua"
-    } else {
-        "adapters/mesen2/emucap-snes.lua"
+    // 시스템별 얇은 엔트리 스크립트(SYS config 설정 후 emucap-core.lua를 require). Mesen은 SNES/GG/GB(+GBC)/GBA/NES 처리.
+    let entry = match system {
+        "gamegear" => "adapters/mesen2/emucap-sms.lua",
+        "gb" | "gbc" => "adapters/mesen2/emucap-gb.lua",
+        "gba" => "adapters/mesen2/emucap-gba.lua",
+        "nes" => "adapters/mesen2/emucap-nes.lua",
+        _ => "adapters/mesen2/emucap-snes.lua",
     };
     let lua = root.join(entry);
     let log = adapter_log_path("mesen2", port, "mesen.log");

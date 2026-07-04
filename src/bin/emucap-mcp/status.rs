@@ -66,6 +66,30 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"start": "pause", "enter": "pause", "return": "pause", "a": "two", "b": "one", "1": "one", "2": "two", "button1": "one", "button2": "two"},
             "notes": "Mesen Game Gear (SMS controller): one=Button1(B), two=Button2(A), pause=Start. Aliases let you use start/a/b/1/2."
         }),
+        "gb" | "gbc" | "gameboy" | "game-boy" | "dmg" | "gbcolor" | "gameboycolor" | "cgb" => serde_json::json!({
+            "system": "gb",
+            "buttons": ["a", "b", "start", "select", "up", "down", "left", "right"],
+            "aliases": {"enter": "start", "return": "start"},
+            "notes": "Mesen Game Boy / Game Boy Color (gameboy console): a/b/start/select + directions, lowercase. No X/Y/L/R."
+        }),
+        "gba" | "gameboyadvance" | "game-boy-advance" | "agb" => serde_json::json!({
+            "system": "gba",
+            "buttons": ["a", "b", "l", "r", "start", "select", "up", "down", "left", "right"],
+            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r", "lb": "l", "rb": "r"},
+            "notes": "Mesen Game Boy Advance (ARM7): a/b/l/r/start/select + directions, lowercase. No X/Y."
+        }),
+        "nes" | "famicom" | "fc" | "nintendo" => serde_json::json!({
+            "system": "nes",
+            "buttons": ["a", "b", "start", "select", "up", "down", "left", "right"],
+            "aliases": {"enter": "start", "return": "start"},
+            "notes": "Mesen NES / Famicom (nes console / 6502-2A03 CPU): a/b/start/select + directions, lowercase. No X/Y/L/R."
+        }),
+        "nds" | "ds" | "nintendo-ds" => serde_json::json!({
+            "system": "nds",
+            "buttons": ["a", "b", "x", "y", "l", "r", "start", "select", "up", "down", "left", "right"],
+            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r"},
+            "notes": "Nintendo DS buttons via the DeSmuME bridge. Touchscreen/microphone are not injectable by name. Input injection is a planned fork hook — check status.capability_notes.input for availability."
+        }),
         // 알 수 없는 system은 어느 패드로도 위장하지 않는다 — 거짓 버튼 힌트 대신 input_buttons를 생략한다.
         _ => return None,
     })
@@ -323,6 +347,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
     let mednafen_launcher = repo_path(&root, &["adapters", "mednafen", "launch.sh"]);
     let mame_launcher = repo_path(&root, &["adapters", "mame-pc98", "launch.sh"]);
     let flycast_launcher = repo_path(&root, &["adapters", "flycast", "launch.sh"]);
+    let desmume_launcher = repo_path(&root, &["adapters", "desmume-nds", "launch.sh"]);
     serde_json::json!({
         "repo_root": root.display().to_string(),
         "repo_root_env": "EMUCAP_REPO_ROOT",
@@ -354,6 +379,11 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "flycast", "build.sh"]),
                 "launch": abs_path_json(&root, &["adapters", "flycast", "launch.sh"]),
+            },
+            "desmume_nds": {
+                "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "desmume-nds", "build.sh"]),
+                "launch": abs_path_json(&root, &["adapters", "desmume-nds", "launch.sh"]),
             }
         },
         "command_templates": port.map(|p| serde_json::json!({
@@ -362,12 +392,14 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "legacy_mednafen": legacy_command_template(&mednafen_launcher, format!("{} <disc_or_rom> {p} [name] [force_module]", mednafen_launcher.display())),
             "legacy_mame_pc98": legacy_command_template(&mame_launcher, format!("{} <disk.hdi|disk.hdm|disk.d88> {p} [name] [machine]", mame_launcher.display())),
             "legacy_flycast": legacy_command_template(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
+            "legacy_desmume_nds": legacy_command_template(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
         })),
         "legacy_fallbacks": port.map(|p| serde_json::json!({
             "mesen2": legacy_fallback_entry(&mesen_launcher, legacy_mesen_command(&root, p)),
             "mednafen": legacy_fallback_entry(&mednafen_launcher, format!("{} <disc_or_rom> {p} [name] [force_module]", mednafen_launcher.display())),
             "mame_pc98": legacy_fallback_entry(&mame_launcher, format!("{} <disk.hdi|disk.hdm|disk.d88> {p} [name] [machine]", mame_launcher.display())),
             "flycast": legacy_fallback_entry(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
+            "desmume_nds": legacy_fallback_entry(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
         })),
     })
 }
@@ -388,6 +420,41 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "content": ["gg", "sms"],
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
+        },
+        {
+            "system": "gb",
+            "aliases": ["gameboy", "game-boy", "dmg"],
+            "adapter": "mesen2",
+            "content": ["gb"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
+        },
+        {
+            "system": "gbc",
+            "aliases": ["gbcolor", "gameboycolor", "game-boy-color", "cgb"],
+            "adapter": "mesen2",
+            "content": ["gbc"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
+            "notes": "GB and GBC share the emucap-gb.lua entry (Mesen gameboy console / SM83 CPU)."
+        },
+        {
+            "system": "gba",
+            "aliases": ["gameboyadvance", "game-boy-advance", "agb"],
+            "adapter": "mesen2",
+            "content": ["gba"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
+            "notes": "ARM7: disassemble/call_stack are honest-unsupported; memory/state/BP/save/input/screenshot are supported."
+        },
+        {
+            "system": "nes",
+            "aliases": ["famicom", "fc", "nintendo"],
+            "adapter": "mesen2",
+            "content": ["nes"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
+            "notes": "6502/2A03: disassemble/call_stack/break_on_reset supported; memory/state/BP/save/input/screenshot supported."
         },
         {
             "system": "saturn",
@@ -439,6 +506,14 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "content": ["gdi", "cdi", "chd", "cue"],
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.flycast.launch"
+        },
+        {
+            "system": "nds",
+            "aliases": ["ds", "nintendo-ds", "desmume"],
+            "adapter": "desmume_nds",
+            "content": ["nds"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.desmume_nds.launch"
         }
     ])
 }
@@ -544,5 +619,54 @@ pub(crate) fn enrich_link_status(
             obj.insert("emulator_build".into(), serde_json::json!(build));
         }
         obj.insert("emulator_identity".into(), redact_identity(identity));
+        // 소유 인스턴스 정리 정보: 이 포트의 pidfile에서 이 세션이 띄운 프로세스 PID를 재발견해준다. agent가
+        // launch 응답을 지나쳐도(다음 턴 등) 여기 pids만 kill하면 되므로, 자기 것을 못 찾아 broad pkill로
+        // 도망쳐 타 세션 에뮬레이터를 죽이는 사고를 막는다.
+        if let (Some(p), Some(emu_dir)) =
+            (port, identity.system.as_deref().and_then(emu_dir_for_system))
+        {
+            obj.insert("owned_instance".into(), owned_instance_json(emu_dir, p));
+        }
     }
+}
+
+/// `status.emulator_identity.system` → 런처가 pidfile을 쓰는 emu 홈 디렉터리 이름(pidfile이 사는 곳).
+/// 아직 런처가 per-port pidfile을 남기는 어댑터만 매핑한다(그 외는 None → owned_instance 생략).
+fn emu_dir_for_system(system: &str) -> Option<&'static str> {
+    match system {
+        "nds" => Some("desmume-nds"),
+        _ => None,
+    }
+}
+
+/// 이 포트 RUN_DIR의 `*.pid`를 읽어 소유 인스턴스 PID + 정리 규칙을 반환한다. best-effort(디렉터리/파일이
+/// 없으면 빈 pids). PID는 launch 시 기록된 값이라 프로세스가 이미 죽었을 수 있으니 kill 전 확인은 agent 몫.
+fn owned_instance_json(emu_dir: &str, port: u16) -> serde_json::Value {
+    let run_dir = emucap::launch::emu_home_dir(emu_dir, port);
+    let mut pids = Vec::new();
+    let mut pidfiles = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&run_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("pid") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                pids.push(pid);
+                pidfiles.push(path.display().to_string());
+            }
+        }
+    }
+    pids.sort_unstable();
+    serde_json::json!({
+        "run_dir": run_dir.display().to_string(),
+        "pids": pids,
+        "pidfiles": pidfiles,
+        "cleanup": "이 인스턴스를 멈추려면 여기 pids만 종료하라(포트별 pidfile 기록) — Unix `kill <pid>`, \
+                    Windows `taskkill /PID <pid> /F`. 바이너리 이름/경로로 광역 종료(Unix `pkill -f`·`killall`· \
+                    `pkill -i`, Windows `taskkill /IM`)는 절대 금지 — 같은 바이너리를 쓰는 타 세션 에뮬레이터까지 죽인다.",
+    })
 }

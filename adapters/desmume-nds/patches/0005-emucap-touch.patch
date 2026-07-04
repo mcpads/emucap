@@ -1,0 +1,112 @@
+--- i/desmume/src/NDSSystem.h	2026-07-04 03:42:20
++++ w/desmume/src/NDSSystem.h	2026-07-04 02:56:53
+@@ -428,6 +428,11 @@
+ // hold survives the frontend's per-frame update_keypad(0). See gdbstub.cpp.
+ void NDS_setEmucapInputOverride(u16 mask, int frames);
+ 
++// emucap: force a bottom-screen touch each frame (touch analogue of the button override). x 0-255,
++// y 0-191; touching=false lifts; frames < 0 holds until changed, > 0 auto-lifts. Driven by the GDB
++// stub's QEmucap,touch command so the hold survives the frontend's per-frame input update.
++void NDS_setEmucapTouchOverride(u16 x, u16 y, bool touching, int frames);
++
+ // get physical user input
+ // not including the results of autofire/etc.
+ // the effects of calls to "set physical user input" functions will be immediately reflected here though.
+--- i/desmume/src/NDSSystem.cpp	2026-07-04 03:42:20
++++ w/desmume/src/NDSSystem.cpp	2026-07-04 02:56:41
+@@ -3078,6 +3078,41 @@
+ 	{
+ 		if (--emucapInput.frames_remaining == 0)
+ 			emucapInput.active = false;
++	}
++}
++
++struct EmucapTouchOverride {
++	bool active;
++	int frames_remaining; // <0 = hold until changed; >0 = release after this many frames
++	u16 x, y;             // bottom-screen coords (x 0-255, y 0-191)
++	bool touching;        // true = press at (x,y); false = lift
++};
++static EmucapTouchOverride emucapTouch = {};
++
++void NDS_setEmucapTouchOverride(u16 x, u16 y, bool touching, int frames)
++{
++	emucapTouch.x = x;
++	emucapTouch.y = y;
++	emucapTouch.touching = touching;
++	emucapTouch.frames_remaining = frames;
++	// A lift with no timed hold means "stop overriding the touch".
++	emucapTouch.active = touching || (frames > 0);
++}
++
++static void emucapApplyTouchOverride(UserTouch& t)
++{
++	if (!emucapTouch.active)
++		return;
++	t.isTouch = emucapTouch.touching;
++	if (emucapTouch.touching)
++	{
++		t.touchX = emucapTouch.x;
++		t.touchY = emucapTouch.y;
++	}
++	if (emucapTouch.frames_remaining > 0)
++	{
++		if (--emucapTouch.frames_remaining == 0)
++			emucapTouch.active = false;
+ 	}
+ }
+ 
+@@ -3089,6 +3124,7 @@
+ 
+ 	// emucap: fold in any forced input before autofire/antipodal processing runs
+ 	emucapApplyInputOverride(intermediateUserInput.buttons);
++	emucapApplyTouchOverride(intermediateUserInput.touch);
+ 
+ 	// processing is valid now
+ 	validToProcessInput = true;
+--- i/desmume/src/gdbstub/gdbstub.cpp	2026-07-04 03:42:20
++++ w/desmume/src/gdbstub/gdbstub.cpp	2026-07-04 02:58:11
+@@ -898,6 +898,30 @@
+     frames = (int)f;
+   }
+   NDS_setEmucapInputOverride((u16)(mask & 0x0fff), frames);
++}
++
++// "release" -> lift; else "<hexX>,<hexY>[,<hexframes>]" -> press the bottom screen at (x,y).
++// frames defaults to -1 (hold until changed); >0 auto-lifts after that many processed frames (a tap).
++static void emucap_apply_touch(const uint8_t *args) {
++  if (strncmp((const char *)args, "release", 7) == 0) {
++    NDS_setEmucapTouchOverride(0, 0, false, -1);
++    return;
++  }
++  const uint8_t *p = args;
++  uint32_t x = 0, y = 0;
++  hexToInt(&p, &x);
++  if (*p == ',') {
++    p++;
++    hexToInt(&p, &y);
++  }
++  int frames = -1;
++  if (*p == ',') {
++    p++;
++    uint32_t f = 0;
++    hexToInt(&p, &f);
++    frames = (int)f;
++  }
++  NDS_setEmucapTouchOverride((u16)(x & 0xFFFF), (u16)(y & 0xFFFF), true, frames);
+ }
+ 
+ /* Decode a hex-encoded byte string (e.g. "2f74...") into out, stopping at the
+@@ -1042,6 +1066,12 @@
+     // emucap input: QEmucap,input:<hexmask>[,<hexframes>] -> force pad buttons.
+     if ( strncmp( (const char *)packet, "QEmucap,input:", 14) == 0) {
+       emucap_apply_input( &packet[14]);
++      strcpy( (char *)out_ptr, "OK");
++      send_size = 2;
++    }
++    // emucap touch: QEmucap,touch:release -> lift; QEmucap,touch:<hexX>,<hexY>[,<hexframes>] -> press.
++    else if ( strncmp( (const char *)packet, "QEmucap,touch:", 14) == 0) {
++      emucap_apply_touch( &packet[14]);
+       strcpy( (char *)out_ptr, "OK");
+       send_size = 2;
+     }

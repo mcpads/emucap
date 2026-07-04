@@ -62,12 +62,25 @@ pub fn find_pattern(
     Ok(ToolOutput::Json(link.call("find_pattern", params)?))
 }
 
-pub fn get_state(link: &mut dyn EmulatorLink, groups: &[String]) -> Result<ToolOutput, LinkError> {
-    let params = if groups.is_empty() {
+/// Insert an optional `cpu` selector into a params object. Single-core adapters ignore it;
+/// the NDS bridge routes it to the ARM9/ARM7 connection (`arm9`/`arm7`, or `both` for resume).
+fn with_cpu(params: &mut serde_json::Value, cpu: Option<&str>) {
+    if let (Some(cpu), Some(obj)) = (cpu, params.as_object_mut()) {
+        obj.insert("cpu".into(), json!(cpu));
+    }
+}
+
+pub fn get_state(
+    link: &mut dyn EmulatorLink,
+    groups: &[String],
+    cpu: Option<&str>,
+) -> Result<ToolOutput, LinkError> {
+    let mut params = if groups.is_empty() {
         json!({})
     } else {
         json!({ "groups": groups })
     };
+    with_cpu(&mut params, cpu);
     Ok(ToolOutput::Json(link.call("get_state", params)?))
 }
 
@@ -150,6 +163,33 @@ pub fn press_buttons(
 ) -> Result<ToolOutput, LinkError> {
     let params = json!({ "port": port, "buttons": buttons, "frames": frames });
     Ok(ToolOutput::Json(link.call("press_buttons", params)?))
+}
+
+/// 하단 터치스크린(256×192)을 (x,y)에서 터치한다 — release면 뗀다, frames>0이면 그만큼 누른 뒤 자동으로 뗀다(탭),
+/// 둘 다 없으면 다음 touch까지 hold. 어댑터에 그대로 포워딩(터치스크린 있는 시스템만 동작; status.methods 정본).
+pub fn touch(
+    link: &mut dyn EmulatorLink,
+    port: u64,
+    x: Option<u64>,
+    y: Option<u64>,
+    frames: Option<u64>,
+    release: bool,
+) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({ "port": port });
+    if release {
+        params["release"] = json!(true);
+    } else {
+        if let Some(x) = x {
+            params["x"] = json!(x);
+        }
+        if let Some(y) = y {
+            params["y"] = json!(y);
+        }
+        if let Some(f) = frames {
+            params["frames"] = json!(f);
+        }
+    }
+    Ok(ToolOutput::Json(link.call("touch", params)?))
 }
 
 /// 한 번의 frozen 탭: set_input→step(press_frames)→해제→해제에지. tap·tap_sequence 공용.
@@ -299,27 +339,38 @@ pub fn run_frames(link: &mut dyn EmulatorLink, n: u64) -> Result<ToolOutput, Lin
     ))
 }
 
-pub fn pause(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(link.call("pause", json!({}))?))
+pub fn pause(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({});
+    with_cpu(&mut params, cpu);
+    Ok(ToolOutput::Json(link.call("pause", params)?))
 }
 
 /// frozen에서 N프레임 진행 후 재정지.
-pub fn step(link: &mut dyn EmulatorLink, frames: u64) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(
-        link.call("step", json!({ "frames": frames }))?,
-    ))
+pub fn step(
+    link: &mut dyn EmulatorLink,
+    frames: u64,
+    cpu: Option<&str>,
+) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({ "frames": frames });
+    with_cpu(&mut params, cpu);
+    Ok(ToolOutput::Json(link.call("step", params)?))
 }
 
 /// frozen에서 N개 CPU 명령 진행 후 재정지(derail 직전을 1명령씩 좁히기). 프레임 step과 분리된 도구.
-pub fn step_instructions(link: &mut dyn EmulatorLink, count: u64) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(link.call(
-        "step",
-        json!({ "frames": count, "unit": "instructions" }),
-    )?))
+pub fn step_instructions(
+    link: &mut dyn EmulatorLink,
+    count: u64,
+    cpu: Option<&str>,
+) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({ "frames": count, "unit": "instructions" });
+    with_cpu(&mut params, cpu);
+    Ok(ToolOutput::Json(link.call("step", params)?))
 }
 
-pub fn resume(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(link.call("resume", json!({}))?))
+pub fn resume(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({});
+    with_cpu(&mut params, cpu);
+    Ok(ToolOutput::Json(link.call("resume", params)?))
 }
 
 pub fn reset(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {

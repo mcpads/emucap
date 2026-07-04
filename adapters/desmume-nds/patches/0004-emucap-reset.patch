@@ -1,0 +1,17 @@
+diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
+index e58ff4f..ff71706 100644
+--- i/desmume/src/gdbstub/gdbstub.cpp
++++ w/desmume/src/gdbstub/gdbstub.cpp
+@@ -1062,6 +1062,12 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       strcpy( (char *)out_ptr, ok ? "OK" : "E01");
+       send_size = ok ? 2 : 3;
+     }
++    // emucap reset: QEmucap,reset -> NDS_Reset (power-cycle; re-runs HLE direct-boot).
++    else if ( strncmp( (const char *)packet, "QEmucap,reset", 13) == 0) {
++      NDS_Reset();
++      strcpy( (char *)out_ptr, "OK");
++      send_size = 2;
++    }
+     break;
+ 
+   case 'c':

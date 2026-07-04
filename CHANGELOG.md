@@ -2,6 +2,28 @@
 
 Beta software — interfaces may still change.
 
+## 0.3.0
+
+### Added
+- **Nintendo DS** adapter, via a headless DeSmuME fork with an ARM9/ARM7 GDB bridge: memory, registers, screenshot, buttons, touchscreen (`touch`), save/load state, disassemble, call_stack, reset, execution breakpoints, and an optional window for human-in-the-loop play (`display: true`). Build with `adapters/desmume-nds/build.sh`.
+- **Game Boy, Game Boy Color, Game Boy Advance, and NES** on the Mesen2 adapter, with a GBA ARM7 disassembler.
+- Game Gear / Master System VRAM write breakpoints.
+- `owned_instance` in `status` — the pids and pidfiles this session started, for scoped cleanup.
+- Optional `cpu` argument on `get_state` / `resume` / `pause` / `step` for multi-core backends (NDS ARM9/ARM7).
+- `EMUCAP_DEADMAN_MS<=0` holds a freeze indefinitely.
+
+### Changed
+- Tool argument descriptions defer per-system specifics to `status` and each adapter's README.
+- The DeSmuME fork build is pinned to a known-good commit.
+
+### Fixed
+- Mesen2 `get_state` after a freeze reports the frozen instant, not a drifted one.
+- NDS screenshots and memory reads taken while the game runs are no longer stale or corrupted.
+- NDS `reset` leaves the game paused; a failed launch no longer leaves a stray emulator process.
+- NDS `step_instructions` steps by instruction, and `poll_events` reports breakpoint hits without noise.
+- NDS timed `press_buttons` / `touch` require a running game.
+- NDS screenshot and disassemble no longer fail intermittently, and parallel NDS sessions no longer collide on a GDB port.
+
 ## 0.2.0
 
 ### Added

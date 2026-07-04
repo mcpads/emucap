@@ -17,7 +17,7 @@ SYS = {
   reset_vector = 0xFFFC,   -- $00:FFFC(뱅크0)
   bank_mirror = true,      -- snesMemory $2000-$7FFF의 $00/$80 뱅크 미러 BP 자동등록
   dma_supported = true,    -- SNES MDMAEN($420B) DMA 컨트롤러 → dma kind BP 지원
-  bp_bus_base = {},        -- read/write BP 주소 변환 맵(§0): SNES는 snesWorkRam low-RAM==버스 미러라 identity(빈 맵=변환 없음)
+  bp_bus_base = {},        -- read/write BP 주소 변환 맵: SNES는 snesWorkRam low-RAM==버스 미러라 identity(빈 맵=변환 없음)
   dump_regions = {
     { name = "wram", mt = "snesWorkRam",   base = 8257536, size = 0x20000 },  -- 128KB @ $7E0000
     { name = "vram", mt = "snesVideoRam",  base = 0,       size = 0x10000 },  -- 64KB
@@ -219,6 +219,11 @@ end
 -- 코어는 require로 로드한다(Mesen 샌드박스에서 require는 검증됨 — socket.core). package.path에
 -- 어댑터 디렉터리를 얹어 emucap-core.lua를 찾게 한다.
 local dir = os.getenv("EMUCAP_ADAPTER_DIR")
-assert(dir and dir ~= "", "emucap-snes: EMUCAP_ADAPTER_DIR 미설정 — launch가 전달해야 한다")
+if not dir or dir == "" then
+  -- 폴백: env가 없으면(수동 Script Window 로드 등) 이 스크립트 파일 경로에서 어댑터 디렉터리를 도출한다.
+  local src = debug.getinfo(1, "S").source
+  if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
+end
+assert(dir and dir ~= "", "emucap-snes: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

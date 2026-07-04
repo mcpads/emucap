@@ -68,7 +68,7 @@ mod tests;
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct ReadMemoryArgs {
-    /// 메모리 타입 식별자. SNES/MD/PCE/PSX/Saturn/PC-98별 이름은 서버 instructions와 status.memory_types 참조.
+    /// 메모리 타입 식별자. 유효한 이름은 연결된 시스템마다 다르니 `status.memory_types`(정본)를 본다(per-system 이름·의미는 각 `adapters/*/README.md`).
     pub(crate) memory_type: String,
     /// 시작 주소(10진 또는 '0x'/'$' 16진, 해당 메모리 타입의 오프셋)
     pub(crate) address: Num,
@@ -94,7 +94,7 @@ pub(crate) struct ProbeArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct DisassembleArgs {
-    /// 디스어셈블 시작 주소(10진 또는 '0x'/'$' 16진). SNES=65816, MD=68000, Saturn=SH-2, PSX=MIPS R3000A, PCE=HuC6280. 반환 [{addr,text,bytes}].
+    /// 디스어셈블 시작 주소(10진 또는 '0x'/'$' 16진). CPU/ISA와 disassemble 지원 여부는 연결된 시스템에 따르며 `status.methods`·어댑터 README가 정본. 반환 [{addr,text,bytes}].
     pub(crate) address: Num,
     /// 디코드할 명령 개수(기본 8, 최대 256)
     #[serde(default = "default_disas_count")]
@@ -156,6 +156,25 @@ pub(crate) struct PressArgs {
     #[serde(deserialize_with = "deser_input_frames")]
     pub(crate) frames: u64,
 }
+
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct TouchArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+    /// 하단 터치스크린 X(0-255). release가 아니면 필수.
+    #[serde(default)]
+    pub(crate) x: Option<u64>,
+    /// 하단 터치스크린 Y(0-191). release가 아니면 필수.
+    #[serde(default)]
+    pub(crate) y: Option<u64>,
+    /// 누른 채 진행할 프레임 수(탭); 생략 시 다음 touch까지 hold. 즉시 반환(입력 오버라이드 설정만).
+    #[serde(default)]
+    pub(crate) frames: Option<u64>,
+    /// true면 터치를 뗀다(x,y 무시).
+    #[serde(default)]
+    pub(crate) release: bool,
+}
+
 fn two() -> u64 {
     2
 }
@@ -265,12 +284,25 @@ fn one() -> u64 {
 pub(crate) struct StepArgs {
     #[serde(default = "one", deserialize_with = "deser_frame_count")]
     pub(crate) frames: u64,
+    /// 멀티코어 백엔드에서 대상 CPU(예: NDS `arm9`/`arm7`). 생략 시 기본 코어. 단일코어는 무시.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct StepInstructionsArgs {
     /// 진행할 CPU 명령 수
     #[serde(default = "one", deserialize_with = "deser_frame_count")]
     pub(crate) count: u64,
+    /// 멀티코어 백엔드에서 대상 CPU(예: NDS `arm9`/`arm7`). 생략 시 기본 코어. 단일코어는 무시.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
+}
+/// pause/resume용 — 대상 CPU만.
+#[derive(Deserialize, JsonSchema)]
+pub(crate) struct CpuArgs {
+    /// 멀티코어 백엔드에서 대상 CPU. NDS: `arm9`(기본)·`arm7`·`both`(resume 전용, 레이스 프리런). 단일코어는 무시.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct BreakpointArgs {
@@ -288,7 +320,7 @@ pub(crate) struct BreakpointArgs {
     pub(crate) pause_on_hit: bool,
     #[serde(default)]
     pub(crate) auto_savestate: bool,
-    /// 선택 pc 조건(read/write/exec): 이 접근을 일으킨 명령의 pc가 [pc_min,pc_max]일 때만 break(정상 push 등 노이즈 제거). SNES는 24비트 CPU버스 PC, MD/Mednafen은 68000 PC, PC-98은 i386 cpu.pc/MAME debugger pc 기준. pc_max와 함께. (kind=dma에선 vram_addr 범위 필터로 재사용 — vmin/vmax)
+    /// 선택 pc 조건(read/write/exec): 이 접근을 일으킨 명령의 pc가 [pc_min,pc_max]일 때만 break(정상 push 등 노이즈 제거). pc의 폭·의미는 연결된 시스템 CPU에 따르며 get_state의 `cpu.pc`와 같은 기준(어댑터 README가 정본). pc_max와 함께. (kind=dma에선 vram_addr 범위 필터로 재사용 — vmin/vmax)
     #[serde(default)]
     pub(crate) pc_min: Option<Num>,
     /// 선택 pc 조건 상한(pc_min과 함께). kind=dma에선 vram_addr 상한
@@ -383,6 +415,9 @@ pub(crate) struct StateArgs {
     /// 필터할 그룹(생략 시 전체): cpu·ppu·dmaController·spc·internalRegisters·memoryManager 등
     #[serde(default)]
     pub(crate) groups: Vec<String>,
+    /// 멀티코어 백엔드에서 대상 CPU(예: NDS `arm9`/`arm7`). 생략 시 기본 코어. 단일코어는 무시.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -457,6 +492,11 @@ pub(crate) struct LaunchArgs {
     /// 연결 이름(선택 — status.emulator_identity.name에 반영).
     #[serde(default)]
     pub(crate) name: Option<String>,
+    /// NDS 창(HITL 시청)을 띄운다 — desmume-cli를 EMUCAP_NDS_DISPLAY=1로 실행해 네이티브 창(Cocoa/Win32/
+    /// X11)을 열고, macOS는 창이 사는 동안 caffeinate로 디스플레이를 깨워둔다. 기본 false(헤드리스, GDB 브리지만).
+    /// NDS 외 어댑터는 무시한다.
+    #[serde(default)]
+    pub(crate) display: Option<bool>,
 }
 
 #[derive(Deserialize, JsonSchema)]

@@ -38,7 +38,12 @@ if [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
 fi
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/runtime-env.sh"
-LUA="$HERE/emucap-snes.lua"
+# 시스템별 엔트리(SNES/GG/GB/GBC/GBA는 각자 SYS config 후 emucap-core.lua를 require). Rust launch 도구가
+# 시스템으로 골라 넘기고, 이 legacy launcher는 EMUCAP_MESEN_LUA로 엔트리를 지정할 수 있다(기본 SNES).
+LUA="${EMUCAP_MESEN_LUA:-$HERE/emucap-snes.lua}"
+# 엔트리가 emucap-core.lua를 찾는 어댑터 디렉터리. export해야 direct 모드(python3 os.environ.copy /
+# nohup)가 상속한다 — open 모드는 아래 --env로도 전달한다.
+export EMUCAP_ADAPTER_DIR="$HERE"
 # 빌드 hash: 스크립트 어댑터(Lua)는 로드시가 곧 버전이라 launch 시점 emucap git hash를 넘긴다 — hello/
 # status.emulator_build로 노출해 사용자가 git HEAD와 대조한다. emucap-core.lua(+엔트리)가 HEAD와 다르면 -dirty.
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
@@ -376,6 +381,21 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
   echo "  emucap_mesen_home=${EMUCAP_MESEN_HOME:-<none>}"
   echo "  launch_mode=${EMUCAP_MESEN_LAUNCH_MODE:-auto}"
 } >>"$LOG"
+
+# GBA는 Mesen이 실 BIOS(gba_bios.bin)를 데이터폴더의 Firmware에서 찾는다. 없으면 GUI 창을 띄워 사람에게
+# 물어 헤드리스·에이전트-주도 모델을 깬다. 포터블 .app 재생성이 Firmware를 비우므로 재생성 후·launch 전에
+# 여기서 provision한다. 출처는 설정 계약(하드코딩된 사용자 경로 없음): EMUCAP_GBA_BIOS(명시) →
+# emucap 소유 firmware 디렉터리(비커밋). PSX BIOS와 같은 방식. BIOS가 없으면 로그로 경고만 한다.
+if [ "$(basename "$LUA")" = "emucap-gba.lua" ] && [ -n "${MESEN_APP_BUNDLE:-}" ]; then
+  GBA_BIOS="${EMUCAP_GBA_BIOS:-$EMUCAP_MESEN_BASE/firmware/gba_bios.bin}"
+  FW_DIR="$MESEN_APP_BUNDLE/Contents/MacOS/Firmware"
+  if [ -f "$GBA_BIOS" ]; then
+    mkdir -p "$FW_DIR" && cp "$GBA_BIOS" "$FW_DIR/gba_bios.bin"
+    echo "  gba_bios=$GBA_BIOS → Firmware/gba_bios.bin" >>"$LOG"
+  else
+    echo "  gba_bios=<없음: $GBA_BIOS — Mesen이 펌웨어 창을 띄운다. EMUCAP_GBA_BIOS로 지정하거나 그 경로에 두라>" >>"$LOG"
+  fi
+fi
 
 LAUNCH_MODE="${EMUCAP_MESEN_LAUNCH_MODE:-auto}"
 if [ "$LAUNCH_MODE" = "auto" ]; then

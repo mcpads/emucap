@@ -3,8 +3,13 @@
 -- reset_vector/bank_mirror/dump_regions/region_sizes를 담는다.
 assert(SYS and SYS.buttons and SYS.cpu_type and SYS.default_memtype,
   "emucap-core: 전역 SYS config가 없다 — 엔트리 스크립트에서 SYS를 설정하고 dofile 하라")
-assert(SYS.disassemble and SYS.op_is_call and SYS.op_is_return and SYS.snapshot_regs,
-  "emucap-core: SYS에 ISA 구현이 없다 — 엔트리가 disassemble/op_is_call/op_is_return/snapshot_regs를 설정해야 한다")
+assert(SYS.snapshot_regs,
+  "emucap-core: SYS.snapshot_regs가 없다 — 엔트리가 snapshot_regs를 설정해야 한다")
+-- disassemble/op_is_call/op_is_return은 optional이다. Lua ISA 디코더와 SP기반 콜스택 모델이 맞는
+-- 시스템(SNES=65816·GG=Z80·GB=SM83)만 제공한다. ARM(GBA)처럼 디코더가 크고 콜스택이 LR기반이라 코어의
+-- SP모델과 안 맞는 ISA는 이 셋을 비우면 disassemble·call_stack이 미구현(TODO — 고칠 것)로 광고·거부된다.
+local HAS_DISASM = SYS.disassemble ~= nil
+local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
 
 -- emucap Mesen2 라이브 클라이언트 (능동 제어)
 -- 필요 옵션: "Allow network access" + "Allow access to I/O and OS functions".
@@ -21,7 +26,8 @@ local HOST = "127.0.0.1"
 local PORT = tonumber(os.getenv("EMUCAP_PORT") or "") or 47800
 local PROTOCOL_VERSION = 1
 -- 데드맨: 명령 없이 이만큼 지나면 자동 resume(에이전트 死 시 무한 frozen 방지). 휴먼-인-루프로 길게
--- 들여다볼 땐 짧을 수 있어 env로 조정(EMUCAP_DEADMAN_MS). hotkey freeze는 데드맨 면제(무기한 hold).
+-- 들여다볼 땐 짧을 수 있어 env로 조정(EMUCAP_DEADMAN_MS). **0 이하면 데드맨 비활성**(무기한 hold —
+-- hotkey freeze처럼; BP 히트 후 오래 검사할 때). hotkey freeze는 값과 무관하게 항상 데드맨 면제.
 local MAX_FREEZE_MS = tonumber(os.getenv("EMUCAP_DEADMAN_MS") or "") or 30000
 local FREEZE_BUDGET_MS = 800  -- 워치독(1초) 마진: 이 안에서 codeBreak 재무장
 -- freeze 중 연결끊김(서버 재시작//mcp 재연결) 시 freeze를 유지한 채 재접속을 시도해 장면을 보존한다
@@ -47,6 +53,11 @@ local prev_freeze_key = false  -- 라이징 에지 검출(running→freeze, froz
 local STATE = "running"       -- "running" | "frozen"
 local freeze_start_ms = nil   -- 마지막 명령 이후 경과 측정(데드맨). frozen 진입/명령 수신 시 갱신.
 local freeze_reason = "paused"
+-- frozen 중 get_state를 서빙하는 freeze 시점 스냅샷. freeze 진입 첫 codeBreak에서(트레드밀 step(1) 재무장 전)
+-- 한 번 캡처한다 — lazy(첫 get_state)로 잡으면 그 사이 재무장 step(1) 드리프트가 섞인다. live emu.getState()는
+-- 비싸 매 서빙마다 부르면 codeBreak 예산(FREEZE_BUDGET)을 넘겨 step(1) 드리프트를 유발하므로, frozen에선 이
+-- 스냅샷에서 서빙한다. 명시적 step/resume에서만 무효화 → baseline 트레드밀 step(1)엔 유지돼 안정 레퍼런스가 된다.
+local freeze_snapshot = nil
 local pending_step_id = nil   -- step(n) 완료 응답 대기
 local step_remaining = 0       -- step(n)의 남은 단위(청크로 나눠 진행)
 local step_unit = "frames"    -- "frames"(ppuFrame) | "instructions"(stepType.step)
@@ -66,6 +77,12 @@ local reset_bp = nil           -- break_on_reset: 리셋 핸들러 exec BP { ref
 local EVENT_CAP = 256
 local READ_CAP = 0x20000       -- read_memory 상한(워치독 안전: 대량 읽기가 emu 스레드를 초단위 블록하지 않게 — find_pattern SCAN_CAP과 동형)
 local WATCH_REG_BUDGET = 1000000  -- watch_register 자동해제 기본 예산(명령 수): full-range exec+매명령 getState라 무기한이면 emu 스레드를 굶긴다. p.max_instructions로 조정.
+-- VRAM 재구성 BP 자동해제 예산: watch_register(매 명령 getState라 1M 필수)보다 크다. 매 명령 비용은 opcode
+-- 비교뿐이고 getState는 VRAM 쓰기마다만(빈도는 게임이 정함, ~수천/초 — 매 명령 flood 아님)이라 예산은 peak를
+-- 안 바꾸고 never-hit BP의 무장 지속시간만 정한다. 1M(≈1초)은 쓰기를 유발하기 전에 만료돼 무용하고, 과하게
+-- 크면 잊힌 never-hit BP가 오래 emu를 느리게 둔다. 100M ≈ ~2분 게임시간이 헌팅엔 넉넉하고 backstop도 적당하다.
+-- pause_on_hit면 첫 히트에서 freeze라 예산은 "대상이 영영 안 쓰이는" 경우에만 물린다. p.max_instructions로 조정.
+local VRAM_RECON_BUDGET = 100000000
 local events = {}              -- poll_events로 드레인
 local dropped = 0              -- 큐 상한 초과로 버린 이벤트 수
 local CPU = nil                -- emu.cpuType.snes (로드 시 설정)
@@ -340,20 +357,25 @@ end
 local handlers = {}
 
 function handlers.hello()
+  -- disassemble/call_stack은 ISA 구현(SYS.disassemble·op_is_call/op_is_return)이 있을 때만 advertise한다.
+  -- GBA처럼 미제공이면 methods에서 빠져 status.methods에 안 뜨고, 호출 시 handler가 unsupported로 거부한다.
+  local method_list = { "read_memory", "screenshot", "get_state", "get_rom_info", "status",
+                "write_memory", "set_input", "pause", "step", "resume",
+                "run_frames", "press_buttons", "save_state", "load_state",
+                "set_breakpoint", "watch_register", "clear_breakpoint", "list_breakpoints",
+                "clear_all_breakpoints", "poll_events", "set_trace", "get_trace",
+                "break_on_reset", "dump_memory", "find_pattern", "probe", "reset" }
+  if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
+  if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
   local result = {
     protocol_version = PROTOCOL_VERSION,
     system = SYS.system,
     adapter = "mesen2-live",
     build = os.getenv("EMUCAP_BUILD_HASH") or "unknown",  -- launch가 넘긴 emucap git hash(status.emulator_build)
-    methods = { "read_memory", "screenshot", "get_state", "get_rom_info", "status",
-                "write_memory", "set_input", "pause", "step", "resume",
-                "run_frames", "press_buttons", "save_state", "load_state",
-                "set_breakpoint", "watch_register", "clear_breakpoint", "list_breakpoints",
-                "clear_all_breakpoints", "poll_events", "set_trace", "get_trace", "call_stack",
-                "break_on_reset", "dump_memory", "find_pattern", "probe", "reset", "disassemble" },
+    methods = method_list,
   }
   -- memory_types: read_memory가 받는 memory_type = emu.memType의 키 전체. 정적 추측이 아니라 Mesen
-  -- API의 실제 메모리 타입을 런타임 열거해 완전·정확하게 advertise한다(능력 발견). MCP가
+  -- API의 실제 메모리 타입을 런타임 열거해 advertise한다(능력 발견). MCP가
   -- status.memory_types로 표면화. emu.memType이 없으면 생략(graceful — MCP가 빈 목록 처리).
   if emu and emu.memType then
     local mtypes = {}
@@ -419,10 +441,22 @@ function handlers.screenshot()
   return true, { png_base64 = base64(emu.takeScreenshot()) }
 end
 
+-- frozen이면 freeze 시점 스냅샷에서, running이면 live로 상태를 준다. 스냅샷은 freeze 진입 첫 codeBreak에서
+-- 잡히므로(위 freeze_snapshot 주석) 드리프트 없는 freeze 지점 상태다. 아래 `if not freeze_snapshot`은 방어적
+-- fallback(어떤 이유로 codeBreak 전에 get_state가 오면) — 정상 경로에선 이미 채워져 있다.
+local function frozen_state()
+  if STATE == "frozen" then
+    if not freeze_snapshot then freeze_snapshot = emu.getState() end
+    return freeze_snapshot
+  end
+  return emu.getState()
+end
+
 -- get_state는 전 상태(레지스터·DMA·PPU·SPC 등 수백 필드)를 돌려준다. groups를 주면 키의
--- 그룹 prefix(첫 "." 앞)로 걸러 토큰 비용을 줄인다. 예: groups=["cpu","ppu"].
+-- 그룹 prefix(첫 "." 앞)로 걸러 토큰 비용을 줄인다. 예: groups=["cpu","ppu"]. frozen이면 freeze 시점
+-- 스냅샷을 서빙해 get_state發 드리프트를 없앤다(baseline 트레드밀 드리프트는 남음 — 진짜 0-드리프트는 fork 필요).
 function handlers.get_state(p)
-  local st = emu.getState()
+  local st = frozen_state()
   if not (p.groups and #p.groups > 0) then
     return true, { state = st }
   end
@@ -486,7 +520,7 @@ local function tick_deferred()
   end
 end
 
--- 백스톱 B2: freeze(브레이크포인트 등)가 진행 중 지연 명령(press/run_frames/probe)을 가로채면
+-- 백스톱: freeze(브레이크포인트 등)가 진행 중 지연 명령(press/run_frames/probe)을 가로채면
 -- frozen 동안 tick_deferred가 안 돌아 응답이 막힌다. freeze 진입 시 여기서 마무리해 클라이언트
 -- 타임아웃을 막는다. press면 버튼을 뗀다.
 local function flush_deferred(status, reason, bp_id)
@@ -499,8 +533,14 @@ local function flush_deferred(status, reason, bp_id)
   deferred = nil
 end
 
+-- full-range exec 콜백(save/load/probe·watch_register·set_trace)의 상한. 대부분 24비트(0xFFFFFF)면 CPU 실행
+-- 주소를 다 덮지만, GBA(ARM7)는 카트ROM 0x08000000·EWRAM 0x02000000에서 실행하므로 24비트 콜백은 절대
+-- 발화하지 않는다(save_state가 영영 안 끝남). SYS.exec_range_max로 32비트 주소공간을 덮게 한다(SNES/GG/GB는
+-- 미설정 → 0xFFFFFF 그대로, 무영향).
+local EXEC_MAX = SYS.exec_range_max or 0xFFFFFF
+
 -- ── 세이브스테이트 (createSavestate/loadSavestate는 exec 콜백 컨텍스트 필요) ──
-local IO_LO, IO_HI = 0, 0xFFFFFF
+local IO_LO, IO_HI = 0, EXEC_MAX
 local function on_io_exec()
   if not pending_io then return end
   local op = pending_io
@@ -552,9 +592,12 @@ local function arm_probe(id, p)
 end
 
 -- ── 브레이크포인트 ───────────────────────────────────────────
--- 24비트 실행 주소(뱅크 포함). pc 필터·이벤트 기록에 쓴다.
+-- 실행 주소. pc 필터·이벤트 기록에 쓴다. SNES=뱅크(k)*0x10000+pc, GG/GB=pc(뱅크 없음).
+-- ARM(GBA)은 cpu.pc가 없고 PC가 r15이므로 폴백한다(없으면 이벤트 pc가 0으로 눕는다).
 local function full_pc(st)
-  return (st["cpu.k"] or 0) * 65536 + (st["cpu.pc"] or 0)
+  local pc = st["cpu.pc"]
+  if pc == nil then pc = st["cpu.r15"] end
+  return (st["cpu.k"] or 0) * 65536 + (pc or 0)
 end
 
 -- hex 허용 숫자 파서(snapshot 스펙 문자열 내 주소용): 0x/$/10진.
@@ -612,7 +655,7 @@ local function record_hit(bp, addr, value)
     events[#events + 1] = ev
   end
   if bp.pause_on_hit and STATE ~= "frozen" then
-    flush_deferred("interrupted", "breakpoint", bp.id)   -- 진행 중 지연 명령 마무리(B2)
+    flush_deferred("interrupted", "breakpoint", bp.id)   -- 진행 중 지연 명령 마무리
     STATE = "frozen"; freeze_reason = "breakpoint"
     emu.breakExecution()
   end
@@ -644,11 +687,11 @@ function handlers.watch_register(p)
   local bp = {
     id = id, kind = "reg", register = p.register or "sp",
     min = p.min or 0, max = p.max or 0xffff, pause_on_hit = p.pause_on_hit,
-    cbtype = emu.callbackType.exec, start = 0, end_ = 0xffffff,
+    cbtype = emu.callbackType.exec, start = 0, end_ = EXEC_MAX,
     seen = 0, budget = budget,
   }
   bp.ref = emu.addMemoryCallback(function(addr, value)
-    -- 플러드 가드(exemplar): 버퍼가 차고 비-pausing이면 매-명령 getState 전에 즉시 드롭.
+    -- 플러드 가드: 버퍼가 차고 비-pausing이면 매-명령 getState 전에 즉시 드롭.
     if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
     -- 자동 해제: full-range exec가 매 명령 getState라, 레지스터가 범위 안이면 이벤트도 안 쌓여 위 가드가
     -- 안 걸린 채 무기한 emu 스레드를 굶긴다. 명령 예산을 넘으면 스스로 콜백을 떼고(hunting 전용)
@@ -685,7 +728,7 @@ end
 -- 그대로 쓴다. value_len>1이면 저바이트=접근 바이트, 상위는 addr+i에서 little-endian으로 읽는다(SNES).
 local function access_value(bp, addr, value)
   if (bp.value_len or 1) <= 1 then return value end
-  -- 상위바이트 읽기용 memory_type. §0에서 버스주소로 변환한 BP는 addr이 버스주소이므로 RAM-상대
+  -- 상위바이트 읽기용 memory_type. 버스주소로 변환한 BP는 addr이 버스주소이므로 RAM-상대
   -- memory_type(예 smsWorkRam)으로 addr+i를 읽으면 범위 밖을 읽는다 — 버스 memtype으로 읽어야 한다.
   local mt = (bp.bus_translated and emu.memType[SYS.default_memtype])
     or emu.memType[bp.memory_type] or emu.memType[SYS.default_memtype]
@@ -723,6 +766,41 @@ local function dma_snapshot(st, mdmaen)
   return chans
 end
 
+-- VRAM write BP 재구성: memtype이 CPU 버스에 없어(SMS/GG VDP는 데이터포트 OUT) Mesen memory 콜백이 못 잡는
+-- 시스템에서, full-range exec 콜백으로 데이터포트 write를 감지해 VRAM 주소 BP를 지원한다. 감지·주소는
+-- SYS.vram_write_target(pc,opcode)가 준다(ISA별). per-instruction이라 watch_register처럼 budget으로 자동해제한다
+-- (hunting 전용 — 끝나면 clear). pause_on_hit면 히트에서 freeze. value 필터(value_len=1)는 데이터바이트에 적용.
+local function setup_vram_recon_bp(bp, budget)
+  bp.is_vram_recon = true
+  bp.cbtype = emu.callbackType.exec
+  bp.recon_lo, bp.recon_hi = 0, EXEC_MAX
+  bp.seen, bp.budget = 0, budget
+  bp.ref = emu.addMemoryCallback(function(pc, opcode)
+    -- freeze 중(Mesen 1초 워치독 회피용 codeBreak 재무장의 step 드리프트)엔 아무 것도 안 한다: per-instruction
+    -- 콜백이 드리프트 명령에 재히트하거나 예산을 태우지 않게. BP는 무장을 유지하고 resume 때 다시 작동한다.
+    if STATE == "frozen" then return end
+    if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
+    bp.seen = bp.seen + 1
+    if bp.seen > bp.budget then            -- 예산 초과: 자동해제(무기한 per-instruction으로 emu 스레드 굶김 방지)
+      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
+      breakpoints[bp.id] = nil
+      if #events < EVENT_CAP then
+        events[#events + 1] = { type = "watch_disarmed", breakpoint_id = bp.id, kind = "write",
+          reason = "instruction_budget", instructions = bp.budget, frame = frame }
+      else dropped = dropped + 1 end
+      return
+    end
+    local va, data = SYS.vram_write_target(pc, opcode)
+    if va and va >= bp.start and va <= bp.end_ then
+      if bp.has_value then
+        local v = access_value(bp, va, data)
+        if band(v, bp.value_mask) ~= band(bp.value, bp.value_mask) then return end
+      end
+      record_hit(bp, va, data)
+    end
+  end, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
+end
+
 function handlers.set_breakpoint(p)
   local id = next_bp_id; next_bp_id = next_bp_id + 1
   -- NMI/IRQ: 메모리 접근이 아니라 이벤트(인터럽트 진입). exec BP가 못 잡는 NMI/VBlank 컨텍스트를
@@ -731,7 +809,7 @@ function handlers.set_breakpoint(p)
     local evtype = (p.kind == "nmi") and emu.eventType.nmi or emu.eventType.irq
     local bp = { id = id, kind = p.kind, is_event = true, evtype = evtype, pause_on_hit = p.pause_on_hit }
     bp.ref = emu.addEventCallback(function()
-      -- 플러드 가드(exemplar): 스캔라인 IRQ는 프레임당 ~224회다. 버퍼가 차고 비-pausing이면 비싼 getState
+      -- 플러드 가드: 스캔라인 IRQ는 프레임당 ~224회다. 버퍼가 차고 비-pausing이면 비싼 getState
       -- 전에 즉시 드롭. pausing BP는 첫 히트에서 freeze해 스스로 멈추므로 예외.
       if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
       local st = emu.getState()
@@ -750,7 +828,7 @@ function handlers.set_breakpoint(p)
   -- 기본은 freeze 안 함(pause_on_hit=true면 freeze). poll_events로 "이번 프레임 DMA"를 드레인.
   if p.kind == "dma" then
     -- 능력 게이트: dma BP는 SNES MDMAEN($420B) 컨트롤러 전용이다. 그런 DMA가 없는 시스템(GG/Z80 등)은
-    -- honest unsupported를 낸다(break_on_reset의 `if not SYS.reset_vector` 패턴 — garbage 대신 명시적 에러).
+    -- 미구현(TODO — 고칠 것)를 낸다(break_on_reset의 `if not SYS.reset_vector` 패턴 — garbage 대신 명시적 에러).
     if not SYS.dma_supported then return false, "unsupported", "dma breakpoints not supported for " .. SYS.system end
     -- $420B(MDMAEN)는 banks $00-$3F·$80-$BF에 미러된다. 게임이 어느 뱅크에서 STA $420B 하든 잡으려면
     -- 미러를 등록해야 한다(Mesen 메모리 콜백은 뱅크별 절대주소 — bank $00 등록은 bank $80 접근을 못 잡음).
@@ -766,7 +844,7 @@ function handlers.set_breakpoint(p)
     local dest_filter, vmin, vmax = p.value, p.pc_min, p.pc_max
     local has_filter = (dest_filter ~= nil) or (vmin ~= nil) or (vmax ~= nil)
     local function on_dma(addr, value)
-      -- 플러드 가드(exemplar): DMA write는 프레임마다 발생한다. 버퍼가 차고 비-pausing이면 dma_snapshot의
+      -- 플러드 가드: DMA write는 프레임마다 발생한다. 버퍼가 차고 비-pausing이면 dma_snapshot의
       -- getState 전에 즉시 드롭.
       if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
       local st = emu.getState()          -- 히트당 1회: dma_snapshot과 pc 라벨이 같은 스냅샷을 공유(중복 getState 제거).
@@ -814,7 +892,7 @@ function handlers.set_breakpoint(p)
     has_value = has_value, value = p.value or 0,
     value_mask = p.value_mask or 0xFFFFFFFF, value_len = math.max(1, math.min(4, p.value_len or 1)),
   }
-  -- 주소 footgun 수정(§0): read/write BP는 CPU-버스 주소로 콜백을 단다 — addMemoryCallback은 memory_type을
+  -- 잘못된 BP 주소 등록 방지: read/write BP는 CPU-버스 주소로 콜백을 단다 — addMemoryCallback은 memory_type을
   -- 콜백 등록에 쓰지 않는다. 그래서 RAM memory_type의 상대 offset을 주면(예 GG smsWorkRam:0x0B) 버스 0x000B(ROM)에
   -- 등록돼 영원히 미발동한다(read_memory는 같은 인자로 WRAM offset을 읽어 조용한 불일치). SYS.bp_bus_base에
   -- 등록된 memory_type만 버스 base를 더해 실제 버스주소로 변환(smsWorkRam:0x0B → 0xC00B)해 발화하게 한다.
@@ -835,6 +913,24 @@ function handlers.set_breakpoint(p)
         bp.snapshot_specs[#bp.snapshot_specs + 1] =
           { mt = emu.memType[mt_s] or mt_s, mt_name = mt_s, addr = snum(addr_s) or 0, len = snum(len_s) or 1 }
       end
+    end
+  end
+  -- non-CPU-버스 memtype 라우팅(조용한 실패 제거): VDP VRAM/CRAM 등은 CPU 버스에 없어 Mesen memory
+  -- 콜백이 절대 안 잡는다(실측). SYS.non_bus_write_memtypes로 (a) 재구성 경로 또는 (b) 정직한 에러로 보낸다 —
+  -- 조용히 ROM 주소에 걸려 영영 미발동하던 것을 막는다. 선언 안 한 시스템(SNES 등)은 종전 CPU-버스 경로 그대로.
+  if (p.kind == "write" or p.kind == "read") and SYS.non_bus_write_memtypes then
+    local disp = SYS.non_bus_write_memtypes[bp.memory_type]
+    if disp == "vram_recon" then
+      if p.kind ~= "write" then
+        return false, "unsupported", bp.memory_type .. " read BP 재구성 미구현(write만) — status.methods 참조"
+      end
+      local budget = math.max(1, p.max_instructions or VRAM_RECON_BUDGET)
+      setup_vram_recon_bp(bp, budget)
+      breakpoints[id] = bp
+      return true, { id = id, mechanism = "vdp_write_reconstruction", max_instructions = budget }
+    elseif disp then
+      return false, "unsupported", bp.memory_type
+        .. "은 CPU 버스에 없어(VDP 포트 write) memory " .. p.kind .. " BP로 못 잡는다 — 재구성 미구현(TODO). status.methods 참조"
     end
   end
   local function on_access(addr, value)
@@ -868,6 +964,10 @@ function handlers.clear_breakpoint(p)
   if bp.is_event then emu.removeEventCallback(bp.ref, bp.evtype)
   elseif bp.is_dma then
     for _, d in ipairs(bp.dma_refs) do emu.removeMemoryCallback(d.ref, bp.cbtype, d.reg, d.reg, CPU) end
+  elseif bp.is_vram_recon then
+    emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
+  elseif bp.kind == "reg" then
+    emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.start, bp.end_, CPU)   -- watch_register: 단일 full-range exec ref(mirror 없음)
   else
     for _, m in ipairs(bp.mirror_refs) do emu.removeMemoryCallback(m.ref, bp.cbtype, m.lo, m.hi, CPU) end
   end
@@ -895,6 +995,10 @@ function handlers.clear_all_breakpoints()
     if bp.is_event then emu.removeEventCallback(bp.ref, bp.evtype)
     elseif bp.is_dma then
       for _, d in ipairs(bp.dma_refs) do emu.removeMemoryCallback(d.ref, bp.cbtype, d.reg, d.reg, CPU) end
+    elseif bp.is_vram_recon then
+      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.recon_lo, bp.recon_hi, CPU)
+    elseif bp.kind == "reg" then
+      emu.removeMemoryCallback(bp.ref, bp.cbtype, bp.start, bp.end_, CPU)
     else
       for _, m in ipairs(bp.mirror_refs) do emu.removeMemoryCallback(m.ref, bp.cbtype, m.lo, m.hi, CPU) end
     end
@@ -951,11 +1055,12 @@ local function trace_cb(addr, value)
   if type(op) ~= "number" then op = emu.read(addr, emu.memType[SYS.default_memtype], false) end
   trace_ring[(trace_idx % TRACE_CAP) + 1] = { pc = addr, op = op }
   trace_idx = trace_idx + 1
-  if SYS.op_is_call(op) then                           -- 호출 명령: 호출지 push(SP 정합 후)
+  -- 콜스택 shadow-track은 op_is_call/op_is_return이 있는 ISA만 갱신한다(GBA엔 없어 트레이스 링만 채운다).
+  if HAS_CALLSTACK and SYS.op_is_call(op) then         -- 호출 명령: 호출지 push(SP 정합 후)
     local sp = emu.getState()["cpu.sp"]
     reconcile_callstack(sp)                            -- 이미 리턴한 프레임(JMP-리턴 포함) 정리
     callstack[#callstack + 1] = { pc = addr, sp = sp }
-  elseif SYS.op_is_return(op) then                     -- 리턴 명령: pop
+  elseif HAS_CALLSTACK and SYS.op_is_return(op) then   -- 리턴 명령: pop
     if #callstack > 0 then table.remove(callstack) end
   end
 end
@@ -965,10 +1070,10 @@ function handlers.set_trace(p)
   local on = p.enabled and true or false
   if on and not trace_on then
     trace_ring = {}; trace_idx = 0; callstack = {}
-    trace_ref = emu.addMemoryCallback(trace_cb, emu.callbackType.exec, 0, 0xffffff, CPU)
+    trace_ref = emu.addMemoryCallback(trace_cb, emu.callbackType.exec, 0, EXEC_MAX, CPU)
     trace_on = true
   elseif not on and trace_on then
-    emu.removeMemoryCallback(trace_ref, emu.callbackType.exec, 0, 0xffffff, CPU)
+    emu.removeMemoryCallback(trace_ref, emu.callbackType.exec, 0, EXEC_MAX, CPU)
     trace_ref = nil; trace_on = false
   end
   return true, { tracing = trace_on }
@@ -989,6 +1094,9 @@ end
 -- 콜스택: 호출지(JSR/JSL의 pc) 리스트, 바깥→안(안쪽이 마지막). "어떻게 여기 왔나" 즉답.
 -- 조회 시 현재 SP로 한 번 더 정합(마지막 호출 이후 JMP로 리턴한 프레임 정리).
 function handlers.call_stack()
+  if not HAS_CALLSTACK then
+    return false, "unsupported", "call_stack not supported for " .. SYS.system .. " (no SP-based call-stack model for this ISA)"
+  end
   reconcile_callstack(emu.getState()["cpu.sp"])
   local out = {}
   for _, f in ipairs(callstack) do out[#out + 1] = f.pc end
@@ -1087,6 +1195,9 @@ end
 -- disassemble(address, count): 실행주소에서 count개 명령. 반환 [{addr,text,bytes}] — Mednafen과 같은 형태.
 -- read_byte(addr)=emu.read(addr, mt, false)(mt는 p.memory_type 또는 SYS.default_memtype).
 function handlers.disassemble(p)
+  if not HAS_DISASM then
+    return false, "unsupported", "disassemble not supported for " .. SYS.system .. " (no Lua ISA decoder for this system)"
+  end
   local addr = p.address or 0
   local count = math.max(1, math.min(p.count or 8, 256))
   local mt = emu.memType[p.memory_type] or emu.memType[SYS.default_memtype]
@@ -1175,6 +1286,8 @@ end
 -- step(n)을 청크(≤STEP_CHUNK)로 진행. codeBreak가 청크마다 재발화하므로
 -- startFrame이 step 중 뜨는지에 의존하지 않는다.
 local function do_step_chunk()
+  -- 명시적 step은 위치를 전진시키므로 freeze 스냅샷을 무효화 → 다음 get_state가 새 위치에서 재캡처.
+  freeze_snapshot = nil
   if step_unit == "instructions" then
     local chunk = math.min(step_remaining, INSTR_CHUNK)
     step_remaining = step_remaining - chunk
@@ -1207,7 +1320,14 @@ emu.addEventCallback(function()
   -- 데드맨은 "마지막 명령 이후" 경과로 잰다. start_ms를 콜백 진입마다 새로 잡으면
   -- 워치독 회피(FREEZE_BUDGET_MS)가 매번 codeBreak를 재무장하며 카운터를 리셋해 데드맨이
   -- 영영 발동하지 않는다. freeze 진입 시 한 번 잡고, 명령을 받을 때만 갱신한다.
-  if not freeze_start_ms then freeze_start_ms = os.clock() * 1000 end
+  if not freeze_start_ms then
+    freeze_start_ms = os.clock() * 1000
+    -- freeze 시점 스냅샷을 이 첫 codeBreak에서 잡는다 — 트레드밀 step(1) 재무장(아래 FREEZE_BUDGET 분기)과
+    -- 이번 콜백의 예산 타이머(cb_start_ms) 시작 전이라, CPU가 아직 freeze 지점에 있다. lazy(첫 get_state) 캡처면
+    -- freeze~첫 get_state 사이에 재무장 step(1)이 끼어 드리프트가 섞이므로 여기서 선캡처한다. getState는 한 번뿐이라
+    -- 예산에도 안 걸린다. step/resume에서만 무효화(freeze_snapshot=nil)해 baseline 트레드밀엔 유지된다.
+    if not freeze_snapshot then freeze_snapshot = emu.getState() end
+  end
   local cb_start_ms = os.clock() * 1000  -- 이번 콜백 진입(워치독 회피용 — 매 진입 리셋)
   local last_key_ms = 0                   -- freeze 핫키 폴 throttle(스핀이 빨라 매 반복 폴은 과함)
   while true do
@@ -1228,7 +1348,7 @@ emu.addEventCallback(function()
           prev_freeze_key = fk
           if #events < EVENT_CAP then events[#events + 1] = { type = "user_resume", reason = "hotkey", frame = frame }
           else dropped = dropped + 1 end
-          STATE = "running"; freeze_start_ms = nil; emu.resume(); return
+          STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return
         end
         prev_freeze_key = fk
       end
@@ -1238,29 +1358,30 @@ emu.addEventCallback(function()
       freeze_start_ms = os.clock() * 1000                     -- 활동 — 비활동 타이머 리셋
       freeze_disc_ms = nil                                    -- 응답 수신 = 재접속됨 → giveup 타이머 리셋
       local act = handle_in_freeze(line)
-      if act == "resume" then STATE = "running"; freeze_start_ms = nil; emu.resume(); return end
+      if act == "resume" then STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return end
       if act == "step" then do_step_chunk(); return end       -- 첫 청크 시작
     elseif not conn then
-      -- B3: 연결끊김(/mcp 재연결=서버 재시작 등)이면 freeze를 유지한 채 재접속을 시도한다(장면 보존 —
+      -- 연결끊김(/mcp 재연결=서버 재시작 등)이면 freeze를 유지한 채 재접속을 시도한다(장면 보존 —
       -- 즉시 resume하면 공들인 장면을 흘려버린다). 포트영속 서버는 같은 포트로 돌아오므로 connect가
       -- 성공하고 다음 poll_line이 hello를 받아 정상화된다.
       local now = os.clock() * 1000
       freeze_disc_ms = freeze_disc_ms or now
       -- giveup: 서버가 영영 안 오면 무한 frozen 방지로 resume(최후수단). 0이면 무기한 유지.
       if RECONNECT_GIVEUP_MS > 0 and now - freeze_disc_ms >= RECONNECT_GIVEUP_MS then
-        freeze_disc_ms = nil; STATE = "running"; freeze_start_ms = nil; emu.resume(); return
+        freeze_disc_ms = nil; STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return
       end
       -- 재접속은 0.5s마다만 시도(throttle) — 매 codeBreak connect 폭주 방지.
       if now - last_reconnect_ms >= 500 then last_reconnect_ms = now; connect() end
       -- 워치독: step(1)은 1명령 드리프트라, 매번이 아니라 FREEZE_BUDGET_MS 마진에서만 재무장(드리프트 1/800ms로
       -- 최소화 — 장면 보존이 목적). 그 전엔 return하지 않고 스핀을 계속(다음 반복서 poll_line이 hello를 받음).
       if now - cb_start_ms >= FREEZE_BUDGET_MS then emu.step(1, emu.stepType.step); return end
-    elseif freeze_reason ~= "hotkey" and (os.clock() * 1000 - freeze_start_ms) >= MAX_FREEZE_MS then
-      -- B4 데드맨(명령 없이 경과 → 자동 resume). 단 hotkey freeze는 제외: 사용자가 Home으로
+    elseif freeze_reason ~= "hotkey" and MAX_FREEZE_MS > 0 and (os.clock() * 1000 - freeze_start_ms) >= MAX_FREEZE_MS then
+      -- 데드맨(명령 없이 경과 → 자동 resume). 단 hotkey freeze는 제외: 사용자가 Home으로
       -- 직접 건 무기한 hold라, human-in-loop 검사 중 명령 간격이 30s를 넘으면 데드맨이 끼어들어
-      -- 데모가 진행돼버린다. hotkey는 같은 키 토글
-      -- resume·에이전트 resume·연결끊김(B3)으로만 끝낸다. (pause/breakpoint freeze는 종전대로 데드맨.)
-      STATE = "running"; freeze_start_ms = nil; emu.resume(); return
+      -- 데모가 진행돼버린다. `EMUCAP_DEADMAN_MS<=0`(MAX_FREEZE_MS<=0)이면 데드맨 전면 비활성 —
+      -- BP 히트 후 무기한 hold(에이전트 死 위험을 감수). hotkey는 같은 키 토글
+      -- resume·에이전트 resume·연결끊김으로만 끝낸다. (pause/breakpoint freeze는 데드맨 활성 시.)
+      STATE = "running"; freeze_start_ms = nil; freeze_snapshot = nil; emu.resume(); return
     elseif (os.clock() * 1000 - cb_start_ms) >= FREEZE_BUDGET_MS then
       -- 워치독 회피: codeBreak 재무장. step(1)은 1명령 전진(드리프트). breakExecution 재무장도
       -- 0드리프트가 아니라(서비스하려면 CPU가 조금 돌아야 함) step(1) 유지. 히트 순간의 정확한

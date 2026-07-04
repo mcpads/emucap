@@ -36,9 +36,11 @@ two checkboxes must be turned on once (Mesen remembers them — only needed the 
 ## 3. Load and run the adapter
 
 In the Script Window → **File → Open** (Ctrl+O) → choose `adapters/mesen2/emucap-snes.lua` (live agent
-control for SNES; `emucap-sms.lua` for Game Gear / Master System) or `emucap.lua` (retrospective-bundle
-capture). Both live entries share `adapters/mesen2/emucap-core.lua`; `emucap-snes.lua` adds the 65816
-decoder, `emucap-sms.lua` the Z80 one, and the entry you load selects the system. It runs automatically;
+control for SNES; `emucap-sms.lua` for Game Gear / Master System, `emucap-gb.lua` for Game Boy / GBC,
+`emucap-gba.lua` for GBA, `emucap-nes.lua` for NES) or `emucap.lua` (retrospective-bundle capture). The
+live entries share `adapters/mesen2/emucap-core.lua`; `emucap-snes.lua` adds the 65816 decoder,
+`emucap-sms.lua` the Z80 one, `emucap-gb.lua` the SM83 one, `emucap-gba.lua` the ARM7 one, `emucap-nes.lua`
+the 6502 one, and the entry you load selects the system. It runs automatically;
 the log pane at the bottom should print `emucap: ROM 경로 = …` with no I/O warning. (To re-run manually:
 **Script → Run Script**, F5.)
 
@@ -81,7 +83,7 @@ combo) at the top of the script.
 
 ## Live MCP mode — agent operation
 
-A separate entry script `emucap-snes.lua` (SNES; `emucap-sms.lua` for Game Gear) lets the agent read and control the running game.
+A separate entry script `emucap-snes.lua` (SNES; `emucap-sms.lua` for Game Gear, `emucap-gb.lua` for Game Boy / GBC, `emucap-gba.lua` for GBA) lets the agent read and control the running game.
 The MCP server `emucap-mcp` comes up over stdio, and the Lua connects to that server's
 TCP port (default 47800).
 
@@ -120,6 +122,15 @@ For Game Gear (or Master System), launch a `.gg` / `.sms` file with `system: "ga
 
 ```json
 {"content_path": "/path/to/game.gg", "system": "gamegear", "name": "gg_session"}
+```
+
+For Game Boy / Game Boy Color, launch a `.gb` / `.gbc` file with `system: "gb"` (or `"gbc"`); for GBA,
+launch a `.gba` file with `system: "gba"`; for NES, launch a `.nes` file with `system: "nes"`:
+
+```json
+{"content_path": "/path/to/game.gb", "system": "gb", "name": "gb_session"}
+{"content_path": "/path/to/game.gba", "system": "gba", "name": "gba_session"}
+{"content_path": "/path/to/game.nes", "system": "nes", "name": "nes_session"}
 ```
 
 The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
@@ -193,6 +204,65 @@ identical to SNES — only the ISA, memory types, and button names differ:
 - **BP address conversion**: a read/write BP given `smsWorkRam` (an offset) fires on the CPU bus
   address (0xC000 + offset) after adapter translation; an exec BP takes `smsMemory` (a Z80 bus
   address). The Mesen-only `nmi` / `irq` / `dma` BP kinds apply here too.
+- **VRAM write BP (`smsVideoRam`)**: VDP VRAM is not on the Z80 bus (it is written through the data
+  port `OUT $BE`), so a plain memory-write callback never sees it. The adapter reconstructs it — a
+  `write` BP on `smsVideoRam` runs a per-instruction exec callback that detects the VDP data-port write
+  (`OUT $BE` and the `OTIR`/`OUTI`/`OUTD`/`OTDR` block forms, port in `C`) and reads the VDP
+  `addressReg`/`codeReg` to recover the destination VRAM word address (the response carries
+  `mechanism: "vdp_write_reconstruction"`). It is a hunting tool: per-instruction, with an instruction
+  budget + auto-disarm, so pair it with `pause_on_hit` and clear it when done. Write BPs on other
+  non-bus memtypes (`smsPaletteRam` / CRAM) return an `unsupported` error rather than silently
+  never firing (CRAM reconstruction is a TODO).
+
+### Game Boy / Game Boy Color — SM83
+
+Game Boy and Game Boy Color both run through the `emucap-gb.lua` entry (an SM83 core; Mesen handles GB
+and GBC as one `gameboy` core, the way `emucap-sms.lua` covers both Master System and Game Gear).
+Launch with `system: "gb"` (or `"gbc"`) and a `.gb` / `.gbc` content path. No BIOS is required. The
+tool set is identical to SNES — only the ISA, memory types, and button names differ:
+
+- **ISA**: SM83. `disassemble`, `call_stack`, and `get_state` are SM83 (SNES uses 65816).
+- **Buttons** (`status.input_buttons`): `a` / `b` / `start` / `select` / `up` / `down` / `left` / `right`.
+- **memory_types**: `gameboyMemory` (full SM83 bus), `gbWorkRam`, `gbVideoRam`, `gbCartRam`,
+  `gbHighRam`, `gbPrgRom`, `gbSpriteRam`, `gbBootRom`. `status.memory_types` is authoritative.
+
+### Game Boy Advance — ARM7
+
+GBA runs through the `emucap-gba.lua` entry (an ARM7TDMI core). Launch with `system: "gba"` and a
+`.gba` content path. The tool set matches SNES for memory / state / input / breakpoints / save-states,
+with these differences:
+
+- **BIOS required**: Mesen needs a real GBA BIOS (`gba_bios.bin`, not committed to the repo). Without
+  it Mesen shows a firmware prompt. The launcher provisions it headlessly from `EMUCAP_GBA_BIOS` (env)
+  or the emucap firmware directory (`<emucap-data>/firmware/gba_bios.bin`) — the same pattern as the
+  PSX BIOS. GB / GBC need no BIOS.
+- **Buttons** (`status.input_buttons`): `a` / `b` / `l` / `r` / `start` / `select` / `up` / `down` /
+  `left` / `right`.
+- **memory_types**: `gbaMemory` (full ARM7 bus), `gbaIntWorkRam`, `gbaExtWorkRam`, `gbaVideoRam`,
+  `gbaPaletteRam`, `gbaSpriteRam`, `gbaSaveRam`, `gbaPrgRom`, `gbaBootRom`. `status.memory_types` is
+  authoritative.
+- **`disassemble` supported; `call_stack` not implemented yet**: the ARM7 decoder is built and
+  live-verified (ARM and Thumb — e.g. the GBA BIOS IRQ dispatcher: `SUBS PC,LR,#4` / PUSH·POP /
+  scaled-register `LDR` / `MRS SPSR`), so `disassemble` works. `call_stack` is not built yet — ARM's
+  LR-based return does not fit the core's SP-based call-stack model, so it has to be written specially
+  (implementation TODO). Everything else (read/write_memory, get_state,
+  step / step_instructions, breakpoints, screenshot, input, save/load_state) works as on SNES.
+  `status.methods` is authoritative.
+
+### NES (Nintendo Entertainment System / Famicom) — 6502
+
+NES runs through the `emucap-nes.lua` entry (a 6502 / 2A03 core). Launch with `system: "nes"` (aliases
+`nintendo` / `famicom` / `fc`) and a `.nes` content path. No BIOS is required. The tool set is identical
+to SNES — only the ISA, memory types, and button names differ:
+
+- **ISA**: 6502 (2A03). `disassemble`, `call_stack`, and `get_state` are 6502 (SNES uses 65816). The
+  6502's `JSR` / `RTS` fit the core's SP-based call-stack model, so `call_stack` is supported.
+- **Buttons** (`status.input_buttons`): `a` / `b` / `start` / `select` / `up` / `down` / `left` /
+  `right` (standard NES controller; no X/Y/L/R). Aliases: `enter` / `return` → `start`.
+- **memory_types**: `nesMemory` (full 6502 bus / default), `nesInternalRam` (2KB @ $0000), `nesWorkRam`,
+  `nesSaveRam` (PRG-RAM @ $6000), `nesPrgRom`, `nesChrRom`, `nesChrRam`, `nesNametableRam`,
+  `nesPaletteRam`, `nesSpriteRam` (OAM), `nesSecondarySpriteRam`, `nesMapperRam`.
+  `status.memory_types` is authoritative.
 
 ### Verify the connection
 Call the `status` tool → `{"connected":true,"frame":…,"state":"running"}` means it is
@@ -201,7 +271,7 @@ seconds later. The MCP server binds lazily, so even before Mesen exists, tool ca
 gracefully with "not connected".
 
 ### (Alternative) Load via the GUI
-If Mesen is already up, you can also load `emucap-snes.lua` (or `emucap-sms.lua` for Game Gear) from Debug → Script Window.
+If Mesen is already up, you can also load `emucap-snes.lua` (or `emucap-sms.lua` for Game Gear, `emucap-gb.lua` for Game Boy / GBC, `emucap-gba.lua` for GBA, `emucap-nes.lua` for NES) from Debug → Script Window.
 
 Server and client match ports via `EMUCAP_PORT`.
 

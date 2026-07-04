@@ -290,6 +290,81 @@ fn infer_system_uses_megadrive_header_in_bin() {
 }
 
 #[test]
+fn infer_system_maps_gameboy_family_extensions() {
+    for (ext, expected) in [("gb", "gb"), ("gbc", "gbc"), ("gba", "gba")] {
+        let inferred = infer_system(Some(&format!("/tmp/game.{ext}")), None);
+        assert_eq!(inferred["system"], expected, "extension .{ext}");
+        assert_eq!(inferred["confidence"], "extension", "extension .{ext}");
+        assert_eq!(inferred["needs_user_input"], false, "extension .{ext}");
+    }
+}
+
+#[test]
+fn infer_system_maps_nes_extension() {
+    let inferred = infer_system(Some("/tmp/game.nes"), None);
+    assert_eq!(inferred["system"], "nes");
+    assert_eq!(inferred["confidence"], "extension");
+    assert_eq!(inferred["needs_user_input"], false);
+}
+
+#[test]
+fn normalize_system_accepts_nes_aliases() {
+    for alias in ["nes", "nintendo", "famicom", "fc"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "nes", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
+}
+
+#[test]
+fn launch_plan_for_nes_uses_mesen2_and_nes_entry() {
+    // NES routes to emucap-nes.lua (6502/2A03) on the mesen2 adapter with no force_module.
+    // Extension inference needs no binary/header evidence.
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/game.nes".into()),
+            system: None,
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "nes");
+    assert_eq!(plan["adapter"], "mesen2");
+    assert_eq!(plan["force_module"], serde_json::Value::Null);
+    assert_eq!(plan["preferred_launcher"]["tool"], "launch");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "nes");
+    assert_eq!(plan["button_hint"]["system"], "nes");
+}
+
+#[test]
+fn launch_plan_for_gameboy_family_uses_mesen2_and_gb_entry() {
+    // GB/GBC route to the shared emucap-gb.lua (SM83); GBA to emucap-gba.lua (ARM7). All three ride
+    // the mesen2 adapter with no force_module. Extension inference needs no binary/header evidence.
+    for (ext, expected) in [("gb", "gb"), ("gbc", "gbc"), ("gba", "gba")] {
+        let plan = make_launch_plan(
+            Some(47804),
+            &LaunchPlanArgs {
+                content_path: Some(format!("/tmp/game.{ext}")),
+                system: None,
+            },
+        );
+        assert_eq!(plan["ok"], true, ".{ext}");
+        assert_eq!(plan["system"], expected, ".{ext}");
+        assert_eq!(plan["adapter"], "mesen2", ".{ext}");
+        assert_eq!(plan["force_module"], serde_json::Value::Null, ".{ext}");
+        assert_eq!(plan["preferred_launcher"]["args"]["system"], expected, ".{ext}");
+        assert_eq!(plan["button_hint"]["system"], expected_button_system(expected), ".{ext}");
+    }
+}
+
+fn expected_button_system(system: &str) -> &'static str {
+    match system {
+        "gba" => "gba",
+        _ => "gb", // gb and gbc share the gb button hint
+    }
+}
+
+#[test]
 fn launch_plan_for_md_uses_mednafen_force_module() {
     let plan = make_launch_plan(
         Some(47804),
@@ -441,6 +516,75 @@ fn launch_plan_for_pc98_uses_repo_launcher_and_headless_contract() {
         .as_str()
         .unwrap()
         .contains("cbus:0"));
+}
+
+#[test]
+fn launch_plan_for_nds_uses_desmume_adapter_and_mcp_launcher() {
+    // .nds routes to the desmume_nds adapter (headless desmume-cli + NDS GDB bridge) with no
+    // force_module; extension inference needs no header evidence. Preferred launcher is the MCP
+    // launch tool; the legacy fallback points at adapters/desmume-nds/launch.sh.
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/game.nds".into()),
+            system: None,
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "nds");
+    assert_eq!(plan["adapter"], "desmume_nds");
+    assert_eq!(plan["force_module"], serde_json::Value::Null);
+    assert_eq!(plan["preferred_launcher"]["tool"], "launch");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "nds");
+    assert!(plan["legacy_fallback_launcher"]
+        .as_str()
+        .is_some_and(|p| path_ends_with_parts(p, &["adapters", "desmume-nds", "launch.sh"])));
+    assert!(plan["legacy_fallback_command"]
+        .as_str()
+        .unwrap()
+        .contains("nds_session"));
+    assert_eq!(
+        plan["legacy_fallback"]["available_on_this_host"],
+        serde_json::json!(!cfg!(windows))
+    );
+    assert_eq!(plan["button_hint"]["system"], "nds");
+}
+
+#[test]
+fn desmume_nds_precondition_reports_missing_binaries() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let old_desmume = std::env::var_os("EMUCAP_DESMUME_BIN");
+    let old_bridge = std::env::var_os("EMUCAP_NDS_BRIDGE_BIN");
+    // Point both overrides at nonexistent files so neither binary resolves regardless of the host.
+    std::env::set_var("EMUCAP_DESMUME_BIN", tmp.path().join("missing-desmume"));
+    std::env::set_var("EMUCAP_NDS_BRIDGE_BIN", tmp.path().join("missing-bridge"));
+
+    let precondition = desmume_nds_binary_precondition(tmp.path());
+
+    match old_desmume {
+        Some(v) => std::env::set_var("EMUCAP_DESMUME_BIN", v),
+        None => std::env::remove_var("EMUCAP_DESMUME_BIN"),
+    }
+    match old_bridge {
+        Some(v) => std::env::set_var("EMUCAP_NDS_BRIDGE_BIN", v),
+        None => std::env::remove_var("EMUCAP_NDS_BRIDGE_BIN"),
+    }
+
+    assert_eq!(precondition["available"], serde_json::json!(false));
+    assert_eq!(
+        precondition["desmume_cli_available"],
+        serde_json::json!(false)
+    );
+    assert_eq!(precondition["bridge_available"], serde_json::json!(false));
+
+    let paths = serde_json::json!({
+        "adapters": { "desmume_nds": { "build": "/repo/adapters/desmume-nds/build.sh" } }
+    });
+    let build_required = build_required_precondition("desmume_nds", &paths, &precondition);
+    assert!(build_required
+        .as_str()
+        .is_some_and(|s| s.contains("emucap-desmume-nds-bridge")));
 }
 
 #[test]
@@ -597,6 +741,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
             content_path2: None,
             system: Some("snes".into()),
             name: None,
+            display: None,
         },
     );
 
@@ -641,6 +786,7 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
             content_path2: None,
             system: Some("dc".into()),
             name: None,
+            display: None,
         },
     );
 
@@ -708,6 +854,7 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
             content_path2: None,
             system: Some("pc98".into()),
             name: None,
+            display: None,
         },
     );
 
@@ -753,6 +900,7 @@ fn launch_refuses_occupied_port_before_spawn() {
             content_path2: None,
             system: Some("md".into()),
             name: None,
+            display: None,
         },
     );
 
@@ -822,6 +970,7 @@ fn launch_refuses_when_this_session_already_connected() {
             content_path2: None,
             system: Some("pc98".into()),
             name: Some("dup-B".into()),
+            display: None,
         },
     );
 

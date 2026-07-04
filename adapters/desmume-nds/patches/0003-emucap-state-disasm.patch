@@ -1,0 +1,142 @@
+diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
+index 76dfa8f..e58ff4f 100644
+--- i/desmume/src/gdbstub/gdbstub.cpp
++++ w/desmume/src/gdbstub/gdbstub.cpp
+@@ -43,6 +43,12 @@
+ #include <string>
+ #include <vector>
+ 
++// emucap savestate + disassemble commands: native DeSmuME save/load and the ARM/Thumb
++// disassembler tables (des_*_instructions_set). snprintf for the disasm row formatting.
++#include "../saves.h"
++#include "../frontend/modules/Disassembler.h"
++#include <cstdio>
++
+ // For cpu_mutex
+ #ifdef HOST_WINDOWS
+ #include <windows.h>
+@@ -894,6 +900,70 @@ static void emucap_apply_input(const uint8_t *args) {
+   NDS_setEmucapInputOverride((u16)(mask & 0x0fff), frames);
+ }
+ 
++/* Decode a hex-encoded byte string (e.g. "2f74...") into out, stopping at the
++ * first non-hex character or NUL. Paths ride the RSP hex-encoded because they can
++ * contain spaces/'/'/'.' which are awkward-to-impossible to send raw in a packet. */
++static void emucap_hex_to_string(const uint8_t *p, std::string &out) {
++  out.clear();
++  while (p[0] && p[1]) {
++    int hi = hex(p[0]);
++    int lo = hex(p[1]);
++    if (hi < 0 || lo < 0) break;
++    out.push_back((char)((hi << 4) | lo));
++    p += 2;
++  }
++}
++
++// Mirror of NDSSystem.cpp's INDEX(): map a 32-bit ARM opcode to its slot in
++// des_arm_instructions_set[4096].
++#define EMUCAP_ARM_INDEX(i) ((((i) >> 16) & 0xFF0) | (((i) >> 4) & 0xF))
++
++/* Disassemble `count` instructions from this stub's CPU bus starting at `addr`.
++ * mode: 0 = ARM (4 bytes/insn), 1 = Thumb (2 bytes/insn), -1 = auto from the CPU's
++ * CPSR T-bit. Emits newline-separated "<addrhex>|<opcodehex>|<text>" rows, then
++ * base64-encodes the whole block so the reply carries no RSP-special bytes (ARM
++ * operand text uses '#', '$', '*'). The bridge base64-decodes and parses the rows. */
++static bool emucap_build_disasm_b64(struct gdb_stub_state *stub, uint32_t addr,
++                                    uint32_t count, int mode, std::string &out) {
++  if (stub->direct_memio == NULL || stub->cpu_ctrl == NULL)
++    return false;
++  bool thumb;
++  if (mode == 0)
++    thumb = false;
++  else if (mode == 1)
++    thumb = true;
++  else {
++    // reg 16 is the CPSR; the T (Thumb) flag is bit 5.
++    uint32_t cpsr = stub->cpu_ctrl->read_reg(stub->cpu_ctrl->data, 16);
++    thumb = ((cpsr >> 5) & 1) != 0;
++  }
++  if (count == 0)
++    count = 1;
++  if (count > 4096)
++    count = 4096; // safety cap so a bad request cannot allocate unbounded
++
++  std::string text;
++  char dasm[256];
++  char line[512];
++  for (uint32_t n = 0; n < count; n++) {
++    dasm[0] = 0;
++    if (thumb) {
++      u16 op = stub->direct_memio->read16(stub->direct_memio->data, addr);
++      des_thumb_instructions_set[(op >> 6) & 1023]((u32)addr, (u32)op, dasm);
++      snprintf(line, sizeof(line), "%x|%04x|%s\n", (unsigned)addr, (unsigned)op, dasm);
++      addr += 2;
++    } else {
++      u32 op = stub->direct_memio->read32(stub->direct_memio->data, addr);
++      des_arm_instructions_set[EMUCAP_ARM_INDEX(op)]((u32)addr, op, dasm);
++      snprintf(line, sizeof(line), "%x|%08x|%s\n", (unsigned)addr, (unsigned)op, dasm);
++      addr += 4;
++    }
++    text.append(line);
++  }
++  emucap_base64_encode((const uint8_t *)text.data(), text.size(), out);
++  return true;
++}
++
+ 
+ /**
+  * Returns -1 if there is a socket error.
+@@ -943,6 +1013,29 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       }
+       /* else: fall through to the empty reply, which the bridge reads as an error */
+     }
++    // emucap disassemble: qEmucap,disasm:<hexaddr>,<hexcount>[,<mode>] -> base64 of
++    // newline-separated "<addr>|<opcode>|<text>" rows on this stub's CPU. mode is an
++    // optional single char: 'a'=ARM, 't'=Thumb; absent = auto from the CPU CPSR T-bit.
++    else if ( strncmp( (const char *)packet, "qEmucap,disasm:", 15) == 0) {
++      const uint8_t *p = &packet[15];
++      uint32_t addr = 0;
++      uint32_t count = 0;
++      hexToInt( &p, &addr);
++      if ( *p == ',') {
++        p++;
++        hexToInt( &p, &count);
++      }
++      int mode = -1;
++      if ( *p == ',') {
++        p++;
++        if ( *p == 'a' || *p == 'A') mode = 0;
++        else if ( *p == 't' || *p == 'T') mode = 1;
++      }
++      if ( emucap_build_disasm_b64( stub, addr, count, mode, emucap_big_reply)) {
++        emucap_have_big_reply = 1;
++        send_reply = 0;
++      }
++    }
+     break;
+ 
+   case 'Q':
+@@ -952,6 +1045,23 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       strcpy( (char *)out_ptr, "OK");
+       send_size = 2;
+     }
++    // emucap savestate: QEmucap,savestate:<hexpath> -> native DeSmuME savestate_save.
++    // Reply OK on success, E01 on failure (bad path / write error).
++    else if ( strncmp( (const char *)packet, "QEmucap,savestate:", 18) == 0) {
++      std::string path;
++      emucap_hex_to_string( &packet[18], path);
++      bool ok = !path.empty() && savestate_save( path.c_str());
++      strcpy( (char *)out_ptr, ok ? "OK" : "E01");
++      send_size = ok ? 2 : 3;
++    }
++    // emucap loadstate: QEmucap,loadstate:<hexpath> -> native DeSmuME savestate_load.
++    else if ( strncmp( (const char *)packet, "QEmucap,loadstate:", 18) == 0) {
++      std::string path;
++      emucap_hex_to_string( &packet[18], path);
++      bool ok = !path.empty() && savestate_load( path.c_str());
++      strcpy( (char *)out_ptr, ok ? "OK" : "E01");
++      send_size = ok ? 2 : 3;
++    }
+     break;
+ 
+   case 'c':

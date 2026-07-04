@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+pub mod desmume_nds;
 pub mod flycast;
 pub mod mame;
 pub mod mednafen;
@@ -164,15 +165,40 @@ pub fn spawn_detached(spec: &LaunchSpec) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+/// Whether a process is still alive. Unix: `kill(pid, 0)`. Windows is not implemented (assumes
+/// alive) — the NDS adapter's Windows build is a separate task, and the bridge's connect retry
+/// surfaces a dead emulator there anyway.
+pub(crate) fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
 pub(crate) fn terminate_detached(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+        // SIGTERM 먼저, 안 죽으면 SIGKILL. desmume-cli는 SIGTERM을 무시하므로
+        // (adapters/desmume-nds/README.md) SIGTERM만 보내는 종료 처리는 실패한 launch에서 프로세스를
+        // orphan으로 남긴다. 종료를 잠깐 폴링한 뒤 살아있으면 SIGKILL로 강제한다(shell launcher의 kill_ours와
+        // 동일 규약). Windows는 taskkill /F가 이미 강제 종료.
+        let p = pid as libc::pid_t;
+        unsafe { libc::kill(p, libc::SIGTERM) };
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // kill(pid, 0): 존재하면 0, 없으면(ESRCH) -1. spawn_detached의 wait 스레드가 reap하므로
+            // 프로세스가 죽으면 곧 사라진다.
+            if unsafe { libc::kill(p, 0) } != 0 {
+                return Ok(());
+            }
         }
+        unsafe { libc::kill(p, libc::SIGKILL) };
+        Ok(())
     }
     #[cfg(windows)]
     {

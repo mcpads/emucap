@@ -20,8 +20,8 @@ SYS = {
   },
   reset_vector = nil,   -- Z80은 리셋 시 PC=0으로 직행(SNES식 벡터 테이블 없음) → break_on_reset 미지원
   bank_mirror = false,  -- Z80/GG는 SNES식 $00/$80 뱅크 미러 없음
-  dma_supported = false,  -- Z80/GG엔 SNES식 MDMAEN DMA 컨트롤러가 없다 → dma kind BP는 honest unsupported
-  -- read/write BP 주소 변환 맵(§0): smsWorkRam offset을 Z80 버스 base(0xC000-0xDFFF)로 변환. 안 하면
+  dma_supported = false,  -- Z80/GG엔 SNES식 MDMAEN DMA 컨트롤러가 없다 → dma kind BP는 미지원
+  -- read/write BP 주소 변환 맵: smsWorkRam offset을 Z80 버스 base(0xC000-0xDFFF)로 변환. 안 하면
   -- addMemoryCallback이 버스 0x000B(ROM)에 걸어 영원히 미발동한다. smsMemory(이미 버스)는 맵에 없어 그대로.
   bp_bus_base = { smsWorkRam = 0xC000 },
   dump_regions = {
@@ -77,6 +77,40 @@ end
 -- GG/SMS VDP는 SNES식 데이터-포트→VRAM 워드주소 매핑을 런타임 상태로 노출하지 않는다(포트 0xBE/0xBF).
 -- write BP 대상 주소도 평범한 Z80 메모리라 SNES식 포트 라벨을 달지 않는다 → nil(하드코딩 누수 방지).
 SYS.port_semantics = nil
+
+-- SMS/GG VDP VRAM은 CPU 버스에 없다 — Z80은 VDP 데이터포트(0xBE) OUT으로만 쓰고, Mesen memory 콜백은 CPU
+-- 버스 접근만 잡으므로 smsVideoRam write는 절대 발화하지 않는다(실측: 같은 구간 WRAM write 32k회 ↔ VRAM 0회).
+-- 그래서 write BP를 exec 콜백에서 재구성한다(코어 setup_vram_recon_bp): 이 훅이 명령을 보고 VRAM 쓰기면
+-- (워드주소, 데이터)를 준다. OUT(0xBE)/블록I/O(OTIR 등, 포트=레지스터 C=0xBE)를 opcode로 감지하고
+-- vdp.addressReg(목적지 워드주소)·vdp.codeReg(1=VRAM write)를 읽는다. getState는 데이터포트 후보에서만 부른다.
+SYS.non_bus_write_memtypes = {
+  smsVideoRam   = "vram_recon",  -- VDP 데이터포트 write 재구성으로 지원
+  smsPaletteRam = "error",       -- CRAM(codeReg=3)도 포트 write지만 재구성 미구현(TODO)
+}
+SYS.vram_write_target = function(pc, opcode)
+  local bus = emu.memType.smsMemory
+  local op = opcode or emu.read(pc, bus)
+  local blockio = false
+  if op == 0xD3 then                                  -- OUT (n),A
+    if emu.read(pc + 1, bus) ~= 0xBE then return nil end
+  elseif op == 0xED then                              -- OUTI/OTIR/OUTD/OTDR (포트=레지스터 C)
+    local sub = emu.read(pc + 1, bus)
+    if sub ~= 0xA3 and sub ~= 0xB3 and sub ~= 0xAB and sub ~= 0xBB then return nil end
+    blockio = true
+  else
+    return nil
+  end
+  local st = emu.getState()                            -- OUT $BE / 블록I/O 후보에서만(플러드 최소화)
+  if blockio and st["cpu.c"] ~= 0xBE then return nil end
+  if st["vdp.codeReg"] ~= 1 then return nil end        -- code 1 = VRAM write(0=read/2=reg/3=CRAM)
+  -- 쓰이는 데이터바이트: OUT ($BE),A는 A지만 블록 I/O(OUTI/OTIR/OUTD/OTDR = OUT (C),(HL))는 (HL)이다.
+  -- 콜백은 실행 전이라 (HL)이 아직 소스 바이트를 가리킨다(OUTI는 이후 INC HL, OUTD는 DEC HL). value 필터·
+  -- event.value가 맞으려면 여기서 정확히 구해야 한다(대량 VRAM 복사는 거의 다 블록 I/O).
+  local data = blockio
+    and emu.read((st["cpu.h"] or 0) * 256 + (st["cpu.l"] or 0), bus)
+    or st["cpu.a"]
+  return st["vdp.addressReg"], data
+end
 
 local function z80_s8(v) return (v >= 0x80) and (v - 0x100) or v end
 -- (IX+d)/(IY+d) 변위: 부호 있는 +$XX/-$XX.
@@ -290,6 +324,11 @@ SYS.disassemble = function(read_byte, start, count)
 end
 
 local dir = os.getenv("EMUCAP_ADAPTER_DIR")
-assert(dir and dir ~= "", "emucap-sms: EMUCAP_ADAPTER_DIR 미설정 — launch가 전달해야 한다")
+if not dir or dir == "" then
+  -- 폴백: env가 없으면(수동 Script Window 로드 등) 이 스크립트 파일 경로에서 어댑터 디렉터리를 도출한다.
+  local src = debug.getinfo(1, "S").source
+  if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
+end
+assert(dir and dir ~= "", "emucap-sms: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

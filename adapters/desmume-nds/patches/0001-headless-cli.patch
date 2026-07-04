@@ -1,0 +1,150 @@
+diff --git i/desmume/src/frontend/posix/cli/main.cpp w/desmume/src/frontend/posix/cli/main.cpp
+index d3e0643..3340109 100644
+--- i/desmume/src/frontend/posix/cli/main.cpp
++++ w/desmume/src/frontend/posix/cli/main.cpp
+@@ -18,8 +18,15 @@
+  * the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+  * Boston, MA 02111-1307, USA.
+  */
++/* emucap: headless (no window) is the DEFAULT so the GDB stub runs without a display; a native window
++ * opens at runtime when EMUCAP_NDS_DISPLAY is set (=1), for human-in-the-loop (HITL) viewing. SDL makes
++ * the native window on every OS (Cocoa/Win32/X11-Wayland) so the window code is cross-platform; only
++ * X11's XInitThreads is Linux-specific and is guarded to Linux below. */
++#if defined(__linux__)
+ #include <X11/Xlib.h>
++#endif
+ #include <SDL.h>
++static bool g_emucap_headless = true;
+ #include <SDL_thread.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -487,21 +494,41 @@ int main(int argc, char ** argv) {
+ 
+   execute = true;
+ 
+-  /* X11 multi-threading support */
+-  if(!XInitThreads())
+-    {
+-      fprintf(stderr, "Warning: X11 not thread-safe\n");
+-    }
++  /* emucap: window on/off is a RUNTIME choice (EMUCAP_NDS_DISPLAY=1 → open a HITL window). Default
++   * headless so the GDB-bridge launch path is unchanged. */
++  {
++    const char *emucap_disp = getenv("EMUCAP_NDS_DISPLAY");
++    g_emucap_headless = !(emucap_disp && emucap_disp[0] && emucap_disp[0] != '0');
++  }
+ 
+-  if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_JOYSTICK| SDL_INIT_GAMECONTROLLER) == -1)
+-    {
+-      fprintf(stderr, "Error trying to initialize SDL: %s\n",
+-              SDL_GetError());
+-      return 1;
+-    }
++  nds_screen_size_ratio = my_config.scale;
++  ctrls_cfg.horizontal = my_config.horizontal;
+ 
+-    nds_screen_size_ratio = my_config.scale;
+-    ctrls_cfg.horizontal = my_config.horizontal;
++  if (g_emucap_headless) {
++    /* Headless: no SDL video. Init only what the emulation loop + gdb-stub need (timer +
++     * joystick/gamecontroller for input polling). No window, renderer or textures. */
++    if(SDL_Init(SDL_INIT_TIMER | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) == -1)
++      {
++        fprintf(stderr, "Error trying to initialize SDL: %s\n", SDL_GetError());
++        return 1;
++      }
++    window = NULL;
++    renderer = NULL;
++    ctrls_cfg.window = window;
++  } else {
++    /* Windowed (HITL): SDL creates the native window on every OS (Cocoa/Win32/X11-Wayland).
++     * XInitThreads is X11-only, so guard it to Linux; SDL handles threading elsewhere. */
++#if defined(__linux__)
++    if(!XInitThreads())
++      {
++        fprintf(stderr, "Warning: X11 not thread-safe\n");
++      }
++#endif
++    if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_JOYSTICK| SDL_INIT_GAMECONTROLLER) == -1)
++      {
++        fprintf(stderr, "Error trying to initialize SDL: %s\n", SDL_GetError());
++        return 1;
++      }
+     unsigned width = 256 + my_config.horizontal*256;
+     unsigned height = 192 + 192 * !my_config.horizontal;
+     sdl_videoFlags |= SDL_WINDOW_OPENGL;
+@@ -521,6 +548,7 @@ int main(int argc, char ** argv) {
+     for(i = 0; i < 2; ++i)
+       screen[i] = SDL_CreateTexture(renderer, desmume_pixelformat, SDL_TEXTUREACCESS_STREAMING,
+ 	GPU_FRAMEBUFFER_NATIVE_WIDTH, GPU_FRAMEBUFFER_NATIVE_HEIGHT);
++  }
+ 
+ 
+   /* Initialize joysticks */
+@@ -562,7 +590,8 @@ int main(int argc, char ** argv) {
+     DrawHUD();
+ #endif
+ 
+-    Draw(&my_config);
++    if (!g_emucap_headless)
++      Draw(&my_config);
+ 
+ #ifdef HAVE_LIBAGG
+     osd->clear();
+@@ -605,7 +634,10 @@ int main(int argc, char ** argv) {
+ 
+       snprintf( win_title, sizeof(win_title), "Desmume %.02f", fps);
+ 
+-      SDL_SetWindowTitle( window, win_title );
++      if (g_emucap_headless)
++        fprintf(stderr, "%s\n", win_title);
++      else
++        SDL_SetWindowTitle( window, win_title );
+     }
+ #endif
+   }
+diff --git i/desmume/src/frontend/posix/cli/meson.build w/desmume/src/frontend/posix/cli/meson.build
+index d3eb234..293a143 100644
+--- i/desmume/src/frontend/posix/cli/meson.build
++++ w/desmume/src/frontend/posix/cli/meson.build
+@@ -1,6 +1,9 @@
+-dep_x11 = dependency('x11')
+-
+-cli_dependencies = dependencies + [dep_x11]
++# emucap: X11 only on Linux. Windowed mode (EMUCAP_NDS_DISPLAY=1) uses SDL's native window on every OS;
++# only its XInitThreads is X11-only and guarded to Linux in main.cpp. macOS/Windows need no X11.
++cli_dependencies = dependencies
++if host_machine.system() == 'linux'
++  cli_dependencies += dependency('x11')
++endif
+ 
+ cli_src = [
+   'main.cpp',
+diff --git i/desmume/src/frontend/posix/meson.build w/desmume/src/frontend/posix/meson.build
+index dda45fc..89e1b67 100644
+--- i/desmume/src/frontend/posix/meson.build
++++ w/desmume/src/frontend/posix/meson.build
+@@ -12,7 +12,8 @@ project('desmume',
+ 
+ dep_glib2 = dependency('glib-2.0')
+ dep_sdl = dependency('sdl2')
+-dep_pcap = dependency('pcap')
++# pcap is only needed for the experimental wifi feature; don't hard-require it.
++dep_pcap = dependency('pcap', required: get_option('wifi'))
+ dep_zlib = dependency('zlib')
+ dep_threads = dependency('threads')
+ dep_gl = dependency('gl', required: false)
+@@ -31,7 +32,12 @@ if get_option('wifi')
+   add_global_arguments('-DEXPERIMENTAL_WIFI_COMM', language: ['c', 'cpp'])
+ endif
+ 
+-dependencies = [dep_glib2, dep_sdl, dep_pcap, dep_zlib, dep_threads]
++dependencies = [dep_glib2, dep_sdl, dep_zlib, dep_threads]
++# wifi.cpp always references libpcap symbols (POSIXPCapInterface), independent of
++# the wifi feature, so link libpcap whenever it is available on the host.
++if dep_pcap.found()
++  dependencies += dep_pcap
++endif
+ 
+ # Determine the CPU architecture of the target.
+ target_cpu_64bit = false

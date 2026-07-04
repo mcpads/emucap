@@ -181,7 +181,7 @@ impl Emucap {
     )]
     async fn get_state(&self, Parameters(a): Parameters<StateArgs>) -> CallToolResult {
         let mut link = self.link();
-        match tools::get_state(&mut *link, &a.groups) {
+        match tools::get_state(&mut *link, &a.groups, a.cpu.as_deref()) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),
         }
@@ -343,6 +343,17 @@ impl Emucap {
     }
 
     #[tool(
+        description = "하단 터치스크린을 (x,y)에서 터치한다 — release=true면 뗀다, frames면 그만큼 눌렀다 자동으로 뗀다(탭), 둘 다 없으면 hold. 터치스크린 있는 시스템(NDS 등)에서만 동작; status.methods 정본."
+    )]
+    async fn touch(&self, Parameters(a): Parameters<TouchArgs>) -> CallToolResult {
+        let mut l = self.link();
+        match tools::touch(&mut *l, a.port, a.x, a.y, a.frames, a.release) {
+            Ok(o) => output_result(o),
+            Err(e) => err_result(e),
+        }
+    }
+
+    #[tool(
         description = "프레임 단위 정밀 탭 — frozen에서 auto-repeat 없이 1칸/1회 입력 후 뗀다(호출 후 frozen 유지). 버튼명은 status.input_buttons."
     )]
     async fn tap(&self, Parameters(a): Parameters<TapArgs>) -> CallToolResult {
@@ -413,9 +424,9 @@ impl Emucap {
     }
 
     #[tool(description = "다음 프레임 경계에서 일시정지(freeze)한다")]
-    async fn pause(&self) -> CallToolResult {
+    async fn pause(&self, Parameters(a): Parameters<CpuArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::pause(&mut *l) {
+        match tools::pause(&mut *l, a.cpu.as_deref()) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),
         }
@@ -426,7 +437,7 @@ impl Emucap {
     )]
     async fn step(&self, Parameters(a): Parameters<StepArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::step(&mut *l, a.frames) {
+        match tools::step(&mut *l, a.frames, a.cpu.as_deref()) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),
         }
@@ -440,16 +451,16 @@ impl Emucap {
         Parameters(a): Parameters<StepInstructionsArgs>,
     ) -> CallToolResult {
         let mut l = self.link();
-        match tools::step_instructions(&mut *l, a.count) {
+        match tools::step_instructions(&mut *l, a.count, a.cpu.as_deref()) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),
         }
     }
 
     #[tool(description = "정상 실행으로 복귀한다")]
-    async fn resume(&self) -> CallToolResult {
+    async fn resume(&self, Parameters(a): Parameters<CpuArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::resume(&mut *l) {
+        match tools::resume(&mut *l, a.cpu.as_deref()) {
             Ok(o) => output_result(o),
             Err(e) => err_result(e),
         }

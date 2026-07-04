@@ -28,12 +28,12 @@ MAME
 Mesen2
   Upstream: https://github.com/SourMesen/Mesen2
   License:  GPL-3.0-or-later
-  Used by:  adapters/mesen2 (runtime Lua script; SNES)
+  Used by:  adapters/mesen2 (runtime Lua script; SNES/NES/GB/GBC/GBA/Game Gear)
 
-PCSX-Redux
-  Upstream: https://github.com/grumpycoders/pcsx-redux
-  License:  GPL-2.0-or-later overall, with MIT subtrees (OpenBIOS/nugget)
-  Used by:  the PSX/PCSX-Redux adapter path
+DeSmuME
+  Upstream: https://github.com/TASEmulators/desmume
+  License:  GPL-2.0-or-later
+  Used by:  adapters/desmume-nds (patch stack + GDB bridge; Nintendo DS)
 
 Upstream license determinations were made from each project's source-file SPDX
 headers and README, not from the bare COPYING boilerplate.

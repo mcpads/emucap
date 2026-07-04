@@ -220,3 +220,34 @@ fn spawn_detached_runs_and_redirects_to_log() {
         std::fs::read_to_string(&log)
     );
 }
+
+// A process that ignores SIGTERM (like desmume-cli, per adapters/desmume-nds/README.md) must still
+// be killed by terminate_detached's SIGTERM→SIGKILL escalation, so a failed NDS launch never strands
+// it untracked. The shell installs SIG_IGN for SIGTERM, writes a ready marker, then `exec sleep`
+// (SIG_IGN survives exec) — waiting for the marker avoids racing the SIGTERM against trap setup.
+#[cfg(unix)]
+#[test]
+fn terminate_detached_escalates_to_sigkill_when_sigterm_ignored() {
+    use std::os::unix::process::ExitStatusExt;
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let script = format!("trap '' TERM; : > '{}'; exec sleep 30", ready.display());
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .spawn()
+        .expect("spawn SIGTERM-ignoring test process");
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "test process never signalled ready");
+    terminate_detached(child.id()).expect("terminate");
+    let status = child.wait().expect("wait");
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "a SIGTERM-ignoring process must be escalated to SIGKILL"
+    );
+}

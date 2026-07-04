@@ -5,11 +5,12 @@
 MCP infrastructure for debugging retro-game patches. An AI agent reads and
 controls a running emulator's memory, state, and screen so it can analyze a
 problem a human described in plain language. A common Core plus per-emulator
-adapters supports several emulators — Mesen2 (SNES · Game Gear), a Mednafen fork
-(Saturn · PlayStation · PC Engine · Mega Drive/Genesis), Flycast (Dreamcast),
-and MAME (PC-98).
+adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy · GBC ·
+GBA · NES), a Mednafen fork
+(Saturn · PlayStation · PC Engine · Mega Drive/Genesis), Flycast (Dreamcast), a
+DeSmuME fork (Nintendo DS), and MAME (PC-98).
 
-**v0.2.0 — beta.** This repository is under active, continuous development;
+**v0.3.0 — beta.** This repository is under active, continuous development;
 interfaces and behavior may still change between updates.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
@@ -150,10 +151,12 @@ install paths and fallbacks**, the agent never has to hunt around the filesystem
 
 Pick one to start. **Mesen2 is the lightest — no source build.**
 
-- **Mesen2 (SNES · Game Gear)** — install the Mesen2 app and, once, allow network
-  access for the Script window in the GUI. The adapter Lua ships with the repo, so
-  there is no build. One adapter covers both systems (65816 for SNES, Z80 for Game
-  Gear / Master System). → `adapters/mesen2/README.md`
+- **Mesen2 (SNES · Game Gear · Game Boy · GBC · GBA · NES)** — install the Mesen2 app
+  and, once, allow network access for the Script window in the GUI. The adapter Lua ships
+  with the repo, so there is no build. Per-system entries cover them (65816 for SNES,
+  Z80 for Game Gear / Master System, SM83 for Game Boy / GBC, ARM7 for GBA, 6502 for
+  NES). GBA needs a real BIOS (`gba_bios.bin`, not committed); SNES / Game Gear / GB /
+  GBC / NES need none. → `adapters/mesen2/README.md`
 - **Mednafen (Saturn · PSX · PCE · MD)** — build the fork with
   `adapters/mednafen/build.sh` (needs SDL: macOS `brew install sdl2`, Linux
   `libsdl2-dev`). One binary handles all four systems. PSX and PCE-CD need BIOS
@@ -161,6 +164,10 @@ Pick one to start. **Mesen2 is the lightest — no source build.**
 - **Flycast (Dreamcast)** — build with `adapters/flycast/build.sh`; it builds in an
   emucap-owned work tree and treats any `FLYCAST_SRC` checkout as read-only input.
   → `adapters/flycast/README.md`
+- **DeSmuME (Nintendo DS)** — build the headless fork with
+  `adapters/desmume-nds/build.sh` (needs meson/ninja/SDL2/glib). No NDS BIOS is
+  needed (HLE direct-boot). The dual CPUs (ARM9/ARM7) each get a GDB stub, like the
+  PC-98 adapter. → `adapters/desmume-nds/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
 
