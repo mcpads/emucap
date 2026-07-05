@@ -1,0 +1,25 @@
+diff --git i/UI/NativeApp.cpp w/UI/NativeApp.cpp
+index 2804ec2..227747c 100644
+--- i/UI/NativeApp.cpp
++++ w/UI/NativeApp.cpp
+@@ -558,6 +558,20 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
+ 	}
+ #endif
+ 
++	// emucap: when EMUCAP_PPSSPP_MEMSTICK is set, pin the memory-stick (config + saves) root to that
++	// isolated per-session directory *before* the config Load() below, so a HITL window never reads or
++	// writes the operator's real PPSSPP profile. On macOS the stock memstick path comes from
++	// NSUserDefaults (UserPreferredMemoryStickDirectoryPath, else defaultCurrentDirectory/.config/ppsspp),
++	// which HOME/XDG cannot fully redirect; this override is deterministic and cross-platform. It also
++	// repoints internalDataDirectory so the memstick_dir.txt logic cannot steer it elsewhere.
++	if (const char *emucapMemStick = getenv("EMUCAP_PPSSPP_MEMSTICK")) {
++		if (emucapMemStick[0] != '\0') {
++			Path emucapMemStickPath(emucapMemStick);
++			g_Config.memStickDirectory = emucapMemStickPath;
++			g_Config.internalDataDirectory = emucapMemStickPath;
++		}
++	}
++
+ 	if (g_Config.currentDirectory.empty()) {
+ 		g_Config.currentDirectory = g_Config.defaultCurrentDirectory;
+ 	}

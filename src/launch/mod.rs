@@ -16,6 +16,7 @@ pub mod flycast;
 pub mod mame;
 pub mod mednafen;
 pub mod mesen;
+pub mod ppsspp;
 pub mod spec;
 
 #[cfg(test)]

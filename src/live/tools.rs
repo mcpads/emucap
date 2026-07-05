@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -512,16 +512,97 @@ pub fn break_on_reset(link: &mut dyn EmulatorLink, enabled: bool) -> Result<Tool
     ))
 }
 
+/// 표준 메모리 리전(.bin+regions.json)과 상태 스냅샷(state.json)을 `dir`에 원자적으로 배치한다.
+///
+/// 브리지 덤프(리전 파일)와 호스트가 쓰는 state.json은 두 단계라, 예전처럼 `dir`에 바로 쓰면
+/// 리전 파일을 배치한 뒤 state.json 쓰기가 실패할 때 직전의 온전한 덤프가 파괴되고(롤백 불가)
+/// state.json 없는 덤프가 남는다. 그래서 리전 파일 + state.json 전부를 형제(sibling) 스테이징
+/// 디렉토리에 모은 뒤, 둘 다 성공했을 때만 `dir`로 원자 스왑한다 — 어느 단계가 실패하든 직전 덤프는
+/// 바이트 그대로 보존되고 스테이징 잔재도 남기지 않는다(모든 어댑터 공통, 어댑터 무관).
 pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput, LinkError> {
-    let regions = link.call("dump_memory", json!({ "path": dir }))?;
-    // 상태(레지스터/DMA/PPU) 스냅샷도 같은 디렉토리에 기록(교차-ROM 키-값 디프 입력).
-    // 교차-ROM에서는 frozen 앵커 지점에서 덤프해야 두 호출이 일관된다.
-    let state = link.call("get_state", json!({}))?;
-    let state_map = state.get("state").cloned().unwrap_or(state.clone());
-    let path = Path::new(dir).join("state.json");
-    std::fs::write(&path, serde_json::to_string(&state_map).unwrap_or_default())
+    let dest = Path::new(dir);
+    let staging = dump_sibling(dest, "dump-staging")
+        .map_err(|e| LinkError::Protocol(format!("덤프 스테이징 경로 실패: {e}")))?;
+    let staging_str = staging
+        .to_str()
+        .ok_or_else(|| LinkError::Protocol("덤프 스테이징 경로가 UTF-8이 아님".into()))?
+        .to_string();
+
+    // 스테이징에 리전 파일 + state.json을 모은다. 실패하면 스테이징을 버리고 `dir`은 건드리지 않는다.
+    let build = (|| -> Result<Value, LinkError> {
+        std::fs::create_dir_all(&staging)
+            .map_err(|e| LinkError::Protocol(format!("스테이징 디렉토리 생성 실패: {e}")))?;
+        let regions = link.call("dump_memory", json!({ "path": staging_str }))?;
+        // 상태(레지스터/DMA/PPU) 스냅샷도 같은 디렉토리에 기록(교차-ROM 키-값 디프 입력).
+        // 교차-ROM에서는 frozen 앵커 지점에서 덤프해야 두 호출이 일관된다.
+        let state = link.call("get_state", json!({}))?;
+        let state_map = state.get("state").cloned().unwrap_or(state.clone());
+        std::fs::write(
+            staging.join("state.json"),
+            serde_json::to_string(&state_map).unwrap_or_default(),
+        )
         .map_err(|e| LinkError::Protocol(format!("state.json 쓰기 실패: {e}")))?;
+        Ok(regions)
+    })();
+
+    let regions = match build {
+        Ok(regions) => regions,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+    };
+
+    // 완성된 스테이징을 `dir`로 원자 스왑(직전 덤프는 스왑 성공 시에만 교체·실패 시 롤백).
+    if let Err(e) = replace_dir(&staging, dest) {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(LinkError::Protocol(format!("덤프 배치(스왑) 실패: {e}")));
+    }
+
+    // 브리지가 돌려준 path는 스테이징 경로이므로, 호출자가 요청한 `dir`로 정정해 보고한다.
+    let mut regions = regions;
+    if let Some(obj) = regions.as_object_mut() {
+        obj.insert("path".into(), json!(dir));
+    }
     Ok(ToolOutput::Json(regions))
+}
+
+/// `dst`의 형제 경로(같은 부모라 이후 `rename`이 한 파일시스템 내라 원자적)를 `label`·PID·나노초로
+/// 고유하게 만든다. 부모 디렉토리가 없으면 에러.
+fn dump_sibling(dst: &Path, label: &str) -> std::io::Result<PathBuf> {
+    let parent = dst.parent().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "dump path {} has no parent directory to stage under",
+            dst.display()
+        ))
+    })?;
+    let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("dump");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(parent.join(format!(".{name}.{label}.{}.{nanos}", std::process::id())))
+}
+
+/// 완성된 스테이징 덤프 `staging`을 `dst`로 원자 이동. `dst`가 없으면 단일 `rename`; 있으면 직전
+/// 덤프를 백업으로 옮기고 `staging`을 rename해 넣은 뒤 성공 시에만 백업을 버린다(실패 시 롤백) —
+/// 직전의 온전한 덤프가 반쯤 교체된 채 남지 않도록.
+fn replace_dir(staging: &Path, dst: &Path) -> std::io::Result<()> {
+    if !dst.exists() {
+        return std::fs::rename(staging, dst);
+    }
+    let backup = dump_sibling(dst, "dump-old")?;
+    std::fs::rename(dst, &backup)?;
+    match std::fs::rename(staging, dst) {
+        Ok(()) => {
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::rename(&backup, dst);
+            Err(e)
+        }
+    }
 }
 
 pub fn screenshot(

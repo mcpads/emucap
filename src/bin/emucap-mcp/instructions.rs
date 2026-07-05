@@ -1,6 +1,6 @@
 /// MCP 서버 사용 가이드. 에이전트가 항상 보는 유일한 문서이므로 자기완결적이어야 한다
 /// (저장소 README는 다른 프로젝트에서 안 보인다). 소스를 뒤지지 않게 하는 것이 목적.
-pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS), MAME PC-98 PoC.
+pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS), PPSSPP 포크(PSP), MAME PC-98 PoC.
 
 **[정본] 도구 가용성은 연결 후 `status.methods`, read/write_memory의 유효 memory_type은 `status.memory_types`가 정본이다 — 어댑터가 advertise한 실제 런타임 capability이니 정적 추측 말 것. 런타임 디버거 강등(예: PCE가 pce_fast로 잡히면 메모리/BP 불가)도 prune되어 반영된다(보강 신호: Mednafen `status.debugger`[PCE가 pce_fast로 잡혀 강등됐으면 `force_module=pce`로 재기동해 디버거 확보], PC-98 `status.backend`·`status.capability_notes`; Mesen은 강등 개념 없어 미해당). 플랫폼×도구 가용성은 status.methods/status.memory_types가 정본이고, per-system memory_type·버튼명·BP 심화·launch 트러블슈팅은 각 `adapters/*/README.md`를 본다. hello는 어댑터→서버 handshake라 직접 호출 대상이 아니다.**
 

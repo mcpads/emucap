@@ -1,0 +1,26 @@
+diff --git i/UI/NativeApp.cpp w/UI/NativeApp.cpp
+index 23eb404068..2804ec2059 100644
+--- i/UI/NativeApp.cpp
++++ w/UI/NativeApp.cpp
+@@ -664,6 +664,21 @@ void NativeInit(int argc, const char *argv[], const char *savegame_dir, const ch
+ 					g_Config.SetAppendedConfigIni(Path(argv[i] + strlen("--appendconfig=")));
+ 					g_Config.LoadAppendedConfig();
+ 				}
++				// emucap: GUI HITL mode honors --debugger=<port> like the headless main() does. The
++				// GUI starts the debugger WebServer on g_Config.iRemoteISOPort (0 = auto-assigned port);
++				// pin it to the requested port so the emucap bridge reaches a known endpoint. Applied
++				// after the main config Load() above so it wins, and DoNotSaveSetting so neither this
++				// session's ephemeral port nor the forced-on flag persists into the user's config.
++				// bRemoteDebuggerOnStartup arms the boot-time WebServer start (below, after this loop).
++				if (!strncmp(argv[i], "--debugger=", strlen("--debugger=")) && strlen(argv[i]) > strlen("--debugger=")) {
++					int emucapDebuggerPort = std::atoi(argv[i] + strlen("--debugger="));
++					if (emucapDebuggerPort > 0) {
++						g_Config.iRemoteISOPort = emucapDebuggerPort;
++						g_Config.bRemoteDebuggerOnStartup = true;
++						g_Config.DoNotSaveSetting(&g_Config.iRemoteISOPort);
++						g_Config.DoNotSaveSetting(&g_Config.bRemoteDebuggerOnStartup);
++					}
++				}
+ 				break;
+ 			}
+ 		} else {

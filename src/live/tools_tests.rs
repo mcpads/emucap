@@ -342,3 +342,114 @@ fn screenshot_saves_to_path_when_given() {
     }
     assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
 }
+
+/// A dump-capable fake link: `dump_memory` writes region files into the caller-provided directory
+/// (as a real bridge does), and can sabotage the host's follow-up `state.json` write by occupying
+/// that name with a directory — modelling a state-write failure after a successful bridge dump.
+struct DumpLink {
+    sabotage_state_write: bool,
+    caps: Capabilities,
+}
+impl DumpLink {
+    fn new(sabotage_state_write: bool) -> Self {
+        DumpLink {
+            sabotage_state_write,
+            caps: Capabilities {
+                protocol_version: 1,
+                methods: vec![],
+                memory_types: vec![],
+                identity: EmulatorIdentity::default(),
+            },
+        }
+    }
+}
+impl EmulatorLink for DumpLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        match method {
+            "dump_memory" => {
+                let path = std::path::PathBuf::from(params["path"].as_str().unwrap());
+                std::fs::create_dir_all(&path).unwrap();
+                std::fs::write(path.join("main.bin"), b"NEWDUMP").unwrap();
+                std::fs::write(path.join("regions.json"), br#"[{"name":"main"}]"#).unwrap();
+                if self.sabotage_state_write {
+                    // Occupy `state.json` with a directory so the host's later file write fails.
+                    std::fs::create_dir_all(path.join("state.json")).unwrap();
+                }
+                Ok(json!({ "path": path.display().to_string(), "regions": 1 }))
+            }
+            "get_state" => Ok(json!({ "state": { "cpu.pc": 42 } })),
+            _ => Ok(json!({})),
+        }
+    }
+}
+
+fn staging_leftovers(parent: &std::path::Path) -> Vec<String> {
+    std::fs::read_dir(parent)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.contains("dump-staging") || n.contains("dump-old"))
+        .collect()
+}
+
+#[test]
+fn dump_memory_publishes_region_files_and_state_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("dump");
+    let mut link = DumpLink::new(false);
+    let result = dump_memory(&mut link, out.to_str().unwrap()).unwrap();
+    // Region files AND the host-written state.json are all published under the requested dir.
+    assert_eq!(std::fs::read(out.join("main.bin")).unwrap(), b"NEWDUMP");
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(out.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["cpu.pc"], 42);
+    // The reported path is the caller's dir, not the internal staging dir.
+    match result {
+        ToolOutput::Json(v) => assert_eq!(v["path"], out.to_str().unwrap()),
+        _ => panic!("Json 기대"),
+    }
+    assert!(
+        staging_leftovers(tmp.path()).is_empty(),
+        "no staging/backup dirs may be left behind on success"
+    );
+}
+
+#[test]
+fn dump_memory_state_write_failure_preserves_prior_dump() {
+    // A state.json write failure AFTER a successful bridge dump must not destroy the prior good dump:
+    // the region files + state.json are staged and swapped in atomically, so a failure before the swap
+    // leaves the previous dump at `dir` byte-for-byte intact and leaves no staging litter.
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("dump");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("main.bin"), b"OLDDUMP").unwrap();
+    std::fs::write(out.join("regions.json"), br#"[{"name":"old"}]"#).unwrap();
+    std::fs::write(out.join("state.json"), br#"{"cpu.pc":1}"#).unwrap();
+
+    let mut link = DumpLink::new(true);
+    let r = dump_memory(&mut link, out.to_str().unwrap());
+    assert!(r.is_err(), "a state.json write failure must fail the dump");
+
+    assert_eq!(
+        std::fs::read(out.join("main.bin")).unwrap(),
+        b"OLDDUMP",
+        "the prior main.bin must survive a failed re-dump"
+    );
+    assert_eq!(
+        std::fs::read(out.join("regions.json")).unwrap(),
+        br#"[{"name":"old"}]"#
+    );
+    assert_eq!(
+        std::fs::read(out.join("state.json")).unwrap(),
+        br#"{"cpu.pc":1}"#,
+        "the prior state.json must survive a failed re-dump"
+    );
+    assert!(
+        staging_leftovers(tmp.path()).is_empty(),
+        "staging/backup dirs must be cleaned up on failure: {:?}",
+        staging_leftovers(tmp.path())
+    );
+}

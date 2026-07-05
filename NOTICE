@@ -35,5 +35,16 @@ DeSmuME
   License:  GPL-2.0-or-later
   Used by:  adapters/desmume-nds (patch stack + GDB bridge; Nintendo DS)
 
+PPSSPP
+  Upstream: https://github.com/hrydgard/ppsspp
+  License:  GPL-2.0-or-later (per source-file headers)
+  Used by:  adapters/ppsspp (patch stack applied to the source tree, compiled into
+            PPSSPPHeadless; PSP)
+  Bundles third-party code under its own license in ext/, notably FFmpeg, plus zlib,
+  zstd, snappy, lzma-sdk, libpng, libzip, libchdr, freetype, glew, glslang, SPIRV-Cross,
+  vulkan/vma, basis_universal, xbrz, jpge, stb, nanosvg, minimp3/at3_standalone, libkirk,
+  armips, udis86, cityhash, sha1, sfmt, cpu_features, rapidjson, pugixml, gason, sol/lua,
+  imgui, portable-file-dialogs, discord-rpc, miniupnp, rcheevos, OpenXR-SDK, libadrenotools.
+
 Upstream license determinations were made from each project's source-file SPDX
 headers and README, not from the bare COPYING boilerplate.

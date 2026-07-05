@@ -1,0 +1,12 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The patch stack in patches/ (0001, 0002) is applied to the PPSSPP source tree by
+build.sh and modifies PPSSPP's own files (0001 adds `savestate.save`/
+`savestate.load` and `emucap.screenshot` WebSocket debugger commands; 0002 fixes
+headless exec breakpoints and single-step advance). It is therefore a
+derivative work of PPSSPP (GPL-2.0-or-later) and is licensed GPL-2.0-or-later.
+emucap does not ship PPSSPP's binary or source — build.sh clones and builds a
+pinned upstream commit on your machine. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

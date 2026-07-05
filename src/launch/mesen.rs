@@ -188,24 +188,44 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     Ok(pid)
 }
 
+/// The default GBA BIOS source when `EMUCAP_GBA_BIOS` is unset: the emucap-owned firmware directory
+/// `<emucap-home>/firmware/gba_bios.bin`. This is the shared firmware dir alongside the per-emulator
+/// homes (matching the docs and legacy launcher's `$EMUCAP_MESEN_BASE/firmware/gba_bios.bin`), NOT
+/// under `mesen2/<port>` — a per-port location would never be found at the documented path.
+fn default_gba_bios_source() -> PathBuf {
+    super::emu_home_base().join("firmware/gba_bios.bin")
+}
+
 /// GBA needs a real BIOS (gba_bios.bin), which Mesen looks for in its data folder's `Firmware`
-/// directory; without it Mesen pops a firmware prompt that breaks the headless/agent flow, and the
-/// portable copy starts with an empty Firmware. When launching the GBA entry script, stage the BIOS
-/// into the portable Firmware directory first — source `EMUCAP_GBA_BIOS`, else `firmware/gba_bios.bin`
-/// under the mesen2 home. A missing BIOS fails fast with a clear precondition instead of hanging on
-/// the prompt.
+/// directory; without it Mesen pops a firmware prompt that breaks the headless/agent flow, and a
+/// freshly-copied portable starts with an empty Firmware. When launching the GBA entry script, stage
+/// the BIOS into the portable Firmware directory first. Source order: explicit `EMUCAP_GBA_BIOS`,
+/// else `default_gba_bios_source()`. When no explicit source is set and the destination BIOS is
+/// already staged (a prior run), accept it rather than failing if the shared source has since gone.
+/// A missing *explicitly-configured* source fails fast with a clear precondition instead of hanging
+/// on the prompt.
 fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Result<()> {
     if l.lua.file_name().and_then(|n| n.to_str()) != Some("emucap-gba.lua") {
         return Ok(());
     }
-    let src = match std::env::var_os("EMUCAP_GBA_BIOS") {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            let base = super::emu_home_dir("mesen2", l.port);
-            base.parent()
-                .unwrap_or(base.as_path())
-                .join("firmware/gba_bios.bin")
-        }
+    let firmware = portable
+        .binary
+        .parent()
+        .ok_or_else(|| {
+            std::io::Error::other("cannot locate the portable Mesen Firmware directory")
+        })?
+        .join("Firmware");
+    let dst = firmware.join("gba_bios.bin");
+
+    let explicit = std::env::var_os("EMUCAP_GBA_BIOS");
+    // No explicit source + an already-staged BIOS: honour the staged copy so a launch does not fail
+    // when the shared firmware source has been moved/removed since the first run.
+    if explicit.is_none() && dst.is_file() {
+        return Ok(());
+    }
+    let src = match explicit {
+        Some(p) => PathBuf::from(p),
+        None => default_gba_bios_source(),
     };
     if !src.is_file() {
         return Err(std::io::Error::new(
@@ -217,18 +237,8 @@ fn provision_gba_bios(l: &Launch, portable: &PreparedPortable) -> std::io::Resul
             ),
         ));
     }
-    let firmware = portable
-        .binary
-        .parent()
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "cannot locate the portable Mesen Firmware directory",
-            )
-        })?
-        .join("Firmware");
     std::fs::create_dir_all(&firmware)?;
-    super::copy_file_replace(&src, &firmware.join("gba_bios.bin"))
+    super::copy_file_replace(&src, &dst)
 }
 
 #[cfg(test)]
@@ -462,5 +472,129 @@ mod tests {
             v.get("Debug").is_none(),
             "settings.json에 우리 키를 주입하지 않는다"
         );
+    }
+
+    /// Run `f` with `EMUCAP_EMU_HOME` and `EMUCAP_GBA_BIOS` set as given (both restored after),
+    /// under the shared env lock so it does not race other env-touching tests.
+    fn with_gba_env<T>(emu_home: &Path, gba_bios: Option<&Path>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("EMUCAP_EMU_HOME");
+        let old_bios = std::env::var_os("EMUCAP_GBA_BIOS");
+        std::env::set_var("EMUCAP_EMU_HOME", emu_home);
+        match gba_bios {
+            Some(p) => std::env::set_var("EMUCAP_GBA_BIOS", p),
+            None => std::env::remove_var("EMUCAP_GBA_BIOS"),
+        }
+        let out = f();
+        match old_home {
+            Some(v) => std::env::set_var("EMUCAP_EMU_HOME", v),
+            None => std::env::remove_var("EMUCAP_EMU_HOME"),
+        }
+        match old_bios {
+            Some(v) => std::env::set_var("EMUCAP_GBA_BIOS", v),
+            None => std::env::remove_var("EMUCAP_GBA_BIOS"),
+        }
+        out
+    }
+
+    /// Build the (`Launch`, `PreparedPortable`) inputs `provision_gba_bios` needs. `portable.binary`
+    /// lives at `<root>/portable/Mesen`, so its `Firmware` dir is `<root>/portable/Firmware`.
+    fn gba_provision_inputs<'a>(
+        root: &Path,
+        lua: &'a Path,
+        log: &'a Path,
+    ) -> (Launch<'a>, PreparedPortable) {
+        let bindir = root.join("portable");
+        let portable = PreparedPortable {
+            binary: bindir.join("Mesen"),
+            settings: bindir.join("settings.json"),
+            home: root.to_path_buf(),
+        };
+        let l = Launch {
+            binary: Path::new("/unused/source/Mesen"),
+            content: "/unused/rom.gba",
+            lua,
+            log_path: log,
+            port: 47800,
+            name: None,
+            session_token: None,
+        };
+        (l, portable)
+    }
+
+    #[test]
+    fn default_gba_bios_source_is_shared_firmware_dir_not_per_port() {
+        let dir = tempfile::tempdir().unwrap();
+        with_gba_env(dir.path(), None, || {
+            assert_eq!(
+                default_gba_bios_source(),
+                dir.path().join("firmware/gba_bios.bin"),
+                "default BIOS source must be the shared <home>/firmware, not under mesen2/<port>"
+            );
+        });
+    }
+
+    #[test]
+    fn provision_stages_bios_from_default_shared_firmware_source() {
+        let dir = tempfile::tempdir().unwrap();
+        // BIOS at the documented shared location, EMUCAP_GBA_BIOS unset.
+        let src = dir.path().join("firmware/gba_bios.bin");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"BIOSBYTES").unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        std::fs::create_dir_all(portable.binary.parent().unwrap()).unwrap();
+
+        with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
+
+        let staged = portable.binary.parent().unwrap().join("Firmware/gba_bios.bin");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"BIOSBYTES");
+    }
+
+    #[test]
+    fn provision_accepts_already_staged_bios_when_source_gone_and_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        // A BIOS was staged by a prior run; the shared source dir does NOT exist now.
+        let staged = portable.binary.parent().unwrap().join("Firmware/gba_bios.bin");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"PRIORRUN").unwrap();
+
+        with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
+
+        // Accepted as-is: not overwritten, not failed.
+        assert_eq!(std::fs::read(&staged).unwrap(), b"PRIORRUN");
+    }
+
+    #[test]
+    fn provision_fails_fast_when_explicit_source_missing_even_if_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        // Even with a staged BIOS, an explicitly-configured but missing source must fail fast.
+        let staged = portable.binary.parent().unwrap().join("Firmware/gba_bios.bin");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, b"PRIORRUN").unwrap();
+        let missing = dir.path().join("nowhere/gba_bios.bin");
+
+        let err = with_gba_env(dir.path(), Some(&missing), || {
+            provision_gba_bios(&l, &portable)
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn provision_skips_non_gba_lua_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-snes.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        // No BIOS anywhere, but a non-GBA entry must not attempt provisioning.
+        with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
     }
 }

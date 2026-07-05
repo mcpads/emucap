@@ -1,0 +1,318 @@
+diff --git c/CMakeLists.txt i/CMakeLists.txt
+index 4dfcc74d53..242db31a7b 100644
+--- c/CMakeLists.txt
++++ i/CMakeLists.txt
+@@ -2220,6 +2220,8 @@ add_library(${CoreLibName} ${CoreLinkType}
+ 	Core/Debugger/WebSocket/MemorySubscriber.h
+ 	Core/Debugger/WebSocket/ReplaySubscriber.cpp
+ 	Core/Debugger/WebSocket/ReplaySubscriber.h
++	Core/Debugger/WebSocket/SaveStateSubscriber.cpp
++	Core/Debugger/WebSocket/SaveStateSubscriber.h
+ 	Core/Debugger/WebSocket/SteppingBroadcaster.cpp
+ 	Core/Debugger/WebSocket/SteppingBroadcaster.h
+ 	Core/Debugger/WebSocket/SteppingSubscriber.cpp
+diff --git c/Core/Debugger/WebSocket.cpp i/Core/Debugger/WebSocket.cpp
+index 6e12abe5db..e282588150 100644
+--- c/Core/Debugger/WebSocket.cpp
++++ i/Core/Debugger/WebSocket.cpp
+@@ -61,6 +61,7 @@
+ #include "Core/Debugger/WebSocket/MemoryInfoSubscriber.h"
+ #include "Core/Debugger/WebSocket/MemorySubscriber.h"
+ #include "Core/Debugger/WebSocket/ReplaySubscriber.h"
++#include "Core/Debugger/WebSocket/SaveStateSubscriber.h"
+ #include "Core/Debugger/WebSocket/SteppingSubscriber.h"
+ #include "Core/Debugger/WebSocket/ClientConfigSubscriber.h"
+ 
+@@ -78,6 +79,7 @@ static const std::vector<SubscriberInit> subscribers({
+ 	&WebSocketMemoryInfoInit,
+ 	&WebSocketMemoryInit,
+ 	&WebSocketReplayInit,
++	&WebSocketSaveStateInit,
+ 	&WebSocketSteppingInit,
+ 	&WebSocketClientConfigInit,
+ });
+diff --git c/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp i/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
+index 972ac82334..4b940cb94c 100644
+--- c/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
++++ i/Core/Debugger/WebSocket/GPUBufferSubscriber.cpp
+@@ -22,15 +22,21 @@
+ #endif
+ #include "Common/Data/Encoding/Base64.h"
+ #include "Common/StringUtils.h"
++#include "Common/TimeUtil.h"
++#include "Core/Core.h"
+ #include "Core/Debugger/WebSocket/GPUBufferSubscriber.h"
+ #include "Core/Debugger/WebSocket/WebSocketUtils.h"
+ #include "Core/MIPS/MIPSDebugInterface.h"
+ #include "Core/Screenshot.h"
++#include "GPU/GPU.h"
++#include "GPU/GPUCommon.h"
++#include "GPU/Debugger/Debugger.h"
+ #include "GPU/Debugger/Stepping.h"
+ 
+ DebuggerSubscriber *WebSocketGPUBufferInit(DebuggerEventHandlerMap &map) {
+ 	// No need to bind or alloc state, these are all global.
+ 	map["gpu.buffer.screenshot"] = &WebSocketGPUBufferScreenshot;
++	map["emucap.screenshot"] = &WebSocketGPUBufferEmucapScreenshot;
+ 	map["gpu.buffer.renderColor"] = &WebSocketGPUBufferRenderColor;
+ 	map["gpu.buffer.renderDepth"] = &WebSocketGPUBufferRenderDepth;
+ 	map["gpu.buffer.renderStencil"] = &WebSocketGPUBufferRenderStencil;
+@@ -285,6 +291,55 @@ void WebSocketGPUBufferScreenshot(DebuggerRequest &req) {
+ 	});
+ }
+ 
++// Retrieve a screenshot even while the game runs (emucap.screenshot)
++//
++// emucap fork: stock gpu.buffer.screenshot only works when the GPU is already GE-stepping
++// (CORE_STEPPING_GE); no stock WebSocket command enters GE stepping, so a headless capture of
++// a running game fails with "Could not download output". This drives GE stepping itself: it
++// breaks the GPU on the next frame, downloads the output framebuffer via the same code path as
++// gpu.buffer.screenshot (identical reply shape), then resumes.
++//
++// Parameters (same as gpu.buffer.screenshot):
++//  - type: either 'uri' or 'base64' (optional, defaults to 'uri').
++//  - alpha: boolean to include the alpha channel for 'uri' type.
++//  - stackWidth: optional, forced width for 'uri' type (increases height.)
++//
++// Response (same event name): matches gpu.buffer.screenshot.
++void WebSocketGPUBufferEmucapScreenshot(DebuggerRequest &req) {
++	if (!currentDebugMIPS->isAlive())
++		return req.Fail("CPU not started");
++	if (!gpu)
++		return req.Fail("GPU not available");
++
++	// If the GPU is already GE-stepping, capture directly; otherwise drive it.
++	bool weEnteredStepping = false;
++	if (!GPUStepping::IsStepping()) {
++		// Break at the next vsync -> the EmuThread's GE run loop calls GPUStepping::EnterStepping.
++		gpu->SetBreakNext(GPUDebug::BreakNext::VSYNC);
++		weEnteredStepping = true;
++
++		const double timeoutSeconds = 5.0;
++		double start = time_now_d();
++		while (!GPUStepping::IsStepping()) {
++			if (time_now_d() - start > timeoutSeconds) {
++				gpu->ClearBreakNext();
++				return req.Fail("Timed out entering GPU stepping for screenshot");
++			}
++			sleep_ms(1, "ge-screenshot-poll");
++		}
++	}
++
++	// Now GE-stepping: reuse the exact gpu.buffer.screenshot path (guard now passes).
++	GenericStreamBuffer(req, [](const GPUDebugBuffer *&buf, bool *isFramebuffer) {
++		*isFramebuffer = false;
++		return GPUStepping::GPU_GetOutputFramebuffer(buf);
++	});
++
++	// Resume the GPU (and CPU) back to running if we broke it.
++	if (weEnteredStepping)
++		gpu->ClearBreakNext();
++}
++
+ // Retrieve current color render buffer (gpu.buffer.renderColor)
+ //
+ // Parameters:
+diff --git c/Core/Debugger/WebSocket/GPUBufferSubscriber.h i/Core/Debugger/WebSocket/GPUBufferSubscriber.h
+index 00b93d74c0..6ba1a960e6 100644
+--- c/Core/Debugger/WebSocket/GPUBufferSubscriber.h
++++ i/Core/Debugger/WebSocket/GPUBufferSubscriber.h
+@@ -22,6 +22,7 @@
+ DebuggerSubscriber *WebSocketGPUBufferInit(DebuggerEventHandlerMap &map);
+ 
+ void WebSocketGPUBufferScreenshot(DebuggerRequest &req);
++void WebSocketGPUBufferEmucapScreenshot(DebuggerRequest &req);
+ void WebSocketGPUBufferRenderColor(DebuggerRequest &req);
+ void WebSocketGPUBufferRenderDepth(DebuggerRequest &req);
+ void WebSocketGPUBufferRenderStencil(DebuggerRequest &req);
+diff --git c/Core/Debugger/WebSocket/SaveStateSubscriber.cpp i/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+new file mode 100644
+index 0000000000..53bb7b2dac
+--- /dev/null
++++ i/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+@@ -0,0 +1,135 @@
++// Copyright (c) 2018- PPSSPP Project.
++
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, version 2.0 or later versions.
++
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License 2.0 for more details.
++
++// A copy of the GPL 2.0 should have been included with the program.
++// If not, see http://www.gnu.org/licenses/
++
++// Official git repository and contact information can be found at
++// https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
++
++// emucap fork: adds savestate.save / savestate.load WebSocket commands.
++//
++// Stock PPSSPP exposes no WebSocket save-state command. SaveState::Save/Load are
++// asynchronous: they enqueue an operation that is serviced by SaveState::Process(),
++// which the EmuThread only runs while stepping (Core_ProcessStepping) or, in the GUI,
++// once per frame. Headless never pumps Process() while CORE_RUNNING_CPU, so this
++// handler breaks the CPU into stepping (if running), lets the EmuThread service the
++// operation, waits for the completion callback, then restores the prior run state.
++
++#include <chrono>
++#include <condition_variable>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <string_view>
++
++#include "Common/File/Path.h"
++#include "Core/Core.h"
++#include "Core/Debugger/WebSocket/SaveStateSubscriber.h"
++#include "Core/Debugger/WebSocket/WebSocketUtils.h"
++#include "Core/SaveState.h"
++#include "Core/System.h"
++
++DebuggerSubscriber *WebSocketSaveStateInit(DebuggerEventHandlerMap &map) {
++	// No per-connection state, the save state system is global.
++	map["savestate.save"] = &WebSocketSaveStateSave;
++	map["savestate.load"] = &WebSocketSaveStateLoad;
++
++	return nullptr;
++}
++
++namespace {
++
++struct SaveStateWait {
++	std::mutex m;
++	std::condition_variable cv;
++	bool done = false;
++	SaveState::Status status = SaveState::Status::FAILURE;
++	std::string message;
++};
++
++// Runs a save or load synchronously (from the debugger's perspective) and responds.
++void RunSaveStateOperation(DebuggerRequest &req, bool isSave, BreakReason breakReason) {
++	if (PSP_GetBootState() != BootState::Complete)
++		return req.Fail("Game not running");
++
++	std::string path;
++	if (!req.ParamString("path", &path))
++		return;
++
++	auto wait = std::make_shared<SaveStateWait>();
++	SaveState::Callback cb = [wait](SaveState::Status status, std::string_view message, std::string_view metadata) {
++		std::lock_guard<std::mutex> guard(wait->m);
++		wait->status = status;
++		wait->message = std::string(message);
++		wait->done = true;
++		wait->cv.notify_all();
++	};
++
++	// SaveState::Process() only runs on the EmuThread while it is stepping. If the game
++	// is running, break so the operation is serviced, and resume afterward.
++	bool resumeAfter = false;
++	if (coreState == CORE_RUNNING_CPU) {
++		Core_Break(breakReason, 0);
++		resumeAfter = true;
++	}
++
++	const Path filename(path);
++	if (isSave)
++		SaveState::Save(filename, -1, cb);
++	else
++		SaveState::Load(filename, -1, cb);
++
++	bool completed;
++	{
++		std::unique_lock<std::mutex> guard(wait->m);
++		completed = wait->cv.wait_for(guard, std::chrono::seconds(15), [&] { return wait->done; });
++	}
++
++	if (resumeAfter)
++		Core_Resume();
++
++	if (!completed)
++		return req.Fail(isSave ? "Timed out saving state" : "Timed out loading state");
++	if (wait->status == SaveState::Status::FAILURE)
++		return req.Fail(wait->message.empty() ? (isSave ? "Failed to save state" : "Failed to load state") : wait->message);
++
++	JsonWriter &json = req.Respond();
++	json.writeString("path", path);
++	if (!wait->message.empty())
++		json.writeString("message", wait->message);
++}
++
++}  // namespace
++
++// Save emulator state to a file (savestate.save)
++//
++// Parameters:
++//  - path: string host path to write the save state to.
++//
++// Response (same event name):
++//  - path: string, the path written.
++//  - message: optional string status message.
++void WebSocketSaveStateSave(DebuggerRequest &req) {
++	RunSaveStateOperation(req, true, BreakReason::SavestateSave);
++}
++
++// Load emulator state from a file (savestate.load)
++//
++// Parameters:
++//  - path: string host path to read the save state from.
++//
++// Response (same event name):
++//  - path: string, the path read.
++//  - message: optional string status message.
++void WebSocketSaveStateLoad(DebuggerRequest &req) {
++	RunSaveStateOperation(req, false, BreakReason::SavestateLoad);
++}
+diff --git c/Core/Debugger/WebSocket/SaveStateSubscriber.h i/Core/Debugger/WebSocket/SaveStateSubscriber.h
+new file mode 100644
+index 0000000000..47d4b438c1
+--- /dev/null
++++ i/Core/Debugger/WebSocket/SaveStateSubscriber.h
+@@ -0,0 +1,25 @@
++// Copyright (c) 2018- PPSSPP Project.
++
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation, version 2.0 or later versions.
++
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License 2.0 for more details.
++
++// A copy of the GPL 2.0 should have been included with the program.
++// If not, see http://www.gnu.org/licenses/
++
++// Official git repository and contact information can be found at
++// https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
++
++#pragma once
++
++#include "Core/Debugger/WebSocket/WebSocketUtils.h"
++
++DebuggerSubscriber *WebSocketSaveStateInit(DebuggerEventHandlerMap &map);
++
++void WebSocketSaveStateSave(DebuggerRequest &req);
++void WebSocketSaveStateLoad(DebuggerRequest &req);
+diff --git c/headless/Headless.cpp i/headless/Headless.cpp
+index 293878d511..9e2c0a735d 100644
+--- c/headless/Headless.cpp
++++ i/headless/Headless.cpp
+@@ -229,7 +229,13 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+ 	bool passed = true;
+ 	double deadline = time_now_d() + opt.timeout;
+ 	coreState = coreParameter.startBreak ? CORE_STEPPING_CPU : CORE_RUNNING_CPU;
+-	while (coreState == CORE_RUNNING_CPU || coreState == CORE_STEPPING_CPU)
++	// emucap fork: also keep the run loop alive while the GPU is GE-stepping (CORE_STEPPING_GE)
++	// or resuming from it (CORE_RUNNING_GE). The WebSocket debugger enters GE stepping to capture
++	// the output framebuffer (emucap.screenshot); Core_RunLoopUntil services the GE step and
++	// switches back to CORE_RUNNING_CPU once resumed. Without these states in the condition, the
++	// loop would exit and shut the emulator down the moment a screenshot enters GE stepping.
++	while (coreState == CORE_RUNNING_CPU || coreState == CORE_STEPPING_CPU ||
++		coreState == CORE_STEPPING_GE || coreState == CORE_RUNNING_GE)
+ 	{
+ 		int blockTicks = (int)usToCycles(1000000 / 10);
+ 		PSP_RunLoopFor(blockTicks);

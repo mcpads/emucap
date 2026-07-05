@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use emucap::launch::{
     desmume_nds as desmume_nds_launch, flycast as flycast_launch, mame as mame_launch,
-    mednafen as mednafen_launch, mesen as mesen_launch,
+    mednafen as mednafen_launch, mesen as mesen_launch, ppsspp as ppsspp_launch,
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};
 
@@ -23,6 +23,7 @@ fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
         "mame_pc98" => "adapters/mame-pc98",
         "flycast" => "adapters/flycast",
         "desmume_nds" => "adapters/desmume-nds",
+        "ppsspp" => "adapters/ppsspp",
         _ => return root.join("adapters"),
     };
     let ps1 = root.join(dir).join("launch.ps1");
@@ -248,6 +249,32 @@ fn desmume_nds_binary_precondition(root: &Path) -> serde_json::Value {
     }
 }
 
+/// PPSSPP/PSP needs two binaries — headless PPSSPPHeadless and the emucap PSP WebSocket bridge.
+/// Both must resolve for the launcher to run, so the precondition is available only when both are
+/// present and reports which one is missing otherwise (mirrors `desmume_nds_binary_precondition`).
+fn ppsspp_binary_precondition(root: &Path) -> serde_json::Value {
+    let headless = ppsspp_launch::resolve_binary(root);
+    let bridge = ppsspp_launch::resolve_bridge(root);
+    match (headless, bridge) {
+        (Some(headless), Some(bridge)) => serde_json::json!({
+            "available": true,
+            "path": headless.display().to_string(),
+            "bridge": bridge.display().to_string(),
+            "source": if std::env::var_os("EMUCAP_PPSSPP_BIN").is_some() {
+                "EMUCAP_PPSSPP_BIN"
+            } else {
+                "repo_build"
+            },
+        }),
+        (headless, bridge) => serde_json::json!({
+            "available": false,
+            "source": null,
+            "ppsspp_headless_available": headless.is_some(),
+            "bridge_available": bridge.is_some(),
+        }),
+    }
+}
+
 fn mame_bridge_precondition(root: &Path) -> serde_json::Value {
     match mame_launch::resolve_bridge_runtime(root) {
         Ok(runtime) => serde_json::json!({
@@ -271,6 +298,7 @@ fn adapter_binary_precondition(adapter: &str, root: &Path) -> serde_json::Value 
         "flycast" => flycast_binary_precondition(),
         "mame_pc98" => mame_binary_precondition(root),
         "desmume_nds" => desmume_nds_binary_precondition(root),
+        "ppsspp" => ppsspp_binary_precondition(root),
         _ => serde_json::Value::Null,
     }
 }
@@ -310,6 +338,12 @@ fn build_required_precondition(
         )),
         "desmume_nds" => serde_json::json!(format!(
             "{} 선행 빌드(desmume-cli) + emucap-desmume-nds-bridge(cargo build --release) 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapter build.sh")
+        )),
+        "ppsspp" => serde_json::json!(format!(
+            "{} 선행 빌드(PPSSPPHeadless) + emucap-ppsspp-bridge(cargo build --release) 필요 — 미충족이면 launcher가 binary-not-found로 실패",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
@@ -406,6 +440,7 @@ fn normalize_system(system: &str) -> Option<&'static str> {
         "pc98" | "pc-98" | "mame-pc98" | "pc9801" | "pc9821" => Some("pc98"),
         "dc" | "dreamcast" | "flycast" | "sega-dreamcast" => Some("dc"),
         "nds" | "ds" | "nintendo-ds" | "nintendods" | "desmume" => Some("nds"),
+        "psp" | "ppsspp" | "playstation-portable" => Some("psp"),
         _ => None,
     }
 }
@@ -479,6 +514,9 @@ fn content_markers(path: Option<&str>) -> serde_json::Value {
     for candidate in candidates.into_iter().take(4) {
         if let Some(bytes) = read_prefix(&candidate, 1024 * 1024) {
             scanned_files.push(candidate.display().to_string());
+            if contains_ascii_case_insensitive(&bytes, b"PSP GAME") {
+                markers.push("psp_game_marker");
+            }
             if contains_ascii_case_insensitive(&bytes, b"SEGA SEGASATURN") {
                 markers.push("sega_saturn_header");
             }
@@ -544,6 +582,15 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             .is_some_and(|items| items.iter().any(|v| v.as_str() == Some(name)))
     };
 
+    if has_marker("psp_game_marker") {
+        return serde_json::json!({
+            "system": "psp",
+            "confidence": "header",
+            "reason": "media prefix contains a PSP GAME marker (ISO9660 System Identifier)",
+            "needs_user_input": false,
+            "markers": markers,
+        });
+    }
     if has_marker("sega_saturn_header") {
         return serde_json::json!({
             "system": "saturn",
@@ -659,13 +706,20 @@ fn infer_system(content_path: Option<&str>, requested_system: Option<&str>) -> s
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("cso" | "pbp") => serde_json::json!({
+            "system": "psp",
+            "confidence": "extension",
+            "reason": "PSP compressed ISO (.cso) / EBOOT (.pbp) extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("cue" | "chd" | "bin" | "iso" | "img" | "ccd") => serde_json::json!({
             "system": null,
             "confidence": "ambiguous_media",
-            "reason": "disc/binary image extension can map to Saturn, PSX, PCE, MD, or Dreamcast; do not guess without header evidence",
+            "reason": "disc/binary image extension can map to Saturn, PSX, PCE, MD, PSP, or Dreamcast; do not guess without header evidence",
             "needs_user_input": true,
-            "required_user_input": "이 image가 saturn, psx, pce, md, dc 중 무엇인지 지정하라",
-            "candidates": ["saturn", "psx", "pce", "md", "dc"],
+            "required_user_input": "이 image가 saturn, psx, pce, md, psp, dc 중 무엇인지 지정하라",
+            "candidates": ["saturn", "psx", "pce", "md", "psp", "dc"],
             "markers": markers,
         }),
         other => serde_json::json!({
@@ -694,6 +748,7 @@ fn adapter_for_system(system: &str) -> (&'static str, Option<&'static str>) {
         "pc98" => ("mame_pc98", None),
         "dc" => ("flycast", None),
         "nds" => ("desmume_nds", None),
+        "psp" => ("ppsspp", None),
         _ => ("", None),
     }
 }
@@ -868,6 +923,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "Mednafen Rust launch is the supported detached path; do not hand-roll raw nohup."
         } else if adapter == "flycast" {
             "Flycast renders a GUI window and needs the display awake. Rust launch uses an emucap-owned isolated config copy and forces the interpreter when needed; do not run Flycast.app directly."
+        } else if adapter == "ppsspp" {
+            "Headless PPSSPP boots the content positionally (not -m/--mount, which only mounts a second image) and is never passed --timeout (that flag aborts the run on a wall-clock deadline regardless of debugger activity); the Rust launch path manages the process lifecycle instead."
         } else {
             "Use the Rust launch tool from this plan."
         },
@@ -969,6 +1026,7 @@ pub(crate) fn make_launch(
         "flycast" => launch_flycast(port, token.as_deref(), a),
         "mame_pc98" => launch_mame(port, token.as_deref(), a),
         "desmume_nds" => launch_desmume_nds(port, token.as_deref(), a),
+        "ppsspp" => launch_ppsspp(port, token.as_deref(), a),
         _ => serde_json::json!({
             "launched": false,
             "reason": format!("{system} 시스템은 Rust 런처 대상이 아니다"),
@@ -1056,6 +1114,65 @@ fn launch_desmume_nds(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_j
             "log": log.display().to_string(),
             "note": "DeSmuME + NDS GDB bridge 2-process launch. If the bridge spawn fails after DeSmuME spawn, the Rust launcher terminates DeSmuME.",
             "next_action": "5~8초 뒤 status로 connected=true를 확인하라(미연결이면 desmume-nds.log의 GDB/bridge 연결을 의심)",
+        }),
+        Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
+    }
+}
+
+/// PPSSPP/PSP leg of `make_launch`: spawn headless PPSSPP (debugger WebSocket) + the PSP WS bridge;
+/// a 2-process launch like NDS/MAME PC-98. Mirrors adapters/ppsspp/launch.sh.
+fn launch_ppsspp(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+    let Some(root) = find_repo_root() else {
+        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+    };
+    let display = a.display.unwrap_or(false);
+    // display=true (HITL) launches the PPSSPPSDL GUI build (a real window a human sees and plays);
+    // default headless launches PPSSPPHeadless. Both carry the same fork patch stack and speak the
+    // same debugger WebSocket, so the agent drives either identically.
+    let binary = if display {
+        let Some(gui) = ppsspp_launch::resolve_gui_binary(&root) else {
+            return serde_json::json!({ "launched": false, "reason": "PPSSPPSDL(GUI) 바이너리 미발견 — display=true는 adapters/ppsspp/build.sh(PPSSPPSDL 타깃)로 빌드하거나 EMUCAP_PPSSPP_GUI_BIN을 설정해야 한다" });
+        };
+        gui
+    } else {
+        let Some(headless) = ppsspp_launch::resolve_binary(&root) else {
+            return serde_json::json!({ "launched": false, "reason": "PPSSPPHeadless 바이너리 미발견 — adapters/ppsspp/build.sh로 빌드하거나 EMUCAP_PPSSPP_BIN을 설정하라" });
+        };
+        headless
+    };
+    let Some(bridge) = ppsspp_launch::resolve_bridge(&root) else {
+        return serde_json::json!({ "launched": false, "reason": "PSP bridge 바이너리 미발견 — cargo build --release --bin emucap-ppsspp-bridge 하거나 EMUCAP_PSP_BRIDGE_BIN을 설정하라" });
+    };
+    let log = adapter_log_path("ppsspp", port, "ppsspp.log");
+    let spec = ppsspp_launch::Launch {
+        binary: &binary,
+        bridge: &bridge,
+        content: &a.content_path,
+        log_path: &log,
+        port,
+        name: a.name.as_deref(),
+        session_token: token,
+        display,
+    };
+    match ppsspp_launch::launch(&spec) {
+        Ok(launched) => serde_json::json!({
+            "launched": true,
+            "adapter": "ppsspp",
+            "pid": launched.ppsspp_pid,
+            "ppsspp_pid": launched.ppsspp_pid,
+            "bridge_pid": launched.bridge_pid,
+            "ws_port": launched.ws_port,
+            "display": display,
+            "port": port,
+            "binary": binary.display().to_string(),
+            "bridge": bridge.display().to_string(),
+            "log": log.display().to_string(),
+            "note": if display {
+                "PPSSPP(GUI) + PSP debugger-WebSocket bridge 2-process launch. HITL 창이 열린다(사람이 보고 PPSSPP 자체 키/게임패드 매핑으로 플레이). GUI는 startBreak 없이 부팅되어 게임이 바로 돈다. macOS는 caffeinate로 디스플레이를 깨워둔다."
+            } else {
+                "PPSSPP + PSP debugger-WebSocket bridge 2-process launch. PPSSPPHeadless는 --timeout 없이 뜬다(지정하면 WS 활동과 무관하게 강제 종료됨). If the bridge spawn fails after PPSSPP spawn, the Rust launcher terminates PPSSPP."
+            },
+            "next_action": "5~8초 뒤 status로 connected=true를 확인하라(미연결이면 ppsspp.log의 debugger WebSocket/bridge 연결을 의심)",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }

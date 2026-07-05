@@ -38,6 +38,7 @@ fn adapter_logs_live_under_per_port_emucap_home() {
         ("flycast", "flycast.log"),
         ("mame-pc98", "mame-pc98.log"),
         ("mednafen", "mednafen.log"),
+        ("ppsspp", "ppsspp.log"),
     ];
     for (adapter, file) in cases {
         let path = adapter_log_path(adapter, 47911, file);
@@ -257,6 +258,51 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
         .unwrap()
         .iter()
         .any(|v| v.as_str() == Some("pce")));
+    // PSP also boots from .iso — registering it must not silently drop it from the ambiguous set
+    // (guessing it without header evidence would be just as wrong as guessing saturn/psx/pce/md).
+    assert!(inferred["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("psp")));
+}
+
+#[test]
+fn infer_system_uses_psp_game_header_in_iso() {
+    // Real PSP UMD ISOs are ISO9660 with a "PSP GAME" System Identifier at the Primary Volume
+    // Descriptor (LBA 16 = byte offset 0x8000, field offset 8) — verified against a real retail
+    // ISO in `.superpowers/sdd/task-11-report.md`. A plain .iso extension alone is ambiguous
+    // (shared with Saturn/PSX/PCE/MD/Dreamcast), so this header disambiguates it like the existing
+    // Saturn/PSX/PCE/MD marker checks.
+    let tmp = tempfile::tempdir().unwrap();
+    let iso = tmp.path().join("game.iso");
+    let mut data = vec![0u8; 0x8100];
+    data[0x8008..0x8008 + 8].copy_from_slice(b"PSP GAME");
+    std::fs::write(&iso, data).unwrap();
+
+    let inferred = infer_system(iso.to_str(), None);
+    assert_eq!(inferred["system"], "psp");
+    assert_eq!(inferred["confidence"], "header");
+    assert_eq!(inferred["needs_user_input"], false);
+}
+
+#[test]
+fn infer_system_maps_psp_cso_and_pbp_extensions() {
+    for ext in ["cso", "pbp"] {
+        let inferred = infer_system(Some(&format!("/tmp/game.{ext}")), None);
+        assert_eq!(inferred["system"], "psp", "extension .{ext}");
+        assert_eq!(inferred["confidence"], "extension", "extension .{ext}");
+        assert_eq!(inferred["needs_user_input"], false, "extension .{ext}");
+    }
+}
+
+#[test]
+fn normalize_system_accepts_psp_aliases() {
+    for alias in ["psp", "ppsspp", "playstation-portable"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "psp", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
 }
 
 #[test]
@@ -585,6 +631,74 @@ fn desmume_nds_precondition_reports_missing_binaries() {
     assert!(build_required
         .as_str()
         .is_some_and(|s| s.contains("emucap-desmume-nds-bridge")));
+}
+
+#[test]
+fn launch_plan_for_psp_uses_ppsspp_adapter_and_mcp_launcher() {
+    // .cso is unambiguously PSP (extension inference, no header evidence needed — mirrors the .nds
+    // case), routing to the ppsspp adapter with no force_module. Preferred launcher is the MCP
+    // launch tool; the legacy fallback points at adapters/ppsspp/launch.sh.
+    let plan = make_launch_plan(
+        Some(47805),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/game.cso".into()),
+            system: None,
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "psp");
+    assert_eq!(plan["adapter"], "ppsspp");
+    assert_eq!(plan["force_module"], serde_json::Value::Null);
+    assert_eq!(plan["preferred_launcher"]["tool"], "launch");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "psp");
+    assert!(plan["legacy_fallback_launcher"]
+        .as_str()
+        .is_some_and(|p| path_ends_with_parts(p, &["adapters", "ppsspp", "launch.sh"])));
+    assert!(plan["legacy_fallback_command"]
+        .as_str()
+        .unwrap()
+        .contains("psp_session"));
+    assert_eq!(
+        plan["legacy_fallback"]["available_on_this_host"],
+        serde_json::json!(!cfg!(windows))
+    );
+}
+
+#[test]
+fn ppsspp_precondition_reports_missing_binaries() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let old_headless = std::env::var_os("EMUCAP_PPSSPP_BIN");
+    let old_bridge = std::env::var_os("EMUCAP_PSP_BRIDGE_BIN");
+    // Point both overrides at nonexistent files so neither binary resolves regardless of the host.
+    std::env::set_var("EMUCAP_PPSSPP_BIN", tmp.path().join("missing-ppsspp"));
+    std::env::set_var("EMUCAP_PSP_BRIDGE_BIN", tmp.path().join("missing-bridge"));
+
+    let precondition = ppsspp_binary_precondition(tmp.path());
+
+    match old_headless {
+        Some(v) => std::env::set_var("EMUCAP_PPSSPP_BIN", v),
+        None => std::env::remove_var("EMUCAP_PPSSPP_BIN"),
+    }
+    match old_bridge {
+        Some(v) => std::env::set_var("EMUCAP_PSP_BRIDGE_BIN", v),
+        None => std::env::remove_var("EMUCAP_PSP_BRIDGE_BIN"),
+    }
+
+    assert_eq!(precondition["available"], serde_json::json!(false));
+    assert_eq!(
+        precondition["ppsspp_headless_available"],
+        serde_json::json!(false)
+    );
+    assert_eq!(precondition["bridge_available"], serde_json::json!(false));
+
+    let paths = serde_json::json!({
+        "adapters": { "ppsspp": { "build": "/repo/adapters/ppsspp/build.sh" } }
+    });
+    let build_required = build_required_precondition("ppsspp", &paths, &precondition);
+    assert!(build_required
+        .as_str()
+        .is_some_and(|s| s.contains("emucap-ppsspp-bridge")));
 }
 
 #[test]

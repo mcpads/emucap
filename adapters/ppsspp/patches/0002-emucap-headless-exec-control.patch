@@ -1,0 +1,75 @@
+diff --git c/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp i/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
+index 57d79459b3..d14d747d84 100644
+--- c/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
++++ i/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
+@@ -91,7 +91,9 @@ void WebSocketCPUResume(DebuggerRequest &req) {
+ 
+ 	g_breakpoints.SetSkipFirst(currentMIPS->pc);
+ 	if (currentMIPS->inDelaySlot) {
+-		Core_RequestCPUStep(CPUStepType::Into, 1);
++		// emucap fork: step size is in BYTES (see SteppingSubscriber Into()); one 4-byte MIPS
++		// delay-slot instruction is 4, not 1 (which single-stepped 0 instructions).
++		Core_RequestCPUStep(CPUStepType::Into, 4);
+ 	}
+ 	Core_Resume();
+ }
+diff --git c/Core/Debugger/WebSocket/SteppingSubscriber.cpp i/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+index 04c2824455..d64a1c8d16 100644
+--- c/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ i/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -103,8 +103,13 @@ void WebSocketSteppingState::Into(DebuggerRequest &req) {
+ 		// If the current PC is on a breakpoint, the user doesn't want to do nothing.
+ 		g_breakpoints.SetSkipFirst(currentMIPS->pc);
+ 
+-		int c = GetNextInstructionCount(cpuDebug);
+-		Core_RequestCPUStep(CPUStepType::Into, c);
++		// emucap fork: Core_PerformCPUStep treats the step size as BYTES (it single-steps
++		// (newAddr - pc) / 4 instructions, newAddr = pc + size). The GUI stepper passes a byte
++		// size (getInstructionSizeAt); this path passed an instruction *count* instead, so a
++		// count of 1 yielded (1 / 4) = 0 single-steps and the PC never advanced. Pass the byte
++		// distance to the next instruction so stepInto advances exactly one instruction.
++		uint32_t byteSize = GetNextAddress(cpuDebug) - cpuDebug->GetPC();
++		Core_RequestCPUStep(CPUStepType::Into, byteSize);
+ 	} else {
+ 		uint32_t breakpointAddress = cpuDebug->GetPC();
+ 		PrepareResume();
+@@ -273,8 +278,10 @@ int WebSocketSteppingState::GetNextInstructionCount(DebugInterface *cpuDebug) {
+ 
+ void WebSocketSteppingState::PrepareResume() {
+ 	if (currentMIPS->inDelaySlot) {
+-		// Delay slot instructions are never joined, so we pass 1.
+-		Core_RequestCPUStep(CPUStepType::Into, 1);
++		// emucap fork: step size is in BYTES (see Into()); a delay-slot instruction is one 4-byte
++		// MIPS instruction, so pass 4 — passing 1 single-stepped (1 / 4) = 0 instructions and left
++		// the CPU stuck in the delay slot on resume.
++		Core_RequestCPUStep(CPUStepType::Into, 4);
+ 	} else {
+ 		// If the current PC is on a breakpoint, the user doesn't want to do nothing.
+ 		g_breakpoints.SetSkipFirst(currentMIPS->pc);
+diff --git c/headless/Headless.cpp i/headless/Headless.cpp
+index 9e2c0a735d..945c46d9ce 100644
+--- c/headless/Headless.cpp
++++ i/headless/Headless.cpp
+@@ -40,6 +40,7 @@
+ #include "Core/ConfigValues.h"
+ #include "Core/Core.h"
+ #include "Core/CoreTiming.h"
++#include "Core/Debugger/Breakpoints.h"
+ #include "Core/System.h"
+ #include "Core/WebServer.h"
+ #include "Core/HLE/sceUtility.h"
+@@ -237,6 +238,14 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+ 	while (coreState == CORE_RUNNING_CPU || coreState == CORE_STEPPING_CPU ||
+ 		coreState == CORE_STEPPING_GE || coreState == CORE_RUNNING_GE)
+ 	{
++		// emucap fork: service pending breakpoint updates. In the GUI this runs once per host
++		// frame from NativeFrame (UI/NativeApp.cpp); headless has its own run loop and never calls
++		// it, so a breakpoint added over the WebSocket while running never invalidated the JIT/IR
++		// block cache — the stale compiled block kept executing with no breakpoint check and the
++		// CPU never halted (only the plain interpreter, which checks per instruction, honored them).
++		// Frame() early-returns unless a breakpoint change is pending, so this is cheap.
++		g_breakpoints.Frame();
++
+ 		int blockTicks = (int)usToCycles(1000000 / 10);
+ 		PSP_RunLoopFor(blockTicks);
+ 

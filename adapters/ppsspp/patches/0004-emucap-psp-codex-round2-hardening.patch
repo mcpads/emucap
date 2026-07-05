@@ -1,0 +1,253 @@
+diff --git c/Core/Debugger/WebSocket/GameSubscriber.cpp w/Core/Debugger/WebSocket/GameSubscriber.cpp
+index 7fc0261efb..84b6b11a0e 100644
+--- c/Core/Debugger/WebSocket/GameSubscriber.cpp
++++ w/Core/Debugger/WebSocket/GameSubscriber.cpp
+@@ -50,27 +50,34 @@ void WebSocketGameReset(DebuggerRequest &req) {
+ 	if (needBreak)
+ 		PSP_CoreParameter().startBreak = true;
+ 
+-	// emucap: snapshot the completed-reset generation *before* requesting, so a reset that finishes
+-	// between here and the wait below is still observed (the wait predicate is already satisfied).
+-	uint64_t resetGen = Core_HeadlessResetGeneration();
++	// emucap: in headless the reset runs on the emu-thread run loop (there is no UI message pump), so
++	// enqueue a ticketed reset for it to service. Enqueue BEFORE posting so a reboot that completes
++	// before we wait still records this ticket's result (no lost wakeup). GUI builds ignore the mode
++	// and drive the reset through System_PostUIMessage's own pump.
++	uint64_t resetTicket = 0;
++	if (Core_HeadlessResetMode())
++		resetTicket = Core_EnqueueHeadlessReset();
+ 
+ 	// We can only support async resets here. A lot of the stuff in init must happen on the EmuThread,
+ 	// and we are not on it here.
+ 	System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
+ 
+-	// emucap: in headless the reset runs on the emu-thread run loop (there is no UI message pump).
+-	// Block until that reboot actually completes so the client's ack means "rebooted", not merely
+-	// "reset queued" — otherwise game.reset would look successful while nothing happened. The reboot's
++	// emucap: block until this ticket's reboot actually completes so the client's ack means "rebooted"
++	// (and reflects whether it succeeded), not merely "reset queued" — otherwise game.reset would look
++	// successful while nothing happened or while the reboot failed and the core stopped. The reboot's
+ 	// PSP_Shutdown takes the WS lifecycle lock (its STOPPING notification), which the dispatch is
+ 	// holding for us right now, so we drop it for the wait and reacquire before returning (else the
+ 	// blocked handler would deadlock the reboot). No-op in GUI builds — the mode is never enabled and
+ 	// the UI pump handles the reset itself.
+ 	if (Core_HeadlessResetMode()) {
+ 		WebSocketReleaseLifecycleLock();
+-		bool completed = Core_WaitHeadlessReset(resetGen, 30.0);
++		bool rebooted = false;
++		bool completed = Core_WaitHeadlessReset(resetTicket, 30.0, &rebooted);
+ 		WebSocketReacquireLifecycleLock();
+ 		if (!completed)
+ 			return req.Fail("Reset timed out waiting for the headless reboot to complete");
++		if (!rebooted)
++			return req.Fail("Headless reboot failed — the core was stopped (see PPSSPPHeadless log)");
+ 	}
+ 
+ 	req.Respond();
+diff --git c/Core/System.cpp w/Core/System.cpp
+index 4333b8e9fb..8374f11325 100644
+--- c/Core/System.cpp
++++ w/Core/System.cpp
+@@ -31,6 +31,8 @@
+ #include <condition_variable>
+ #include <chrono>
+ #include <cstdint>
++#include <deque>
++#include <map>
+ 
+ #include "ext/lua/lapi.h"
+ 
+@@ -789,15 +791,20 @@ void PSP_Shutdown(bool success) {
+ 	IncrementDebugCounter(DebugCounter::GAME_SHUTDOWN);
+ }
+ 
+-// emucap headless reset coordination — see Core/System.h. Guards a "reset pending" flag and a
+-// monotonic "reset completed" generation, so the debugger's game.reset handler (WS thread) can
+-// block until the run loop (emu thread) has actually torn down and rebooted the PSP.
++// emucap headless reset coordination — see Core/System.h. Each debugger game.reset (WS thread)
++// enqueues a request that carries its own monotonic ticket, then blocks until the run loop (emu
++// thread) has actually rebooted the PSP for THAT ticket and recorded its success/failure. Tickets
++// keep two concurrent resets from acknowledging each other's reboot (each waiter targets its own
++// ticket, not a shared generation/boolean), and the recorded result lets a failed reboot surface as
++// an error instead of a false "reset ok". emucap uses a single debugger connection so resets are
++// already serialized; this is correctness under concurrency, not a throughput change.
+ namespace {
+ std::mutex g_headlessResetMutex;
+ std::condition_variable g_headlessResetCv;
+ bool g_headlessResetMode = false;
+-bool g_headlessResetPending = false;
+-uint64_t g_headlessResetDoneGen = 0;
++uint64_t g_headlessResetNextTicket = 1;
++std::deque<uint64_t> g_headlessResetQueue;        // enqueued reset requests (tickets), FIFO
++std::map<uint64_t, bool> g_headlessResetResults;  // ticket -> reboot success, set on completion
+ }  // namespace
+ 
+ void Core_EnableHeadlessResetMode() {
+@@ -810,40 +817,47 @@ bool Core_HeadlessResetMode() {
+ 	return g_headlessResetMode;
+ }
+ 
+-void Core_RequestHeadlessReset() {
++uint64_t Core_EnqueueHeadlessReset() {
+ 	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
+-	g_headlessResetPending = true;
++	uint64_t ticket = g_headlessResetNextTicket++;
++	g_headlessResetQueue.push_back(ticket);
++	return ticket;
+ }
+ 
+-bool Core_ConsumeHeadlessReset() {
++bool Core_DequeueHeadlessReset(uint64_t *ticketOut) {
+ 	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
+-	if (!g_headlessResetPending)
++	if (g_headlessResetQueue.empty())
+ 		return false;
+-	g_headlessResetPending = false;
++	*ticketOut = g_headlessResetQueue.front();
++	g_headlessResetQueue.pop_front();
+ 	return true;
+ }
+ 
+-void Core_NotifyHeadlessResetDone() {
++void Core_CompleteHeadlessReset(uint64_t ticket, bool success) {
+ 	{
+ 		std::lock_guard<std::mutex> guard(g_headlessResetMutex);
+-		g_headlessResetDoneGen++;
++		g_headlessResetResults[ticket] = success;
+ 	}
+ 	g_headlessResetCv.notify_all();
+ }
+ 
+-uint64_t Core_HeadlessResetGeneration() {
+-	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
+-	return g_headlessResetDoneGen;
+-}
+-
+-bool Core_WaitHeadlessReset(uint64_t sinceGeneration, double timeoutSeconds) {
++bool Core_WaitHeadlessReset(uint64_t ticket, double timeoutSeconds, bool *successOut) {
+ 	std::unique_lock<std::mutex> guard(g_headlessResetMutex);
+-	// Generation-based so a reset that completes between the caller's snapshot and this wait is not
+-	// missed (the predicate is already satisfied and returns immediately).
+-	return g_headlessResetCv.wait_for(
++	// Ticket-based so a reboot that completes between enqueue and this wait is not missed (its result
++	// is already recorded and the predicate returns immediately), and so this waiter only observes its
++	// OWN ticket's reboot rather than any completed reset. On timeout the result may still be written
++	// later, leaving one bounded stale map entry — acceptable for a 30s timeout that never fires in
++	// the single-connection use.
++	bool done = g_headlessResetCv.wait_for(
+ 		guard,
+ 		std::chrono::duration<double>(timeoutSeconds),
+-		[&] { return g_headlessResetDoneGen > sinceGeneration; });
++		[&] { return g_headlessResetResults.find(ticket) != g_headlessResetResults.end(); });
++	if (!done)
++		return false;
++	if (successOut)
++		*successOut = g_headlessResetResults[ticket];
++	g_headlessResetResults.erase(ticket);
++	return true;
+ }
+ 
+ void PSP_RunLoopWhileState() {
+diff --git c/Core/System.h w/Core/System.h
+index d6e08dde6c..d4dfe6c2c0 100644
+--- c/Core/System.h
++++ w/Core/System.h
+@@ -82,17 +82,19 @@ void PSP_Shutdown(bool success);
+ 
+ // emucap headless reset coordination. A host with no UI message pump (the headless run loop)
+ // performs REQUEST_GAME_RESET on its own emu-thread loop rather than via System_PostUIMessage. The
+-// debugger's game.reset handler blocks on Core_WaitHeadlessReset until that reboot completes, so the
+-// client's ack means "rebooted", not merely "reset queued". These are inert in GUI builds — the
+-// mode is only ever enabled from headless main(), so Core_HeadlessResetMode() stays false there and
+-// the GUI keeps handling REQUEST_GAME_RESET through its own message pump.
++// debugger's game.reset handler enqueues a ticketed request and blocks on Core_WaitHeadlessReset
++// until the run loop reboots the PSP for that ticket, so the client's ack means "rebooted (and
++// whether it succeeded)", not merely "reset queued". Each request carries its own ticket so two
++// concurrent resets never acknowledge each other's reboot, and the recorded per-ticket result lets a
++// failed reboot be reported as an error. Inert in GUI builds — the mode is only ever enabled from
++// headless main(), so Core_HeadlessResetMode() stays false there and the GUI keeps handling
++// REQUEST_GAME_RESET through its own message pump.
+ void Core_EnableHeadlessResetMode();
+ bool Core_HeadlessResetMode();
+-void Core_RequestHeadlessReset();          // set pending (from the headless System_PostUIMessage stub)
+-bool Core_ConsumeHeadlessReset();          // run loop: true (and clears pending) if a reset is due
+-void Core_NotifyHeadlessResetDone();       // run loop: one reset completed
+-uint64_t Core_HeadlessResetGeneration();   // completed-reset counter; snapshot it before requesting
+-bool Core_WaitHeadlessReset(uint64_t sinceGeneration, double timeoutSeconds);  // block until it advances
++uint64_t Core_EnqueueHeadlessReset();                       // WS thread: enqueue a reset, returns its ticket
++bool Core_DequeueHeadlessReset(uint64_t *ticketOut);        // run loop: pop the next queued reset ticket, if any
++void Core_CompleteHeadlessReset(uint64_t ticket, bool success);  // run loop: record this ticket's reboot result
++bool Core_WaitHeadlessReset(uint64_t ticket, double timeoutSeconds, bool *successOut);  // WS: block for this ticket
+ 
+ FileLoader *PSP_LoadedFile();
+ 
+diff --git c/Core/WebServer.cpp w/Core/WebServer.cpp
+index a44f64db4d..31b9e7423f 100644
+--- c/Core/WebServer.cpp
++++ w/Core/WebServer.cpp
+@@ -767,12 +767,16 @@ static void WebServerThread() {
+ 	http->RegisterHandler("/debugger", &ForwardDebuggerRequest);
+ 	http->RegisterHandler("/upload_file", &HandleUploadPost);
+ 
+-	// emucap: when this web server exists only to serve the debugger control channel (no LAN disc
+-	// sharing requested), bind loopback only. Otherwise the debugger — which can memory.read/write
+-	// and, via the fork's savestate.save with a host path, write arbitrary files — is reachable
+-	// unauthenticated from any host on the network. Disc sharing (DISCS) legitimately needs the LAN,
+-	// so it keeps the all-interfaces bind.
+-	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) && !(serverFlags & WebServerFlags::DISCS);
++	// emucap: whenever the debugger control channel is served, bind this shared HTTP server loopback
++	// only. The debugger can memory.read/write and, via the fork's savestate.save with a host path,
++	// write arbitrary files, so it must never be reachable unauthenticated from another host on the
++	// LAN. This is a single listener socket shared by every enabled handler, so the loopback bind is
++	// all-or-nothing: with DEBUGGER set we deliberately keep the whole server loopback even when disc
++	// sharing (DISCS) is also enabled — i.e. LAN disc sharing is unavailable while the debugger is on
++	// (the debugger's confinement wins over disc reach). The loopback decision must NOT depend on
++	// DISCS: DEBUGGER|DISCS previously flipped this to a wildcard bind and re-exposed /debugger. emucap
++	// only ever enables DEBUGGER (headless main), so disc sharing is moot here; this is defense in depth.
++	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) != 0;
+ 	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
+ 		if (!http->Listen(0, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
+ 			ERROR_LOG(Log::FileSystem, "Unable to listen on any port (debugger - webserver)");
+diff --git c/headless/Headless.cpp w/headless/Headless.cpp
+index 44e996f6a1..304b2b4b1e 100644
+--- c/headless/Headless.cpp
++++ w/headless/Headless.cpp
+@@ -98,11 +98,9 @@ bool System_GetPropertyBool(SystemProperty prop) {
+ void System_Notify(SystemNotification notification) {}
+ void System_PostUIMessage(UIMessage message, std::string_view param) {
+ 	// emucap: headless has no UI message pump, so the GUI's REQUEST_GAME_RESET path never runs and
+-	// game.reset would be a silent no-op. Record the request; the run loop below performs the real
+-	// reset (shutdown + reboot) on the emu thread and signals completion.
+-	if (message == UIMessage::REQUEST_GAME_RESET) {
+-		Core_RequestHeadlessReset();
+-	}
++	// game.reset would be a silent no-op. The debugger's game.reset handler instead enqueues a
++	// ticketed reset (Core_EnqueueHeadlessReset) that the run loop below services — so this stub does
++	// nothing (enqueuing here too would double-run the reset for one request).
+ }
+ void System_RunOnMainThread(std::function<void()>) {}
+ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
+@@ -258,7 +256,8 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+ 		// the reboot here on the emu thread — the same PSP_Shutdown + re-init the GUI does — then
+ 		// signal the waiting game.reset ack. Breakpoints live in g_breakpoints (WS-side) and survive
+ 		// the reset; the next g_breakpoints.Frame() re-arms them against the freshly booted code.
+-		if (Core_ConsumeHeadlessReset()) {
++		uint64_t resetTicket = 0;
++		if (Core_DequeueHeadlessReset(&resetTicket)) {
+ 			// End the current host frame on the old GPU before PSP_Shutdown destroys it.
+ 			if (gpu) {
+ 				gpu->EndHostFrame();
+@@ -287,9 +286,10 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+ 				fprintf(stderr, "headless reset failed to reboot: %s\n", reset_error.c_str());
+ 				Core_Stop();
+ 			}
+-			// Wake the game.reset handler only after the reboot has completed (or failed), so the
+-			// debugger client's ack means the machine really rebooted.
+-			Core_NotifyHeadlessResetDone();
++			// Record this ticket's outcome so the waiting game.reset ack reflects the real result: a
++			// successful reboot responds success, a failed reboot (core stopped) surfaces as an error
++			// instead of a false "reset ok".
++			Core_CompleteHeadlessReset(resetTicket, rebooted);
+ 			continue;
+ 		}
+ 

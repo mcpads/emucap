@@ -1,0 +1,370 @@
+diff --git c/Common/Net/HTTPServer.cpp w/Common/Net/HTTPServer.cpp
+index c69aae0125..e931676991 100644
+--- c/Common/Net/HTTPServer.cpp
++++ w/Common/Net/HTTPServer.cpp
+@@ -158,18 +158,25 @@ void Server::SetFallbackHandler(UrlHandlerFunc handler) {
+ 	fallback_ = handler;
+ }
+ 
+-bool Server::Listen(int port, const char *reason, net::DNSType type) {
++bool Server::Listen(int port, const char *reason, net::DNSType type, bool loopbackOnly) {
+ 	bool success = false;
++	// emucap: a loopback-only server binds IPv4 127.0.0.1. The emucap debugger bridge connects over
++	// IPv4, and a single listener socket can bind only one loopback address — a socket bound to ::1
++	// alone would refuse 127.0.0.1. IPv4 loopback is both what the client uses and off-LAN, which is
++	// the security goal; so for loopback-only we take the IPv4 path regardless of the DNS type hint.
++	if (loopbackOnly) {
++		return Listen4(port, reason, true);
++	}
+ 	if (type == net::DNSType::ANY || type == net::DNSType::IPV6) {
+-		success = Listen6(port, type == net::DNSType::IPV6, reason);
++		success = Listen6(port, type == net::DNSType::IPV6, reason, loopbackOnly);
+ 	}
+ 	if (!success && (type == net::DNSType::ANY || type == net::DNSType::IPV4)) {
+-		success = Listen4(port, reason);
++		success = Listen4(port, reason, loopbackOnly);
+ 	}
+ 	return success;
+ }
+ 
+-bool Server::Listen4(int port, const char *reason) {
++bool Server::Listen4(int port, const char *reason, bool loopbackOnly) {
+ 	listenerSock_ = socket(AF_INET, SOCK_STREAM, 0);
+ 	if (listenerSock_ < 0)
+ 		return false;
+@@ -177,7 +184,8 @@ bool Server::Listen4(int port, const char *reason) {
+ 	struct sockaddr_in server_addr;
+ 	memset(&server_addr, 0, sizeof(server_addr));
+ 	server_addr.sin_family = AF_INET;
+-	server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
++	// emucap: loopback-only binds 127.0.0.1 so the server can't be reached from other hosts.
++	server_addr.sin_addr.s_addr = htonl(loopbackOnly ? INADDR_LOOPBACK : INADDR_ANY);
+ 	server_addr.sin_port = htons(port);
+ 
+ 	int opt = 1;
+@@ -215,7 +223,7 @@ bool Server::Listen4(int port, const char *reason) {
+ 	return true;
+ }
+ 
+-bool Server::Listen6(int port, bool ipv6_only, const char *reason) {
++bool Server::Listen6(int port, bool ipv6_only, const char *reason, bool loopbackOnly) {
+ #if !PPSSPP_PLATFORM(SWITCH)
+ 	listenerSock_ = socket(AF_INET6, SOCK_STREAM, 0);
+ 	if (listenerSock_ < 0)
+@@ -224,7 +232,8 @@ bool Server::Listen6(int port, bool ipv6_only, const char *reason) {
+ 	struct sockaddr_in6 server_addr;
+ 	memset(&server_addr, 0, sizeof(server_addr));
+ 	server_addr.sin6_family = AF_INET6;
+-	server_addr.sin6_addr = in6addr_any;
++	// emucap: loopback-only binds ::1 so the server can't be reached from other hosts.
++	server_addr.sin6_addr = loopbackOnly ? in6addr_loopback : in6addr_any;
+ 	server_addr.sin6_port = htons(port);
+ 
+ 	int opt = 1;
+diff --git c/Common/Net/HTTPServer.h w/Common/Net/HTTPServer.h
+index a60b061b7f..facd32065d 100644
+--- c/Common/Net/HTTPServer.h
++++ w/Common/Net/HTTPServer.h
+@@ -89,7 +89,9 @@ class Server {
+ 	// May run for (significantly) longer than timeout, but won't wait longer than that
+ 	// for a new connection to handle.
+ 	bool RunSlice(double timeout);
+-	bool Listen(int port, const char *reason, net::DNSType type = net::DNSType::ANY);
++	// emucap: when `loopbackOnly` is set, bind 127.0.0.1 / ::1 instead of INADDR_ANY / in6addr_any,
++	// so a server (e.g. the debugger control channel) is not reachable from other hosts on the LAN.
++	bool Listen(int port, const char *reason, net::DNSType type = net::DNSType::ANY, bool loopbackOnly = false);
+ 	void Stop();
+ 
+ 	void RegisterHandler(const char *url_path, UrlHandlerFunc handler);
+@@ -111,8 +113,8 @@ class Server {
+ 	}
+ 
+ private:
+-	bool Listen6(int port, bool ipv6_only, const char *reason);
+-	bool Listen4(int port, const char *reason);
++	bool Listen6(int port, bool ipv6_only, const char *reason, bool loopbackOnly);
++	bool Listen4(int port, const char *reason, bool loopbackOnly);
+ 
+ 	void HandleConnection(int conn_fd);
+ 
+diff --git c/Core/Debugger/WebSocket.cpp w/Core/Debugger/WebSocket.cpp
+index e282588150..0d3fb30885 100644
+--- c/Core/Debugger/WebSocket.cpp
++++ w/Core/Debugger/WebSocket.cpp
+@@ -94,6 +94,16 @@ static std::condition_variable stopCond;
+ static bool lifecycleLockSetup = false;
+ static std::mutex lifecycleLock;
+ 
++// emucap: see WebSocket.h. A WS command handler that must wait for a core reboot (headless
++// game.reset) releases this lock for the wait so the reboot's PSP_Shutdown (which takes it via the
++// STOPPING lifecycle notification) can proceed, then reacquires it before returning to the dispatch.
++void WebSocketReleaseLifecycleLock() {
++	lifecycleLock.unlock();
++}
++void WebSocketReacquireLifecycleLock() {
++	lifecycleLock.lock();
++}
++
+ static void UpdateConnected(int delta) {
+ 	std::lock_guard<std::mutex> guard(stopLock);
+ 	debuggersConnected += delta;
+diff --git c/Core/Debugger/WebSocket.h w/Core/Debugger/WebSocket.h
+index f05856db20..c4e067d30e 100644
+--- c/Core/Debugger/WebSocket.h
++++ w/Core/Debugger/WebSocket.h
+@@ -24,3 +24,12 @@ class ServerRequest;
+ void HandleDebuggerRequest(const http::ServerRequest &request);
+ // Note: blocks.
+ void StopAllDebuggers();
++
++// emucap: the WS command dispatch runs each handler holding an internal "lifecycle" lock that also
++// guards core startup/shutdown. A handler that must wait for a core reboot (headless game.reset) has
++// to release that lock while waiting — the reboot's PSP_Shutdown takes the same lock via its STOPPING
++// lifecycle notification, so a blocked handler still holding it would deadlock. These let such a
++// handler drop the lock for the wait and reacquire it before returning to the dispatch (whose guard
++// then releases it normally). Only valid to call from within a WS command handler on the WS thread.
++void WebSocketReleaseLifecycleLock();
++void WebSocketReacquireLifecycleLock();
+diff --git c/Core/Debugger/WebSocket/GameSubscriber.cpp w/Core/Debugger/WebSocket/GameSubscriber.cpp
+index b738bd1d9b..7fc0261efb 100644
+--- c/Core/Debugger/WebSocket/GameSubscriber.cpp
++++ w/Core/Debugger/WebSocket/GameSubscriber.cpp
+@@ -17,6 +17,7 @@
+ 
+ #include "Common/System/System.h"
+ #include "Core/Config.h"
++#include "Core/Debugger/WebSocket.h"
+ #include "Core/Debugger/WebSocket/GameSubscriber.h"
+ #include "Core/Debugger/WebSocket/WebSocketUtils.h"
+ #include "Core/ELF/ParamSFO.h"
+@@ -49,10 +50,29 @@ void WebSocketGameReset(DebuggerRequest &req) {
+ 	if (needBreak)
+ 		PSP_CoreParameter().startBreak = true;
+ 
++	// emucap: snapshot the completed-reset generation *before* requesting, so a reset that finishes
++	// between here and the wait below is still observed (the wait predicate is already satisfied).
++	uint64_t resetGen = Core_HeadlessResetGeneration();
++
+ 	// We can only support async resets here. A lot of the stuff in init must happen on the EmuThread,
+ 	// and we are not on it here.
+ 	System_PostUIMessage(UIMessage::REQUEST_GAME_RESET);
+ 
++	// emucap: in headless the reset runs on the emu-thread run loop (there is no UI message pump).
++	// Block until that reboot actually completes so the client's ack means "rebooted", not merely
++	// "reset queued" — otherwise game.reset would look successful while nothing happened. The reboot's
++	// PSP_Shutdown takes the WS lifecycle lock (its STOPPING notification), which the dispatch is
++	// holding for us right now, so we drop it for the wait and reacquire before returning (else the
++	// blocked handler would deadlock the reboot). No-op in GUI builds — the mode is never enabled and
++	// the UI pump handles the reset itself.
++	if (Core_HeadlessResetMode()) {
++		WebSocketReleaseLifecycleLock();
++		bool completed = Core_WaitHeadlessReset(resetGen, 30.0);
++		WebSocketReacquireLifecycleLock();
++		if (!completed)
++			return req.Fail("Reset timed out waiting for the headless reboot to complete");
++	}
++
+ 	req.Respond();
+ }
+ 
+diff --git c/Core/System.cpp w/Core/System.cpp
+index 43b40967ea..4333b8e9fb 100644
+--- c/Core/System.cpp
++++ w/Core/System.cpp
+@@ -28,6 +28,9 @@
+ #endif
+ 
+ #include <mutex>
++#include <condition_variable>
++#include <chrono>
++#include <cstdint>
+ 
+ #include "ext/lua/lapi.h"
+ 
+@@ -786,6 +789,63 @@ void PSP_Shutdown(bool success) {
+ 	IncrementDebugCounter(DebugCounter::GAME_SHUTDOWN);
+ }
+ 
++// emucap headless reset coordination — see Core/System.h. Guards a "reset pending" flag and a
++// monotonic "reset completed" generation, so the debugger's game.reset handler (WS thread) can
++// block until the run loop (emu thread) has actually torn down and rebooted the PSP.
++namespace {
++std::mutex g_headlessResetMutex;
++std::condition_variable g_headlessResetCv;
++bool g_headlessResetMode = false;
++bool g_headlessResetPending = false;
++uint64_t g_headlessResetDoneGen = 0;
++}  // namespace
++
++void Core_EnableHeadlessResetMode() {
++	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
++	g_headlessResetMode = true;
++}
++
++bool Core_HeadlessResetMode() {
++	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
++	return g_headlessResetMode;
++}
++
++void Core_RequestHeadlessReset() {
++	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
++	g_headlessResetPending = true;
++}
++
++bool Core_ConsumeHeadlessReset() {
++	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
++	if (!g_headlessResetPending)
++		return false;
++	g_headlessResetPending = false;
++	return true;
++}
++
++void Core_NotifyHeadlessResetDone() {
++	{
++		std::lock_guard<std::mutex> guard(g_headlessResetMutex);
++		g_headlessResetDoneGen++;
++	}
++	g_headlessResetCv.notify_all();
++}
++
++uint64_t Core_HeadlessResetGeneration() {
++	std::lock_guard<std::mutex> guard(g_headlessResetMutex);
++	return g_headlessResetDoneGen;
++}
++
++bool Core_WaitHeadlessReset(uint64_t sinceGeneration, double timeoutSeconds) {
++	std::unique_lock<std::mutex> guard(g_headlessResetMutex);
++	// Generation-based so a reset that completes between the caller's snapshot and this wait is not
++	// missed (the predicate is already satisfied and returns immediately).
++	return g_headlessResetCv.wait_for(
++		guard,
++		std::chrono::duration<double>(timeoutSeconds),
++		[&] { return g_headlessResetDoneGen > sinceGeneration; });
++}
++
+ void PSP_RunLoopWhileState() {
+ 	// We just run the CPU until we get to vblank. This will quickly sync up pretty nicely.
+ 	// The actual number of cycles doesn't matter so much here as we will break due to CORE_NEXTFRAME, most of the time hopefully...
+diff --git c/Core/System.h w/Core/System.h
+index a5dd39489d..d6e08dde6c 100644
+--- c/Core/System.h
++++ w/Core/System.h
+@@ -80,6 +80,20 @@ BootState PollBootState();
+ 
+ void PSP_Shutdown(bool success);
+ 
++// emucap headless reset coordination. A host with no UI message pump (the headless run loop)
++// performs REQUEST_GAME_RESET on its own emu-thread loop rather than via System_PostUIMessage. The
++// debugger's game.reset handler blocks on Core_WaitHeadlessReset until that reboot completes, so the
++// client's ack means "rebooted", not merely "reset queued". These are inert in GUI builds — the
++// mode is only ever enabled from headless main(), so Core_HeadlessResetMode() stays false there and
++// the GUI keeps handling REQUEST_GAME_RESET through its own message pump.
++void Core_EnableHeadlessResetMode();
++bool Core_HeadlessResetMode();
++void Core_RequestHeadlessReset();          // set pending (from the headless System_PostUIMessage stub)
++bool Core_ConsumeHeadlessReset();          // run loop: true (and clears pending) if a reset is due
++void Core_NotifyHeadlessResetDone();       // run loop: one reset completed
++uint64_t Core_HeadlessResetGeneration();   // completed-reset counter; snapshot it before requesting
++bool Core_WaitHeadlessReset(uint64_t sinceGeneration, double timeoutSeconds);  // block until it advances
++
+ FileLoader *PSP_LoadedFile();
+ 
+ void PSP_RunLoopWhileState();
+diff --git c/Core/WebServer.cpp w/Core/WebServer.cpp
+index 9c0c469495..a44f64db4d 100644
+--- c/Core/WebServer.cpp
++++ w/Core/WebServer.cpp
+@@ -767,8 +767,14 @@ static void WebServerThread() {
+ 	http->RegisterHandler("/debugger", &ForwardDebuggerRequest);
+ 	http->RegisterHandler("/upload_file", &HandleUploadPost);
+ 
+-	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver")) {
+-		if (!http->Listen(0, "debugger-webserver")) {
++	// emucap: when this web server exists only to serve the debugger control channel (no LAN disc
++	// sharing requested), bind loopback only. Otherwise the debugger — which can memory.read/write
++	// and, via the fork's savestate.save with a host path, write arbitrary files — is reachable
++	// unauthenticated from any host on the network. Disc sharing (DISCS) legitimately needs the LAN,
++	// so it keeps the all-interfaces bind.
++	bool loopbackOnly = (serverFlags & WebServerFlags::DEBUGGER) && !(serverFlags & WebServerFlags::DISCS);
++	if (!http->Listen(g_Config.iRemoteISOPort, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
++		if (!http->Listen(0, "debugger-webserver", net::DNSType::ANY, loopbackOnly)) {
+ 			ERROR_LOG(Log::FileSystem, "Unable to listen on any port (debugger - webserver)");
+ 			UpdateStatus(ServerStatus::FINISHED);
+ 			return;
+diff --git c/headless/Headless.cpp w/headless/Headless.cpp
+index 945c46d9ce..44e996f6a1 100644
+--- c/headless/Headless.cpp
++++ w/headless/Headless.cpp
+@@ -96,7 +96,14 @@ bool System_GetPropertyBool(SystemProperty prop) {
+ 	}
+ }
+ void System_Notify(SystemNotification notification) {}
+-void System_PostUIMessage(UIMessage message, std::string_view param) {}
++void System_PostUIMessage(UIMessage message, std::string_view param) {
++	// emucap: headless has no UI message pump, so the GUI's REQUEST_GAME_RESET path never runs and
++	// game.reset would be a silent no-op. Record the request; the run loop below performs the real
++	// reset (shutdown + reboot) on the emu thread and signals completion.
++	if (message == UIMessage::REQUEST_GAME_RESET) {
++		Core_RequestHeadlessReset();
++	}
++}
+ void System_RunOnMainThread(std::function<void()>) {}
+ bool System_MakeRequest(SystemRequestType type, int requestId, const std::string &param1, const std::string &param2, int64_t param3, int64_t param4) {
+ 	switch (type) {
+@@ -246,6 +253,46 @@ bool RunAutoTest(HeadlessHost *headlessHost, CoreParameter &coreParameter, const
+ 		// Frame() early-returns unless a breakpoint change is pending, so this is cheap.
+ 		g_breakpoints.Frame();
+ 
++		// emucap fork: service a real reset requested over the debugger (game.reset). Headless has
++		// no UI message pump, so the GUI's REQUEST_GAME_RESET handler never runs; instead we perform
++		// the reboot here on the emu thread — the same PSP_Shutdown + re-init the GUI does — then
++		// signal the waiting game.reset ack. Breakpoints live in g_breakpoints (WS-side) and survive
++		// the reset; the next g_breakpoints.Frame() re-arms them against the freshly booted code.
++		if (Core_ConsumeHeadlessReset()) {
++			// End the current host frame on the old GPU before PSP_Shutdown destroys it.
++			if (gpu) {
++				gpu->EndHostFrame();
++			}
++			PSP_Shutdown(true);
++
++			std::string reset_error;
++			bool rebooted = false;
++			if (PSP_InitStart(coreParameter)) {
++				while (PSP_InitUpdate(&reset_error) == BootState::Booting) {
++					sleep_ms(1, "headless-reset");
++				}
++				rebooted = PSP_IsInited();
++			}
++			if (rebooted) {
++				System_Notify(SystemNotification::BOOT_DONE);
++				if (gpu) {
++					gpu->BeginHostFrame(g_Config.GetDisplayLayoutConfig(DeviceOrientation::Landscape));
++				}
++				// Mirror the initial launch: a debugger session (startBreak) reboots halted at the
++				// fresh boot entry so the caller can inspect / re-arm breakpoints before running (and
++				// so the reset is verifiable — pc is back at the entry path). Resume to run it.
++				coreState = coreParameter.startBreak ? CORE_STEPPING_CPU : CORE_RUNNING_CPU;
++				deadline = time_now_d() + opt.timeout;
++			} else {
++				fprintf(stderr, "headless reset failed to reboot: %s\n", reset_error.c_str());
++				Core_Stop();
++			}
++			// Wake the game.reset handler only after the reboot has completed (or failed), so the
++			// debugger client's ack means the machine really rebooted.
++			Core_NotifyHeadlessResetDone();
++			continue;
++		}
++
+ 		int blockTicks = (int)usToCycles(1000000 / 10);
+ 		PSP_RunLoopFor(blockTicks);
+ 
+@@ -629,6 +676,9 @@ int main(int argc, const char* argv[])
+ 	if (debuggerPort > 0) {
+ 		g_Config.iRemoteISOPort = debuggerPort;
+ 		coreParameter.startBreak = true;
++		// emucap: let the debugger's game.reset drive a real reboot on the headless run loop and
++		// block its ack until the reboot completes.
++		Core_EnableHeadlessResetMode();
+ 		StartWebServer(WebServerFlags::DEBUGGER);
+ 	}
+ 

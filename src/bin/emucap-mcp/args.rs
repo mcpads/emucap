@@ -492,9 +492,10 @@ pub(crate) struct LaunchArgs {
     /// 연결 이름(선택 — status.emulator_identity.name에 반영).
     #[serde(default)]
     pub(crate) name: Option<String>,
-    /// NDS 창(HITL 시청)을 띄운다 — desmume-cli를 EMUCAP_NDS_DISPLAY=1로 실행해 네이티브 창(Cocoa/Win32/
-    /// X11)을 열고, macOS는 창이 사는 동안 caffeinate로 디스플레이를 깨워둔다. 기본 false(헤드리스, GDB 브리지만).
-    /// NDS 외 어댑터는 무시한다.
+    /// HITL 창(사람이 보고 직접 플레이)을 띄운다 — 에이전트가 디버거로 붙는 동안 사람이 네이티브 창에서
+    /// 게임을 본다. NDS는 desmume-cli를 EMUCAP_NDS_DISPLAY=1로, PSP는 헤드리스 대신 PPSSPPSDL(GUI) 빌드를
+    /// 실행한다. macOS는 창이 사는 동안 caffeinate로 디스플레이를 깨워둔다. 기본 false(헤드리스). HITL 창을
+    /// 지원하지 않는 어댑터는 무시한다.
     #[serde(default)]
     pub(crate) display: Option<bool>,
 }
