@@ -35,6 +35,77 @@ fn is_ping_line(line: &str) -> bool {
         .unwrap_or(false)
 }
 
+// ── 세션-세대 펜싱(steal 안전) ──────────────────────────────
+// stale 세션에서 에뮬레이터를 steal하면, 옛 세션의 in-flight 요청에 대한 응답이 뒤늦게 도착해 신규
+// 세션으로 라우팅될 수 있다. 세션마다 요청 id 공간이 겹치므로(둘 다 1부터) 신규 세션이 그 응답을 자기
+// 것으로 오인할 수 있다. 이를 막으려 세션→에뮬레이터로 나가는 요청 id에 그 세션의 세대(session_gen)를
+// 상위 비트로 박아 세션별 id 네임스페이스를 만든다. 에뮬레이터가 id를 echo하면, 에뮬레이터→세션
+// 라우팅에서 박힌 세대가 *현재 페어링 세션* 세대와 다르면(=옛/steal된 세션의 응답) 버린다(fence).
+//
+// id는 Lua 어댑터(double, 53비트 가수)도 손실 없이 echo하도록 2^53 아래로 유지한다: 하위 32비트=원본
+// id, 다음 20비트=세대 필드. 원본 id는 세션 수명 내 2^32을 넘지 않고, 세대는 20비트로 접어도 steal 시
+// 옛/신 세션 세대가 소수 차이라 앨리어싱하지 않는다.
+const FENCE_ID_BITS: u64 = 32;
+const FENCE_GEN_MASK: u64 = 0xF_FFFF; // 20비트 필드 마스크
+const FENCE_ORIG_MASK: u64 = 0xFFFF_FFFF; // 32비트
+
+/// 세션 세대를 20비트 세대 *필드*로 사상한다. 필드값 0은 "네임스페이스 안 됨" 센티널로 예약하므로,
+/// 실제 세대는 절대 0으로 접히지 않도록 [1, 2^20-1]에 1-based로 사상한다 — 세대가 2^20의 배수일 때
+/// 옛 단순 마스킹이 필드 0을 만들어 그 세션의 펜싱이 조용히 무력화되던 것을 막는다.
+fn fence_gen_field(gen: u64) -> u64 {
+    (gen % FENCE_GEN_MASK) + 1 // ∈ [1, 2^20-1] — 절대 0 아님
+}
+
+fn fence_pack(gen: u64, orig: u64) -> u64 {
+    (fence_gen_field(gen) << FENCE_ID_BITS) | (orig & FENCE_ORIG_MASK)
+}
+fn fence_gen(packed: u64) -> u64 {
+    (packed >> FENCE_ID_BITS) & FENCE_GEN_MASK
+}
+fn fence_orig(packed: u64) -> u64 {
+    packed & FENCE_ORIG_MASK
+}
+
+/// 세션→에뮬레이터로 나가는 요청 줄의 `id`를 이 세션 세대로 네임스페이스한다. numeric `id`가 있으면
+/// `fence_pack(gen, id)`로 치환해 재직렬화, 없거나(heartbeat 등) 파싱 불가면 원본 그대로.
+fn fence_outgoing(line: &str, gen: u64) -> String {
+    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) {
+        if let Some(id) = v.get("id").and_then(|i| i.as_u64()) {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("id".into(), serde_json::json!(fence_pack(gen, id)));
+                return v.to_string();
+            }
+        }
+    }
+    line.to_string()
+}
+
+/// 에뮬레이터→세션으로 가는 응답 줄을 현재 세션 세대 `cur_gen`으로 검사한다.
+/// - 박힌 세대 필드가 현재 세션과 같으면 원본 id로 복원한 줄을 반환(Some).
+/// - 박힌 세대 필드가 있고 다르면(옛/steal된 세션 응답) None → 드롭(fence).
+/// - 세대 필드가 0이면(비-JSON·id 없음·우리가 네임스페이스하지 않은 unsolicited) 원본 그대로 전달(Some).
+///   우리 네임스페이싱은 세대 필드를 절대 0으로 만들지 않으므로(1-based) 이 경로는 진짜 미네임스페이스만 탄다.
+fn fence_incoming(line: &str, cur_gen: u64) -> Option<String> {
+    let mut v = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => v,
+        Err(_) => return Some(line.to_string()), // 비-JSON은 무해석 전달
+    };
+    let Some(id) = v.get("id").and_then(|i| i.as_u64()) else {
+        return Some(line.to_string()); // id 없음 → 그대로 전달
+    };
+    let gen = fence_gen(id);
+    if gen == 0 {
+        return Some(line.to_string()); // 네임스페이스 안 된 id → 그대로 전달
+    }
+    if gen != fence_gen_field(cur_gen) {
+        return None; // 옛/steal된 세션의 응답 → 드롭
+    }
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("id".into(), serde_json::json!(fence_orig(id)));
+    }
+    Some(v.to_string())
+}
+
 #[derive(Default)]
 struct Registry {
     emus: HashMap<String, Emu>,
@@ -160,23 +231,34 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         let _ = old_s.shutdown(std::net::Shutdown::Both);
     }
     // 에뮬레이터-리더: 줄을 읽어 페어링 세션으로(없으면 드레인).
-    // writer는 lock 안에서 try_clone만 — 쓰기는 lock 밖.
+    // writer는 lock 안에서 try_clone만 — 쓰기는 lock 밖. 현재 세션 세대로 응답을 펜싱해, steal 이전
+    // 옛 세션의 in-flight 응답이 신규 소유자에게 오배달되는 것을 막는다(fence_incoming).
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
             break; // EOF
         }
-        let sess = {
+        let raw = line.trim_end();
+        // lock 안에서는 값싼 스냅샷(writer clone + session_gen 복사)만 잡고, 값비싼 JSON 파싱/재직렬화
+        // (fence_incoming)는 lock 밖에서 한다 — 안 그러면 emu→session 줄마다 두 번의 full JSON 패스가
+        // 전역 레지스트리 mutex를 쥔 채 실행돼 broker 트래픽이 그 뒤로 직렬화된다. session_gen은 여기서
+        // 복사한 값으로 펜싱하므로(스냅샷 시점 세대) 동시 steal에도 의미가 바뀌지 않는다(옛 writer로의
+        // 쓰기는 steal 시 소켓이 닫혀 무해).
+        let target = {
             let g = lock(&reg);
-            g.emus
-                .get(&name)
-                .and_then(|e| e.session.as_ref())
-                .and_then(|s| s.try_clone().ok())
+            g.emus.get(&name).and_then(|e| {
+                e.session
+                    .as_ref()
+                    .and_then(|s| s.try_clone().ok())
+                    .map(|s| (s, e.session_gen))
+            })
         };
-        if let Some(mut s) = sess {
-            let _ = write_line(&mut s, line.trim_end());
+        // 페어링 세션 없음, 또는 fence_incoming이 None(옛/steal된 세션 응답)이면 폐기.
+        if let Some((mut s, sess_gen)) = target {
+            if let Some(out) = fence_incoming(raw, sess_gen) {
+                let _ = write_line(&mut s, &out);
+            }
         }
-        // 세션 없으면 드레인(폐기)
     }
     // 에뮬레이터 끊김: gen 가드로 내가 등록한 엔트리일 때만 제거 + 페어링 세션에 알림.
     // 같은 name 재등록(신규 gen)이 먼저 이뤄진 경우 remove를 건너뛰어 신규 등록을 clobber하지 않는다.
@@ -329,7 +411,10 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
         }
         match emu {
             Some(mut e) => {
-                let _ = write_line(&mut e, trimmed);
+                // 요청 id를 이 세션 세대로 네임스페이스해 보낸다 — 응답 echo가 이 세션 것임을 나타내,
+                // steal 이후 옛 세션 응답이 신규 소유자에게 오배달되지 않게 한다(fence_incoming).
+                let out = fence_outgoing(trimmed, my_session_gen);
+                let _ = write_line(&mut e, &out);
             }
             None => break, // 에뮬레이터 사라짐
         }
@@ -341,5 +426,39 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
         if e.session_gen == my_session_gen {
             e.session = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod fence_tests {
+    use super::*;
+
+    #[test]
+    fn session_whose_gen_maps_to_zero_is_still_fenced() {
+        // 세대가 2^20의 배수면 옛 단순 20비트 마스킹이 세대 필드 0을 만들어, fence_incoming의 gen==0
+        // 분기가 그 응답을 무조건 전달 → 그 세션(매 2^20번째)의 steal 펜싱이 조용히 꺼졌다. 1-based
+        // 필드 사상으로 어떤 세대도 0으로 접히지 않아 항상 펜싱되어야 한다.
+        let cur_gen = 1u64 << 20; // 2^20 → 옛 스킴에서 세대 필드 0
+        assert_ne!(
+            fence_gen_field(cur_gen),
+            0,
+            "2^20 배수 세대의 필드는 0이면 안 된다"
+        );
+
+        // 현재 세션이 보낸 요청(orig id=7)의 응답은 통과하고 orig id로 복원돼야 한다.
+        let packed = fence_pack(cur_gen, 7);
+        assert_ne!(fence_gen(packed), 0);
+        let mine = format!(r#"{{"id":{packed},"ok":true}}"#);
+        let out = fence_incoming(&mine, cur_gen).expect("현재 세션 응답은 통과");
+        assert!(out.contains(r#""id":7"#), "orig id 복원: {out}");
+
+        // steal된 옛 세션(다른 세대)의 뒤늦은 응답은 같은 orig id라도 드롭(fence)돼야 한다.
+        let stale_packed = fence_pack(cur_gen + 1, 7);
+        let stale = format!(r#"{{"id":{stale_packed},"ok":true,"result":{{"stale":true}}}}"#);
+        assert_eq!(
+            fence_incoming(&stale, cur_gen),
+            None,
+            "2^20 배수 세대라도 옛/steal 세션 응답은 펜싱(드롭)돼야"
+        );
     }
 }

@@ -315,20 +315,10 @@ mod tests {
         default_rompath, gdb_port_for_emucap_port, repo_local_binary, resolve_bridge_launch,
         resolve_bridge_script, resolve_flop2, Launch,
     };
-    use std::ffi::OsString;
+    use crate::launch::test_env::{lock_env, EnvGuard};
     use std::path::Path;
     #[cfg(any(target_os = "macos", windows))]
     use std::path::PathBuf;
-    use std::sync::Mutex;
-    use std::sync::MutexGuard;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     fn assert_os_path_eq(actual: &Path, expected: &Path) {
         #[cfg(windows)]
@@ -346,29 +336,6 @@ mod tests {
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(perms.mode() | 0o755);
         std::fs::set_permissions(path, perms).unwrap();
-    }
-
-    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
-
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            )
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
     }
 
     #[test]

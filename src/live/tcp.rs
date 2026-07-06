@@ -73,7 +73,40 @@ pub fn new_session_token() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    format!("{:016x}-{:x}-{:x}", cwd_hash(), std::process::id(), nanos)
+    // 포맷 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`. 세션 식별부는 앞 두 필드
+    // `{cwd_hash}-{session_anchor}` — cwd는 세션마다 다르고, session_anchor는 Claude 세션 id 해시라
+    // 같은 세션의 서버 respawn(/mcp 재연결)엔 불변이면서 동시 실행되는 다른 세션과는 달라, 같은 cwd의
+    // 형제 세션을 구별한다(reclaim 오인 방지). 부모 PID는 respawn이 다른 부모 아래로 재spawn되면 값이
+    // 바뀌어, 자기 토큰을 foreign으로 오판해 실행 중 에뮬을 strand하므로 앵커로 쓰지 않는다.
+    // 안정 세션 id가 없으면 앵커 필드는 0으로 적는다(값은 무의미) — 소유 판정은 저장된 앵커가 아니라
+    // own_session_identity()가 Some일 때만 매칭하므로, 이 0은 형제 간 own 오판으로 이어지지 않는다.
+    format!(
+        "{:016x}-{:x}-{:x}-{:x}",
+        cwd_hash(),
+        session_anchor().unwrap_or(0),
+        std::process::id(),
+        nanos
+    )
+}
+
+/// 세션-안정·세션-고유 앵커. 같은 Claude 세션은 /mcp 재연결·서버 respawn에도 같은 session id를
+/// 물려받아 값이 불변(→ 실행 중 자기 에뮬 reclaim)이고, 동시 실행되는 다른 세션은 다른 session id라
+/// 값이 달라(→ 형제 에뮬 조용한 인계 방지) 앵커가 된다. 부모 PID(respawn 시 변동)는 쓰지 않는다.
+/// 안정된 per-session id가 없으면(비-Claude 런타임·plain shell·CI·테스트) `None` — 같은 cwd 형제를
+/// 구별할 수 없으므로 fail-closed로 강등한다. `None`이면 어떤 기존 토큰/포트도 own으로 재사용하지 않아
+/// (session_token_is_own·reusable_session_token·port_persist_path가 모두 거부/None) 형제가 살아있는
+/// 에뮬을 조용히 이어받지 못한다. 옛 동작(앵커 0으로 강등)은 두 형제가 같은 식별부로 붕괴해 서로의
+/// 토큰을 own으로 오판하는 인계 회귀를 냈다 — 그래서 0-강등이 아니라 None-거부로 일반화했다.
+fn session_anchor() -> Option<u64> {
+    for key in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"] {
+        if let Ok(v) = std::env::var(key) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return Some(fnv1a_64(v.as_bytes()));
+            }
+        }
+    }
+    None
 }
 
 const AUTO_PORT_RANGE: u16 = 16; // 기준 포트부터 이만큼 빈 포트를 탐색(N 세션 자동 격리)
@@ -84,24 +117,36 @@ const AUTO_PORT_RANGE: u16 = 16; // 기준 포트부터 이만큼 빈 포트를 
 // 에뮬레이터가 고아가 되고(freeze 화면 손실), 에이전트는 not connected를 본다. 이를 막기 위해 바인드한
 // 포트를 파일에 적어두고, 다음 바인드 때 그 포트를 먼저 정확히 재바인드한다 — 서버가 죽으면 리스너가
 // 닫혀 포트가 비므로 재시작 서버가 같은 포트를 되찾고, 에뮬레이터(옛 포트 고정)가 자동 재연결된다.
-// 세션 구분 키는 cwd(작업 디렉터리) — 세션마다 다르고 /mcp 재연결에도 유지된다. 점유 중이면 스캔 폴백.
-fn cwd_hash() -> u64 {
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_default();
-    // FNV-1a(64) — 프로세스·실행 무관 결정론적(DefaultHasher의 시드 모호성 회피).
+// 세션 구분 키는 세션 식별부(cwd+session id 앵커) — /mcp 재연결에도 유지되고 형제 세션과는 다르다.
+// 안정 세션 id가 없으면 영속화 자체를 건너뛴다(port_persist_path=None) — 형제와 같은 포트 파일을
+// 공유해 서로의 포트를 가로채는 창을 없앤다(fail-closed). 점유 중이면 스캔 폴백.
+/// FNV-1a(64) — 프로세스·실행 무관 결정론적 해시(DefaultHasher의 시드 모호성 회피).
+fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
-    for b in cwd.bytes() {
+    for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
 }
 
-/// 이 세션(cwd)+기준 포트에 대한 포트 영속화 파일 경로. 세션마다 다른 cwd → 다른 파일(상호 간섭 없음).
-pub(crate) fn port_persist_path(base: u16) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("emucap-mcp-port-{:016x}-{base}", cwd_hash()))
+fn cwd_hash() -> u64 {
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_default();
+    fnv1a_64(cwd.as_bytes())
+}
+
+/// 이 세션(식별부 `{cwd_hash}-{session_anchor}`)+기준 포트의 포트 영속화 파일 경로. 세션 식별부로 키해
+/// 형제 세션과 다른 파일을 쓴다(cwd만으로 키하면 형제가 같은 파일을 공유해 포트를 가로챈다). 안정 세션
+/// id가 없거나(fail-closed) base==0(임시포트, 세션 고정 무의미)이면 `None` — 영속화를 건너뛴다.
+pub(crate) fn port_persist_path(base: u16) -> Option<std::path::PathBuf> {
+    if base == 0 {
+        return None;
+    }
+    let identity = own_session_identity()?;
+    Some(std::env::temp_dir().join(format!("emucap-mcp-port-{identity}-{base}")))
 }
 
 fn read_persisted_port(path: &std::path::Path) -> Option<u16> {
@@ -132,16 +177,47 @@ fn write_session_token(port: u16, token: &str) {
     let _ = std::fs::write(session_token_path(port), token);
 }
 
-/// 토큰이 *이 세션(cwd)* 소유인지 — session_token 포맷 `{cwd_hash:016x}-{pid}-{nanos}`의 cwd_hash
-/// 프리픽스로 판정. 소유면 서버 재기동/재연결 시 토큰을 회전하지 않고 재사용해, 실행 중인 자기
-/// 에뮬레이터를 strand하지 않는다(reclaim-own). cwd가 세션 식별 키인 건 포트 영속화와 동일.
+/// 토큰 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`의 세션 식별부 `{cwd_hash}-{session_anchor}`
+/// (앞 두 필드)를 반환한다. 형식이 아니면(구분자 부족) None.
+fn identity_of(token: &str) -> Option<&str> {
+    let cwd_end = token.find('-')?;
+    let anchor_end = token[cwd_end + 1..].find('-')?;
+    Some(&token[..cwd_end + 1 + anchor_end])
+}
+
+/// 이 세션의 식별부 `{cwd_hash}-{session_anchor}` — 안정 세션 id가 있을 때만 Some. 없으면(비-Claude
+/// 런타임 등) None으로 fail-closed 신호를 전파해, 소유 판정·포트 영속화가 모두 거부된다.
+fn own_session_identity() -> Option<String> {
+    session_anchor().map(|anchor| format!("{:016x}-{anchor:x}", cwd_hash()))
+}
+
+/// 토큰이 *이 세션* 소유인지 — cwd만이 아니라 세션 식별부(`{cwd_hash}-{session_anchor}`) 전체
+/// 일치로 판정한다. 소유면 서버 respawn/재연결 시 토큰을 회전하지 않고 재사용해, 실행 중인 자기
+/// 에뮬레이터를 strand하지 않는다(reclaim-own). 앵커가 session id라 부모 pid가 바뀌는 respawn에도
+/// 자기 토큰은 계속 own이다. 같은 cwd라도 session id가 다른 형제 세션의 토큰은 own이 아니라, 그
+/// 형제의 살아있는 에뮬레이터를 조용히 이어받지 않는다(identity-guard 충돌 방지).
 pub fn session_token_is_own(existing: &str) -> bool {
-    existing.starts_with(&format!("{:016x}-", cwd_hash()))
+    // 안정 세션 id가 없으면 own_session_identity()가 None → 어떤 토큰도 own이 아니다(fail-closed).
+    // 이것이 두 형제 세션이 앵커 0으로 붕괴해 서로의 토큰을 own으로 오판(=조용한 인계)하던 회귀를 막는다.
+    match own_session_identity() {
+        Some(identity) => identity_of(existing) == Some(identity.as_str()),
+        None => false,
+    }
+}
+
+/// 두 세션 토큰이 같은 세션(식별부 `{cwd_hash}-{session_anchor}` 일치)인지 — 같은 cwd라도 session id가
+/// 다르면 false. 형제 세션 간 reclaim 금지를 프로세스 밖에서(테스트 등) 검증할 때 쓴다.
+pub fn same_session_identity(a: &str, b: &str) -> bool {
+    match (identity_of(a), identity_of(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// 이 포트의 기존 토큰파일이 *이 세션 소유*면 재사용 후보로 반환한다(없거나 foreign이면 None →
-/// 새 토큰 유지; foreign 에뮬은 여전히 mismatch → 진입점이 graceful 처리). 로컬 MCP: cwd가 세션
-/// 식별이고 토큰파일은 포트별이라, 같은 cwd 두 세션도 포트가 달라 충돌하지 않는다.
+/// 새 토큰 유지; foreign 에뮬은 여전히 mismatch → 진입점이 graceful 처리). 토큰파일은 포트별이나,
+/// 같은 cwd의 형제 세션이 잠깐 이 포트를 놓쳐 이 세션이 바인드하더라도, 식별부(cwd+session id)가 달라
+/// 형제의 살아있는 토큰은 재사용하지 않는다 — 그 형제 에뮬레이터를 조용히 이어받는 것을 막는다.
 pub(crate) fn reusable_session_token(port: u16) -> Option<String> {
     let existing = std::fs::read_to_string(session_token_path(port)).ok()?;
     let existing = existing.trim();
@@ -415,12 +491,9 @@ impl TcpLink {
             // 세션 고정(서버 재시작 시 같은 포트 되찾기): 지난번 바인드한 포트를 먼저 정확히 시도한다.
             // 성공하면 그 포트의 에뮬레이터가 자동 재연결돼 freeze 화면을 잃지 않는다. base==0(임시포트)은
             // 세션 고정 의미가 없어 건너뛴다. 점유 중이거나 파일이 없으면 아래 스캔으로 폴백(기존 동작).
-            // 단일 bind 시도라 TOCTOU로 막혀도 그냥 폴백 — 절대 블록/루프하지 않는다.
-            let persist = if base != 0 {
-                Some(port_persist_path(base))
-            } else {
-                None
-            };
+            // 단일 bind 시도라 TOCTOU로 막혀도 그냥 폴백 — 절대 블록/루프하지 않는다. base==0(임시포트)이나
+            // 안정 세션 id가 없으면(fail-closed) port_persist_path가 None → 영속화를 건너뛰고 스캔만 한다.
+            let persist = port_persist_path(base);
             if let Some(pf) = persist.as_ref() {
                 if let Some(pp) = read_persisted_port(pf) {
                     // 이 세션의 범위 안에 있을 때만(범위 밖/쓰레기 값은 무시). 점유면 폴백.
@@ -469,9 +542,10 @@ impl TcpLink {
                         }
                     }
                     if let Ok(a) = l.local_addr() {
-                        // reclaim-own: 이 포트의 기존 토큰이 같은 세션(cwd)이면 재사용해, 서버
-                        // 재기동/재연결이 토큰을 회전하지 않게 한다 — 실행 중인 자기 에뮬레이터가
-                        // 옛 토큰으로 strand되지 않고 그대로 reclaim된다. foreign이면 새 토큰 유지.
+                        // reclaim-own: 이 포트의 기존 토큰이 이 세션(cwd+session id 식별부) 소유면
+                        // 재사용해, 서버 respawn/재연결이 토큰을 회전하지 않게 한다 — 실행 중인 자기
+                        // 에뮬레이터가 옛 토큰으로 strand되지 않고 reclaim된다. 형제 세션(다른 session id)·
+                        // foreign이면 새 토큰 유지 → 그 살아있는 에뮬을 이어받지 않는다.
                         if let Some(tok) = reusable_session_token(a.port()) {
                             self.session_token = tok;
                         }

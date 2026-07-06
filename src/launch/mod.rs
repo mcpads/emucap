@@ -23,6 +23,53 @@ pub mod spec;
 #[path = "mod_tests.rs"]
 mod tests;
 
+/// Process-wide serialization for launch tests that mutate global env (HOME, EMUCAP_*, ...).
+///
+/// The launch test modules all compile into one test binary and run in one process; several mutate
+/// process-global environment variables. A per-module lock lets one module's mutation race another
+/// module's env read, clobbering the value a running test asserts on, so every env-mutating launch
+/// test takes this single shared lock.
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the shared env lock, tolerating a poisoned lock (a panicking test leaves the env
+    /// snapshot to restore anyway) so one failed test does not cascade into the rest.
+    pub(crate) fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Snapshots the named env vars on construction and restores them (set previous value or remove)
+    /// on drop, so a test that mutates process-global env leaves it as it found it.
+    pub(crate) struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
+
+    impl EnvGuard {
+        pub(crate) fn new(keys: &[&'static str]) -> Self {
+            Self(
+                keys.iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            )
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
 /// Base directory for emucap-owned emulator data, per OS. `EMUCAP_EMU_HOME` overrides it.
 fn emu_home_base() -> PathBuf {
     if let Some(base) = std::env::var_os("EMUCAP_EMU_HOME") {
@@ -164,6 +211,39 @@ pub fn spawn_detached(spec: &LaunchSpec) -> std::io::Result<u32> {
         let _ = child.wait();
     });
     Ok(pid)
+}
+
+/// Spawn a short-lived helper child with a reaper thread so it never lingers as a zombie in the
+/// long-lived MCP. Mirrors `spawn_detached`'s reaper but starts no new session — the caller ties the
+/// helper to another process's lifetime rather than detaching it as its own emulator. Returns the
+/// child pid.
+pub(crate) fn spawn_reaped(mut cmd: Command) -> std::io::Result<u32> {
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
+}
+
+/// Keep the macOS display awake while a HITL GUI window is open, releasing when the emulator process
+/// `target_pid` exits (`caffeinate -d -w <pid>`). GUI emulator windows die if the display sleeps, so
+/// this is required on macOS. The helper is reaped (see `spawn_reaped`) so it never accumulates as a
+/// zombie across relaunches in the long-lived MCP. No-op off macOS (windows there don't need it).
+pub(crate) fn spawn_display_caffeinate(target_pid: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("caffeinate");
+        cmd.args(["-d", "-w", &target_pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = spawn_reaped(cmd);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target_pid;
+    }
 }
 
 /// Whether a process is still alive. Unix: `kill(pid, 0)`. Windows is not implemented (assumes
@@ -381,7 +461,12 @@ pub(crate) fn copy_dir_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
 
     let tmp = unique_sibling_path(dst, "tmp");
     let backup = unique_sibling_path(dst, "old");
-    copy_dir_contents(src, &tmp)?;
+    if let Err(e) = copy_dir_contents(src, &tmp) {
+        // A partial recursive copy can already have created the staging temp; remove it so a failed
+        // initial copy does not leak it, matching every other error path in this function.
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(e);
+    }
 
     if !dst.exists() {
         return match std::fs::rename(&tmp, dst) {

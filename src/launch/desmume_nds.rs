@@ -161,22 +161,6 @@ fn emu_spec(l: &Launch, arm9: u16, arm7: u16) -> LaunchSpec {
     }
 }
 
-/// While a HITL window is open, keep the macOS display awake and let it auto-release when DeSmuME
-/// exits (`caffeinate -d -w <pid>`). No-op off macOS (SDL windows there don't need it).
-#[cfg(target_os = "macos")]
-fn spawn_display_caffeinate(desmume_pid: u32) {
-    let _ = std::process::Command::new("caffeinate")
-        .arg("-d")
-        .arg("-w")
-        .arg(desmume_pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
-#[cfg(not(target_os = "macos"))]
-fn spawn_display_caffeinate(_desmume_pid: u32) {}
-
 /// The bridge that relays the ARM9/ARM7 GDB stubs to emucap on `l.port`. Mirrors `launch.sh`:
 /// `emucap-desmume-nds-bridge <port> 127.0.0.1:<arm9> 127.0.0.1:<arm7>` with EMUCAP_* env.
 fn bridge_spec(l: &Launch, arm9: u16, arm7: u16) -> LaunchSpec {
@@ -227,7 +211,8 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
         return Err(e);
     }
     if l.display {
-        spawn_display_caffeinate(desmume_pid);
+        // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
+        super::spawn_display_caffeinate(desmume_pid);
     }
     let bridge_pid = match spawn_detached(&bridge_spec(l, arm9, arm7)) {
         Ok(pid) => pid,
@@ -285,17 +270,8 @@ mod tests {
         let _ = dead.wait(); // reap so the pid is gone
         assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
     }
-    use std::ffi::OsString;
+    use crate::launch::test_env::{lock_env, EnvGuard};
     use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[cfg(unix)]
     fn make_executable(path: &Path) {
@@ -303,29 +279,6 @@ mod tests {
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(perms.mode() | 0o755);
         std::fs::set_permissions(path, perms).unwrap();
-    }
-
-    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
-
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            )
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
     }
 
     fn launch_for<'a>(binary: &'a Path, bridge: &'a Path, log: &'a Path) -> Launch<'a> {

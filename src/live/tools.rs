@@ -521,6 +521,11 @@ pub fn break_on_reset(link: &mut dyn EmulatorLink, enabled: bool) -> Result<Tool
 /// 바이트 그대로 보존되고 스테이징 잔재도 남기지 않는다(모든 어댑터 공통, 어댑터 무관).
 pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput, LinkError> {
     let dest = Path::new(dir);
+    // 요청 경로에 이미 심링크나 (디렉토리가 아닌) 일반 파일이 있으면 스테이징·브리지 덤프 전에
+    // 거부한다 — 원자 스왑/폴백이 그 파일을 숨은 이름으로 밀어내 요청 경로에서 사라지게 하는 것을
+    // 막는다(fail-fast, replace_dir와 동일 가드).
+    ensure_replaceable_dir(dest)
+        .map_err(|e| LinkError::Protocol(format!("덤프 경로가 교체 가능한 디렉토리가 아님: {e}")))?;
     let staging = dump_sibling(dest, "dump-staging")
         .map_err(|e| LinkError::Protocol(format!("덤프 스테이징 경로 실패: {e}")))?;
     let staging_str = staging
@@ -584,13 +589,51 @@ fn dump_sibling(dst: &Path, label: &str) -> std::io::Result<PathBuf> {
     Ok(parent.join(format!(".{name}.{label}.{}.{nanos}", std::process::id())))
 }
 
-/// 완성된 스테이징 덤프 `staging`을 `dst`로 원자 이동. `dst`가 없으면 단일 `rename`; 있으면 직전
-/// 덤프를 백업으로 옮기고 `staging`을 rename해 넣은 뒤 성공 시에만 백업을 버린다(실패 시 롤백) —
-/// 직전의 온전한 덤프가 반쯤 교체된 채 남지 않도록.
+/// `dst`가 원자 스왑으로 안전히 교체 가능한 대상인지 확인한다 — 없으면(새로 생성) 또는 디렉토리면 OK,
+/// 심링크거나 (디렉토리가 아닌) 일반 파일 등 기존 항목이면 거부한다. src/launch의 copy_dir_replace와
+/// 같은 가드로, 사용자의 파일이 덤프 경로로 밀려나 요청 경로에서 사라지는 것을 막는다.
+fn ensure_replaceable_dir(dst: &Path) -> std::io::Result<()> {
+    if crate::launch::is_symlink(dst) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("destination is a symlink, refusing to replace: {}", dst.display()),
+        ));
+    }
+    if dst.exists() && !dst.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("destination is not a directory: {}", dst.display()),
+        ));
+    }
+    Ok(())
+}
+
+/// 완성된 스테이징 덤프 `staging`을 `dst`로 배치한다.
+/// - `dst`가 없으면 단일 `rename`(같은 파일시스템이라 원자적).
+/// - `dst`가 있고 OS가 단일-syscall 교환을 지원하면(Linux `renameat2(RENAME_EXCHANGE)`,
+///   macOS `renamex_np(RENAME_SWAP)`) `staging`↔`dst`를 한 syscall로 맞바꾼 뒤, 이제 구 덤프를
+///   담은 `staging`을 제거한다 — 어느 순간에 죽어도 `dst`는 항상 온전한 덤프(구본 또는 신본)를 가리킨다.
+/// - 교환 프리미티브가 없거나 파일시스템이 거부하면 2-rename 폴백(백업→rename→성공 시 백업 삭제,
+///   실패 시 롤백). 폴백은 두 rename 사이 크래시에 `dst`가 잠깐 없을 수 있다(구 덤프는 백업에 보존).
 fn replace_dir(staging: &Path, dst: &Path) -> std::io::Result<()> {
+    // dst가 심링크거나 (디렉토리가 아닌) 기존 항목이면 거부한다 — 그렇지 않으면 원자 스왑/폴백이
+    // 사용자의 파일을 요청 경로에서 밀어내(숨은 이름으로 이동) 조용히 사라지게 한다. copy_dir_replace와
+    // 같은 가드로 어느 호출자가 부르든(dump_memory 등) 파일 대상을 절대 밀어내지 않게 한다.
+    ensure_replaceable_dir(dst)?;
     if !dst.exists() {
         return std::fs::rename(staging, dst);
     }
+    // 지원 OS: 단일 syscall 원자 교환. 성공 후 `staging`은 구 덤프를 담으므로 제거한다.
+    if try_exchange(staging, dst)? {
+        let _ = std::fs::remove_dir_all(staging);
+        return Ok(());
+    }
+    replace_dir_fallback(staging, dst)
+}
+
+/// 교환 프리미티브가 없는 플랫폼/파일시스템용 2-rename 폴백. 두 rename 사이 크래시에 `dst`가 잠깐
+/// 비는 창이 있으나(구 덤프는 백업에 있음), 직전의 온전한 덤프가 반쯤 교체된 채 남지는 않는다.
+fn replace_dir_fallback(staging: &Path, dst: &Path) -> std::io::Result<()> {
     let backup = dump_sibling(dst, "dump-old")?;
     std::fs::rename(dst, &backup)?;
     match std::fs::rename(staging, dst) {
@@ -603,6 +646,67 @@ fn replace_dir(staging: &Path, dst: &Path) -> std::io::Result<()> {
             Err(e)
         }
     }
+}
+
+/// 교환 프리미티브 syscall의 errno가 "이 커널/파일시스템이 지원 안 함"이라 2-rename 폴백으로 강등해야
+/// 하는지. 커널 미구현(ENOSYS)·플래그 거부(EINVAL/ENOTSUP)를 폴백으로 본다(그 외 errno는 경로 소멸 등
+/// 진짜 I/O 실패). macOS·Linux가 같은 errno 계열을 폴백해 어느 한 플랫폼만 좁게 하드-실패하지 않게 한다.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn is_unsupported_exchange_errno(raw: Option<i32>) -> bool {
+    matches!(raw, Some(libc::ENOSYS | libc::EINVAL | libc::ENOTSUP))
+}
+
+/// 두 경로 `a`·`b`(둘 다 존재)를 단일 syscall로 원자 교환한다. 성공하면 `Ok(true)`, 이
+/// 플랫폼/파일시스템에 교환 프리미티브가 없으면 `Ok(false)`(호출자 폴백), 그 외 I/O 실패는 `Err`.
+#[cfg(target_os = "macos")]
+fn try_exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let ca = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let cb = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // RENAME_SWAP: a↔b를 원자적으로 맞바꾼다(둘 다 존재해야). 성공하면 a는 옛 b, b는 옛 a를 담는다.
+    let rc = unsafe { libc::renamex_np(ca.as_ptr(), cb.as_ptr(), libc::RENAME_SWAP) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    // 파일시스템/커널이 RENAME_SWAP 미지원 → 폴백. 그 외(경로 소멸 등)는 진짜 실패.
+    if is_unsupported_exchange_errno(err.raw_os_error()) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn try_exchange(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let ca = std::ffi::CString::new(a.as_os_str().as_bytes())?;
+    let cb = std::ffi::CString::new(b.as_os_str().as_bytes())?;
+    // RENAME_EXCHANGE: a↔b를 원자적으로 맞바꾼다(둘 다 존재해야).
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            ca.as_ptr(),
+            libc::AT_FDCWD,
+            cb.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    // 커널(구커널 ENOSYS)·파일시스템(플래그 거부 EINVAL/ENOTSUP)이 미지원 → 폴백. 그 외는 진짜 실패.
+    if is_unsupported_exchange_errno(err.raw_os_error()) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn try_exchange(_a: &Path, _b: &Path) -> std::io::Result<bool> {
+    Ok(false) // 교환 프리미티브 없음 → 호출자가 2-rename 폴백
 }
 
 pub fn screenshot(
@@ -680,5 +784,156 @@ mod tests {
             tap_sequence(&mut link, 0, &steps, 2).is_ok(),
             "예산 이내는 통과해야"
         );
+    }
+
+    fn dir_with(path: &std::path::Path, marker: &[u8]) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join("marker"), marker).unwrap();
+    }
+
+    #[test]
+    fn replace_dir_into_absent_dst_is_single_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dump");
+        let staging = tmp.path().join(".dump.staging");
+        dir_with(&staging, b"new");
+        super::replace_dir(&staging, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"new");
+        assert!(!staging.exists(), "이동 후 staging은 사라져야");
+    }
+
+    #[test]
+    fn replace_dir_publishes_new_dump_over_existing() {
+        // end-to-end(교환 또는 폴백): 기존 덤프 위에 새 스테이징 배치 → dst엔 신본, staging 제거.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dump");
+        dir_with(&dst, b"old");
+        let staging = tmp.path().join(".dump.staging");
+        dir_with(&staging, b"new");
+        super::replace_dir(&staging, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"new");
+        assert!(!staging.exists(), "스왑/이동 후 staging은 제거되어야");
+        // 백업 잔재(.dump.dump-old.*)가 남지 않아야.
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("dump-old"));
+        assert!(!leftovers, "성공 시 백업/구덤프 잔재가 없어야");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn unsupported_exchange_errnos_fall_back_not_hard_fail() {
+        // 교환 프리미티브를 파일시스템/커널이 거부하는 errno 계열은 2-rename 폴백으로 강등해야 한다.
+        // macOS 아암이 ENOTSUP만 폴백하던 회귀: EINVAL을 내는 파일시스템이면 덤프 publish가 하드-실패했다.
+        use super::is_unsupported_exchange_errno as f;
+        for e in [libc::ENOSYS, libc::EINVAL, libc::ENOTSUP] {
+            assert!(f(Some(e)), "미지원 errno {e}는 폴백해야");
+        }
+        assert!(!f(Some(libc::ENOENT)), "경로 소멸(ENOENT)은 진짜 실패");
+        assert!(!f(None), "errno 없음은 진짜 실패");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn try_exchange_swaps_contents_atomically() {
+        // 이 플랫폼의 원자 교환 프리미티브가 두 디렉토리 내용을 한 번에 맞바꾼다(교환 경로 검증).
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        dir_with(&a, b"A");
+        dir_with(&b, b"B");
+        assert!(
+            super::try_exchange(&a, &b).unwrap(),
+            "지원 플랫폼(linux/macos)은 교환에 성공해야"
+        );
+        assert_eq!(std::fs::read(a.join("marker")).unwrap(), b"B");
+        assert_eq!(std::fs::read(b.join("marker")).unwrap(), b"A");
+    }
+
+    #[test]
+    fn replace_dir_refuses_file_destination() {
+        // 요청 경로에 사용자의 일반 파일이 있으면 원자 스왑/폴백이 그 파일을 숨은 이름으로 밀어내
+        // (요청 경로에서 사라지게) 하면 안 된다 — 거부하고 파일을 바이트 그대로 둔다.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dump");
+        std::fs::write(&dst, b"user-file").unwrap();
+        let staging = tmp.path().join(".dump.staging");
+        dir_with(&staging, b"new");
+        let err = super::replace_dir(&staging, &dst).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"user-file",
+            "거부 시 사용자 파일은 그대로여야"
+        );
+        assert!(staging.exists(), "거부 시 staging은 밀려나지 않아야");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replace_dir_refuses_symlink_destination() {
+        // dst가 심링크면(파일이든 디렉토리든) 거부한다 — 스왑/폴백이 링크를 교체하거나 대상을 밀어내지
+        // 않게. copy_dir_replace와 같은 가드.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        dir_with(&real, b"real");
+        let dst = tmp.path().join("dump");
+        std::os::unix::fs::symlink(&real, &dst).unwrap();
+        let staging = tmp.path().join(".dump.staging");
+        dir_with(&staging, b"new");
+        let err = super::replace_dir(&staging, &dst).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            std::fs::symlink_metadata(&dst)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "심링크는 보존되어야"
+        );
+        assert_eq!(
+            std::fs::read(real.join("marker")).unwrap(),
+            b"real",
+            "심링크 대상 디렉토리는 보존되어야"
+        );
+    }
+
+    #[test]
+    fn dump_memory_refuses_file_destination() {
+        // 요청 경로가 일반 파일이면 브리지 덤프·스테이징 전에 거부하고 파일을 보존한다(fail-fast) —
+        // 어댑터를 호출하지 않는다.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dump");
+        std::fs::write(&dst, b"user-file").unwrap();
+        let mut link = FakeLink::ok(json!({}));
+        let err = super::dump_memory(&mut link, dst.to_str().unwrap()).unwrap_err();
+        assert!(matches!(err, LinkError::Protocol(_)), "가드는 Protocol 에러");
+        assert_eq!(
+            std::fs::read(&dst).unwrap(),
+            b"user-file",
+            "거부 시 사용자 파일은 그대로여야"
+        );
+        assert!(
+            link.last_method.is_none(),
+            "가드가 브리지 dump_memory 호출 전에 거부해야"
+        );
+    }
+
+    #[test]
+    fn replace_dir_fallback_swaps_over_existing() {
+        // 폴백(2-rename) 경로를 직접 검증 — 교환 미지원 플랫폼/파일시스템의 동작.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dump");
+        dir_with(&dst, b"old");
+        let staging = tmp.path().join(".dump.staging");
+        dir_with(&staging, b"new");
+        super::replace_dir_fallback(&staging, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("marker")).unwrap(), b"new");
+        assert!(!staging.exists(), "폴백 성공 후 staging 제거");
+        let leftovers = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains("dump-old"));
+        assert!(!leftovers, "폴백 성공 시 백업이 제거되어야");
     }
 }

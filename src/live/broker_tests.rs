@@ -248,6 +248,83 @@ fn broker_keeps_busy_for_active_session() {
     );
 }
 
+// hello 응답 후 명령 하나를 읽어 *받은 그대로의 id*를 기억하고, `go` 신호가 올 때까지 응답을 보류한다.
+// 신호가 오면 그 id로 (뒤늦은) 응답을 보낸다 — steal 이후 도착하는 in-flight 응답을 재현한다.
+fn fake_emu_hold_reply(
+    addr: String,
+    name: &str,
+    go: std::sync::mpsc::Receiver<()>,
+) -> std::thread::JoinHandle<()> {
+    let name = name.to_string();
+    std::thread::spawn(move || {
+        let s = TcpStream::connect(addr).unwrap();
+        let mut r = BufReader::new(s.try_clone().unwrap());
+        let mut w = s;
+        let mut hello = String::new();
+        r.read_line(&mut hello).unwrap();
+        writeln!(
+            w,
+            r#"{{"id":0,"ok":true,"result":{{"protocol_version":1,"methods":["status"],"name":"{name}"}}}}"#
+        )
+        .unwrap();
+        // A의 요청 한 줄을 읽어 broker가 부여한(네임스페이스된) id를 그대로 보관.
+        let mut cmd = String::new();
+        r.read_line(&mut cmd).unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(cmd.trim()).unwrap()["id"].clone();
+        // steal이 끝날 때까지 응답 보류.
+        let _ = go.recv();
+        // A의 요청에 대한 뒤늦은 응답 — 펜싱되어 신규 소유자 B에게 배달되면 안 된다.
+        writeln!(w, r#"{{"id":{id},"ok":true,"result":{{"stale":true}}}}"#).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    })
+}
+
+#[test]
+fn broker_fences_stale_response_after_steal() {
+    // steal 안전: stale 세션 A의 in-flight 응답이 뒤늦게 와도, 세대 펜싱으로 신규 소유자 B가 그것을
+    // 자기 응답으로 받지 않아야 한다(A·B가 같은 요청 id를 써도).
+    let (ea, sa) = start_broker_with(Duration::from_millis(150));
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let _e = fake_emu_hold_reply(ea, "g", go_rx);
+    std::thread::sleep(Duration::from_millis(100)); // 등록 여유
+
+    // 세션 A: attach 후 요청(id=7) 전송 — 에뮬레이터는 읽되 응답 보류.
+    let (a_sock, ar_a) = attach(&sa, Some("g"));
+    assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
+    {
+        let mut wa = a_sock.try_clone().unwrap();
+        writeln!(wa, r#"{{"v":1,"id":7,"method":"status","params":{{}}}}"#).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(80)); // 에뮬레이터가 A 요청을 읽을 시간
+
+    // A가 조용해져(heartbeat 없음) stale → B가 steal.
+    std::thread::sleep(Duration::from_millis(250)); // > 150ms 임계
+    let (b_sock, ar_b) = attach(&sa, Some("g"));
+    assert!(ar_b.contains("attached_name"), "B가 stale A를 steal: {ar_b}");
+    // B도 같은 id=7로 자기 요청 전송(겹치는 id 공간 재현).
+    {
+        let mut wb = b_sock.try_clone().unwrap();
+        writeln!(wb, r#"{{"v":1,"id":7,"method":"status","params":{{}}}}"#).unwrap();
+    }
+
+    // 이제 에뮬레이터가 A의 요청에 대한 뒤늦은 응답을 방출.
+    go_tx.send(()).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+
+    // B는 A의 stale 응답(id=7, "stale":true)을 자기 것으로 받아선 안 된다.
+    b_sock
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let mut rb = BufReader::new(b_sock);
+    let mut got = String::new();
+    let n = rb.read_line(&mut got).unwrap_or(0);
+    assert!(
+        !got.contains("stale"),
+        "B가 옛 세션 A의 in-flight 응답을 받으면 안 됨(fence): n={n}, got={got:?}"
+    );
+    let _ = a_sock;
+}
+
 #[test]
 fn broker_persists_across_session() {
     let (ea, sa) = start_broker();

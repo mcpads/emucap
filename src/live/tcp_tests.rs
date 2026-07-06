@@ -2,7 +2,50 @@ use super::link::{EmulatorLink, LinkError};
 use super::tcp;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
+
+/// 세션 식별(CLAUDE_*_SESSION_ID) env는 프로세스 전역이라, 값을 바꿔 테스트하는 케이스는 직렬화한다.
+static SESSION_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// 세션 id env를 원하는 상태로 두고, 가드 드롭 시 이전 값을 원복하는 RAII. 가드가 살아있는 동안
+/// SESSION_ENV_LOCK을 단독 점유해 병렬 테스트 간 간섭을 막는다. `id=None`이면 안정 세션 id 없음(fail-closed).
+struct SessionEnv {
+    _guard: MutexGuard<'static, ()>,
+    prev_code: Option<String>,
+    prev_sess: Option<String>,
+}
+
+impl SessionEnv {
+    fn with(id: Option<&str>) -> Self {
+        let guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_code = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+        let prev_sess = std::env::var("CLAUDE_SESSION_ID").ok();
+        match id {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
+            None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+        }
+        std::env::remove_var("CLAUDE_SESSION_ID");
+        Self {
+            _guard: guard,
+            prev_code,
+            prev_sess,
+        }
+    }
+}
+
+impl Drop for SessionEnv {
+    fn drop(&mut self) {
+        match &self.prev_code {
+            Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
+            None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+        }
+        match &self.prev_sess {
+            Some(v) => std::env::set_var("CLAUDE_SESSION_ID", v),
+            None => std::env::remove_var("CLAUDE_SESSION_ID"),
+        }
+    }
+}
 
 fn hello_parts(line: &str) -> (serde_json::Value, String) {
     let v = serde_json::from_str::<serde_json::Value>(line.trim()).unwrap();
@@ -532,6 +575,8 @@ fn tcp_link_bails_on_id_mismatch_flood() {
 #[test]
 fn tcp_link_prefers_persisted_port_over_lowest_free() {
     use super::link::EmulatorLink;
+    // 포트 영속화는 안정 세션 id가 있을 때만 동작(fail-closed) — 테스트 동안 id를 고정한다.
+    let _env = SessionEnv::with(Some("port-test-prefers"));
     // 빈 base 포트 확보(임시포트 하나 잡았다 놓음)
     let probe = tcp::bind("127.0.0.1:0", Duration::from_millis(100)).unwrap();
     let base = probe.local_addr().port();
@@ -546,7 +591,7 @@ fn tcp_link_prefers_persisted_port_over_lowest_free() {
         Err(_) => return,
     }
     // portfile에 preferred 기록 → lazy(base)가 base(최저빈)가 아니라 preferred를 잡아야 한다.
-    let pf = tcp::port_persist_path(base);
+    let pf = tcp::port_persist_path(base).expect("안정 id면 포트 영속화 경로가 있어야");
     tcp::write_persisted_port(&pf, preferred);
 
     let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100));
@@ -565,6 +610,8 @@ fn tcp_link_prefers_persisted_port_over_lowest_free() {
 #[test]
 fn tcp_link_falls_back_to_scan_when_persisted_port_busy() {
     use super::link::EmulatorLink;
+    // 포트 영속화는 안정 세션 id가 있을 때만 동작(fail-closed) — 테스트 동안 id를 고정한다.
+    let _env = SessionEnv::with(Some("port-test-fallback"));
     let probe = tcp::bind("127.0.0.1:0", Duration::from_millis(100)).unwrap();
     let base = probe.local_addr().port();
     drop(probe);
@@ -580,7 +627,7 @@ fn tcp_link_falls_back_to_scan_when_persisted_port_busy() {
         Ok(o) => o,
         Err(_) => return, // 못 잡으면 스킵
     };
-    let pf = tcp::port_persist_path(base);
+    let pf = tcp::port_persist_path(base).expect("안정 id면 포트 영속화 경로가 있어야");
     tcp::write_persisted_port(&pf, busy_pref);
 
     let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(100));
@@ -633,7 +680,8 @@ fn tcp_link_auto_selects_next_port_when_occupied() {
 
 #[test]
 fn session_token_reused_for_own_cwd_on_reconnect() {
-    // 같은 cwd로 발급한 토큰은 own → 서버 재기동/재연결 시 재사용해 실행 중 에뮬 reclaim.
+    // 안정 세션 id가 있을 때 같은 cwd+id로 발급한 토큰은 own → 서버 재기동/재연결 시 재사용해 실행 중 에뮬 reclaim.
+    let _env = SessionEnv::with(Some("reconnect-own"));
     let own = tcp::new_session_token();
     assert!(
         tcp::session_token_is_own(&own),
@@ -662,6 +710,7 @@ fn session_token_path_parent_exists() {
 #[test]
 fn reusable_session_token_reuses_own_mints_for_foreign() {
     // 재사용 경로 통합: own 토큰파일은 재사용(reclaim), foreign은 None(새 토큰 발급→guard가 차단).
+    let _env = SessionEnv::with(Some("reuse-own"));
     let port = 59777u16; // 테스트 전용 포트(충돌 회피)
     let path = tcp::session_token_path(port);
     let own = tcp::new_session_token();
@@ -681,6 +730,162 @@ fn reusable_session_token_reuses_own_mints_for_foreign() {
         "foreign은 재사용 안 함"
     );
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn distinct_sessions_same_cwd_are_not_own() {
+    // 같은 cwd의 두 세션이라도 session id(앵커)가 다르면(동시 실행) 서로 own이 아니어야 한다 — 형제 구별.
+    let own = tcp::new_session_token();
+    let mut fields = own.split('-');
+    let cwd = fields.next().unwrap();
+    let anchor = fields.next().unwrap();
+    // 같은 cwd, 다른 session id 앵커(문자열을 확실히 다르게), 다른 pid/nanos.
+    let sibling = format!("{cwd}-{anchor}f-1-1");
+    assert!(
+        !tcp::same_session_identity(&own, &sibling),
+        "같은 cwd라도 다른 session id(세션)는 서로 own 아님: own={own} sibling={sibling}"
+    );
+    // 같은 세션(같은 cwd+앵커)은 pid/nanos가 달라도(서버 respawn) own.
+    let same_session_restart = format!("{cwd}-{anchor}-99-99");
+    assert!(
+        tcp::same_session_identity(&own, &same_session_restart),
+        "같은 세션 식별부면 respawn해도 own"
+    );
+}
+
+#[test]
+fn reusable_session_token_reclaims_across_process_respawn() {
+    // (b) 같은 세션이 서버 respawn(새 pid, 부모 pid 변경)으로 재연결해도 자기 토큰을 reclaim해야 한다.
+    // 과거 회귀: 식별부에 부모 PID를 넣어, respawn이 다른 부모 아래로 재spawn되면 자기 토큰을 foreign으로
+    // 오판해 실행 중 에뮬을 strand했다. 앵커는 session id라 respawn(부모 pid 변경)에 불변 → reclaim 유지.
+    let _env = SessionEnv::with(Some("respawn-reclaim"));
+    let port = 59772u16; // 테스트 전용 포트(충돌 회피)
+    let path = tcp::session_token_path(port);
+    let mine = tcp::new_session_token();
+    // 같은 세션 식별부(cwd+앵커), 다른 pid/nanos = respawn된 프로세스가 남긴 토큰.
+    let ident: Vec<&str> = mine.split('-').take(2).collect();
+    let respawned = format!("{}-{}-dead-beef", ident[0], ident[1]);
+    std::fs::write(&path, &respawned).unwrap();
+    assert_eq!(
+        tcp::reusable_session_token(port).as_deref(),
+        Some(respawned.as_str()),
+        "같은 세션 앵커면 respawn(부모 pid 변경) 후에도 reclaim해야"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn reusable_session_token_rejects_live_sibling_same_cwd() {
+    // (a) 같은 cwd의 형제 세션(다른 session id)이 이 포트에 남긴 *살아있는* 토큰파일을, 이 세션이
+    // 포트를 바인드하며 조용히 재사용(=그 에뮬레이터 인계)하면 안 된다. 내 토큰은 재사용, 형제는 None.
+    let _env = SessionEnv::with(Some("sibling-reject"));
+    let port = 59771u16; // 테스트 전용 포트(충돌 회피)
+    let path = tcp::session_token_path(port);
+    let own = tcp::new_session_token();
+    std::fs::write(&path, &own).unwrap();
+    assert_eq!(
+        tcp::reusable_session_token(port).as_deref(),
+        Some(own.as_str()),
+        "내 세션(같은 cwd+앵커) 토큰은 reclaim"
+    );
+    // 형제 세션 토큰: 같은 cwd, 다른 session id 앵커 → identity 불일치 → 재사용 금지(None).
+    let mut fields = own.split('-');
+    let cwd = fields.next().unwrap();
+    let anchor = fields.next().unwrap();
+    let sibling = format!("{cwd}-{anchor}f-1-1");
+    std::fs::write(&path, &sibling).unwrap();
+    assert_eq!(
+        tcp::reusable_session_token(port),
+        None,
+        "형제 세션(같은 cwd, 다른 session id)의 살아있는 토큰은 reclaim 금지 — 조용한 인계 방지"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn no_stable_session_id_fails_closed_no_takeover() {
+    // 안정 세션 id가 없으면(Codex·plain shell·CI 등 CLAUDE_*_SESSION_ID 미설정) 같은 cwd의 두 세션이
+    // 모두 앵커 0으로 붕괴해 서로 own으로 오판하면 안 된다 — fail-closed. 세션 A가 남긴 토큰을 형제
+    // 세션 B가 own으로 보면(=조용한 인계) 안 되고, 포트 영속화도 공유하지 않아야(hijack 창 제거).
+    let _env = SessionEnv::with(None);
+    let a_token = tcp::new_session_token(); // 세션 A(안정 id 없음)
+    // 세션 B(같은 cwd, 여전히 안정 id 없음): A의 토큰을 own으로 보면 안 됨.
+    assert!(
+        !tcp::session_token_is_own(&a_token),
+        "안정 세션 id가 없으면 형제 토큰을 own으로 보면 안 됨(fail-closed): {a_token}"
+    );
+    // reusable도 재사용 거부(형제 에뮬 조용한 인계 방지).
+    let port = 59762u16;
+    let path = tcp::session_token_path(port);
+    std::fs::write(&path, &a_token).unwrap();
+    assert_eq!(
+        tcp::reusable_session_token(port),
+        None,
+        "안정 세션 id 없으면 기존 토큰을 재사용(reclaim)하지 않아야"
+    );
+    let _ = std::fs::remove_file(&path);
+    // 포트 영속화 경로도 없어야(형제와 포트 파일 공유·hijack 창 방지).
+    assert!(
+        tcp::port_persist_path(47800).is_none(),
+        "안정 세션 id 없으면 포트 영속화를 건너뛰어야(fail-closed)"
+    );
+}
+
+#[test]
+fn stable_session_id_reclaims_across_reconnect() {
+    // 안정 세션 id가 있으면 같은 세션의 서버 respawn(/mcp 재연결, pid 변동)은 자기 토큰을 계속 own으로
+    // 봐 reclaim한다(실행 중 에뮬 strand 방지). 다른 안정 id의 형제 토큰은 own이 아님.
+    let _env = SessionEnv::with(Some("test-stable-session-A"));
+    let mine = tcp::new_session_token();
+    assert!(
+        tcp::session_token_is_own(&mine),
+        "안정 id면 자기 토큰은 own(재연결 reclaim): {mine}"
+    );
+    // respawn: 같은 안정 id(같은 식별부), 다른 pid/nanos → 여전히 own.
+    let ident: Vec<&str> = mine.split('-').take(2).collect();
+    let respawned = format!("{}-{}-dead-beef", ident[0], ident[1]);
+    let port = 59763u16;
+    let path = tcp::session_token_path(port);
+    std::fs::write(&path, &respawned).unwrap();
+    assert_eq!(
+        tcp::reusable_session_token(port).as_deref(),
+        Some(respawned.as_str()),
+        "같은 안정 세션 id면 respawn 후에도 reclaim"
+    );
+    let _ = std::fs::remove_file(&path);
+    // 안정 id면 포트 영속화 경로가 존재한다.
+    assert!(
+        tcp::port_persist_path(47800).is_some(),
+        "안정 id면 포트 영속화 경로가 있어야"
+    );
+}
+
+#[test]
+fn port_persist_path_keyed_on_session_identity_not_cwd_alone() {
+    // 같은 cwd·같은 base라도 세션 id가 다르면 포트 영속화 파일이 달라야 한다 — 그렇지 않으면 형제 세션이
+    // 같은 포트 파일을 공유해 서로의 포트를 가로챈다. env를 직렬화 lock 아래 직접 토글해 두 id를 비교한다.
+    let guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
+    let prev_alt = std::env::var("CLAUDE_SESSION_ID").ok();
+    std::env::remove_var("CLAUDE_SESSION_ID");
+
+    std::env::set_var("CLAUDE_CODE_SESSION_ID", "session-one");
+    let path_one = tcp::port_persist_path(47800).expect("안정 id면 경로 Some");
+    std::env::set_var("CLAUDE_CODE_SESSION_ID", "session-two");
+    let path_two = tcp::port_persist_path(47800).expect("안정 id면 경로 Some");
+    assert_ne!(
+        path_one, path_two,
+        "다른 세션 id(같은 cwd)는 다른 포트 영속화 파일을 써야(hijack 창 방지)"
+    );
+
+    match prev {
+        Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
+        None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+    }
+    if let Some(v) = prev_alt {
+        std::env::set_var("CLAUDE_SESSION_ID", v);
+    }
+    drop(guard);
 }
 
 /// hello만 답하고 이후 소켓에서 절대 read하지 않는 클라이언트 — 서버 송신 버퍼를 채워 큰 요청의

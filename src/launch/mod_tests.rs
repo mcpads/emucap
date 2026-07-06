@@ -147,6 +147,31 @@ fn copy_dir_replace_refuses_file_destination() {
     assert_eq!(std::fs::read_to_string(&dst).unwrap(), "old");
 }
 
+#[test]
+fn copy_dir_replace_removes_staging_temp_on_copy_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    // A missing source makes the initial recursive copy fail *after* the staging temp dir has
+    // already been created (copy_dir_contents mkdirs the temp, then read_dir(src) errors), which
+    // exercises the initial-copy error path.
+    let missing_src = dir.path().join("missing-src");
+    let dst = dir.path().join("dst");
+
+    let err = copy_dir_replace(&missing_src, &dst).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+    // No staging temp (`.dst.tmp.<pid>.<nanos>`) may be left behind on the failed initial copy.
+    let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".dst.tmp."))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "staging temp left behind after failed initial copy: {leftovers:?}"
+    );
+    assert!(!dst.exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn copy_dir_replace_refuses_symlinked_directory_destination() {
@@ -218,6 +243,30 @@ fn spawn_detached_runs_and_redirects_to_log() {
     panic!(
         "log did not receive echo output: {:?}",
         std::fs::read_to_string(&log)
+    );
+}
+
+// A reaped helper (the caffeinate spawn path) must not linger as a zombie in the long-lived MCP.
+// A fast-exiting child whose `Child` is merely dropped stays a zombie — `kill(pid,0)` still returns
+// 0 — until its parent exits. `spawn_reaped`'s reaper thread waits on it, freeing the pid so
+// `process_alive` turns false; without the reaper this would spin to the deadline and fail.
+#[cfg(unix)]
+#[test]
+fn spawn_reaped_reaps_fast_child_so_it_does_not_linger_as_zombie() {
+    let mut cmd = std::process::Command::new("true");
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let pid = spawn_reaped(cmd).expect("spawn");
+    assert!(pid > 0);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while process_alive(pid) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        !process_alive(pid),
+        "child pid {pid} still present after exit — not reaped (zombie)"
     );
 }
 

@@ -176,15 +176,8 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     };
     let spec = crate::launch::spec::mesen_spec(&portable.binary, l.log_path, l.lua, &opts);
     let pid = crate::launch::spawn_detached(&spec)?;
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("caffeinate")
-            .args(["-d", "-w", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+    // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
+    crate::launch::spawn_display_caffeinate(pid);
     Ok(pid)
 }
 

@@ -257,24 +257,6 @@ fn emu_spec(l: &Launch, ws_port: u16) -> LaunchSpec {
     }
 }
 
-/// While a HITL window is open, keep the macOS display awake and let it auto-release when PPSSPP
-/// exits (`caffeinate -d -w <pid>`). The window dies if the display sleeps (same failure mode as the
-/// other GUI adapters), so this is required on macOS. No-op off macOS (SDL windows there don't need
-/// it).
-#[cfg(target_os = "macos")]
-fn spawn_display_caffeinate(ppsspp_pid: u32) {
-    let _ = std::process::Command::new("caffeinate")
-        .arg("-d")
-        .arg("-w")
-        .arg(ppsspp_pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
-}
-#[cfg(not(target_os = "macos"))]
-fn spawn_display_caffeinate(_ppsspp_pid: u32) {}
-
 /// The bridge that relays the debugger WebSocket to emucap on `l.port`. Mirrors `launch.sh`:
 /// `emucap-ppsspp-bridge <port> <ws_port>` with `EMUCAP_*` env (content/name/session token —
 /// `PpssppBridge::new` reads `EMUCAP_CONTENT` itself for `get_rom_info`'s sha1/size).
@@ -321,7 +303,9 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
         return Err(e);
     }
     if l.display {
-        spawn_display_caffeinate(ppsspp_pid);
+        // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS);
+        // the window dies if the display sleeps, same failure mode as the other GUI adapters.
+        super::spawn_display_caffeinate(ppsspp_pid);
     }
     if let Err(e) = wait_ws_ready(ppsspp_pid, ws_port, Duration::from_secs(8)) {
         let _ = terminate_detached(ppsspp_pid);
@@ -411,17 +395,8 @@ mod tests {
         assert!(err.to_string().contains("exited"));
     }
 
-    use std::ffi::OsString;
+    use crate::launch::test_env::{lock_env, EnvGuard};
     use std::path::Path;
-    use std::sync::{Mutex, MutexGuard};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    fn lock_env() -> MutexGuard<'static, ()> {
-        ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[cfg(unix)]
     fn make_executable(path: &Path) {
@@ -429,29 +404,6 @@ mod tests {
         let mut perms = std::fs::metadata(path).unwrap().permissions();
         perms.set_mode(perms.mode() | 0o755);
         std::fs::set_permissions(path, perms).unwrap();
-    }
-
-    struct EnvGuard(Vec<(&'static str, Option<OsString>)>);
-
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self(
-                keys.iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            )
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in &self.0 {
-                match value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
     }
 
     fn launch_for<'a>(binary: &'a Path, bridge: &'a Path, log: &'a Path) -> Launch<'a> {
