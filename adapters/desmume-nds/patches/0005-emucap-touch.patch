@@ -1,26 +1,11 @@
---- i/desmume/src/NDSSystem.h	2026-07-04 03:42:20
-+++ w/desmume/src/NDSSystem.h	2026-07-04 02:56:53
-@@ -428,6 +428,11 @@
- // hold survives the frontend's per-frame update_keypad(0). See gdbstub.cpp.
- void NDS_setEmucapInputOverride(u16 mask, int frames);
+diff --git i/desmume/src/NDSSystem.cpp w/desmume/src/NDSSystem.cpp
+index 996d1f3..f5614fb 100755
+--- i/desmume/src/NDSSystem.cpp
++++ w/desmume/src/NDSSystem.cpp
+@@ -3081,6 +3081,44 @@ static void emucapApplyInputOverride(UserButtons& b)
+ 	}
+ }
  
-+// emucap: force a bottom-screen touch each frame (touch analogue of the button override). x 0-255,
-+// y 0-191; touching=false lifts; frames < 0 holds until changed, > 0 auto-lifts. Driven by the GDB
-+// stub's QEmucap,touch command so the hold survives the frontend's per-frame input update.
-+void NDS_setEmucapTouchOverride(u16 x, u16 y, bool touching, int frames);
-+
- // get physical user input
- // not including the results of autofire/etc.
- // the effects of calls to "set physical user input" functions will be immediately reflected here though.
---- i/desmume/src/NDSSystem.cpp	2026-07-04 03:42:20
-+++ w/desmume/src/NDSSystem.cpp	2026-07-04 02:56:41
-@@ -3078,6 +3078,41 @@
- 	{
- 		if (--emucapInput.frames_remaining == 0)
- 			emucapInput.active = false;
-+	}
-+}
-+
 +struct EmucapTouchOverride {
 +	bool active;
 +	int frames_remaining; // <0 = hold until changed; >0 = release after this many frames
@@ -46,17 +31,23 @@
 +	t.isTouch = emucapTouch.touching;
 +	if (emucapTouch.touching)
 +	{
-+		t.touchX = emucapTouch.x;
-+		t.touchY = emucapTouch.y;
++		// DeSmuME stores touch as the pixel coordinate pre-shifted <<4 (canonical NDS_setTouchPos
++		// does touchX = x<<4; the TSC consumer NDS_getADCTouchPosX expects that lsl-4 form). Skipping
++		// the shift lands every touch at 1/16 of the requested pixel (top-left), so shift here too.
++		t.touchX = emucapTouch.x << 4;
++		t.touchY = emucapTouch.y << 4;
 +	}
 +	if (emucapTouch.frames_remaining > 0)
 +	{
 +		if (--emucapTouch.frames_remaining == 0)
 +			emucapTouch.active = false;
- 	}
- }
++	}
++}
++
  
-@@ -3089,6 +3124,7 @@
+ void NDS_beginProcessingInput()
+ {
+@@ -3089,6 +3127,7 @@ void NDS_beginProcessingInput()
  
  	// emucap: fold in any forced input before autofire/antipodal processing runs
  	emucapApplyInputOverride(intermediateUserInput.buttons);
@@ -64,14 +55,30 @@
  
  	// processing is valid now
  	validToProcessInput = true;
---- i/desmume/src/gdbstub/gdbstub.cpp	2026-07-04 03:42:20
-+++ w/desmume/src/gdbstub/gdbstub.cpp	2026-07-04 02:58:11
-@@ -898,6 +898,30 @@
-     frames = (int)f;
-   }
-   NDS_setEmucapInputOverride((u16)(mask & 0x0fff), frames);
-+}
+diff --git i/desmume/src/NDSSystem.h w/desmume/src/NDSSystem.h
+index cc36100..76a806a 100755
+--- i/desmume/src/NDSSystem.h
++++ w/desmume/src/NDSSystem.h
+@@ -428,6 +428,11 @@ void NDS_setMic(bool pressed);
+ // hold survives the frontend's per-frame update_keypad(0). See gdbstub.cpp.
+ void NDS_setEmucapInputOverride(u16 mask, int frames);
+ 
++// emucap: force a bottom-screen touch each frame (touch analogue of the button override). x 0-255,
++// y 0-191; touching=false lifts; frames < 0 holds until changed, > 0 auto-lifts. Driven by the GDB
++// stub's QEmucap,touch command so the hold survives the frontend's per-frame input update.
++void NDS_setEmucapTouchOverride(u16 x, u16 y, bool touching, int frames);
 +
+ // get physical user input
+ // not including the results of autofire/etc.
+ // the effects of calls to "set physical user input" functions will be immediately reflected here though.
+diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
+index ff71706..7def9c6 100644
+--- i/desmume/src/gdbstub/gdbstub.cpp
++++ w/desmume/src/gdbstub/gdbstub.cpp
+@@ -900,6 +900,30 @@ static void emucap_apply_input(const uint8_t *args) {
+   NDS_setEmucapInputOverride((u16)(mask & 0x0fff), frames);
+ }
+ 
 +// "release" -> lift; else "<hexX>,<hexY>[,<hexframes>]" -> press the bottom screen at (x,y).
 +// frames defaults to -1 (hold until changed); >0 auto-lifts after that many processed frames (a tap).
 +static void emucap_apply_touch(const uint8_t *args) {
@@ -94,19 +101,21 @@
 +    frames = (int)f;
 +  }
 +  NDS_setEmucapTouchOverride((u16)(x & 0xFFFF), (u16)(y & 0xFFFF), true, frames);
- }
- 
++}
++
  /* Decode a hex-encoded byte string (e.g. "2f74...") into out, stopping at the
-@@ -1042,6 +1066,12 @@
-     // emucap input: QEmucap,input:<hexmask>[,<hexframes>] -> force pad buttons.
-     if ( strncmp( (const char *)packet, "QEmucap,input:", 14) == 0) {
-       emucap_apply_input( &packet[14]);
-+      strcpy( (char *)out_ptr, "OK");
-+      send_size = 2;
-+    }
-+    // emucap touch: QEmucap,touch:release -> lift; QEmucap,touch:<hexX>,<hexY>[,<hexframes>] -> press.
-+    else if ( strncmp( (const char *)packet, "QEmucap,touch:", 14) == 0) {
-+      emucap_apply_touch( &packet[14]);
+  * first non-hex character or NUL. Paths ride the RSP hex-encoded because they can
+  * contain spaces/'/'/'.' which are awkward-to-impossible to send raw in a packet. */
+@@ -1045,6 +1069,12 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
        strcpy( (char *)out_ptr, "OK");
        send_size = 2;
      }
++    // emucap touch: QEmucap,touch:release -> lift; QEmucap,touch:<hexX>,<hexY>[,<hexframes>] -> press.
++    else if ( strncmp( (const char *)packet, "QEmucap,touch:", 14) == 0) {
++      emucap_apply_touch( &packet[14]);
++      strcpy( (char *)out_ptr, "OK");
++      send_size = 2;
++    }
+     // emucap savestate: QEmucap,savestate:<hexpath> -> native DeSmuME savestate_save.
+     // Reply OK on success, E01 on failure (bad path / write error).
+     else if ( strncmp( (const char *)packet, "QEmucap,savestate:", 18) == 0) {

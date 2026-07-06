@@ -1,5 +1,5 @@
 diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
-index 7def9c6..31c0fac 100644
+index 7def9c6..9ae4262 100644
 --- i/desmume/src/gdbstub/gdbstub.cpp
 +++ w/desmume/src/gdbstub/gdbstub.cpp
 @@ -403,8 +403,11 @@ step_instruction_watch( void *data, uint32_t addr, UNUSED_PARM(int thunmb)) {
@@ -34,6 +34,45 @@ index 7def9c6..31c0fac 100644
              strcpy ( (char *)out_ptr, "E03");
              send_size = 3;
            }
+@@ -1210,15 +1222,31 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+             DEBUG_LOG("Memory write of %d bytes to %08x\n",
+                       length, addr);
+ 
+-            for ( i = 0; i < length; i++) {
+-              rx_ptr = hex2mem( rx_ptr, &write_byte, 1);
+-
+-              stub->direct_memio->write8( stub->direct_memio->data,
+-                                         addr++, write_byte);
++            // emucap: the loop below reads 2 hex chars per byte from the client packet and writes
++            // `length` bytes into emulated memory. The hex payload sits in the SAME fixed input buffer
++            // that still holds the request header `M<addr>,<len>:` before it, so the room left for the
++            // payload is BUFMAX minus the header bytes already consumed -- not the read-reply framing
++            // bound. rx_ptr now points at the first payload char, so (rx_ptr - packet) is that consumed
++            // header length; reject any write whose header + 2*length hex chars would run past the input
++            // buffer (an OOB read of it) with E03 instead of overflowing. error01 is cleared so the
++            // trailing E02 path does not overwrite the E03 reply.
++            uint32_t header_bytes = (uint32_t)(rx_ptr - packet);
++            if ( length > (uint32_t)((BUFMAX - header_bytes) / 2)) {
++              strcpy( (char *)out_ptr, "E03");
++              send_size = 3;
++              error01 = 0;
+             }
++            else {
++              for ( i = 0; i < length; i++) {
++                rx_ptr = hex2mem( rx_ptr, &write_byte, 1);
+ 
+-            strcpy( (char *)out_ptr, "OK");
+-            error01 = 0;
++                stub->direct_memio->write8( stub->direct_memio->data,
++                                           addr++, write_byte);
++              }
++
++              strcpy( (char *)out_ptr, "OK");
++              error01 = 0;
++            }
+           }
+         }
+         else {
 diff --git i/desmume/src/gdbstub/gdbstub_internal.h w/desmume/src/gdbstub/gdbstub_internal.h
 index 747720e..aed239d 100644
 --- i/desmume/src/gdbstub/gdbstub_internal.h

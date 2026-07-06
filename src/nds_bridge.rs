@@ -42,10 +42,27 @@ const GDBSTUB_REPLY_FRAMING: usize = 5;
 // bulk read (dump_memory/find_pattern) overflows `hidden_buffer` and segfaults DeSmuME (the live crash
 // this fix targets). Enforced at build time so a future MAX_READ_CHUNK bump cannot silently regress it.
 const _: () = assert!(MAX_READ_CHUNK * 2 + GDBSTUB_REPLY_FRAMING <= GDBSTUB_BUFMAX);
+/// Bulk-write chunk size for the GDB `M addr,len:hex` path. Unlike a read (whose *reply* fills the
+/// stub buffer), a write's inbound *packet* does — 2 hex chars per byte plus the `M`-header — so an
+/// over-large write packet overruns the stub's fixed input buffer and DeSmuME silently drops it
+/// (lost write + multi-second stall). A larger write is split into chunks this size, all under one
+/// freeze so a running core cannot advance and tear it. Provably within `GDBSTUB_BUFMAX` — see below.
+const MAX_WRITE_CHUNK: usize = 0x2000;
+/// Bytes the `M addr,len:` header (`M` + ≤8 addr hex + `,` + ≤8 len hex + `:`) and the `$..#cc`
+/// framing add around a write packet's hex payload — an upper bound. `2*len + GDBSTUB_WRITE_FRAMING`
+/// must fit `GDBSTUB_BUFMAX`.
+const GDBSTUB_WRITE_FRAMING: usize = 32;
+// Compile-time guard: a full MAX_WRITE_CHUNK `M` packet must fit the stub's input buffer, or a
+// chunked write overflows it and DeSmuME silently drops the packet (the lost-write defect this cap
+// fixes). Enforced at build time so a future MAX_WRITE_CHUNK bump cannot silently regress it.
+const _: () = assert!(MAX_WRITE_CHUNK * 2 + GDBSTUB_WRITE_FRAMING <= GDBSTUB_BUFMAX);
 /// Cap on a single `read_memory` length (matches the Mesen adapter's READ_CAP). A larger region is
 /// read in chunks — an unbounded length would preallocate `length*2` and tie up the bridge on one
 /// request. The region-size check in `route` also bounds it, but this caps the 4 GB `arm9`/`arm7` bus.
 const MAX_READ_LEN: usize = 0x2_0000;
+/// Cap on a single `write_memory` length (mirrors MAX_READ_LEN). A larger write is rejected rather
+/// than streamed; within the cap it is split into MAX_WRITE_CHUNK packets.
+const MAX_WRITE_LEN: usize = 0x2_0000;
 /// Cap on a single `find_pattern` scan window (128 KB, matching the pc98 adapter). The 4 GB
 /// `arm9`/`arm7` bus views would otherwise stream the whole address space over the GDB `m` path;
 /// a longer request is scanned up to this cap and reported as `truncated_scan`.
@@ -208,13 +225,18 @@ impl<G: GdbTransport> CpuConn<G> {
     }
 
     fn note_stop(&mut self, stop: String) {
-        self.frozen = true;
-        // S02(SIGINT)는 async 이벤트가 아니라 우리가 건 pause/interrupt다 — with_frozen이 데이터 명령마다
-        // pause하면 이 인터럽트 스톱이 큐에 쌓여 poll_events에서 실제 BP 히트(S05=SIGTRAP)를 가린다.
-        // frozen 상태만 갱신하고 큐엔 넣지 않는다.
+        // S02(SIGINT)는 async 이벤트가 아니라 우리가 건 pause/interrupt다. 두 가지를 지운다:
+        //   1) 이벤트 큐 — with_frozen이 데이터 명령마다 pause하면 이 SIGINT가 쌓여 poll_events에서 실제 BP
+        //      히트(S05=SIGTRAP)를 가린다.
+        //   2) frozen — interrupt()는 0x03의 async stop을 소비하지만 뒤이은 `?` 조회가 만든 *중복* SIGINT가
+        //      소켓에 남는다. 그 잔류를 (이미 resume한 뒤) 나중 drain_stops가 읽어 frozen=true로 되돌리면
+        //      running 코어를 phantom freeze시킨다(공유 write 후 비-라우팅 ARM7이 그렇게 굳었다). 그래서
+        //      frozen은 reportable stop에서만 세우고, 우리 pause/interrupt의 frozen 부기는 pause()/resume()가
+        //      명시적으로 소유한다.
         if is_interrupt_stop(&stop) {
             return;
         }
+        self.frozen = true;
         let mut event = stop_event(&stop);
         set_event_field(&mut event, "cpu", json!(self.id.as_str()));
         self.events.push(event);
@@ -279,7 +301,39 @@ impl<G: GdbTransport> CpuConn<G> {
         })
     }
 
+    /// Write `hexstr` (2 hex chars per byte) at `address` via GDB `M` packets, split into
+    /// `MAX_WRITE_CHUNK`-byte packets so no packet exceeds the stub's fixed input buffer — a
+    /// too-large `M` packet is silently dropped by DeSmuME (lost write + multi-second stall). Like
+    /// `read_abs_hex`, the whole write runs under one freeze so a running core cannot advance between
+    /// chunks and tear it; the inner `send_cmd` is already frozen and does not re-pause.
+    fn write_abs_hex(&mut self, address: u64, hexstr: &str) -> NdsResult<()> {
+        self.with_frozen(|s| {
+            let size = hexstr.len() / 2;
+            let mut offset = 0usize;
+            while offset < size {
+                let chunk = std::cmp::min(MAX_WRITE_CHUNK, size - offset);
+                let hex_slice = &hexstr[offset * 2..(offset + chunk) * 2];
+                let resp =
+                    s.send_cmd(&format!("M{:x},{chunk:x}:{hex_slice}", address + offset as u64))?;
+                // DeSmuME answers `M` with an empty packet, not "OK"; accept either. A non-empty
+                // non-OK reply (e.g. "E02" on a bad address) is a real error.
+                if !resp.is_empty() && resp != "OK" {
+                    return Err(NdsBridgeError::Emulator(format!(
+                        "GDB memory write failed: {resp}"
+                    )));
+                }
+                offset += chunk;
+            }
+            Ok(())
+        })
+    }
+
     fn step_instructions(&mut self, count: u64) -> NdsResult<()> {
+        // Stepping halts the core, so the bridge must halt it first: otherwise send_cmd's with_frozen
+        // treats each `s` as a bridge-injected pause and auto-resumes ("c") after it, re-running the
+        // core while step then labels it frozen — a mismatch that desyncs the next command. Pausing
+        // up front makes with_frozen a no-op per step and keeps the frozen bookkeeping consistent.
+        self.pause()?;
         for _ in 0..count {
             // `s` replies with a stop, so it bypasses send_cmd's demux; clear any buffered
             // stale stop first so it is not mistaken for this step's completion.
@@ -309,14 +363,16 @@ impl<G: GdbTransport> CpuConn<G> {
         if !self.frozen {
             // 인터럽트 전에 대기 중인 스톱(BP 히트 S05 등)을 드레인해 큐에 넣는다 — 안 그러면 interrupt()의
             // 읽기가 그 S05를 삼켜 poll_events가 BP 히트를 잃는다. 드레인으로 이미 멈춘 게 드러나면(frozen)
-            // 인터럽트를 생략한다(멈춘 스텁에 0x03은 무응답→hang 위험). 살아있으면 인터럽트하고 그 응답도
-            // note_stop한다 — 우리 SIGINT(S02)는 note_stop이 거르고, 인터럽트 순간 실제 스톱이면 큐에 남는다.
+            // 인터럽트를 생략한다(멈춘 스텁에 0x03은 무응답→hang 위험). 살아있으면 인터럽트하고 우리 SIGINT의
+            // frozen 부기를 여기서 명시적으로 소유한다 — note_stop은 S02(우리 SIGINT)로 frozen을 세우지 않는다
+            // (잔류 SIGINT가 나중 drain에서 running 코어를 phantom freeze시키는 걸 막으려고).
             let events_before = self.events.len();
             self.drain_stops()?;
             let drained_reportable = self.events.len() > events_before;
             if !self.frozen {
                 let stop = self.gdb.interrupt()?;
                 self.note_stop(stop);
+                self.frozen = true;
             }
             return Ok(drained_reportable);
         }
@@ -641,7 +697,7 @@ impl<G: GdbTransport> NdsBridge<G> {
                 "read length {length:#x} exceeds the {MAX_READ_LEN:#x} cap — read a large region in chunks (advance the start address)"
             )));
         }
-        let (cpu, addr) = route(params, length as u64)?;
+        let (cpu, addr, _region) = route(params, length as u64)?;
         let hex = self.cpu_mut(cpu)?.read_abs_hex(addr, length)?;
         Ok(json!({ "hex": hex, "cpu": cpu.as_str() }))
     }
@@ -653,18 +709,24 @@ impl<G: GdbTransport> NdsBridge<G> {
         }
         hex::decode(hexstr).map_err(|_| NdsBridgeError::BadParams("hex decode failed".into()))?;
         let size = hexstr.len() / 2;
-        let (cpu, addr) = route(params, size as u64)?;
-        let resp = self
-            .cpu_mut(cpu)?
-            .send_cmd(&format!("M{addr:x},{size:x}:{hexstr}"))?;
-        // DeSmuME's stub performs the write but answers `M` with an empty packet, not
-        // "OK" (standard GDB / the MAME stub reply). Accept empty or "OK" as success; a
-        // non-empty non-OK reply (e.g. "E02" on a bad address) is a real error.
-        if !resp.is_empty() && resp != "OK" {
-            return Err(NdsBridgeError::Emulator(format!(
-                "GDB memory write failed: {resp}"
+        if size > MAX_WRITE_LEN {
+            return Err(NdsBridgeError::BadParams(format!(
+                "write length {size:#x} exceeds the {MAX_WRITE_LEN:#x} cap — write a large region in chunks (advance the start address)"
             )));
         }
+        let (cpu, addr, _region) = route(params, size as u64)?;
+        // The chunked write freezes ONLY the routed core (write_abs_hex's own with_frozen), never the
+        // sibling. Freezing every core for a shared-Main write (to guard a running ARM7 against
+        // observing a partially-applied multi-packet write) was tried and reverted: our only interrupt
+        // path is 0x03 + a `?` query, and that `?` is retransmitted while the core breaks, so ONE
+        // interrupt emits a burst of SIGINT (S02) echoes. Pausing the un-routed ARM7 on every write
+        // doubled that burst pressure and its trailing echoes desynced a later data read into a
+        // multi-second blocking-read stall AND left ARM7 pinned "frozen" after a resume — a running
+        // debugger core reported halted. A correct, running debugger state beats a purely theoretical
+        // multi-packet tearing guard on shared Main RAM, so the write freezes only the routed core and
+        // a HITL-resumed ARM7 keeps running (a torn shared-Main write is possible in principle but was
+        // never observed; bulk READS still take the all-core freeze for snapshot consistency).
+        self.cpu_mut(cpu)?.write_abs_hex(addr, hexstr)?;
         Ok(json!({ "written": size, "cpu": cpu.as_str() }))
     }
 
@@ -853,9 +915,10 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     /// Run `f` with every attached core frozen, then restore each core to its prior running/frozen
-    /// state. Used for shared-RAM bulk reads (dump_memory/find_pattern): ARM9 and ARM7 run behind
-    /// independent stubs, so freezing only the routed core leaves the other free to mutate shared
-    /// `main` RAM mid-read. A core the bridge pauses here is resumed afterwards; a core that was
+    /// state. Used for shared-RAM bulk reads (dump_memory/find_pattern) AND shared-RAM writes
+    /// (write_memory to `main`): ARM9 and ARM7 run behind independent stubs, so freezing only the
+    /// routed core leaves the other free to mutate — or read a partially-applied write of — shared
+    /// `main` RAM mid-access. A core the bridge pauses here is resumed afterwards; a core that was
     /// already halted — or one whose pause drained a real breakpoint stop (`pause` returns `true`) —
     /// is left halted, so this never resumes past a genuine stop or un-pauses a deliberately frozen core.
     fn with_all_cores_frozen<T>(
@@ -867,9 +930,22 @@ impl<G: GdbTransport> NdsBridge<G> {
         } else {
             !self.arm9.pause()?
         };
-        let resume_arm7 = match self.arm7.as_mut() {
-            Some(a7) if !a7.frozen => !a7.pause()?,
-            _ => false,
+        // ARM7's pause can fail. ARM9 is already paused above, so a bare `?` here would return with
+        // ARM9 left wrongly frozen after a failed find_pattern/dump_memory. Roll back the ARM9 pause
+        // this helper injected before propagating the error.
+        let arm7_running = self.arm7.as_ref().is_some_and(|a7| !a7.frozen);
+        let resume_arm7 = if arm7_running {
+            match self.arm7.as_mut().expect("checked running above").pause() {
+                Ok(drained_reportable) => !drained_reportable,
+                Err(e) => {
+                    if resume_arm9 {
+                        let _ = self.arm9.resume();
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            false
         };
         let r = f(self);
         if resume_arm7 {
@@ -992,7 +1068,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let ztype = if hardware { "1" } else { "0" };
-        let (cpu, addr) = route(params, 4)?;
+        let (cpu, addr, _region) = route(params, 4)?;
         let resp = self
             .cpu_mut(cpu)?
             .send_cmd(&format!("Z{ztype},{addr:x},4"))?;
@@ -1309,11 +1385,21 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     fn poll_events(&mut self, params: &Value) -> NdsResult<Value> {
-        let mut fresh = Vec::new();
+        // Validate the `breakpoint_id` filter BEFORE draining the stop sockets or `mem::take`ing any
+        // queue (both destructive): a malformed filter must fail without consuming — and thereby
+        // losing forever — the just-drained hits plus every previously-held event.
+        let filter_id = optional_num(params, "breakpoint_id")?;
+        // Drain BOTH cores' async-stop sockets before harvesting any events into a local. Draining
+        // appends hits to each core's own queue, so if a later drain (ARM7) errors, the events
+        // already drained from an earlier core (ARM9) stay safe in that core's queue and surface on
+        // the next poll — harvesting ARM9 into a local between the two drains (the previous order)
+        // would drop them when the ARM7 drain's `?` returns.
         self.arm9.drain_stops()?;
-        fresh.append(&mut std::mem::take(&mut self.arm9.events));
         if let Some(a7) = self.arm7.as_mut() {
             a7.drain_stops()?;
+        }
+        let mut fresh = std::mem::take(&mut self.arm9.events);
+        if let Some(a7) = self.arm7.as_mut() {
             fresh.append(&mut std::mem::take(&mut a7.events));
         }
         for event in &mut fresh {
@@ -1322,7 +1408,6 @@ impl<G: GdbTransport> NdsBridge<G> {
         let mut all = std::mem::take(&mut self.events);
         all.append(&mut fresh);
 
-        let filter_id = optional_num(params, "breakpoint_id")?;
         let mut out = Vec::new();
         for mut event in all {
             let matches_filter = match filter_id {
@@ -1487,9 +1572,11 @@ fn memory_region(name: &str) -> Option<&'static NdsRegion> {
     MEMORY_REGIONS.iter().find(|r| r.name == name)
 }
 
-/// Resolve a request's `(cpu, absolute_address)` from `memory_type` + `address`/`start`.
-/// The routing CPU is the memory_type's default unless an explicit `cpu` param overrides it.
-fn route(params: &Value, len: u64) -> NdsResult<(CpuId, u64)> {
+/// Resolve a request's `(cpu, absolute_address, region)` from `memory_type` + `address`/`start`.
+/// The routing CPU is the memory_type's default unless an explicit `cpu` param overrides it; the
+/// resolved region is returned so callers can honor its freeze discipline (e.g. a shared-RAM write
+/// freezes every core, not just the routed one).
+fn route(params: &Value, len: u64) -> NdsResult<(CpuId, u64, &'static NdsRegion)> {
     let memory_type = params
         .get("memory_type")
         .and_then(Value::as_str)
@@ -1520,7 +1607,7 @@ fn route(params: &Value, len: u64) -> NdsResult<(CpuId, u64)> {
     let addr = region.base.checked_add(offset).ok_or_else(|| {
         NdsBridgeError::BadParams(format!("{memory_type} address overflow at offset {offset:#x}"))
     })?;
-    Ok((cpu, addr))
+    Ok((cpu, addr, region))
 }
 
 fn region_offset(params: &Value) -> NdsResult<u64> {
@@ -1883,6 +1970,10 @@ mod tests {
         replies: VecDeque<(String, String)>,
         calls: Vec<String>,
         nonblocking: VecDeque<String>,
+        /// When set, `interrupt()` returns an error — models a core whose pause (SIGINT) fails.
+        fail_interrupt: bool,
+        /// When set, `recv_nonblocking()` returns an error — models a drain-stops socket failure.
+        fail_nonblocking: bool,
     }
 
     impl FakeGdb {
@@ -1922,12 +2013,18 @@ mod tests {
         }
 
         fn interrupt(&mut self) -> Result<String, BridgeError> {
+            if self.fail_interrupt {
+                return Err(BridgeError::Emulator("fake interrupt failure".into()));
+            }
             // A real interrupt reads the next packet off the socket: a pending stop is consumed here
             // (the loss the pause fix drains first). Otherwise the stub answers our SIGINT (S02).
             Ok(self.nonblocking.pop_front().unwrap_or_else(|| "S02".into()))
         }
 
         fn recv_nonblocking(&mut self) -> Result<Option<String>, BridgeError> {
+            if self.fail_nonblocking {
+                return Err(BridgeError::Emulator("fake nonblocking failure".into()));
+            }
             Ok(self.nonblocking.pop_front())
         }
     }
@@ -2294,6 +2391,39 @@ mod tests {
                 .iter()
                 .any(|e| e["signal"] == "05"),
             "pending breakpoint hit was lost: {events:?}"
+        );
+    }
+
+    #[test]
+    fn poll_events_bad_filter_does_not_drop_buffered_hit() {
+        // A malformed `breakpoint_id` filter must be rejected BEFORE poll_events drains the stop
+        // sockets or `mem::take`s the queues: otherwise the `?` early-return drops every just-drained
+        // and previously-held event forever. Here a breakpoint hit is already buffered; a bad filter
+        // must error without consuming it, and the hit must surface on the next valid poll.
+        let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+        bridge.events.push(json!({
+            "type": "breakpoint_hit",
+            "signal": "05",
+            "id": 7,
+        }));
+        let bad = bridge.handle_request(Request::new(
+            1,
+            "poll_events",
+            json!({"breakpoint_id": "abc"}),
+        ));
+        assert!(!bad.ok, "malformed breakpoint_id must be rejected");
+        assert_eq!(bad.error.unwrap().kind, "bad_params");
+        let good = bridge
+            .handle_request(Request::new(2, "poll_events", json!({})))
+            .result
+            .unwrap();
+        assert!(
+            good["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["id"] == 7 && e["signal"] == "05"),
+            "buffered breakpoint hit was lost by the bad-filter poll: {good:?}"
         );
     }
 
@@ -2919,6 +3049,282 @@ mod tests {
             !a7.gdb.calls.iter().any(|c| c == "c"),
             "an already-frozen ARM7 must not be resumed by a shared read: {:?}",
             a7.gdb.calls
+        );
+    }
+
+    #[test]
+    fn step_on_running_core_stays_halted_and_labeled_frozen() {
+        // Stepping a running core must end with the core actually halted AND labeled frozen —
+        // consistently. The old path let send_cmd's with_frozen auto-resume ("c") after each `s`,
+        // re-running the core while step set frozen=true, so the next command hit a running stub and
+        // desynced. Assert: no `c` (resume) is emitted and the core is labeled frozen.
+        let regs = arm_regs_hex(&[(15, 0x0200_0004)], 0);
+        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("s", "S05"), ("g", &regs)]);
+        bridge.arm9.frozen = false; // running (e.g. HITL resume-both)
+        let response =
+            bridge.handle_request(Request::new(9, "step_instructions", json!({"count": 1})));
+        assert!(response.ok, "{:?}", response.error);
+        assert!(
+            bridge.arm9.frozen,
+            "a stepped core must be labeled frozen (matching its real halted state)"
+        );
+        assert!(
+            !bridge.arm9.gdb.calls.iter().any(|c| c == "c"),
+            "stepping must not resume (re-run) the core: {:?}",
+            bridge.arm9.gdb.calls
+        );
+        assert_eq!(
+            bridge.arm9.gdb.calls.iter().filter(|c| c.as_str() == "s").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn write_memory_chunks_large_write_into_buffer_sized_packets() {
+        // A write larger than the stub's input buffer must be split into MAX_WRITE_CHUNK packets, not
+        // sent as one oversized `M` packet that DeSmuME silently drops (lost write + stall). Here a
+        // write just over one chunk produces exactly two `M` packets, each within the buffer.
+        let size = MAX_WRITE_CHUNK + 0x10;
+        let hexstr = "ab".repeat(size);
+        let hex1 = "ab".repeat(MAX_WRITE_CHUNK);
+        let hex2 = "ab".repeat(0x10);
+        let addr2 = 0x0200_0000usize + MAX_WRITE_CHUNK;
+        let mut bridge = bridge_arm9_only_pairs(vec![
+            ("?".into(), "S05".into()),
+            (format!("M2000000,{:x}:{hex1}", MAX_WRITE_CHUNK), "OK".into()),
+            (format!("M{addr2:x},10:{hex2}"), "OK".into()),
+        ]);
+        let response = bridge.handle_request(Request::new(
+            3,
+            "write_memory",
+            json!({"memory_type": "main", "address": "0x0", "hex": hexstr}),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["written"], size);
+        let m_calls: Vec<&String> =
+            bridge.arm9.gdb.calls.iter().filter(|c| c.starts_with('M')).collect();
+        assert_eq!(
+            m_calls.len(),
+            2,
+            "an over-chunk write must be split into 2 M packets, got {}",
+            m_calls.len()
+        );
+        // Every emitted packet (payload + $..#cc framing) must fit the stub's input buffer.
+        for c in &m_calls {
+            assert!(
+                c.len() + 4 <= GDBSTUB_BUFMAX,
+                "M packet ({} bytes) must fit the stub input buffer",
+                c.len()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_main_write_leaves_running_arm7_untouched() {
+        // A `main` (shared Main RAM) write freezes ONLY the routed ARM9, never the sibling ARM7.
+        // Freezing both cores would guard a running ARM7 against a partially-applied multi-packet
+        // write, but the only interrupt available is 0x03 + a `?` query whose retransmits burst SIGINT
+        // echoes: pausing ARM7 on every write desyncs later reads into multi-second stalls and can
+        // leave ARM7 pinned "frozen" after a resume. A correct running debugger state beats a
+        // theoretical tearing guard, so a HITL-resumed ARM7 keeps running: no interrupt, no `c`.
+        let size = MAX_WRITE_CHUNK + 0x10;
+        let hexstr = "ab".repeat(size);
+        let hex1 = "ab".repeat(MAX_WRITE_CHUNK);
+        let hex2 = "ab".repeat(0x10);
+        let addr2 = 0x0200_0000usize + MAX_WRITE_CHUNK;
+        let arm9 = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (format!("M2000000,{:x}:{hex1}", MAX_WRITE_CHUNK), "OK".into()),
+            (format!("M{addr2:x},10:{hex2}"), "OK".into()),
+        ]);
+        let arm7 = FakeGdb::with(&[("?", "S05")]);
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.frozen = false; // HITL both-running
+        bridge.arm7.as_mut().unwrap().frozen = false;
+        let response = bridge.handle_request(Request::new(
+            1,
+            "write_memory",
+            json!({"memory_type": "main", "address": "0x0", "hex": hexstr}),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["written"], size);
+
+        // ARM7 is never touched by the write: it keeps running and sees nothing past the construction
+        // handshake `?` — no interrupt, no resume `c`.
+        let a7 = bridge.arm7.as_ref().unwrap();
+        assert!(
+            !a7.frozen,
+            "a running ARM7 must stay running across a shared-Main write"
+        );
+        assert_eq!(
+            a7.gdb.calls,
+            vec!["?".to_string()],
+            "a shared-Main write must not send ARM7 anything past the handshake: {:?}",
+            a7.gdb.calls
+        );
+
+        // The write still lands as 2 M packets on the routed ARM9, which is restored to running.
+        let m_calls: Vec<&String> =
+            bridge.arm9.gdb.calls.iter().filter(|c| c.starts_with('M')).collect();
+        assert_eq!(
+            m_calls.len(),
+            2,
+            "the chunked write must reach ARM9 as 2 M packets: {m_calls:?}"
+        );
+        assert!(!bridge.arm9.frozen, "ARM9 must be restored to running after the write");
+        assert!(
+            bridge.arm9.gdb.calls.iter().any(|c| c == "c"),
+            "ARM9 frozen for the write must be resumed after: {:?}",
+            bridge.arm9.gdb.calls
+        );
+    }
+
+    #[test]
+    fn shared_read_does_not_phantom_freeze_arm7_when_stale_sigint_drains_after_resume() {
+        // A shared bulk READ (find_pattern/dump) still runs under with_all_cores_frozen, which pauses
+        // then resumes a running ARM7 (`c`). But a SIGINT (S02) — a residual async interrupt echo —
+        // then surfaces on ARM7's socket, and the NEXT drain_stops (status/poll) reads it. It must be
+        // dropped WITHOUT flipping the genuinely-running, already-resumed ARM7 back to "frozen".
+        // note_stop keys `frozen` off reportable stops only (S05), never our SIGINT (S02); the pause/
+        // resume bookkeeping owns frozen explicitly. Before that fix, this stale S02 pinned ARM7
+        // "frozen" (pc pinned) even though the core was running — the exact live shared-write symptom.
+        let arm9 = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            // find_pattern reads the 8-byte window as one m-chunk on ARM9.
+            ("m2000000,8".into(), "1122334455667788".into()),
+        ]);
+        let arm7 = FakeGdb::with(&[("?", "S05")]);
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.frozen = false; // HITL both-running (resume cpu="both")
+        bridge.arm7.as_mut().unwrap().frozen = false;
+
+        let r = bridge.handle_request(Request::new(
+            1,
+            "find_pattern",
+            json!({"memory_type": "main", "start": 0, "length": 8, "hex": "55"}),
+        ));
+        assert!(r.ok, "{:?}", r.error);
+        // The shared read paused+resumed ARM7 (proven by the `c`), leaving it running.
+        let a7 = bridge.arm7.as_ref().unwrap();
+        assert!(a7.gdb.calls.iter().any(|c| c == "c"), "shared read must resume ARM7: {:?}", a7.gdb.calls);
+        assert!(!a7.frozen, "ARM7 must be running right after the shared read");
+
+        // A stale SIGINT now surfaces on ARM7's socket and is drained by the next status. It must not
+        // re-freeze the resumed core (note_stop drops S02 and never sets frozen from it).
+        bridge
+            .arm7
+            .as_mut()
+            .unwrap()
+            .gdb
+            .nonblocking
+            .push_back("S02".into());
+        let st = bridge
+            .handle_request(Request::new(2, "status", json!({})))
+            .result
+            .unwrap();
+        assert_eq!(
+            st["cpus"]["arm7"]["state"], "running",
+            "a stale SIGINT must not phantom-freeze a resumed ARM7: {st}"
+        );
+        assert_eq!(st["cpus"]["arm9"]["state"], "running", "{st}");
+        assert_eq!(st["state"], "running", "{st}");
+    }
+
+    #[test]
+    fn nonshared_write_does_not_freeze_running_arm7() {
+        // A per-core write (memory_type=arm9) must NOT pause the sibling ARM7 — freezing every core
+        // on every write would needlessly halt a HITL-resumed ARM7. Only the routed core is frozen
+        // for the write and resumed after; ARM7 is left untouched.
+        let arm9 = FakeGdb::with(&[("?", "S05"), ("M2000000,4:deadbeef", "OK")]);
+        let arm7 = FakeGdb::with(&[("?", "S05")]);
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.frozen = false; // both running
+        bridge.arm7.as_mut().unwrap().frozen = false;
+        let response = bridge.handle_request(Request::new(
+            1,
+            "write_memory",
+            json!({"memory_type": "arm9", "address": 0x0200_0000u64, "hex": "deadbeef"}),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        let a7 = bridge.arm7.as_ref().unwrap();
+        assert!(!a7.frozen, "ARM7 stays running for a non-shared write");
+        assert_eq!(
+            a7.gdb.calls,
+            vec!["?".to_string()],
+            "a non-shared write must not touch ARM7 (no pause/resume): {:?}",
+            a7.gdb.calls
+        );
+    }
+
+    #[test]
+    fn write_memory_rejects_length_over_cap() {
+        let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+        let hexstr = "00".repeat(MAX_WRITE_LEN + 1);
+        let r = bridge.handle_request(Request::new(
+            1,
+            "write_memory",
+            json!({"memory_type": "arm9", "address": 0, "hex": hexstr}),
+        ));
+        assert!(!r.ok);
+        assert_eq!(r.error.unwrap().kind, "bad_params");
+    }
+
+    #[test]
+    fn shared_read_arm7_pause_failure_resumes_arm9() {
+        // with_all_cores_frozen pauses ARM9 first, then ARM7. If ARM7's pause errors, the helper must
+        // roll back the ARM9 pause it injected — otherwise a failed find_pattern/dump_memory leaves
+        // ARM9 wrongly frozen. Assert ARM9 ends running (a resume `c` was sent) and the error surfaces.
+        let arm9 = FakeGdb::with(&[("?", "S05")]);
+        let mut arm7 = FakeGdb::with(&[("?", "S05")]);
+        arm7.fail_interrupt = true; // ARM7's pause (SIGINT) will error
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.frozen = false; // both running (HITL)
+        bridge.arm7.as_mut().unwrap().frozen = false;
+        let resp = bridge.handle_request(Request::new(
+            1,
+            "find_pattern",
+            json!({"memory_type": "main", "start": 0, "length": 8, "hex": "aa"}),
+        ));
+        assert!(!resp.ok, "an ARM7 pause failure must propagate as an error");
+        assert_eq!(resp.error.unwrap().kind, "emulator_error");
+        assert!(
+            !bridge.arm9.frozen,
+            "ARM9 paused by the helper must be resumed after the ARM7 pause fails"
+        );
+        assert!(
+            bridge.arm9.gdb.calls.iter().any(|c| c == "c"),
+            "a rollback resume (continue) must be sent to ARM9: {:?}",
+            bridge.arm9.gdb.calls
+        );
+    }
+
+    #[test]
+    fn poll_events_preserves_arm9_events_when_arm7_drain_errors() {
+        // poll_events drains ARM9 then ARM7. If the ARM7 drain errors, the ARM9 hits already drained
+        // must not be discarded — they stay queued and surface on the next poll. Regression for a
+        // harvest-into-local between the drains that dropped ARM9 events on an ARM7 socket error.
+        let regs = arm_regs_hex(&[(15, 0x0200_0000)], 0);
+        let arm9 = FakeGdb::with(&[("?", "S05"), ("g", &regs)]);
+        let arm7 = FakeGdb::with(&[("?", "S05")]);
+        let mut bridge = NdsBridge::new(arm9, Some(arm7), BridgeEnv::default());
+        bridge.arm9.gdb.nonblocking.push_back("S05".into()); // an ARM9 breakpoint hit is pending
+        bridge.arm7.as_mut().unwrap().gdb.fail_nonblocking = true; // the ARM7 drain will error
+
+        let first = bridge.handle_request(Request::new(1, "poll_events", json!({})));
+        assert!(!first.ok, "an ARM7 drain error must surface");
+
+        // The ARM9 hit was drained before the ARM7 error; it must not be lost.
+        bridge.arm7.as_mut().unwrap().gdb.fail_nonblocking = false;
+        let second = bridge.handle_request(Request::new(2, "poll_events", json!({})));
+        assert!(second.ok, "{:?}", second.error);
+        let events = second.result.unwrap();
+        assert!(
+            events["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["signal"] == "05"),
+            "the ARM9 breakpoint hit drained before the ARM7 error was lost: {events:?}"
         );
     }
 
