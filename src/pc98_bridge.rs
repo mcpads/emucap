@@ -460,6 +460,11 @@ pub struct Bridge<G> {
     bps: BTreeMap<u64, Breakpoint>,
     next_bp: u64,
     input_fields: Option<Vec<String>>,
+    /// Count of trailing interrupt-echo stops that `interrupt()` left buffered and that `note_stop`
+    /// must drop instead of surfacing as phantom poll_events. PC-98's own pause reports `S05` (same
+    /// as a breakpoint), so signal number cannot distinguish it — this counter is the equivalent of
+    /// the NDS bridge's `is_interrupt_stop` (which keys off SIGINT `S02`).
+    pending_interrupt_stops: u32,
 }
 
 impl<G: GdbTransport> Bridge<G> {
@@ -475,6 +480,7 @@ impl<G: GdbTransport> Bridge<G> {
             bps: BTreeMap::new(),
             next_bp: 1,
             input_fields: None,
+            pending_interrupt_stops: 0,
         }
     }
 
@@ -734,11 +740,16 @@ impl<G: GdbTransport> Bridge<G> {
         self.stop_for_state_restore()?;
         let regs_hex = self.read_regs_hex()?;
         let save_items_dir = unique_temp_dir("emucap_pc98_saveitems_")?;
+        // Stage the zip to a sibling `.partial` and rename over out_path only once it is fully
+        // written, so a mid-save failure (region read timeout, peer close, ENOSPC, kill) leaves any
+        // pre-existing savestate byte-for-byte intact instead of truncating it. Mirrors the NDS
+        // dump_memory and PPSSPP dump atomic-swap.
+        let partial_path = state_partial_sibling(&out_path)?;
         let result = (|| {
             let mut save_items = self.save_lua_save_items(&save_items_dir)?;
             save_items.insert("dir".into(), json!(SAVE_ITEMS_DIR));
             let save_items_members = save_item_members(&save_items_dir)?;
-            let file = File::create(&out_path)?;
+            let file = File::create(&partial_path)?;
             let mut zip = ZipWriter::new(file);
             let options =
                 SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -778,6 +789,7 @@ impl<G: GdbTransport> Bridge<G> {
             });
             zip.write_all(&serde_json::to_vec(&manifest)?)?;
             zip.finish()?;
+            fs::rename(&partial_path, &out_path)?;
             let bytes = out_path.metadata()?.len();
             Ok(json!({
                 "path": path.display().to_string(),
@@ -789,6 +801,10 @@ impl<G: GdbTransport> Bridge<G> {
             }))
         })();
         let _ = fs::remove_dir_all(&save_items_dir);
+        if result.is_err() {
+            // The rename never ran, so out_path (any prior save) is untouched; drop the partial zip.
+            let _ = fs::remove_file(&partial_path);
+        }
         result
     }
 
@@ -1112,7 +1128,15 @@ impl<G: GdbTransport> Bridge<G> {
 
     fn pause(&mut self) -> BridgeResult<Value> {
         if !self.frozen {
+            // interrupt() = 0x03 브레이크 + `?` → 스텁이 두 개의 stop(S05)을 보낸다. interrupt()가 하나를
+            // 반환값으로 소비하고 나머지 하나(우리가 만든 인터럽트 에코)가 버퍼에 남는다. pc98 에코는
+            // S05라 signal로 실제 BP 히트와 구분 불가하므로, interrupt() 전에 버퍼의 실제 pending stop
+            // (직전 pause_on_hit BP 등)을 먼저 이벤트 큐로 걷어낸다(step_instruction_count/frames_op와
+            // 동일). 그러면 카운터가 억제할 대상은 인터럽트 자신의 에코 하나뿐이라, 앞서 버퍼된 실제
+            // 히트가 카운트되어 드롭되지 않는다.
+            self.drain_buffered_stops()?;
             let _ = self.gdb.interrupt()?;
+            self.pending_interrupt_stops = self.pending_interrupt_stops.saturating_add(1);
             self.frozen = true;
         }
         Ok(json!({ "state": "frozen" }))
@@ -1799,6 +1823,12 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     fn frames_op(&mut self, name: &str, frames: u64) -> BridgeResult<Option<String>> {
+        // s(step)와 마찬가지로 framestep/runframes도 응답 자체가 stop이라 send_cmd의 stale-stop demux가
+        // command_expects_stop로 스킵된다. 직전 resume()가 pause_on_hit BP를 물어 남긴 버퍼된 stop이
+        // 앞에 끼면 이 프레임 명령의 응답 자리에 오배달돼(drain_immediate_stops가 프레임 결과로 오소비)
+        // 프레임을 안 돌리고도 interrupted+frozen로 오인되고 응답 스트림이 desync된다. step_instruction_count
+        // 처럼 명령 전에 버퍼의 stale stop을 이벤트 큐로 걷어낸다.
+        self.drain_buffered_stops()?;
         let previous = self.gdb.get_timeout()?;
         // 트레이싱 중이면 프레임마다 수십만 명령을 디스어셈+기록하므로 무트레이스 50ms/frame
         // 예산으론 타임아웃→지연 stop이 늦게 도착한다. 트레이스일 때 프레임당 예산을 크게 잡아
@@ -1876,11 +1906,12 @@ impl<G: GdbTransport> Bridge<G> {
         for _ in 0..12 {
             match self.gdb.recv_nonblocking()? {
                 Some(stop) if is_stop_packet(&stop) => {
-                    if first.is_none() {
-                        first = Some(stop.clone());
+                    // note_stop이 인터럽트 에코로 억제하면(true) 이 stop은 우리가 만든 에코일 뿐이므로
+                    // 프레임 명령 결과(first)로 오소비하지 않는다.
+                    let suppressed = self.note_stop(stop.clone(), false);
+                    if !suppressed && first.is_none() {
+                        first = Some(stop);
                     }
-                    self.note_stop(stop, false);
-                    self.frozen = true;
                 }
                 Some(_) => return Ok(first),
                 None => std::thread::sleep(Duration::from_millis(5)),
@@ -1889,13 +1920,22 @@ impl<G: GdbTransport> Bridge<G> {
         Ok(first)
     }
 
-    fn note_stop(&mut self, stop: String, enrich: bool) {
+    /// stop을 이벤트 큐에 넣는다. 단, 우리가 pause/interrupt로 주입한 인터럽트 에코 stop은 async
+    /// 이벤트가 아니므로 큐에 넣으면 phantom stop으로 샌다 — interrupt()가 남긴 트레일링 stop 개수만큼
+    /// 억제한다(pc98 인터럽트는 S05라 signal로 구분 불가 — NDS is_interrupt_stop(S02)에 상응하는 카운터
+    /// 방식). 억제했으면 `true`를 반환해 호출부가 이 stop을 명령 결과로 오소비하지 않게 한다.
+    fn note_stop(&mut self, stop: String, enrich: bool) -> bool {
         self.frozen = true;
+        if self.pending_interrupt_stops > 0 && is_stop_packet(&stop) {
+            self.pending_interrupt_stops -= 1;
+            return true;
+        }
         let mut event = stop_event(&stop);
         if enrich {
             self.enrich_event(&mut event);
         }
         self.events.push(event);
+        false
     }
 
     fn drain_reset_event(&mut self) -> BridgeResult<bool> {
@@ -2558,6 +2598,27 @@ fn absolute_path(path: &Path) -> PathBuf {
     }
 }
 
+/// A sibling `.partial` temp of `dst` (same parent → the later rename stays on one filesystem and is
+/// atomic), tagged with this process id and a nanosecond stamp. save_state stages the zip here and
+/// renames over `dst` only when complete, so a mid-save failure never truncates a pre-existing save.
+fn state_partial_sibling(dst: &Path) -> BridgeResult<PathBuf> {
+    let parent = dst.parent().ok_or_else(|| {
+        BridgeError::BadParams(format!(
+            "save path {} has no parent directory to stage under",
+            dst.display()
+        ))
+    })?;
+    let name = dst
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("state.zip");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(parent.join(format!(".{name}.partial.{}.{nanos}", std::process::id())))
+}
+
 fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
     for attempt in 0..100u32 {
         let path = std::env::temp_dir().join(format!(
@@ -2965,6 +3026,14 @@ mod tests {
         calls: Vec<String>,
         no_reply: Vec<String>,
         nonblocking: VecDeque<String>,
+        /// (trigger payload, stop) pairs: when `send` serves the trigger, the stop is enqueued to
+        /// `nonblocking`. Models an async stop that arrives *after* a command (e.g. a frame-target
+        /// stop that coincides with a BP hit), which a pre-command drain must not see early.
+        nonblocking_after: Vec<(String, String)>,
+        /// Trailing interrupt-echo stops the stub leaves buffered after a 0x03 break. `interrupt()`
+        /// enqueues these to `nonblocking` so the echo arrives *after* the interrupt, exactly as the
+        /// real stub does — a pre-interrupt drain must never mistake them for a pre-existing hit.
+        interrupt_echo: Vec<String>,
         timeout: Duration,
         timeouts: Vec<Duration>,
         interrupts: usize,
@@ -2992,6 +3061,16 @@ mod tests {
             self.nonblocking = replies.iter().map(|reply| (*reply).into()).collect();
             self
         }
+
+        fn enqueue_nonblocking_after(mut self, trigger: &str, stop: &str) -> Self {
+            self.nonblocking_after.push((trigger.into(), stop.into()));
+            self
+        }
+
+        fn with_interrupt_echo(mut self, echoes: &[&str]) -> Self {
+            self.interrupt_echo = echoes.iter().map(|s| (*s).into()).collect();
+            self
+        }
     }
 
     impl GdbTransport for FakeGdb {
@@ -3003,6 +3082,14 @@ mod tests {
                 )));
             };
             assert_eq!(payload, expected);
+            if let Some(pos) = self
+                .nonblocking_after
+                .iter()
+                .position(|(trigger, _)| trigger == payload)
+            {
+                let (_, stop) = self.nonblocking_after.remove(pos);
+                self.nonblocking.push_back(stop);
+            }
             Ok(reply)
         }
 
@@ -3013,6 +3100,11 @@ mod tests {
 
         fn interrupt(&mut self) -> BridgeResult<String> {
             self.interrupts += 1;
+            // The real stub leaves its trailing echo stop(s) buffered *after* the 0x03 break, so
+            // enqueue them to nonblocking here rather than pre-seeding them ahead of the interrupt.
+            for echo in &self.interrupt_echo {
+                self.nonblocking.push_back(echo.clone());
+            }
             Ok("S05".into())
         }
 
@@ -3052,6 +3144,7 @@ mod tests {
         regs_hex: String,
         save_items_dir: Option<PathBuf>,
         reads: usize,
+        fail_at_read: Option<usize>,
     }
 
     impl StateSaveGdb {
@@ -3060,6 +3153,17 @@ mod tests {
                 regs_hex,
                 save_items_dir: None,
                 reads: 0,
+                fail_at_read: None,
+            }
+        }
+
+        /// Fake a region read that times out on the Nth `m` read, so save_state fails mid-zip.
+        fn failing_at_read(regs_hex: String, fail_at_read: usize) -> Self {
+            Self {
+                regs_hex,
+                save_items_dir: None,
+                reads: 0,
+                fail_at_read: Some(fail_at_read),
             }
         }
     }
@@ -3094,6 +3198,9 @@ mod tests {
                 let len = usize::from_str_radix(len_hex, 16)
                     .map_err(|_| BridgeError::Emulator(format!("bad read len: {payload}")))?;
                 self.reads += 1;
+                if self.fail_at_read == Some(self.reads) {
+                    return Err(BridgeError::Emulator("simulated region read timeout".into()));
+                }
                 return Ok("00".repeat(len));
             }
             Err(BridgeError::Emulator(format!("unexpected call: {payload}")))
@@ -3557,12 +3664,16 @@ mod tests {
 
     #[test]
     fn step_frames_drains_immediate_stop_after_ok() {
+        // The stop arrives *after* the framestep "OK" (a frame-target that coincides with a BP hit),
+        // so drain_immediate_stops must pick it up as the result. Enqueued on the framestep send so
+        // the new pre-command drain (which only sees stops buffered *before* the command) can't eat
+        // it early.
         let fake = FakeGdb::with(&[
             ("?", "S05"),
             ("qEmucap,framestep,31", "OK"),
             ("qEmucap,frame", "9"),
         ])
-        .with_nonblocking(&["S05"]);
+        .enqueue_nonblocking_after("qEmucap,framestep,31", "S05");
         let mut bridge = Bridge::new(fake, BridgeEnv::default());
         let response = bridge.handle_request(Request::new(16, "step", json!({"frames": 1})));
         let result = response.result.unwrap();
@@ -3840,6 +3951,170 @@ mod tests {
             manifest["regions"].as_array().unwrap().len(),
             DUMP_REGION_NAMES.len()
         );
+    }
+
+    #[test]
+    fn save_state_preserves_prior_save_on_mid_save_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("state.zip");
+        // A pre-existing valid savestate with a distinct byte fingerprint. A mid-save failure must
+        // leave it byte-for-byte intact — never truncated by an in-place File::create.
+        let prior = b"PRIOR-VALID-SAVESTATE-BYTES".to_vec();
+        std::fs::write(&out, &prior).unwrap();
+
+        let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
+        // Fail on the first region read (timeout mid-zip), after the staging file is created.
+        let mut bridge = Bridge::new(
+            StateSaveGdb::failing_at_read(regs, 1),
+            BridgeEnv::default(),
+        );
+        let response = bridge.handle_request(Request::new(
+            60,
+            "save_state",
+            json!({"path": out.display().to_string()}),
+        ));
+        assert!(!response.ok, "a mid-save read failure must be reported as an error");
+
+        // The prior savestate survives byte-for-byte (not truncated, not overwritten).
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            prior,
+            "the pre-existing savestate must survive a mid-save failure"
+        );
+
+        // The staging .partial temp is cleaned up, not left behind.
+        let leftovers: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".partial"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the staging .partial temp must be removed: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn run_frames_drains_pre_command_stale_stop() {
+        // A buffered stop left after a prior resume() that hit a pause_on_hit BP sits ahead of the
+        // frames command. Without a pre-command drain, drain_immediate_stops mis-consumes it as the
+        // frames result → spurious interrupted+frozen. Draining it first routes it to the event queue
+        // and the frames run completes normally (frozen stays false).
+        let gdb = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (format!("qEmucap,runframes,{}", hex::encode("3")), "OK".into()),
+            ("qEmucap,frame".into(), "42".into()),
+        ])
+        .with_nonblocking(&["T05hwbreak:00100000;idx:2"]);
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let response = bridge.handle_request(Request::new(50, "run_frames", json!({"n": 3})));
+        let result = response.result.unwrap();
+        assert_eq!(
+            result["status"], "completed",
+            "the buffered stop must not be mis-consumed as the frames result"
+        );
+        assert_eq!(result["frames"], 3);
+        assert_eq!(result["state"], "running");
+        assert!(!bridge.frozen, "frozen must stay false after a completed run");
+        // The buffered stop was drained to the event queue, not returned as the frames result.
+        assert_eq!(bridge.events.len(), 1);
+        assert_eq!(bridge.events[0]["raw"], "T05hwbreak:00100000;idx:2");
+    }
+
+    #[test]
+    fn step_framestep_drains_pre_command_stale_stop() {
+        let gdb = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (format!("qEmucap,framestep,{}", hex::encode("2")), "OK".into()),
+            ("qEmucap,frame".into(), "7".into()),
+        ])
+        .with_nonblocking(&["T05hwbreak:00200000;idx:3"]);
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        let response = bridge.handle_request(Request::new(
+            51,
+            "step",
+            json!({"frames": 2, "unit": "frames"}),
+        ));
+        let result = response.result.unwrap();
+        assert_eq!(
+            result["status"], "completed",
+            "the buffered stop must not be mis-consumed as the framestep result"
+        );
+        assert_eq!(result["frames"], 2);
+        // The buffered stop was drained to the event queue, not returned as the framestep result.
+        assert_eq!(bridge.events.len(), 1);
+        assert_eq!(bridge.events[0]["raw"], "T05hwbreak:00200000;idx:3");
+    }
+
+    #[test]
+    fn interrupt_trailing_stop_does_not_produce_phantom_event() {
+        // pause() → interrupt() = 0x03 break + `?`, so the stub emits two S05 stops; interrupt()
+        // consumes one as its reply and leaves the other buffered (modeled by with_interrupt_echo,
+        // which enqueues it *after* the interrupt). That trailing stop is our own interrupt echo,
+        // not an async game event — the counter must suppress it so it never surfaces as a phantom.
+        let gdb = FakeGdb::with(&[("?", "S05"), ("qEmucap,pollreset", "NONE")])
+            .with_interrupt_echo(&["S05"]);
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        bridge.frozen = false; // core running, so pause() actually injects an interrupt
+        bridge.pause().unwrap();
+        bridge.resume().unwrap();
+        let response = bridge.handle_request(Request::new(70, "poll_events", json!({})));
+        let events = response.result.unwrap()["events"].as_array().unwrap().clone();
+        assert!(
+            events.is_empty(),
+            "the interrupt echo must not surface as a phantom event: {events:?}"
+        );
+    }
+
+    #[test]
+    fn pause_preserves_real_bp_hit_buffered_before_interrupt() {
+        // A pause_on_hit BP fired and its stop is buffered just before pause() injects an interrupt.
+        // The echo is S05 — indistinguishable by signal from the real hit — so pause() must drain
+        // the real hit to the event queue BEFORE arming the counter; only the interrupt's own echo
+        // then remains for the counter to suppress. The pre-fix code counted-and-dropped the real
+        // hit (FIFO-first) while the bare echo surfaced as a phantom.
+        let regs = i386_regs_hex(&[("eip", 0x1234), ("cs", 0)]);
+        let gdb = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            ("qEmucap,pollreset".into(), "NONE".into()),
+            ("g".into(), regs),
+        ])
+        .with_nonblocking(&["T05hwbreak:00100000;idx:2"]) // real hit already buffered
+        .with_interrupt_echo(&["S05"]); // interrupt's own trailing echo, enqueued after interrupt
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        bridge.frozen = false; // core running, so pause() actually injects an interrupt
+        bridge.pause().unwrap();
+        bridge.resume().unwrap();
+        let response = bridge.handle_request(Request::new(80, "poll_events", json!({})));
+        let events = response.result.unwrap()["events"].as_array().unwrap().clone();
+        assert_eq!(
+            events.len(),
+            1,
+            "the real BP hit must surface and the echo must not: {events:?}"
+        );
+        assert_eq!(events[0]["raw"], "T05hwbreak:00100000;idx:2");
+        assert_eq!(events[0]["type"], "breakpoint_hit");
+    }
+
+    #[test]
+    fn drain_immediate_stops_does_not_return_suppressed_echo() {
+        // A buffered interrupt echo (counted in pending_interrupt_stops) that lands as a frame
+        // command's immediate stop must be suppressed by note_stop, not returned as the frame's
+        // stop result — otherwise a completed frame is mis-reported as interrupted+frozen.
+        let gdb = FakeGdb::with(&[("?", "S05")]).with_nonblocking(&["S05"]);
+        let mut bridge = Bridge::new(gdb, BridgeEnv::default());
+        bridge.pending_interrupt_stops = 1;
+        let stop = bridge.drain_immediate_stops().unwrap();
+        assert_eq!(
+            stop, None,
+            "a suppressed interrupt echo must not be returned as a frame stop"
+        );
+        assert!(
+            bridge.events.is_empty(),
+            "the echo must not surface as an event either"
+        );
+        assert_eq!(bridge.pending_interrupt_stops, 0, "the echo was consumed");
     }
 
     #[test]
