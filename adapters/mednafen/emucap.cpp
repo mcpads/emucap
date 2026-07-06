@@ -725,6 +725,18 @@ bool read_aspace_hex(const std::string& mt, long addr, long len, std::string& he
   return true;
 }
 
+// Saturn "physical"(합성 128MB SH-2 버스)은 미구현이라 read가 조용히 0을 준다 — advertise되는데도
+// silent-wrong이다. read_memory·probe·find_pattern이 공통으로 거부해 zero-fill 데이터 대신 명확한
+// "unimplemented" 신호를 준다(구체 region memory_type을 쓰게). 거부하면 true(핸들러는 return).
+bool reject_ss_physical_read(long id, const std::string& mt) {
+  if (is_ss() && mt == "physical") {
+    reply_err(id, "unsupported",
+              "Mednafen Saturn physical address space is unimplemented (reads 0); use a specific region memory_type (workraml/workramh/scspram/vdp1vram/vdp2vram/cram)");
+    return true;
+  }
+  return false;
+}
+
 int hex_nibble(char c) {
   if (c >= '0' && c <= '9') return c - '0';
   if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -748,6 +760,9 @@ bool decode_hex_bytes(const std::string& hex, std::vector<uint8>& out) {
 void handle_find_pattern(long id, const std::string& line) {
   std::string mt = json_str(line, "memory_type");
   std::string pat_hex = json_str(line, "hex");
+  // Saturn "physical"은 미구현(read=0)이라 스캔이 조용히 all-zeros를 훑어 거짓 "패턴 없음"을 낸다 —
+  // read_memory와 동일하게 거부한다(silent-wrong 검색 결과 방지).
+  if (reject_ss_physical_read(id, mt)) return;
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
 
@@ -821,12 +836,8 @@ void handle_read_memory(long id, const std::string& line) {
   json_num(line, "length", len);
   // Saturn "physical"(합성 128MB SH-2 버스)은 미구현이라 read가 조용히 0을 준다 — advertise되는데도
   // silent-wrong이므로 명확히 거부하고 구체 region memory_type을 쓰게 한다(가치-조건 BP가 kSSBusRegions로
-  // 하듯 SH-2 버스주소를 workraml/workramh/vdp2vram/cram 등으로 지정).
-  if (is_ss() && mt == "physical") {
-    reply_err(id, "unsupported",
-              "Mednafen Saturn physical address space is unimplemented (reads 0); use a specific region memory_type (workraml/workramh/scspram/vdp1vram/vdp2vram/cram)");
-    return;
-  }
+  // 하듯 SH-2 버스주소를 workraml/workramh/vdp2vram/cram 등으로 지정). probe·find_pattern과 공통 가드.
+  if (reject_ss_physical_read(id, mt)) return;
   std::string hex;
   if (!read_aspace_hex(mt, addr, len, hex)) {
     reply_err(id, "bad_params", "알 수 없는 memory_type 또는 address/length 범위 초과");
@@ -2146,6 +2157,10 @@ void handle(const std::string& line) {
     // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
     // 중에는 거부한다 — Mesen 어댑터와 동일하게 freeze 상태머신과 섞이지 않게 한다.
     if (g_frozen) { reply_err(id, "frozen", "frozen 중에는 probe 불가 — resume 후 사용"); return; }
+    std::string probe_mt = json_str(line, "memory_type");
+    // Saturn "physical"은 미구현(read=0)이라 타깃 읽기가 조용히 all-zeros를 줘 거짓 bisect 결과를 낸다 —
+    // read_memory와 동일하게 거부한다(상태-파괴적 savestate 로드/프레임 진행 전에).
+    if (reject_ss_physical_read(id, probe_mt)) return;
     std::string path = json_str(line, "state");
     long frames = 0;
     json_num(line, "frame", frames);
@@ -2156,7 +2171,7 @@ void handle(const std::string& line) {
     } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
     g_probe_id = id;                   // 진행·읽기·응답은 emucap_service가(그 사이 새 명령 차단)
     g_probe_remaining = frames < 0 ? 0 : frames;
-    g_probe_mt = json_str(line, "memory_type");
+    g_probe_mt = probe_mt;
     g_probe_addr = 0;
     g_probe_len = 0;
     json_num(line, "address", g_probe_addr);
