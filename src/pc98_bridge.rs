@@ -934,18 +934,20 @@ impl<G: GdbTransport> Bridge<G> {
         let region = memory_region(memory_type).ok_or_else(|| {
             BridgeError::BadParams(format!("unsupported memory_type: {memory_type}"))
         })?;
-        let addr = region.base as u64 + required_num(params, "start")?;
-        let size = match optional_num(params, "end")? {
-            Some(end) => {
-                let end_addr = region.base as u64 + end;
-                if end_addr >= addr {
-                    end_addr - addr + 1
-                } else {
-                    1
-                }
-            }
-            None => 1,
-        };
+        let start = required_num(params, "start")?;
+        // `end`는 포함(inclusive) region 오프셋이며, 없으면 start 한 단위다. start보다 작으면 1바이트로 접는다.
+        let end = optional_num(params, "end")?.unwrap_or(start).max(start);
+        let size = end - start + 1;
+        // [start, start+size)가 선택된 region 안이어야 한다 — 유한 region(ram·tvram 등) 밖 offset을
+        // region.base로 감싸 MAME setpoint에 넘기면 절대 안 맞을 BP가 조용히 서므로 거부한다
+        // (nds_bridge route()의 범위 가드와 동형).
+        if !matches!(start.checked_add(size), Some(last) if last <= region.size as u64) {
+            return Err(BridgeError::BadParams(format!(
+                "{memory_type} breakpoint out of range: offset {start:#x}+{size:#x} exceeds region size {region_size:#x}",
+                region_size = region.size
+            )));
+        }
+        let addr = region.base as u64 + start;
         let snapshots = parse_snapshot_specs(params.get("snapshot"))?;
         let condition = breakpoint_condition(params, &kind)?;
         let pause_on_hit = params
@@ -3574,6 +3576,50 @@ mod tests {
     }
 
     #[test]
+    fn set_breakpoint_rejects_out_of_range_region_offset() {
+        // tvram is 0x4000; without the bound, region.base + start lands past the region and MAME's
+        // setpoint may silently accept an address that can never fire. Reject before arming.
+        let fake = FakeGdb::with(&[("?", "S05")]);
+        let mut bridge = Bridge::new(fake, BridgeEnv::default());
+        let r = bridge.handle_request(Request::new(
+            1,
+            "set_breakpoint",
+            json!({"kind": "exec", "memory_type": "tvram", "start": "0x5000"}),
+        ));
+        assert!(!r.ok);
+        let err = r.error.unwrap();
+        assert_eq!(err.kind, "bad_params");
+        assert!(
+            err.message.contains("out of range") && err.message.contains("tvram"),
+            "names the region and the out-of-range condition: {}",
+            err.message
+        );
+        // Nothing was armed on the emulator.
+        assert!(!bridge.gdb.calls.iter().any(|c| c.contains("setpoint")));
+    }
+
+    #[test]
+    fn set_breakpoint_in_range_resolves_to_region_base_plus_offset() {
+        // tvram base 0xA0000 + start 0x100 = 0xA0100; the setpoint spec carries the absolute address.
+        let set_spec = format!("0|{:x}|1|1|", 0xA0000u64 + 0x100);
+        let fake = FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (
+                format!("qEmucap,setpoint,{}", hex::encode(set_spec.as_bytes())),
+                "BP:9".into(),
+            ),
+        ]);
+        let mut bridge = Bridge::new(fake, BridgeEnv::default());
+        let r = bridge.handle_request(Request::new(
+            1,
+            "set_breakpoint",
+            json!({"kind": "exec", "memory_type": "tvram", "start": "0x100"}),
+        ));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.result.unwrap()["id"], 1);
+    }
+
+    #[test]
     fn watch_register_sets_regpoint_and_reports_value() {
         let spec = "1|(esp < 1000) || (esp > 2000)";
         let regs = i386_regs_hex(&[("esp", 0x3000), ("eip", 0x2222), ("cs", 0)]);
@@ -4072,8 +4118,8 @@ mod tests {
         // A pause_on_hit BP fired and its stop is buffered just before pause() injects an interrupt.
         // The echo is S05 — indistinguishable by signal from the real hit — so pause() must drain
         // the real hit to the event queue BEFORE arming the counter; only the interrupt's own echo
-        // then remains for the counter to suppress. The pre-fix code counted-and-dropped the real
-        // hit (FIFO-first) while the bare echo surfaced as a phantom.
+        // then remains for the counter to suppress. Counting FIFO-first instead would drop the real
+        // hit while the bare echo surfaced as a phantom.
         let regs = i386_regs_hex(&[("eip", 0x1234), ("cs", 0)]);
         let gdb = FakeGdb::from_pairs(vec![
             ("?".into(), "S05".into()),
