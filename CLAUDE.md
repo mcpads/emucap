@@ -27,6 +27,8 @@ composes them (they do not call each other).
   `.emucap` at the working repo's git root).
 - `emucap-broker` — multi-session connection sharing (for the Control MCP).
 - `emucap-mame-pc98-bridge` — PC-98 launch helper used by the Rust MAME launcher.
+- `emucap-desmume-nds-bridge` — NDS launch helper used by the Rust DeSmuME launcher.
+- `emucap-ppsspp-bridge` — PSP launch helper used by the Rust PPSSPP launcher.
 
 ## MCP operating notes
 
@@ -41,7 +43,14 @@ MCP. Read `rom_sha1` from the Control MCP's `get_rom_info` and pass it to the Tr
 `run_start`; record analysis-verb results with `log_gate` and state-changing interventions with
 `log_intervention`.
 
+Treat transport, execution, and evidence as separate states. A timeout or disconnected socket does
+not prove that the emulator exited: inspect `status.continuity`, `status.runtime_instance`, and
+`get_failure_context` before launching again. Reattach to a live owned generation; use
+`launch(..., replace: true)` only for an intentional identity-verified replacement. Flycast can hold
+an exact fatal snapshot in read-only quarantine; inspect it first, then call `dismiss_failure` only
+when the connected adapter advertises that method.
+
 If tool discovery lacks the Control MCP's `bootstrap`/`launch_plan`, or `status` has no
 `runtime_paths` (or the Tracking MCP's `run_start` is missing), the running release is stale. Rebuild
-with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge`
+with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge --bin emucap-ppsspp-bridge`
 and restart both MCPs.

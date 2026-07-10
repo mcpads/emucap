@@ -58,7 +58,8 @@ after a crash, new launches are blocked until it is dismissed.
   only the orphan instance on that port, and refuses if a connected instance exists.
 
 Recommended path: call the MCP `launch` tool. It copies Mesen into an emucap-owned portable directory,
-writes `settings.json` next to that copy, and leaves the user's default Mesen settings/app state alone.
+applies required options without modifying the user's default settings, and leaves native key mappings
+available. GBA alone creates a minimal portable `settings.json` so the staged BIOS is discoverable.
 The legacy `adapters/mesen2/launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME]` helper follows the same portable
 copy rule and remains a fallback when the MCP tool is unavailable.
 
@@ -72,8 +73,8 @@ copy rule and remains a fallback when the MCP tool is unavailable.
 emucap finalize bundles/<timestamp>-retrospective
 emucap inspect  bundles/<timestamp>-retrospective
 ```
-Then write up the problem in `note.md` and have Claude Code analyze the bundle
-directory.
+Give the finalized bundle directory and a short problem description to the analysis
+agent or tool of your choice.
 
 ## Tuning
 Adjust `INTERVAL` (sample interval), `DEPTH` (ring depth), and `TRIGGER_KEYS` (key
@@ -84,6 +85,11 @@ combo) at the top of the script.
 A separate entry script `emucap-snes.lua` (SNES; `emucap-sms.lua` for Game Gear, `emucap-gb.lua` for Game Boy / GBC, `emucap-gba.lua` for GBA) lets the agent read and control the running game.
 The MCP server `emucap-mcp` comes up over stdio, and the Lua connects to that server's
 TCP port (default 47800).
+
+After a disconnect, the adapter accepts a replacement same-session connection without restarting
+Mesen. Unfinished request IDs and transient presses belong to the dead connection and are canceled;
+execution state, breakpoints, and explicit `set_input` holds remain. A timeout alone is not proof
+that Mesen exited, so reconnect and query `status` before launching another process.
 
 - Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
@@ -132,8 +138,10 @@ launch a `.gba` file with `system: "gba"`; for NES, launch a `.nes` file with `s
 ```
 
 The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
-data root. It writes only that copy's `settings.json`; fallback pidfiles and logs also stay under that
-per-port directory unless `EMUCAP_LOG` overrides the log path.
+data root. The Rust MCP launcher applies required options on the command line and creates a local
+`settings.json` only for GBA firmware discovery; legacy fallback launchers write their settings beside
+their own portable copy. Pidfiles and logs stay under the per-port directory unless `EMUCAP_LOG`
+overrides the log path.
 
 **macOS / Linux fallback** — use `launch.sh` only when the MCP `launch` tool is unavailable:
 
@@ -178,9 +186,11 @@ powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:
   unset, the launcher checks common install paths and PATH), `EMUCAP_EMU_HOME` (portable copy root),
   `EMUCAP_LAUNCH_WAIT` (seconds to wait for connection, default 20),
   `EMUCAP_POST_CONNECT_GRACE` (grace seconds after connection, default 2), `EMUCAP_LOG`
-  (log path), `EMUCAP_DEADMAN_MS` (if the step interval is long, the deadman auto-resumes —
-  default 30000, 0 disables), `EMUCAP_RECONNECT_GIVEUP_MS` (upper bound on waiting for MCP
-  reconnect, default 600000, 0 for indefinite).
+  (log path), `EMUCAP_DEADMAN_MS` (operator opt-in idle auto-resume; default 0 = disabled),
+  `EMUCAP_RECONNECT_GIVEUP_MS` (operator opt-in auto-resume after MCP disconnect; default 0 =
+  wait indefinitely). `status.freeze_policy` reports the effective values. Mesen's Lua API still
+  requires a one-instruction watchdog rearm roughly every 800 ms, so this is a treadmill freeze,
+  not a zero-drift CPU halt; use breakpoint `snapshot` for exact hit-time evidence.
 - `EMUCAP_PREARM` pre-arms a DMA write BP right after cold boot (form `dma` | `dma:<dest>` |
   `dma:<dest>:<vmin>-<vmax>`). When an agent round-trip cannot catch a DMA write that
   vanishes in an instant during boot (e.g. initialization before the attract), arm it ahead
@@ -210,7 +220,7 @@ identical to SNES — only the ISA, memory types, and button names differ:
   `mechanism: "vdp_write_reconstruction"`). It is a hunting tool: per-instruction, with an instruction
   budget + auto-disarm, so pair it with `pause_on_hit` and clear it when done. Write BPs on other
   non-bus memtypes (`smsPaletteRam` / CRAM) return an `unsupported` error rather than silently
-  never firing (CRAM reconstruction is a TODO).
+  never firing (CRAM reconstruction is not supported).
 - **ROM bank tagging**: the Z80 bus is 16-bit and ROM is paged into three 16 KB slots by the Sega
   mapper, so a bare pc does not say which bank ran. `call_stack` frames (`{pc, bank}`), `get_trace`
   entries, and breakpoint-hit events carry the ROM `bank` — the slot bank from `get_state`'s
@@ -252,11 +262,11 @@ with these differences:
 - **memory_types**: `gbaMemory` (full ARM7 bus), `gbaIntWorkRam`, `gbaExtWorkRam`, `gbaVideoRam`,
   `gbaPaletteRam`, `gbaSpriteRam`, `gbaSaveRam`, `gbaPrgRom`, `gbaBootRom`. `status.memory_types` is
   authoritative.
-- **`disassemble` supported; `call_stack` not implemented yet**: the ARM7 decoder is built and
-  live-verified (ARM and Thumb — e.g. the GBA BIOS IRQ dispatcher: `SUBS PC,LR,#4` / PUSH·POP /
-  scaled-register `LDR` / `MRS SPSR`), so `disassemble` works. `call_stack` is not built yet — ARM's
-  LR-based return does not fit the core's SP-based call-stack model, so it has to be written specially
-  (implementation TODO). Everything else (read/write_memory, get_state,
+- **`disassemble` supported; `call_stack` not implemented yet**: the ARM7 decoder handles ARM and
+  Thumb instructions including `SUBS PC,LR,#4`, PUSH/POP, scaled-register `LDR`, and `MRS SPSR`.
+  `call_stack` is not built yet — ARM's
+  LR-based return does not fit the core's SP-based call-stack model, so `call_stack` is not advertised.
+  Everything else (read/write_memory, get_state,
   step / step_instructions, breakpoints, screenshot, input, save/load_state) works as on SNES.
   `status.methods` is authoritative.
 

@@ -1,6 +1,6 @@
 # emucap — Flycast (Dreamcast) adapter
 
-Live-debug the Dreamcast (SH-4) with emucap. The third platform, after SNES (Mesen) and Saturn/PSX (Mednafen).
+Live-debug the Dreamcast (SH-4) with emucap.
 
 ## What the user provides (agent: relay these by name)
 
@@ -31,23 +31,31 @@ through each by exact filename/path and confirm before proceeding:
 launcher handles Flycast's Windows config model by copying `Flycast.exe` into an emucap-owned portable directory
 and writing `emu.cfg` next to that copy. Building Flycast itself on Windows is still unverified here.
 
-## Current status: native fork done (emucap.cpp — all capture/control methods live-verified)
+## Native adapter
 
-A native adapter that builds by injecting `emucap.cpp`/`emucap.h` into the Flycast tree (no GDB bridge needed). It connects
-directly to emucap-mcp over NDJSON, serviced by `emucap_service()` injected into `vblank()`. **Live-verified methods** (2026-06-27,
-Puyo Puyo 4): status·read_memory·write_memory·get_state (SH-4 registers)·**save_state·load_state**
-(registers confirmed to restore exactly)·**run_frames** (keepalive keeps even long runs from timing out)·**screenshot** (running+frozen)·
-**set_input·tap·tap_sequence** (title→mode-select transition)·pause·resume·step (frame)·reset·**set_breakpoint·
-clear_breakpoint·clear_all_breakpoints·list_breakpoints·poll_events** (exec BP, instruction-precise stop verified: pc stops
-exactly at the BP address)·**find_pattern** (addrspace scan)·**disassemble** (SH4, OpDesc decode)·**get_rom_info** (gameId
-HDR-0014, etc.). Server-composed verbs (tap/bisect/hold_until/regression) run on top of these primitives.
+A native adapter is the supported path. The build injects `emucap.cpp`/`emucap.h` into the Flycast
+work tree (no GDB bridge needed), and `emucap_service()` connects directly to the Control MCP over
+NDJSON from `vblank()`. Its advertised methods include status·read_memory·write_memory·get_state
+(SH-4 registers)·save_state·load_state·run_frames·screenshot (running or frozen)·set_input·pause·
+resume·step (frame)·reset·set_breakpoint·clear_breakpoint·clear_all_breakpoints·list_breakpoints·
+poll_events·find_pattern·disassemble·get_rom_info. Server-composed verbs such as `tap` and
+`tap_sequence` are available when their primitive dependencies exist. `status.methods` is
+authoritative; `bisect` is unavailable because the native adapter has no atomic `probe`.
 
-Not implemented (graceful refusal / GDB bridge): read/write watchpoints·step_instructions (given the freeze model)·dump_memory
-(a flat-address 16MB dump is a read8 loop, so it is slow)·watch_register/get_trace/call_stack (some Mesen-specific ones).
+A replacement Control MCP can reconnect without restarting Flycast. Do not treat a disconnected
+socket as permission to relaunch: inspect `status.continuity`, `status.runtime_instance`, and
+`get_failure_context` first. A blocked fatal SH-4 exception preserves its exact registers and recent
+PC ring before upstream state changes, then permits read-only diagnostics in a bounded quarantine.
+After collecting the evidence, `dismiss_failure` explicitly ends the quarantine and continues the
+existing termination path; it is not guest recovery.
+
+Native adapter limitations (graceful refusal; the GDB fallback covers a subset): read/write watchpoints·step_instructions (given the freeze model)·dump_memory
+(a flat-address 16MB dump is a read8 loop, so it is slow). The native adapter does implement
+`set_trace`/`get_trace`/`watch_register`/`call_stack`; the fatal PC ring is separate from opt-in tracing.
 
 **The exec breakpoint is instruction-precise via a hook in the interpreter's Run() loop** — build.sh injects
-`if (g_emucap_bp_armed && emucap_exec_bp_check(pc)) emucap_bp_spin(pc);` into sh4_interpreter.cpp (when armed is false it reads a
-single bool, so the hot-loop cost is 0). On a hit, emucap_bp_spin stops and services the socket before that instruction executes.
+`if (g_emucap_bp_armed && emucap_exec_bp_check(pc)) emucap_bp_spin(pc);` into sh4_interpreter.cpp (when armed is false it only
+checks the guard flag). On a hit, emucap_bp_spin stops and services the socket before that instruction executes.
 read/write watchpoints and instruction-level step use the GDB bridge (below). step_instructions is refused because it is
 impossible under the vblank-frame freeze model.
 
@@ -82,13 +90,14 @@ Default build output:
 - Windows BETA: `%LOCALAPPDATA%\emucap\flycast-build\work\build\Flycast.exe`
 `FLYCAST_APP` may point to either the executable or a macOS `Flycast.app` bundle.
 
-⚠ macOS arm64: a rebuilt .app has no JIT signature, so **dynarec crashes** → the launcher forces the interpreter
-(Dynarec.Enabled=no), which is enough for debugging.
+⚠ macOS arm64: a rebuilt .app has no JIT signature, so **dynarec can crash before the adapter connects**. The build skips
+recompiler initialization when the interpreter is selected, and the launcher also forces `Dynarec.Enabled=no` for the isolated
+instance.
 
-## Earlier approach: GDB-stub bridge PoC
+## GDB-stub fallback
 
-`emucap-gdb-bridge.py` — a PoC that relays Flycast's **built-in GDB stub** (SH-4) to emucap NDJSON.
-It proves the emucap loop on Dreamcast without a fork or a build. Live-verified (2026-06-27, Puyo Puyo 4).
+`emucap-gdb-bridge.py` relays Flycast's **built-in GDB stub** (SH-4) to emucap NDJSON. It provides a
+reduced tool surface without the native adapter hooks.
 
 **Supported (advertised) methods**: `read_memory`·`write_memory`·`get_state` (SH-4 registers)·`status`·`pause`·`resume`·
 `step` (1 instruction)·`set_breakpoint` (exec/SW only)·`clear_breakpoint`·`list_breakpoints`·`poll_events`.
@@ -122,10 +131,3 @@ adapters/flycast/launch.sh "<disc.gdi>" <listening_port> [name]
 
 Addresses are all SH-4 addresses (main RAM `0x8C......`, 1ST_READ.BIN from `0x8C010000`). hex strings accepted.
 For an accurate snapshot, read after `pause` (emucap determinism convention).
-
-## Native-fork plan
-
-Using the Flycast fork entry points, add emucap.cpp socket hooks to provide all 10
-methods + full speed (dynarec kept): `addrspace::read/write*`·`Sh4cntx`·`dc_savestate/loadstate`·
-`renderer->GetLastFrame`·`mapleInputState[]`·`Emulator::run/step/stop/start`. GdbServer's asio · emu-thread
-stop/start handshake is the threading template.

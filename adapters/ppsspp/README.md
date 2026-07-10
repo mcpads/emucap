@@ -221,8 +221,8 @@ authoritative, not this list)**:
 - The MCP-composed `bisect`/`regression_run`/`verify_determinism` — both of their replay paths
   need either `probe` or a frame-level `step`, neither of which exists here yet, so they report
   `unsupported`.
-- Structured breakpoint value-conditions (`value`/`value_mask`/`value_len`) — rejected
-  (TODO); use a raw `condition` expression (PPSSPP's own expression language) instead, or
+- Structured breakpoint value-conditions (`value`/`value_mask`/`value_len`) — unsupported; use a
+  raw `condition` expression (PPSSPP's own expression language) instead, or
   `pc_min`/`pc_max`, which the bridge compiles into one automatically.
 - BP kind `nmi`/`irq`/`dma`, range exec breakpoints (`start` must equal `end`), and
   `auto_savestate`/`snapshot` breakpoint options.

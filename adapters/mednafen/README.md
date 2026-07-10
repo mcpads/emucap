@@ -90,12 +90,18 @@ until the emucap connection is confirmed. Even right after connecting, it verifi
 after passing the immediate-death case.  By default the per-port binary copy, pidfile, and log live under the
 OS-specific emucap data root (`EMUCAP_EMU_HOME` override, otherwise macOS `~/Library/Application Support/emucap`,
 Linux `${XDG_DATA_HOME:-~/.local/share}/emucap`, Windows `%LOCALAPPDATA%\emucap`).
-So that a parent-shell exit does not propagate SIGHUP in a transient PTY like Codex, the launcher, if `python3`
+So that a parent-shell exit does not propagate SIGHUP in a transient PTY, the launcher, if `python3`
 is available, launches Mednafen into a new session with `start_new_session=True` and detaches stdio to the log/
 `/dev/null` (falling back to `nohup` only when `python3` is absent).
-In environments like Codex where you cannot make an MCP tool call while a shell command is running, `status`
+When an MCP tool call cannot run while a shell command is still active, `status`
 before launch prepares the background accept/hello ahead of time. Skipping this procedure means only the TCP
 connects while the protocol round-trip lags, and Mednafen may disconnect shortly.
+
+After a disconnect, Mednafen accepts a replacement same-session connection without restarting the
+emulator. Unfinished request IDs and transient presses are canceled and transient input ownership is
+released; execution state, breakpoints, and explicit `set_input` holds remain. A timeout alone is not
+proof that Mednafen exited, so reconnect and query `status` before launching another process.
+
 ```
 # Saturn
 ./launch.sh "/path/to/saturn.cue" 47800
@@ -205,8 +211,10 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `get_rom_info` (name/path/size/media_type from EMUCAP_CONTENT + **content_md5** (`MDFNGameInfo->MD5` — disc
   layout-aware · path-independent, recommended as rom_sha1) + sha1 (file)), `step_instructions` (instruction-granularity advance via
   the fork's per-instruction CPU callback; SS is 1 instruction of the active CPU).
-- **Unsupported (Mesen-only — not in this adapter, error kind `unknown_method`)**:
-  `watch_register` · `set_trace`/`get_trace`/`call_stack` · `break_on_reset`, and set_breakpoint's kind `nmi`/`irq`/`dma`.
+- **Unsupported or system-dependent**: set_breakpoint kind `nmi`/`irq`/`dma` is unsupported.
+  `break_on_reset` is advertised only for cartridge systems with a meaningful reset vector. Runtime
+  `status.methods` is authoritative; `watch_register`, `set_trace`/`get_trace`, and `call_stack` are supported when
+  the selected core exposes a debugger.
   **Behavior differences**: `get_state`'s `groups` filter is ignored (always returns everything), input `port` is ignored (always port0), `save_state`/
   `load_state` work both frozen and running (Mesen only running), `poll_events` returns at minimum `{pc}` and access
   BPs also carry `{kind,address,length,value}` where possible. MD VDP write BP events also carry `memory_type`,

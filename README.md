@@ -57,13 +57,18 @@ use the equivalents (and see the Platforms note above).
 From the repo root:
 
 ```sh
-cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge
+cargo build --release \
+  --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
+  --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge \
+  --bin emucap-ppsspp-bridge
 ```
 
 Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap-track-mcp` (**Tracking MCP** — experiment ledger, emulator-less),
-`emucap` (case-bundle CLI), `emucap-broker` (multi-session broker), and
-`emucap-mame-pc98-bridge` (PC-98 launch helper). All dependencies come from
+`emucap` (case-bundle CLI), `emucap-broker` (multi-session broker),
+`emucap-mame-pc98-bridge` (PC-98 launch helper),
+`emucap-desmume-nds-bridge` (NDS launch helper), and
+`emucap-ppsspp-bridge` (PSP launch helper). All dependencies come from
 crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
 required** for a source build. The first build is slower while dependencies
 download; later builds are fast.
@@ -147,6 +152,13 @@ returns the preferred MCP `launch` tool arguments. The agent calls `launch` and
 checks `status` a few seconds later. Because **bootstrap also reveals the adapter
 install paths and fallbacks**, the agent never has to hunt around the filesystem.
 
+A timeout or `connected: false` reports transport state, not proof that the
+emulator exited. Inspect `status.continuity`, `status.runtime_instance`, and
+`get_failure_context` before relaunching. Reattach to a live owned generation;
+use `launch(..., replace: true)` only for an intentional, identity-verified
+replacement. On a Flycast fatal quarantine, read the preserved context first and
+call `dismiss_failure` only when `status.methods` advertises it.
+
 ## Per-emulator adapters (the agent installs when needed)
 
 Pick one to start. **Mesen2 is the lightest — no source build.**
@@ -184,4 +196,5 @@ Pick one to start. **Mesen2 is the lightest — no source build.**
 Binaries: `emucap` (case bundles: `finalize` / `inspect`), `emucap-mcp` (Control
 MCP — live emulator control, stdio), `emucap-track-mcp` (Tracking MCP —
 experiment ledger, emulator-less, stdio), `emucap-broker` (multi-session
-connection sharing).
+connection sharing), and the PC-98/NDS/PSP launch bridges listed in the build
+section.
