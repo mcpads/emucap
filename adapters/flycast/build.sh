@@ -154,12 +154,12 @@ inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 
 }
 
 # 1. 어댑터 소스 복사
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$SRC/core/"
-echo "→ emucap.cpp/.h 복사: $SRC/core/"
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
+echo "→ emucap.cpp/.h + input ownership + failure serializer 복사: $SRC/core/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알린다(사용자가 git
 # HEAD와 대조해 재빌드 필요 여부 확인 — build-time 임베드라 재빌드 안 하면 옛 hash 그대로). 미커밋이면 -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
+git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h emucap_input.h emucap_failure.cpp emucap_failure.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/core/emucap_build.h"
 
 # 1b. 줄끝 정규화(LF). 아래 perl 앵커는 `..."\n`처럼 LF를 가정하는데, Windows에서 core.autocrlf=true로
@@ -169,6 +169,7 @@ for f in \
   core/emulator.cpp \
   core/hw/maple/maple_cfg.cpp \
   core/hw/sh4/interpr/sh4_interpreter.cpp \
+  core/hw/sh4/sh4_interrupts.cpp \
   core/ui/gui.cpp \
   core/ui/mainui.cpp \
   core/cfg/option.h \
@@ -176,6 +177,10 @@ for f in \
   CMakeLists.txt; do
   [ -f "$SRC/$f" ] && perl -i -pe 's/\r\n/\n/g' "$SRC/$f"
 done
+
+# 독립 serializer gate: upstream 헤더 없이 128 KiB 상한·R0-R15·원자 파일 교체를 먼저 검증한다.
+"$HERE/test-failure.sh"
+echo "→ Flycast fatal serializer 단독 회귀 테스트 통과"
 
 # 2. emulator.cpp 훅: emucap.h include + vblank()에 emucap_service() 호출(Event::VBlank 직후).
 #    근거: vblank()는 emu 스레드에서 프레임당 1회.
@@ -186,6 +191,18 @@ perl -0777 -pi -e 's/(EventManager::event\(Event::VBlank\);)/${1}\n\temucap_serv
 inject_check 'emucap.h' "$SRC/core/emulator.cpp"
 inject_check 'emucap_service' "$SRC/core/emulator.cpp"
 echo "→ emulator.cpp 훅 주입(include + vblank emucap_service)"
+
+# Runtime `Dynarec.Enabled=no` selects the interpreter, but upstream initializes the SH4 recompiler
+# first anyway. Unsigned macOS builds can SIGTRAP there before emucap connects. Defer initialization
+# until the option is enabled; launch.sh also supplies a transient command-line override so the
+# per-instance config suffix cannot restore the default.
+# Normalize either supported injected form before inserting the hook so repeated builds stay idempotent.
+perl -0777 -pi -e 's{recompiler = Get_Sh4Recompiler\(\);\n\t// emucap: do not initialize unsigned JIT when the interpreter was selected\.\n\tif\(config::DynarecEnabled\)\n\t\{\n\t\trecompiler->Init\(\);\n\t\tINFO_LOG\(DYNAREC, "Using Recompiler"\);\n\t\}}{recompiler = Get_Sh4Recompiler();\n\trecompiler->Init();\n\tif(config::DynarecEnabled)\n\t\tINFO_LOG(DYNAREC, "Using Recompiler");}' \
+  "$SRC/core/emulator.cpp"
+perl -0777 -pi -e 's{recompiler = Get_Sh4Recompiler\(\);\n\trecompiler->Init\(\);\n\tif\(config::DynarecEnabled\)\n\t\tINFO_LOG\(DYNAREC, "Using Recompiler"\);}{// emucap: instantiate the SH4 recompiler only when it will be initialized.\n\tif(config::DynarecEnabled)\n\t{\n\t\trecompiler = Get_Sh4Recompiler();\n\t\trecompiler->Init();\n\t\tINFO_LOG(DYNAREC, "Using Recompiler");\n\t}} unless m{emucap: instantiate the SH4 recompiler only when it will be initialized}' \
+  "$SRC/core/emulator.cpp"
+inject_check 'emucap: instantiate the SH4 recompiler only when it will be initialized' "$SRC/core/emulator.cpp"
+echo "→ emulator.cpp interpreter 선택 시 unsigned SH4 JIT 초기화 생략"
 
 # 2b. maple_cfg.cpp 입력 주입: 게임이 실제 입력을 읽는 소비 지점(MapleConfigMap::GetInput, emu 스레드
 #    maple DMA)에서 pjs->kcode를 emucap 주입값으로 override. emu 스레드 동기라 UI 스레드 os_UpdateInputState
@@ -215,9 +232,19 @@ perl -0777 -pi -e 's/(os_UpdateInputState\(\);)/${1}\n\temucap_capture_latest();
   "$SRC/core/ui/mainui.cpp"
 inject_check 'emucap_capture_latest' "$SRC/core/ui/mainui.cpp"
 inject_check 'emucap.h' "$SRC/core/ui/mainui.cpp"
-echo "→ mainui.cpp 캡처 훅 주입(emucap_capture_latest)"
+perl -0777 -pi -e 's/(void mainui_stop\(\)\n\{\n\tmainui_enabled = false;)/${1}\n\temucap_notify_shutdown();/ unless m{emucap_notify_shutdown}' \
+  "$SRC/core/ui/mainui.cpp"
+inject_check 'emucap_notify_shutdown' "$SRC/core/ui/mainui.cpp"
+echo "→ mainui.cpp 캡처 + fatal quarantine 창 닫기 훅 주입"
 
-# 2e. sh4_interpreter Run() 루프 exec breakpoint 훅: 매 명령 실행 전 pc가 BP면 그 자리에서 정지(명령-정밀).
+# 2e. sh4_interpreter always-on fatal PC ring: 매 명령 실행 직전 PC 하나만 고정 배열에 기록한다.
+#    allocation/decode/lock 없이 inline store+mask라 set_trace와 독립적으로 실패 직전 512개를 보존한다.
+perl -0777 -pi -e 's/(\t+)(u32 op = ReadNexOp\(\);\n\n\t+ExecuteOpcode\(op\);\n\t+\} while \(ctx->cycle_counter > 0\);)/${1}emucap_crash_pc_hook(ctx->pc);\n${1}${2}/ unless m{emucap_crash_pc_hook}' \
+  "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
+inject_check 'emucap_crash_pc_hook' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
+echo "→ sh4_interpreter.cpp always-on fatal PC ring 훅 주입"
+
+# 2f. sh4_interpreter Run() 루프 exec breakpoint 훅: 매 명령 실행 전 pc가 BP면 그 자리에서 정지(명령-정밀).
 #    armed(전역 bool)가 false면 bool 한 번만 봐서 핫루프 비용 0. Run()의 inner do{}만 노린다(delay slot 제외).
 perl -0777 -pi -e 's/(#include [^\n]*\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
   "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
@@ -227,7 +254,7 @@ inject_check 'emucap_exec_bp_check' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cp
 inject_check 'emucap.h' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
 echo "→ sh4_interpreter.cpp exec BP 훅 주입(Run 루프 명령-정밀 정지)"
 
-# 2f. sh4_interpreter Run() 루프 크래시경로 관측 훅: exec BP와 같은 자리에 매 명령 전 trace 훅을 추가 주입한다.
+# 2g. sh4_interpreter Run() 루프 크래시경로 관측 훅: exec BP와 같은 자리에 매 명령 전 trace 훅을 추가 주입한다.
 #    armed(전역 bool)가 false면 bool 한 번만 봐서 핫루프 비용 0(set_trace/watch 셋 다 off면 무회귀). 같은 원본
 #    패턴(u32 op = ReadNexOp())을 노려 BP 라인 뒤에 붙는다(BP 주입은 prepend라 이 패턴은 그대로 남아 매칭).
 perl -0777 -pi -e 's/(\t+)(u32 op = ReadNexOp\(\);\n\n\t+ExecuteOpcode\(op\);\n\t+\} while \(ctx->cycle_counter > 0\);)/${1}if (g_emucap_trace_armed) emucap_trace_hook(ctx->pc);\n${1}${2}/ unless m{emucap_trace_hook}' \
@@ -235,11 +262,37 @@ perl -0777 -pi -e 's/(\t+)(u32 op = ReadNexOp\(\);\n\n\t+ExecuteOpcode\(op\);\n\
 inject_check 'emucap_trace_hook' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
 echo "→ sh4_interpreter.cpp 크래시경로 관측 훅 주입(Run 루프 매 명령 trace/watch/callstack)"
 
-# 3. CMakeLists에 core/emucap.cpp 추가(core 'main' target_sources 블록의 nullDC.cpp 뒤).
+# 2h. blocked SH4 exception exact capture: sr/ccn/spc/pc를 upstream이 바꾸거나 FlycastException을
+#     던지기 전에 incoming EPC/event + full registers + always-on ring을 durable failure file로 쓴다.
+perl -0777 -pi -e 's/(#include "types\.h"\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
+  "$SRC/core/hw/sh4/sh4_interrupts.cpp"
+perl -0777 -pi -e 's{if \(Sh4cntx\.sr\.BL != 0\)\n(?:\t\{\n\t\temucap_capture_fatal_sh4\([^\n]*\);\n\t\tthrow FlycastException\("Fatal: SH4 exception when blocked"\);\n\t\}|\t\tthrow FlycastException\("Fatal: SH4 exception when blocked"\);)}{if (Sh4cntx.sr.BL != 0)\n\t{\n\t\temucap_capture_fatal_sh4("Fatal: SH4 exception when blocked", epc, (uint32_t)expEvn,\n\t\t\t(uint32_t)CCN_EXPEVT, (uint32_t)CCN_INTEVT, (uint32_t)CCN_TEA);\n\t\tthrow FlycastException("Fatal: SH4 exception when blocked");\n\t}}g' \
+  "$SRC/core/hw/sh4/sh4_interrupts.cpp"
+inject_check 'emucap.h' "$SRC/core/hw/sh4/sh4_interrupts.cpp"
+inject_check 'emucap_capture_fatal_sh4' "$SRC/core/hw/sh4/sh4_interrupts.cpp"
+[ "$(grep -c 'emucap_capture_fatal_sh4' "$SRC/core/hw/sh4/sh4_interrupts.cpp")" -eq 1 ] || {
+  echo "ERROR: blocked-exception fatal hook must occur exactly once" >&2; exit 1;
+}
+grep -Fq '(uint32_t)CCN_EXPEVT, (uint32_t)CCN_INTEVT, (uint32_t)CCN_TEA' \
+  "$SRC/core/hw/sh4/sh4_interrupts.cpp" || {
+  echo "ERROR: blocked-exception hook does not preserve pre-mutation CCN context" >&2; exit 1;
+}
+echo "→ sh4_interrupts.cpp blocked exception exact-capture/quarantine 훅 주입"
+
+# 3. CMakeLists에 emucap sources 추가(core 'main' target_sources 블록의 nullDC.cpp 뒤).
 perl -0777 -pi -e 's{(\n\t\tcore/nullDC\.cpp\n)}{$1\t\tcore/emucap.cpp\n} unless m{core/emucap\.cpp}' \
   "$SRC/CMakeLists.txt"
+perl -0777 -pi -e 's{(\n\t\tcore/emucap\.cpp\n)}{$1\t\tcore/emucap_failure.cpp\n} unless m{core/emucap_failure\.cpp}' \
+  "$SRC/CMakeLists.txt"
+if [ "${EMUCAP_FLYCAST_DISABLE_CRASH_RING:-0}" = "1" ]; then
+  perl -0777 -pi -e 's{(\n\t\tcore/debug/gdb_server\.h\)\n)}{$1\ntarget_compile_definitions(flycast PRIVATE EMUCAP_DISABLE_CRASH_PC_RING)\n} unless m{EMUCAP_DISABLE_CRASH_PC_RING}' \
+    "$SRC/CMakeLists.txt"
+  inject_check 'target_compile_definitions(flycast PRIVATE EMUCAP_DISABLE_CRASH_PC_RING)' "$SRC/CMakeLists.txt"
+  echo "→ benchmark-only crash PC ring 비활성 빌드"
+fi
 inject_check 'core/emucap.cpp' "$SRC/CMakeLists.txt"
-echo "→ CMakeLists.txt target_sources에 core/emucap.cpp 추가"
+inject_check 'core/emucap_failure.cpp' "$SRC/CMakeLists.txt"
+echo "→ CMakeLists.txt target_sources에 emucap + fatal serializer 추가"
 
 # 3b. macOS 필수 빌드 픽스(클린 upstream엔 없음 — 텍스처 디버그 mods와 무관한 빌드 자체 픽스).
 #     (1) enable_language(OBJC): macOS는 .mm(Objective-C)라 OBJC 언어 활성 없으면 generate가

@@ -3,11 +3,11 @@
 //! The emucap Lua's socket needs Mesen's script I/O + network access enabled, a script timeout large
 //! enough for one big read (dump_memory reads a whole region in a single call), and SingleInstance off
 //! so starting an emucap instance doesn't take over the user's other open ROM, and a controller
-//! connected on the game port (emu.setInput reaches no device otherwise). The launcher copies the
-//! Mesen executable/app into an emucap-owned portable directory but writes NO settings.json there, so
-//! Mesen loads the user's own settings and inherits their keymaps/controller (hands-on HITL works);
-//! the required keys are passed as CLI config overrides in `mesen_spec` with `--donotSaveSettings` so
-//! they never persist to the user's file.
+//! connected on the game port (emu.setInput reaches no device otherwise). The launcher normally
+//! leaves settings.json absent so Mesen inherits the user's keymaps/controller (hands-on HITL works);
+//! GBA is the narrow exception: Mesen must enter portable-data mode to discover the staged BIOS next
+//! to the copied app, so that launch gets a minimal settings.json. Required values are still passed
+//! as CLI overrides with `--donotSaveSettings` and never persist to the user's file.
 
 use std::path::{Path, PathBuf};
 
@@ -89,8 +89,9 @@ fn app_bundle_root(binary: &Path) -> Option<(&Path, PathBuf)> {
     None
 }
 
-/// Copy Mesen into an emucap-owned portable directory and write the required settings next to the
-/// copied executable. The source binary/app is read-only input.
+/// Copy Mesen into an emucap-owned portable directory and locate its optional settings path. The
+/// source binary/app is read-only input; system-specific launch preparation decides whether a
+/// settings file is needed.
 pub fn prepare_portable_binary(
     source_binary: &Path,
     port: u16,
@@ -160,18 +161,21 @@ pub struct Launch<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
+    pub runtime: Option<super::RuntimeEnv<'a>>,
 }
 
 /// Prepare an emucap-owned portable Mesen copy and launch it detached with the ROM + adapter Lua and
 /// the emucap environment. Returns the child pid.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let portable = prepare_portable_binary(l.binary, l.port)?;
+    ensure_gba_portable_settings(l, &portable)?;
     provision_gba_bios(l, &portable)?;
     let opts = crate::launch::spec::SpecOpts {
         content: l.content,
         port: l.port,
         name: l.name,
         session_token: l.session_token,
+        runtime: l.runtime,
         headless: false, // Mesen renders a GUI window; there is no headless mode.
     };
     let spec = crate::launch::spec::mesen_spec(&portable.binary, l.log_path, l.lua, &opts);
@@ -179,6 +183,63 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
     crate::launch::spawn_display_caffeinate(pid);
     Ok(pid)
+}
+
+const GBA_PORTABLE_SETTINGS: &str = r#"{
+  "Debug": {
+    "ScriptWindow": {
+      "AllowIoOsAccess": true,
+      "AllowNetworkAccess": true,
+      "ScriptTimeout": 60
+    }
+  },
+  "Preferences": {
+    "SingleInstance": false
+  }
+}
+"#;
+
+/// A settings.json beside the executable is Mesen's portable-data marker. GBA needs that marker so
+/// its `Firmware/gba_bios.bin` staging path and Mesen's lookup path are the same. Other systems keep
+/// the file absent and continue inheriting the user's native key bindings. An existing regular file
+/// copied from the source app is preserved verbatim.
+fn ensure_gba_portable_settings(
+    l: &Launch,
+    portable: &PreparedPortable,
+) -> std::io::Result<()> {
+    if l.lua.file_name().and_then(|n| n.to_str()) != Some("emucap-gba.lua") {
+        return Ok(());
+    }
+    if super::has_symlink_component_under(&portable.home, &portable.settings) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "portable Mesen settings path contains a symlink, refusing to write: {}",
+                portable.settings.display()
+            ),
+        ));
+    }
+    if portable.settings.is_file() {
+        return Ok(());
+    }
+    if portable.settings.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "portable Mesen settings path is not a regular file: {}",
+                portable.settings.display()
+            ),
+        ));
+    }
+    if let Some(parent) = portable.settings.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = super::unique_sibling_path(&portable.settings, "tmp");
+    if let Err(err) = std::fs::write(&tmp, GBA_PORTABLE_SETTINGS.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+    super::rename_file_tmp(&tmp, &portable.settings)
 }
 
 /// The default GBA BIOS source when `EMUCAP_GBA_BIOS` is unset: the emucap-owned firmware directory
@@ -511,8 +572,75 @@ mod tests {
             port: 47800,
             name: None,
             session_token: None,
+            runtime: None,
         };
         (l, portable)
+    }
+
+    #[test]
+    fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+
+        ensure_gba_portable_settings(&l, &portable).unwrap();
+
+        let settings = read(&portable.settings);
+        assert_eq!(settings["Debug"]["ScriptWindow"]["AllowIoOsAccess"], true);
+        assert_eq!(settings["Debug"]["ScriptWindow"]["AllowNetworkAccess"], true);
+        assert_eq!(settings["Debug"]["ScriptWindow"]["ScriptTimeout"], 60);
+        assert_eq!(settings["Preferences"]["SingleInstance"], false);
+        assert_eq!(
+            portable.settings.parent(),
+            portable.binary.parent(),
+            "settings and Firmware must resolve from the same portable data directory"
+        );
+    }
+
+    #[test]
+    fn gba_preserves_existing_portable_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        std::fs::create_dir_all(portable.settings.parent().unwrap()).unwrap();
+        std::fs::write(&portable.settings, br#"{"Video":{"Scale":4}}"#).unwrap();
+
+        ensure_gba_portable_settings(&l, &portable).unwrap();
+
+        assert_eq!(read(&portable.settings), json!({"Video": {"Scale": 4}}));
+    }
+
+    #[test]
+    fn non_gba_keeps_portable_settings_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-snes.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+
+        ensure_gba_portable_settings(&l, &portable).unwrap();
+
+        assert!(!portable.settings.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gba_refuses_symlinked_portable_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let lua = dir.path().join("emucap-gba.lua");
+        let log = dir.path().join("launch.log");
+        let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+        std::fs::create_dir_all(portable.settings.parent().unwrap()).unwrap();
+        let target = outside.path().join("settings.json");
+        std::fs::write(&target, b"user settings").unwrap();
+        std::os::unix::fs::symlink(&target, &portable.settings).unwrap();
+
+        let err = ensure_gba_portable_settings(&l, &portable).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(&target).unwrap(), b"user settings");
     }
 
     #[test]
@@ -541,7 +669,11 @@ mod tests {
 
         with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
 
-        let staged = portable.binary.parent().unwrap().join("Firmware/gba_bios.bin");
+        let staged = portable
+            .binary
+            .parent()
+            .unwrap()
+            .join("Firmware/gba_bios.bin");
         assert_eq!(std::fs::read(&staged).unwrap(), b"BIOSBYTES");
     }
 
@@ -552,7 +684,11 @@ mod tests {
         let log = dir.path().join("launch.log");
         let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
         // A BIOS was staged by a prior run; the shared source dir does NOT exist now.
-        let staged = portable.binary.parent().unwrap().join("Firmware/gba_bios.bin");
+        let staged = portable
+            .binary
+            .parent()
+            .unwrap()
+            .join("Firmware/gba_bios.bin");
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
         std::fs::write(&staged, b"PRIORRUN").unwrap();
 
@@ -569,7 +705,11 @@ mod tests {
         let log = dir.path().join("launch.log");
         let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
         // Even with a staged BIOS, an explicitly-configured but missing source must fail fast.
-        let staged = portable.binary.parent().unwrap().join("Firmware/gba_bios.bin");
+        let staged = portable
+            .binary
+            .parent()
+            .unwrap()
+            .join("Firmware/gba_bios.bin");
         std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
         std::fs::write(&staged, b"PRIORRUN").unwrap();
         let missing = dir.path().join("nowhere/gba_bios.bin");

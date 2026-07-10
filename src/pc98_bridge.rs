@@ -435,6 +435,7 @@ impl GdbTransport for GdbRspClient {
 pub struct BridgeEnv {
     pub name: Option<String>,
     pub session_token: Option<String>,
+    pub launch_id: Option<String>,
     pub content: Option<PathBuf>,
     pub build: Option<String>,
 }
@@ -444,6 +445,7 @@ impl BridgeEnv {
         Self {
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
+            launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
             content: std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from),
             build: std::env::var("EMUCAP_BUILD_HASH").ok(),
         }
@@ -570,6 +572,9 @@ impl<G: GdbTransport> Bridge<G> {
         }
         if let Some(token) = &self.env.session_token {
             obj.insert("session_token".into(), json!(token));
+        }
+        if let Some(launch_id) = &self.env.launch_id {
+            obj.insert("launch_id".into(), json!(launch_id));
         }
         if let Some(content) = &self.env.content {
             obj.insert("content".into(), json!(content.display().to_string()));
@@ -1188,10 +1193,30 @@ impl<G: GdbTransport> Bridge<G> {
     fn press_buttons(&mut self, params: &Value) -> BridgeResult<Value> {
         let buttons = normalize_buttons(params.get("buttons"))?;
         let frames = optional_num(params, "frames")?.unwrap_or(1).max(1);
-        if let Err(err) = self.lua_cmd("press", Some(&format!("{frames}:{}", buttons.join(",")))) {
-            return Err(self.explain_input_failure(err, &buttons));
+        let arg = format!("{frames}:{}", buttons.join(","));
+        let stop = match self.deferred_lua_op("press", &arg, frames) {
+            Ok(stop) => stop,
+            Err(err) => return Err(self.explain_input_failure(err, &buttons)),
+        };
+        if let Some(raw) = stop {
+            self.frozen = true;
+            return Ok(json!({
+                "status": "interrupted",
+                "reason": "breakpoint",
+                "raw": raw,
+                "buttons": buttons,
+                "frames": frames,
+                "frame": self.current_frame(),
+            }));
         }
-        Ok(json!({ "buttons": buttons, "frames": frames }))
+        self.frozen = false;
+        Ok(json!({
+            "status": "completed",
+            "buttons": buttons,
+            "frames": frames,
+            "frame": self.current_frame(),
+            "state": "running",
+        }))
     }
 
     fn refresh_input_fields(&mut self) -> Vec<String> {
@@ -1825,6 +1850,15 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     fn frames_op(&mut self, name: &str, frames: u64) -> BridgeResult<Option<String>> {
+        self.deferred_lua_op(name, &frames.to_string(), frames)
+    }
+
+    fn deferred_lua_op(
+        &mut self,
+        name: &str,
+        arg: &str,
+        budget_frames: u64,
+    ) -> BridgeResult<Option<String>> {
         // s(step)와 마찬가지로 framestep/runframes도 응답 자체가 stop이라 send_cmd의 stale-stop demux가
         // command_expects_stop로 스킵된다. 직전 resume()가 pause_on_hit BP를 물어 남긴 버퍼된 stop이
         // 앞에 끼면 이 프레임 명령의 응답 자리에 오배달돼(drain_immediate_stops가 프레임 결과로 오소비)
@@ -1838,11 +1872,11 @@ impl<G: GdbTransport> Bridge<G> {
         let per_frame_ms = if self.tracing { 5_000 } else { 50 };
         let timeout = Duration::from_millis(
             5_000u64
-                .saturating_add(frames.saturating_mul(per_frame_ms))
+                .saturating_add(budget_frames.saturating_mul(per_frame_ms))
                 .min(600_000),
         );
         self.gdb.set_timeout(timeout)?;
-        let result = self.lua_cmd_allow_stop(name, Some(&frames.to_string()));
+        let result = self.lua_cmd_allow_stop(name, Some(arg));
         let restore = self.gdb.set_timeout(previous);
         match (result, restore) {
             (Ok(value), Ok(())) => Ok(value),
@@ -2316,7 +2350,7 @@ fn is_stop_packet(resp: &str) -> bool {
 }
 
 /// 이 명령의 정상 RSP 응답 자체가 stop 패킷인 명령인지. continue/step/`?`/vCont 외에,
-/// framestep·runframes는 프레임 노티파이어가 목표에 도달할 때 stop을 지연 응답으로 보내므로
+/// framestep·runframes·press는 프레임 노티파이어가 목표에 도달할 때 stop을 지연 응답으로 보내므로
 /// 여기에 포함한다 — 이들 응답의 stop은 stale이 아니라 정상 응답이라 demux하면 안 된다.
 fn command_expects_stop(payload: &str) -> bool {
     payload == "c"
@@ -2327,6 +2361,7 @@ fn command_expects_stop(payload: &str) -> bool {
         || payload.starts_with("vCont")
         || payload.starts_with("qEmucap,framestep")
         || payload.starts_with("qEmucap,runframes")
+        || payload.starts_with("qEmucap,press")
 }
 
 fn parse_breakpoint_reply(resp: &str) -> BridgeResult<(String, u64)> {
@@ -3452,6 +3487,7 @@ mod tests {
                 ("?", "S05"),
                 ("qEmucap,setinput,656e7465722c657363", "OK"),
                 ("qEmucap,press,333a612c62", "OK"),
+                ("qEmucap,frame", "42"),
                 ("qEmucap,reset", "OK"),
                 ("qEmucap,breakonreset,31", "OK"),
             ]),
@@ -3472,7 +3508,13 @@ mod tests {
         ));
         assert_eq!(
             press.result.unwrap(),
-            json!({"buttons":["a","b"],"frames":3})
+            json!({
+                "status":"completed",
+                "buttons":["a","b"],
+                "frames":3,
+                "frame":42,
+                "state":"running"
+            })
         );
 
         let reset = bridge.handle_request(Request::new(10, "reset", json!({})));
@@ -3690,6 +3732,31 @@ mod tests {
             .iter()
             .any(|t| *t > Duration::from_secs(5)));
         assert_eq!(bridge.gdb.get_timeout().unwrap(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn press_buttons_reports_breakpoint_interruption_and_releases_operation() {
+        let fake = FakeGdb::with(&[
+            ("?", "S05"),
+            (
+                "qEmucap,press,31303a656e746572",
+                "T05hwbreak:01000000;idx:2;",
+            ),
+            ("qEmucap,frame", "77"),
+        ]);
+        let mut bridge = Bridge::new(fake, BridgeEnv::default());
+        let response = bridge.handle_request(Request::new(
+            15,
+            "press_buttons",
+            json!({"buttons":["start"],"frames":10}),
+        ));
+        let result = response.result.unwrap();
+        assert_eq!(result["status"], "interrupted");
+        assert_eq!(result["reason"], "breakpoint");
+        assert_eq!(result["raw"], "T05hwbreak:01000000;idx:2;");
+        assert_eq!(result["buttons"], json!(["enter"]));
+        assert_eq!(result["frames"], 10);
+        assert_eq!(result["frame"], 77);
     }
 
     #[test]

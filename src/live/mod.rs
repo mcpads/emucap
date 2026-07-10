@@ -1,7 +1,10 @@
 pub mod broker;
 pub mod broker_link;
+pub mod continuity;
 pub mod link;
 pub mod protocol;
+pub mod reconnect;
+pub mod runtime;
 pub mod tcp;
 pub mod tools;
 

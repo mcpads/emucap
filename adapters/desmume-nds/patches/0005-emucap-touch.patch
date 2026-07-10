@@ -2,7 +2,7 @@ diff --git i/desmume/src/NDSSystem.cpp w/desmume/src/NDSSystem.cpp
 index 996d1f3..f5614fb 100755
 --- i/desmume/src/NDSSystem.cpp
 +++ w/desmume/src/NDSSystem.cpp
-@@ -3081,6 +3081,44 @@ static void emucapApplyInputOverride(UserButtons& b)
+@@ -3086,6 +3086,49 @@ static void emucapApplyInputOverride(UserButtons& b)
  	}
  }
  
@@ -22,6 +22,11 @@ index 996d1f3..f5614fb 100755
 +	emucapTouch.frames_remaining = frames;
 +	// A lift with no timed hold means "stop overriding the touch".
 +	emucapTouch.active = touching || (frames > 0);
++}
++
++int NDS_getEmucapTouchOverrideRemaining()
++{
++	return emucapTouch.active ? emucapTouch.frames_remaining : 0;
 +}
 +
 +static void emucapApplyTouchOverride(UserTouch& t)

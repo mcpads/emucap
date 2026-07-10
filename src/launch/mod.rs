@@ -71,7 +71,7 @@ pub(crate) mod test_env {
 }
 
 /// Base directory for emucap-owned emulator data, per OS. `EMUCAP_EMU_HOME` overrides it.
-fn emu_home_base() -> PathBuf {
+pub(crate) fn emu_home_base() -> PathBuf {
     if let Some(base) = std::env::var_os("EMUCAP_EMU_HOME") {
         return PathBuf::from(base);
     }
@@ -120,6 +120,15 @@ pub struct LaunchSpec {
     pub cwd: Option<PathBuf>,
 }
 
+/// Runtime-generation identity handed to the adapter process.  The failure path belongs to the
+/// same generation as `launch_id`, so a later MCP can reject stale evidence without relying on the
+/// listening port or PID alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeEnv<'a> {
+    pub launch_id: &'a str,
+    pub adapter_failure_path: &'a Path,
+}
+
 impl LaunchSpec {
     pub fn new(program: impl Into<PathBuf>, log_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -145,6 +154,20 @@ impl LaunchSpec {
 
     pub fn env(mut self, k: impl Into<String>, v: impl Into<String>) -> Self {
         self.env.push((k.into(), v.into()));
+        self
+    }
+
+    /// Add the optional runtime-generation contract understood by continuity-aware adapters.
+    /// Older adapters harmlessly ignore the environment variables.
+    pub fn runtime_env(mut self, runtime: Option<RuntimeEnv<'_>>) -> Self {
+        if let Some(runtime) = runtime {
+            self.env
+                .push(("EMUCAP_LAUNCH_ID".into(), runtime.launch_id.to_string()));
+            self.env.push((
+                "EMUCAP_FAILURE_FILE".into(),
+                runtime.adapter_failure_path.to_string_lossy().into_owned(),
+            ));
+        }
         self
     }
 
@@ -246,22 +269,39 @@ pub(crate) fn spawn_display_caffeinate(target_pid: u32) {
     }
 }
 
-/// Whether a process is still alive. Unix: `kill(pid, 0)`. Windows is not implemented (assumes
-/// alive) — the NDS adapter's Windows build is a separate task, and the bridge's connect retry
-/// surfaces a dead emulator there anyway.
+/// Whether a process is still alive. Unix uses `kill(pid, 0)`; Windows queries the process exit
+/// code through a limited-information handle. Runtime ownership additionally compares the process
+/// start identity before treating an alive PID as the launched process.
 pub(crate) fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+        unsafe { CloseHandle(handle) };
+        ok && exit_code == STILL_ACTIVE
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
-        true
+        false
     }
 }
 
-pub(crate) fn terminate_detached(pid: u32) -> std::io::Result<()> {
+/// Terminate a PID that the caller has already proven it owns. Runtime callers normally validate
+/// process start identity first; launch rollback may call this immediately for a PID it just spawned.
+pub fn terminate_detached(pid: u32) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         // SIGTERM 먼저, 안 죽으면 SIGKILL. desmume-cli는 SIGTERM을 무시하므로

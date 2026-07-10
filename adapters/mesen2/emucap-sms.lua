@@ -105,7 +105,7 @@ SYS.bank_tagging_active = function(st) return st["cart.prgBanks0"] ~= nil end
 -- vdp.addressReg(목적지 워드주소)·vdp.codeReg(1=VRAM write)를 읽는다. getState는 데이터포트 후보에서만 부른다.
 SYS.non_bus_write_memtypes = {
   smsVideoRam   = "vram_recon",  -- VDP 데이터포트 write 재구성으로 지원
-  smsPaletteRam = "error",       -- CRAM(codeReg=3)도 포트 write지만 재구성 미구현(TODO)
+  smsPaletteRam = "error",       -- CRAM(codeReg=3)도 포트 write지만 재구성 미지원
 }
 SYS.vram_write_target = function(pc, opcode)
   local bus = emu.memType.smsMemory

@@ -1,0 +1,21 @@
+diff --git i/desmume/src/gdbstub/gdbstub.cpp w/desmume/src/gdbstub/gdbstub.cpp
+--- i/desmume/src/gdbstub/gdbstub.cpp
++++ w/desmume/src/gdbstub/gdbstub.cpp
+@@ -1040,6 +1040,17 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       }
+       /* else: fall through to the empty reply, which the bridge reads as an error */
+     }
++    // Timed override status: 0=terminal/released, -1=persistent hold, >0=frames remaining.
++    else if ( strncmp( (const char *)packet, "qEmucap,inputstatus", 19) == 0) {
++      extern int NDS_getEmucapInputOverrideRemaining();
++      send_size = snprintf( (char *)out_ptr, BUFMAX, "%d",
++                            NDS_getEmucapInputOverrideRemaining());
++    }
++    else if ( strncmp( (const char *)packet, "qEmucap,touchstatus", 19) == 0) {
++      extern int NDS_getEmucapTouchOverrideRemaining();
++      send_size = snprintf( (char *)out_ptr, BUFMAX, "%d",
++                            NDS_getEmucapTouchOverrideRemaining());
++    }
+     // emucap disassemble: qEmucap,disasm:<hexaddr>,<hexcount>[,<mode>] -> base64 of
+     // newline-separated "<addr>|<opcode>|<text>" rows on this stub's CPU. mode is an
+     // optional single char: 'a'=ARM, 't'=Thumb; absent = auto from the CPU CPSR T-bit.

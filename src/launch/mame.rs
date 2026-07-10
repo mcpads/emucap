@@ -100,6 +100,7 @@ pub struct Launch<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
+    pub runtime: Option<super::RuntimeEnv<'a>>,
     pub headless: bool,
 }
 
@@ -249,6 +250,7 @@ fn resolve_bridge_launch(l: &Launch, gdb_port: u16) -> std::io::Result<BridgeLau
     if let Some(token) = l.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
     }
+    spec = spec.runtime_env(l.runtime);
     Ok(BridgeLaunch {
         kind: runtime.kind,
         spec,
@@ -454,6 +456,7 @@ mod tests {
             port: 47800,
             name: None,
             session_token: None,
+            runtime: None,
             headless: true,
         };
 
@@ -495,6 +498,7 @@ mod tests {
             port: 47800,
             name: None,
             session_token: None,
+            runtime: None,
             headless: true,
         };
 
@@ -538,6 +542,7 @@ mod tests {
             port: 47800,
             name: Some("pc98"),
             session_token: Some("token"),
+            runtime: None,
             headless: true,
         };
 
@@ -555,7 +560,10 @@ mod tests {
     #[test]
     fn resolve_flop2_prefers_explicit_over_env() {
         // 명시 param(launch 툴 content_path2)이 MAME_FLOP2 폴백보다 우선.
-        assert_eq!(resolve_flop2(Some("/a.d88"), Some("/b.d88")), Some("/a.d88"));
+        assert_eq!(
+            resolve_flop2(Some("/a.d88"), Some("/b.d88")),
+            Some("/a.d88")
+        );
         // param 없으면 env 폴백(legacy launch.sh 동형).
         assert_eq!(resolve_flop2(None, Some("/b.d88")), Some("/b.d88"));
         // 둘 다 없으면 단일 매체.
@@ -581,6 +589,7 @@ mod tests {
             port: 47800,
             name: None,
             session_token: None,
+            runtime: None,
             headless: true,
         };
 

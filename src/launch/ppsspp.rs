@@ -85,6 +85,7 @@ pub struct Launch<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
+    pub runtime: Option<super::RuntimeEnv<'a>>,
     /// Open a native PPSSPP window (HITL viewing/play) by launching the `PPSSPPSDL` GUI build instead
     /// of `PPSSPPHeadless`; false = headless (debugger WebSocket only, the default). `binary` must
     /// already point at the GUI build when this is true (the caller resolves it via
@@ -186,15 +187,13 @@ fn wait_ws_ready(pid: u32, port: u16, timeout: Duration) -> io::Result<()> {
 /// Headless PPSSPP with the debugger WebSocket open. Mirrors `launch.sh`:
 /// `PPSSPPHeadless --debugger=<port> --graphics=software <content>`.
 ///
-/// Two gotchas found by the fork review + live verification (`docs/research/ppsspp-debugger.md`,
-/// `.superpowers/sdd/task-11-report.md`):
+/// Two upstream command-line constraints define this launch shape:
 /// - The content is a **positional** boot argument, not `-m`/`--mount` — `-m` only mounts a
 ///   *second* image on `umd1:` for ELF+CSO test harnesses; passed alone it leaves PPSSPP's boot
 ///   list empty and nothing boots.
 /// - `--timeout=<sec>` (a headless test-harness flag) aborts the run after that many wall-clock
 ///   seconds regardless of debugger/WebSocket activity — it is never passed here. Omitting it lets
-///   PPSSPPHeadless run with no deadline (verified live: survived 30+s idle with the WS still
-///   answering `game.status` against a real ISO).
+///   PPSSPPHeadless run with no wall-clock deadline while the debugger remains interactive.
 ///
 /// Per-port emucap-owned profile environment for the PPSSPP process, so a session — headless *or* a
 /// HITL `display:true` window the human plays with PPSSPP's own control mappings — reads and writes
@@ -271,7 +270,7 @@ fn bridge_spec(l: &Launch, ws_port: u16) -> LaunchSpec {
     if let Some(token) = l.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
     }
-    spec
+    spec.runtime_env(l.runtime)
 }
 
 /// Spawn headless PPSSPP (debugger WebSocket), wait until it survives startup and the WebSocket
@@ -348,7 +347,7 @@ fn write_pidfile(log_path: &Path, name: &str, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::{
-        bridge_spec, emu_spec, resolve_bridge, resolve_binary, resolve_gui_binary, resolve_ws_port,
+        bridge_spec, emu_spec, resolve_binary, resolve_bridge, resolve_gui_binary, resolve_ws_port,
         Launch,
     };
 
@@ -356,12 +355,18 @@ mod tests {
     #[test]
     fn wait_survives_passes_a_living_process_and_flags_an_exited_one() {
         use std::time::Duration;
-        let mut alive = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let mut alive = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
         assert!(super::wait_survives(alive.id(), Duration::from_millis(400), "died").is_ok());
         let _ = alive.kill();
         let _ = alive.wait();
 
-        let mut dead = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
         let dead_pid = dead.id();
         let _ = dead.wait(); // reap so the pid is gone
         assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
@@ -374,7 +379,10 @@ mod tests {
         use std::time::Duration;
 
         // A process that stays alive and a port that is already listening → ready immediately.
-        let alive = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let alive = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(super::wait_ws_ready(alive.id(), port, Duration::from_secs(2)).is_ok());
@@ -384,7 +392,10 @@ mod tests {
         drop(listener);
 
         // A process that has already exited, and nothing listening → fails fast (dead, not a timeout).
-        let mut dead = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
         let dead_pid = dead.id();
         let _ = dead.wait();
         let free_port = {
@@ -415,6 +426,7 @@ mod tests {
             port: 47800,
             name: Some("psp_session"),
             session_token: Some("token"),
+            runtime: None,
             display: false,
         }
     }
@@ -533,9 +545,9 @@ mod tests {
         let _env = EnvGuard::new(&["EMUCAP_PPSSPP_GUI_BIN"]);
         std::env::remove_var("EMUCAP_PPSSPP_GUI_BIN");
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir
-            .path()
-            .join("adapters/ppsspp/work/ppsspp/build-headless/PPSSPPSDL.app/Contents/MacOS/PPSSPPSDL");
+        let bin = dir.path().join(
+            "adapters/ppsspp/work/ppsspp/build-headless/PPSSPPSDL.app/Contents/MacOS/PPSSPPSDL",
+        );
         std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
         std::fs::write(&bin, b"fake PPSSPPSDL").unwrap();
         #[cfg(unix)]

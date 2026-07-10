@@ -409,7 +409,7 @@ if [ "$LAUNCH_MODE" = "open" ]; then
     echo "ERROR: open launch mode requires a portable .app bundle; use direct mode for this binary." >&2
     exit 2
   fi
-  # Codex처럼 transient PTY/agent에서 GUI .app을 직접 exec하면 macOS reopen/open 경로와 충돌해
+  # transient PTY에서 GUI .app을 직접 exec하면 macOS reopen/open 경로와 충돌해
   # 신규 창이 안 뜨거나 연결 직후 사라지는 사례가 있다. LaunchServices로 새 인스턴스를 요청하되,
   # EMUCAP_* 환경변수는 open --env로 명시 전달한다. 실제 PID는 포트 연결 후 lsof로 역추적한다.
   OPEN_ENV=(--env "EMUCAP_PORT=$PORT" --env "EMUCAP_BUILD_HASH=$EMUCAP_BUILD_HASH" --env "EMUCAP_ADAPTER_DIR=$HERE")
@@ -418,9 +418,11 @@ if [ "$LAUNCH_MODE" = "open" ]; then
   OPEN_ENV+=(--env "EMUCAP_CONTENT=$ROM")
   [ -n "${EMUCAP_PREARM:-}" ] && OPEN_ENV+=(--env "EMUCAP_PREARM=$EMUCAP_PREARM")
   [ -n "${EMUCAP_FREEZE_KEY:-}" ] && OPEN_ENV+=(--env "EMUCAP_FREEZE_KEY=$EMUCAP_FREEZE_KEY")
+  [ -n "${EMUCAP_DEADMAN_MS:-}" ] && OPEN_ENV+=(--env "EMUCAP_DEADMAN_MS=$EMUCAP_DEADMAN_MS")
+  [ -n "${EMUCAP_RECONNECT_GIVEUP_MS:-}" ] && OPEN_ENV+=(--env "EMUCAP_RECONNECT_GIVEUP_MS=$EMUCAP_RECONNECT_GIVEUP_MS")
   open -n -g "$MESEN_APP_BUNDLE" --stdout "$LOG" --stderr "$LOG" "${OPEN_ENV[@]}" --args "$ROM" "$LUA"
 else
-  # Codex 같은 transient PTY/agent에서 direct exec를 쓰면 부모 shell 종료나 PTY 정리가
+  # transient PTY에서 direct exec를 쓰면 부모 shell 종료나 PTY 정리가
   # GUI 프로세스에 영향을 줄 수 있다. Mednafen launcher와 같은 방식으로 가능한 경우
   # 새 세션(start_new_session)에 띄우고 stdio를 /dev/null + log로 분리한다.
   if command -v python3 >/dev/null 2>&1; then

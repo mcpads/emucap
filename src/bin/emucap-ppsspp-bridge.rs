@@ -1,9 +1,7 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use emucap::live::protocol::{ProtocolError, Request, Response};
+use emucap::live::reconnect::serve_reconnecting;
 use emucap::ppsspp_bridge::{PpssppBridge, TungsteniteWs};
 
 fn main() -> anyhow::Result<()> {
@@ -24,7 +22,7 @@ fn main() -> anyhow::Result<()> {
     );
     // 8s default, not 5s: the emucap fork's `emucap.screenshot` has its own internal 5.0s wait for
     // GE stepping (`WebSocketGPUBufferEmucapScreenshot`'s `timeoutSeconds`) before it replies with an
-    // error event. A 5s socket read timeout here would race that — verified live: the client's
+    // error event. A 5s socket read timeout here would race that; the client's
     // own read can time out (`bridge_error`/IO) a few ms ahead of PPSSPP's reply, which then
     // arrives unread on the socket and gets misattributed as an error to whatever unrelated
     // request comes next (this transport demuxes by event name only, no per-request id). Comfortably
@@ -38,40 +36,10 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("connect PPSSPP debugger websocket at 127.0.0.1:{ppsspp_port}"))?;
     let mut bridge = PpssppBridge::new(ws);
 
-    let sock = TcpStream::connect(("127.0.0.1", emucap_port))
-        .with_context(|| format!("connect emucap MCP listener at 127.0.0.1:{emucap_port}"))?;
-    sock.set_nodelay(true).ok();
-    let mut reader = BufReader::new(sock.try_clone()?);
-    let mut writer = sock;
-    eprintln!("[ppsspp-rust] connected");
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(request) => bridge.handle_request(request),
-            Err(err) => Response {
-                id: 0,
-                ok: false,
-                result: None,
-                error: Some(ProtocolError {
-                    kind: "protocol_error".into(),
-                    message: err.to_string(),
-                }),
-            },
-        };
-        serde_json::to_writer(&mut writer, &response)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-    }
-    Ok(())
+    serve_reconnecting(emucap_port, "ppsspp-rust", move |request| {
+        bridge.handle_request(request)
+    })
+    .context("serve reconnecting emucap session")
 }
 
 fn parse_port(raw: &str) -> anyhow::Result<u16> {

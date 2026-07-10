@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use super::LaunchSpec;
+use super::{LaunchSpec, RuntimeEnv};
 
 /// Options shared by adapter spec builders.
 pub struct SpecOpts<'a> {
@@ -12,6 +12,7 @@ pub struct SpecOpts<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
+    pub runtime: Option<RuntimeEnv<'a>>,
     /// Run without a visible window where the emulator supports it.
     pub headless: bool,
 }
@@ -46,7 +47,7 @@ pub fn mednafen_spec(
     if opts.headless {
         spec = spec.env("SDL_VIDEODRIVER", "dummy");
     }
-    spec
+    spec.runtime_env(opts.runtime)
 }
 
 /// Flycast (Dreamcast). The interpreter/mute/GDB settings are seeded into the isolated config
@@ -62,7 +63,7 @@ pub fn flycast_spec(binary: &Path, log_path: &Path, opts: &SpecOpts) -> LaunchSp
     if let Some(token) = opts.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
     }
-    spec
+    spec.runtime_env(opts.runtime)
 }
 
 /// Mesen2 (SNES). The ROM and the adapter Lua script are positional args; the port, name,
@@ -101,7 +102,7 @@ pub fn mesen_spec(binary: &Path, log_path: &Path, lua: &Path, opts: &SpecOpts) -
     if let Some(token) = opts.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
     }
-    spec
+    spec.runtime_env(opts.runtime)
 }
 
 /// Resolved inputs for the MAME (PC-98) process spec.
@@ -228,6 +229,7 @@ mod tests {
             port: 47800,
             name: None,
             session_token: None,
+            runtime: None,
             headless: true,
         }
     }

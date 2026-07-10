@@ -1,6 +1,8 @@
-use std::io::{BufRead, BufReader, Write};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -16,8 +18,11 @@ pub struct TcpLink {
     conn: Option<Conn>,
     caps: Capabilities,
     session_token: String,
+    preaccept_token: Arc<RwLock<String>>,
     next_id: u64,
     preaccept: Option<Preaccept>,
+    runtime_store: super::runtime::RuntimeStore,
+    runtime_candidates: Vec<Value>,
     /// 연속 요청 타임아웃 횟수. 1회 타임아웃은 느리지만 살아있는 어댑터(큰 read·NMI 장면)일 수 있어
     /// 연결을 끊지 않는다. 응답을 한 번이라도 받으면 0으로 리셋. 임계치 연속이면 진짜 행으로 보고 드롭한다.
     /// 쓰기 타임아웃(플러드된 emu가 recv를 안 비움)도 읽기 타임아웃과 동일하게 여기 편입된다(비치명).
@@ -46,7 +51,7 @@ struct Conn {
     pending: String,
 }
 
-type PreacceptResult = Result<(Conn, Capabilities), LinkError>;
+type PreacceptResult = Result<(Conn, Capabilities, String), LinkError>;
 
 struct Preaccept {
     rx: Receiver<PreacceptResult>,
@@ -54,15 +59,19 @@ struct Preaccept {
 }
 
 fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLink {
+    let session_token = new_session_token();
     TcpLink {
         addr: addr.to_string(),
         listener,
         timeout,
         conn: None,
         caps: Capabilities::empty(),
-        session_token: new_session_token(),
+        preaccept_token: Arc::new(RwLock::new(session_token.clone())),
+        session_token,
         next_id: 1,
         preaccept: None,
+        runtime_store: super::runtime::RuntimeStore::discover(),
+        runtime_candidates: Vec::new(),
         consecutive_timeouts: 0,
         deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
     }
@@ -74,7 +83,7 @@ pub fn new_session_token() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     // 포맷 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`. 세션 식별부는 앞 두 필드
-    // `{cwd_hash}-{session_anchor}` — cwd는 세션마다 다르고, session_anchor는 Claude 세션 id 해시라
+    // `{cwd_hash}-{session_anchor}` — cwd는 세션마다 다르고, session_anchor는 제어 세션 id 해시라
     // 같은 세션의 서버 respawn(/mcp 재연결)엔 불변이면서 동시 실행되는 다른 세션과는 달라, 같은 cwd의
     // 형제 세션을 구별한다(reclaim 오인 방지). 부모 PID는 respawn이 다른 부모 아래로 재spawn되면 값이
     // 바뀌어, 자기 토큰을 foreign으로 오판해 실행 중 에뮬을 strand하므로 앵커로 쓰지 않는다.
@@ -89,16 +98,21 @@ pub fn new_session_token() -> String {
     )
 }
 
-/// 세션-안정·세션-고유 앵커. 같은 Claude 세션은 /mcp 재연결·서버 respawn에도 같은 session id를
-/// 물려받아 값이 불변(→ 실행 중 자기 에뮬 reclaim)이고, 동시 실행되는 다른 세션은 다른 session id라
-/// 값이 달라(→ 형제 에뮬 조용한 인계 방지) 앵커가 된다. 부모 PID(respawn 시 변동)는 쓰지 않는다.
-/// 안정된 per-session id가 없으면(비-Claude 런타임·plain shell·CI·테스트) `None` — 같은 cwd 형제를
+/// 세션-안정·세션-고유 제어 lease label의 앵커. 명시적인 공통 ID를 우선하고 알려진 host session ID를
+/// fallback으로 쓴다. 같은 세션은 /mcp 재연결·서버 respawn에도 값이 불변이고, 동시 실행되는 다른 세션은
+/// 값이 달라 형제 에뮬레이터의 조용한 인계를 막는다. 부모 PID(respawn 시 변동)는 쓰지 않는다.
+/// 안정된 per-session id가 없으면(plain shell·CI·테스트) `None` — 같은 cwd 형제를
 /// 구별할 수 없으므로 fail-closed로 강등한다. `None`이면 어떤 기존 토큰/포트도 own으로 재사용하지 않아
 /// (session_token_is_own·reusable_session_token·port_persist_path가 모두 거부/None) 형제가 살아있는
 /// 에뮬을 조용히 이어받지 못한다. 옛 동작(앵커 0으로 강등)은 두 형제가 같은 식별부로 붕괴해 서로의
 /// 토큰을 own으로 오판하는 인계 회귀를 냈다 — 그래서 0-강등이 아니라 None-거부로 일반화했다.
 fn session_anchor() -> Option<u64> {
-    for key in ["CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"] {
+    for key in [
+        "EMUCAP_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+    ] {
         if let Ok(v) = std::env::var(key) {
             let v = v.trim();
             if !v.is_empty() {
@@ -173,8 +187,31 @@ pub fn session_token_path(port: u16) -> std::path::PathBuf {
     }
 }
 
-fn write_session_token(port: u16, token: &str) {
-    let _ = std::fs::write(session_token_path(port), token);
+pub(crate) fn write_session_token(port: u16, token: &str) {
+    let path = session_token_path(port);
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(mut file) = options.open(&path) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if file
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .is_err()
+        {
+            return;
+        }
+    }
+    let _ = file
+        .write_all(token.as_bytes())
+        .and_then(|()| file.sync_all());
 }
 
 /// 토큰 `{cwd_hash}-{session_anchor}-{pid}-{nanos}`의 세션 식별부 `{cwd_hash}-{session_anchor}`
@@ -185,8 +222,8 @@ fn identity_of(token: &str) -> Option<&str> {
     Some(&token[..cwd_end + 1 + anchor_end])
 }
 
-/// 이 세션의 식별부 `{cwd_hash}-{session_anchor}` — 안정 세션 id가 있을 때만 Some. 없으면(비-Claude
-/// 런타임 등) None으로 fail-closed 신호를 전파해, 소유 판정·포트 영속화가 모두 거부된다.
+/// 이 세션의 식별부 `{cwd_hash}-{session_anchor}` — 안정 세션 id가 있을 때만 Some. 없으면
+/// None으로 fail-closed 신호를 전파해, 소유 판정·포트 영속화가 모두 거부된다.
 fn own_session_identity() -> Option<String> {
     session_anchor().map(|anchor| format!("{:016x}-{anchor:x}", cwd_hash()))
 }
@@ -219,7 +256,20 @@ pub fn same_session_identity(a: &str, b: &str) -> bool {
 /// 같은 cwd의 형제 세션이 잠깐 이 포트를 놓쳐 이 세션이 바인드하더라도, 식별부(cwd+session id)가 달라
 /// 형제의 살아있는 토큰은 재사용하지 않는다 — 그 형제 에뮬레이터를 조용히 이어받는 것을 막는다.
 pub(crate) fn reusable_session_token(port: u16) -> Option<String> {
-    let existing = std::fs::read_to_string(session_token_path(port)).ok()?;
+    let path = session_token_path(port);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut existing = String::new();
+    options
+        .open(path)
+        .ok()?
+        .read_to_string(&mut existing)
+        .ok()?;
     let existing = existing.trim();
     if session_token_is_own(existing) {
         Some(existing.to_string())
@@ -264,7 +314,9 @@ fn handshake_stream(
     // 쓰기에도 같은 상한을 건다 — 플러드된 emu가 recv를 안 비우면 write_all이 영원히 블록해
     // raw_call(및 그것이 쥔 SharedLink mutex)이 통째 wedge된다. 소켓 옵션이라 try_clone한 writer에도
     // 적용된다(hello write·이후 raw_call write 모두 이 상한을 받는다).
-    stream.set_write_timeout(Some(timeout)).map_err(io_to_link)?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(io_to_link)?;
     stream.set_nonblocking(false).map_err(io_to_link)?;
 
     let mut writer = stream.try_clone().map_err(io_to_link)?;
@@ -370,12 +422,29 @@ impl TcpLink {
         self.conn.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_runtime_store(&mut self, store: super::runtime::RuntimeStore) {
+        self.runtime_store = store;
+    }
+
     /// 현재 연결을 버린다. 다음 `ensure_connected`가 새 클라이언트를 재수락한다. 죽은·행된
     /// 연결을 붙들면 영영 wedge되어 세션 재시작을 강요하므로, 모든 끊김 신호(쓰기 실패·읽기
     /// EOF·읽기 에러·hello 실패·타임아웃)에서 한곳을 거쳐 비운다.
     fn drop_conn(&mut self) {
         self.conn = None;
         self.caps = Capabilities::empty();
+    }
+
+    fn set_reclaim_token(&mut self, token: &str) {
+        self.session_token.clear();
+        self.session_token.push_str(token);
+        *self
+            .preaccept_token
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = token.to_string();
+        if let Some(port) = self.endpoint_port() {
+            write_session_token(port, token);
+        }
     }
 
     fn finish_preaccept(&mut self, wait: Duration) -> Result<bool, LinkError> {
@@ -397,11 +466,15 @@ impl TcpLink {
         };
 
         match msg {
-            Some(Ok((conn, caps))) => {
+            Some(Ok((conn, caps, token))) if token == self.session_token => {
                 self.conn = Some(conn);
                 self.caps = caps;
                 self.preaccept = None;
                 Ok(true)
+            }
+            Some(Ok(_)) => {
+                self.preaccept = None;
+                Ok(false)
             }
             Some(Err(e)) => {
                 self.preaccept = None;
@@ -422,12 +495,18 @@ impl TcpLink {
             .try_clone()
             .map_err(io_to_link)?;
         let timeout = self.timeout;
-        let session_token = self.session_token.clone();
+        let token_source = Arc::clone(&self.preaccept_token);
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = tx.send(handshake_stream(stream, timeout, Some(&session_token)));
+                    let session_token = token_source
+                        .read()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let result = handshake_stream(stream, timeout, Some(&session_token))
+                        .map(|(conn, caps)| (conn, caps, session_token));
+                    let _ = tx.send(result);
                     break;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -488,14 +567,52 @@ impl TcpLink {
             // 잡은 포트를 self.addr에 반영 — 에뮬레이터는 이 포트로 접속해야 한다(status가 알려줌).
             let (host, base) = split_addr(&self.addr);
             let mut bound = None;
+            self.runtime_candidates.clear();
+            let mut reclaim_token = None;
+            if base != 0 {
+                match select_runtime_generation(&self.runtime_store, base)? {
+                    RuntimeSelection::Attach {
+                        port,
+                        token,
+                        candidate,
+                    } => match TcpListener::bind(format!("{host}:{port}")) {
+                        Ok(listener) => {
+                            listener.set_nonblocking(true).map_err(io_to_link)?;
+                            self.addr = listener
+                                .local_addr()
+                                .map(|addr| addr.to_string())
+                                .unwrap_or_else(|_| format!("{host}:{port}"));
+                            self.runtime_candidates = vec![candidate];
+                            reclaim_token = Some(token);
+                            bound = Some(listener);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                            self.runtime_candidates = vec![candidate];
+                            return Err(LinkError::PortBusy {
+                                addr: format!("{host}:{port}"),
+                            });
+                        }
+                        Err(error) => return Err(io_to_link(error)),
+                    },
+                    RuntimeSelection::Blocked(candidates) => {
+                        self.runtime_candidates = candidates;
+                        return Err(LinkError::PortBusy {
+                            addr: format!("{host}:{base}"),
+                        });
+                    }
+                    RuntimeSelection::None => {}
+                }
+            }
             // 세션 고정(서버 재시작 시 같은 포트 되찾기): 지난번 바인드한 포트를 먼저 정확히 시도한다.
             // 성공하면 그 포트의 에뮬레이터가 자동 재연결돼 freeze 화면을 잃지 않는다. base==0(임시포트)은
             // 세션 고정 의미가 없어 건너뛴다. 점유 중이거나 파일이 없으면 아래 스캔으로 폴백(기존 동작).
             // 단일 bind 시도라 TOCTOU로 막혀도 그냥 폴백 — 절대 블록/루프하지 않는다. base==0(임시포트)이나
             // 안정 세션 id가 없으면(fail-closed) port_persist_path가 None → 영속화를 건너뛰고 스캔만 한다.
             let persist = port_persist_path(base);
-            if let Some(pf) = persist.as_ref() {
-                if let Some(pp) = read_persisted_port(pf) {
+            let persisted_port = persist.as_ref().and_then(|pf| read_persisted_port(pf));
+            let mut bound_from_persist = false;
+            if bound.is_none() {
+                if let Some(pp) = persisted_port {
                     // 이 세션의 범위 안에 있을 때만(범위 밖/쓰레기 값은 무시). 점유면 폴백.
                     if pp >= base && (pp as u32) < base as u32 + AUTO_PORT_RANGE as u32 {
                         if let Ok(l) = TcpListener::bind(format!("{host}:{pp}")) {
@@ -505,6 +622,7 @@ impl TcpLink {
                                     .map(|a| a.to_string())
                                     .unwrap_or_else(|_| format!("{host}:{pp}"));
                                 bound = Some(l);
+                                bound_from_persist = true;
                             }
                         }
                     }
@@ -546,8 +664,19 @@ impl TcpLink {
                         // 재사용해, 서버 respawn/재연결이 토큰을 회전하지 않게 한다 — 실행 중인 자기
                         // 에뮬레이터가 옛 토큰으로 strand되지 않고 reclaim된다. 형제 세션(다른 session id)·
                         // foreign이면 새 토큰 유지 → 그 살아있는 에뮬을 이어받지 않는다.
-                        if let Some(tok) = reusable_session_token(a.port()) {
-                            self.session_token = tok;
+                        if let Some(tok) = reclaim_token.take().or_else(|| {
+                            bound_from_persist
+                                .then(|| {
+                                    self.runtime_store
+                                        .live_current_with_auth(a.port())
+                                        .ok()
+                                        .flatten()
+                                        .map(|(_, token)| token)
+                                })
+                                .flatten()
+                                .or_else(|| reusable_session_token(a.port()))
+                        }) {
+                            self.set_reclaim_token(&tok);
                         }
                         write_session_token(a.port(), &self.session_token);
                     }
@@ -740,6 +869,147 @@ impl EmulatorLink for TcpLink {
     fn session_token(&self) -> Option<&str> {
         Some(&self.session_token)
     }
+
+    fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.drop_conn();
+        self.set_reclaim_token(token);
+        Ok(true)
+    }
+
+    fn runtime_candidates(&self) -> Vec<Value> {
+        self.runtime_candidates.clone()
+    }
+}
+
+pub(crate) enum RuntimeSelection {
+    None,
+    Attach {
+        port: u16,
+        token: String,
+        candidate: Value,
+    },
+    Blocked(Vec<Value>),
+}
+
+pub(crate) fn select_runtime_generation(
+    store: &super::runtime::RuntimeStore,
+    base: u16,
+) -> Result<RuntimeSelection, LinkError> {
+    let Some(control_key) = super::runtime::control_session_key() else {
+        return Ok(RuntimeSelection::None);
+    };
+    let holder = super::runtime::capture_process(std::process::id());
+    let mut preferred = Vec::new();
+    let mut reclaimable = Vec::new();
+    let mut same_session_blocked = Vec::new();
+    let mut unreclaimable = Vec::new();
+    for offset in 0..AUTO_PORT_RANGE {
+        let Some(port) = base.checked_add(offset) else {
+            break;
+        };
+        let Some(current) = store.read_current(port).map_err(io_to_link)? else {
+            continue;
+        };
+        if current.process_state() != super::runtime::ProcessState::Alive {
+            continue;
+        }
+        let record = store
+            .read_link_json::<super::continuity::LinkRecord>(port, &current.launch_id)
+            .map_err(io_to_link)?
+            .filter(|record| record.launch_id == current.launch_id);
+        let Some(lease) = record.as_ref().and_then(|record| record.lease.as_ref()) else {
+            // No lease means there is no holder whose death can be proven. A same-session
+            // persisted port can still recover through the legacy exact-port path below, but a
+            // range scan must not adopt this generation as merely "available".
+            continue;
+        };
+        let lease_state = {
+            if lease.holder == holder {
+                super::runtime::LeaseState::Held
+            } else {
+                match super::runtime::process_state(&lease.holder) {
+                    super::runtime::ProcessState::Alive => super::runtime::LeaseState::Occupied,
+                    super::runtime::ProcessState::Exited => super::runtime::LeaseState::Available,
+                    super::runtime::ProcessState::Unknown => super::runtime::LeaseState::Unknown,
+                }
+            }
+        };
+        let same_control = lease.control_session_key.as_deref() == Some(control_key.as_str());
+        let token = store
+            .read_auth(port, &current.launch_id)
+            .map_err(io_to_link)?;
+        let mut candidate = current.public_value_with_lease(&super::runtime::LeaseView {
+            state: lease_state,
+            holder_pid: Some(lease.holder.pid),
+        });
+        if let Some(object) = candidate.as_object_mut() {
+            object.insert(
+                "attach".into(),
+                serde_json::json!({"port": port, "launch_id": current.launch_id}),
+            );
+            object.insert(
+                "reclaim_capability_available".into(),
+                Value::Bool(token.is_some()),
+            );
+        }
+        if token.is_none() && (same_control || lease_state == super::runtime::LeaseState::Available)
+        {
+            unreclaimable.push(candidate);
+            continue;
+        }
+        match (same_control, lease_state, token) {
+            (true, super::runtime::LeaseState::Held, Some(token)) => {
+                preferred.push((port, token, candidate));
+            }
+            (true, super::runtime::LeaseState::Available, Some(token)) => {
+                preferred.push((port, token, candidate));
+            }
+            (
+                true,
+                super::runtime::LeaseState::Occupied | super::runtime::LeaseState::Unknown,
+                _,
+            ) => {
+                same_session_blocked.push(candidate);
+            }
+            (_, super::runtime::LeaseState::Available, Some(token)) => {
+                reclaimable.push((port, token, candidate));
+            }
+            _ => {}
+        }
+    }
+    if preferred.len() == 1 {
+        let (port, token, candidate) = preferred.pop().expect("one preferred candidate");
+        return Ok(RuntimeSelection::Attach {
+            port,
+            token,
+            candidate,
+        });
+    }
+    if preferred.len() > 1 {
+        return Ok(RuntimeSelection::Blocked(
+            preferred.into_iter().map(|(_, _, value)| value).collect(),
+        ));
+    }
+    if !same_session_blocked.is_empty() {
+        return Ok(RuntimeSelection::Blocked(same_session_blocked));
+    }
+    if !unreclaimable.is_empty() {
+        return Ok(RuntimeSelection::Blocked(unreclaimable));
+    }
+    if reclaimable.len() == 1 {
+        let (port, token, candidate) = reclaimable.pop().expect("one reclaimable candidate");
+        return Ok(RuntimeSelection::Attach {
+            port,
+            token,
+            candidate,
+        });
+    }
+    if reclaimable.len() > 1 {
+        return Ok(RuntimeSelection::Blocked(
+            reclaimable.into_iter().map(|(_, _, value)| value).collect(),
+        ));
+    }
+    Ok(RuntimeSelection::None)
 }
 
 /// read/write가 설정된 상한 안에 진행하지 못했을 때의 타임아웃(SO_RCVTIMEO/SO_SNDTIMEO). 블로킹

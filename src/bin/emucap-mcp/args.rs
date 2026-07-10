@@ -167,7 +167,8 @@ pub(crate) struct TouchArgs {
     /// 하단 터치스크린 Y(0-191). release가 아니면 필수.
     #[serde(default)]
     pub(crate) y: Option<u64>,
-    /// 누른 채 진행할 프레임 수(탭); 생략 시 다음 touch까지 hold. 즉시 반환(입력 오버라이드 설정만).
+    /// 누른 채 진행할 프레임 수(탭). 지정하면 프레임 효과와 release가 끝난 뒤 terminal 응답하고,
+    /// 생략하면 다음 touch까지 hold를 설정한 뒤 즉시 반환한다.
     #[serde(default)]
     pub(crate) frames: Option<u64>,
     /// true면 터치를 뗀다(x,y 무시).
@@ -498,6 +499,10 @@ pub(crate) struct LaunchArgs {
     /// 지원하지 않는 어댑터는 무시한다.
     #[serde(default)]
     pub(crate) display: Option<bool>,
+    /// current capsule의 동일 프로세스가 살아 있을 때 명시적으로 교체한다. PID와 process start identity가
+    /// 모두 일치할 때만 해당 generation의 프로세스를 종료하며, 불명확하면 안전하게 거부한다.
+    #[serde(default)]
+    pub(crate) replace: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]

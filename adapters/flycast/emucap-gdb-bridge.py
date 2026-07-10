@@ -18,6 +18,10 @@ import json
 import os
 import socket
 import sys
+import time
+
+
+FRONT_WRITE_TIMEOUT = 5.0
 
 # ── Flycast SH-4 GDB 레지스터 순서 (core/debug/debug_agent.h Sh4RegList, 59×u32 LE) ──
 # 'g' 응답은 각 레지스터를 8 hex(=4바이트, little-endian)로 이어 붙인다(unpack 로직 = 첫 hex쌍이 LSB).
@@ -156,6 +160,8 @@ class Bridge:
             result["session_token"] = token
         if content := os.environ.get("EMUCAP_CONTENT"):
             result["content"] = content
+        if launch_id := os.environ.get("EMUCAP_LAUNCH_ID"):
+            result["launch_id"] = launch_id
         return result
 
     def status(self, p):
@@ -286,11 +292,24 @@ def main():
     print(f"[bridge] GDB {gdb_host}:{gdb_port} 접속됨. emucap-mcp 127.0.0.1:{emucap_port} 연결…",
           file=sys.stderr)
 
-    s = socket.create_connection(("127.0.0.1", emucap_port))
-    f = s.makefile("rwb", buffering=0)
-    print("[bridge] emucap-mcp 연결됨. 요청 대기.", file=sys.stderr)
+    retry = 0.05
+    while True:
+        try:
+            s = socket.create_connection(("127.0.0.1", emucap_port), timeout=1.0)
+            s.settimeout(None)
+            print("[bridge] emucap-mcp 연결됨. 요청 대기.", file=sys.stderr)
+            _serve_emucap_session(s, bridge)
+            print("[bridge] emucap-mcp 연결 종료. 재연결 중.", file=sys.stderr)
+            retry = 0.05
+        except OSError as err:
+            print(f"[bridge] emucap-mcp 미가용({err}). 재시도.", file=sys.stderr)
+        time.sleep(retry)
+        retry = min(retry * 2.0, 2.0)
 
-    for line in f:
+
+def _serve_emucap_session(sock, bridge):
+    with sock, sock.makefile("rwb", buffering=0) as f:
+      for line in f:
         line = line.strip()
         if not line:
             continue
@@ -314,7 +333,26 @@ def main():
             except Exception as e:  # noqa: BLE001 — PoC: 모든 예외를 에러로 보고
                 resp = {"id": rid, "ok": False,
                         "error": {"kind": "bridge_error", "message": repr(e)}}
-        f.write((json.dumps(resp, separators=(",", ":")) + "\n").encode())
+        payload = (json.dumps(resp, separators=(",", ":")) + "\n").encode()
+        if not _write_front_response(sock, payload):
+            return
+
+
+def _write_front_response(sock, payload):
+    """Bound a bridge-to-MCP write without turning idle reads into periodic timeouts."""
+    ok = False
+    try:
+        sock.settimeout(FRONT_WRITE_TIMEOUT)
+        sock.sendall(payload)
+        ok = True
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.settimeout(None)
+        except OSError:
+            ok = False
+    return ok
 
 
 if __name__ == "__main__":

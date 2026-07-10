@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use emucap::analysis::bisect::{self, CmpOp, Predicate};
 use emucap::live::broker_link;
+use emucap::live::continuity;
 use emucap::live::link::{EmulatorLink, LinkError};
 use emucap::live::tcp;
 use emucap::live::tools::{self, ToolOutput};
@@ -253,6 +254,8 @@ impl Emucap {
                 let memory_types = link.capabilities().memory_types.clone();
                 enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
                 enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
+                status::enrich_continuity(&mut v, &*link);
+                v["request_succeeded"] = serde_json::json!(true);
                 output_result(ToolOutput::Json(v))
             }
             Ok(o) => output_result(o),
@@ -295,19 +298,63 @@ impl Emucap {
                     )),
                 });
                 enrich_link_status(&mut v, port, token.as_deref(), None);
+                status::enrich_continuity(&mut v, &*link);
+                v["request_succeeded"] = serde_json::json!(false);
                 output_result(ToolOutput::Json(v))
             }
             Err(LinkError::IdentityMismatch { identity, .. }) => {
                 // 포트를 다른 세션 에뮬이 점유 — 하드에러 대신 graceful(잠금 방지·진입점 계약 유지).
                 let port = link.endpoint_port();
                 let token = link.session_token().map(str::to_string);
-                output_result(ToolOutput::Json(occupied_graceful(
-                    &identity,
-                    port,
-                    token.as_deref(),
-                )))
+                let mut value = occupied_graceful(&identity, port, token.as_deref());
+                status::enrich_continuity(&mut value, &*link);
+                output_result(ToolOutput::Json(value))
+            }
+            Err(e) if status::is_observation_failure(&e) => {
+                let port = link.endpoint_port();
+                let token = link.session_token().map(str::to_string);
+                let mut v = serde_json::json!({
+                    "connected": false,
+                    "request_succeeded": false,
+                    "error_kind": e.kind(),
+                    "error": e.to_string(),
+                    "listening_port": port,
+                });
+                enrich_link_status(&mut v, port, token.as_deref(), None);
+                status::enrich_continuity(&mut v, &*link);
+                output_result(ToolOutput::Json(v))
             }
             Err(e) => err_result(e),
+        }
+    }
+
+    #[tool(
+        description = "마지막 정상 상태와 transport/adapter 실패 캡슐을 읽는다. 에뮬레이터에 요청하지 않으므로 연결이 끊긴 뒤에도 동작한다."
+    )]
+    async fn get_failure_context(&self) -> CallToolResult {
+        let mut link = self.link();
+        output_result(ToolOutput::Json(link.failure_context()))
+    }
+
+    #[tool(
+        description = "fatal quarantine의 보존 상태를 해제하고 에뮬레이터의 기존 종료 경로를 계속한다. status.methods에 dismiss_failure가 있을 때만 사용한다."
+    )]
+    async fn dismiss_failure(&self) -> CallToolResult {
+        let mut link = self.link();
+        if !link
+            .capabilities()
+            .methods
+            .iter()
+            .any(|method| method == "dismiss_failure")
+        {
+            return err_result(LinkError::Emulator {
+                kind: "unsupported".into(),
+                message: "connected adapter does not advertise dismiss_failure".into(),
+            });
+        }
+        match tools::dismiss_failure(&mut *link) {
+            Ok(output) => output_result(output),
+            Err(error) => err_result(error),
         }
     }
 
@@ -792,18 +839,18 @@ async fn main() -> anyhow::Result<()> {
             let broker_bin = exe.with_file_name("emucap-broker");
             let _ = std::process::Command::new(broker_bin).spawn();
         }
-        Arc::new(Mutex::new(broker_link::lazy(
+        Arc::new(Mutex::new(continuity::observed(broker_link::lazy(
             &sess_addr,
             name,
             Duration::from_secs(5),
-        )))
+        ))))
     } else {
         // 직접 모드(기본): 지연 바인드로 포트를 즉시 잡지 않아 MCP 핸드셰이크가 항상 성공하고,
         // 다른 인스턴스가 포트를 쥐고 있어도 서버가 죽지 않는다.
-        Arc::new(Mutex::new(tcp::lazy(
+        Arc::new(Mutex::new(continuity::observed(tcp::lazy(
             &format!("127.0.0.1:{emu_port}"),
             Duration::from_secs(5),
-        )))
+        ))))
     };
 
     let server = Emucap::new(link);

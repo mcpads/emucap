@@ -2,7 +2,7 @@ diff --git i/desmume/src/NDSSystem.cpp w/desmume/src/NDSSystem.cpp
 index c5c7b42..996d1f3 100755
 --- i/desmume/src/NDSSystem.cpp
 +++ w/desmume/src/NDSSystem.cpp
-@@ -3040,11 +3040,56 @@ void NDS_setMic(bool pressed)
+@@ -3040,11 +3040,61 @@ void NDS_setMic(bool pressed)
  static void NDS_applyFinalInput();
  
  
@@ -21,6 +21,11 @@ index c5c7b42..996d1f3 100755
 +	emucapInput.frames_remaining = frames;
 +	// A zero mask with no timed hold means "release everything".
 +	emucapInput.active = (emucapInput.mask != 0) || (frames > 0);
++}
++
++int NDS_getEmucapInputOverrideRemaining()
++{
++	return emucapInput.active ? emucapInput.frames_remaining : 0;
 +}
 +
 +static void emucapApplyInputOverride(UserButtons& b)

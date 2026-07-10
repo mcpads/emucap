@@ -5,7 +5,7 @@
 --
 -- disassemble는 ARM7TDMI Lua 디코더로 제공한다(ARM 32비트 + Thumb 16비트, CPSR T비트로 모드 판정).
 -- op_is_call/op_is_return은 미제공 — ARM 콜스택은 LR기반이라 코어의 SP모델과 안 맞는다(이번 범위 밖).
--- 따라서 disassemble는 광고되고 call_stack은 미구현(TODO — 고칠 것)로 광고·거부된다.
+-- 따라서 disassemble는 광고되고 call_stack은 미지원으로 광고·거부된다.
 -- memory/state/screenshot/input/BP/save·load·probe·watch_register·set_trace는 상속.
 SYS = {
   system = "gba",
@@ -23,10 +23,10 @@ SYS = {
     l1 = "l", r1 = "r", lb = "l", rb = "r",
   },
   -- ARM 예외벡터($0=리셋)는 SNES식 포인터 테이블이 아니고 GBA 카트는 $08000000에서 시작한다 —
-  -- break_on_reset의 read16-포인터 모델이 안 맞아 미구현(TODO — 고칠 것).
+  -- break_on_reset의 read16-포인터 모델이 맞지 않아 지원하지 않는다.
   reset_vector = nil,
   bank_mirror = false,
-  dma_supported = false,  -- GBA DMA는 SNES MDMAEN($420B) 컨트롤러가 아님 → dma kind BP는 미구현(TODO — 고칠 것)
+  dma_supported = false,  -- GBA DMA는 SNES MDMAEN($420B) 컨트롤러가 아님 → dma kind BP 미지원
   -- full-range exec 콜백(save/load/probe·watch_register·set_trace) 상한을 32비트로 올린다. GBA는 카트ROM
   -- $08000000·EWRAM $02000000·IWRAM $03000000에서 실행하므로 코어 기본 24비트(0xFFFFFF)면 콜백이 절대
   -- 발화하지 않는다(save_state가 영영 미완). $0FFFFFFF이 전 실행영역을 덮는다.

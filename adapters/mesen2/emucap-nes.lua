@@ -27,7 +27,7 @@ SYS = {
   -- PPU측 메모리는 6502 CPU 버스에 없다 — CPU는 PPU 레지스터($2006/$2007 등)를 통해서만 접근하고, Mesen
   -- memory 콜백은 CPU 버스 접근만 잡으므로 이 memType들에 write/read BP를 걸면 절대 발화하지 않는다(조용한
   -- 미발동). bp_bus_base로 변환할 CPU-버스 주소가 없어 에러로 거부한다(SMS smsPaletteRam과 동형).
-  -- Mesen Lua엔 PPU 콜백이 없어 재구성 미구현(TODO — $2007 write 훅으로 SMS VDP처럼 재구성 가능).
+  -- Mesen Lua엔 PPU 콜백이 없어 PPU 포트 write 재구성을 지원하지 않는다.
   non_bus_write_memtypes = {
     nesPpuMemory          = "error",  -- PPU 주소공간 $0000-$3FFF 의사메모리(패턴/네임/팔레트 전체)
     nesNametableRam       = "error",  -- 네임테이블 VRAM

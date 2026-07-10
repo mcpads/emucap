@@ -16,10 +16,10 @@ SYS = {
     enter = "start", ["return"] = "start",
   },
   -- SM83은 SNES식 리셋벡터 포인터 테이블이 없다(리셋 시 부트ROM→$0100로 직행, $0100은 포인터가 아니라 코드).
-  -- break_on_reset의 read16-포인터 모델이 안 맞아 미구현(TODO — 고칠 것)(GG와 동일 판단).
+  -- break_on_reset의 read16-포인터 모델이 맞지 않아 지원하지 않는다(GG와 동일 판단).
   reset_vector = nil,
   bank_mirror = false,   -- SM83엔 SNES식 $00/$80 뱅크 미러 없음
-  dma_supported = false, -- SNES식 MDMAEN DMA 컨트롤러 없음 → dma kind BP는 미구현(TODO — 고칠 것)(GB OAM DMA는 별개)
+  dma_supported = false, -- SNES식 MDMAEN DMA 컨트롤러 없음 → dma kind BP 미지원(GB OAM DMA는 별개)
   -- read/write BP 주소 변환 맵: RAM offset을 SM83 버스 base로 변환. 안 하면 addMemoryCallback이 버스
   -- $00xx(ROM)에 걸려 미발동한다. SM83은 전 메모리가 CPU 버스($0000-$FFFF)에 매핑돼(NES PPU처럼 off-bus인
   -- 영역이 없다) 전부 base 변환으로 잡는다 → non_bus_write_memtypes 불필요. 고정 base만 등록:

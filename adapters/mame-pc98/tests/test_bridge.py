@@ -76,6 +76,30 @@ def i386_regs_hex(**values: int) -> str:
 
 
 class BridgeTests(unittest.TestCase):
+    def test_front_response_write_is_bounded_and_restores_blocking_reads(self) -> None:
+        class FakeFront:
+            def __init__(self, fail: bool = False) -> None:
+                self.fail = fail
+                self.timeouts: list[float | None] = []
+                self.payloads: list[bytes] = []
+
+            def settimeout(self, timeout: float | None) -> None:
+                self.timeouts.append(timeout)
+
+            def sendall(self, payload: bytes) -> None:
+                if self.fail:
+                    raise TimeoutError("front write stalled")
+                self.payloads.append(payload)
+
+        success = FakeFront()
+        self.assertTrue(pc98_bridge._write_front_response(success, b"reply\n"))
+        self.assertEqual(success.timeouts, [pc98_bridge.FRONT_WRITE_TIMEOUT, None])
+        self.assertEqual(success.payloads, [b"reply\n"])
+
+        stalled = FakeFront(fail=True)
+        self.assertFalse(pc98_bridge._write_front_response(stalled, b"reply\n"))
+        self.assertEqual(stalled.timeouts, [pc98_bridge.FRONT_WRITE_TIMEOUT, None])
+
     def test_hello_advertises_lua_control_methods(self) -> None:
         bridge = pc98_bridge.Bridge(FakeGdb({"?": ""}))
         hello = bridge.hello({})
@@ -484,6 +508,41 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(gdb.timeouts, "run_frames must scale the recv timeout for large N")
         self.assertGreater(max(gdb.timeouts), 5.0)
         self.assertEqual(gdb.get_timeout(), 5.0)  # restored after the op
+
+    def test_press_buttons_waits_for_terminal_reply_and_scales_timeout(self) -> None:
+        command = "qEmucap,press," + "3000:enter".encode("utf-8").hex()
+        gdb = FakeGdb({"?": "", command: "OK", "qEmucap,frame": "42"})
+        bridge = pc98_bridge.Bridge(gdb)
+
+        result = bridge.press_buttons({"buttons": ["start"], "frames": 3000})
+
+        self.assertEqual(
+            result,
+            {
+                "status": "completed",
+                "buttons": ["enter"],
+                "frames": 3000,
+                "frame": 42,
+                "state": "running",
+            },
+        )
+        self.assertGreater(max(gdb.timeouts), 5.0)
+        self.assertEqual(gdb.get_timeout(), 5.0)
+
+    def test_press_buttons_reports_breakpoint_interruption(self) -> None:
+        command = "qEmucap,press," + "10:enter".encode("utf-8").hex()
+        stop = "T05hwbreak:01000000;idx:2;"
+        gdb = FakeGdb({"?": "", command: stop, "qEmucap,frame": "77"})
+        bridge = pc98_bridge.Bridge(gdb)
+
+        result = bridge.press_buttons({"buttons": ["start"], "frames": 10})
+
+        self.assertEqual(result["status"], "interrupted")
+        self.assertEqual(result["reason"], "breakpoint")
+        self.assertEqual(result["raw"], stop)
+        self.assertEqual(result["buttons"], ["enter"])
+        self.assertEqual(result["frame"], 77)
+        self.assertTrue(bridge.frozen)
 
     def test_run_frames_restores_timeout_on_small_n(self) -> None:
         gdb = FakeGdb({"?": ""})

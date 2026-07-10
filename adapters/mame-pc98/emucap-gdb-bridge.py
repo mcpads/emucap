@@ -32,6 +32,9 @@ import zipfile
 from typing import Any
 
 
+FRONT_WRITE_TIMEOUT = 5.0
+
+
 class BridgeError(Exception):
     pass
 
@@ -403,6 +406,8 @@ class Bridge:
             result["session_token"] = token
         if content := os.environ.get("EMUCAP_CONTENT"):
             result["content"] = content
+        if launch_id := os.environ.get("EMUCAP_LAUNCH_ID"):
+            result["launch_id"] = launch_id
         # launch가 넘긴 emucap git hash(status.emulator_build) — 사용자가 git HEAD와 대조해 최신 여부 확인.
         result["build"] = os.environ.get("EMUCAP_BUILD_HASH", "unknown")
         return result
@@ -489,8 +494,25 @@ class Bridge:
         self._require_lua_backend("press_buttons")
         buttons = self._normalize_buttons(params.get("buttons") or [])
         frames = max(_num(params.get("frames", 1)), 1)
-        self._lua_cmd("press", f"{frames}:{','.join(buttons)}")
-        return {"buttons": buttons, "frames": frames}
+        stop = self._deferred_lua_op("press", f"{frames}:{','.join(buttons)}", frames)
+        if stop:
+            self.frozen = True
+            return {
+                "status": "interrupted",
+                "reason": "breakpoint",
+                "raw": stop,
+                "buttons": buttons,
+                "frames": frames,
+                "frame": self._current_frame(),
+            }
+        self.frozen = False
+        return {
+            "status": "completed",
+            "buttons": buttons,
+            "frames": frames,
+            "frame": self._current_frame(),
+            "state": "running",
+        }
 
     def find_pattern(self, params: dict[str, Any]) -> dict[str, Any]:
         memory_type = str(params.get("memory_type", "physical"))
@@ -859,6 +881,9 @@ class Bridge:
         return self.step({"unit": "instructions", "frames": count})
 
     def _frames_op(self, name: str, frames: int) -> str | None:
+        return self._deferred_lua_op(name, str(frames), frames)
+
+    def _deferred_lua_op(self, name: str, arg: str, budget_frames: int) -> str | None:
         """프레임 진행 명령(runframes/framestep)을 보내되 recv 타임아웃을 N에 맞춰 늘린다.
 
         프레임 진행은 벽시계라(plugin은 N프레임이 끝나야 OK를 보냄) recv 5초 고정 타임아웃으로는
@@ -872,9 +897,9 @@ class Bridge:
         """
         prev = self.gdb.get_timeout()
         per_frame = 5.0 if self.tracing else 0.05
-        self.gdb.set_timeout(min(600.0, 5.0 + frames * per_frame))
+        self.gdb.set_timeout(min(600.0, 5.0 + budget_frames * per_frame))
         try:
-            return self._lua_cmd_allow_stop(name, str(frames))
+            return self._lua_cmd_allow_stop(name, arg)
         finally:
             self.gdb.set_timeout(prev)
 
@@ -1769,12 +1794,24 @@ def main() -> int:
         file=sys.stderr,
     )
     bridge = Bridge(GdbRsp(gdb_host, gdb_port))
-    sock = socket.create_connection(("127.0.0.1", emucap_port), timeout=5.0)
-    sock.settimeout(None)
-    fp = sock.makefile("rwb", buffering=0)
-    print("[mame-pc98] connected", file=sys.stderr)
+    retry = 0.05
+    while True:
+        try:
+            sock = socket.create_connection(("127.0.0.1", emucap_port), timeout=1.0)
+            sock.settimeout(None)
+            print("[mame-pc98] connected", file=sys.stderr)
+            _serve_emucap_session(sock, bridge)
+            print("[mame-pc98] emucap disconnected; reconnecting", file=sys.stderr)
+            retry = 0.05
+        except OSError as err:
+            print(f"[mame-pc98] emucap unavailable ({err}); retrying", file=sys.stderr)
+        time.sleep(retry)
+        retry = min(retry * 2.0, 2.0)
 
-    for raw in fp:
+
+def _serve_emucap_session(sock: socket.socket, bridge: Bridge) -> None:
+    with sock, sock.makefile("rwb", buffering=0) as fp:
+      for raw in fp:
         if not raw.strip():
             continue
         try:
@@ -1806,8 +1843,26 @@ def main() -> int:
                     "ok": False,
                     "error": {"kind": "bridge_error", "message": repr(err)},
                 }
-        fp.write((json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8"))
-    return 0
+        payload = (json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8")
+        if not _write_front_response(sock, payload):
+            return
+
+
+def _write_front_response(sock: socket.socket, payload: bytes) -> bool:
+    """Bound a bridge-to-MCP write while leaving the next request read blocking."""
+    ok = False
+    try:
+        sock.settimeout(FRONT_WRITE_TIMEOUT)
+        sock.sendall(payload)
+        ok = True
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.settimeout(None)
+        except OSError:
+            ok = False
+    return ok
 
 
 if __name__ == "__main__":

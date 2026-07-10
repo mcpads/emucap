@@ -57,10 +57,14 @@ ulid = "1"
 time = { version = "0.3", features = ["formatting"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tungstenite = "0.29"
+fs2 = "0.4"
 
 # setsid() for detached emulator launch; Unix only (Windows uses creation_flags).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = "3"

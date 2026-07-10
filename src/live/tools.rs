@@ -132,6 +132,12 @@ pub fn status(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
     Ok(ToolOutput::Json(link.call("status", json!({}))?))
 }
 
+pub fn dismiss_failure(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
+    Ok(ToolOutput::Json(
+        link.call("dismiss_failure", json!({}))?,
+    ))
+}
+
 pub fn write_memory(
     link: &mut dyn EmulatorLink,
     memory_type: &str,
@@ -524,8 +530,9 @@ pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput,
     // 요청 경로에 이미 심링크나 (디렉토리가 아닌) 일반 파일이 있으면 스테이징·브리지 덤프 전에
     // 거부한다 — 원자 스왑/폴백이 그 파일을 숨은 이름으로 밀어내 요청 경로에서 사라지게 하는 것을
     // 막는다(fail-fast, replace_dir와 동일 가드).
-    ensure_replaceable_dir(dest)
-        .map_err(|e| LinkError::Protocol(format!("덤프 경로가 교체 가능한 디렉토리가 아님: {e}")))?;
+    ensure_replaceable_dir(dest).map_err(|e| {
+        LinkError::Protocol(format!("덤프 경로가 교체 가능한 디렉토리가 아님: {e}"))
+    })?;
     let staging = dump_sibling(dest, "dump-staging")
         .map_err(|e| LinkError::Protocol(format!("덤프 스테이징 경로 실패: {e}")))?;
     let staging_str = staging
@@ -596,7 +603,10 @@ fn ensure_replaceable_dir(dst: &Path) -> std::io::Result<()> {
     if crate::launch::is_symlink(dst) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            format!("destination is a symlink, refusing to replace: {}", dst.display()),
+            format!(
+                "destination is a symlink, refusing to replace: {}",
+                dst.display()
+            ),
         ));
     }
     if dst.exists() && !dst.is_dir() {
@@ -907,7 +917,10 @@ mod tests {
         std::fs::write(&dst, b"user-file").unwrap();
         let mut link = FakeLink::ok(json!({}));
         let err = super::dump_memory(&mut link, dst.to_str().unwrap()).unwrap_err();
-        assert!(matches!(err, LinkError::Protocol(_)), "가드는 Protocol 에러");
+        assert!(
+            matches!(err, LinkError::Protocol(_)),
+            "가드는 Protocol 에러"
+        );
         assert_eq!(
             std::fs::read(&dst).unwrap(),
             b"user-file",

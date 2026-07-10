@@ -2,14 +2,15 @@ use std::path::{Path, PathBuf};
 
 use emucap::launch::{
     desmume_nds as desmume_nds_launch, flycast as flycast_launch, mame as mame_launch,
-    mednafen as mednafen_launch, mesen as mesen_launch, ppsspp as ppsspp_launch,
+    mednafen as mednafen_launch, mesen as mesen_launch, ppsspp as ppsspp_launch, RuntimeEnv,
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};
+use emucap::live::runtime::{ManifestSpec, ProcessState, RuntimeStore};
 
 use crate::args::{LaunchArgs, LaunchPlanArgs};
 use crate::status::{
     button_hint_for_system, enrich_link_status, find_repo_root, make_bootstrap_value,
-    runtime_paths, supported_systems_value,
+    runtime_paths, supported_systems_value, BUILD_HASH,
 };
 
 #[cfg(test)]
@@ -982,7 +983,7 @@ pub(crate) fn make_launch(
         .get("connected")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    if already_connected {
+    if already_connected && !a.replace {
         return serde_json::json!({
             "launched": false,
             "reason": "an emulator is already connected on this session's listening_port; not launching another (it would orphan the current one)",
@@ -1030,22 +1031,195 @@ pub(crate) fn make_launch(
             }
         }
     }
-    match adapter {
-        "mesen2" => launch_mesen(port, token.as_deref(), system, a),
-        "mednafen" => launch_mednafen(port, token.as_deref(), module, a),
-        "flycast" => launch_flycast(port, token.as_deref(), a),
-        "mame_pc98" => launch_mame(port, token.as_deref(), a),
-        "desmume_nds" => launch_desmume_nds(port, token.as_deref(), a),
-        "ppsspp" => launch_ppsspp(port, token.as_deref(), a),
+    let store = RuntimeStore::discover();
+    let previous = match store.read_current(port) {
+        Ok(value) => value,
+        Err(e) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "runtime current capsule is unreadable; refusing to guess ownership",
+                "error": e.to_string(),
+                "listening_port": port,
+            })
+        }
+    };
+    if let Some(current) = previous.as_ref() {
+        match current.process_state() {
+            ProcessState::Alive if !a.replace => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "current launch generation is still alive; reattach instead of launching a duplicate",
+                    "runtime_instance": current.public_value(),
+                    "next_action": "status/bootstrap으로 같은 launch_id에 재부착하라. 의도적 교체만 replace=true로 다시 호출한다.",
+                })
+            }
+            ProcessState::Alive => {
+                if let Err(e) = current.terminate_owned_processes() {
+                    return serde_json::json!({
+                        "launched": false,
+                        "reason": "verified current generation could not be terminated for replacement",
+                        "error": e.to_string(),
+                        "runtime_instance": current.public_value(),
+                    });
+                }
+            }
+            ProcessState::Unknown => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "current process liveness is unknown; refusing duplicate launch or unsafe replacement",
+                    "runtime_instance": current.public_value(),
+                    "next_action": "프로세스 identity를 확인하고 명시적으로 정리한 뒤 다시 launch하라.",
+                })
+            }
+            ProcessState::Exited => {}
+        }
+    } else if already_connected {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "connected legacy emulator has no runtime capsule; safe replacement ownership cannot be proven",
+            "next_action": "기존 에뮬레이터를 명시적으로 정리한 뒤 status가 connected=false인지 확인하고 다시 launch하라.",
+        });
+    }
+
+    let prepared = match store.prepare(port) {
+        Ok(prepared) => prepared,
+        Err(e) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "failed to prepare runtime launch generation",
+                "error": e.to_string(),
+            })
+        }
+    };
+    let direct_reclaim = match link.replace_reclaim_token(prepared.reclaim_token()) {
+        Ok(true) => Some(prepared.reclaim_token()),
+        Ok(false) if token.is_none() => None,
+        Ok(false) => {
+            let _ = prepared.abort();
+            return serde_json::json!({
+                "launched": false,
+                "reason": "direct link cannot install a launch-generation reclaim capability",
+            });
+        }
+        Err(e) => {
+            let _ = prepared.abort();
+            return serde_json::json!({
+                "launched": false,
+                "reason": "failed to install launch reclaim capability",
+                "error": e.to_string(),
+            });
+        }
+    };
+
+    let failure_path = prepared.adapter_failure_path();
+    let runtime = RuntimeEnv {
+        launch_id: prepared.launch_id(),
+        adapter_failure_path: &failure_path,
+    };
+    let mut outcome = match adapter {
+        "mesen2" => launch_mesen(port, direct_reclaim, runtime, system, a),
+        "mednafen" => launch_mednafen(port, direct_reclaim, runtime, module, a),
+        "flycast" => launch_flycast(port, direct_reclaim, runtime, a),
+        "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
+        "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
+        "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
         _ => serde_json::json!({
             "launched": false,
             "reason": format!("{system} 시스템은 Rust 런처 대상이 아니다"),
         }),
+    };
+    if !outcome
+        .get("launched")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        let _ = prepared.abort();
+        return outcome;
     }
+
+    let bridge_pid = outcome
+        .get("bridge_pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok());
+    let Some(emulator_pid) = outcome
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    else {
+        if let Some(bridge_pid) = bridge_pid {
+            let _ = emucap::launch::terminate_detached(bridge_pid);
+        }
+        let _ = prepared.abort();
+        return serde_json::json!({
+            "launched": false,
+            "reason": "launcher returned success without an emulator PID",
+            "launcher_outcome": outcome,
+        });
+    };
+    let backend_endpoint = backend_endpoint_from_launch(&outcome);
+    // 즉시 exec 실패·동적 로더 오류가 이전 current를 덮지 않게 짧은 process-readiness 창을 둔다.
+    // adapter hello readiness는 이후 status가 증명하지만, 최소한 이 generation의 소유 프로세스가
+    // 안정적으로 살아 있는지 확인한 뒤에만 current pointer를 교체한다.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let manifest = prepared.manifest(ManifestSpec {
+        adapter: adapter.into(),
+        system: system.into(),
+        content: a.content_path.clone(),
+        emulator_pid,
+        bridge_pid,
+        backend_endpoint,
+        build: Some(BUILD_HASH.to_string()),
+    });
+    let emulator_state = manifest.process_state();
+    let bridge_state = manifest.bridge_process_state();
+    if emulator_state != ProcessState::Alive
+        || bridge_state.is_some_and(|state| state != ProcessState::Alive)
+    {
+        if let Some(bridge_pid) = bridge_pid {
+            let _ = emucap::launch::terminate_detached(bridge_pid);
+        }
+        let _ = emucap::launch::terminate_detached(emulator_pid);
+        let _ = prepared.abort();
+        return serde_json::json!({
+            "launched": false,
+            "reason": "a launch process was not verifiably alive before the runtime generation became current",
+            "emulator_process_state": emulator_state,
+            "bridge_process_state": bridge_state,
+            "launcher_outcome": outcome,
+        });
+    }
+    if let Err(e) = prepared.commit(&manifest) {
+        let _ = manifest.terminate_owned_processes();
+        let _ = prepared.abort();
+        return serde_json::json!({
+            "launched": false,
+            "reason": "failed to publish runtime current generation",
+            "error": e.to_string(),
+        });
+    }
+    if let Some(obj) = outcome.as_object_mut() {
+        obj.insert("launch_id".into(), serde_json::json!(prepared.launch_id()));
+        obj.insert("runtime_instance".into(), manifest.public_value());
+    }
+    outcome
+}
+
+fn backend_endpoint_from_launch(outcome: &serde_json::Value) -> Option<String> {
+    for key in ["ws_port", "gdb_port", "arm9_gdb_port"] {
+        if let Some(port) = outcome.get(key).and_then(serde_json::Value::as_u64) {
+            return Some(format!("127.0.0.1:{port}"));
+        }
+    }
+    None
 }
 
 /// MAME/PC-98 leg of `make_launch`: spawn MAME + the Python GDB bridge; defaults the machine to pc9801rs.
-fn launch_mame(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+fn launch_mame(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
     };
@@ -1063,6 +1237,7 @@ fn launch_mame(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Va
         port,
         name: a.name.as_deref(),
         session_token: token,
+        runtime: Some(runtime),
         headless: true,
     };
     match emucap::launch::mame::launch(&spec) {
@@ -1086,7 +1261,12 @@ fn launch_mame(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Va
 
 /// DeSmuME/NDS leg of `make_launch`: spawn headless desmume-cli (ARM9/ARM7 GDB stubs) + the NDS GDB
 /// bridge; a 2-process launch like MAME PC-98. Mirrors adapters/desmume-nds/launch.sh.
-fn launch_desmume_nds(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+fn launch_desmume_nds(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
     };
@@ -1106,6 +1286,7 @@ fn launch_desmume_nds(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_j
         port,
         name: a.name.as_deref(),
         session_token: token,
+        runtime: Some(runtime),
         display,
     };
     match desmume_nds_launch::launch(&spec) {
@@ -1131,7 +1312,12 @@ fn launch_desmume_nds(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_j
 
 /// PPSSPP/PSP leg of `make_launch`: spawn headless PPSSPP (debugger WebSocket) + the PSP WS bridge;
 /// a 2-process launch like NDS/MAME PC-98. Mirrors adapters/ppsspp/launch.sh.
-fn launch_ppsspp(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+fn launch_ppsspp(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
     };
@@ -1162,6 +1348,7 @@ fn launch_ppsspp(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::
         port,
         name: a.name.as_deref(),
         session_token: token,
+        runtime: Some(runtime),
         display,
     };
     match ppsspp_launch::launch(&spec) {
@@ -1190,7 +1377,12 @@ fn launch_ppsspp(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::
 
 /// Flycast leg of `make_launch` (Dreamcast): resolve the built app and hand off with the isolated
 /// config seeding. Mute defaults on and the GDB stub off (the exec-BP path enables it explicitly).
-fn launch_flycast(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json::Value {
+fn launch_flycast(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
     let Some(binary) = emucap::launch::flycast::resolve_binary() else {
         return serde_json::json!({ "launched": false, "reason": "Flycast 바이너리 미발견 — adapters/flycast/build.sh로 빌드하거나 FLYCAST_APP을 실행파일 또는 macOS Flycast.app 경로로 설정하라" });
     };
@@ -1202,6 +1394,7 @@ fn launch_flycast(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json:
         port,
         name: a.name.as_deref(),
         session_token: token,
+        runtime: Some(runtime),
         mute: true,
         gdb: false,
     };
@@ -1220,7 +1413,13 @@ fn launch_flycast(port: u16, token: Option<&str>, a: &LaunchArgs) -> serde_json:
 }
 
 /// SNES/Mesen leg of `make_launch`: resolve the binary + adapter Lua and hand off to the orchestrator.
-fn launch_mesen(port: u16, token: Option<&str>, system: &str, a: &LaunchArgs) -> serde_json::Value {
+fn launch_mesen(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    system: &str,
+    a: &LaunchArgs,
+) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
     };
@@ -1245,6 +1444,7 @@ fn launch_mesen(port: u16, token: Option<&str>, system: &str, a: &LaunchArgs) ->
         port,
         name: a.name.as_deref(),
         session_token: token,
+        runtime: Some(runtime),
     };
     match emucap::launch::mesen::launch(&spec) {
         Ok(pid) => serde_json::json!({
@@ -1267,6 +1467,7 @@ fn launch_mesen(port: u16, token: Option<&str>, system: &str, a: &LaunchArgs) ->
 fn launch_mednafen(
     port: u16,
     token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
     module: Option<&'static str>,
     a: &LaunchArgs,
 ) -> serde_json::Value {
@@ -1286,6 +1487,7 @@ fn launch_mednafen(
         port,
         name: a.name.as_deref(),
         session_token: token,
+        runtime: Some(runtime),
         headless: false,
     };
     match emucap::launch::mednafen::launch(&spec) {

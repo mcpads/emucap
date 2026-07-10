@@ -10,7 +10,7 @@
 #   PSP_DEBUGGER_PORT=<port>                    default: an OS-assigned free port
 #   EMUCAP_LOG=/path/to/custom.log               default: <emucap-data>/ppsspp/<port>/ppsspp.log
 #
-# Gotchas (see docs/research/ppsspp-debugger.md):
+# Upstream command-line constraints:
 #   - The content is passed *positionally*, never via -m/--mount (that flag only mounts a second
 #     image on umd1: for ELF+CSO test harnesses; passed alone it leaves the boot list empty).
 #   - --timeout is never passed: it aborts the run after N wall-clock seconds regardless of

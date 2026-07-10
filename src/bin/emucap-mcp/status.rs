@@ -66,12 +66,14 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"start": "pause", "enter": "pause", "return": "pause", "a": "two", "b": "one", "1": "one", "2": "two", "button1": "one", "button2": "two"},
             "notes": "Mesen Game Gear (SMS controller): one=Button1(B), two=Button2(A), pause=Start. Aliases let you use start/a/b/1/2."
         }),
-        "gb" | "gbc" | "gameboy" | "game-boy" | "dmg" | "gbcolor" | "gameboycolor" | "cgb" => serde_json::json!({
-            "system": "gb",
-            "buttons": ["a", "b", "start", "select", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start"},
-            "notes": "Mesen Game Boy / Game Boy Color (gameboy console): a/b/start/select + directions, lowercase. No X/Y/L/R."
-        }),
+        "gb" | "gbc" | "gameboy" | "game-boy" | "dmg" | "gbcolor" | "gameboycolor" | "cgb" => {
+            serde_json::json!({
+                "system": "gb",
+                "buttons": ["a", "b", "start", "select", "up", "down", "left", "right"],
+                "aliases": {"enter": "start", "return": "start"},
+                "notes": "Mesen Game Boy / Game Boy Color (gameboy console): a/b/start/select + directions, lowercase. No X/Y/L/R."
+            })
+        }
         "gba" | "gameboyadvance" | "game-boy-advance" | "agb" => serde_json::json!({
             "system": "gba",
             "buttons": ["a", "b", "l", "r", "start", "select", "up", "down", "left", "right"],
@@ -335,10 +337,16 @@ fn legacy_fallback_entry(launcher: &Path, command: String) -> serde_json::Value 
 }
 
 pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
+    let runtime_store = emucap::live::runtime::RuntimeStore::discover();
+    let capsule_paths = serde_json::json!({
+        "root": runtime_store.root().display().to_string(),
+        "current": port.map(|p| runtime_store.current_path(p).display().to_string()),
+    });
     let Some(root) = find_repo_root() else {
         return serde_json::json!({
             "repo_root": null,
             "repo_root_env": "EMUCAP_REPO_ROOT",
+            "runtime_capsule": capsule_paths,
             "error": "emucap repo root not found from EMUCAP_REPO_ROOT, current_exe, cwd, or CARGO_MANIFEST_DIR",
         });
     };
@@ -353,6 +361,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
         "repo_root": root.display().to_string(),
         "repo_root_env": "EMUCAP_REPO_ROOT",
         "token_file": token_file.map(|p| p.display().to_string()),
+        "runtime_capsule": capsule_paths,
         "adapters": {
             "mesen2": {
                 "preferred_launcher": "MCP tool: launch",
@@ -549,6 +558,8 @@ pub(crate) fn make_bootstrap_value(
             let memory_types = link.capabilities().memory_types.clone();
             enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
             enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
+            enrich_continuity(&mut v, link);
+            v["request_succeeded"] = serde_json::json!(true);
             v
         }
         Ok(_) => serde_json::json!({"connected": true}),
@@ -558,13 +569,30 @@ pub(crate) fn make_bootstrap_value(
                 "listening_port": port,
             });
             enrich_link_status(&mut v, port, token.as_deref(), None);
+            enrich_continuity(&mut v, link);
+            v["request_succeeded"] = serde_json::json!(false);
             v
         }
         Err(LinkError::IdentityMismatch { identity, .. }) => {
             occupied_graceful(&identity, port, token.as_deref())
         }
+        Err(e) if is_observation_failure(&e) => {
+            let mut v = serde_json::json!({
+                "connected": false,
+                "request_succeeded": false,
+                "error_kind": e.kind(),
+                "error": e.to_string(),
+                "listening_port": port,
+            });
+            enrich_link_status(&mut v, port, token.as_deref(), None);
+            enrich_continuity(&mut v, link);
+            v
+        }
         Err(e) => return Err(e),
     };
+
+    // Also covers the identity-mismatch branch, whose graceful response is assembled separately.
+    enrich_continuity(&mut status_value, link);
 
     if let Some(obj) = status_value.as_object_mut() {
         obj.entry("listening_port")
@@ -605,6 +633,48 @@ pub(crate) fn make_bootstrap_value(
     }))
 }
 
+pub(crate) fn is_observation_failure(error: &LinkError) -> bool {
+    matches!(
+        error,
+        LinkError::NotConnected
+            | LinkError::PortBusy { .. }
+            | LinkError::Timeout
+            | LinkError::Protocol(_)
+    )
+}
+
+pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLink) {
+    let continuity = link.continuity();
+    let Some(object) = v.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "continuity".into(),
+        serde_json::to_value(&continuity).unwrap_or_else(|_| serde_json::json!({})),
+    );
+    let candidates = link.runtime_candidates();
+    if !candidates.is_empty() {
+        object.insert(
+            "runtime_candidates".into(),
+            serde_json::Value::Array(candidates),
+        );
+        object.insert(
+            "next_safe_action".into(),
+            serde_json::json!("select an explicit runtime candidate; automatic attach refused"),
+        );
+    }
+    if let Some(runtime) = object
+        .get_mut("runtime_instance")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        runtime.insert(
+            "lease".into(),
+            serde_json::to_value(&continuity.lease)
+                .unwrap_or_else(|_| serde_json::json!({"state": "unknown"})),
+        );
+    }
+}
+
 pub(crate) fn enrich_link_status(
     v: &mut serde_json::Value,
     port: Option<u16>,
@@ -629,6 +699,13 @@ pub(crate) fn enrich_link_status(
         }),
     );
     obj.insert("runtime_paths".into(), runtime_paths(port));
+    if let Some(port) = port {
+        if let Ok(Some(current)) =
+            emucap::live::runtime::RuntimeStore::discover().read_current(port)
+        {
+            obj.insert("runtime_instance".into(), current.public_value());
+        }
+    }
     if let Some(identity) = identity {
         // 실행 중 에뮬레이터(어댑터)가 빌드/로드된 emucap git hash — server_build와 대칭. 운영자가
         // `git rev-parse --short HEAD`와 대조해 재빌드 필요 여부를 확인한다(server_build·emulator_build 둘 다).
@@ -639,9 +716,10 @@ pub(crate) fn enrich_link_status(
         // 소유 인스턴스 정리 정보: 이 포트의 pidfile에서 이 세션이 띄운 프로세스 PID를 재발견해준다. agent가
         // launch 응답을 지나쳐도(다음 턴 등) 여기 pids만 kill하면 되므로, 자기 것을 못 찾아 broad pkill로
         // 도망쳐 타 세션 에뮬레이터를 죽이는 사고를 막는다.
-        if let (Some(p), Some(emu_dir)) =
-            (port, identity.system.as_deref().and_then(emu_dir_for_system))
-        {
+        if let (Some(p), Some(emu_dir)) = (
+            port,
+            identity.system.as_deref().and_then(emu_dir_for_system),
+        ) {
             obj.insert("owned_instance".into(), owned_instance_json(emu_dir, p));
         }
     }

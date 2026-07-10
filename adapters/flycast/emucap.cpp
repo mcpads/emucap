@@ -3,6 +3,8 @@
 // Flycast API로 적응: 메모리=공통 region(ram/vram/aica)→SH-4 addrspace, 레지스터=Sh4cntx, freeze=vblank 훅 스핀.
 // 빌드/주입은 adapters/flycast/build.sh. 광고 메서드는 런타임에 hello/status.methods로 확인한다.
 #include "emulator.h"
+#include "emucap_failure.h"
+#include "emucap_input.h"
 #include "hw/sh4/sh4_if.h"
 #include "hw/sh4/sh4_opcode_list.h"  // OpDesc[]·Disassemble (disassemble)
 #include "hw/mem/addrspace.h"
@@ -23,11 +25,13 @@
 #include <string>
 #include <vector>
 #include <set>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cctype>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #ifdef _WIN32
 #include <winsock2.h>   // Windows 소켓(MinGW) — POSIX sys/socket.h 대체
@@ -77,19 +81,23 @@ bool g_emucap_bp_armed = false;
 // watch_register가 켜졌을 때만 true → 셋 다 off면 인터프리터 핫루프는 bool 한 번만 봐서 훅 비용 0.
 // rebuild_trace_armed()가 g_trace_enabled||g_watch_enabled로 매번 재계산해 갱신한다.
 bool g_emucap_trace_armed = false;
+uint32_t g_emucap_crash_pc_ring[EMUCAP_CRASH_PC_CAP]{};
+uint64_t g_emucap_crash_pc_sequence = 0;
 
 namespace {
 
 int g_fd = -1;            // emucap-mcp 서버 소켓(클라이언트). <0이면 미연결.
 std::string g_rx;         // 수신 라인 버퍼
+std::string g_tx;         // 아직 보내지 못한 NDJSON bytes(keepalive + final을 순서대로 보존)
+size_t g_tx_pos = 0;      // g_tx의 다음 전송 byte
+static const size_t TX_CAP = 8 * 1024 * 1024;
 uint64_t g_frame = 0;     // vblank 카운터(우리 기준)
 bool g_frozen = false;    // freeze 상태(스핀으로 프레임 진행 차단)
 long g_step_id = -1;      // step(frames) 완료 응답 대기 id
 long g_step_remaining = 0;
-// 입력 홀드: set_input은 emucap_service(emu 스레드)에서 쓰고, emucap_apply_input은 os_UpdateInputState
-// 직후(UI 스레드)에서 읽어 mapleInputState에 주입한다 → cross-thread라 atomic 필수(가시성).
-std::atomic<bool> g_input_engaged{false};
-std::atomic<uint32_t> g_input_pressed{0};  // 눌린 버튼 비트(DC_BTN_*). kcode=~pressed(active-low)
+// 입력 홀드: set_input은 emucap_service(emu 스레드)에서 쓰고, Maple GetInput 소비 지점이 읽는다.
+// 소유권+pressed mask 단일 atomic snapshot이며 빈 mask는 네이티브 입력권을 반환한다.
+EmucapFlycastInputOverride g_input_override;
 // screenshot(연속 버퍼): UI 스레드가 매 렌더마다 최신 프레임 raw를 g_fb_raw에 캡처(emucap_capture_latest),
 // emu 스레드는 screenshot 요청 시 그 버퍼를 PNG 인코딩해 즉시 응답한다. freeze(vblank-스핀)는 UI 렌더를
 // 막으므로 gui_runOnUiThread/지연 방식은 데드락 → 버퍼 방식이라야 frozen서도 동작(버퍼엔 freeze 직전
@@ -129,7 +137,47 @@ struct CSFrame { uint32_t pc, sp; bool established = false; };
 std::vector<CSFrame> g_callstack;
 static const size_t CALLSTACK_CAP = 256;
 
+// Fatal state is captured on the emulation thread before the upstream throw. While active, the
+// same thread remains at that exact point and serves only read-only diagnostic methods.
+bool g_failure_active = false;
+bool g_failure_captured = false;
+bool g_failure_file_written = false;
+bool g_failure_dismissed = false;
+bool g_failure_synthetic = false;
+bool g_synthetic_fatal_pending = false;
+std::atomic<bool> g_failure_shutdown_requested{false};
+std::string g_failure_reason;
+uint32_t g_failure_epc = 0;
+uint32_t g_failure_event = 0;
+
 const char* PROTOCOL_NAME = "flycast";
+
+bool env_enabled(const char* name) {
+	const char* value = getenv(name);
+	return value != nullptr && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0
+		|| strcmp(value, "TRUE") == 0);
+}
+
+uint64_t failure_hold_ms() {
+	const char* value = getenv("EMUCAP_FAILURE_HOLD_MS");
+	if (value == nullptr || value[0] == '\0') return 10 * 60 * 1000;
+	char* end = nullptr;
+	unsigned long long parsed = strtoull(value, &end, 10);
+	if (end == value || (end != nullptr && *end != '\0')) return 10 * 60 * 1000;
+	return (uint64_t)parsed;  // zero explicitly means no deadline
+}
+
+uint64_t unix_time_ms() {
+	return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+bool failure_method_allowed(const std::string& method) {
+	return method == "hello" || method == "status" || method == "get_state"
+		|| method == "read_memory" || method == "screenshot" || method == "get_trace"
+		|| method == "call_stack" || method == "disassemble" || method == "find_pattern"
+		|| method == "get_rom_info" || method == "poll_events" || method == "dismiss_failure";
+}
 
 // ── DC 메모리 region(균일 인터페이스) ────────────────────────
 // 다른 어댑터(SS/MD가 ram/vram, Mednafen kSSBusRegions)와 동일하게, read/write_memory/find_pattern은
@@ -157,9 +205,39 @@ int emucap_port() {
 	return (port > 0 && port < 65536) ? port : 47800;
 }
 void emucap_disconnect() {
+	// Request ids are scoped to one TCP session. An unfinished frame command cannot answer on the
+	// replacement session before its hello; cancel only request-scoped work and preserve emulator,
+	// input-hold, breakpoint, and fatal-quarantine state.
+	g_step_id = -1;
+	g_step_remaining = 0;
+	g_synthetic_fatal_pending = false;
 	if (g_fd >= 0) emucap_closesock(g_fd);
 	g_fd = -1;
 	g_rx.clear();
+	g_tx.clear();
+	g_tx_pos = 0;
+}
+enum TxFlush { TX_IDLE, TX_COMPLETE, TX_PENDING, TX_ERROR };
+TxFlush flush_tx_once() {
+	if (g_fd < 0 || g_tx.empty()) return TX_IDLE;
+#ifdef MSG_NOSIGNAL
+	const int send_flags = MSG_NOSIGNAL;
+#else
+	const int send_flags = 0;
+#endif
+	ssize_t n = ::send(g_fd, g_tx.data() + g_tx_pos, g_tx.size() - g_tx_pos, send_flags);
+	if (n > 0) {
+		g_tx_pos += (size_t)n;
+		if (g_tx_pos >= g_tx.size()) {
+			g_tx.clear();
+			g_tx_pos = 0;
+			return TX_COMPLETE;
+		}
+		return TX_PENDING;
+	}
+	if (n < 0 && emucap_sock_wouldblock()) return TX_PENDING;
+	emucap_disconnect();
+	return TX_ERROR;
 }
 // handle()은 아래(요청 디스패치)에 정의 — 동기 핸드셰이크가 hello 요청을 처리하려 전방 선언한다.
 void handle(const std::string& line);
@@ -168,6 +246,12 @@ void emucap_connect() {
 	emucap_net_init();
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (fd < 0) return;
+#ifdef SO_NOSIGPIPE
+	{
+		int one = 1;
+		setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+	}
+#endif
 	sockaddr_in addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -186,6 +270,8 @@ void emucap_connect() {
 	// emu 스레드에서.) g_fd를 먼저 세팅해야 handle()→reply_ok→send_line이 이 소켓으로 응답을 보낸다.
 	g_fd = fd;
 	g_rx.clear();
+	g_tx.clear();
+	g_tx_pos = 0;
 	{
 		// 블로킹 recv 타임아웃(SO_RCVTIMEO). 서버는 accept 직후 hello를 보내므로 보통 수 ms; 이 타임아웃은
 		// 서버가 bind만 하고 accept 대기자가 없는(idle) 좁은 경우의 상한일 뿐이다. 2s로 잡아 idle-재연결 1회
@@ -204,31 +290,43 @@ void emucap_connect() {
 			g_rx.append(tmp, (size_t)n);
 			if (g_rx.find('\n') != std::string::npos) have_line = true;
 		}
-		// 받은 완성 라인(정상은 hello 1줄)을 처리 → handle()가 전체 hello 응답을 즉시 송신한다.
-		// 소켓이 아직 블로킹이라 send_line이 큰 응답도 완전히 보낸다. 타임아웃으로 한 줄도 못 받았으면
-		// g_rx가 비어 아무 것도 안 하고 폴백 — 아래 O_NONBLOCK 전환 후 기존 프레임루프 service가
-		// 이어서 처리한다(회귀 없음).
+		// 받은 완성 라인(정상은 hello 1줄)을 처리하기 전에 nonblocking으로 전환한다. hello는 작아서 보통
+		// 한 번에 전송되지만, 송신버퍼가 막혀도 아래 고정 횟수 drain 뒤 연결을 버려 부팅 스레드를 무한히
+		// 붙잡지 않는다. 타임아웃으로 한 줄도 못 받았으면 g_rx를 프레임루프 service가 이어 처리한다.
+		emucap_set_nonblock(fd);
 		size_t pos;
 		while ((pos = g_rx.find('\n')) != std::string::npos) {
 			std::string l = g_rx.substr(0, pos);
 			g_rx.erase(0, pos + 1);
 			if (!l.empty()) handle(l);
 		}
+		for (int guard = 0; guard < 16 && g_fd >= 0 && !g_tx.empty(); guard++) {
+			TxFlush status = flush_tx_once();
+			if (status == TX_COMPLETE || status == TX_IDLE || status == TX_ERROR) break;
+			emucap_sock_wait_ms(1);
+		}
+		if (g_fd >= 0 && !g_tx.empty()) {
+			fprintf(stderr, "emucap: hello TX did not drain within bounded handshake budget\n");
+			emucap_disconnect();
+		}
 	}
-
-	emucap_set_nonblock(fd);  // 이후 수신은 논블로킹 — 프레임루프 service가 처리(O_NONBLOCK이면 SO_RCVTIMEO는 무시됨)
 }
 void send_line(const std::string& s) {
 	if (g_fd < 0) return;
-	std::string line = s + "\n";
-	size_t sent = 0;
-	while (sent < line.size()) {
-		ssize_t n = ::send(g_fd, line.data() + sent, line.size() - sent, 0);
-		if (n > 0) { sent += (size_t)n; continue; }
-		if (n < 0 && emucap_sock_wouldblock()) { emucap_sock_wait_ms(1); continue; }
+	const size_t line_size = s.size() + 1;
+	const size_t remaining = g_tx.empty() ? 0 : g_tx.size() - g_tx_pos;
+	if (s.size() >= TX_CAP || remaining > TX_CAP - line_size) {
+		fprintf(stderr, "emucap: TX too large; dropping connection\n");
 		emucap_disconnect();
 		return;
 	}
+	if (!g_tx.empty() && g_tx_pos > 0) {
+		g_tx.erase(0, g_tx_pos);
+		g_tx_pos = 0;
+	}
+	g_tx.append(s);
+	g_tx.push_back('\n');
+	flush_tx_once();
 }
 
 // ── JSON(최소 추출/생성) ─────────────────────────────────────
@@ -475,7 +573,9 @@ void handle_write_memory(long id, const std::string& line) {
 void handle_get_state(long id) {
 	// SH-4 주요 레지스터를 cpu.* 키로(리틀엔디언 u32). fr/fpscr는 후속.
 	std::string s = "{\"state\":{";
-	char t[64];
+	// Four decimal u32 register fields plus JSON syntax can exceed 64 bytes. Truncating this buffer
+	// silently dropped cpu.dbr while still leaving parseable JSON after the next append.
+	char t[256];
 	for (int i = 0; i < 16; i++) {
 		snprintf(t, sizeof(t), "%s\"cpu.r%d\":%u", (i ? "," : ""), i, Sh4cntx.r[i]);
 		s += t;
@@ -751,18 +851,26 @@ void handle_set_trace(long id, const std::string& line) {
 	reply_ok(id, std::string("{\"enabled\":") + (enabled ? "true" : "false") + "}");
 }
 
-// get_trace(count): 최근 count개(기본 256) 실행 명령을 시간순(오래된→최근) [{pc,text}]로 반환. set_trace(true) 선행.
+// get_trace(count): fatal quarantine에서는 always-on 512-PC ring, 평상시에는 opt-in hunting ring을 반환.
 void handle_get_trace(long id, const std::string& line) {
 	long count = 256;
 	json_num(line, "count", count);
 	if (count < 1) count = 1;
+	const bool crash_ring = g_failure_captured;
+	const uint64_t crash_sequence = g_emucap_crash_pc_sequence;
+	const size_t crash_count = (size_t)std::min<uint64_t>(crash_sequence, EMUCAP_CRASH_PC_CAP);
+	const size_t available = crash_ring ? crash_count : g_trace_count;
+	const size_t capacity = crash_ring ? EMUCAP_CRASH_PC_CAP : TRACE_CAP;
+	const size_t head = crash_ring
+		? (size_t)(crash_sequence & (EMUCAP_CRASH_PC_CAP - 1)) : g_trace_head;
 	size_t want = (size_t)count;
-	if (want > g_trace_count) want = g_trace_count;
-	std::string out = "{\"trace\":[";
+	if (want > available) want = available;
+	std::string out = std::string("{\"trace_scope\":\"")
+		+ (crash_ring ? "interpreter" : "opt_in") + "\",\"trace\":[";
 	for (size_t i = 0; i < want; i++) {
 		// 최근 want개: 링에서 (head-want)..(head-1) 순서. head는 다음 쓸 위치.
-		size_t idx = (g_trace_head + TRACE_CAP - want + i) % TRACE_CAP;
-		uint32_t pc = g_trace_ring[idx];
+		size_t idx = (head + capacity - want + i) % capacity;
+		uint32_t pc = crash_ring ? g_emucap_crash_pc_ring[idx] : g_trace_ring[idx];
 		char pcbuf[40];
 		snprintf(pcbuf, sizeof(pcbuf), "%s{\"pc\":%u,\"text\":\"", i ? "," : "", (unsigned)pc);
 		out += pcbuf;
@@ -822,7 +930,11 @@ void handle(const std::string& line) {
 	std::string method = json_str(line, "method");
 	long id = 0;
 	json_num(line, "id", id);
-		try {
+	if (g_failure_active && !failure_method_allowed(method)) {
+		reply_err(id, "crashed", "Flycast is quarantined at a fatal SH4 exception; mutation refused");
+		return;
+	}
+	try {
 		if (method == "hello") {
 			std::string r = "{\"protocol_version\":1,\"system\":\"dreamcast\",\"adapter\":\"flycast-native\",\"build\":\"" EMUCAP_BUILD_HASH "\",\"name\":\"";
 			const char* nm = getenv("EMUCAP_NAME");
@@ -832,7 +944,9 @@ void handle(const std::string& line) {
 			     "\"set_input\",\"pause\",\"resume\",\"step\",\"reset\","
 			     "\"set_breakpoint\",\"clear_breakpoint\",\"clear_all_breakpoints\",\"list_breakpoints\",\"poll_events\","
 			     "\"find_pattern\",\"disassemble\",\"get_rom_info\","
-			     "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\"],"
+			     "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\",\"dismiss_failure\"";
+			if (env_enabled("EMUCAP_ENABLE_TEST_FATAL")) r += ",\"test_fatal\"";
+			r += "],"
 			     // read/write_memory/find_pattern의 유효 memory_type 정본 → status.memory_types로 표면화(균일 인터페이스).
 			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"]}";
 			const char* tok = getenv("EMUCAP_SESSION_TOKEN");
@@ -849,12 +963,50 @@ void handle(const std::string& line) {
 				r.pop_back();
 				r += ",\"content\":\"" + json_escape(s) + "\"}";
 			}
+			const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+			if (launch_id && launch_id[0] && !r.empty() && r.back() == '}') {
+				std::string s(launch_id);
+				if (s.size() > 128) s.resize(128);
+				r.pop_back();
+				r += ",\"launch_id\":\"" + json_escape(s) + "\"}";
+			}
 			reply_ok(id, r);
 		} else if (method == "status") {
-			char buf[160];
-			snprintf(buf, sizeof(buf), "{\"connected\":true,\"frame\":%llu,\"state\":\"%s\",\"adapter\":\"flycast\"}",
-			         (unsigned long long)g_frame, g_frozen ? "frozen" : "running");
-			reply_ok(id, buf);
+			std::string state = g_failure_captured ? "crashed" : (g_frozen ? "frozen" : "running");
+			std::string result = "{\"connected\":true,\"frame\":" + std::to_string(g_frame)
+				+ ",\"state\":\"" + state + "\",\"adapter\":\"flycast\""
+				+ ",\"input_override\":{\"engaged\":"
+				+ (g_input_override.engaged() ? std::string("true") : std::string("false"))
+				+ ",\"pressed_mask\":" + std::to_string(g_input_override.pressed_mask()) + "}";
+			if (g_failure_captured) {
+				result += ",\"reason\":\"" + json_escape(g_failure_reason) + "\""
+					+ std::string(",\"failure_context_available\":")
+					+ (g_failure_file_written ? "true" : "false")
+					+ ",\"quarantine_active\":" + (g_failure_active ? std::string("true") : std::string("false"))
+					+ ",\"dismissed\":" + (g_failure_dismissed ? std::string("true") : std::string("false"))
+					+ ",\"epc\":" + std::to_string(g_failure_epc)
+					+ ",\"incoming_event\":" + std::to_string(g_failure_event)
+					+ ",\"trace_scope\":\"interpreter\"";
+			}
+			result += "}";
+			reply_ok(id, result);
+		} else if (method == "dismiss_failure") {
+			if (!g_failure_active) {
+				reply_err(id, "no_active_failure", "no active fatal quarantine");
+			} else {
+				reply_ok(id, std::string("{\"dismissed\":true,\"process_will_exit\":")
+					+ (g_failure_synthetic ? "false" : "true") + "}");
+				for (int guard = 0; guard < 100 && g_fd >= 0 && !g_tx.empty(); guard++) {
+					TxFlush status = flush_tx_once();
+					if (status == TX_COMPLETE || status == TX_IDLE || status == TX_ERROR) break;
+					emucap_sock_wait_ms(1);
+				}
+				g_failure_dismissed = true;
+				g_failure_active = false;
+			}
+		} else if (method == "test_fatal" && env_enabled("EMUCAP_ENABLE_TEST_FATAL")) {
+			g_synthetic_fatal_pending = true;
+			reply_ok(id, "{\"scheduled\":true}");
 		} else if (method == "read_memory") {
 			handle_read_memory(id, line);
 		} else if (method == "write_memory") {
@@ -866,20 +1018,20 @@ void handle(const std::string& line) {
 		} else if (method == "load_state") {
 			handle_load_state(id, line);
 		} else if (method == "run_frames") {
-			// N프레임 진행 후 완료 응답(지연 — emucap_service가 카운트다운). frozen 상태 보존:
-			// frozen이면 N프레임 스텝 후 다시 스핀, running이면 N프레임 흐른 뒤 응답.
+			// N프레임 진행 후 완료 응답(지연 — emucap_service가 카운트다운). run_frames의
+			// terminal state는 항상 running; frozen으로 끝내는 exact advance는 step이 소유한다.
 			long n = 1;
 			json_num(line, "n", n);
 			if (n < 1) n = 1;
+			g_frozen = false;
 			g_step_id = id;
 			g_step_remaining = n;
 		} else if (method == "set_input") {
-			// 홀드: emucap_apply_input(UI 스레드)이 매 프레임 kcode를 덮어쓴다(빈 배열=전부 뗌). active-low.
+			// 홀드: Maple 소비 지점에서 kcode를 덮어쓴다. 빈 배열은 0 강제가 아니라 네이티브 입력권 반환.
 			u32 mask = 0;
 			std::string input_err;
 			if (!parse_buttons(line, mask, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
-			g_input_pressed.store(mask);
-			g_input_engaged.store(true);
+			g_input_override.set(mask);
 			char rbuf[256];
 			snprintf(rbuf, sizeof(rbuf), "{\"applied\":true,\"applied_mask\":\"0x%08x\",\"applied_buttons\":%s}",
 			         (unsigned)mask, dc_mask_to_buttons(mask).c_str());
@@ -962,6 +1114,11 @@ void handle(const std::string& line) {
 }
 
 void serve_socket_once() {
+	if (g_fd < 0) return;
+	if (!g_tx.empty()) {
+		flush_tx_once();
+		if (g_fd < 0 || !g_tx.empty()) return;
+	}
 	char tmp[8192];
 	ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
 	if (n == 0) { emucap_disconnect(); return; }  // 피어 종료(FIN)
@@ -984,6 +1141,109 @@ void serve_socket_once() {
 
 }  // namespace
 
+void emucap_capture_fatal_sh4(
+	const char* reason,
+	uint32_t epc,
+	uint32_t incoming_event,
+	uint32_t existing_expevt,
+	uint32_t existing_intevt,
+	uint32_t tea) noexcept {
+	// Copy all SH4 and ring fields before any file, socket, allocation-heavy, or quarantine work.
+	EmucapSh4FailureSnapshot snapshot;
+	snapshot.observed_at_unix_ms = unix_time_ms();
+	snapshot.frame = g_frame;
+	snapshot.epc = epc;
+	snapshot.incoming_event = incoming_event;
+	snapshot.existing_expevt = existing_expevt;
+	snapshot.existing_intevt = existing_intevt;
+	snapshot.tea = tea;
+	for (size_t i = 0; i < snapshot.r.size(); i++) snapshot.r[i] = Sh4cntx.r[i];
+	for (size_t i = 0; i < snapshot.r_bank.size(); i++) snapshot.r_bank[i] = Sh4cntx.r_bank[i];
+	snapshot.pc = Sh4cntx.pc;
+	snapshot.pr = Sh4cntx.pr;
+	snapshot.gbr = Sh4cntx.gbr;
+	snapshot.vbr = Sh4cntx.vbr;
+	snapshot.mach = Sh4cntx.mac.h;
+	snapshot.macl = Sh4cntx.mac.l;
+	snapshot.sr = Sh4cntx.sr.getFull();
+	snapshot.ssr = Sh4cntx.ssr;
+	snapshot.spc = Sh4cntx.spc;
+	snapshot.sgr = Sh4cntx.sgr;
+	snapshot.dbr = Sh4cntx.dbr;
+	snapshot.fpul = Sh4cntx.fpul;
+	snapshot.fpscr = Sh4cntx.fpscr.full;
+	for (size_t i = 0; i < EMUCAP_CRASH_PC_CAP; i++)
+		snapshot.pc_ring[i] = g_emucap_crash_pc_ring[i];
+	const uint64_t crash_sequence = g_emucap_crash_pc_sequence;
+	snapshot.pc_ring_head = (size_t)(crash_sequence & (EMUCAP_CRASH_PC_CAP - 1));
+	snapshot.pc_ring_count = (size_t)std::min<uint64_t>(crash_sequence, EMUCAP_CRASH_PC_CAP);
+
+	g_failure_active = true;
+	g_failure_captured = true;
+	g_failure_dismissed = false;
+	g_failure_synthetic = incoming_event == 0xFFFFFFFFu;
+	g_failure_shutdown_requested.store(false);
+	g_failure_file_written = false;
+	g_failure_epc = epc;
+	g_failure_event = incoming_event;
+	try {
+		g_failure_reason = reason != nullptr ? reason : "Fatal SH4 exception";
+		snapshot.reason = g_failure_reason;
+		const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+		snapshot.launch_id = launch_id != nullptr ? launch_id : "";
+		snapshot.emulator_build = EMUCAP_BUILD_HASH;
+		const char* content = getenv("EMUCAP_CONTENT");
+		snapshot.content = content != nullptr ? content : "";
+		const std::string failure_json = emucap_failure_json(snapshot);
+		const char* failure_path = getenv("EMUCAP_FAILURE_FILE");
+		if (failure_path != nullptr && failure_path[0] != '\0') {
+			std::string error;
+			g_failure_file_written = emucap_write_failure_atomic(failure_path, failure_json, &error);
+			if (!g_failure_file_written)
+				fprintf(stderr, "emucap: cannot persist fatal context: %s\n", error.c_str());
+		} else {
+			fprintf(stderr, "emucap: EMUCAP_FAILURE_FILE missing; fatal context is live-only\n");
+		}
+	} catch (const std::exception& error) {
+		fprintf(stderr, "emucap: fatal snapshot serialization failed: %s\n", error.what());
+	} catch (...) {
+		fprintf(stderr, "emucap: fatal snapshot serialization failed\n");
+	}
+
+	const uint64_t hold_ms = failure_hold_ms();
+	const auto started = std::chrono::steady_clock::now();
+	while (g_failure_active && !g_failure_shutdown_requested.load()) {
+		if (hold_ms != 0) {
+			const uint64_t elapsed = (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::steady_clock::now() - started).count();
+			if (elapsed >= hold_ms) {
+				fprintf(stderr, "emucap: fatal quarantine hold expired after %llu ms\n",
+					(unsigned long long)elapsed);
+				g_failure_active = false;
+				break;
+			}
+		}
+		try {
+			if (g_fd < 0) emucap_connect();
+			if (g_fd >= 0) serve_socket_once();
+		} catch (...) {
+			emucap_disconnect();
+		}
+		emucap_sock_wait_ms(2);
+	}
+	// Flycast's normal fatal catch calls dc_exit(), whose unload path can wait forever after this
+	// blocked exception. Quarantine completion is a lifecycle decision, not recovery: terminate on
+	// dismiss, deadline, or UI shutdown without re-entering cleanup on corrupted guest state.
+	if (!g_failure_synthetic)
+		std::_Exit(EXIT_FAILURE);
+	if (g_failure_synthetic && g_failure_dismissed)
+		g_failure_captured = false;
+}
+
+void emucap_notify_shutdown() noexcept {
+	g_failure_shutdown_requested.store(true);
+}
+
 // vblank마다(emu 스레드). 예외는 전부 삼켜 프레임 루프를 보호한다.
 void emucap_service() {
 	try {
@@ -992,19 +1252,20 @@ void emucap_service() {
 		// (maple_cfg.cpp, build.sh 주입). 여기선 kcode[] 전역을 쓰지 않는다: 게임 입력엔 불필요(GetInput
 		// override가 항상 이김)하고 UI 스레드 gamepad 핸들러와 cross-thread 경합이다 — 정본은 emucap_kcode().
 		if (g_fd < 0) { emucap_connect(); return; }   // 매 프레임 재연결 시도
-
 		// step(frames)/run_frames: 카운트다운 — 이 프레임은 진행시킨다(return → vblank 반환 → 1프레임 진행).
 		if (g_step_remaining > 0) {
+			if (!g_tx.empty()) flush_tx_once();
 			// 긴 진행은 30프레임마다 keepalive를 보내 서버 읽기 타임아웃(5s)을 막는다(인터프리터가 느려
 			// 수백 프레임이 5s를 넘는다). 서버는 status:"working"을 건너뛰므로 같은 호출이 유지된다.
-			if (g_step_id >= 0 && (g_step_remaining % 30) == 0) reply_working(g_step_id);
+			if (g_step_id >= 0 && (g_step_remaining % 30) == 0 && g_tx.empty()) reply_working(g_step_id);
 			g_step_remaining--;
 			if (g_step_remaining == 0 && g_step_id >= 0) {
-				char buf[64];
-				snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu}", (unsigned long long)g_frame);
+				char buf[96];
+				snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu,\"state\":\"%s\"}",
+					(unsigned long long)g_frame, g_frozen ? "frozen" : "running");
 				reply_ok(g_step_id, buf);
 				g_step_id = -1;
-				// frozen 유지 → 다음 프레임부터 아래 스핀
+				// step이면 frozen을 유지해 다음 프레임부터 스핀, run_frames이면 running 유지.
 			}
 			return;
 		}
@@ -1022,6 +1283,11 @@ void emucap_service() {
 		}
 
 		serve_socket_once();
+		if (g_synthetic_fatal_pending) {
+			g_synthetic_fatal_pending = false;
+			emucap_capture_fatal_sh4(
+				"Synthetic SH4 fatal (test gate)", Sh4cntx.pc, 0xFFFFFFFFu, 0, 0, 0);
+		}
 	} catch (...) {
 	}
 }
@@ -1029,8 +1295,8 @@ void emucap_service() {
 // 입력 소비 지점(MapleConfigMap::GetInput, emu 스레드 maple DMA)에서 직접 override하기 위한 헬퍼.
 // kcode[] 전역 쓰기는 os_UpdateInputState(UI 스레드)가 매 프레임 리셋해 경합·드롭이 났다 → 게임이
 // 실제 읽는 pjs->kcode를 GetInput에서 덮으면 emu 스레드 동기라 경합 zero(결정론적 입력).
-bool emucap_input_engaged() { return g_input_engaged.load(); }
-uint32_t emucap_kcode() { return ~g_input_pressed.load(); }  // active-low: 눌린 비트 클리어
+bool emucap_input_engaged() { return g_input_override.engaged(); }
+uint32_t emucap_kcode() { return g_input_override.kcode(); }  // active-low: 눌린 비트 클리어
 
 // 인터프리터 Run() 훅(주입)이 매 명령 전 호출 — pc가 exec BP면 true. armed(전역 bool)가 true일 때만
 // 불리므로(핫루프 보호) 여기선 집합 조회만. emu 스레드 단독 접근이라 락 불필요.

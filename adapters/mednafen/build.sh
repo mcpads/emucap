@@ -115,12 +115,12 @@ safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
 
 # 3. 우리 소켓 클라이언트
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$SRC/src/drivers/"
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$SRC/src/drivers/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알리게 한다 —
 # 사용자가 `git rev-parse --short HEAD`와 대조해 재빌드 필요 여부를 확인한다(build-time 임베드라 재빌드
-# 안 하면 옛 hash 그대로다). emucap.cpp/h가 HEAD와 다르면(미커밋) -dirty.
+# 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
-git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
+git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h emucap_input.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/src/drivers/emucap_build.h"
 
 # 헬퍼: perl 주입 후 마커(고정 문자열)가 들어갔는지 검증. fresh 빌드가 조용히 깨지는 것을 막는다.

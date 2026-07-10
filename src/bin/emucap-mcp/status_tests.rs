@@ -351,6 +351,45 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
         .contains("추측 실행하지 말라"));
 }
 
+struct TimeoutLink {
+    caps: emucap::live::link::Capabilities,
+}
+
+impl EmulatorLink for TimeoutLink {
+    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        Err(LinkError::Timeout)
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(47856)
+    }
+}
+
+#[test]
+fn bootstrap_is_total_when_status_times_out() {
+    let mut link = TimeoutLink {
+        caps: emucap::live::link::Capabilities::empty(),
+    };
+
+    let value = make_bootstrap_value(&mut link).unwrap();
+
+    assert_eq!(value["status"]["request_succeeded"], false);
+    assert_eq!(value["status"]["error_kind"], "request_timeout");
+    assert_eq!(
+        value["status"]["continuity"]["transport"]["state"],
+        "disconnected"
+    );
+    assert_eq!(value["listening_port"], 47856);
+}
+
 #[test]
 fn enrich_status_value_adds_methods() {
     let mut v = serde_json::json!({"connected": true, "system": "snes"});

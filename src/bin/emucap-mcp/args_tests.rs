@@ -94,17 +94,15 @@ fn frame_args_reject_over_cap() {
 #[test]
 fn frame_args_accept_at_cap_and_defaults() {
     // 상한 이내는 통과, 필드 부재 시 기본값(상한 이내)도 통과 — clamp가 정상 사용을 깨지 않아야.
-    let r: RunFramesArgs =
-        serde_json::from_str(&format!(r#"{{"n":{MAX_FRAME_ARG}}}"#)).unwrap();
+    let r: RunFramesArgs = serde_json::from_str(&format!(r#"{{"n":{MAX_FRAME_ARG}}}"#)).unwrap();
     assert_eq!(r.n, MAX_FRAME_ARG);
     let s: StepArgs = serde_json::from_str("{}").unwrap();
     assert_eq!(s.frames, 1, "step frames 기본값");
     let si: StepInstructionsArgs = serde_json::from_str("{}").unwrap();
     assert_eq!(si.count, 1, "step_instructions count 기본값");
-    let h: HoldUntilArgs = serde_json::from_str(
-        r#"{"buttons":["a"],"memory_type":"x","address":0,"length":1}"#,
-    )
-    .unwrap();
+    let h: HoldUntilArgs =
+        serde_json::from_str(r#"{"buttons":["a"],"memory_type":"x","address":0,"length":1}"#)
+            .unwrap();
     assert_eq!(h.max_frames, 300, "hold_until max_frames 기본값");
 }
 

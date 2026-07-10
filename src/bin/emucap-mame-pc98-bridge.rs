@@ -1,9 +1,7 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use emucap::live::protocol::{ProtocolError, Request, Response};
+use emucap::live::reconnect::serve_reconnecting;
 use emucap::pc98_bridge::{Bridge, BridgeEnv, GdbRspClient};
 
 fn main() -> anyhow::Result<()> {
@@ -31,40 +29,10 @@ fn main() -> anyhow::Result<()> {
     .with_context(|| format!("connect GDB stub at {gdb_host}:{gdb_port}"))?;
     let mut bridge = Bridge::new(gdb, BridgeEnv::from_process_env());
 
-    let sock = TcpStream::connect(("127.0.0.1", emucap_port))
-        .with_context(|| format!("connect emucap MCP listener at 127.0.0.1:{emucap_port}"))?;
-    sock.set_nodelay(true).ok();
-    let mut reader = BufReader::new(sock.try_clone()?);
-    let mut writer = sock;
-    eprintln!("[mame-pc98-rust] connected");
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(request) => bridge.handle_request(request),
-            Err(err) => Response {
-                id: 0,
-                ok: false,
-                result: None,
-                error: Some(ProtocolError {
-                    kind: "protocol_error".into(),
-                    message: err.to_string(),
-                }),
-            },
-        };
-        serde_json::to_writer(&mut writer, &response)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-    }
-    Ok(())
+    serve_reconnecting(emucap_port, "mame-pc98-rust", move |request| {
+        bridge.handle_request(request)
+    })
+    .context("serve reconnecting emucap session")
 }
 
 fn parse_port(raw: &str) -> anyhow::Result<u16> {

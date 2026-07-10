@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use super::protocol::{to_line, Request};
 
+const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// 페어링된 세션이 stale(hang)인지 — 마지막 활동 이후 threshold를 넘겼는지.
 /// 시계 역행에도 안전하도록 saturating으로 잰다.
 pub fn is_stale(now: Instant, last_seen: Instant, threshold: Duration) -> bool {
@@ -148,6 +150,9 @@ pub fn serve(emu_listener: TcpListener, session_listener: TcpListener, stale_thr
 }
 
 fn handle_emulator(stream: TcpStream, reg: Shared) {
+    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
+        return;
+    }
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -256,7 +261,9 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         // 페어링 세션 없음, 또는 fence_incoming이 None(옛/steal된 세션 응답)이면 폐기.
         if let Some((mut s, sess_gen)) = target {
             if let Some(out) = fence_incoming(raw, sess_gen) {
-                let _ = write_line(&mut s, &out);
+                if write_line(&mut s, &out).is_err() {
+                    let _ = s.shutdown(std::net::Shutdown::Both);
+                }
             }
         }
     }
@@ -279,6 +286,9 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
 }
 
 fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
+    if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
+        return;
+    }
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -414,7 +424,10 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
                 // 요청 id를 이 세션 세대로 네임스페이스해 보낸다 — 응답 echo가 이 세션 것임을 나타내,
                 // steal 이후 옛 세션 응답이 신규 소유자에게 오배달되지 않게 한다(fence_incoming).
                 let out = fence_outgoing(trimmed, my_session_gen);
-                let _ = write_line(&mut e, &out);
+                if write_line(&mut e, &out).is_err() {
+                    let _ = e.shutdown(std::net::Shutdown::Both);
+                    break;
+                }
             }
             None => break, // 에뮬레이터 사라짐
         }

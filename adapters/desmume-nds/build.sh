@@ -23,6 +23,7 @@ PATCH3="$HERE/patches/0003-emucap-state-disasm.patch"
 PATCH4="$HERE/patches/0004-emucap-reset.patch"
 PATCH5="$HERE/patches/0005-emucap-touch.patch"
 PATCH6="$HERE/patches/0006-emucap-gdb-bufmax.patch"
+PATCH7="$HERE/patches/0007-emucap-input-status.patch"
 WORK="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 SRC="$WORK/src"
 POSIX="$SRC/desmume/src/frontend/posix"
@@ -35,6 +36,7 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 [ -f "$PATCH4" ] || { echo "ERROR: emucap reset patch not found: $PATCH4" >&2; exit 1; }
 [ -f "$PATCH5" ] || { echo "ERROR: emucap touch patch not found: $PATCH5" >&2; exit 1; }
 [ -f "$PATCH6" ] || { echo "ERROR: emucap gdb-bufmax patch not found: $PATCH6" >&2; exit 1; }
+[ -f "$PATCH7" ] || { echo "ERROR: emucap input-status patch not found: $PATCH7" >&2; exit 1; }
 
 for tool in meson ninja git; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing build tool: $tool (macOS: brew install $tool)" >&2; exit 1; }
@@ -86,7 +88,8 @@ for entry in \
   "$PATCH3|emucap state/disasm patch (0003)" \
   "$PATCH4|emucap reset patch (0004)" \
   "$PATCH5|emucap touch patch (0005)" \
-  "$PATCH6|emucap gdb-bufmax patch (0006)"; do
+  "$PATCH6|emucap gdb-bufmax patch (0006)" \
+  "$PATCH7|emucap input-status patch (0007)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"

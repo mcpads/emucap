@@ -5,46 +5,66 @@ use std::net::TcpStream;
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-/// 세션 식별(CLAUDE_*_SESSION_ID) env는 프로세스 전역이라, 값을 바꿔 테스트하는 케이스는 직렬화한다.
+/// 세션 식별 env는 프로세스 전역이라, 값을 바꿔 테스트하는 케이스는 직렬화한다.
 static SESSION_ENV_LOCK: Mutex<()> = Mutex::new(());
+const SESSION_ENV_KEYS: [&str; 4] = [
+    "EMUCAP_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_SESSION_ID",
+];
 
 /// 세션 id env를 원하는 상태로 두고, 가드 드롭 시 이전 값을 원복하는 RAII. 가드가 살아있는 동안
 /// SESSION_ENV_LOCK을 단독 점유해 병렬 테스트 간 간섭을 막는다. `id=None`이면 안정 세션 id 없음(fail-closed).
 struct SessionEnv {
     _guard: MutexGuard<'static, ()>,
-    prev_code: Option<String>,
-    prev_sess: Option<String>,
+    previous: Vec<Option<String>>,
 }
 
 impl SessionEnv {
     fn with(id: Option<&str>) -> Self {
-        let guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_code = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-        let prev_sess = std::env::var("CLAUDE_SESSION_ID").ok();
         match id {
-            Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
-            None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+            Some(value) => Self::with_vars(&[("EMUCAP_SESSION_ID", value)]),
+            None => Self::with_vars(&[]),
         }
-        std::env::remove_var("CLAUDE_SESSION_ID");
+    }
+
+    fn with_vars(values: &[(&str, &str)]) -> Self {
+        let guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = SESSION_ENV_KEYS
+            .iter()
+            .map(|key| std::env::var(key).ok())
+            .collect();
+        for key in SESSION_ENV_KEYS {
+            std::env::remove_var(key);
+        }
+        for (key, value) in values {
+            assert!(
+                SESSION_ENV_KEYS.contains(key),
+                "unknown session env key: {key}"
+            );
+            std::env::set_var(key, value);
+        }
         Self {
             _guard: guard,
-            prev_code,
-            prev_sess,
+            previous,
         }
     }
 }
 
 impl Drop for SessionEnv {
     fn drop(&mut self) {
-        match &self.prev_code {
-            Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
-            None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
-        }
-        match &self.prev_sess {
-            Some(v) => std::env::set_var("CLAUDE_SESSION_ID", v),
-            None => std::env::remove_var("CLAUDE_SESSION_ID"),
+        for (key, previous) in SESSION_ENV_KEYS.iter().zip(&self.previous) {
+            match previous {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
+}
+
+fn token_anchor(token: &str) -> &str {
+    token.split('-').nth(1).expect("session anchor field")
 }
 
 fn hello_parts(line: &str) -> (serde_json::Value, String) {
@@ -707,6 +727,51 @@ fn session_token_path_parent_exists() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn session_token_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let path = tcp::session_token_path(port);
+    let _ = std::fs::remove_file(&path);
+
+    tcp::write_session_token(port, "private-reclaim-token");
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "private-reclaim-token"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_token_writer_and_reader_refuse_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let path = tcp::session_token_path(port);
+    let _ = std::fs::remove_file(&path);
+    let temp = tempfile::tempdir().unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, "do-not-overwrite").unwrap();
+    symlink(&outside, &path).unwrap();
+
+    tcp::write_session_token(port, "replacement");
+
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "do-not-overwrite"
+    );
+    assert!(tcp::reusable_session_token(port).is_none());
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn reusable_session_token_reuses_own_mints_for_foreign() {
     // 재사용 경로 통합: own 토큰파일은 재사용(reclaim), foreign은 None(새 토큰 발급→guard가 차단).
@@ -804,12 +869,12 @@ fn reusable_session_token_rejects_live_sibling_same_cwd() {
 
 #[test]
 fn no_stable_session_id_fails_closed_no_takeover() {
-    // 안정 세션 id가 없으면(Codex·plain shell·CI 등 CLAUDE_*_SESSION_ID 미설정) 같은 cwd의 두 세션이
+    // 안정 세션 id가 없으면(plain shell·CI 등 지원 ID 미설정) 같은 cwd의 두 세션이
     // 모두 앵커 0으로 붕괴해 서로 own으로 오판하면 안 된다 — fail-closed. 세션 A가 남긴 토큰을 형제
     // 세션 B가 own으로 보면(=조용한 인계) 안 되고, 포트 영속화도 공유하지 않아야(hijack 창 제거).
     let _env = SessionEnv::with(None);
-    let a_token = tcp::new_session_token(); // 세션 A(안정 id 없음)
-    // 세션 B(같은 cwd, 여전히 안정 id 없음): A의 토큰을 own으로 보면 안 됨.
+    // 세션 A와 B 모두 안정 ID가 없는 상황을 같은 환경에서 판정한다.
+    let a_token = tcp::new_session_token();
     assert!(
         !tcp::session_token_is_own(&a_token),
         "안정 세션 id가 없으면 형제 토큰을 own으로 보면 안 됨(fail-closed): {a_token}"
@@ -829,6 +894,45 @@ fn no_stable_session_id_fails_closed_no_takeover() {
         tcp::port_persist_path(47800).is_none(),
         "안정 세션 id 없으면 포트 영속화를 건너뛰어야(fail-closed)"
     );
+}
+
+#[test]
+fn explicit_session_id_takes_priority_over_runtime_ids() {
+    let both = {
+        let _env = SessionEnv::with_vars(&[
+            ("EMUCAP_SESSION_ID", "explicit-session"),
+            ("CODEX_THREAD_ID", "codex-thread"),
+            ("CLAUDE_CODE_SESSION_ID", "claude-session"),
+        ]);
+        tcp::new_session_token()
+    };
+    let explicit_only = {
+        let _env = SessionEnv::with_vars(&[("EMUCAP_SESSION_ID", "explicit-session")]);
+        tcp::new_session_token()
+    };
+    let codex_only = {
+        let _env = SessionEnv::with_vars(&[("CODEX_THREAD_ID", "codex-thread")]);
+        tcp::new_session_token()
+    };
+
+    assert_eq!(token_anchor(&both), token_anchor(&explicit_only));
+    assert_ne!(token_anchor(&both), token_anchor(&codex_only));
+}
+
+#[test]
+fn codex_thread_id_is_a_stable_control_session_label() {
+    let _env = SessionEnv::with_vars(&[("CODEX_THREAD_ID", "codex-reconnect")]);
+    let token = tcp::new_session_token();
+    assert!(tcp::session_token_is_own(&token));
+    assert!(tcp::port_persist_path(47800).is_some());
+}
+
+#[test]
+fn claude_session_id_remains_a_supported_fallback() {
+    let _env = SessionEnv::with_vars(&[("CLAUDE_CODE_SESSION_ID", "claude-reconnect")]);
+    let token = tcp::new_session_token();
+    assert!(tcp::session_token_is_own(&token));
+    assert!(tcp::port_persist_path(47800).is_some());
 }
 
 #[test]
@@ -863,29 +967,250 @@ fn stable_session_id_reclaims_across_reconnect() {
 #[test]
 fn port_persist_path_keyed_on_session_identity_not_cwd_alone() {
     // 같은 cwd·같은 base라도 세션 id가 다르면 포트 영속화 파일이 달라야 한다 — 그렇지 않으면 형제 세션이
-    // 같은 포트 파일을 공유해 서로의 포트를 가로챈다. env를 직렬화 lock 아래 직접 토글해 두 id를 비교한다.
-    let guard = SESSION_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let prev = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-    let prev_alt = std::env::var("CLAUDE_SESSION_ID").ok();
-    std::env::remove_var("CLAUDE_SESSION_ID");
-
-    std::env::set_var("CLAUDE_CODE_SESSION_ID", "session-one");
-    let path_one = tcp::port_persist_path(47800).expect("안정 id면 경로 Some");
-    std::env::set_var("CLAUDE_CODE_SESSION_ID", "session-two");
-    let path_two = tcp::port_persist_path(47800).expect("안정 id면 경로 Some");
+    // 같은 포트 파일을 공유해 서로의 포트를 가로챈다.
+    let path_one = {
+        let _env = SessionEnv::with(Some("session-one"));
+        tcp::port_persist_path(47800).expect("안정 id면 경로 Some")
+    };
+    let path_two = {
+        let _env = SessionEnv::with(Some("session-two"));
+        tcp::port_persist_path(47800).expect("안정 id면 경로 Some")
+    };
     assert_ne!(
         path_one, path_two,
         "다른 세션 id(같은 cwd)는 다른 포트 영속화 파일을 써야(hijack 창 방지)"
     );
+}
 
-    match prev {
-        Some(v) => std::env::set_var("CLAUDE_CODE_SESSION_ID", v),
-        None => std::env::remove_var("CLAUDE_CODE_SESSION_ID"),
+#[test]
+fn replacing_reclaim_token_updates_an_already_armed_preaccept() {
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let addr = link.local_addr().to_string();
+    let replacement = "reclaim-test-generation";
+    assert!(link.replace_reclaim_token(replacement).unwrap());
+
+    let expected = replacement.to_string();
+    let client = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        let (hello_id, token) = hello_parts(&hello);
+        assert_eq!(token, expected);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": hello_id,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "methods": ["status"],
+                    "session_token": token,
+                }
+            })
+        )
+        .unwrap();
+
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(request.trim()).unwrap()["id"].clone();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": id, "ok": true, "result": {"state": "running"}})
+        )
+        .unwrap();
+    });
+
+    let result = link.call("status", serde_json::json!({})).unwrap();
+    assert_eq!(result["state"], "running");
+    client.join().unwrap();
+}
+
+#[test]
+fn persisted_control_port_recovers_live_generation_auth() {
+    let _env = SessionEnv::with(Some("runtime-auth-reconnect"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(port).unwrap();
+    let manifest = prepared.manifest(super::runtime::ManifestSpec {
+        adapter: "mesen2".into(),
+        system: "snes".into(),
+        content: "/games/test.sfc".into(),
+        emulator_pid: std::process::id(),
+        bridge_pid: None,
+        backend_endpoint: None,
+        build: None,
+    });
+    prepared.commit(&manifest).unwrap();
+
+    let persist = tcp::port_persist_path(port).unwrap();
+    tcp::write_persisted_port(&persist, port);
+    let mut link = tcp::lazy(&format!("127.0.0.1:{port}"), Duration::from_millis(50));
+    link.set_runtime_store(store);
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_eq!(link.session_token(), Some(prepared.reclaim_token()));
+
+    let _ = std::fs::remove_file(persist);
+    let _ = std::fs::remove_file(tcp::session_token_path(port));
+}
+
+#[test]
+fn fallback_port_does_not_adopt_unrelated_generation_auth() {
+    let _env = SessionEnv::with(Some("runtime-auth-fallback"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let Some(busy_port) = base.checked_add(1) else {
+        return;
+    };
+    let busy = match std::net::TcpListener::bind(("127.0.0.1", busy_port)) {
+        Ok(listener) => listener,
+        Err(_) => return,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    let manifest = prepared.manifest(super::runtime::ManifestSpec {
+        adapter: "mesen2".into(),
+        system: "snes".into(),
+        content: "/games/foreign.sfc".into(),
+        emulator_pid: std::process::id(),
+        bridge_pid: None,
+        backend_endpoint: None,
+        build: None,
+    });
+    prepared.commit(&manifest).unwrap();
+
+    let persist = tcp::port_persist_path(base).unwrap();
+    tcp::write_persisted_port(&persist, busy_port);
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    link.set_runtime_store(store);
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_eq!(link.endpoint_port(), Some(base));
+    assert_ne!(link.session_token(), Some(prepared.reclaim_token()));
+
+    drop(busy);
+    let _ = std::fs::remove_file(persist);
+    let _ = std::fs::remove_file(tcp::session_token_path(base));
+}
+
+#[cfg(unix)]
+fn install_stale_lease(
+    store: &super::runtime::RuntimeStore,
+    port: u16,
+    launch_id: &str,
+    control_key: Option<String>,
+) {
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let holder = super::runtime::capture_process(child.id());
+    child.wait().unwrap();
+    let mut record = super::continuity::LinkRecord::new(launch_id.to_string());
+    record.lease = Some(super::runtime::LeaseRecord {
+        control_session_key: control_key,
+        holder,
+        acquired_at_unix_ms: 1,
+        refreshed_at_unix_ms: 1,
+    });
+    store
+        .update_link_json(port, launch_id, |_| Ok(record))
+        .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn range_scan_reattaches_one_generation_with_confirmed_stale_lease() {
+    let _env = SessionEnv::with(Some("runtime-range-reattach"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mesen2".into(),
+            system: "snes".into(),
+            content: "/games/reclaim.sfc".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(
+        &store,
+        base,
+        prepared.launch_id(),
+        Some(super::runtime::control_session_key().unwrap()),
+    );
+
+    match tcp::select_runtime_generation(&store, base).unwrap() {
+        tcp::RuntimeSelection::Attach { port, token, .. } => {
+            assert_eq!(port, base);
+            assert_eq!(token, prepared.reclaim_token());
+        }
+        _ => panic!("one stale generation should be selected"),
     }
-    if let Some(v) = prev_alt {
-        std::env::set_var("CLAUDE_SESSION_ID", v);
+}
+
+#[cfg(unix)]
+#[test]
+fn range_scan_refuses_to_guess_between_two_stale_generations() {
+    let _env = SessionEnv::with(Some("runtime-range-ambiguous"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let Some(second_port) = base.checked_add(1) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    for port in [base, second_port] {
+        let prepared = store.prepare(port).unwrap();
+        prepared
+            .commit(&prepared.manifest(super::runtime::ManifestSpec {
+                adapter: "mesen2".into(),
+                system: "snes".into(),
+                content: format!("/games/{port}.sfc"),
+                emulator_pid: std::process::id(),
+                bridge_pid: None,
+                backend_endpoint: None,
+                build: None,
+            }))
+            .unwrap();
+        install_stale_lease(
+            &store,
+            port,
+            prepared.launch_id(),
+            Some("control-old".into()),
+        );
     }
-    drop(guard);
+
+    match tcp::select_runtime_generation(&store, base).unwrap() {
+        tcp::RuntimeSelection::Blocked(candidates) => assert_eq!(candidates.len(), 2),
+        _ => panic!("ambiguous stale generations must not be selected arbitrarily"),
+    }
 }
 
 /// hello만 답하고 이후 소켓에서 절대 read하지 않는 클라이언트 — 서버 송신 버퍼를 채워 큰 요청의

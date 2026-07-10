@@ -198,7 +198,7 @@ fn broker_link_preserves_partial_reply_across_timeout() {
         write!(w, r#"{{"id":{id1},"ok":true,"resu"#).unwrap();
         w.flush().unwrap();
         std::thread::sleep(Duration::from_millis(170)); // 1회 타임아웃 경계 확보(120ms<170ms<360ms)
-        // 나머지 절반 + 개행(=#1 응답 완성). 클라의 다음 호출에선 id 불일치로 버려진다.
+                                                        // 나머지 절반 + 개행(=#1 응답 완성). 클라의 다음 호출에선 id 불일치로 버려진다.
         writeln!(w, r#"lt":{{"connected":true}}}}"#).unwrap();
         // 이후 오는 status마다 n=2로 응답(각 호출이 자기 id 응답을 결국 받게 — 데드라인 없는 demux).
         loop {
@@ -239,7 +239,10 @@ fn broker_link_preserves_partial_reply_across_timeout() {
             other => panic!("Ok/Timeout 기대: {other:?}"),
         }
     }
-    assert!(ok, "pending 이어읽기로 결국 유효 응답을 받아야(desync 없이)");
+    assert!(
+        ok,
+        "pending 이어읽기로 결국 유효 응답을 받아야(desync 없이)"
+    );
     drop(link); // 소켓을 닫아 broker의 응답 루프 read_line이 EOF로 끝나게(join 무한대기 방지).
     h.join().unwrap();
 }
@@ -347,7 +350,12 @@ fn broker_link_bails_on_working_flood_past_deadline() {
         let id2 = serde_json::from_str::<serde_json::Value>(l2.trim()).unwrap()["id"].clone();
         // 완료를 절대 안 보내고 working만 계속. 데드라인으로 링크가 끊으면 write가 실패해 종료.
         for _ in 0..100_000 {
-            if writeln!(w, r#"{{"id":{id2},"ok":true,"result":{{"status":"working"}}}}"#).is_err() {
+            if writeln!(
+                w,
+                r#"{{"id":{id2},"ok":true,"result":{{"status":"working"}}}}"#
+            )
+            .is_err()
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));

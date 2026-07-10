@@ -130,6 +130,8 @@ function emucap_gdbstub.startplugin()
   local frame_wait_target
   local frame_wait_stop
   local frame_wait_probe
+  local frame_wait_release_input = false
+  local clear_inputs
   local break_on_reset_enabled = false
   local pending_reset
   local socket
@@ -140,6 +142,19 @@ function emucap_gdbstub.startplugin()
   local trace_last_state = nil
   local function trace(msg)
     if trace_enabled then print("emucap_gdbstub: TRACE " .. tostring(msg)) end
+  end
+
+  -- frame-target 명령은 응답 수명주기와 임시 입력 소유권을 함께 끝낸다. press가 완료되거나
+  -- breakpoint/stop/reset으로 중단될 때 입력만 남아 네이티브 키보드를 덮지 않게 한 곳에서 해제한다.
+  local function clear_frame_wait()
+    local release_input = frame_wait_release_input
+    frame_wait_target = nil
+    frame_wait_stop = false
+    frame_wait_probe = nil
+    frame_wait_release_input = false
+    if release_input and clear_inputs then
+      clear_inputs()
+    end
   end
 
   reset_subscription = emu.add_machine_reset_notifier(function()
@@ -165,12 +180,16 @@ function emucap_gdbstub.startplugin()
     regpoints = { byidx = {} }
     running = false
     rxbuf = ""
+    -- A reset can interrupt a deferred press before the frame notifier reaches its target.
+    -- Release that transient override while its field references are still available.
+    clear_frame_wait()
     input_fields = {}
     active_input_fields = {}
     release_input_frame = nil
     frame_wait_target = nil
     frame_wait_stop = false
     frame_wait_probe = nil
+    frame_wait_release_input = false
     if break_on_reset_enabled and socket and debugger and cpu then
       local map = regmaps[cpu.shortname]
       if map then
@@ -235,9 +254,7 @@ function emucap_gdbstub.startplugin()
       debugger.execution_state = "stop"
     end
     running = false
-    frame_wait_target = nil
-    frame_wait_stop = false
-    frame_wait_probe = nil
+    clear_frame_wait()
   end
 
   local function apply_regs_hex(regs_hex)
@@ -254,9 +271,7 @@ function emucap_gdbstub.startplugin()
       debugger.execution_state = "stop"
     end
     running = false
-    frame_wait_target = nil
-    frame_wait_stop = false
-    frame_wait_probe = nil
+    clear_frame_wait()
     return regs_payload(map)
   end
 
@@ -284,9 +299,7 @@ function emucap_gdbstub.startplugin()
     local is_new_stop = running or frame_wait_target
     if is_new_stop then
       local reply_to_frame_wait = frame_wait_target ~= nil
-      frame_wait_target = nil
-      frame_wait_stop = false
-      frame_wait_probe = nil
+      clear_frame_wait()
       local map = cpu and regmaps[cpu.shortname]
       local stop_payload
       if map then
@@ -331,12 +344,10 @@ function emucap_gdbstub.startplugin()
     trace("note_bp detected msg=[" .. tostring(msg) .. "] execstate=" .. tostring(debugger.execution_state))
     local map = regmaps[cpu.shortname]
     local point = tonumber(msg:match("Stopped at breakpoint ([0-9]+)"))
-    running = false
-    local reply_to_frame_wait = frame_wait_target ~= nil
-    frame_wait_target = nil
-    frame_wait_stop = false
-    frame_wait_probe = nil
     if point then
+      running = false
+      local reply_to_frame_wait = frame_wait_target ~= nil
+      clear_frame_wait()
       local pause_on_hit = breaks.pause and breaks.pause[point]
       local addr = breaks.byidx[point]
       local payload
@@ -373,10 +384,9 @@ function emucap_gdbstub.startplugin()
 
     point = tonumber(msg:match("Stopped at watchpoint ([0-9]+)"))
     if point then
-      reply_to_frame_wait = frame_wait_target ~= nil
-      frame_wait_target = nil
-      frame_wait_stop = false
-      frame_wait_probe = nil
+      running = false
+      local reply_to_frame_wait = frame_wait_target ~= nil
+      clear_frame_wait()
       local wp = watches.byidx[point]
       local pause_on_hit = wp and wp.pause_on_hit
       local payload
@@ -407,10 +417,9 @@ function emucap_gdbstub.startplugin()
 
     point = tonumber(msg:match("Stopped at registerpoint ([0-9]+)"))
     if point then
-      reply_to_frame_wait = frame_wait_target ~= nil
-      frame_wait_target = nil
-      frame_wait_stop = false
-      frame_wait_probe = nil
+      running = false
+      local reply_to_frame_wait = frame_wait_target ~= nil
+      clear_frame_wait()
       local rp = regpoints.byidx[point]
       local pause_on_hit = rp and rp.pause_on_hit
       local payload
@@ -603,13 +612,14 @@ function emucap_gdbstub.startplugin()
     return 0
   end
 
-  local function start_frame_wait(frames, stop_on_done)
+  local function start_frame_wait(frames, stop_on_done, release_input_on_done)
     if frame_wait_target then
       return false
     end
     frames = math.max(tonumber(frames) or 1, 1)
     frame_wait_target = current_frame() + frames
     frame_wait_stop = stop_on_done and true or false
+    frame_wait_release_input = release_input_on_done and true or false
     trace("framewait start frames=" .. tostring(frames) .. " stop_on_done=" .. tostring(stop_on_done) .. " execstate_was=" .. tostring(debugger and debugger.execution_state))
     hold_requested = false  -- 프레임 진행은 재개 상태 — 홀드 의도 없음(stop_on_done이면 target 도달 시 frame notifier가 세팅)
     if debugger and debugger.execution_state == "stop" then
@@ -630,9 +640,7 @@ function emucap_gdbstub.startplugin()
 
     local should_stop = frame_wait_stop
     local probe = frame_wait_probe
-    frame_wait_target = nil
-    frame_wait_stop = false
-    frame_wait_probe = nil
+    clear_frame_wait()
     if should_stop and debugger then
       running = false
       debugger.execution_state = "stop"
@@ -646,7 +654,7 @@ function emucap_gdbstub.startplugin()
     end
   end)
 
-  local function clear_inputs()
+  clear_inputs = function()
     for field, _ in pairs(active_input_fields) do
       field:clear_value()
     end
@@ -1109,7 +1117,12 @@ function emucap_gdbstub.startplugin()
       local ok, unresolved = set_inputs(split_csv(buttons))
       if ok then
         release_input_frame = current_frame() + frames
-        ack_packet(socket, "OK")
+        if start_frame_wait(frames, false, true) then
+          -- Reply is deferred until every requested frame elapsed and clear_frame_wait released input.
+        else
+          clear_inputs()
+          ack_packet(socket, "E09")
+        end
       else
         ack_packet(socket, "E08:" .. tostring(unresolved or ""))
       end

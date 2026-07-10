@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
@@ -32,7 +32,25 @@ pub enum LinkError {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+impl LinkError {
+    /// Stable machine-readable category for continuity records. Display text remains free to be
+    /// operator-friendly and localized without changing the persisted contract.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::NotConnected => "not_connected",
+            Self::PortBusy { .. } => "port_busy",
+            Self::Busy => "busy",
+            Self::NoSuchEmulator { .. } => "no_such_emulator",
+            Self::Ambiguous { .. } => "ambiguous",
+            Self::Timeout => "request_timeout",
+            Self::Protocol(_) => "protocol_error",
+            Self::Emulator { .. } => "emulator_error",
+            Self::IdentityMismatch { .. } => "identity_mismatch",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EmulatorIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub system: Option<String>,
@@ -47,6 +65,8 @@ pub struct EmulatorIdentity {
     pub session_token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
 }
 
 impl EmulatorIdentity {
@@ -61,6 +81,7 @@ impl EmulatorIdentity {
                 .and_then(Value::as_str)
                 .map(String::from),
             content: v.get("content").and_then(Value::as_str).map(String::from),
+            launch_id: v.get("launch_id").and_then(Value::as_str).map(String::from),
         }
     }
 }
@@ -97,6 +118,28 @@ pub trait EmulatorLink {
     /// 이 MCP 세션의 direct-mode guard token. status가 launcher env로 안내한다.
     fn session_token(&self) -> Option<&str> {
         None
+    }
+    /// 새 launch generation의 비공개 reclaim capability를 direct listener에 설치한다.
+    /// broker 등 capability를 직접 소유하지 않는 링크는 false로 강등한다.
+    fn replace_reclaim_token(&mut self, _token: &str) -> Result<bool, LinkError> {
+        Ok(false)
+    }
+    /// Last host-side observation, available even when the adapter socket is gone.
+    fn continuity(&self) -> super::continuity::ContinuitySnapshot {
+        super::continuity::ContinuitySnapshot::default()
+    }
+    /// Durable host/adapter failure context. Implementations must not contact the emulator here.
+    fn failure_context(&mut self) -> Value {
+        serde_json::json!({
+            "continuity": self.continuity(),
+            "link_failure": null,
+            "adapter_failure": null,
+        })
+    }
+    /// Public live-generation candidates when direct automatic reattachment is ambiguous or held
+    /// by a still-live lease. Empty for links without a direct port range.
+    fn runtime_candidates(&self) -> Vec<Value> {
+        Vec::new()
     }
 }
 

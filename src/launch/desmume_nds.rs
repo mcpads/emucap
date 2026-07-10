@@ -66,6 +66,7 @@ pub struct Launch<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
+    pub runtime: Option<super::RuntimeEnv<'a>>,
     /// Open a native DeSmuME window (HITL viewing) by running desmume-cli with EMUCAP_NDS_DISPLAY=1;
     /// false = headless (GDB bridge only, the default). On macOS a caffeinate keeps the display awake
     /// while the window lives.
@@ -175,6 +176,7 @@ fn bridge_spec(l: &Launch, arm9: u16, arm7: u16) -> LaunchSpec {
     if let Some(token) = l.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
     }
+    spec = spec.runtime_env(l.runtime);
     // HITL 창 세션임을 브리지에도 알린다 → 기본 resume가 both(ARM7이 입력을 읽으므로)로 바뀐다.
     if l.display {
         spec = spec.env("EMUCAP_NDS_DISPLAY", "1");
@@ -252,7 +254,7 @@ fn write_pidfile(log_path: &Path, name: &str, pid: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{bridge_spec, emu_spec, resolve_bridge, resolve_binary, resolve_gdb_port, Launch};
+    use super::{bridge_spec, emu_spec, resolve_binary, resolve_bridge, resolve_gdb_port, Launch};
 
     #[cfg(unix)]
     #[test]
@@ -260,12 +262,18 @@ mod tests {
         use std::time::Duration;
         // A bridge (or desmume) still alive after the settle passes; one that already exited fails,
         // so a process that dies during startup surfaces as a launch error, not a false success.
-        let mut alive = std::process::Command::new("sleep").arg("5").spawn().unwrap();
+        let mut alive = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
         assert!(super::wait_survives(alive.id(), Duration::from_millis(400), "died").is_ok());
         let _ = alive.kill();
         let _ = alive.wait();
 
-        let mut dead = std::process::Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        let mut dead = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
         let dead_pid = dead.id();
         let _ = dead.wait(); // reap so the pid is gone
         assert!(super::wait_survives(dead_pid, Duration::from_secs(1), "died").is_err());
@@ -290,6 +298,7 @@ mod tests {
             port: 47800,
             name: Some("nds_session"),
             session_token: Some("token"),
+            runtime: None,
             display: false,
         }
     }

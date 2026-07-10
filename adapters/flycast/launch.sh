@@ -2,9 +2,9 @@
 # Flycast(Dreamcast)를 emucap용으로 안전하게 띄운다. Mesen launch.sh와 동형 — 다중세션 안전(이 포트로
 # 띄운 우리 인스턴스만 PID로 정리, 광역 kill 금지), 디스플레이 슬립 대응(caffeinate), 그리고 Flycast
 # 특유의 macOS 함정을 처리한다:
-#   - dynarec(JIT): 재빌드한 .app은 JIT 엔타이틀먼트 서명이 없어 dynarec가 Init에서 verify 크래시한다
-#     (nvmem/blockmanager). emucap은 디버깅 어댑터라 인터프리터로 충분(GDB 스텁도 인터프리터 강제) →
-#     emu.cfg에 Dynarec.Enabled=no 강제. (풀스피드가 필요하면 .app을 com.apple.security.cs.allow-jit로 재서명.)
+#   - dynarec(JIT): 재빌드한 .app은 JIT 엔타이틀먼트 서명이 없어 Sh4Recompiler::Init에서 SIGTRAP할 수
+#     있다. build.sh는 interpreter 선택 시 해당 초기화를 생략하고, 이 런처는 격리 config와 명령행
+#     transient override 양쪽에 Dynarec.Enabled=no를 고정한다.
 #   - "지난번 비정상 종료… 창을 다시 열까요?" 대화창: 반복 크래시가 띄운다. ApplePersistenceIgnoreState로
 #     억제한다.
 # 사용: launch.sh <disc.gdi/chd/cdi> <EMUCAP_PORT>   (포트는 emucap-mcp status의 listening_port)
@@ -265,7 +265,8 @@ fi
 # 출력은 discoverable 로그로(무음 실패 방지 — 부팅 에러를 에이전트가 볼 수 있게).
 LAUNCH_LOG="${EMUCAP_LOG:-$RUN_DIR/flycast.log}"
 mkdir -p "$(dirname "$LAUNCH_LOG")"
-env EMUCAP_PORT="$PORT" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$DISC" "${FLYCAST_ISO_ENV[@]}" nohup "$FLY_RUNTIME" "$DISC" >"$LAUNCH_LOG" 2>&1 &
+env EMUCAP_PORT="$PORT" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$DISC" "${FLYCAST_ISO_ENV[@]}" \
+  nohup "$FLY_RUNTIME" -config "Dynarec:Enabled=no" "$DISC" >"$LAUNCH_LOG" 2>&1 &
 NEWPID=$!; disown
 command -v caffeinate >/dev/null 2>&1 && { caffeinate -d -w "$NEWPID" >/dev/null 2>&1 & disown; }
 echo "$NEWPID" > "$PIDFILE"

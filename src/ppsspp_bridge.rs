@@ -3,8 +3,7 @@
 //! PPSSPP's built-in remote debugger speaks JSON over a WebSocket at
 //! `ws://127.0.0.1:<port>/debugger` with subprotocol `debugger.ppsspp.org`: a request is
 //! `{"event": "<name>", ...params}`, the matching response reuses the same event name, and PPSSPP
-//! also emits spontaneous events (log lines, breakpoint/stepping hits) unprompted. See
-//! `docs/research/ppsspp-debugger.md` for the verified command set.
+//! also emits spontaneous events (log lines, breakpoint/stepping hits) unprompted.
 //!
 //! `WsTransport` abstracts that call/drain surface so `PpssppBridge` can run against either the real
 //! `TungsteniteWs` connection or the `FakeWs` test double. Wired up today: `status` (via PPSSPP's
@@ -20,11 +19,9 @@
 //! `savestate.load`, stock PPSSPP exposes no WS savestate command), `reset` (stock `game.reset`),
 //! and `get_rom_info` (stock `game.status` for id/title + a locally computed sha1 of the
 //! `EMUCAP_CONTENT` image, since PPSSPP's WS API never exposes a content path or hash). `step`
-//! (frame-based stepping) has no PPSSPP WS/fork primitive yet and remains planned (see
-//! `docs/research/ppsspp-debugger.md`).
+//! (frame-based stepping) has no PPSSPP WS/fork primitive and is not advertised.
 //!
-//! Two PPSSPP quirks shape the stepping/pause/resume/poll_events code below (verified empirically
-//! against a headless PPSSPP, see `docs/research/ppsspp-debugger.md`):
+//! Two PPSSPP protocol quirks shape the stepping/pause/resume/poll_events code below:
 //! - `cpu.stepInto`/`cpu.stepOver`/`cpu.stepOut`/`cpu.runUntil`/`cpu.nextHLE` have **no synchronous
 //!   reply** — PPSSPP acks them with a *differently named* spontaneous `cpu.stepping` event once the
 //!   step completes (`SteppingSubscriber.cpp`). `cpu.resume` and the plain `cpu.stepping` (pause)
@@ -57,9 +54,8 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 /// PPSSPP subprotocol the debugger WebSocket upgrade must advertise (`Core/Debugger/WebSocket.cpp`).
 const PPSSPP_SUBPROTOCOL: &str = "debugger.ppsspp.org";
 
-/// v1 PSP memory map. `main` is PSP user RAM, base `PSP_MAIN_RAM_BASE` (confirmed in
-/// `docs/research/ppsspp-debugger.md` — real game data observed there via `memory.read`, and
-/// `Core/MemMap.h`'s `PSP_GetUserMemoryBase()`). `read_memory`/`write_memory` add this base to the
+/// v1 PSP memory map. `main` is PSP user RAM at `Core/MemMap.h`'s
+/// `PSP_GetUserMemoryBase()`. `read_memory`/`write_memory` add this base to the
 /// request's `address`/`start` offset; PPSSPP's own `memory.read`/`memory.write` take the resulting
 /// absolute address.
 const MEMORY_TYPES: &[&str] = &["main"];
@@ -122,9 +118,8 @@ const RESET_READ_TIMEOUT: Duration = Duration::from_secs(35);
 const RESET_HALT_POLLS: u32 = 3;
 const RESET_HALT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Methods this bridge actually dispatches today — kept truthful to `handle_request` (a caller must
-/// be able to trust `status.methods`/`hello.methods`; see `CLAUDE.md`). Grows as later tasks add
-/// handlers.
+/// Methods this bridge actually dispatches — kept truthful to `handle_request` so callers can trust
+/// `status.methods`/`hello.methods`. Add a name only with its working handler.
 const METHODS: &[&str] = &[
     "hello",
     "status",
@@ -212,7 +207,7 @@ fn psp_input_buttons_json() -> Value {
         "system": "psp",
         "buttons": PSP_INPUT_BUTTONS,
         "implemented": true,
-        "notes": "Button names map to PSP: a→cross(✕), b→circle(○), x→square(□), y→triangle(△), l→ltrigger, r→rtrigger, plus start, select, and the d-pad (up/down/left/right). Confirm/cancel is game-defined — Japanese titles typically confirm with circle (b) and cancel with cross (a). Stock PPSSPP WebSocket commands (input.buttons.send/press), no fork hook needed. set_input holds until changed (a full replace — an empty list releases every button); press_buttons times a single-button press and blocks for its ack, so a multi-button list presses sequentially, not as a held combo.",
+        "notes": "Button names map to PSP: a→cross(✕), b→circle(○), x→square(□), y→triangle(△), l→ltrigger, r→rtrigger, plus start, select, and the d-pad (up/down/left/right). Confirm/cancel is game-defined — Japanese titles typically confirm with circle (b) and cancel with cross (a). Stock PPSSPP WebSocket commands (input.buttons.send/press), no fork hook needed. set_input holds until changed (a full replace — an empty list releases every button); press_buttons is a terminal-ack timed pulse for exactly one button and rejects multi-button lists because stock PPSSPP cannot apply them in one frame window.",
     })
 }
 
@@ -543,6 +538,7 @@ pub struct PpssppBridge<T> {
     /// not a stale/foreign process holding the port (mirrors the NDS/PC-98 bridges' `BridgeEnv`).
     name: Option<String>,
     session_token: Option<String>,
+    launch_id: Option<String>,
     /// Monotonic counter minting a unique `ticket` for each timed `input.buttons.press`, so the
     /// bridge can correlate a delayed release ack to the exact press that issued it (see
     /// `press_buttons` / `WsTransport::call_ticketed`).
@@ -551,12 +547,14 @@ pub struct PpssppBridge<T> {
 
 impl<T: WsTransport> PpssppBridge<T> {
     pub fn new(ws: T) -> Self {
-        Self::with_identity(
+        let mut bridge = Self::with_identity(
             ws,
             std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from),
             std::env::var("EMUCAP_NAME").ok(),
             std::env::var("EMUCAP_SESSION_TOKEN").ok(),
-        )
+        );
+        bridge.launch_id = std::env::var("EMUCAP_LAUNCH_ID").ok();
+        bridge
     }
 
     /// Explicit-content constructor — `new()` reads `EMUCAP_CONTENT` from the process environment
@@ -583,6 +581,7 @@ impl<T: WsTransport> PpssppBridge<T> {
             content,
             name,
             session_token,
+            launch_id: None,
             next_ticket: 1,
         }
     }
@@ -691,6 +690,9 @@ impl<T: WsTransport> PpssppBridge<T> {
         }
         if let Some(token) = &self.session_token {
             obj.insert("session_token".into(), json!(token));
+        }
+        if let Some(launch_id) = &self.launch_id {
+            obj.insert("launch_id".into(), json!(launch_id));
         }
         Ok(result)
     }
@@ -961,7 +963,7 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// back as an `emulator_error`, not a silently-ignored one. `pause_on_hit` (default true) maps to
     /// PPSSPP's `enabled` (a `false` value is honored — unlike the NDS/GDB bridge, PPSSPP natively
     /// supports a log-only, non-pausing breakpoint). `auto_savestate`/`snapshot`/value filters
-    /// (`value`/`value_mask`/`value_len`) are not implemented yet (TODO) and are rejected
+    /// (`value`/`value_mask`/`value_len`) are unsupported and rejected
     /// rather than silently ignored.
     fn set_breakpoint(&mut self, params: &Value) -> BridgeResult<Value> {
         let kind = params
@@ -976,7 +978,7 @@ impl<T: WsTransport> PpssppBridge<T> {
         }
         if params.get("auto_savestate").and_then(Value::as_bool) == Some(true) {
             return Err(BridgeError::Unsupported(
-                "psp bridge: auto_savestate not supported yet (TODO)".into(),
+                "psp bridge: auto_savestate is unsupported".into(),
             ));
         }
         if params
@@ -985,14 +987,14 @@ impl<T: WsTransport> PpssppBridge<T> {
             .is_some_and(|a| !a.is_empty())
         {
             return Err(BridgeError::Unsupported(
-                "psp bridge: snapshot not supported yet — read_memory after the hit instead (TODO)"
+                "psp bridge: snapshot is unsupported — read_memory after the hit instead"
                     .into(),
             ));
         }
         for opt in ["value", "value_mask", "value_len"] {
             if params.get(opt).is_some() {
                 return Err(BridgeError::Unsupported(format!(
-                    "psp bridge: {opt} not supported yet — use pc_min/pc_max or a raw condition expression instead (TODO)"
+                    "psp bridge: {opt} is unsupported — use pc_min/pc_max or a raw condition expression instead"
                 )));
             }
         }
@@ -1010,7 +1012,7 @@ impl<T: WsTransport> PpssppBridge<T> {
             if let Some(end) = optional_num(params, "end")? {
                 if end != region_offset(params)? {
                     return Err(BridgeError::Unsupported(
-                        "psp bridge: range exec breakpoints unsupported — single address only (start==end) (TODO)"
+                        "psp bridge: range exec breakpoints are unsupported — single address only (start==end)"
                             .into(),
                     ));
                 }
@@ -1459,11 +1461,10 @@ impl<T: WsTransport> PpssppBridge<T> {
         Ok(json!({ "buttons": requested }))
     }
 
-    /// `input.buttons.press {button, duration}` per requested button. PPSSPP has no multi-button
-    /// timed-press command (`ButtonsPress` takes exactly one `button`), so a combo list is pressed
-    /// as N sequential single-button presses, not held together — a known v1 limitation; a true
-    /// simultaneous combo tap should go through `set_input` plus a caller-side step/pause dance,
-    /// the way the `tools.rs` `one_tap` helper already does for other adapters. PPSSPP acks each
+    /// `input.buttons.press {button, duration}` for one requested button. PPSSPP has no multi-button
+    /// timed-press command (`ButtonsPress` takes exactly one `button`), so accepting a combo would
+    /// silently serialize it and violate the common same-frame-window contract. Multi-button lists
+    /// are rejected before any WS mutation until a fork-owned combo command exists. PPSSPP acks the
     /// press asynchronously under the *same* event name once `duration` frames have elapsed and
     /// the button auto-releases (`WebSocketInputState::Broadcast`), so this rides `call_ticketed`
     /// (the ack name matches the request name): each press carries a unique `ticket` PPSSPP echoes
@@ -1480,6 +1481,12 @@ impl<T: WsTransport> PpssppBridge<T> {
         if requested.is_empty() {
             return Err(BridgeError::BadParams(
                 "press_buttons requires at least one button".into(),
+            ));
+        }
+        if requested.len() > 1 {
+            return Err(BridgeError::BadParams(
+                "PPSSPP press_buttons currently supports exactly one button: stock PPSSPP has no atomic timed-combo command, and sequential presses would violate the simultaneous frame-window contract. Use set_input for an explicit persistent combo and set_input([]) to release it, or send single-button pulses."
+                    .into(),
             ));
         }
         let frames = optional_num(params, "frames")?.unwrap_or(1).max(1);
@@ -1499,35 +1506,31 @@ impl<T: WsTransport> PpssppBridge<T> {
                     .into(),
             ));
         }
-        for name in &requested {
-            let psp_name = psp_button_name(name).expect("validated by button_list");
-            let ticket = self.mint_ticket();
-            // Ticket-correlated so a stale ack from a *previous* press (one whose release was
-            // stranded when a breakpoint halted the CPU mid-press, then fired late on resume) can't
-            // satisfy this call — it carries the earlier ticket and is queued/ignored.
-            match self.ws.call_ticketed(
-                "input.buttons.press",
-                json!({ "button": psp_name, "duration": frames }),
-                &ticket,
-            ) {
-                Ok(_) => {}
-                Err(err) => {
-                    // The press ack only fires after `duration` frames elapse. If a breakpoint
-                    // halts the CPU before then, frames stop, the auto-release never runs, and this
-                    // read times out with the button still held. Release everything best-effort so
-                    // the button doesn't stay stuck, then surface a clear error. The late ack (this
-                    // ticket) is ignored by every later ticketed read.
-                    let _ = self.release_all_inputs();
-                    if is_timeout_error(&err) {
-                        return Err(BridgeError::Emulator(format!(
-                            "press_buttons({name}) timed out waiting for the timed release — the \
-                             CPU likely halted (breakpoint) mid-press so frames stopped advancing. \
-                             Inputs were released; resume and retry, or hold with set_input instead."
-                        )));
-                    }
-                    return Err(err);
-                }
+        let name = &requested[0];
+        let psp_name = psp_button_name(name).expect("validated by button_list");
+        let ticket = self.mint_ticket();
+        // Ticket-correlated so a stale ack from a *previous* press (one whose release was
+        // stranded when a breakpoint halted the CPU mid-press, then fired late on resume) can't
+        // satisfy this call — it carries the earlier ticket and is queued/ignored.
+        if let Err(err) = self.ws.call_ticketed(
+            "input.buttons.press",
+            json!({ "button": psp_name, "duration": frames }),
+            &ticket,
+        ) {
+            // The press ack only fires after `duration` frames elapse. If a breakpoint
+            // halts the CPU before then, frames stop, the auto-release never runs, and this
+            // read times out with the button still held. Release everything best-effort so
+            // the button doesn't stay stuck, then surface a clear error. The late ack (this
+            // ticket) is ignored by every later ticketed read.
+            let _ = self.release_all_inputs();
+            if is_timeout_error(&err) {
+                return Err(BridgeError::Emulator(format!(
+                    "press_buttons({name}) timed out waiting for the timed release — the \
+                     CPU likely halted (breakpoint) mid-press so frames stopped advancing. \
+                     Inputs were released; resume and retry, or hold with set_input instead."
+                )));
             }
+            return Err(err);
         }
         Ok(json!({ "buttons": requested, "frames": frames }))
     }
@@ -1702,6 +1705,7 @@ fn capability_notes() -> Value {
         "planned_methods": planned,
         "screenshot": true,
         "input": true,
+        "press_buttons_max_simultaneous": 1,
         "frame_step": false,
         "step_units": ["instructions"],
         "breakpoints": true,
@@ -3765,32 +3769,16 @@ mod tests {
     }
 
     #[test]
-    fn press_buttons_presses_each_button_in_a_combo_sequentially() {
-        let mut bridge = PpssppBridge::new(FakeWs::with(&[
-            (
-                "cpu.status",
-                json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
-            ),
-            (
-                "input.buttons.press",
-                json!({"event":"input.buttons.press","ticket":"emucap-1"}),
-            ),
-            (
-                "input.buttons.press",
-                json!({"event":"input.buttons.press","ticket":"emucap-2"}),
-            ),
-        ]));
+    fn press_buttons_rejects_combo_before_any_ws_mutation() {
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
         let resp = bridge.handle_request(Request::new(
             1,
             "press_buttons",
             json!({"buttons": ["up", "a"], "frames": 2}),
         ));
-        assert!(resp.ok, "{:?}", resp.error);
-        assert_eq!(bridge.ws.calls[1].1["button"], "up");
-        assert_eq!(bridge.ws.calls[1].1["ticket"], "emucap-1");
-        assert_eq!(bridge.ws.calls[2].1["button"], "cross");
-        // Each press gets its own ticket, so a late ack for the first can't satisfy the second.
-        assert_eq!(bridge.ws.calls[2].1["ticket"], "emucap-2");
+        assert!(!resp.ok);
+        assert_eq!(resp.error.unwrap().kind, "bad_params");
+        assert!(bridge.ws.calls.is_empty());
     }
 
     #[test]

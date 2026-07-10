@@ -1,9 +1,7 @@
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use emucap::live::protocol::{ProtocolError, Request, Response};
+use emucap::live::reconnect::serve_reconnecting;
 use emucap::nds_bridge::NdsBridge;
 use emucap::pc98_bridge::{BridgeEnv, GdbRspClient};
 
@@ -19,8 +17,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
     let emucap_port = parse_port(&args[1]).context("invalid EMUCAP_PORT")?;
-    let (arm9_host, arm9_port) =
-        parse_endpoint(&args[2]).context("invalid ARM9 GDB endpoint")?;
+    let (arm9_host, arm9_port) = parse_endpoint(&args[2]).context("invalid ARM9 GDB endpoint")?;
     let arm7_endpoint = match args.get(3) {
         Some(raw) => Some(parse_endpoint(raw).context("invalid ARM7 GDB endpoint")?),
         None => None,
@@ -41,13 +38,8 @@ fn main() -> anyhow::Result<()> {
         Some((host, port)) => {
             eprintln!("[desmume-nds-rust] connecting arm7={host}:{port}");
             Some(
-                GdbRspClient::connect(
-                    host,
-                    *port,
-                    Duration::from_secs(5),
-                    Duration::from_secs(30),
-                )
-                .with_context(|| format!("connect ARM7 GDB stub at {host}:{port}"))?,
+                GdbRspClient::connect(host, *port, Duration::from_secs(5), Duration::from_secs(30))
+                    .with_context(|| format!("connect ARM7 GDB stub at {host}:{port}"))?,
             )
         }
         None => {
@@ -58,40 +50,10 @@ fn main() -> anyhow::Result<()> {
 
     let mut bridge = NdsBridge::new(arm9, arm7, BridgeEnv::from_process_env());
 
-    let sock = TcpStream::connect(("127.0.0.1", emucap_port))
-        .with_context(|| format!("connect emucap MCP listener at 127.0.0.1:{emucap_port}"))?;
-    sock.set_nodelay(true).ok();
-    let mut reader = BufReader::new(sock.try_clone()?);
-    let mut writer = sock;
-    eprintln!("[desmume-nds-rust] connected");
-
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = match serde_json::from_str::<Request>(line.trim()) {
-            Ok(request) => bridge.handle_request(request),
-            Err(err) => Response {
-                id: 0,
-                ok: false,
-                result: None,
-                error: Some(ProtocolError {
-                    kind: "protocol_error".into(),
-                    message: err.to_string(),
-                }),
-            },
-        };
-        serde_json::to_writer(&mut writer, &response)?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-    }
-    Ok(())
+    serve_reconnecting(emucap_port, "desmume-nds-rust", move |request| {
+        bridge.handle_request(request)
+    })
+    .context("serve reconnecting emucap session")
 }
 
 fn parse_port(raw: &str) -> anyhow::Result<u16> {

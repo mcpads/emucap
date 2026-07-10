@@ -11,6 +11,7 @@
 #include <mednafen/hash/sha1.h>  // sha1(EMUCAP_CONTENT 보조 해시 — get_rom_info)
 
 #include "emucap.h"
+#include "emucap_input.h"
 
 // 빌드 hash(build.sh가 생성; 없으면 unknown 폴백 — LSP·build.sh 밖 직접 컴파일 대비).
 #if defined(__has_include)
@@ -54,7 +55,6 @@ static inline void emucap_net_init() { static bool d = false; if (!d) { WSADATA 
 static inline int  emucap_closesock(int s) { return ::closesocket((SOCKET)s); }
 static inline int  emucap_set_nonblock(int s) { u_long m = 1; return ::ioctlsocket((SOCKET)s, FIONBIO, &m); }
 static inline bool emucap_sock_wouldblock() { int e = ::WSAGetLastError(); return e == WSAEWOULDBLOCK || e == WSAEINTR; }
-static inline void emucap_sock_wait_ms(unsigned ms) { ::Sleep(ms); }
 static inline int  emucap_mkdir(const char* p) { return ::_mkdir(p); }
 static inline std::string emucap_temp_file(const std::string& name) {
   char dir[MAX_PATH]; DWORD n = ::GetTempPathA(MAX_PATH, dir);
@@ -66,7 +66,6 @@ static inline void emucap_net_init() {}
 static inline int  emucap_closesock(int s) { return ::close(s); }
 static inline int  emucap_set_nonblock(int s) { return ::fcntl(s, F_SETFL, O_NONBLOCK); }
 static inline bool emucap_sock_wouldblock() { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
-static inline void emucap_sock_wait_ms(unsigned ms) { ::usleep(ms * 1000); }
 static inline int  emucap_mkdir(const char* p) { return ::mkdir(p, 0755); }
 static inline std::string emucap_temp_file(const std::string& name) {
   const char* t = getenv("TMPDIR"); std::string d = (t && *t) ? std::string(t) : std::string("/tmp");
@@ -133,6 +132,9 @@ uint32 g_bp_hit_value = 0;
 
 int g_fd = -1;
 std::string g_rx;
+std::string g_tx;
+size_t g_tx_pos = 0;
+static const size_t TX_CAP = 8 * 1024 * 1024;
 uint64_t g_frame = 0;
 
 // 지연 명령(run_frames): N프레임 진행 후 응답. 진행 중엔 새 명령을 받지 않고 keepalive를 보낸다.
@@ -142,11 +144,9 @@ long g_def_age = 0;
 bool g_def_is_press = false;        // 현재 g_def가 press_buttons면 완료 시 입력 해제
 const long KEEPALIVE_FRAMES = 120;  // Rust 링크 타임아웃(5s) 안에서 데드라인 리셋
 
-// 입력 주입: 각 코어의 raw PortData 버튼 마스크(비트 set=눌림). emucap_apply_input이
-// 매 프레임 PortData[0] 버퍼에 반영한다. set_input은 다음 set_input/resume까지 유지, press_buttons는
-// g_def로 N프레임 후 해제. tap/tap_sequence/hold_until은 Rust가 set_input+step으로 조립한다.
-std::atomic<uint16_t> g_input_mask{0};   // set_input(emucap_service 스레드)과 코어 UpdateInput(GameThread)
-std::atomic<bool> g_input_engaged{false};// 간 가시성을 위해 atomic — volatile은 CPU 가시성 보장 안 함
+// 입력 주입: non-empty set_input은 다음 set_input까지 유지하고 press_buttons는 완료·중단 때
+// 네이티브 입력권을 반환한다. mask와 소유 flag를 한 atomic snapshot으로 읽어 release/apply 경합을 막는다.
+EmucapInputOverride g_input_override;
 // 게임 스레드 gamepad UpdateInput이 실제로 읽은 입력 버퍼 비트(emucap_game_data_store가 기록).
 // status/set_input 응답으로 노출해 "보낸 버튼 → 게임이 실제 받은 비트"를 한눈에 확인한다(매핑 디버깅).
 std::atomic<uint16_t> g_last_game_data{0};
@@ -245,10 +245,63 @@ int emucap_port() {
   return (port > 0 && port < 65536) ? port : 47800;
 }
 
+void rearm_breakpoints();
+
+void cancel_session_requests() {
+  const bool had_request = g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
+      || g_insn_step_id >= 0;
+  if (g_def_is_press) g_input_override.release();
+  g_def_id = -1;
+  g_def_remaining = 0;
+  g_def_age = 0;
+  g_def_is_press = false;
+  g_probe_id = -1;
+  g_probe_remaining = 0;
+  g_probe_mt.clear();
+  g_probe_addr = 0;
+  g_probe_len = 0;
+  g_step_id = -1;
+  g_step_remaining = 0;
+  g_insn_step_id = -1;
+  g_insn_remaining = 0;
+  g_insn_skip_first = false;
+  if (g_insn_armed) rearm_breakpoints();
+  if (had_request)
+    fprintf(stderr, "emucap: connection ended; cancelled session-scoped request\n");
+}
+
 void emucap_disconnect() {
+  // Never put an old response id ahead of the replacement session's hello. Persistent emulator,
+  // breakpoint, explicit set_input, and freeze state survive; only the dead session's work is lost.
+  cancel_session_requests();
   if (g_fd >= 0) emucap_closesock(g_fd);
   g_fd = -1;
   g_rx.clear();
+  g_tx.clear();
+  g_tx_pos = 0;
+}
+
+enum TxFlush { TX_IDLE, TX_COMPLETE, TX_PENDING, TX_ERROR };
+TxFlush flush_tx_once() {
+  if (g_fd < 0 || g_tx.empty()) return TX_IDLE;
+#ifdef MSG_NOSIGNAL
+  const int send_flags = MSG_NOSIGNAL;
+#else
+  const int send_flags = 0;
+#endif
+  ssize_t n = ::send(g_fd, g_tx.data() + g_tx_pos, g_tx.size() - g_tx_pos, send_flags);
+  if (n > 0) {
+    g_tx_pos += (size_t)n;
+    if (g_tx_pos >= g_tx.size()) {
+      g_tx.clear();
+      g_tx_pos = 0;
+      return TX_COMPLETE;
+    }
+    return TX_PENDING;
+  }
+  if (n < 0 && emucap_sock_wouldblock()) return TX_PENDING;
+  emucap_disconnect();
+  return TX_ERROR;
 }
 
 // emucap-mcp(서버)에 접속. localhost 블로킹 connect는 즉시 성공/거부된다.
@@ -274,27 +327,26 @@ void emucap_connect() {
   emucap_set_nonblock(fd);  // recv는 논블로킹
   g_fd = fd;
   g_rx.clear();
+  g_tx.clear();
+  g_tx_pos = 0;
 }
 
 void send_line(const std::string& s) {
   if (g_fd < 0) return;
-  std::string line = s + "\n";
-  size_t sent = 0;
-  while (sent < line.size()) {
-#ifdef MSG_NOSIGNAL
-    const int send_flags = MSG_NOSIGNAL;
-#else
-    const int send_flags = 0;
-#endif
-    ssize_t n = ::send(g_fd, line.data() + sent, line.size() - sent, send_flags);
-    if (n > 0) { sent += (size_t)n; continue; }
-    if (n < 0 && emucap_sock_wouldblock()) {
-      emucap_sock_wait_ms(1);   // 논블로킹 소켓 송신버퍼 가득(대용량 응답) — 잠깐 대기 후 재시도
-      continue;
-    }
-    emucap_disconnect();  // 진짜 끊김 → 재접속 유도
+  const size_t line_size = s.size() + 1;
+  const size_t remaining = g_tx.empty() ? 0 : g_tx.size() - g_tx_pos;
+  if (s.size() >= TX_CAP || remaining > TX_CAP - line_size) {
+    fprintf(stderr, "emucap: TX too large; dropping connection\n");
+    emucap_disconnect();
     return;
   }
+  if (!g_tx.empty() && g_tx_pos > 0) {
+    g_tx.erase(0, g_tx_pos);
+    g_tx_pos = 0;
+  }
+  g_tx.append(s);
+  g_tx.push_back('\n');
+  flush_tx_once();
 }
 
 // ── 최소 JSON 추출(첫 컷). 정식 파서는 후속(Lua의 json_decode에 대응). ──
@@ -629,7 +681,7 @@ void flush_deferred_on_freeze(uint32 pc) {
            "{\"status\":\"interrupted\",\"reason\":\"breakpoint\",\"pc\":%u,\"frame\":%llu}",
            (unsigned)pc, (unsigned long long)g_frame);
   if (g_def_id >= 0) {
-    if (g_def_is_press) { g_input_mask = 0; g_def_is_press = false; }  // press 중단 → 버튼 해제
+    if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
     reply_ok(g_def_id, buf);
     g_def_id = -1;
     g_def_remaining = 0;
@@ -2030,6 +2082,7 @@ void handle(const std::string& line) {
     const char* emu_name = getenv("EMUCAP_NAME");
     const char* session_token = getenv("EMUCAP_SESSION_TOKEN");
     const char* content = getenv("EMUCAP_CONTENT");
+    const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
     std::string resp = std::move(hello_resp);
     if (emu_name && emu_name[0]) {
       // 닫는 } 전에 ,"name":"..."를 삽입한다. JSON 이스케이프 + std::string 조립으로
@@ -2052,6 +2105,12 @@ void handle(const std::string& line) {
       if (c.size() > 512) c.resize(512);
       resp.pop_back();
       resp += ",\"content\":\"" + json_escape(c) + "\"}";
+    }
+    if (launch_id && launch_id[0] && !resp.empty() && resp.back() == '}') {
+      std::string value(launch_id);
+      if (value.size() > 128) value.resize(128);
+      resp.pop_back();
+      resp += ",\"launch_id\":\"" + json_escape(value) + "\"}";
     }
     reply_ok(id, resp);
   } else if (method == "status") {
@@ -2125,8 +2184,8 @@ void handle(const std::string& line) {
     uint16_t m = 0;
     std::string input_err;
     if (!buttons_to_mask(line, m, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
-    g_input_mask = m;
-    g_input_engaged = true;                // 이후 매 프레임 주입이 호스트 입력을 덮어씀
+    if (m == 0) g_input_override.release();
+    else g_input_override.engage(m);
     reset_input_diagnostics();             // 이번 주입 이후 latch/read 진단만 모은다
     // 응답에 적용된 비트마스크·버튼명을 echo한다(보낸 버튼 ↔ 실제 비트 불일치를 즉시 확인).
     char rbuf[256];
@@ -2140,8 +2199,7 @@ void handle(const std::string& line) {
     uint16_t m = 0;
     std::string input_err;
     if (!buttons_to_mask(line, m, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
-    g_input_mask = m;
-    g_input_engaged = true;
+    g_input_override.engage(m);
     reset_input_diagnostics(); // 이번 주입 이후 latch/read 진단만 모은다
     g_frozen = false;          // run_frames와 동일: 어댑터에서 직접 resume(재freeze 레이스로 g_def가 freeze_spin에 갇히는 timeout 방지)
     g_def_id = id;             // 지연: N프레임 누른 뒤 완료 응답 + 입력 해제(emucap_service)
@@ -2623,10 +2681,19 @@ void handle(const std::string& line) {
 
 // 소켓을 한 사이클 서비스(논블로킹 recv + 줄 단위 처리). 정상 경로와 frozen 스핀 양쪽에서 쓴다.
 void serve_socket_once() {
+  if (g_fd < 0) return;
+  if (!g_tx.empty()) {
+    flush_tx_once();
+    if (g_fd < 0 || !g_tx.empty()) return;
+  }
   char tmp[8192];
   ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
   if (n == 0) { emucap_disconnect(); return; }  // 상대 끊김
-  if (n < 0) return;                             // EAGAIN: 데이터 없음
+  if (n < 0) {
+    if (emucap_sock_wouldblock()) return;         // EAGAIN/EWOULDBLOCK/EINTR: 데이터 없음
+    emucap_disconnect();                          // ECONNRESET 등 hard error → 재접속
+    return;
+  }
   g_rx.append(tmp, (size_t)n);
   size_t pos;
   while ((pos = g_rx.find('\n')) != std::string::npos) {
@@ -2849,18 +2916,13 @@ extern "C" void emucap_md_vdp_write(const char* memory_type, unsigned address, u
   enqueue_bp_hit(hit, should_freeze);
 }
 
-// MDFNGameInfo->Emulate 직전과 MidSync에서 호출. 주입이 engaged면 포트0 버퍼를 g_input_mask로
-// 덮어쓴다. 다음 코어 입력 갱신이 이 버퍼를 읽으므로 step/run_frames
-// 진행 중에도 주입 입력이 반영된다. g_input_*는 emucap_service 스레드가 쓰고 여기(main)서 읽으므로
-// atomic이라야 가시성이 보장된다(이게 없으면 입력이 무입력↔입력으로 진동한다).
+// MDFNGameInfo->Emulate 직전과 MidSync에서 호출. 주입이 engaged면 포트0 버퍼를 override mask로
+// 덮어쓴다. 다음 코어 입력 갱신이 이 버퍼를 읽으므로 step/run_frames 진행 중에도 주입이 반영된다.
 extern "C" void emucap_apply_input(unsigned char* port0_data, unsigned port0_len) {
-  if (!g_input_engaged || !port0_data) return;
   // 포트0 버퍼는 active-high(눌림=1)로 SS·PSX·PCE·MD 공통이다 — 코어가 읽을 때만 반전한다
   // (Saturn: ~(data[0]|data[1]<<8); PSX gamepad/DualShock: 전송 시 0xFF^buttons). 따라서
   // 마스크를 그대로 기록한다. PSX DualShock의 analog/axis(바이트2~)는 안 건드려 보존된다.
-  port0_data[0] = (unsigned char)(g_input_mask & 0xFF);
-  if (port0_len > 1)
-    port0_data[1] = (unsigned char)((g_input_mask >> 8) & 0xFF);
+  g_input_override.apply(port0_data, port0_len);
 }
 
 // MDFNI_Emulate 직후 훅에서 최신 프레임버퍼를 기록(screenshot이 PNG로 인코딩). 타입 결합을 피하려고
@@ -2881,25 +2943,27 @@ void emucap_service(uint64_t frame) {
   }
   // 지연 명령(run_frames) 진행 중이면 그것만 진행한다(새 명령은 안 받음 — 에이전트 대기 중).
   if (g_def_id >= 0) {
+    if (!g_tx.empty()) flush_tx_once();
     g_def_remaining--;
     g_def_age++;
     if (g_def_remaining <= 0) {
-      if (g_def_is_press) { g_input_mask = 0; g_def_is_press = false; }  // press_buttons 끝 → 뗌
+      if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
       char buf[96];
       snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu}",
                (unsigned long long)g_frame);
       reply_ok(g_def_id, buf);
       g_def_id = -1;
-    } else if (g_def_age % KEEPALIVE_FRAMES == 0) {
+    } else if (g_def_age % KEEPALIVE_FRAMES == 0 && g_tx.empty()) {
       reply_ok(g_def_id, "{\"status\":\"working\"}");  // keepalive(Rust가 working은 건너뜀)
     }
     return;
   }
   // 원자적 probe 진행 중: N프레임 진행(다른 명령 차단) 후 타깃 읽고 응답.
   if (g_probe_id >= 0) {
+    if (!g_tx.empty()) flush_tx_once();
     if (g_probe_remaining > 0) {
       g_probe_remaining--;
-      if (g_probe_remaining > 0 && g_probe_remaining % KEEPALIVE_FRAMES == 0)
+      if (g_probe_remaining > 0 && g_probe_remaining % KEEPALIVE_FRAMES == 0 && g_tx.empty())
         reply_ok(g_probe_id, "{\"status\":\"working\"}");  // 긴 진행도 타임아웃 안 나게
       return;  // 프레임 진행만(serve_socket_once 미호출 → 네트워크 갭 없음 → 결정론)
     }
@@ -2914,6 +2978,7 @@ void emucap_service(uint64_t frame) {
   }
   // step(N) 진행: 매 프레임 1씩 줄이고, 0에서 완료 응답 후 frozen 유지(다음 호출이 스핀).
   if (g_step_remaining > 0) {
+    if (!g_tx.empty()) flush_tx_once();
     g_step_remaining--;
     if (g_step_remaining == 0 && g_step_id >= 0) {
       char buf[96];

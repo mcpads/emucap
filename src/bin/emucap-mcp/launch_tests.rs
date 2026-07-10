@@ -9,6 +9,29 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn new(keys: &[&'static str]) -> Self {
+        Self(
+            keys.iter()
+                .map(|key| (*key, std::env::var_os(key)))
+                .collect(),
+        )
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, value) in &self.0 {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 fn make_executable(path: &Path) {
     #[cfg(unix)]
     {
@@ -269,9 +292,8 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
 
 #[test]
 fn infer_system_uses_psp_game_header_in_iso() {
-    // Real PSP UMD ISOs are ISO9660 with a "PSP GAME" System Identifier at the Primary Volume
-    // Descriptor (LBA 16 = byte offset 0x8000, field offset 8) — verified against a real retail
-    // ISO in `.superpowers/sdd/task-11-report.md`. A plain .iso extension alone is ambiguous
+    // PSP UMD ISOs are ISO9660 with a "PSP GAME" System Identifier at the Primary Volume
+    // Descriptor (LBA 16 = byte offset 0x8000, field offset 8). A plain .iso extension alone is ambiguous
     // (shared with Saturn/PSX/PCE/MD/Dreamcast), so this header disambiguates it like the existing
     // Saturn/PSX/PCE/MD marker checks.
     let tmp = tempfile::tempdir().unwrap();
@@ -398,8 +420,15 @@ fn launch_plan_for_gameboy_family_uses_mesen2_and_gb_entry() {
         assert_eq!(plan["system"], expected, ".{ext}");
         assert_eq!(plan["adapter"], "mesen2", ".{ext}");
         assert_eq!(plan["force_module"], serde_json::Value::Null, ".{ext}");
-        assert_eq!(plan["preferred_launcher"]["args"]["system"], expected, ".{ext}");
-        assert_eq!(plan["button_hint"]["system"], expected_button_system(expected), ".{ext}");
+        assert_eq!(
+            plan["preferred_launcher"]["args"]["system"], expected,
+            ".{ext}"
+        );
+        assert_eq!(
+            plan["button_hint"]["system"],
+            expected_button_system(expected),
+            ".{ext}"
+        );
     }
 }
 
@@ -842,6 +871,144 @@ impl EmulatorLink for NotConnectedPortLink {
     }
 }
 
+struct RuntimeLaunchLink {
+    caps: Capabilities,
+    port: u16,
+    token: String,
+}
+
+impl RuntimeLaunchLink {
+    fn new(port: u16) -> Self {
+        Self {
+            caps: Capabilities::empty(),
+            port,
+            token: "legacy-control-token".into(),
+        }
+    }
+}
+
+impl EmulatorLink for RuntimeLaunchLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        Err(LinkError::NotConnected)
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(self.port)
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        Some(&self.token)
+    }
+
+    fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.token = token.to_string();
+        Ok(true)
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_launch_publishes_generation_and_refuses_duplicate() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("fake-mesen");
+    let content = tmp.path().join("game.sfc");
+    let capture = PathBuf::from(format!("{}.token", content.display()));
+    let runtime_capture = PathBuf::from(format!("{}.runtime", content.display()));
+    std::fs::write(
+        &binary,
+        b"#!/bin/sh\nprintf '%s' \"$EMUCAP_SESSION_TOKEN\" > \"${EMUCAP_CONTENT}.token\"\nprintf '%s\\n%s' \"$EMUCAP_LAUNCH_ID\" \"$EMUCAP_FAILURE_FILE\" > \"${EMUCAP_CONTENT}.runtime\"\nexec sleep 30\n",
+    )
+    .unwrap();
+    make_executable(&binary);
+    std::fs::write(&content, b"rom").unwrap();
+
+    let _env = EnvRestore::new(&["MESEN_BIN", "EMUCAP_EMU_HOME"]);
+    std::env::set_var("MESEN_BIN", &binary);
+    std::env::set_var("EMUCAP_EMU_HOME", tmp.path().join("emu-home"));
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut link = RuntimeLaunchLink::new(port);
+    let mut args = LaunchArgs {
+        content_path: content.display().to_string(),
+        content_path2: None,
+        system: Some("snes".into()),
+        name: Some("capsule-test".into()),
+        display: None,
+        replace: false,
+    };
+
+    let first = make_launch(&mut link, &args);
+    assert_eq!(first["launched"], true, "{first}");
+    let launch_id = first["launch_id"].as_str().unwrap();
+    let store = emucap::live::runtime::RuntimeStore::discover();
+    let current = store.read_current(port).unwrap().unwrap();
+    assert_eq!(current.launch_id, launch_id);
+    assert_eq!(current.process_state(), ProcessState::Alive);
+    let auth = store.read_auth(port, launch_id).unwrap().unwrap();
+    assert_eq!(auth, link.token);
+
+    for _ in 0..20 {
+        if capture.exists() && runtime_capture.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(&capture).unwrap(), auth);
+    let runtime_lines = std::fs::read_to_string(&runtime_capture).unwrap();
+    let mut runtime_lines = runtime_lines.lines();
+    assert_eq!(runtime_lines.next(), Some(launch_id));
+    assert_eq!(
+        runtime_lines.next(),
+        Some(
+            store
+                .adapter_failure_path(port, launch_id)
+                .to_str()
+                .unwrap()
+        )
+    );
+    assert_eq!(runtime_lines.next(), None);
+
+    let duplicate = make_launch(&mut link, &args);
+    assert_eq!(duplicate["launched"], false, "{duplicate}");
+    assert!(duplicate["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("still alive")));
+    assert_eq!(
+        store.read_current(port).unwrap().unwrap().launch_id,
+        launch_id
+    );
+
+    args.replace = true;
+    let replacement = make_launch(&mut link, &args);
+    assert_eq!(replacement["launched"], true, "{replacement}");
+    let replacement_id = replacement["launch_id"].as_str().unwrap();
+    assert_ne!(replacement_id, launch_id);
+    let replacement_current = store.read_current(port).unwrap().unwrap();
+    assert_eq!(replacement_current.launch_id, replacement_id);
+    assert!(!store.generation_dir(port, launch_id).exists());
+
+    std::fs::write(&binary, b"#!/bin/sh\nexit 7\n").unwrap();
+    make_executable(&binary);
+    let failed = make_launch(&mut link, &args);
+    assert_eq!(failed["launched"], false, "{failed}");
+    assert_eq!(
+        store.read_current(port).unwrap().unwrap().launch_id,
+        replacement_id,
+        "failed replacement must not publish its prepared generation"
+    );
+}
+
 #[test]
 fn launch_refuses_missing_content_before_binary_resolution() {
     let tmp = tempfile::tempdir().unwrap();
@@ -856,6 +1023,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
             system: Some("snes".into()),
             name: None,
             display: None,
+            replace: false,
         },
     );
 
@@ -901,6 +1069,7 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
             system: Some("dc".into()),
             name: None,
             display: None,
+            replace: false,
         },
     );
 
@@ -969,6 +1138,7 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
             system: Some("pc98".into()),
             name: None,
             display: None,
+            replace: false,
         },
     );
 
@@ -1015,6 +1185,7 @@ fn launch_refuses_occupied_port_before_spawn() {
             system: Some("md".into()),
             name: None,
             display: None,
+            replace: false,
         },
     );
 
@@ -1085,6 +1256,7 @@ fn launch_refuses_when_this_session_already_connected() {
             system: Some("pc98".into()),
             name: Some("dup-B".into()),
             display: None,
+            replace: false,
         },
     );
 

@@ -104,6 +104,7 @@ pub struct Launch<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
+    pub runtime: Option<super::RuntimeEnv<'a>>,
     /// Mute audio (default true for debugging).
     pub mute: bool,
     /// Enable Flycast's GDB stub (for the exec-breakpoint path).
@@ -268,6 +269,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
         port: l.port,
         name: l.name,
         session_token: l.session_token,
+        runtime: l.runtime,
         headless: false,
     };
     let mut spec = flycast_spec(&launch_binary, l.log_path, &opts);

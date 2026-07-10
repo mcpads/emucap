@@ -300,7 +300,10 @@ fn broker_fences_stale_response_after_steal() {
     // A가 조용해져(heartbeat 없음) stale → B가 steal.
     std::thread::sleep(Duration::from_millis(250)); // > 150ms 임계
     let (b_sock, ar_b) = attach(&sa, Some("g"));
-    assert!(ar_b.contains("attached_name"), "B가 stale A를 steal: {ar_b}");
+    assert!(
+        ar_b.contains("attached_name"),
+        "B가 stale A를 steal: {ar_b}"
+    );
     // B도 같은 id=7로 자기 요청 전송(겹치는 id 공간 재현).
     {
         let mut wb = b_sock.try_clone().unwrap();

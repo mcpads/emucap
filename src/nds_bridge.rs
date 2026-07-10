@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -67,6 +68,13 @@ const MAX_WRITE_LEN: usize = 0x2_0000;
 /// `arm9`/`arm7` bus views would otherwise stream the whole address space over the GDB `m` path;
 /// a longer request is scanned up to this cap and reported as `truncated_scan`.
 const MAX_FIND_LEN: usize = 128 * 1024;
+/// The bridge must return a terminal NDJSON response before the outer link's five-second read
+/// deadline. DeSmuME's GDB stub cannot stream keepalives while the bridge polls a timed override,
+/// so accept only a bounded real-time pulse here; longer holds remain available through
+/// `set_input` plus an explicit release.
+const MAX_SYNC_TIMED_INPUT_FRAMES: u64 = 120;
+const TIMED_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const TIMED_INPUT_DEADLINE: Duration = Duration::from_millis(4_000);
 
 const METHODS: &[&str] = &[
     "hello",
@@ -115,6 +123,12 @@ const NDS_INPUT_BUTTONS: &[&str] = &[
 enum CpuId {
     Arm9,
     Arm7,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimedOverrideTerminal {
+    Completed,
+    Interrupted { frames_elapsed: u64 },
 }
 
 impl CpuId {
@@ -436,25 +450,9 @@ impl<G: GdbTransport> CpuConn<G> {
         r
     }
 
-    /// 타이밍(frames) 입력은 프레임이 흘러야 auto-release되는데 그 카운터는 running 중에만 감소한다(fork). frozen
-    /// 코어에 timed 입력을 심으면 프레임이 안 흘러 armed로 남아 다음 resume에 stale 발화한다 — 그래서 frozen이면
-    /// 거부한다(resume 후 다시 호출하거나 frames를 빼 hold로 쓰라). hold(frames=None)는 frozen에서도 무해하다.
-    fn reject_timed_input_while_frozen(&self, frames: Option<u64>) -> NdsResult<()> {
-        if frames.is_some() && self.frozen {
-            return Err(NdsBridgeError::BadParams(
-                "timed input (frames) needs a running emulator — on a frozen core the frame counter \
-                 never advances, so the press/tap never elapses and stays armed until a later resume \
-                 (firing in an unrelated state). resume first, or omit frames to hold the input."
-                    .into(),
-            ));
-        }
-        Ok(())
-    }
-
     /// emucap custom RSP input (`QEmucap,input:<hexmask>[,<hexframes>]`). `frames=None` holds
     /// until the next input command; `Some(n)` auto-releases after n processed frames.
     fn send_input(&mut self, mask: u16, frames: Option<u64>) -> NdsResult<()> {
-        self.reject_timed_input_while_frozen(frames)?;
         let payload = match frames {
             Some(frames) => format!("QEmucap,input:{mask:x},{frames:x}"),
             None => format!("QEmucap,input:{mask:x}"),
@@ -471,7 +469,6 @@ impl<G: GdbTransport> CpuConn<G> {
     /// emucap custom RSP touch (`QEmucap,touch:<hexX>,<hexY>[,<hexframes>]`, `QEmucap,touch:release`).
     /// `frames=None` holds until changed; `Some(n)` auto-lifts after n processed frames (a tap).
     fn send_touch(&mut self, x: u16, y: u16, frames: Option<u64>) -> NdsResult<()> {
-        self.reject_timed_input_while_frozen(frames)?;
         let payload = match frames {
             Some(frames) => format!("QEmucap,touch:{x:x},{y:x},{frames:x}"),
             None => format!("QEmucap,touch:{x:x},{y:x}"),
@@ -481,6 +478,58 @@ impl<G: GdbTransport> CpuConn<G> {
             return Err(NdsBridgeError::Emulator(format!("touch injection failed: {resp}")));
         }
         Ok(())
+    }
+
+    fn override_remaining(&mut self, status_command: &str) -> NdsResult<i64> {
+        let resp = self.send_cmd(status_command)?;
+        let remaining = resp.parse::<i64>().map_err(|_| {
+            NdsBridgeError::Emulator(format!(
+                "timed override status returned an invalid value: {resp:?}"
+            ))
+        })?;
+        if remaining < -1 {
+            return Err(NdsBridgeError::Emulator(format!(
+                "timed override status returned an invalid remaining count: {remaining}"
+            )));
+        }
+        Ok(remaining)
+    }
+
+    /// Poll the fork-owned emulator-frame countdown until release. Each query is sent through
+    /// `with_frozen`, so the RSP stub sees a clean prompt; the brief host polling gaps only affect
+    /// wall time, never the number of emulator frames for which the override is applied.
+    fn wait_timed_override(
+        &mut self,
+        status_command: &str,
+        requested_frames: u64,
+    ) -> NdsResult<TimedOverrideTerminal> {
+        let started = Instant::now();
+        loop {
+            std::thread::sleep(TIMED_INPUT_POLL_INTERVAL);
+            let remaining = self.override_remaining(status_command)?;
+            if remaining < 0 {
+                return Err(NdsBridgeError::Emulator(
+                    "timed override unexpectedly became a persistent hold".into(),
+                ));
+            }
+            let frames_elapsed = requested_frames.saturating_sub(remaining as u64);
+            // with_frozen leaves a genuinely stopped core frozen instead of resuming past its BP.
+            // Check this before remaining==0: release and a breakpoint can land on the same frame,
+            // and reporting completed/running would otherwise hide the real frozen terminal state.
+            // The caller owns cleanup and will release the transient override before responding.
+            if self.frozen {
+                return Ok(TimedOverrideTerminal::Interrupted { frames_elapsed });
+            }
+            if remaining == 0 {
+                return Ok(TimedOverrideTerminal::Completed);
+            }
+            if started.elapsed() >= TIMED_INPUT_DEADLINE {
+                return Err(NdsBridgeError::Emulator(format!(
+                    "timed override did not complete within {} ms (requested {requested_frames} frames, {remaining} remaining)",
+                    TIMED_INPUT_DEADLINE.as_millis()
+                )));
+            }
+        }
     }
 
     fn send_touch_release(&mut self) -> NdsResult<()> {
@@ -640,6 +689,9 @@ impl<G: GdbTransport> NdsBridge<G> {
         if let Some(token) = &self.env.session_token {
             obj.insert("session_token".into(), json!(token));
         }
+        if let Some(launch_id) = &self.env.launch_id {
+            obj.insert("launch_id".into(), json!(launch_id));
+        }
         if let Some(content) = &self.env.content {
             obj.insert("content".into(), json!(content.display().to_string()));
         }
@@ -655,6 +707,18 @@ impl<G: GdbTransport> NdsBridge<G> {
         if let Some(a7) = self.arm7.as_mut() {
             a7.drain_stops()?;
         }
+        // The fork owns persistent/timed overrides, so query it instead of trusting bridge-local
+        // bookkeeping that would be lost on a bridge reconnect. Older binaries remain observable=false.
+        let input_override = override_status_json(
+            self.arm9
+                .override_remaining("qEmucap,inputstatus")
+                .ok(),
+        );
+        let touch_override = override_status_json(
+            self.arm9
+                .override_remaining("qEmucap,touchstatus")
+                .ok(),
+        );
         Ok(json!({
             "connected": true,
             "system": "nds",
@@ -666,6 +730,8 @@ impl<G: GdbTransport> NdsBridge<G> {
             "cpus": self.cpu_status(),
             "capability_notes": self.capability_notes(),
             "input_buttons": nds_input_buttons_json(),
+            "input_override": input_override,
+            "touch_override": touch_override,
         }))
     }
 
@@ -982,7 +1048,7 @@ impl<G: GdbTransport> NdsBridge<G> {
                 if params.get("frames").is_some() {
                     return Err(NdsBridgeError::Unsupported(
                         "nds bridge: 프레임 step 미지원 — GDB-RSP엔 프레임 개념이 없다. 명령 단위 진행은 \
-                         step_instructions를 쓰라. 진짜 프레임 실행(DeSmuME fork run-frames 훅)은 미구현(TODO)"
+                         step_instructions를 쓰라. DeSmuME fork도 frame-run primitive를 제공하지 않는다"
                             .into(),
                     ));
                 }
@@ -1025,13 +1091,13 @@ impl<G: GdbTransport> NdsBridge<G> {
             )));
         }
         // NDS GDB-RSP는 단일 주소 exec BP만이다(Z0/Z1 @ addr, 4바이트). 코어 BP 페이로드의 범위(end)·pc/value
-        // 필터·비-pausing·auto_savestate·snapshot은 브리지가 아직 구현 안 했다. 이들을 조용히 무시하면(성공인데
+        // 필터·비-pausing·auto_savestate·snapshot은 브리지가 지원하지 않는다. 이들을 조용히 무시하면(성공인데
         // start만 걸리거나 GDB가 무조건 halt) 호출자가 오해하므로, 지원 서브셋만 통과시키고 나머지는
-        // 거부한다. 필터 지원은 후속 TODO.
+        // 거부한다.
         if let (Some(s), Some(e)) = (optional_num(params, "start")?, optional_num(params, "end")?) {
             if e != s {
                 return Err(NdsBridgeError::Unsupported(
-                    "nds bridge: 범위 BP 미지원 — 단일 주소 exec만(start==end). 범위/워치포인트는 아직 미구현(TODO)"
+                    "nds bridge: 범위 BP 미지원 — 단일 주소 exec만(start==end)"
                         .into(),
                 ));
             }
@@ -1039,19 +1105,19 @@ impl<G: GdbTransport> NdsBridge<G> {
         for opt in ["pc_min", "pc_max", "value"] {
             if optional_num(params, opt)?.is_some() {
                 return Err(NdsBridgeError::Unsupported(format!(
-                    "nds bridge: {opt} 미지원 — 단일 주소 exec BP만(GDB Z0/Z1). pc/value 필터는 아직 미구현(TODO)"
+                    "nds bridge: {opt} 미지원 — 단일 주소 exec BP만(GDB Z0/Z1)"
                 )));
             }
         }
         if params.get("pause_on_hit").and_then(Value::as_bool) == Some(false) {
             return Err(NdsBridgeError::Unsupported(
-                "nds bridge: pause_on_hit=false 미지원 — GDB BP는 항상 코어를 halt한다(비-pausing 텔레메트리 미구현 TODO)"
+                "nds bridge: pause_on_hit=false 미지원 — GDB BP는 항상 코어를 halt한다"
                     .into(),
             ));
         }
         if params.get("auto_savestate").and_then(Value::as_bool) == Some(true) {
             return Err(NdsBridgeError::Unsupported(
-                "nds bridge: auto_savestate 미지원(TODO)".into(),
+                "nds bridge: auto_savestate 미지원".into(),
             ));
         }
         if params
@@ -1060,7 +1126,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             .is_some_and(|a| !a.is_empty())
         {
             return Err(NdsBridgeError::Unsupported(
-                "nds bridge: snapshot 미지원 — 히트 후 read_memory로 직접 캡처하라(TODO)".into(),
+                "nds bridge: snapshot 미지원 — 히트 후 read_memory로 직접 캡처하라".into(),
             ));
         }
         let hardware = params
@@ -1188,7 +1254,11 @@ impl<G: GdbTransport> NdsBridge<G> {
     fn set_input(&mut self, params: &Value) -> NdsResult<Value> {
         let (mask, buttons) = buttons_to_mask(params.get("buttons"))?;
         self.arm9.send_input(mask, None)?;
-        Ok(json!({ "buttons": buttons, "cpu": "arm9" }))
+        Ok(json!({
+            "buttons": buttons,
+            "cpu": "arm9",
+            "override_engaged": mask != 0,
+        }))
     }
 
     /// Hold a button set for `frames` processed frames, then auto-release. The fork counts the
@@ -1202,8 +1272,57 @@ impl<G: GdbTransport> NdsBridge<G> {
             ));
         }
         let frames = optional_num(params, "frames")?.unwrap_or(1).max(1);
+        if frames > MAX_SYNC_TIMED_INPUT_FRAMES {
+            return Err(NdsBridgeError::BadParams(format!(
+                "NDS synchronous press_buttons supports at most {MAX_SYNC_TIMED_INPUT_FRAMES} frames; use set_input plus an explicit set_input([]) release for a longer hold"
+            )));
+        }
+        let was_frozen = self.arm9.frozen;
         self.arm9.send_input(mask, Some(frames))?;
-        Ok(json!({ "buttons": buttons, "frames": frames, "cpu": "arm9" }))
+        if was_frozen {
+            if let Err(err) = self.resume(&json!({})) {
+                return Err(cleanup_timed_override_error(
+                    err,
+                    self.arm9.send_input(0, None),
+                ));
+            }
+        }
+        let terminal = match self
+            .arm9
+            .wait_timed_override("qEmucap,inputstatus", frames)
+        {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                return Err(cleanup_timed_override_error(
+                    err,
+                    self.arm9.send_input(0, None),
+                ))
+            }
+        };
+        match terminal {
+            TimedOverrideTerminal::Completed => Ok(json!({
+                "status": "completed",
+                "buttons": buttons,
+                "frames": frames,
+                "frames_elapsed": frames,
+                "cpu": "arm9",
+                "state": "running",
+                "override_engaged": false,
+            })),
+            TimedOverrideTerminal::Interrupted { frames_elapsed } => {
+                self.arm9.send_input(0, None)?;
+                Ok(json!({
+                    "status": "interrupted",
+                    "reason": "breakpoint",
+                    "buttons": buttons,
+                    "frames": frames,
+                    "frames_elapsed": frames_elapsed,
+                    "cpu": "arm9",
+                    "state": "frozen",
+                    "override_engaged": false,
+                }))
+            }
+        }
     }
 
     /// Touch the bottom screen at (x, y) (256x192). `release: true` lifts; `frames` presses for that
@@ -1211,7 +1330,7 @@ impl<G: GdbTransport> NdsBridge<G> {
     fn touch(&mut self, params: &Value) -> NdsResult<Value> {
         if params.get("release").and_then(Value::as_bool).unwrap_or(false) {
             self.arm9.send_touch_release()?;
-            return Ok(json!({ "released": true, "cpu": "arm9" }));
+            return Ok(json!({ "released": true, "cpu": "arm9", "override_engaged": false }));
         }
         let x = optional_num(params, "x")?
             .ok_or_else(|| NdsBridgeError::BadParams("touch requires x (0-255)".into()))?;
@@ -1223,8 +1342,69 @@ impl<G: GdbTransport> NdsBridge<G> {
             )));
         }
         let frames = optional_num(params, "frames")?;
+        if let Some(frames) = frames {
+            if frames == 0 || frames > MAX_SYNC_TIMED_INPUT_FRAMES {
+                return Err(NdsBridgeError::BadParams(format!(
+                    "NDS timed touch frames must be 1..={MAX_SYNC_TIMED_INPUT_FRAMES}; omit frames for a persistent hold"
+                )));
+            }
+            let was_frozen = self.arm9.frozen;
+            self.arm9.send_touch(x as u16, y as u16, Some(frames))?;
+            if was_frozen {
+                if let Err(err) = self.resume(&json!({})) {
+                    return Err(cleanup_timed_override_error(
+                        err,
+                        self.arm9.send_touch_release(),
+                    ));
+                }
+            }
+            let terminal = match self
+                .arm9
+                .wait_timed_override("qEmucap,touchstatus", frames)
+            {
+                Ok(terminal) => terminal,
+                Err(err) => {
+                    return Err(cleanup_timed_override_error(
+                        err,
+                        self.arm9.send_touch_release(),
+                    ))
+                }
+            };
+            return match terminal {
+                TimedOverrideTerminal::Completed => Ok(json!({
+                    "status": "completed",
+                    "x": x,
+                    "y": y,
+                    "frames": frames,
+                    "frames_elapsed": frames,
+                    "cpu": "arm9",
+                    "state": "running",
+                    "override_engaged": false,
+                })),
+                TimedOverrideTerminal::Interrupted { frames_elapsed } => {
+                    self.arm9.send_touch_release()?;
+                    Ok(json!({
+                        "status": "interrupted",
+                        "reason": "breakpoint",
+                        "x": x,
+                        "y": y,
+                        "frames": frames,
+                        "frames_elapsed": frames_elapsed,
+                        "cpu": "arm9",
+                        "state": "frozen",
+                        "override_engaged": false,
+                    }))
+                }
+            };
+        }
         self.arm9.send_touch(x as u16, y as u16, frames)?;
-        Ok(json!({ "x": x, "y": y, "frames": frames, "cpu": "arm9" }))
+        Ok(json!({
+            "x": x,
+            "y": y,
+            "frames": frames,
+            "cpu": "arm9",
+            "override_engaged": true,
+        }))
     }
 
     /// Write a native DeSmuME savestate to `path`. Savestates are global (both cores + PPU/SPU),
@@ -1544,6 +1724,8 @@ impl<G: GdbTransport> NdsBridge<G> {
             "implemented_methods": METHODS,
             "screenshot": true,
             "input": true,
+            "timed_input_terminal_ack": true,
+            "timed_input_max_frames": MAX_SYNC_TIMED_INPUT_FRAMES,
             "frame_step": false,
             "step_units": ["instructions"],
             "breakpoints": true,
@@ -1555,6 +1737,40 @@ impl<G: GdbTransport> NdsBridge<G> {
             "dual_cpu": true,
             "cpus": self.connected_cpu_names(),
         })
+    }
+}
+
+fn cleanup_timed_override_error(
+    primary: NdsBridgeError,
+    cleanup: NdsResult<()>,
+) -> NdsBridgeError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup_err) => NdsBridgeError::Emulator(format!(
+            "{primary}; transient input cleanup also failed: {cleanup_err}"
+        )),
+    }
+}
+
+fn override_status_json(remaining: Option<i64>) -> Value {
+    match remaining {
+        None => json!({ "observable": false }),
+        Some(0) => json!({
+            "observable": true,
+            "engaged": false,
+            "remaining_frames": 0,
+        }),
+        Some(-1) => json!({
+            "observable": true,
+            "engaged": true,
+            "mode": "persistent",
+        }),
+        Some(remaining) => json!({
+            "observable": true,
+            "engaged": true,
+            "mode": "timed",
+            "remaining_frames": remaining,
+        }),
     }
 }
 
@@ -2374,7 +2590,8 @@ mod tests {
         // Scope: a breakpoint hits while the bridge still believes the core is running; the data
         // command's with_frozen pause must not swallow the pending S05, so poll_events still reports
         // it. Register/state correctness at the stop is out of scope here — the fake stub's `g` reply
-        // is static and can't model the core advancing past the breakpoint; that is verified live.
+        // is static and can't model the core advancing past the breakpoint; the live core owns
+        // that transition.
         let regs = arm_regs_hex(&[(15, 0x0200_0000)], 0);
         let mut bridge = bridge_arm9_only(&[("?", "S05"), ("g", &regs)]);
         bridge.arm9.frozen = false; // bridge believes the core is running
@@ -2569,8 +2786,12 @@ mod tests {
     #[test]
     fn press_buttons_encodes_mask_and_frames() {
         // a=bit0 -> mask 1, frames 3 -> "QEmucap,input:1,3"
-        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("QEmucap,input:1,3", "OK")]);
-        bridge.arm9.frozen = false; // timed input needs a running core (with_frozen pauses to inject)
+        let mut bridge = bridge_arm9_only(&[
+            ("?", "S05"),
+            ("QEmucap,input:1,3", "OK"),
+            ("qEmucap,inputstatus", "2"),
+            ("qEmucap,inputstatus", "0"),
+        ]);
         let response = bridge.handle_request(Request::new(
             1,
             "press_buttons",
@@ -2578,8 +2799,12 @@ mod tests {
         ));
         assert!(response.ok, "press failed: {:?}", response.error);
         let result = response.result.unwrap();
+        assert_eq!(result["status"], "completed");
         assert_eq!(result["frames"], 3);
+        assert_eq!(result["frames_elapsed"], 3);
         assert_eq!(result["buttons"], json!(["a"]));
+        assert_eq!(result["override_engaged"], false);
+        assert!(!bridge.arm9.frozen, "frozen press must atomically resume");
     }
 
     #[test]
@@ -2613,34 +2838,92 @@ mod tests {
     #[test]
     fn touch_with_frames_is_a_tap() {
         // x=10 (0xa), y=20 (0x14), frames=5 -> "QEmucap,touch:a,14,5"
-        let mut bridge = bridge_arm9_only(&[("?", "S05"), ("QEmucap,touch:a,14,5", "OK")]);
-        bridge.arm9.frozen = false; // a timed tap needs a running core
+        let mut bridge = bridge_arm9_only(&[
+            ("?", "S05"),
+            ("QEmucap,touch:a,14,5", "OK"),
+            ("qEmucap,touchstatus", "0"),
+        ]);
         let response =
             bridge.handle_request(Request::new(1, "touch", json!({"x": 10, "y": 20, "frames": 5})));
         assert!(response.ok, "touch failed: {:?}", response.error);
-        assert_eq!(response.result.unwrap()["frames"], 5);
+        let result = response.result.unwrap();
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["frames"], 5);
+        assert_eq!(result["override_engaged"], false);
     }
 
     #[test]
-    fn timed_input_while_frozen_is_rejected() {
-        // press_buttons / touch(frames) on a frozen core would install a timed override whose frame
-        // counter never advances (the game is not running), leaving it armed to fire on a later
-        // resume in an unrelated state. Reject with bad_params; a held input (no frames) is fine.
-        let mut bridge = bridge_arm9_only(&[("?", "S05")]); // arm9 frozen after handshake
-        let press = bridge.handle_request(Request::new(
+    fn timed_input_interruption_releases_override_before_reply() {
+        let mut bridge = bridge_arm9_only(&[
+            ("?", "S05"),
+            ("QEmucap,input:1,3", "OK"),
+            ("qEmucap,inputstatus", "2"),
+            ("QEmucap,input:0", "OK"),
+        ]);
+        // The request starts frozen, arms input, then resumes. A real stop waiting at the first
+        // terminal-status poll must halt the core and force a release before interrupted returns.
+        bridge.arm9.gdb.nonblocking.push_back("S05".into());
+        let response = bridge.handle_request(Request::new(
             1,
             "press_buttons",
             json!({"buttons": ["a"], "frames": 3}),
         ));
-        assert!(!press.ok);
-        assert_eq!(press.error.unwrap().kind, "bad_params");
-        let tap = bridge.handle_request(Request::new(
-            2,
-            "touch",
-            json!({"x": 10, "y": 20, "frames": 5}),
+        assert!(response.ok, "interruption should be a terminal result: {:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["status"], "interrupted");
+        assert_eq!(result["reason"], "breakpoint");
+        assert_eq!(result["frames_elapsed"], 1);
+        assert_eq!(result["override_engaged"], false);
+        assert!(bridge.arm9.frozen);
+        assert!(bridge
+            .arm9
+            .gdb
+            .calls
+            .iter()
+            .any(|call| call == "QEmucap,input:0"));
+    }
+
+    #[test]
+    fn timed_input_release_and_stop_same_poll_reports_interrupted() {
+        let mut bridge = bridge_arm9_only(&[
+            ("?", "S05"),
+            ("QEmucap,input:1,3", "OK"),
+            ("qEmucap,inputstatus", "0"),
+            ("QEmucap,input:0", "OK"),
+        ]);
+        bridge.arm9.gdb.nonblocking.push_back("S05".into());
+
+        let response = bridge.handle_request(Request::new(
+            1,
+            "press_buttons",
+            json!({"buttons": ["a"], "frames": 3}),
         ));
-        assert!(!tap.ok);
-        assert_eq!(tap.error.unwrap().kind, "bad_params");
+
+        assert!(response.ok, "same-frame stop is a terminal interruption");
+        let result = response.result.unwrap();
+        assert_eq!(result["status"], "interrupted");
+        assert_eq!(result["frames_elapsed"], 3);
+        assert_eq!(result["state"], "frozen");
+        assert_eq!(result["override_engaged"], false);
+        assert!(bridge.arm9.frozen);
+    }
+
+    #[test]
+    fn timed_input_over_sync_bound_is_rejected_before_arming() {
+        let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+        let response = bridge.handle_request(Request::new(
+            1,
+            "press_buttons",
+            json!({"buttons": ["a"], "frames": MAX_SYNC_TIMED_INPUT_FRAMES + 1}),
+        ));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert!(!bridge
+            .arm9
+            .gdb
+            .calls
+            .iter()
+            .any(|call| call.starts_with("QEmucap,input:")));
     }
 
     #[test]
