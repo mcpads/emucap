@@ -10,7 +10,7 @@ GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
 
-**v0.7.0 — beta.** This repository is under active, continuous development;
+**v0.7.1 — beta.** This repository is under active, continuous development;
 interfaces and behavior may still change between updates.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
@@ -161,13 +161,16 @@ call `dismiss_failure` only when `status.methods` advertises it.
 
 ## Per-emulator adapters (the agent installs when needed)
 
-Pick one to start. **Mesen2 is the lightest — no source build.**
+Pick one to start. MesenCE uses a local source build because live control requires its native
+debugger halt to service requests without advancing the guest.
 
-- **Mesen2 (SNES · Game Gear · Game Boy · GBC · GBA · NES)** — install the Mesen2 app
-  and, once, allow network access for the Script window in the GUI. The adapter Lua ships
-  with the repo, so there is no build. Per-system entries cover them (65816 for SNES,
+- **Mesen2 (SNES · Game Gear · Game Boy · GBC · GBA · NES)** — run
+  `adapters/mesen2/build.sh` (Windows: `build.ps1`). It fetches pinned MesenCE 2.2.1 into a
+  local directory excluded from version control, applies the GPLv3 patch stack, and builds locally;
+  no emulator binary is distributed. Per-system Lua entries cover them (65816 for SNES,
   Z80 for Game Gear / Master System, SM83 for Game Boy / GBC, ARM7 for GBA, 6502 for
-  NES). GBA needs a real BIOS (`gba_bios.bin`, not committed); SNES / Game Gear / GB /
+  NES). An unmodified Mesen build is rejected for live control because it lacks `codeBreakIdle`.
+  GBA needs a real BIOS (`gba_bios.bin`, not committed); SNES / Game Gear / GB /
   GBC / NES need none. → `adapters/mesen2/README.md`
 - **Mednafen (Saturn · PSX · PCE · MD · WonderSwan/WSC)** — build the fork with
   `adapters/mednafen/build.sh` (needs SDL: macOS `brew install sdl2`, Linux

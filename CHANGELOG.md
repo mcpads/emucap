@@ -2,6 +2,18 @@
 
 Beta software — interfaces may still change.
 
+## 0.7.1
+
+### Added
+- Mesen live control now uses a locally built, pinned MesenCE 2.2.1 host with a repository-owned GPLv3 patch stack and verifiable build sidecar. The project distributes source, patches, and build recipes, not Mesen binaries.
+
+### Changed
+- Mesen pause and breakpoint control now remain in a native debugger halt serviced by bounded `codeBreakIdle` callbacks. Frozen sessions make zero guest progress and remain available through same-process reconnects and callback errors. Builds that lack the required host API are rejected as `mesen-patch-required`.
+
+### Fixed
+- Mesen numeric command-line settings are applied before first-run and single-instance decisions, so the script timeout, script permissions, and per-session instance override take effect without modifying the user's normal settings.
+- GBA launch detects `.gba` content even through a wrapper Lua, stages an exactly 16 KiB BIOS into the isolated runtime, and fails before launch when firmware is missing or invalid instead of opening an interactive firmware prompt.
+
 ## 0.7.0
 
 ### Added
@@ -27,7 +39,7 @@ Beta software — interfaces may still change.
 
 ### Fixed
 - PSP: an execution breakpoint at a raw PC (e.g. straight from `get_state`'s `cpu.pc`, as the adapter README documents) now arms at that address. In 0.5.0 the address was mis-read as a `main` offset and rejected as out of range; `memory_type` is now ignored for an exec breakpoint, which takes an absolute address like `disassemble`. Read/write breakpoints still resolve their `memory_type` offset the way `read_memory`/`write_memory` do.
-- Mesen: `call_stack` no longer collapses to an empty stack while tracing. The shadow call stack popped on return opcodes, which over-popped on Z80/SM83 conditional returns that were not taken and on interrupt returns (pushed with no matching call opcode), pinning the depth at 0 — most visibly on Game Gear and Game Boy/GBC. Returns are now recognized by the stack pointer unwinding instead (popping at the return site), and `call_stack` reads the freeze-point register snapshot so a treadmill-drifted read cannot skew the depth. This also fixes the same interrupt-return over-pop on SNES and NES.
+- Mesen: `call_stack` no longer collapses to an empty stack while tracing. The shadow call stack popped on return opcodes, which over-popped on Z80/SM83 conditional returns that were not taken and on interrupt returns (pushed with no matching call opcode), pinning the depth at 0 — most visibly on Game Gear and Game Boy/GBC. Returns are now recognized by the stack pointer unwinding instead (popping at the return site), and `call_stack` reads the freeze-point register snapshot so a delayed read cannot skew the depth. This also fixes the same interrupt-return over-pop on SNES and NES.
 
 ## 0.5.0
 
