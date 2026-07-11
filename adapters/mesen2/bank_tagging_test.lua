@@ -36,7 +36,7 @@ ok(gb.bank_of(0x7FFF, bk) == 7, "GB switchable top -> cart.prgBank")
 ok(gb.bank_of(0x8000, bk) == nil, "GB VRAM -> nil")
 
 -- GB MBC1 mode-1 / MBC1M: low region is remapped and Mesen exposes no resolved low bank, so bank_of
--- returns nil (honest "undetermined") for 0x0000-0x3FFF instead of a wrong 0. Switchable stays correct.
+-- returns nil (undetermined) for 0x0000-0x3FFF instead of a wrong 0. Switchable stays correct.
 local bkm = gb.read_banks({ ["cart.prgBank"] = 7, ["cart.mode"] = true })
 ok(gb.bank_of(0x1000, bkm) == nil, "GB MBC1 mode-1 low region -> nil (not a wrong 0)")
 ok(gb.bank_of(0x4000, bkm) == 7, "GB MBC1 mode-1 switchable still -> cart.prgBank")

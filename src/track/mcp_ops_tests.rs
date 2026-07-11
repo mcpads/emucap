@@ -336,7 +336,7 @@ fn log_artifact_resolves_relative_against_git_root() {
 }
 
 #[test]
-fn log_artifact_missing_path_is_honest_error() {
+fn log_artifact_reports_missing_path() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
