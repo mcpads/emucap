@@ -290,7 +290,7 @@ pub(crate) fn process_alive(pid: u32) -> bool {
         let mut exit_code = 0u32;
         let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
         unsafe { CloseHandle(handle) };
-        ok && exit_code == STILL_ACTIVE
+        ok && exit_code == STILL_ACTIVE as u32
     }
     #[cfg(not(any(unix, windows)))]
     {
