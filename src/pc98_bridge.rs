@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -620,20 +621,22 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     fn read_memory(&mut self, params: &Value) -> BridgeResult<Value> {
-        let address = region_address(params)?;
-        let length = required_num(params, "length")? as usize;
+        let length = required_num(params, "length")?;
+        let address = region_address(params, length)?;
+        let length = length as usize;
         let hex = self.read_abs_hex(address, length)?;
         Ok(json!({ "hex": hex }))
     }
 
     fn write_memory(&mut self, params: &Value) -> BridgeResult<Value> {
-        let address = region_address(params)?;
         let hexstr = required_str(params, "hex")?;
         if hexstr.len() % 2 != 0 {
             return Err(BridgeError::BadParams("hex must have even length".into()));
         }
-        hex::decode(hexstr).map_err(|_| BridgeError::BadParams("hex decode failed".into()))?;
-        let size = hexstr.len() / 2;
+        let data =
+            hex::decode(hexstr).map_err(|_| BridgeError::BadParams("hex decode failed".into()))?;
+        let size = data.len();
+        let address = region_address(params, size as u64)?;
         let resp = self.send_cmd(&format!("M{address:x},{size:x}:{hexstr}"))?;
         if resp != "OK" {
             return Err(BridgeError::Emulator(format!(
@@ -1158,6 +1161,8 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     fn screenshot(&mut self) -> BridgeResult<Value> {
+        let state = if self.frozen { "frozen" } else { "running" };
+        let frame_before = self.current_frame();
         let path = std::env::temp_dir().join(format!(
             "emucap_pc98_{}_{}.png",
             std::process::id(),
@@ -1174,8 +1179,20 @@ impl<G: GdbTransport> Bridge<G> {
                     "MAME snapshot did not produce a PNG".into(),
                 ));
             }
+            let frame_after = self.current_frame();
+            let frame_stable = frame_before.is_some() && frame_before == frame_after;
+            let mut hasher = Sha256::new();
+            hasher.update(&data);
             Ok(json!({
-                "png_base64": base64::engine::general_purpose::STANDARD.encode(data),
+                "png_base64": base64::engine::general_purpose::STANDARD.encode(&data),
+                "sha256": format!("{:x}", hasher.finalize()),
+                "byte_len": data.len(),
+                "state": state,
+                "frame_before": frame_before,
+                "frame_after": frame_after,
+                "frame_stable": frame_stable,
+                "freshness": "unverified",
+                "frame_binding": "unverified",
             }))
         })();
         let _ = fs::remove_file(&path);
@@ -2229,14 +2246,25 @@ fn memory_region(name: &str) -> Option<&'static MemoryRegion> {
     MEMORY_REGIONS.iter().find(|r| r.name == name)
 }
 
-fn region_address(params: &Value) -> BridgeResult<u64> {
+fn region_address(params: &Value, length: u64) -> BridgeResult<u64> {
     let memory_type = params
         .get("memory_type")
         .and_then(Value::as_str)
         .unwrap_or("physical");
     let region = memory_region(memory_type)
         .ok_or_else(|| BridgeError::BadParams(format!("unsupported memory_type: {memory_type}")))?;
-    Ok(region.base as u64 + required_num(params, "address")?)
+    let offset = required_num(params, "address")?;
+    if !matches!(offset.checked_add(length), Some(end) if end <= region.size as u64) {
+        return Err(BridgeError::BadParams(format!(
+            "{memory_type} access out of range: offset {offset:#x}+{length:#x} exceeds region size {region_size:#x}",
+            region_size = region.size
+        )));
+    }
+    (region.base as u64).checked_add(offset).ok_or_else(|| {
+        BridgeError::BadParams(format!(
+            "{memory_type} address overflow at offset {offset:#x}"
+        ))
+    })
 }
 
 fn required_num(params: &Value, key: &str) -> BridgeResult<u64> {
@@ -3463,6 +3491,56 @@ mod tests {
     }
 
     #[test]
+    fn read_memory_rejects_access_straddling_region_end() {
+        let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), BridgeEnv::default());
+        let response = bridge.handle_request(Request::new(
+            4,
+            "read_memory",
+            json!({"memory_type":"tvram","address":"0x3fff","length":2}),
+        ));
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.kind, "bad_params");
+        assert!(error.message.contains("tvram access out of range"));
+        assert_eq!(bridge.gdb.calls, vec!["?"], "reject before GDB read");
+    }
+
+    #[test]
+    fn write_memory_rejects_access_straddling_region_end() {
+        let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), BridgeEnv::default());
+        let response = bridge.handle_request(Request::new(
+            5,
+            "write_memory",
+            json!({"memory_type":"tvram","address":"0x3fff","hex":"aabb"}),
+        ));
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.kind, "bad_params");
+        assert!(error.message.contains("tvram access out of range"));
+        assert_eq!(bridge.gdb.calls, vec!["?"], "reject before GDB write");
+    }
+
+    #[test]
+    fn memory_access_ending_exactly_at_region_end_is_allowed() {
+        let fake = FakeGdb::with(&[("?", "S05"), ("ma3fff,1", "7f"), ("Ma3fff,1:80", "OK")]);
+        let mut bridge = Bridge::new(fake, BridgeEnv::default());
+
+        let read = bridge.handle_request(Request::new(
+            6,
+            "read_memory",
+            json!({"memory_type":"tvram","address":"0x3fff","length":1}),
+        ));
+        assert_eq!(read.result.unwrap()["hex"], "7f");
+
+        let write = bridge.handle_request(Request::new(
+            7,
+            "write_memory",
+            json!({"memory_type":"tvram","address":"0x3fff","hex":"80"}),
+        ));
+        assert_eq!(write.result.unwrap()["written"], 1);
+    }
+
+    #[test]
     fn find_pattern_scans_region_with_match_limit() {
         let mut bridge = Bridge::new(
             FakeGdb::with(&[("?", "S05"), ("m0,8", "aa00aa00aa00aa00")]),
@@ -4327,6 +4405,9 @@ mod tests {
             if payload == "?" {
                 return Ok("S05".into());
             }
+            if payload == "qEmucap,frame" {
+                return Ok("42".into());
+            }
             let prefix = "qEmucap,snapshot,";
             if let Some(hex_path) = payload.strip_prefix(prefix) {
                 let bytes = hex::decode(hex_path)
@@ -4352,10 +4433,22 @@ mod tests {
     fn screenshot_returns_png_base64_from_lua_snapshot() {
         let mut bridge = Bridge::new(SnapshotGdb, BridgeEnv::default());
         let response = bridge.handle_request(Request::new(13, "screenshot", json!({})));
+        let result = response.result.unwrap();
         assert_eq!(
-            response.result.unwrap()["png_base64"],
+            result["png_base64"],
             base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nfake")
         );
+        assert_eq!(
+            result["sha256"],
+            format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\nfake"))
+        );
+        assert_eq!(result["byte_len"], 12);
+        assert_eq!(result["state"], "frozen");
+        assert_eq!(result["frame_before"], 42);
+        assert_eq!(result["frame_after"], 42);
+        assert_eq!(result["frame_stable"], true);
+        assert_eq!(result["freshness"], "unverified");
+        assert_eq!(result["frame_binding"], "unverified");
     }
 
     #[test]

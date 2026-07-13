@@ -313,18 +313,42 @@ fn step_and_poll_events_forward() {
 
 #[test]
 fn screenshot_returns_image_without_save() {
-    let mut link = FakeLink::ok(json!({ "png_base64": "QUJD" }));
+    let expected_hash = crate::track::observe::sha256_hex(b"ABC");
+    let mut link = FakeLink::ok(json!({
+        "png_base64": "QUJD",
+        "frame_before": 42,
+        "frame_after": 42,
+        "state": "frozen",
+        "sha256": expected_hash,
+    }));
     let out = screenshot(&mut link, None).unwrap();
     match out {
         ToolOutput::Image {
             png_base64,
             saved_path,
+            provenance,
         } => {
             assert_eq!(png_base64, "QUJD");
             assert!(saved_path.is_none());
+            assert_eq!(provenance["sha256"], expected_hash);
+            assert_eq!(provenance["byte_len"], 3);
+            assert_eq!(provenance["frame_before"], 42);
+            assert_eq!(provenance["frame_after"], 42);
+            assert_eq!(provenance["state"], "frozen");
+            assert!(provenance.get("png_base64").is_none());
         }
         _ => panic!("Image 기대"),
     }
+}
+
+#[test]
+fn screenshot_rejects_adapter_hash_mismatch() {
+    let mut link = FakeLink::ok(json!({
+        "png_base64": "QUJD",
+        "sha256": "not-the-decoded-png-hash",
+    }));
+    let error = screenshot(&mut link, None).unwrap_err();
+    assert!(error.to_string().contains("sha256 mismatch"));
 }
 
 #[test]

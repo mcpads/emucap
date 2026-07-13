@@ -8,7 +8,7 @@
 PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), MAME PC-98.
 
-**v0.7.1 — 베타.** 이 저장소는 계속 개발 중이며, 인터페이스·동작은 업데이트마다 바뀔 수 있다.
+**v0.7.2 — 베타.** 이 저장소는 계속 개발 중이며, 인터페이스·동작은 업데이트마다 바뀔 수 있다.
 
 ## 플랫폼
 

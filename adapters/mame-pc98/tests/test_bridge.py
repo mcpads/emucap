@@ -124,6 +124,56 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(hello["state_restore"]["hidden_device_state"])
         self.assertTrue(hello["state_restore"]["save_manager_items"])
 
+    def test_read_memory_rejects_access_straddling_region_end(self) -> None:
+        gdb = FakeGdb()
+        bridge = pc98_bridge.Bridge(gdb)
+        with self.assertRaisesRegex(pc98_bridge.BridgeError, "tvram access out of range"):
+            bridge.read_memory({"memory_type": "tvram", "address": 0x3FFF, "length": 2})
+        self.assertEqual(gdb.calls, ["?"], "reject before GDB read")
+
+    def test_write_memory_rejects_access_straddling_region_end(self) -> None:
+        gdb = FakeGdb()
+        bridge = pc98_bridge.Bridge(gdb)
+        with self.assertRaisesRegex(pc98_bridge.BridgeError, "tvram access out of range"):
+            bridge.write_memory({"memory_type": "tvram", "address": 0x3FFF, "hex": "aabb"})
+        self.assertEqual(gdb.calls, ["?"], "reject before GDB write")
+
+    def test_memory_access_ending_exactly_at_region_end_is_allowed(self) -> None:
+        gdb = FakeGdb({"ma3fff,1": "7f", "Ma3fff,1:80": "OK"})
+        bridge = pc98_bridge.Bridge(gdb)
+        self.assertEqual(
+            bridge.read_memory({"memory_type": "tvram", "address": 0x3FFF, "length": 1}),
+            {"hex": "7f"},
+        )
+        self.assertEqual(
+            bridge.write_memory({"memory_type": "tvram", "address": 0x3FFF, "hex": "80"}),
+            {"written": 1},
+        )
+
+    def test_screenshot_reports_frame_state_and_hash_provenance(self) -> None:
+        bridge = pc98_bridge.Bridge(FakeGdb())
+        frames = iter((42, 42))
+        bridge._current_frame = lambda: next(frames)  # type: ignore[method-assign]
+
+        png = b"\x89PNG\r\n\x1a\nfake"
+
+        def fake_lua(name: str, path: str) -> None:
+            self.assertEqual(name, "snapshot")
+            pathlib.Path(path).write_bytes(png)
+
+        bridge._lua_cmd = fake_lua  # type: ignore[method-assign]
+        result = bridge.screenshot({})
+
+        self.assertEqual(result["png_base64"], pc98_bridge.base64.b64encode(png).decode("ascii"))
+        self.assertEqual(result["sha256"], pc98_bridge.hashlib.sha256(png).hexdigest())
+        self.assertEqual(result["byte_len"], len(png))
+        self.assertEqual(result["state"], "frozen")
+        self.assertEqual(result["frame_before"], 42)
+        self.assertEqual(result["frame_after"], 42)
+        self.assertTrue(result["frame_stable"])
+        self.assertEqual(result["freshness"], "unverified")
+        self.assertEqual(result["frame_binding"], "unverified")
+
     def test_load_state_reports_lua_register_write_drift_without_extra_stop(self) -> None:
         regs = i386_regs_hex(eip=0x8000, cs=0)
         drifted_regs = i386_regs_hex(eip=0x8004, cs=0)

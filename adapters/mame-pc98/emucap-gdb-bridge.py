@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """emucap <-> MAME PC-98 GDB-stub bridge.
 
-This is a proof-of-concept.  It translates the common emucap NDJSON protocol to the
-repo-local MAME Lua GDB stub or the built-in MAME C++ gdbstub.
+It translates the common emucap NDJSON protocol to the repository-local MAME
+Lua GDB stub or the built-in MAME C++ gdbstub.
 
 Scope:
 - status/read_memory/write_memory/get_state/get_rom_info/find_pattern/dump_memory/screenshot
 - save_state/load_state/reset/break_on_reset
 - pause/resume/step/run_frames/input/breakpoints
 
-Not in this PoC:
+Not supported:
 - full device-state snapshots
 
 Usage:
@@ -355,12 +355,19 @@ def _num(value: Any) -> int:
     return int(value)
 
 
-def _addr(params: dict[str, Any]) -> int:
+def _addr(params: dict[str, Any], length: int) -> int:
     mt = params.get("memory_type", "physical")
     base = MEM_BASE.get(mt)
     if base is None:
         raise BridgeError(f"unsupported memory_type: {mt}")
-    return base + _num(_need(params, "address"))
+    offset = _num(_need(params, "address"))
+    region_size = REGION_SIZE[mt]
+    if offset < 0 or length < 0 or offset + length > region_size:
+        raise BridgeError(
+            f"{mt} access out of range: offset {offset:#x}+{length:#x} "
+            f"exceeds region size {region_size:#x}"
+        )
+    return base + offset
 
 
 class Bridge:
@@ -451,16 +458,16 @@ class Bridge:
         }
 
     def read_memory(self, params: dict[str, Any]) -> dict[str, Any]:
-        addr = _addr(params)
         length = int(_need(params, "length"))
+        addr = _addr(params, length)
         return {"hex": self._read_abs_hex(addr, length)}
 
     def write_memory(self, params: dict[str, Any]) -> dict[str, Any]:
-        addr = _addr(params)
         hexstr = str(_need(params, "hex"))
         if len(hexstr) % 2:
             raise BridgeError("hex must have even length")
         size = len(hexstr) // 2
+        addr = _addr(params, size)
         resp = self._send_command(f"M{addr:x},{size:x}:{hexstr}")
         if resp != "OK":
             raise BridgeError(f"GDB memory write failed: {resp}")
@@ -602,6 +609,8 @@ class Bridge:
 
     def screenshot(self, _params: dict[str, Any]) -> dict[str, Any]:
         self._require_lua_backend("screenshot")
+        state = "frozen" if self.frozen else "running"
+        frame_before = self._current_frame()
         fd, path = tempfile.mkstemp(prefix="emucap_pc98_", suffix=".png")
         os.close(fd)
         try:
@@ -610,7 +619,19 @@ class Bridge:
                 data = f.read()
             if not data.startswith(b"\x89PNG\r\n\x1a\n"):
                 raise BridgeError("MAME snapshot did not produce a PNG")
-            return {"png_base64": base64.b64encode(data).decode("ascii")}
+            frame_after = self._current_frame()
+            frame_stable = frame_before is not None and frame_before == frame_after
+            return {
+                "png_base64": base64.b64encode(data).decode("ascii"),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "byte_len": len(data),
+                "state": state,
+                "frame_before": frame_before,
+                "frame_after": frame_after,
+                "frame_stable": frame_stable,
+                "freshness": "unverified",
+                "frame_binding": "unverified",
+            }
         finally:
             try:
                 os.unlink(path)
@@ -1837,7 +1858,7 @@ def _serve_emucap_session(sock: socket.socket, bridge: Bridge) -> None:
                     "ok": False,
                     "error": {"kind": "emulator_error", "message": str(err)},
                 }
-            except Exception as err:  # noqa: BLE001 - PoC bridge returns errors to MCP.
+            except Exception as err:  # noqa: BLE001 - report unexpected bridge failures to MCP.
                 resp = {
                     "id": rid,
                     "ok": False,

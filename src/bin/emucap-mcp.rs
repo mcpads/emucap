@@ -167,7 +167,9 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "현재 화면을 캡처한다")]
+    #[tool(
+        description = "현재 화면을 캡처하고 PNG SHA-256·byte length와 backend가 제공하는 frame/state/freshness provenance를 함께 반환한다"
+    )]
     async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> CallToolResult {
         let mut link = self.link();
         let path = a.save_path.as_ref().map(std::path::Path::new);

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::link::{EmulatorLink, LinkError};
 
@@ -11,6 +12,7 @@ pub enum ToolOutput {
     Image {
         png_base64: String,
         saved_path: Option<String>,
+        provenance: Value,
     },
 }
 
@@ -730,20 +732,33 @@ pub fn screenshot(
         .ok_or_else(|| LinkError::Protocol("screenshot 응답에 png_base64 없음".into()))?
         .to_string();
 
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.as_bytes())
+        .map_err(|e| LinkError::Protocol(format!("base64 디코드 실패: {e}")))?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    if let Some(reported) = result.get("sha256").and_then(Value::as_str) {
+        if reported != sha256 {
+            return Err(LinkError::Protocol(format!(
+                "screenshot sha256 mismatch: adapter={reported}, decoded={sha256}"
+            )));
+        }
+    }
     let saved_path = match save_path {
         Some(p) => {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(b64.as_bytes())
-                .map_err(|e| LinkError::Protocol(format!("base64 디코드 실패: {e}")))?;
-            std::fs::write(p, bytes)
+            std::fs::write(p, &bytes)
                 .map_err(|e| LinkError::Protocol(format!("스크린샷 저장 실패: {e}")))?;
             Some(p.to_string_lossy().to_string())
         }
         None => None,
     };
+    let mut provenance = result.as_object().cloned().unwrap_or_default();
+    provenance.remove("png_base64");
+    provenance.insert("sha256".into(), Value::String(sha256));
+    provenance.insert("byte_len".into(), json!(bytes.len()));
     Ok(ToolOutput::Image {
         png_base64: b64,
         saved_path,
+        provenance: Value::Object(provenance),
     })
 }
 

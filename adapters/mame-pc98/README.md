@@ -1,21 +1,19 @@
-# emucap — MAME PC-98 adapter PoC
+# emucap — MAME PC-98 adapter
 
-This adapter is a PC-98 experiment (proof-of-concept).  The default path uses a
-repo-local MAME Lua plugin (`emucap_gdbstub`) plus the Rust `emucap-mame-pc98-bridge`.  The
-plugin exposes enough GDB remote protocol for the bridge to reuse the existing
-emucap TCP protocol.  Treat this as an adapter-owned emulator control path, not
-as instructions to rely on a user's global MAME/RetroArch setup: launch flags,
-runtime directories, debugger protocol, and crash workarounds live in this repo.
-PC-98 parity work continues through a repo-owned MAME source build: `build.sh`
+The supported path uses a repository-local MAME Lua plugin (`emucap_gdbstub`)
+plus the Rust `emucap-mame-pc98-bridge`. The plugin exposes the GDB remote
+protocol operations needed by the bridge to reuse the common emucap TCP
+protocol. Launch flags, runtime directories, debugger protocol, and required
+MAME fixes are adapter-owned rather than inherited from a user's global
+MAME/RetroArch setup. `build.sh`
 fetches a pinned MAME release into `work/mame-src`, applies `patches/*.patch`,
 and writes `work/mame` as a safe headless wrapper.  The raw executable is linked
 as `work/mame.raw` only for explicit diagnostics.  `launch.sh` prefers
 `work/mame` only when it is an executable regular file; a stale source directory
 at that path is ignored with a warning.  A global `mame` binary is only a
-bootstrap smoke fallback while the adapter has no local hook for a specific
-behavior.
+bootstrap smoke fallback.
 
-## Current result
+## Backend and compatibility
 
 - The pinned MAME 0.288 source target exposes PC-98 drivers: `pc9801`,
   `pc9801vm`, `pc9821`, `pc9821ap2`.
@@ -28,10 +26,10 @@ behavior.
   not honor `-time-limit` in the tested boot command, so it is not a good first
   emucap control surface.
 - Stock MAME's built-in C++ `-debugger gdbstub` is not the PC-98 control
-  surface.  The unpatched binary exits with `gdbstub: cpuname i386sx not found
-  in gdb stub descriptions`, and a patched experiment only exposed generic RSP
-  behavior while failing full register restore against MAME's packet buffer
-  limit.  The repo-local Lua plugin owns the supported control path.
+  surface. The unpatched binary exits with `gdbstub: cpuname i386sx not found
+  in gdb stub descriptions`; the built-in stub's packet limit also prevents a
+  complete register restore. The repository-local Lua plugin owns the supported
+  control path.
 - The supported MCP control surface runs through `pc9801rs`; the live method set
   is listed under Supported methods below.
 - MAME's native `machine:load()`/debugger `stateload` path does not restore RAM
@@ -162,9 +160,11 @@ It ignores the user's global `mame.ini` by default and forces
 `SDL_VIDEODRIVER=dummy`, `-video none`, `-window`, and `-nomaximize` in
 headless mode; this prevents saved fullscreen/window settings from opening a
 visible MAME window during agent-run probes.  Visible mode is blocked unless it
-is explicit: use both `MAME_HEADLESS=0` and `MAME_ALLOW_VISIBLE=1` only when a
-window is intentional.  The launcher still requests windowed, non-maximized mode
-for visible launches.
+is explicit.  The MCP `launch` tool accepts `display: true` and authorizes the
+safe wrapper automatically.  For the legacy shell launcher, use both
+`MAME_HEADLESS=0` and `MAME_ALLOW_VISIBLE=1` only when a window is intentional.
+Visible launches use MAME's real video and keyboard providers and request a
+windowed, non-maximized window.
 
 Do not run raw MAME directly for PC-98 probes.  If a direct diagnostic command
 is needed, use `adapters/mame-pc98/work/mame` or
@@ -406,8 +406,8 @@ adapters/mame-pc98/work/mame -listroms pc9821
 adapters/mame-pc98/work/mame -listroms pc9821ap2
 ```
 
-The existing RetroArch PC-98 BIOS directory in this workstation was useful for
-comparison, but did not satisfy MAME's PC-98 romset requirements.
+RetroArch-style PC-98 BIOS sets do not by themselves satisfy MAME's PC-98
+romset requirements.
 
 A local PC-9801RS BIOS set matches MAME's `pc9801rs` driver
 better than `pc9821`.  Expose it through a `pc9801rs` romset directory or symlink
@@ -417,6 +417,6 @@ labels.
 `archtaurus/RetroPieBIOS` has the same kind of PC-98 payload: a
 RetroArch/NP2Kai-style set with names such as `bios.rom`, `font.rom`,
 `itf.rom`, `sound.rom`, and `ym2608.zip`.  That is a good reference for an
-NP2Kai/libretro PoC, but it is not enough for MAME `pc9821` or `pc9821ap2`,
+NP2Kai/libretro setup, but it is not enough for MAME `pc9821` or `pc9821ap2`,
 which require additional MAME romset files such as the `24256c-x*.bin` board
 ROMs and other driver-specific dumps.

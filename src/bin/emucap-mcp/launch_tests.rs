@@ -614,11 +614,34 @@ fn launch_plan_for_pc98_uses_repo_launcher_and_headless_contract() {
     assert!(plan["headless_contract"]
         .as_str()
         .unwrap()
-        .contains("headless MAME wrapper"));
+        .contains("headless by default"));
+    assert!(plan["headless_contract"]
+        .as_str()
+        .unwrap()
+        .contains("display:true"));
     assert!(plan["headless_contract"]
         .as_str()
         .unwrap()
         .contains("cbus:0"));
+}
+
+#[test]
+fn pc98_display_selects_visible_mame_launch() {
+    let args = LaunchArgs {
+        content_path: "/tmp/game.hdi".into(),
+        content_path2: None,
+        system: Some("pc98".into()),
+        name: None,
+        display: Some(true),
+        replace: false,
+    };
+    assert!(!pc98_headless(&args));
+
+    let default_args = LaunchArgs {
+        display: None,
+        ..args
+    };
+    assert!(pc98_headless(&default_args));
 }
 
 #[test]

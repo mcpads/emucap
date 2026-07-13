@@ -21,11 +21,13 @@ pub(crate) fn output_result(out: ToolOutput) -> CallToolResult {
         ToolOutput::Image {
             png_base64,
             saved_path,
+            provenance,
         } => {
             let mut content = vec![Content::image(png_base64, "image/png")];
             if let Some(p) = saved_path {
                 content.push(Content::text(format!("saved: {p}")));
             }
+            content.push(Content::text(format!("provenance: {provenance}")));
             CallToolResult::success(content)
         }
     }

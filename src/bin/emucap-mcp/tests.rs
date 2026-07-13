@@ -12,6 +12,28 @@ fn body_text(r: &CallToolResult) -> String {
         .join("")
 }
 
+#[test]
+fn image_output_publishes_screenshot_provenance() {
+    let result = output_result(ToolOutput::Image {
+        png_base64: "QUJD".into(),
+        saved_path: Some("/tmp/shot.png".into()),
+        provenance: serde_json::json!({
+            "sha256": "abc",
+            "byte_len": 3,
+            "frame_before": 42,
+            "frame_after": 42,
+            "state": "frozen",
+        }),
+    });
+    let text = body_text(&result);
+    assert!(text.contains("saved: /tmp/shot.png"));
+    assert!(text.contains("provenance:"));
+    assert!(text.contains("\"sha256\":\"abc\""));
+    assert!(text.contains("\"frame_before\":42"));
+    assert!(text.contains("\"frame_after\":42"));
+    assert!(text.contains("\"state\":\"frozen\""));
+}
+
 // 한 도구가 lock을 쥔 채 panic해 뮤텍스가 poisoned돼도, link() 헬퍼가 복구해 서버가
 // 죽지 않는지(다음 호출이 panic 안 함). poison이면 lock().unwrap()은 panic한다.
 #[test]
@@ -47,6 +69,33 @@ fn server_instructions_publish_the_mesen_runtime_contract() {
         assert!(
             SERVER_INSTRUCTIONS.contains(required),
             "server instructions omit required Mesen contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn server_instructions_publish_the_pc98_display_contract() {
+    for required in [
+        "display:true",
+        "PC-98은 실제 MAME video/keyboard provider 사용",
+    ] {
+        assert!(
+            SERVER_INSTRUCTIONS.contains(required),
+            "server instructions omit required PC-98 display contract: {required}"
+        );
+    }
+}
+
+#[test]
+fn server_instructions_publish_the_pc98_screenshot_freshness_contract() {
+    for required in [
+        "PC-98은 load_state가 screen bitmap을 복원하지 않으므로",
+        "freshness:unverified",
+        "step(1)",
+    ] {
+        assert!(
+            SERVER_INSTRUCTIONS.contains(required),
+            "server instructions omit required PC-98 screenshot freshness contract: {required}"
         );
     }
 }

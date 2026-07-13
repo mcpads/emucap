@@ -2,6 +2,19 @@
 
 Beta software — interfaces may still change.
 
+## 0.7.2
+
+### Added
+- Screenshot results now include the decoded PNG's SHA-256 and byte length. Backend-provided state, frame, freshness, and frame-binding metadata is returned as provenance instead of being implied by image timing alone.
+
+### Changed
+- PC-98 `launch(display: true)` opens the MAME display while the default launch remains headless.
+- PC-98 screenshots explicitly report unverified freshness and frame binding. Because MAME save states do not restore the screen bitmap, the server instructions require a frozen `step(1)` before judging the screen after `load_state`.
+
+### Fixed
+- PC-98 named-memory reads and writes reject any request whose offset plus length crosses the selected region boundary, before sending it to GDB.
+- Windows builds no longer fail in `process_alive()` when `windows-sys 0.61` exposes `STILL_ACTIVE` as `i32`; the comparison now uses the corresponding `u32` value ([#2](https://github.com/mcpads/emucap/pull/2), thanks @Pesumelga).
+
 ## 0.7.1
 
 ### Added

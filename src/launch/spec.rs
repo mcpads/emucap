@@ -208,6 +208,11 @@ pub fn mame_spec(binary: &Path, log_path: &Path, o: &MameOpts) -> LaunchSpec {
     .env("EMUCAP_CONTENT", o.media);
     if o.headless {
         spec = spec.env("SDL_VIDEODRIVER", "dummy");
+    } else {
+        // The repo-local MAME binary is a fail-closed wrapper that appends `-video none` unless
+        // visible mode is explicitly authorized. Without this flag, display=true is converted
+        // back to headless after the Rust launcher has built the correct visible arguments.
+        spec = spec.env("MAME_ALLOW_VISIBLE", "1");
     }
     if let Some(name) = o.name {
         spec = spec.env("EMUCAP_NAME", name);
@@ -392,5 +397,34 @@ mod tests {
             .args
             .windows(2)
             .any(|w| w == ["-flop2".to_string(), "sampling.d88".to_string()]));
+    }
+
+    #[test]
+    fn mame_spec_visible_mode_authorizes_wrapper_without_headless_options() {
+        let mut o = mame_opts("game.hdm");
+        o.headless = false;
+        let spec = mame_spec(Path::new("/mame"), Path::new("/l"), &o);
+
+        assert!(spec
+            .env
+            .contains(&("MAME_ALLOW_VISIBLE".to_string(), "1".to_string())));
+        assert!(!spec
+            .env
+            .iter()
+            .any(|(key, value)| key == "SDL_VIDEODRIVER" && value == "dummy"));
+        for forbidden in [
+            "-video",
+            "-videodriver",
+            "-keyboardprovider",
+            "-mouseprovider",
+            "-output",
+        ] {
+            assert!(
+                !spec.args.iter().any(|arg| arg == forbidden),
+                "visible MAME spec contains headless option {forbidden}"
+            );
+        }
+        assert!(spec.args.iter().any(|arg| arg == "-window"));
+        assert!(spec.args.iter().any(|arg| arg == "-nomaximize"));
     }
 }

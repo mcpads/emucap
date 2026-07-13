@@ -953,7 +953,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "runtime_paths": paths,
         "button_hint": button_hint_for_system(Some(system)),
         "headless_contract": if adapter == "mame_pc98" {
-            "PC-98 Rust launch uses repo-local safe headless MAME wrapper by default and disables pc9801rs cbus:0 unless MAME_CBUS0 is explicitly set; do not run work/mame.raw or system mame directly."
+            "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It disables pc9801rs cbus:0 unless MAME_CBUS0 is explicitly set; do not run work/mame.raw or system mame directly."
         } else if adapter == "mednafen" {
             "Mednafen Rust launch is the supported detached path; do not hand-roll raw nohup."
         } else if adapter == "flycast" {
@@ -1237,7 +1237,11 @@ fn backend_endpoint_from_launch(outcome: &serde_json::Value) -> Option<String> {
     None
 }
 
-/// MAME/PC-98 leg of `make_launch`: spawn MAME + the Python GDB bridge; defaults the machine to pc9801rs.
+fn pc98_headless(a: &LaunchArgs) -> bool {
+    !a.display.unwrap_or(false)
+}
+
+/// MAME/PC-98 leg of `make_launch`: spawn MAME + the GDB bridge; defaults the machine to pc9801rs.
 fn launch_mame(
     port: u16,
     token: Option<&str>,
@@ -1250,6 +1254,7 @@ fn launch_mame(
     let Some(binary) = emucap::launch::mame::resolve_binary(&root) else {
         return serde_json::json!({ "launched": false, "reason": "MAME 바이너리 미발견 — adapters/mame-pc98/build.sh로 빌드하거나 MAME_BIN을 설정하라" });
     };
+    let headless = pc98_headless(a);
     let log = adapter_log_path("mame-pc98", port, "mame-pc98.log");
     let spec = emucap::launch::mame::Launch {
         binary: &binary,
@@ -1262,7 +1267,7 @@ fn launch_mame(
         name: a.name.as_deref(),
         session_token: token,
         runtime: Some(runtime),
-        headless: true,
+        headless,
     };
     match emucap::launch::mame::launch(&spec) {
         Ok(launched) => serde_json::json!({
@@ -1272,6 +1277,7 @@ fn launch_mame(
             "mame_pid": launched.mame_pid,
             "bridge_pid": launched.bridge_pid,
             "bridge": launched.bridge_kind,
+            "display": !headless,
             "gdb_port": launched.gdb_port,
             "port": port,
             "binary": binary.display().to_string(),

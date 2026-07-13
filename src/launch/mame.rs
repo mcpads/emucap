@@ -303,6 +303,10 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
             return Err(e);
         }
     };
+    if !l.headless {
+        // Keep the macOS HITL window awake for the lifetime of this MAME process.
+        super::spawn_display_caffeinate(mame_pid);
+    }
     Ok(Launched {
         mame_pid,
         bridge_pid,
