@@ -416,10 +416,22 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// precision).
     pub(super) fn step_instructions(&mut self, params: &Value) -> BridgeResult<Value> {
         let count = step_count(params)?;
+        if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(BridgeError::BadParams(format!(
+                "instruction count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
+                crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            )));
+        }
         if !self.cpu_is_stepping()? {
             self.ws.call("cpu.stepping", json!({}))?;
         }
-        for _ in 0..count {
+        let deadline = std::time::Instant::now() + crate::live::temporal::MAX_SYNC_OPERATION_TIME;
+        for completed in 0..count {
+            if std::time::Instant::now() >= deadline {
+                return Err(BridgeError::Emulator(format!(
+                    "instruction step deadline exceeded after {completed} of {count}; the CPU remains halted"
+                )));
+            }
             self.ws
                 .call_and_wait_for("cpu.stepInto", json!({}), "cpu.stepping")?;
         }

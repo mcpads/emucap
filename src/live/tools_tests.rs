@@ -102,6 +102,23 @@ fn step_rejects_units_missing_from_adapter_capabilities() {
     assert!(link.calls.is_empty());
 }
 
+#[test]
+fn synchronous_advance_caps_reject_before_transport() {
+    let over = crate::live::temporal::MAX_SYNC_ADVANCE_COUNT + 1;
+
+    let mut run_link = FakeLink::ok(json!({}));
+    assert!(run_frames(&mut run_link, over).is_err());
+    assert_eq!(run_link.last_method, None);
+
+    let mut press_link = FakeLink::ok(json!({}));
+    assert!(press_buttons(&mut press_link, 0, &["a".into()], over).is_err());
+    assert_eq!(press_link.last_method, None);
+
+    let mut step_link = Rec::new("frozen", &[]).with_methods(&["step"]);
+    assert!(step(&mut step_link, over, StepUnit::Frames, None).is_err());
+    assert!(step_link.calls.is_empty());
+}
+
 struct ProjectionLink {
     caps: Capabilities,
     delay: std::time::Duration,
@@ -183,6 +200,120 @@ fn frozen_tap_projection_is_independent_of_host_delay() {
     );
 }
 
+struct FaultProjectionLink {
+    caps: Capabilities,
+    fail_after_apply: Option<usize>,
+    disconnect_after_apply: Option<usize>,
+    calls: usize,
+    connected: bool,
+    frozen: bool,
+    buttons: Vec<String>,
+    projection: Vec<Vec<String>>,
+}
+
+impl FaultProjectionLink {
+    fn timeout_on(call: usize) -> Self {
+        Self::new(Some(call), None)
+    }
+
+    fn disconnect_on(call: usize) -> Self {
+        Self::new(None, Some(call))
+    }
+
+    fn new(fail_after_apply: Option<usize>, disconnect_after_apply: Option<usize>) -> Self {
+        Self {
+            caps: Capabilities {
+                protocol_version: 1,
+                methods: vec!["pause".into(), "set_input".into(), "step".into()],
+                memory_types: vec![],
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
+                identity: EmulatorIdentity::default(),
+            },
+            fail_after_apply,
+            disconnect_after_apply,
+            calls: 0,
+            connected: true,
+            frozen: false,
+            buttons: vec![],
+            projection: vec![],
+        }
+    }
+}
+
+impl EmulatorLink for FaultProjectionLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        if !self.connected {
+            return Err(LinkError::NotConnected);
+        }
+        self.calls += 1;
+        match method {
+            "pause" => self.frozen = true,
+            "set_input" => {
+                self.buttons = params["buttons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect();
+            }
+            "step" => {
+                assert!(self.frozen, "step projection requires a frozen clock");
+                for _ in 0..params["frames"].as_u64().unwrap() {
+                    self.projection.push(self.buttons.clone());
+                }
+            }
+            other => return Err(LinkError::Protocol(format!("unexpected call: {other}"))),
+        }
+        if self.disconnect_after_apply == Some(self.calls) {
+            self.connected = false;
+            return Err(LinkError::NotConnected);
+        }
+        if self.fail_after_apply == Some(self.calls) {
+            return Err(LinkError::Timeout);
+        }
+        Ok(json!({}))
+    }
+}
+
+#[test]
+fn transient_tap_recovers_after_post_effect_timeout_at_each_boundary() {
+    // pause, acquire, pressed step, release, release-edge step. Pause itself owns no transient
+    // resource, so inject an ambiguous post-effect timeout at every later boundary.
+    for fail_call in 2..=5 {
+        let mut link = FaultProjectionLink::timeout_on(fail_call);
+        let result = tap(&mut link, 0, &["a".into()], 2, 0);
+        assert!(
+            result.is_err(),
+            "failure at call {fail_call} must be visible"
+        );
+        assert!(
+            link.buttons.is_empty(),
+            "failure at call {fail_call} left transient input engaged"
+        );
+        assert!(
+            link.frozen,
+            "failure at call {fail_call} did not restore the frozen terminal state"
+        );
+    }
+}
+
+#[test]
+fn disconnect_without_adapter_cleanup_is_never_reported_as_completion() {
+    let mut link = FaultProjectionLink::disconnect_on(2);
+    let error = tap(&mut link, 0, &["a".into()], 2, 0).unwrap_err();
+
+    assert!(
+        matches!(error, LinkError::Emulator { ref kind, .. } if kind == "cleanup_failed"),
+        "an unreachable release must stay fail-loud: {error:?}"
+    );
+    assert_eq!(link.buttons, vec!["a"]);
+}
+
 #[test]
 fn run_frames_no_separate_resume_when_frozen() {
     // frozen이어도 어댑터 run_frames 핸들러가 원자적으로 resume하므로, Rust는 별도 resume을 보내지 않는다
@@ -247,8 +378,23 @@ fn tap_step_failure_releases_input_before_returning_error() {
     let mut l = Rec::new("frozen", &[]).with_fail_calls(&[3]);
     let error = tap(&mut l, 0, &["a".into()], 2, 0).unwrap_err();
     assert!(matches!(error, LinkError::Timeout));
-    assert_eq!(l.methods(), vec!["pause", "set_input", "step", "set_input"]);
-    assert_eq!(l.calls.last().unwrap().1["buttons"], json!([]));
+    assert_eq!(
+        l.methods(),
+        vec!["pause", "set_input", "step", "set_input", "pause"]
+    );
+    assert_eq!(l.calls[3].1["buttons"], json!([]));
+}
+
+#[test]
+fn tap_lost_acquire_response_still_releases_and_refreezes() {
+    let mut l = Rec::new("frozen", &[]).with_fail_calls(&[2]);
+    let error = tap(&mut l, 0, &["a".into()], 2, 0).unwrap_err();
+    assert!(matches!(error, LinkError::Timeout));
+    assert_eq!(
+        l.methods(),
+        vec!["pause", "set_input", "set_input", "pause"]
+    );
+    assert_eq!(l.calls[2].1["buttons"], json!([]));
 }
 
 #[test]
@@ -282,8 +428,23 @@ fn hold_until_read_failure_releases_input() {
     let mut l = Rec::new("frozen", &["aa"]).with_fail_calls(&[3]);
     let error = hold_until(&mut l, 0, &["down".to_string()], "workraml", 0x1000, 1, 3).unwrap_err();
     assert!(matches!(error, LinkError::Timeout));
-    assert_eq!(l.calls.last().unwrap().0, "set_input");
-    assert_eq!(l.calls.last().unwrap().1["buttons"], json!([]));
+    assert_eq!(
+        l.methods(),
+        vec!["pause", "set_input", "read_memory", "set_input", "pause"]
+    );
+    assert_eq!(l.calls[3].1["buttons"], json!([]));
+}
+
+#[test]
+fn hold_until_lost_acquire_response_still_releases_and_refreezes() {
+    let mut l = Rec::new("frozen", &["aa"]).with_fail_calls(&[2]);
+    let error = hold_until(&mut l, 0, &["down".to_string()], "workraml", 0x1000, 1, 3).unwrap_err();
+    assert!(matches!(error, LinkError::Timeout));
+    assert_eq!(
+        l.methods(),
+        vec!["pause", "set_input", "set_input", "pause"]
+    );
+    assert_eq!(l.calls[2].1["buttons"], json!([]));
 }
 
 #[test]

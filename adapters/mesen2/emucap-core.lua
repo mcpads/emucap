@@ -89,6 +89,7 @@ local breakpoints = {}         -- id -> { ref, kind, start, end, pause_on_hit }
 local reset_bp = nil           -- break_on_reset: 리셋 핸들러 exec BP { ref, handler }
 local EVENT_CAP = 256
 local READ_CAP = 0x20000       -- read_memory 상한(워치독 안전: 대량 읽기가 emu 스레드를 초단위 블록하지 않게 — find_pattern SCAN_CAP과 동형)
+local MAX_SYNC_ADVANCE = 5000  -- Keep one request within the transport deadline.
 local WATCH_REG_BUDGET = 1000000  -- watch_register 자동해제 기본 예산(명령 수): full-range exec+매명령 getState라 무기한이면 emu 스레드를 굶긴다. p.max_instructions로 조정.
 -- VRAM 재구성 BP 자동해제 예산: watch_register(매 명령 getState라 1M 필수)보다 크다. 매 명령 비용은 opcode
 -- 비교뿐이고 getState는 VRAM 쓰기마다만(빈도는 게임이 정함, ~수천/초 — 매 명령 flood 아님)이라 예산은 peak를
@@ -406,6 +407,23 @@ end
 -- ── 핸들러: (ok=true, result) 또는 (false, kind, msg) ─────────
 local handlers = {}
 
+local function bounded_sync_count(value, default_value, allow_zero)
+  local n = tonumber(value)
+  if n == nil then n = default_value end
+  if n ~= math.floor(n) then
+    return nil, "frame/instruction count must be an integer"
+  end
+  local minimum = allow_zero and 0 or 1
+  if n < minimum then n = minimum end
+  if n > MAX_SYNC_ADVANCE then
+    return nil, string.format(
+      "frame/instruction count %s exceeds synchronous limit %d; split the request and verify each terminal response",
+      tostring(n), MAX_SYNC_ADVANCE
+    )
+  end
+  return n
+end
+
 function handlers.hello()
   -- disassemble/call_stack은 ISA 구현(SYS.disassemble·op_is_call/op_is_return)이 있을 때만 advertise한다.
   -- GBA처럼 미제공이면 methods에서 빠져 status.methods에 안 뜨고, 호출 시 handler가 unsupported로 거부한다.
@@ -425,6 +443,7 @@ function handlers.hello()
     mesen_host_api = MESEN_HOST_API,
     host_features = { "code_break_idle", "native_halt_service" },
     methods = method_list,
+    execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
   local active_exceptions = { "mesen.execution.instruction-step-absent" }
   if HAS_CALLSTACK then
@@ -552,7 +571,12 @@ end
 
 local bank_tag_active = nil    -- status.bank_tagging 캐시(카트 상수 — 필드 존재 여부, 1회 getState로 판정)
 function handlers.status()
-  local r = { connected = true, frame = frame, state = STATE }
+  local r = {
+    connected = true,
+    frame = frame,
+    state = STATE,
+    execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
+  }
   if STATE == "frozen" then r.reason = freeze_reason end   -- "hotkey"면 사용자가 로컬 핫키로 얼림
   local held_buttons = {}
   if input_hold then
@@ -699,9 +723,11 @@ end
 -- 의미 키: state(베이스 세이브스테이트), frame(프레임), memory_type/address/length(타깃).
 local function arm_probe(id, p)
   if not p.state then reply_err(id, "bad_params", "state 필요"); return end
+  local frames, err = bounded_sync_count(p.frame, 0, true)
+  if not frames then reply_err(id, "bad_params", err); return end
   pending_io = {
     kind = "probe", id = id, path = p.state,
-    probe = { frame = p.frame or 0, mem = p.memory_type, addr = p.address or 0, len = p.length or 1 },
+    probe = { frame = frames, mem = p.memory_type, addr = p.address or 0, len = p.length or 1 },
   }
   pending_io.ref = emu.addMemoryCallback(on_io_exec, emu.callbackType.exec, IO_LO, IO_HI, CPU)
 end
@@ -1465,14 +1491,18 @@ local function dispatch(line)
   end
   -- 지연 명령(즉시 응답 안 함; 프레임 경과/exec 후 응답)
   if method == "run_frames" then
-    deferred = { id = id, kind = "run", remaining = p.n or 1, age = 0 }
+    local frames, err = bounded_sync_count(p.n, 1, false)
+    if not frames then reply_err(id, "bad_params", err); return end
+    deferred = { id = id, kind = "run", remaining = frames, age = 0 }
     return
   end
   if method == "press_buttons" then
+    local frames, frame_err = bounded_sync_count(p.frames, 1, false)
+    if not frames then reply_err(id, "bad_params", frame_err); return end
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = { id = id, kind = "press", remaining = p.frames or 1, age = 0 }
+    deferred = { id = id, kind = "press", remaining = frames, age = 0 }
     return
   end
   if method == "save_state" then arm_io("save", id, p.path); return end
@@ -1494,8 +1524,10 @@ local function handle_in_freeze(line)
     reply_ok(id, { state = "running" })
     return "resume"
   elseif method == "step" then
+    local count, err = bounded_sync_count(p.frames, 1, false)
+    if not count then reply_err(id, "bad_params", err); return nil end
     step_unit = (p.unit == "instructions") and "instructions" or "frames"
-    step_remaining = p.frames or 1
+    step_remaining = count
     pending_step_id = id   -- 완료 응답은 청크들이 끝난 뒤
     return "step"
   elseif method == "pause" then
@@ -1504,13 +1536,17 @@ local function handle_in_freeze(line)
     -- frozen이면 원자적으로 resume하며 진행한다 — deferred를 세팅하고 "resume"을 반환해 freeze 루프를 빠져나가
     -- 게임을 재개한다. Rust는 이제 별도 ensure_running(resume)을 안 보낸다(별도 resume은 run_frames 도착 전
     -- free-run으로 one-shot watch/BP를 조기 소진시키는 레이스라 제거됨 — Mednafen과 동일 원자 resume 규약).
-    deferred = { id = id, kind = "run", remaining = p.n or 1, age = 0 }
+    local frames, err = bounded_sync_count(p.n, 1, false)
+    if not frames then reply_err(id, "bad_params", err); return nil end
+    deferred = { id = id, kind = "run", remaining = frames, age = 0 }
     return "resume"
   elseif method == "press_buttons" then
+    local frames, frame_err = bounded_sync_count(p.frames, 1, false)
+    if not frames then reply_err(id, "bad_params", frame_err); return nil end
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return nil end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = { id = id, kind = "press", remaining = p.frames or 1, age = 0 }
+    deferred = { id = id, kind = "press", remaining = frames, age = 0 }
     return "resume"
   elseif method == "save_state" or method == "load_state" or method == "probe" then
     reply_err(id, "frozen", "frozen 상태에서는 불가 — step/resume 사용")

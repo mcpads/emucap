@@ -114,6 +114,14 @@ fn hello_advertises_only_tier1_truths() {
     assert_eq!(result["adapter"], "desmume-nds-rust-gdb");
     assert_eq!(result["system"], "nds");
     assert_eq!(result["memory_types"], json!(["main", "arm9", "arm7"]));
+    assert_eq!(
+        result["execution_limits"]["max_sync_advance_count"],
+        crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+    );
+    assert_eq!(
+        result["execution_limits"]["max_sync_operation_ms"],
+        crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64
+    );
 
     let methods = result["methods"].as_array().unwrap();
     for wanted in [
@@ -314,6 +322,21 @@ fn step_instructions_single_steps_then_reports_pc() {
             .count(),
         1
     );
+}
+
+#[test]
+fn step_instructions_rejects_over_sync_cap_before_backend_calls() {
+    let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+    bridge.arm9.gdb.calls.clear();
+    let response = bridge.handle_request(Request::new(
+        9,
+        "step_instructions",
+        json!({"count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT + 1}),
+    ));
+
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_params");
+    assert!(bridge.arm9.gdb.calls.is_empty());
 }
 
 #[test]

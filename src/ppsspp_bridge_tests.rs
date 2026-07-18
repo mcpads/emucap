@@ -146,7 +146,16 @@ fn status_reports_connected_and_version() {
     ]));
     let resp = bridge.handle_request(Request::new(1, "status", json!({})));
     assert!(resp.ok, "{:?}", resp.error);
-    assert_eq!(resp.result.unwrap()["system"], "psp");
+    let result = resp.result.unwrap();
+    assert_eq!(result["system"], "psp");
+    assert_eq!(
+        result["execution_limits"]["max_sync_advance_count"],
+        crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+    );
+    assert_eq!(
+        result["execution_limits"]["max_sync_operation_ms"],
+        crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64
+    );
 }
 
 #[test]
@@ -242,6 +251,14 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
     assert_eq!(result["backend"], "ppsspp-debugger-ws");
     assert_eq!(result["debugger"], true);
     assert_eq!(result["memory_types"], json!(["main"]));
+    assert_eq!(
+        result["execution_limits"]["max_sync_advance_count"],
+        crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+    );
+    assert_eq!(
+        result["execution_limits"]["max_sync_operation_ms"],
+        crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64
+    );
 
     let methods = result["methods"].as_array().unwrap();
     for wanted in [
@@ -1179,6 +1196,20 @@ fn step_instructions_pauses_first_when_running_then_steps_and_reports_state() {
     // request goes out) followed by exactly one cpu.stepInto for count=1.
     assert_eq!(bridge.ws.calls[1].0, "cpu.stepping");
     assert_eq!(bridge.ws.calls[2].0, "cpu.stepInto");
+}
+
+#[test]
+fn step_instructions_rejects_over_sync_cap_before_backend_calls() {
+    let mut bridge = PpssppBridge::with_content(FakeWs::default(), None);
+    let response = bridge.handle_request(Request::new(
+        1,
+        "step_instructions",
+        json!({"count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT + 1}),
+    ));
+
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_params");
+    assert!(bridge.ws.calls.is_empty());
 }
 
 #[test]

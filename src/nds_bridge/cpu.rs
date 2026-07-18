@@ -119,12 +119,24 @@ impl<G: GdbTransport> CpuConn<G> {
     }
 
     pub(super) fn step_instructions(&mut self, count: u64) -> NdsResult<()> {
+        if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(NdsBridgeError::BadParams(format!(
+                "instruction count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
+                crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            )));
+        }
         // Stepping halts the core, so the bridge must halt it first: otherwise send_cmd's with_frozen
         // treats each `s` as a bridge-injected pause and auto-resumes ("c") after it, re-running the
         // core while step then labels it frozen — a mismatch that desyncs the next command. Pausing
         // up front makes with_frozen a no-op per step and keeps the frozen bookkeeping consistent.
         self.pause()?;
-        for _ in 0..count {
+        let deadline = Instant::now() + crate::live::temporal::MAX_SYNC_OPERATION_TIME;
+        for completed in 0..count {
+            if Instant::now() >= deadline {
+                return Err(NdsBridgeError::Emulator(format!(
+                    "instruction step deadline exceeded after {completed} of {count}; the core remains frozen"
+                )));
+            }
             // `s` replies with a stop, so it bypasses send_cmd's demux; clear any buffered
             // stale stop first so it is not mistaken for this step's completion.
             self.drain_stops()?;

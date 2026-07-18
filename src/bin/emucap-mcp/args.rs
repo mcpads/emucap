@@ -233,29 +233,29 @@ pub(crate) struct PathArgs {
     pub(crate) path: String,
 }
 
-/// 프레임/명령 진행 인자의 상한(~60fps로 약 4.6시간분). 상한 없는 n·frames·count·max_frames는
-/// deferred 명령을 사실상 무한 루프시켜 어댑터를 붙잡고, raw_call(및 그것이 쥔 SharedLink mutex)을
-/// wedge한다. regression.rs의 MAX_REPLAY_FRAMES와 같은 취지의 상한 — 초과를 조용히 잘라
-/// 잘못된 결과를 내는 대신 에러로 드러낸다.
-pub(crate) const MAX_FRAME_ARG: u64 = 1_000_000;
+/// Common bound for one synchronous frame or instruction advance. At 60 fps, 5,000 frames take
+/// about 83 seconds, leaving cleanup time before the 300-second deferred deadline. Bridges that
+/// step one instruction at a time also receive a finite work bound. Callers split longer travel
+/// into terminally acknowledged requests.
+pub(crate) const MAX_SYNC_ADVANCE_COUNT: u64 = emucap::live::temporal::MAX_SYNC_ADVANCE_COUNT;
 
-/// 프레임/명령 수 필드용 디시리얼라이저 — MAX_FRAME_ARG 초과를 거부한다. 값이 존재할 때만 호출되고
-/// (serde default는 필드 부재 시 우회하므로 기본값은 상한 검사 없이 통과 — 모두 상한 이내).
+/// Reject a supplied frame or instruction count above the common synchronous bound. Serde defaults
+/// bypass this function when a field is absent; every default remains within the bound.
 fn deser_frame_count<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     let n = u64::deserialize(d)?;
-    if n > MAX_FRAME_ARG {
+    if n > MAX_SYNC_ADVANCE_COUNT {
         return Err(serde::de::Error::custom(format!(
-            "프레임/명령 수 {n}이 상한 {MAX_FRAME_ARG} 초과 — 더 작게 나눠 호출하라"
+            "frame/instruction count {n} exceeds the synchronous limit {MAX_SYNC_ADVANCE_COUNT}; split the request and verify each terminal response"
         )));
     }
     Ok(n)
 }
 
-/// 입력을 누른 채 진행하는 deferred 명령(press/tap/hold)의 프레임 상한. run_frames/step(입력 없음)과 달리
-/// 큰 값은 링크 deadline(300s)을 넘겨 — MCP가 포기해 timeout/drop한 뒤에도 어댑터가 버튼을 계속 눌러
-/// 게임 상태를 오염시킨다(취소 경로도 없다). deadline 안에 드는 작은 상한으로 둔다(어떤 정상 입력 hold도
-/// 이보다 훨씬 짧다 — 60fps에서 ~166초).
-pub(crate) const MAX_INPUT_HOLD_FRAMES: u64 = 10_000;
+/// Frame bound for deferred input operations such as press, tap, and hold. An oversized request
+/// could outlive the link deadline and leave a button override active after the MCP has given up.
+/// Keep this equal to the common advance limit so a composed operation is not rejected only when it
+/// reaches its internal step.
+pub(crate) const MAX_INPUT_HOLD_FRAMES: u64 = MAX_SYNC_ADVANCE_COUNT;
 
 fn deser_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     let n = u64::deserialize(d)?;

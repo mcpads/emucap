@@ -30,6 +30,10 @@ impl<G: GdbTransport> Bridge<G> {
                 "state_restore": state_restore_info(),
             },
             "input_buttons": input_buttons_json(),
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+            },
         });
         let obj = result.as_object_mut().expect("hello is an object");
         if let Some(name) = &self.env.name {
@@ -88,6 +92,15 @@ impl<G: GdbTransport> Bridge<G> {
             },
             "input_buttons": input_buttons,
             "input_override": input_override,
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+                "frame": {
+                    "max_count": self.max_sync_frame_count(),
+                    "estimated_ms_per_frame": self.frame_operation_budget_ms(),
+                    "trace_enabled": self.tracing,
+                },
+            },
         }))
     }
 

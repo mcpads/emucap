@@ -761,6 +761,18 @@ fn run_frames_sends_lua_command_with_scaled_timeout() {
 }
 
 #[test]
+fn run_frames_rejects_work_past_backend_deadline_before_mutation() {
+    let fake = FakeGdb::with(&[("?", "S05")]);
+    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let requested = bridge.max_sync_frame_count() + 1;
+    let response = bridge.handle_request(Request::new(14, "run_frames", json!({"n": requested})));
+
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_params");
+    assert_eq!(bridge.gdb.calls, vec!["?"]);
+}
+
+#[test]
 fn press_buttons_reports_breakpoint_interruption_and_releases_operation() {
     let fake = FakeGdb::with(&[
         ("?", "S05"),
@@ -820,10 +832,19 @@ fn status_reports_plugin_input_ownership() {
     ]);
     let mut bridge = Bridge::new(fake, BridgeEnv::default());
     let response = bridge.handle_request(Request::new(20, "status", json!({})));
-    let input = &response.result.unwrap()["input_override"];
+    let result = response.result.unwrap();
+    let input = &result["input_override"];
     assert_eq!(input["observable"], true);
     assert_eq!(input["engaged"], true);
     assert_eq!(input["mode"], "persistent");
+    assert_eq!(
+        result["execution_limits"]["frame"]["max_count"],
+        bridge.max_sync_frame_count()
+    );
+    assert_eq!(
+        result["execution_limits"]["max_sync_operation_ms"],
+        crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64
+    );
 }
 
 #[test]
@@ -881,6 +902,21 @@ fn step_instructions_sends_gdb_single_step_count() {
             .count(),
         3
     );
+}
+
+#[test]
+fn step_instructions_rejects_over_sync_cap_before_mutation() {
+    let fake = FakeGdb::with(&[("?", "S05")]);
+    let mut bridge = Bridge::new(fake, BridgeEnv::default());
+    let response = bridge.handle_request(Request::new(
+        17,
+        "step_instructions",
+        json!({"count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT + 1}),
+    ));
+
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_params");
+    assert_eq!(bridge.gdb.calls, vec!["?"]);
 }
 
 struct DasmGdb;

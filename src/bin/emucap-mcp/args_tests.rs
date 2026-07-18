@@ -83,7 +83,7 @@ fn write_memory_schema_exposes_both_input_sources() {
 #[test]
 fn frame_args_reject_over_cap() {
     // 상한 초과는 deserialize 단계에서 거부(무한 deferred 루프·raw_call wedge 방지, H2).
-    let over = MAX_FRAME_ARG + 1;
+    let over = MAX_SYNC_ADVANCE_COUNT + 1;
     assert!(
         serde_json::from_str::<RunFramesArgs>(&format!(r#"{{"n":{over}}}"#)).is_err(),
         "run_frames n 상한 초과는 거부해야"
@@ -115,8 +115,9 @@ fn frame_args_reject_over_cap() {
 #[test]
 fn frame_args_accept_at_cap_and_defaults() {
     // 상한 이내는 통과, 필드 부재 시 기본값(상한 이내)도 통과 — clamp가 정상 사용을 깨지 않아야.
-    let r: RunFramesArgs = serde_json::from_str(&format!(r#"{{"n":{MAX_FRAME_ARG}}}"#)).unwrap();
-    assert_eq!(r.n, MAX_FRAME_ARG);
+    let r: RunFramesArgs =
+        serde_json::from_str(&format!(r#"{{"n":{MAX_SYNC_ADVANCE_COUNT}}}"#)).unwrap();
+    assert_eq!(r.n, MAX_SYNC_ADVANCE_COUNT);
     let s: StepArgs = serde_json::from_str("{}").unwrap();
     assert_eq!(s.count, 1, "step count 기본값");
     assert_eq!(s.unit, StepUnit::Frames, "step unit 기본값");
@@ -132,9 +133,9 @@ fn frame_args_accept_at_cap_and_defaults() {
 }
 
 #[test]
-fn input_hold_frame_cap_is_tighter_than_run_frames() {
-    // 입력 hold 프레임(press/tap)은 run_frames보다 작은 상한 — 링크 deadline 안에 들어야 MCP 포기 후
-    // 버튼이 눌린 채 안 남는다. MAX_INPUT_HOLD_FRAMES+1은 press/tap 거부, run_frames 통과.
+fn input_hold_frame_cap_matches_sync_advance_cap() {
+    // 합성 입력이 내부 step에서 뒤늦게 거부되지 않도록 입력 hold와 공통 advance가 같은 상한을 쓴다.
+    assert_eq!(MAX_INPUT_HOLD_FRAMES, MAX_SYNC_ADVANCE_COUNT);
     let over_input = MAX_INPUT_HOLD_FRAMES + 1;
     assert!(
         serde_json::from_str::<PressArgs>(&format!(r#"{{"buttons":["a"],"frames":{over_input}}}"#))
@@ -147,10 +148,6 @@ fn input_hold_frame_cap_is_tighter_than_run_frames() {
         ))
         .is_err(),
         "tap press_frames는 입력 상한 초과를 거부해야"
-    );
-    assert!(
-        serde_json::from_str::<RunFramesArgs>(&format!(r#"{{"n":{over_input}}}"#)).is_ok(),
-        "run_frames(입력 없음)는 입력 상한보다 큰 값도 통과 — 입력 상한이 더 tight"
     );
 }
 

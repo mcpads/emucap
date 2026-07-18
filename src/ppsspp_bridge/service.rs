@@ -32,6 +32,10 @@ impl<T: WsTransport> PpssppBridge<T> {
             "ppsspp_version": ppsspp_version,
             "game": game_status.get("game").cloned().unwrap_or(Value::Null),
             "input_buttons": psp_input_buttons_json(),
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+            },
             "input_override": match &self.held_buttons {
                 Some(buttons) => json!({
                     "observable": true,
@@ -71,6 +75,10 @@ impl<T: WsTransport> PpssppBridge<T> {
             ]),
             "capability_notes": capability_notes(),
             "input_buttons": psp_input_buttons_json(),
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+            },
         });
         let obj = result.as_object_mut().expect("hello is an object");
         if let Some(name) = &self.name {

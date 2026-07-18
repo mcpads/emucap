@@ -1,8 +1,7 @@
 use super::*;
 
-fn enriched(methods: &[&str]) -> serde_json::Value {
+fn enriched_from(mut v: serde_json::Value, methods: &[&str]) -> serde_json::Value {
     let m: Vec<String> = methods.iter().map(|s| s.to_string()).collect();
-    let mut v = serde_json::json!({"connected": true});
     enrich_status_value(&mut v, &m, &[], None);
     let identity = EmulatorIdentity {
         adapter: Some("contract-test".into()),
@@ -18,6 +17,10 @@ fn enriched(methods: &[&str]) -> serde_json::Value {
         &emucap::contracts::advertisement_from_hello(&hello),
     );
     v
+}
+
+fn enriched(methods: &[&str]) -> serde_json::Value {
+    enriched_from(serde_json::json!({"connected": true}), methods)
 }
 fn has_method(v: &serde_json::Value, name: &str) -> bool {
     v["methods"]
@@ -79,6 +82,41 @@ fn write_memory_exposes_host_input_bounds() {
         Some(&serde_json::json!(
             crate::memory_write::FILE_LOAD_TIMEOUT_MS
         ))
+    );
+}
+
+#[test]
+fn synchronous_advance_exposes_host_admission_bounds() {
+    let value = enriched(&["step", "run_frames"]);
+    assert_eq!(
+        value.pointer("/contracts/constraints/execution.step.max_count"),
+        Some(&serde_json::json!(crate::args::MAX_SYNC_ADVANCE_COUNT))
+    );
+    assert_eq!(
+        value.pointer("/contracts/constraints/execution.run_frames.max_frames"),
+        Some(&serde_json::json!(crate::args::MAX_SYNC_ADVANCE_COUNT))
+    );
+}
+
+#[test]
+fn synchronous_advance_uses_smaller_adapter_frame_limit() {
+    let value = enriched_from(
+        serde_json::json!({
+            "connected": true,
+            "execution_limits": {
+                "max_sync_advance_count": 5_000,
+                "frame": {"max_count": 49}
+            }
+        }),
+        &["step", "run_frames"],
+    );
+    assert_eq!(
+        value.pointer("/contracts/constraints/execution.step.max_count"),
+        Some(&serde_json::json!(5_000))
+    );
+    assert_eq!(
+        value.pointer("/contracts/constraints/execution.run_frames.max_frames"),
+        Some(&serde_json::json!(49))
     );
 }
 

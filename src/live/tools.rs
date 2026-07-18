@@ -63,6 +63,7 @@ pub fn probe(
     address: u64,
     length: u64,
 ) -> Result<ToolOutput, LinkError> {
+    validate_sync_advance("probe frame", frame)?;
     let params = json!({
         "state": state, "frame": frame,
         "memory_type": memory_type, "address": address, "length": length,
@@ -220,6 +221,16 @@ fn bad_params(message: impl Into<String>) -> LinkError {
     }
 }
 
+fn validate_sync_advance(label: &str, count: u64) -> Result<(), LinkError> {
+    if count > super::temporal::MAX_SYNC_ADVANCE_COUNT {
+        return Err(bad_params(format!(
+            "{label} count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
+            super::temporal::MAX_SYNC_ADVANCE_COUNT
+        )));
+    }
+    Ok(())
+}
+
 pub fn set_input(
     link: &mut dyn EmulatorLink,
     port: u64,
@@ -239,6 +250,7 @@ pub fn press_buttons(
     buttons: &[String],
     frames: u64,
 ) -> Result<ToolOutput, LinkError> {
+    validate_sync_advance("press_buttons frame", frames)?;
     let params = json!({ "port": port, "buttons": buttons, "frames": frames });
     Ok(ToolOutput::Json(link.call("press_buttons", params)?))
 }
@@ -278,30 +290,56 @@ fn one_tap(
     buttons: &[String],
     press_frames: u64,
 ) -> Result<(), LinkError> {
-    let empty: [String; 0] = [];
-    link.call("set_input", json!({ "port": port, "buttons": buttons }))?;
+    if let Err(primary) = link.call("set_input", json!({ "port": port, "buttons": buttons })) {
+        // A lost set_input response is ambiguous: the adapter may already own the override. Always
+        // issue an explicit release before returning the original error.
+        return finish_transient_input(link, port, Err(primary));
+    }
     let outcome = link
         .call("step", json!({ "frames": press_frames.max(1) }))
         .map(|_| ());
-    let cleanup = link
-        .call("set_input", json!({ "port": port, "buttons": empty }))
-        .map(|_| ());
-    finish_with_cleanup(outcome, cleanup, combine_input_cleanup_error)?;
-    link.call("step", json!({ "frames": 1 }))?; // 해제 에지
+    finish_transient_input(link, port, outcome)?;
+    let release_edge = link.call("step", json!({ "frames": 1 })).map(|_| ());
+    finish_frozen(link, release_edge)?;
     Ok(())
 }
 
-fn combine_input_cleanup_error(primary: Option<LinkError>, cleanup: LinkError) -> LinkError {
+fn combine_temporal_cleanup_error(primary: Option<LinkError>, cleanup: LinkError) -> LinkError {
     let message = match primary {
-        Some(primary) => {
-            format!("{primary}; transient input cleanup also failed: {cleanup}")
-        }
-        None => format!("transient input cleanup failed: {cleanup}"),
+        Some(primary) => format!("{primary}; request-scoped cleanup also failed: {cleanup}"),
+        None => format!("request-scoped cleanup failed: {cleanup}"),
     };
     LinkError::Emulator {
         kind: "cleanup_failed".into(),
         message,
     }
+}
+
+/// Release a request-scoped input override and restore the frozen terminal state on every failure.
+/// Calls continue after an individual cleanup error so a failed release does not suppress the
+/// re-freeze attempt. A transport loss remains fail-loud: both cleanup failures are retained.
+fn finish_transient_input<T>(
+    link: &mut dyn EmulatorLink,
+    port: u64,
+    outcome: Result<T, LinkError>,
+) -> Result<T, LinkError> {
+    let empty: [String; 0] = [];
+    let release = link
+        .call("set_input", json!({ "port": port, "buttons": empty }))
+        .map(|_| ());
+    let result = finish_with_cleanup(outcome, release, combine_temporal_cleanup_error);
+    finish_frozen(link, result)
+}
+
+fn finish_frozen<T>(
+    link: &mut dyn EmulatorLink,
+    outcome: Result<T, LinkError>,
+) -> Result<T, LinkError> {
+    if outcome.is_ok() {
+        return outcome;
+    }
+    let stabilize = link.call("pause", json!({})).map(|_| ());
+    finish_with_cleanup(outcome, stabilize, combine_temporal_cleanup_error)
 }
 
 /// 프레임 단위 정밀 탭: freeze에서 정확히 press_frames만 입력을 주고 떼어, auto-repeat 없이
@@ -314,10 +352,15 @@ pub fn tap(
     press_frames: u64,
     after_frames: u64,
 ) -> Result<ToolOutput, LinkError> {
+    validate_sync_advance("tap press frame", press_frames)?;
+    validate_sync_advance("tap trailing frame", after_frames)?;
     link.call("pause", json!({}))?; // 멱등
     one_tap(link, port, buttons, press_frames)?;
     if after_frames > 0 {
-        link.call("step", json!({ "frames": after_frames }))?;
+        let outcome = link
+            .call("step", json!({ "frames": after_frames }))
+            .map(|_| ());
+        finish_frozen(link, outcome)?;
     }
     Ok(ToolOutput::Json(json!({
         "tapped": buttons, "press_frames": press_frames, "after_frames": after_frames, "state": "frozen"
@@ -337,6 +380,7 @@ pub fn hold_until(
     length: u64,
     max_frames: u64,
 ) -> Result<ToolOutput, LinkError> {
+    validate_sync_advance("hold_until frame", max_frames)?;
     let read = |link: &mut dyn EmulatorLink| -> Result<String, LinkError> {
         let r = link.call(
             "read_memory",
@@ -348,7 +392,9 @@ pub fn hold_until(
             .to_string())
     };
     link.call("pause", json!({}))?; // 멱등
-    link.call("set_input", json!({ "port": port, "buttons": buttons }))?;
+    if let Err(primary) = link.call("set_input", json!({ "port": port, "buttons": buttons })) {
+        return finish_transient_input(link, port, Err(primary));
+    }
     // 코어 루프를 돌리되 성패 무관하게 입력을 해제한다.
     let outcome: Result<(bool, u64, String, String), LinkError> = (|| {
         let before = read(link)?;
@@ -366,13 +412,9 @@ pub fn hold_until(
         }
         Ok((changed, frames, before, after))
     })();
-    let empty: [String; 0] = [];
-    let cleanup = link
-        .call("set_input", json!({ "port": port, "buttons": empty }))
-        .map(|_| ());
-    let (changed, frames, before, after) =
-        finish_with_cleanup(outcome, cleanup, combine_input_cleanup_error)?;
-    link.call("step", json!({ "frames": 1 }))?; // 해제 에지
+    let (changed, frames, before, after) = finish_transient_input(link, port, outcome)?;
+    let release_edge = link.call("step", json!({ "frames": 1 })).map(|_| ());
+    finish_frozen(link, release_edge)?;
     Ok(ToolOutput::Json(json!({
         "changed": changed, "frames": frames, "before": before, "after": after, "state": "frozen"
     })))
@@ -394,6 +436,7 @@ pub fn load_state(link: &mut dyn EmulatorLink, path: &str) -> Result<ToolOutput,
 /// 여기서 별도 resume을 보내지 않는다 — 별도 resume은 명령 도착 전 free-run으로 watch_register/BP를 조기
 /// 소진(one-shot)시키는 레이스다. 원자 resume이면 derail이 run_frames 구간에서 발화해 interrupted로 반환된다.
 pub fn run_frames(link: &mut dyn EmulatorLink, n: u64) -> Result<ToolOutput, LinkError> {
+    validate_sync_advance("run_frames", n)?;
     Ok(ToolOutput::Json(
         link.call("run_frames", json!({ "n": n }))?,
     ))
@@ -412,6 +455,7 @@ pub fn step(
     unit: StepUnit,
     cpu: Option<&str>,
 ) -> Result<ToolOutput, LinkError> {
+    validate_sync_advance("step", count)?;
     let required = unit.capability_method();
     if !link
         .capabilities()

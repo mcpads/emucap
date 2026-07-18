@@ -1,3 +1,15 @@
+use std::time::Duration;
+
+/// Maximum work admitted to one synchronous frame/instruction advance. Longer travel is composed
+/// from terminally acknowledged calls so a dropped host cannot leave one unbounded operation
+/// advancing the emulator.
+pub const MAX_SYNC_ADVANCE_COUNT: u64 = 5_000;
+
+/// Backend-side deadline for bridges that execute an advance as repeated GDB/WebSocket requests.
+/// It stays below the outer link's 300-second deferred deadline, leaving time for terminal cleanup
+/// and the final response.
+pub const MAX_SYNC_OPERATION_TIME: Duration = Duration::from_secs(250);
+
 /// Finish a temporal operation only after its terminal cleanup has run.
 ///
 /// A successful effect with failed cleanup is not a successful operation. If both the effect and

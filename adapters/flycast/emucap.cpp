@@ -91,6 +91,7 @@ std::string g_rx;         // 수신 라인 버퍼
 std::string g_tx;         // 아직 보내지 못한 NDJSON bytes(keepalive + final을 순서대로 보존)
 size_t g_tx_pos = 0;      // g_tx의 다음 전송 byte
 static const size_t TX_CAP = 8 * 1024 * 1024;
+static const long MAX_SYNC_ADVANCE = 5000;
 uint64_t g_frame = 0;     // vblank 카운터(우리 기준)
 bool g_frozen = false;    // freeze 상태(스핀으로 프레임 진행 차단)
 long g_step_id = -1;      // step(frames) 완료 응답 대기 id
@@ -430,6 +431,17 @@ void reply_err(long id, const char* kind, const char* msg) {
 	char head[96];
 	snprintf(head, sizeof(head), "{\"id\":%ld,\"ok\":false,\"error\":{\"kind\":\"%s\",\"message\":\"", id, kind);
 	send_line(std::string(head) + json_escape(msg) + "\"}}");
+}
+
+bool normalize_sync_advance(long id, long& count) {
+	if (count < 1) count = 1;
+	if (count <= MAX_SYNC_ADVANCE) return true;
+	char msg[192];
+	snprintf(msg, sizeof(msg),
+	         "frame count %ld exceeds synchronous limit %ld; split the request and verify each terminal response",
+	         count, MAX_SYNC_ADVANCE);
+	reply_err(id, "bad_params", msg);
+	return false;
 }
 // 지연 명령(run_frames/step) 진행 중 keepalive — 서버는 status:"working"을 건너뛰어 요청 타임아웃을
 // 방지한다(긴 진행이 5초 읽기 타임아웃에 안 걸리게). 같은 id로 보내야 서버가 같은 호출로 인식한다.
@@ -954,7 +966,9 @@ void handle(const std::string& line) {
 			r += "],"
 			     // Advertise the memory types accepted by read_memory, write_memory, and find_pattern.
 			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"],"
-			     "\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","
+			     "\"execution_limits\":{\"max_sync_advance_count\":";
+			r += std::to_string(MAX_SYNC_ADVANCE);
+			r += "},\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","
 			     "\"active_exceptions\":[\"flycast.execution.instruction-step-absent\","
 			     "\"flycast.call-stack.best-effort\",\"flycast.input-hold.port-zero-only\"]}}";
 			const char* tok = getenv("EMUCAP_SESSION_TOKEN");
@@ -986,7 +1000,8 @@ void handle(const std::string& line) {
 				+ ",\"input_override\":{\"observable\":true,\"engaged\":"
 				+ (g_input_override.engaged() ? std::string("true") : std::string("false"))
 				+ ",\"mode\":\"" + (g_input_override.engaged() ? std::string("persistent") : std::string("native"))
-				+ "\",\"pressed_mask\":" + std::to_string(g_input_override.pressed_mask()) + "}";
+				+ "\",\"pressed_mask\":" + std::to_string(g_input_override.pressed_mask()) + "}"
+				+ ",\"execution_limits\":{\"max_sync_advance_count\":" + std::to_string(MAX_SYNC_ADVANCE) + "}";
 			{
 				std::lock_guard<std::mutex> lk(g_fb_mtx);
 				result += std::string(",\"framebuffer_fresh\":") + (g_fb_fresh ? "true" : "false");
@@ -1035,7 +1050,7 @@ void handle(const std::string& line) {
 			// terminal state는 항상 running; frozen으로 끝내는 exact advance는 step이 소유한다.
 			long n = 1;
 			json_num(line, "n", n);
-			if (n < 1) n = 1;
+			if (!normalize_sync_advance(id, n)) return;
 			g_frozen = false;
 			g_step_id = id;
 			g_step_remaining = n;
@@ -1072,7 +1087,7 @@ void handle(const std::string& line) {
 			}
 			long frames = 1;
 			json_num(line, "frames", frames);
-			if (frames < 1) frames = 1;
+			if (!normalize_sync_advance(id, frames)) return;
 			g_frozen = true;
 			g_step_id = id;        // 완료 응답은 emucap_service가 frames 경과 후
 			g_step_remaining = frames;

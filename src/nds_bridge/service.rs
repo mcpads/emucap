@@ -32,6 +32,10 @@ impl<G: GdbTransport> NdsBridge<G> {
             "capability_notes": self.capability_notes(),
             "input_buttons": nds_input_buttons_json(),
             "cpus": self.connected_cpu_names(),
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+            },
         });
         let obj = result.as_object_mut().expect("hello is an object");
         if let Some(name) = &self.env.name {
@@ -84,6 +88,10 @@ impl<G: GdbTransport> NdsBridge<G> {
             "input_buttons": nds_input_buttons_json(),
             "input_override": input_override,
             "touch_override": touch_override,
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+            },
         }))
     }
 

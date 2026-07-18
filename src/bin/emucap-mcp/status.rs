@@ -246,6 +246,18 @@ pub(crate) fn enrich_contract_status(
         identity.system.as_deref(),
         &methods,
     );
+    let adapter_sync_limit = |pointer: &str| {
+        v.pointer(pointer)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(crate::args::MAX_SYNC_ADVANCE_COUNT)
+            .min(crate::args::MAX_SYNC_ADVANCE_COUNT)
+    };
+    let step_limit = adapter_sync_limit("/execution_limits/max_sync_advance_count");
+    let run_frames_limit = v
+        .pointer("/execution_limits/frame/max_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(step_limit)
+        .min(step_limit);
     if methods.iter().any(|method| method == "write_memory") {
         contracts.constraints.insert(
             "memory.write.input_sources".into(),
@@ -258,6 +270,21 @@ pub(crate) fn enrich_contract_status(
         contracts.constraints.insert(
             "memory.write.file_load_timeout_ms".into(),
             serde_json::json!(crate::memory_write::FILE_LOAD_TIMEOUT_MS),
+        );
+    }
+    if methods
+        .iter()
+        .any(|method| method == "step" || method == "step_instructions")
+    {
+        contracts.constraints.insert(
+            "execution.step.max_count".into(),
+            serde_json::json!(step_limit),
+        );
+    }
+    if methods.iter().any(|method| method == "run_frames") {
+        contracts.constraints.insert(
+            "execution.run_frames.max_frames".into(),
+            serde_json::json!(run_frames_limit),
         );
     }
     if contracts.state == "validated" {

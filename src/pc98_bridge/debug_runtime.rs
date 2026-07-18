@@ -159,7 +159,20 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub(super) fn step_instruction_count(&mut self, count: u64) -> BridgeResult<Value> {
-        for _ in 0..count {
+        if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(BridgeError::BadParams(format!(
+                "instruction count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
+                crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            )));
+        }
+        let deadline = std::time::Instant::now() + crate::live::temporal::MAX_SYNC_OPERATION_TIME;
+        for completed in 0..count {
+            if std::time::Instant::now() >= deadline {
+                self.frozen = true;
+                return Err(BridgeError::Emulator(format!(
+                    "instruction step deadline exceeded after {completed} of {count}; the CPU remains frozen"
+                )));
+            }
             // s는 정상 응답 자체가 stop이라 send_cmd의 demux(command_expects_stop 아닌 명령만)가
             // 스킵된다. 그래서 s 앞에 낀 stale async stop(직전 framestep/BP 히트)은 send_cmd로도
             // 안 걷혀 s의 응답 자리에 오배달되고, 스텝이 실제로 안 돌고도 완료로 오인돼 off-by-one
@@ -177,8 +190,8 @@ impl<G: GdbTransport> Bridge<G> {
                     "GDB instruction step returned unexpected response: {resp}"
                 )));
             }
+            self.frozen = true;
         }
-        self.frozen = true;
         Ok(json!({
             "status": "completed",
             "unit": "instructions",
@@ -471,6 +484,18 @@ impl<G: GdbTransport> Bridge<G> {
         arg: &str,
         budget_frames: u64,
     ) -> BridgeResult<Option<String>> {
+        let per_frame_ms = self.frame_operation_budget_ms();
+        let estimated_ms = 5_000u64.saturating_add(budget_frames.saturating_mul(per_frame_ms));
+        let deadline_ms = crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64;
+        if budget_frames > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            || estimated_ms > deadline_ms
+        {
+            return Err(BridgeError::BadParams(format!(
+                "{name} frame count {budget_frames} exceeds the current synchronous limit {} ({} ms/frame estimate, {deadline_ms} ms deadline); split the advance and verify each terminal response",
+                self.max_sync_frame_count(),
+                per_frame_ms
+            )));
+        }
         // s(step)와 마찬가지로 framestep/runframes도 응답 자체가 stop이라 send_cmd의 stale-stop demux가
         // command_expects_stop로 스킵된다. 직전 resume()가 pause_on_hit BP를 물어 남긴 버퍼된 stop이
         // 앞에 끼면 이 프레임 명령의 응답 자리에 오배달돼(drain_immediate_stops가 프레임 결과로 오소비)
@@ -481,12 +506,7 @@ impl<G: GdbTransport> Bridge<G> {
         // 트레이싱 중이면 프레임마다 수십만 명령을 디스어셈+기록하므로 무트레이스 50ms/frame
         // 예산으론 타임아웃→지연 stop이 늦게 도착한다. 트레이스일 때 프레임당 예산을 크게 잡아
         // 지연 응답이 이 recv 창 안에서 매칭되게 한다.
-        let per_frame_ms = if self.tracing { 5_000 } else { 50 };
-        let timeout = Duration::from_millis(
-            5_000u64
-                .saturating_add(budget_frames.saturating_mul(per_frame_ms))
-                .min(600_000),
-        );
+        let timeout = Duration::from_millis(estimated_ms);
         self.gdb.set_timeout(timeout)?;
         let result = self.lua_cmd_allow_stop(name, Some(arg));
         let restore = self.gdb.set_timeout(previous);
@@ -496,6 +516,23 @@ impl<G: GdbTransport> Bridge<G> {
             (Ok(_), Err(err)) => Err(err),
             (Err(err), Err(_)) => Err(err),
         }
+    }
+
+    pub(super) fn frame_operation_budget_ms(&self) -> u64 {
+        if self.tracing {
+            5_000
+        } else {
+            50
+        }
+    }
+
+    pub(super) fn max_sync_frame_count(&self) -> u64 {
+        let deadline_ms = crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64;
+        deadline_ms
+            .saturating_sub(5_000)
+            .checked_div(self.frame_operation_budget_ms())
+            .unwrap_or(0)
+            .min(crate::live::temporal::MAX_SYNC_ADVANCE_COUNT)
     }
 
     pub(super) fn lua_cmd_allow_stop(

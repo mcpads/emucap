@@ -135,6 +135,7 @@ std::string g_rx;
 std::string g_tx;
 size_t g_tx_pos = 0;
 static const size_t TX_CAP = 8 * 1024 * 1024;
+static const long MAX_SYNC_ADVANCE = 5000;
 uint64_t g_frame = 0;
 
 // 지연 명령(run_frames): N프레임 진행 후 응답. 진행 중엔 새 명령을 받지 않고 keepalive를 보낸다.
@@ -450,6 +451,18 @@ void reply_err(long id, const char* kind, const char* msg) {
   char head[96];
   snprintf(head, sizeof(head), "{\"id\":%ld,\"ok\":false,\"error\":{\"kind\":\"%s\",\"message\":\"", id, kind);
   send_line(std::string(head) + json_escape(msg) + "\"}}");  // msg는 예외 등 비신뢰 → 이스케이프
+}
+
+bool normalize_sync_advance(long id, long& count, bool allow_zero) {
+  const long minimum = allow_zero ? 0 : 1;
+  if (count < minimum) count = minimum;
+  if (count <= MAX_SYNC_ADVANCE) return true;
+  char msg[192];
+  snprintf(msg, sizeof(msg),
+           "frame/instruction count %ld exceeds synchronous limit %ld; split the request and verify each terminal response",
+           count, MAX_SYNC_ADVANCE);
+  reply_err(id, "bad_params", msg);
+  return false;
 }
 
 AddressSpaceType* find_aspace(const std::string& name) {
@@ -2128,7 +2141,8 @@ void handle(const std::string& line) {
              PROTOCOL_VERSION, sys, EMUCAP_BUILD_HASH, has_debugger ? "true" : "false");
     std::string hello_resp = std::string(head) + "\"methods\":[" + methods +
                              "],\"memory_types\":[" + mtypes + "],\"contracts\":" +
-                             contracts + "}";
+                             contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
+                             std::to_string(MAX_SYNC_ADVANCE) + "}}";
     // broker 등록용 name(EMUCAP_NAME 설정 시 포함, 직접 모드는 무시됨).
     const char* emu_name = getenv("EMUCAP_NAME");
     const char* session_token = getenv("EMUCAP_SESSION_TOKEN");
@@ -2174,13 +2188,13 @@ void handle(const std::string& line) {
              "{\"connected\":true,\"system\":\"%s\",\"debugger\":%s,\"frame\":%llu,\"state\":\"%s\","
              "\"last_game_input\":\"0x%04x\",\"last_game_buttons\":%s,"
              "\"input_override\":{\"observable\":true,\"engaged\":%s,\"mode\":\"%s\","
-             "\"pressed_mask\":%u}}",
+             "\"pressed_mask\":%u},\"execution_limits\":{\"max_sync_advance_count\":%ld}}",
              sys, has_debugger ? "true" : "false",
              (unsigned long long)g_frame, g_frozen ? "frozen" : "running",
              (unsigned)g, mask_to_buttons(g).c_str(),
              g_input_override.engaged() ? "true" : "false",
              g_def_is_press ? "timed" : (g_input_override.engaged() ? "persistent" : "native"),
-             (unsigned)g_input_override.mask());
+             (unsigned)g_input_override.mask(), MAX_SYNC_ADVANCE);
     std::string resp(buf);
     if (is_ss()) {
       uint32_t a = g_last_smpc_read_addr.load();
@@ -2227,6 +2241,7 @@ void handle(const std::string& line) {
   } else if (method == "run_frames") {
     long n = 1;
     json_num(line, "n", n);
+    if (!normalize_sync_advance(id, n, false)) return;
     // 어댑터에서 직접 resume한다 — Rust ensure_running이 먼저 resume해도, BP가 메인루프에 있으면 resume 직후
     // 재히트→재freeze되고 그 사이 도착한 run_frames는 게임스레드가 freeze_spin에 park된 채라 g_def가 진행
     // 안 돼 timeout이 났다(freeze_spin 탈출조건이 g_step/g_insn만 봐 g_def는 못 깨움). 여기서 g_frozen=false로
@@ -2261,7 +2276,7 @@ void handle(const std::string& line) {
     }
     long frames = 1;
     json_num(line, "frames", frames);
-    if (frames < 1) frames = 1;
+    if (!normalize_sync_advance(id, frames, false)) return;
     uint16_t m = 0;
     std::string input_err;
     if (!buttons_to_mask(line, m, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
@@ -2307,7 +2322,7 @@ void handle(const std::string& line) {
         json_num(line, "count", count);
       else
         json_num(line, "frames", count);
-      if (count < 1) count = 1;
+      if (!normalize_sync_advance(id, count, false)) return;
       g_insn_remaining = count;
       g_insn_step_id = id;               // 완료 응답은 cb가 count 명령 실행 후(지연)
       // cold(콜백 밖) 진입이면 첫 continuous cb를 흡수해 진입명령을 공짜 실행(BP 진입과 동형) → 정확히 N.
@@ -2320,7 +2335,7 @@ void handle(const std::string& line) {
     }
     long frames = 1;
     json_num(line, "frames", frames);
-    if (frames < 1) frames = 1;
+    if (!normalize_sync_advance(id, frames, false)) return;
     g_frozen = true;           // 진행 후 재정지
     // via_cb는 핸들러가 정하지 않는다 — frame-step 완료 후 emucap_service frozen park가 false로 설정.
     // 프레임 중 BP가 히트해 cb 안에서 park하면 freeze_spin이 true로(park 위치가 권위).
@@ -2337,13 +2352,14 @@ void handle(const std::string& line) {
     std::string path = json_str(line, "state");
     long frames = 0;
     json_num(line, "frame", frames);
+    if (!normalize_sync_advance(id, frames, true)) return;
     try {                              // 즉시 복귀(원자적 진입)
       FileStream fs(path, FileStream::MODE_READ);
       MDFNSS_LoadSM(&fs);
       fs.close();
     } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
     g_probe_id = id;                   // 진행·읽기·응답은 emucap_service가(그 사이 새 명령 차단)
-    g_probe_remaining = frames < 0 ? 0 : frames;
+    g_probe_remaining = frames;
     g_probe_mt = probe_mt;
     g_probe_addr = 0;
     g_probe_len = 0;

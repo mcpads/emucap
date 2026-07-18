@@ -1057,7 +1057,9 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     let auth = store.read_auth(port, launch_id).unwrap().unwrap();
     assert_eq!(auth, link.token);
 
-    for _ in 0..20 {
+    // The detached child can be scheduled late while all-target test binaries are starting.
+    // Keep the common path immediate, but allow enough wall time for it to publish both files.
+    for _ in 0..200 {
         if capture.exists() && runtime_capture.exists() {
             break;
         }
