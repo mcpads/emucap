@@ -10,7 +10,7 @@ GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), and MAME (PC-98).
 
-**v0.9.0-alpha.2 — alpha.** This repository is under active, continuous development;
+**v0.9.0-alpha.3 — alpha.** This repository is under active, continuous development;
 interfaces and behavior may change between prereleases.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
@@ -177,10 +177,11 @@ debugger halt to service requests without advancing the guest.
   GBC / NES need none. → `adapters/mesen2/README.md`
 - **Mednafen (Saturn · PSX · PCE · MD · WonderSwan/WSC)** — build the fork with
   `adapters/mednafen/build.sh` (needs SDL: macOS `brew install sdl2`, Linux
-  `libsdl2-dev`). One binary handles all five systems. PSX and PCE-CD need BIOS
+  `libsdl2-dev`). Its source archive and checksum are pinned. One binary handles all five systems. PSX and PCE-CD need BIOS
   files (not committed to the repo). → `adapters/mednafen/README.md`
 - **Flycast (Dreamcast)** — build with `adapters/flycast/build.sh`; it builds in an
-  emucap-owned work tree and treats any `FLYCAST_SRC` checkout as read-only input.
+  emucap-owned work tree, pins the commit and recursive submodule graph, and treats any
+  `FLYCAST_SRC` checkout as a read-only Git object source.
   → `adapters/flycast/README.md`
 - **DeSmuME (Nintendo DS)** — build the headless fork with
   `adapters/desmume-nds/build.sh` (needs meson/ninja/SDL2/glib). No NDS BIOS is

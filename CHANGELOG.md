@@ -2,6 +2,20 @@
 
 Prerelease software — interfaces may still change.
 
+## 0.9.0-alpha.3
+
+### Added
+- `status.continuity.runtime_diagnostics` reports invalid, oversized, inaccessible, or otherwise unreadable runtime artifacts without promoting damaged adapter evidence to an exact crash. `bootstrap` and `status` remain usable and return a safe next action.
+
+### Changed
+- Direct-mode compatibility tokens and preferred listener ports now live under the private emucap runtime directory. Existing files must be regular, user-owned, and private on Unix; read and write failures are surfaced instead of silently ignored.
+- Flycast builds use a pinned commit and recursive submodule manifest, while Mednafen builds verify the pinned release archive SHA-256 before every extraction. Adapter build identities now include both the emucap and upstream revisions.
+- Shared POSIX adapter work trees use kernel advisory locks for the complete reset, patch, and build critical section. Windows Mesen builds use a work-tree-specific named mutex.
+
+### Fixed
+- Parallel adapter builds can no longer steal a live build lock based on file age or mutate the same work tree concurrently. Kernel locks are released automatically after failure or process exit, so an immediate retry is safe.
+- Launch and direct-session tests now share one process-wide environment lock and restore changed values, preventing parallel tests from leaking emulator paths or session identities into one another.
+
 ## 0.9.0-alpha.2
 
 ### Added
