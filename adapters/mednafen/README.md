@@ -65,6 +65,9 @@ path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fa
 - Download Mednafen 1.32.1 → inject `emucap.cpp` → re-inject all emucap hooks into the fresh source with perl →
   `./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-debugger` → make.
   Output: `work/mednafen/src/mednafen`.
+- `upstream.lock` fixes the release URL and SHA-256. `build.sh` verifies both a newly downloaded archive and
+  every cached archive before extraction. The adapter `build` identity combines the emucap revision and
+  `mednafen-1.32.1`.
 - **`--enable-ss` required**: configure's Saturn auto-detection only turns it on when `host_cpu` is `aarch64*`/`arm64*`,
   but Apple Silicon reports as `arm` and gets dropped. psx is on by default, but `--enable-psx` pins the intent.
 - **Hooks injected by build.sh (no reliance on hand-edits · reproducible)**: ① the main.cpp frame loop (`emucap_service`/

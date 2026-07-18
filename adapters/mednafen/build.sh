@@ -12,7 +12,21 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-VER="${MEDNAFEN_VER:-1.32.1}"
+. "$HERE/../_common/build-lock.sh"
+LOCK_FILE="$HERE/upstream.lock"
+
+lock_value() {
+  sed -n "s/^$1=//p" "$LOCK_FILE"
+}
+
+VER="$(lock_value MEDNAFEN_VERSION)"
+URL="$(lock_value MEDNAFEN_URL)"
+MEDNAFEN_SHA256="$(lock_value MEDNAFEN_SHA256)"
+[ -n "$VER" ] && [ -n "$URL" ] &&
+  printf '%s' "$MEDNAFEN_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+  echo "ERROR: invalid Mednafen upstream lock: $LOCK_FILE" >&2
+  exit 1
+}
 DEFAULT_WORK="$HERE/work"
 WORK_INPUT="${EMUCAP_MEDNAFEN_WORK:-$DEFAULT_WORK}"
 CUSTOM_WORK=0
@@ -28,7 +42,6 @@ WORK="$(cd "$WORK_INPUT" && pwd -P)"  # 세션별 병렬 빌드 격리용 오버
 OWNER_FILE="$WORK/.emucap-mednafen-work"
 SRC="$WORK/mednafen"
 TARBALL="$WORK/mednafen-$VER.tar.xz"
-URL="https://mednafen.github.io/releases/files/mednafen-$VER.tar.xz"
 
 abs_child_path() {
   local path="$1"
@@ -71,43 +84,46 @@ if [ "$CUSTOM_WORK" = "1" ] && [ ! -f "$OWNER_FILE" ]; then
     exit 2
   fi
 fi
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "Mednafen"
 : >"$OWNER_FILE"
 
-# 0. 동시-빌드 직렬화: 다중 세션이 공유 work/를 동시에 빌드하면 rm -rf/추출이 서로 clobber해
-# "Makefile.in/config.rpath 부재" 같은 configure 실패가 난다.
-# macOS엔 flock 커맨드가 없어 mkdir 원자 락으로 직렬화한다. 크래시로 남은 stale 락(30분 초과)은 회수한다.
-# 세션별 병렬 빌드가 필요하면 EMUCAP_MEDNAFEN_WORK로 work/를 분리하라(그러면 락 경합도 없다).
-LOCKDIR="${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}"
-LOCK_OWNER_FILE="$LOCKDIR/.emucap-mednafen-build-lock"
-LOCK_PARENT="$(dirname "$LOCKDIR")"
-if [ ! -d "$LOCK_PARENT" ]; then
-  echo "ERROR: build lock parent directory does not exist: $LOCK_PARENT" >&2
-  exit 2
-fi
-if [ -e "$LOCKDIR" ] && [ ! -d "$LOCKDIR" ]; then
-  echo "ERROR: build lock path exists but is not a directory: $LOCKDIR" >&2
-  exit 2
-fi
-_bl_waited=0
-while ! mkdir "$LOCKDIR" 2>/dev/null; do
-  if [ -f "$LOCK_OWNER_FILE" ] && [ -n "$(find "$LOCK_OWNER_FILE" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
-    echo "→ stale 빌드 락 회수(30분 초과): $LOCKDIR" >&2
-    rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true
-    rmdir "$LOCKDIR" 2>/dev/null || true
-    continue
+sha256_path() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "ERROR: shasum or sha256sum is required" >&2
+    return 1
   fi
-  [ "$_bl_waited" = 0 ] && echo "→ 다른 Mednafen build.sh 진행 중 — 직렬화 대기(공유 work/ clobber 방지)…" >&2
-  _bl_waited=1
-  sleep 5
-done
-: >"$LOCK_OWNER_FILE"
-trap 'rm -f "$LOCK_OWNER_FILE" 2>/dev/null || true; rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+}
 
 # 1. 소스(캐시)
 if [ ! -f "$TARBALL" ]; then
   echo "→ Mednafen $VER 다운로드"
-  curl -fsSL -o "$TARBALL" "$URL"
+  DOWNLOAD="$TARBALL.download.$$"
+  rm -f "$DOWNLOAD"
+  if ! curl -fsSL -o "$DOWNLOAD" "$URL"; then
+    rm -f "$DOWNLOAD"
+    exit 1
+  fi
+  GOT_MEDNAFEN_SHA256="$(sha256_path "$DOWNLOAD")"
+  if [ "$GOT_MEDNAFEN_SHA256" != "$MEDNAFEN_SHA256" ]; then
+    rm -f "$DOWNLOAD"
+    echo "ERROR: downloaded Mednafen archive checksum mismatch" >&2
+    echo "  expected=$MEDNAFEN_SHA256" >&2
+    echo "  actual=$GOT_MEDNAFEN_SHA256" >&2
+    exit 1
+  fi
+  mv "$DOWNLOAD" "$TARBALL"
 fi
+GOT_MEDNAFEN_SHA256="$(sha256_path "$TARBALL")"
+[ "$GOT_MEDNAFEN_SHA256" = "$MEDNAFEN_SHA256" ] || {
+  echo "ERROR: Mednafen archive checksum mismatch: $TARBALL" >&2
+  echo "  expected=$MEDNAFEN_SHA256" >&2
+  echo "  actual=$GOT_MEDNAFEN_SHA256" >&2
+  exit 1
+}
 
 # 2. 깨끗이 추출
 echo "→ 추출"
@@ -121,6 +137,7 @@ cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$SRC/src/drivers/
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h emucap_input.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
+BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/src/drivers/emucap_build.h"
 
 # 헬퍼: perl 주입 후 마커(고정 문자열)가 들어갔는지 검증. fresh 빌드가 조용히 깨지는 것을 막는다.

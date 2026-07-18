@@ -7,14 +7,14 @@ Live-debug the Dreamcast (SH-4) with emucap.
 You (the agent) run `build.sh` and launch yourself. Three inputs come from the **user** — walk them
 through each by exact filename/path and confirm before proceeding:
 
-1. **Flycast source checkout, optional** — `build.sh` uses `FLYCAST_SRC` only as a read-only source input.
-   It copies/clones Flycast into an emucap-owned build tree before injecting `emucap.cpp`; it does not patch
-   the user's checkout or remove that checkout's `build/` directory. Normally the agent handles the source:
-   if no source is present, the script clones it recursively into the emucap build cache —
+1. **Flycast source checkout, optional** — `build.sh` uses `FLYCAST_SRC` only as a read-only Git object source.
+   It fetches the commit pinned in `upstream.lock` into an emucap-owned cache, checks out the pinned recursive
+   submodule graph there, and only then copies source into the patch/build tree. It does not read modified
+   working files from, patch, or remove the user's checkout. Normally the agent handles the source:
    ```bash
    adapters/flycast/build.sh
    ```
-   — or set `FLYCAST_SRC=<path to an existing recursive checkout>` to reuse an existing checkout as input.
+   — or set `FLYCAST_SRC=<path to an existing checkout>` to reuse its local Git objects as the fetch origin.
    Set `EMUCAP_FLYCAST_BUILD_HOME` only to an empty directory or one previously created by `build.sh`.
    Only involve the user if you cannot reach GitHub or need them to pick a location.
 
@@ -89,6 +89,8 @@ Default build output:
 - Linux: `${XDG_DATA_HOME:-~/.local/share}/emucap/flycast-build/work/build/flycast`
 - Windows BETA: `%LOCALAPPDATA%\emucap\flycast-build\work\build\Flycast.exe`
 `FLYCAST_APP` may point to either the executable or a macOS `Flycast.app` bundle.
+The adapter `build` identity uses the form
+`<emucap-revision>@flycast-<upstream-revision>`, so `status.emulator_build` distinguishes both inputs.
 
 ⚠ macOS arm64: a rebuilt .app has no JIT signature, so **dynarec can crash before the adapter connects**. The build skips
 recompiler initialization when the interpreter is selected, and the launcher also forces `Dynarec.Enabled=no` for the isolated

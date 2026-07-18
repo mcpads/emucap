@@ -17,6 +17,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/../_common/build-lock.sh"
 PATCH="$HERE/patches/0001-headless-cli.patch"
 PATCH2="$HERE/patches/0002-emucap-hooks.patch"
 PATCH3="$HERE/patches/0003-emucap-state-disasm.patch"
@@ -26,7 +27,10 @@ PATCH6="$HERE/patches/0006-emucap-gdb-bufmax.patch"
 PATCH7="$HERE/patches/0007-emucap-input-status.patch"
 PATCH8="$HERE/patches/0008-emucap-gdb-io-deadline.patch"
 PATCH9="$HERE/patches/0009-emucap-gdb-no-sigpipe.patch"
-WORK="${EMUCAP_DESMUME_WORK:-$HERE/work}"
+WORK_INPUT="${EMUCAP_DESMUME_WORK:-$HERE/work}"
+[ ! -L "$WORK_INPUT" ] || { echo "ERROR: DeSmuME work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
+mkdir -p "$WORK_INPUT"
+WORK="$(cd "$WORK_INPUT" && pwd -P)"
 SRC="$WORK/src"
 POSIX="$SRC/desmume/src/frontend/posix"
 BUILD="$POSIX/build-headless"
@@ -46,7 +50,7 @@ for tool in meson ninja git; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing build tool: $tool (macOS: brew install $tool)" >&2; exit 1; }
 done
 
-mkdir -p "$WORK"
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "DeSmuME"
 
 # DeSmuME upstream is pinned to a known-good revision — the patch stack (0001-0009) is written
 # against exactly this tree. Cloning a moving HEAD would silently build an untested revision, and any

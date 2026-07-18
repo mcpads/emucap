@@ -2,7 +2,12 @@
 # Build PPSSPPHeadless from a pinned PPSSPP commit for the emucap PSP adapter.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WORK="$HERE/work"
+. "$HERE/../_common/build-lock.sh"
+WORK_INPUT="${EMUCAP_PPSSPP_WORK:-$HERE/work}"
+[ ! -L "$WORK_INPUT" ] || { echo "ERROR: PPSSPP work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
+mkdir -p "$WORK_INPUT"
+WORK="$(cd "$WORK_INPUT" && pwd -P)"
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "PPSSPP"
 PPSSPP_COMMIT="${EMUCAP_PPSSPP_COMMIT:-56c694d88bbf82270e8b472fe63abd60f3f8e0a9}"
 REPO="https://github.com/hrydgard/ppsspp.git"
 # macOS: force Apple clang (homebrew LLVM breaks libc++).

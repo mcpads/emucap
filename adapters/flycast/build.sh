@@ -3,6 +3,22 @@
 # FLYCAST_SRC는 읽기 전용 입력으로만 쓰고, 실제 패치와 build/는 emucap 소유 작업 트리에서 수행한다.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/../_common/build-lock.sh"
+LOCK_FILE="$HERE/upstream.lock"
+
+lock_value() {
+  sed -n "s/^$1=//p" "$LOCK_FILE"
+}
+
+FLYCAST_REPO="$(lock_value FLYCAST_REPO)"
+FLYCAST_COMMIT="$(lock_value FLYCAST_COMMIT)"
+FLYCAST_SUBMODULES_SHA256="$(lock_value FLYCAST_SUBMODULES_SHA256)"
+[ -n "$FLYCAST_REPO" ] &&
+  printf '%s' "$FLYCAST_COMMIT" | grep -Eq '^[0-9a-f]{40}$' &&
+  printf '%s' "$FLYCAST_SUBMODULES_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+  echo "ERROR: invalid Flycast upstream lock: $LOCK_FILE" >&2
+  exit 1
+}
 
 emucap_data_root() {
   if [ -n "${EMUCAP_EMU_HOME:-}" ]; then
@@ -60,6 +76,7 @@ if [ "$CUSTOM_BUILD_HOME" = "1" ] && [ ! -f "$OWNER_FILE" ]; then
     exit 2
   fi
 fi
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$BUILD_HOME/.build.lock}" "Flycast"
 : >"$OWNER_FILE"
 
 guard_path() {
@@ -92,20 +109,54 @@ safe_rm_rf() {
   rm -rf -- "$1"
 }
 
-if [ -n "${FLYCAST_SRC:-}" ]; then
-  UPSTREAM="$FLYCAST_SRC"
-elif [ -d "${HOME:-}/flycast/core" ]; then
-  UPSTREAM="$HOME/flycast"
-else
-  UPSTREAM="$UPSTREAM_CACHE"
-  if [ ! -d "$UPSTREAM/core" ]; then
-    echo "→ Flycast 소스 캐시 생성: $UPSTREAM"
-    git clone --recursive https://github.com/flyinghead/flycast "$UPSTREAM"
-  fi
-fi
-[ -d "$UPSTREAM/core" ] || { echo "ERROR: Flycast 소스 없음: $UPSTREAM (FLYCAST_SRC로 지정하거나 네트워크 clone 허용)"; exit 1; }
-
 ensure_under_build_home "$SRC"
+ORIGIN="${FLYCAST_SRC:-$FLYCAST_REPO}"
+if [ -n "${FLYCAST_SRC:-}" ] && ! git -C "$FLYCAST_SRC" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "ERROR: FLYCAST_SRC is not a git checkout: $FLYCAST_SRC" >&2
+  exit 1
+fi
+if [ ! -d "$UPSTREAM_CACHE/.git" ]; then
+  if [ -e "$UPSTREAM_CACHE" ] && [ -n "$(find "$UPSTREAM_CACHE" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null || true)" ]; then
+    echo "ERROR: Flycast upstream cache exists but is not a git checkout: $UPSTREAM_CACHE" >&2
+    exit 1
+  fi
+  mkdir -p "$UPSTREAM_CACHE"
+  git init -q "$UPSTREAM_CACHE"
+  git -C "$UPSTREAM_CACHE" remote add origin "$ORIGIN"
+else
+  git -C "$UPSTREAM_CACHE" remote set-url origin "$ORIGIN"
+fi
+echo "→ fetching pinned Flycast $FLYCAST_COMMIT"
+git -C "$UPSTREAM_CACHE" fetch -q --depth 1 origin "$FLYCAST_COMMIT"
+git -C "$UPSTREAM_CACHE" checkout -q --detach "$FLYCAST_COMMIT"
+git -C "$UPSTREAM_CACHE" reset -q --hard "$FLYCAST_COMMIT"
+git -C "$UPSTREAM_CACHE" clean -fdx
+git -C "$UPSTREAM_CACHE" submodule sync --recursive
+git -C "$UPSTREAM_CACHE" submodule update --init --recursive --force
+git -C "$UPSTREAM_CACHE" submodule foreach --recursive 'git reset -q --hard "$sha1"; git clean -fdxq'
+GOT_FLYCAST_COMMIT="$(git -C "$UPSTREAM_CACHE" rev-parse HEAD)"
+[ "$GOT_FLYCAST_COMMIT" = "$FLYCAST_COMMIT" ] || {
+  echo "ERROR: Flycast revision mismatch: got $GOT_FLYCAST_COMMIT expected $FLYCAST_COMMIT" >&2
+  exit 1
+}
+SUBMODULE_MANIFEST="$BUILD_HOME/flycast-submodules.txt"
+git -C "$UPSTREAM_CACHE" submodule status --recursive |
+  sed -E 's/^[ +U-]([0-9a-f]+) ([^ ]+).*/\1 \2/' >"$SUBMODULE_MANIFEST"
+if command -v shasum >/dev/null 2>&1; then
+  GOT_SUBMODULES_SHA256="$(shasum -a 256 "$SUBMODULE_MANIFEST" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  GOT_SUBMODULES_SHA256="$(sha256sum "$SUBMODULE_MANIFEST" | awk '{print $1}')"
+else
+  echo "ERROR: shasum or sha256sum is required" >&2
+  exit 1
+fi
+[ "$GOT_SUBMODULES_SHA256" = "$FLYCAST_SUBMODULES_SHA256" ] || {
+  echo "ERROR: Flycast submodule manifest mismatch" >&2
+  echo "  expected=$FLYCAST_SUBMODULES_SHA256" >&2
+  echo "  actual=$GOT_SUBMODULES_SHA256" >&2
+  exit 1
+}
+UPSTREAM="$UPSTREAM_CACHE"
 mkdir -p "$SRC"
 if command -v rsync >/dev/null 2>&1; then
   rsync -a --delete --exclude '.git' --exclude '/build/' --exclude '/.emucap_build.lock' "$UPSTREAM"/ "$SRC"/
@@ -121,34 +172,6 @@ echo "→ Flycast work tree 준비: $SRC (source: $UPSTREAM)"
 . "$HERE/../_common/build-env.sh"
 emucap_scrub_build_env
 
-# 동시-빌드 직렬화: 다중 세션이 같은 $SRC/build에서 동시에 cmake --build하면 오브젝트가 clobber돼 레이스가
-# 난다(Mednafen과 동형 이슈). macOS엔 flock이 없어 mkdir 원자 락으로 직렬화한다(stale 30분 초과는 회수).
-LOCKDIR="${EMUCAP_BUILD_LOCK:-$BUILD_HOME/.build.lock}"
-LOCK_PARENT="$(dirname "$LOCKDIR")"
-if [ ! -d "$LOCK_PARENT" ]; then
-  echo "ERROR: build lock parent directory does not exist: $LOCK_PARENT" >&2
-  exit 2
-fi
-if [ -e "$LOCKDIR" ] && [ ! -d "$LOCKDIR" ]; then
-  echo "ERROR: build lock path exists but is not a directory: $LOCKDIR" >&2
-  exit 2
-fi
-LOCK_MARKER="$LOCKDIR/.emucap-flycast-build-lock"
-_bl_waited=0
-while ! mkdir "$LOCKDIR" 2>/dev/null; do
-  if [ -f "$LOCK_MARKER" ] && [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
-    echo "→ stale 빌드 락 회수(30분 초과): $LOCKDIR" >&2
-    rm -f "$LOCK_MARKER"
-    rmdir "$LOCKDIR" 2>/dev/null || true
-    continue
-  fi
-  [ "$_bl_waited" = 0 ] && echo "→ 다른 Flycast build.sh 진행 중 — 직렬화 대기(동시 cmake clobber 방지)…" >&2
-  _bl_waited=1
-  sleep 5
-done
-: >"$LOCK_MARKER"
-trap 'rm -f "$LOCK_MARKER"; rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
-
 inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 금지)
   grep -q "$1" "$2" || { echo "ERROR: 주입 실패 [$1] in $2"; exit 1; }
 }
@@ -160,6 +183,7 @@ echo "→ emucap.cpp/.h + input ownership + failure serializer 복사: $SRC/core
 # HEAD와 대조해 재빌드 필요 여부 확인 — build-time 임베드라 재빌드 안 하면 옛 hash 그대로). 미커밋이면 -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- emucap.cpp emucap.h emucap_input.h emucap_failure.cpp emucap_failure.h 2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
+BUILD_HASH="${BUILD_HASH}@flycast-${FLYCAST_COMMIT:0:12}"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/core/emucap_build.h"
 
 # 1b. 줄끝 정규화(LF). 아래 perl 앵커는 `..."\n`처럼 LF를 가정하는데, Windows에서 core.autocrlf=true로

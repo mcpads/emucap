@@ -3,6 +3,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/../_common/build-lock.sh"
 LOCK_FILE="$HERE/upstream.lock"
 DEFAULT_WORK="$HERE/work"
 WORK_INPUT="${EMUCAP_MESEN_WORK:-$DEFAULT_WORK}"
@@ -35,34 +36,12 @@ if [ ! -f "$MARKER" ]; then
     echo "ERROR: EMUCAP_MESEN_WORK is not empty or emucap-owned: $WORK" >&2
     exit 1
   fi
-  : >"$MARKER"
 fi
 
-# mkdir is the cross-platform atomic lock primitive. Reclaim only when the recorded PID is gone or
-# its process start identity no longer matches; elapsed wall time never steals a live build lock.
-LOCKDIR="$WORK/.build.lock"
-OWNER="$LOCKDIR/owner"
-current_start() {
-  ps -p "$1" -o lstart= 2>/dev/null | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
-}
-while ! mkdir "$LOCKDIR" 2>/dev/null; do
-  owner_pid="$(sed -n 's/^pid=//p' "$OWNER" 2>/dev/null || true)"
-  owner_start="$(sed -n 's/^start=//p' "$OWNER" 2>/dev/null || true)"
-  live_start=""
-  if [ -n "$owner_pid" ] && kill -0 "$owner_pid" 2>/dev/null; then
-    live_start="$(current_start "$owner_pid")"
-  fi
-  if [ -z "$owner_pid" ] || [ -z "$live_start" ] || [ "$live_start" != "$owner_start" ]; then
-    echo "→ reclaiming dead Mesen build lock: $LOCKDIR" >&2
-    rm -f "$OWNER"
-    rmdir "$LOCKDIR" 2>/dev/null || true
-    continue
-  fi
-  echo "→ waiting for Mesen build owned by pid $owner_pid" >&2
-  sleep 1
-done
-printf 'pid=%s\nstart=%s\n' "$$" "$(current_start $$)" >"$OWNER"
-trap 'rm -f "$OWNER" 2>/dev/null || true; rmdir "$LOCKDIR" 2>/dev/null || true' EXIT
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "Mesen"
+if [ ! -f "$MARKER" ]; then
+  : >"$MARKER"
+fi
 
 SRC="$WORK/mesen"
 [ ! -L "$SRC" ] || {

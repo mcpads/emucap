@@ -9,6 +9,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/../_common/build-lock.sh"
 VER="${MAME_VER:-0.288}"
 TAG="${MAME_TAG:-mame0288}"
 URL="${MAME_URL:-https://github.com/mamedev/mame/archive/refs/tags/${TAG}.tar.gz}"
@@ -74,6 +75,7 @@ if [ "$CUSTOM_WORK" = "1" ] && [ ! -f "$OWNER_FILE" ]; then
     exit 2
   fi
 fi
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "MAME PC-98"
 : >"$OWNER_FILE"
 
 if [ ! -f "$TARBALL" ]; then

@@ -41,40 +41,39 @@ if (-not (Test-Path -LiteralPath $Marker)) {
     if ($env:EMUCAP_MESEN_WORK -and $entries.Count -gt 0) {
         throw "EMUCAP_MESEN_WORK is not empty or emucap-owned: $Work"
     }
-    New-Item -ItemType File -Path $Marker | Out-Null
 }
 
-$LockDir = Join-Path $Work ".build.lock"
-$OwnerFile = Join-Path $LockDir "owner.json"
-while ($true) {
-    try {
-        New-Item -ItemType Directory -Path $LockDir -ErrorAction Stop | Out-Null
-        break
-    } catch {
-        $owner = $null
-        try { $owner = Get-Content -Raw -LiteralPath $OwnerFile | ConvertFrom-Json } catch {}
-        $live = $null
-        if ($owner -and $owner.pid) {
-            try { $live = Get-Process -Id ([int]$owner.pid) -ErrorAction Stop } catch {}
-        }
-        $liveStart = if ($live) { $live.StartTime.ToUniversalTime().Ticks } else { $null }
-        if (-not $owner -or -not $live -or $liveStart -ne [long]$owner.start_ticks) {
-            Write-Warning "Reclaiming dead Mesen build lock: $LockDir"
-            Remove-Item -Force -LiteralPath $OwnerFile -ErrorAction SilentlyContinue
-            Remove-Item -Force -LiteralPath $LockDir -ErrorAction SilentlyContinue
-            continue
-        }
-        Write-Host "Waiting for Mesen build owned by pid $($owner.pid)"
-        Start-Sleep -Seconds 1
-    }
+$pathHash = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $pathBytes = [System.Text.Encoding]::UTF8.GetBytes($Work.ToLowerInvariant())
+    $mutexSuffix = -join ($pathHash.ComputeHash($pathBytes) | Select-Object -First 16 | ForEach-Object { $_.ToString("x2") })
+} finally {
+    $pathHash.Dispose()
 }
-
-@{
-    pid = $PID
-    start_ticks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
-} | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $OwnerFile
+$MutexName = "Local\emucap-build-$mutexSuffix"
+$BuildMutex = [System.Threading.Mutex]::new($false, $MutexName)
+$MutexHeld = $false
+$OwnerFile = Join-Path $Work ".build-owner.json"
 
 try {
+    try {
+        if (-not $BuildMutex.WaitOne(0)) {
+            Write-Host "Waiting for Mesen build lock: $MutexName"
+            $null = $BuildMutex.WaitOne()
+        }
+    } catch [System.Threading.AbandonedMutexException] {
+        Write-Warning "Recovered abandoned Mesen build lock: $MutexName"
+    }
+    $MutexHeld = $true
+    @{
+        pid = $PID
+        start_ticks = (Get-Process -Id $PID).StartTime.ToUniversalTime().Ticks
+        mutex = $MutexName
+    } | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $OwnerFile
+    if (-not (Test-Path -LiteralPath $Marker)) {
+        New-Item -ItemType File -Path $Marker | Out-Null
+    }
+
     $Source = Join-Path $Work "mesen"
     if (Test-Path -LiteralPath $Source) {
         $SourceItem = Get-Item -Force -LiteralPath $Source
@@ -172,5 +171,8 @@ try {
     Write-Host "metadata: $Metadata"
 } finally {
     Remove-Item -Force -LiteralPath $OwnerFile -ErrorAction SilentlyContinue
-    Remove-Item -Force -LiteralPath $LockDir -ErrorAction SilentlyContinue
+    if ($MutexHeld) {
+        $BuildMutex.ReleaseMutex()
+    }
+    $BuildMutex.Dispose()
 }
