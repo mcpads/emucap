@@ -159,27 +159,72 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub(super) fn step_instruction_count(&mut self, count: u64) -> BridgeResult<Value> {
+        self.step_instruction_count_with_budget(
+            count,
+            crate::live::temporal::MAX_SYNC_OPERATION_TIME,
+        )
+    }
+
+    pub(super) fn step_instruction_count_with_budget(
+        &mut self,
+        count: u64,
+        budget: Duration,
+    ) -> BridgeResult<Value> {
         if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
             return Err(BridgeError::BadParams(format!(
                 "instruction count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
                 crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
             )));
         }
-        let deadline = std::time::Instant::now() + crate::live::temporal::MAX_SYNC_OPERATION_TIME;
+        let previous_timeout = self.gdb.get_timeout()?;
+        let deadline = crate::live::temporal::OperationDeadline::after(budget);
+        let outcome = self.step_instruction_count_before(count, deadline, previous_timeout);
+        let restore = self.gdb.set_timeout(previous_timeout);
+        match (outcome, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(BridgeError::Emulator(format!(
+                "instruction step completed but failed to restore the GDB timeout: {cleanup}"
+            ))),
+            (Err(primary), Err(cleanup)) => Err(BridgeError::Emulator(format!(
+                "{primary}; additionally failed to restore the GDB timeout: {cleanup}"
+            ))),
+        }
+    }
+
+    fn step_instruction_count_before(
+        &mut self,
+        count: u64,
+        deadline: crate::live::temporal::OperationDeadline,
+        default_timeout: Duration,
+    ) -> BridgeResult<Value> {
         for completed in 0..count {
-            if std::time::Instant::now() >= deadline {
-                self.frozen = true;
-                return Err(BridgeError::Emulator(format!(
-                    "instruction step deadline exceeded after {completed} of {count}; the CPU remains frozen"
-                )));
-            }
+            self.set_instruction_step_timeout(deadline, default_timeout, completed, count)?;
             // s는 정상 응답 자체가 stop이라 send_cmd의 demux(command_expects_stop 아닌 명령만)가
             // 스킵된다. 그래서 s 앞에 낀 stale async stop(직전 framestep/BP 히트)은 send_cmd로도
             // 안 걷혀 s의 응답 자리에 오배달되고, 스텝이 실제로 안 돌고도 완료로 오인돼 off-by-one
             // 디싱크가 남는다. 스텝 전에 버퍼의 stale stop을 이벤트 큐로 걷어낸 뒤(=note_stop) s를
             // send_cmd로 보내 진짜 스텝 완료 stop을 응답으로 받는다(=re-read).
             self.drain_buffered_stops()?;
-            let resp = self.send_cmd("s")?;
+            if deadline.expired() {
+                self.frozen = true;
+                return Err(self.instruction_step_deadline_error(
+                    completed,
+                    count,
+                    "while draining earlier stop packets",
+                ));
+            }
+            self.set_instruction_step_timeout(deadline, default_timeout, completed, count)?;
+            let response = self.send_cmd("s");
+            if deadline.expired() {
+                self.frozen = true;
+                return Err(self.instruction_step_deadline_error(
+                    completed,
+                    count,
+                    "while awaiting the next step acknowledgement",
+                ));
+            }
+            let resp = response?;
             if resp.starts_with('E') {
                 return Err(BridgeError::Emulator(format!(
                     "GDB instruction step failed: {resp}"
@@ -197,6 +242,35 @@ impl<G: GdbTransport> Bridge<G> {
             "unit": "instructions",
             "count": count,
         }))
+    }
+
+    fn set_instruction_step_timeout(
+        &mut self,
+        deadline: crate::live::temporal::OperationDeadline,
+        default_timeout: Duration,
+        completed: u64,
+        count: u64,
+    ) -> BridgeResult<()> {
+        let Some(remaining) = deadline.remaining_timeout() else {
+            self.frozen = true;
+            return Err(self.instruction_step_deadline_error(
+                completed,
+                count,
+                "before the next backend call",
+            ));
+        };
+        self.gdb.set_timeout(default_timeout.min(remaining))
+    }
+
+    fn instruction_step_deadline_error(
+        &self,
+        acknowledged: u64,
+        count: u64,
+        phase: &str,
+    ) -> BridgeError {
+        BridgeError::Emulator(format!(
+            "instruction step deadline exceeded {phase} after {acknowledged} acknowledged of {count}; the CPU remains frozen"
+        ))
     }
 
     pub(super) fn stop_for_state_restore(&mut self) -> BridgeResult<()> {

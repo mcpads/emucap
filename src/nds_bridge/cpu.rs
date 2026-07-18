@@ -118,29 +118,68 @@ impl<G: GdbTransport> CpuConn<G> {
         })
     }
 
-    pub(super) fn step_instructions(&mut self, count: u64) -> NdsResult<()> {
+    pub(super) fn step_instructions_and_read_state(
+        &mut self,
+        count: u64,
+        budget: Duration,
+    ) -> NdsResult<Value> {
         if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
             return Err(NdsBridgeError::BadParams(format!(
                 "instruction count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
                 crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
             )));
         }
+        let previous_timeout = self.gdb.get_timeout()?;
+        let deadline = crate::live::temporal::OperationDeadline::after(budget);
+        let outcome =
+            self.step_instructions_and_read_state_before(count, deadline, previous_timeout);
+        let restore = self
+            .gdb
+            .set_timeout(previous_timeout)
+            .map_err(NdsBridgeError::from);
+        match (outcome, restore) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(_), Err(cleanup)) => Err(NdsBridgeError::Emulator(format!(
+                "instruction step completed but failed to restore the GDB timeout: {cleanup}"
+            ))),
+            (Err(primary), Err(cleanup)) => Err(NdsBridgeError::Emulator(format!(
+                "{primary}; additionally failed to restore the GDB timeout: {cleanup}"
+            ))),
+        }
+    }
+
+    fn step_instructions_and_read_state_before(
+        &mut self,
+        count: u64,
+        deadline: crate::live::temporal::OperationDeadline,
+        default_timeout: Duration,
+    ) -> NdsResult<Value> {
         // Stepping halts the core, so the bridge must halt it first: otherwise send_cmd's with_frozen
         // treats each `s` as a bridge-injected pause and auto-resumes ("c") after it, re-running the
         // core while step then labels it frozen — a mismatch that desyncs the next command. Pausing
         // up front makes with_frozen a no-op per step and keeps the frozen bookkeeping consistent.
-        self.pause()?;
-        let deadline = Instant::now() + crate::live::temporal::MAX_SYNC_OPERATION_TIME;
+        self.set_step_timeout(deadline, default_timeout, 0, count)?;
+        let pause = self.pause();
+        if deadline.expired() {
+            return Err(self.step_deadline_error(0, count, "while halting the core"));
+        }
+        pause?;
+
         for completed in 0..count {
-            if Instant::now() >= deadline {
-                return Err(NdsBridgeError::Emulator(format!(
-                    "instruction step deadline exceeded after {completed} of {count}; the core remains frozen"
-                )));
-            }
+            self.set_step_timeout(deadline, default_timeout, completed, count)?;
             // `s` replies with a stop, so it bypasses send_cmd's demux; clear any buffered
             // stale stop first so it is not mistaken for this step's completion.
             self.drain_stops()?;
-            let resp = self.send_cmd("s")?;
+            let response = self.send_cmd("s");
+            if deadline.expired() {
+                return Err(self.step_deadline_error(
+                    completed,
+                    count,
+                    "while awaiting the next step acknowledgement",
+                ));
+            }
+            let resp = response?;
             if resp.starts_with('E') {
                 return Err(NdsBridgeError::Emulator(format!(
                     "GDB instruction step failed: {resp}"
@@ -153,7 +192,36 @@ impl<G: GdbTransport> CpuConn<G> {
             }
         }
         self.frozen = true;
+        self.set_step_timeout(deadline, default_timeout, count, count)?;
+        let registers = self.read_regs_hex();
+        if deadline.expired() {
+            return Err(self.step_deadline_error(
+                count,
+                count,
+                "while reading the terminal CPU state",
+            ));
+        }
+        Ok(state_from_arm_regs_hex(&registers?))
+    }
+
+    fn set_step_timeout(
+        &mut self,
+        deadline: crate::live::temporal::OperationDeadline,
+        default_timeout: Duration,
+        completed: u64,
+        count: u64,
+    ) -> NdsResult<()> {
+        let remaining = deadline.remaining_timeout().ok_or_else(|| {
+            self.step_deadline_error(completed, count, "before the next backend call")
+        })?;
+        self.gdb.set_timeout(default_timeout.min(remaining))?;
         Ok(())
+    }
+
+    fn step_deadline_error(&self, acknowledged: u64, count: u64, phase: &str) -> NdsBridgeError {
+        NdsBridgeError::Emulator(format!(
+            "instruction step deadline exceeded {phase} after {acknowledged} acknowledged of {count}; the core remains frozen"
+        ))
     }
 
     /// Halt the core. Returns whether pausing drained a *reportable* async stop — a breakpoint or

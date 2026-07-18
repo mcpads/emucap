@@ -427,10 +427,22 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     pub(super) fn step_cpu(&mut self, params: &Value, count: u64) -> NdsResult<Value> {
+        self.step_cpu_with_budget(
+            params,
+            count,
+            crate::live::temporal::MAX_SYNC_OPERATION_TIME,
+        )
+    }
+
+    pub(super) fn step_cpu_with_budget(
+        &mut self,
+        params: &Value,
+        count: u64,
+        budget: Duration,
+    ) -> NdsResult<Value> {
         let cpu = cpu_from_params(params)?;
         let conn = self.cpu_mut(cpu)?;
-        conn.step_instructions(count)?;
-        let state = state_from_arm_regs_hex(&conn.read_regs_hex()?);
+        let state = conn.step_instructions_and_read_state(count, budget)?;
         let pc = state.get("cpu.pc").and_then(Value::as_u64);
         Ok(json!({
             "status": "completed",

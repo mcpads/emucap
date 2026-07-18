@@ -25,6 +25,15 @@ pub trait WsTransport {
         params: Value,
         expect_event: &str,
     ) -> Result<Value, BridgeError>;
+    /// Like `call_and_wait_for`, but bounds this exchange by the operation's remaining wall-clock
+    /// budget. Implementations that can change their transport timeout must override this method.
+    fn call_and_wait_for_with_timeout(
+        &mut self,
+        event: &str,
+        params: Value,
+        expect_event: &str,
+        timeout: Duration,
+    ) -> Result<Value, BridgeError>;
     /// Like `call`, but with a per-call read budget overriding the transport's default read timeout
     /// for just this exchange — for a command whose reply is legitimately slow (`save_state`/
     /// `load_state`, whose fork handler waits up to 15s). Restores the default afterward so ordinary
@@ -178,6 +187,56 @@ impl TungsteniteWs {
             }
         }
     }
+
+    fn with_socket_timeout<T>(
+        &mut self,
+        timeout: Duration,
+        operation: impl FnOnce(&mut Self) -> BridgeResult<T>,
+    ) -> BridgeResult<T> {
+        self.socket
+            .get_ref()
+            .set_read_timeout(Some(timeout))
+            .map_err(BridgeError::from)?;
+        if let Err(error) = self.socket.get_ref().set_write_timeout(Some(timeout)) {
+            let rollback = self
+                .socket
+                .get_ref()
+                .set_read_timeout(Some(self.default_timeout));
+            return match rollback {
+                Ok(()) => Err(BridgeError::from(error)),
+                Err(rollback_error) => Err(BridgeError::Emulator(format!(
+                    "failed to set the WebSocket write timeout: {error}; additionally failed to restore the read timeout: {rollback_error}"
+                ))),
+            };
+        }
+
+        let outcome = operation(self);
+        let read_restore = self
+            .socket
+            .get_ref()
+            .set_read_timeout(Some(self.default_timeout));
+        let write_restore = self
+            .socket
+            .get_ref()
+            .set_write_timeout(Some(self.default_timeout));
+        let restore = match (read_restore, write_restore) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(BridgeError::from(error)),
+            (Err(read_error), Err(write_error)) => Err(BridgeError::Emulator(format!(
+                "failed to restore WebSocket read timeout: {read_error}; failed to restore write timeout: {write_error}"
+            ))),
+        };
+        crate::live::temporal::finish_with_cleanup(outcome, restore, |primary, cleanup| {
+            match primary {
+                Some(primary) => BridgeError::Emulator(format!(
+                    "{primary}; additionally failed to restore the WebSocket timeout: {cleanup}"
+                )),
+                None => BridgeError::Emulator(format!(
+                    "backend call completed but failed to restore the WebSocket timeout: {cleanup}"
+                )),
+            }
+        })
+    }
 }
 
 impl WsTransport for TungsteniteWs {
@@ -202,16 +261,27 @@ impl WsTransport for TungsteniteWs {
         params: Value,
         timeout: Duration,
     ) -> BridgeResult<Value> {
-        self.send_request(event, params)?;
-        // Widen the read budget for just this one slow exchange, then restore the default so the
-        // next ordinary read still fails fast. Restored on both the ok and error paths.
-        self.socket.get_ref().set_read_timeout(Some(timeout)).ok();
-        let result = self.read_until(event);
-        self.socket
-            .get_ref()
-            .set_read_timeout(Some(self.default_timeout))
-            .ok();
-        result
+        // Bound both the write and read. Applying the timeout only after send_request would let a
+        // blocked socket write outlive the caller's operation deadline.
+        self.with_socket_timeout(timeout, |transport| {
+            transport
+                .send_request(event, params)
+                .and_then(|()| transport.read_until(event))
+        })
+    }
+
+    fn call_and_wait_for_with_timeout(
+        &mut self,
+        event: &str,
+        params: Value,
+        expect_event: &str,
+        timeout: Duration,
+    ) -> BridgeResult<Value> {
+        self.with_socket_timeout(timeout, |transport| {
+            transport
+                .send_request(event, params)
+                .and_then(|()| transport.read_until(expect_event))
+        })
     }
 
     fn call_ticketed(&mut self, event: &str, params: Value, ticket: &str) -> BridgeResult<Value> {

@@ -15,6 +15,17 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// stop event, which PPSSPP's `cpu.stepping` event never carries itself).
     pub(super) fn fetch_cpu_state(&mut self) -> BridgeResult<Value> {
         let result = self.ws.call("cpu.getAllRegs", json!({}))?;
+        Self::cpu_state_from_reply(result)
+    }
+
+    fn fetch_cpu_state_with_timeout(&mut self, timeout: Duration) -> BridgeResult<Value> {
+        let result = self
+            .ws
+            .call_with_timeout("cpu.getAllRegs", json!({}), timeout)?;
+        Self::cpu_state_from_reply(result)
+    }
+
+    fn cpu_state_from_reply(result: Value) -> BridgeResult<Value> {
         let categories = result
             .get("categories")
             .and_then(Value::as_array)
@@ -89,10 +100,21 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// `game.status.paused` is not it).
     pub(super) fn cpu_is_stepping(&mut self) -> BridgeResult<bool> {
         let status = self.ws.call("cpu.status", json!({}))?;
-        Ok(status
+        Ok(Self::cpu_stepping_from_reply(&status))
+    }
+
+    fn cpu_stepping_from_reply(status: &Value) -> bool {
+        status
             .get("stepping")
             .and_then(Value::as_bool)
-            .unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    fn cpu_is_stepping_with_timeout(&mut self, timeout: Duration) -> BridgeResult<bool> {
+        let status = self
+            .ws
+            .call_with_timeout("cpu.status", json!({}), timeout)?;
+        Ok(Self::cpu_stepping_from_reply(&status))
     }
 
     /// kind `exec` → `cpu.breakpoint.add {address, enabled, condition?}`; kind `read`/`write` →
@@ -415,6 +437,14 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// (undocumented-accurate only "while stepping", and this bridge does not depend on its
     /// precision).
     pub(super) fn step_instructions(&mut self, params: &Value) -> BridgeResult<Value> {
+        self.step_instructions_with_budget(params, crate::live::temporal::MAX_SYNC_OPERATION_TIME)
+    }
+
+    pub(super) fn step_instructions_with_budget(
+        &mut self,
+        params: &Value,
+        budget: Duration,
+    ) -> BridgeResult<Value> {
         let count = step_count(params)?;
         if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
             return Err(BridgeError::BadParams(format!(
@@ -422,20 +452,64 @@ impl<T: WsTransport> PpssppBridge<T> {
                 crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
             )));
         }
-        if !self.cpu_is_stepping()? {
-            self.ws.call("cpu.stepping", json!({}))?;
+        let deadline = crate::live::temporal::OperationDeadline::after(budget);
+        let timeout = self.instruction_step_timeout(deadline, 0, count, "before CPU status")?;
+        let stepping = self.cpu_is_stepping_with_timeout(timeout);
+        if deadline.expired() {
+            return Err(self.instruction_step_deadline_error(0, count, "while reading CPU status"));
         }
-        let deadline = std::time::Instant::now() + crate::live::temporal::MAX_SYNC_OPERATION_TIME;
-        for completed in 0..count {
-            if std::time::Instant::now() >= deadline {
-                return Err(BridgeError::Emulator(format!(
-                    "instruction step deadline exceeded after {completed} of {count}; the CPU remains halted"
-                )));
+        if !stepping? {
+            let timeout =
+                self.instruction_step_timeout(deadline, 0, count, "before halting the CPU")?;
+            let pause = self
+                .ws
+                .call_with_timeout("cpu.stepping", json!({}), timeout);
+            if deadline.expired() {
+                return Err(self.instruction_step_deadline_error(
+                    0,
+                    count,
+                    "while halting the CPU",
+                ));
             }
-            self.ws
-                .call_and_wait_for("cpu.stepInto", json!({}), "cpu.stepping")?;
+            pause?;
         }
-        let state = self.fetch_cpu_state()?;
+        for completed in 0..count {
+            let timeout = self.instruction_step_timeout(
+                deadline,
+                completed,
+                count,
+                "before the next backend call",
+            )?;
+            let response = self.ws.call_and_wait_for_with_timeout(
+                "cpu.stepInto",
+                json!({}),
+                "cpu.stepping",
+                timeout,
+            );
+            if deadline.expired() {
+                return Err(self.instruction_step_deadline_error(
+                    completed,
+                    count,
+                    "while awaiting the next step acknowledgement",
+                ));
+            }
+            response?;
+        }
+        let timeout = self.instruction_step_timeout(
+            deadline,
+            count,
+            count,
+            "before reading the terminal CPU state",
+        )?;
+        let state = self.fetch_cpu_state_with_timeout(timeout);
+        if deadline.expired() {
+            return Err(self.instruction_step_deadline_error(
+                count,
+                count,
+                "while reading the terminal CPU state",
+            ));
+        }
+        let state = state?;
         let pc = state.get("cpu.pc").and_then(Value::as_u64);
         Ok(json!({
             "status": "completed",
@@ -444,6 +518,29 @@ impl<T: WsTransport> PpssppBridge<T> {
             "pc": pc,
             "state": state,
         }))
+    }
+
+    fn instruction_step_timeout(
+        &self,
+        deadline: crate::live::temporal::OperationDeadline,
+        acknowledged: u64,
+        count: u64,
+        phase: &str,
+    ) -> BridgeResult<Duration> {
+        deadline
+            .remaining_timeout()
+            .ok_or_else(|| self.instruction_step_deadline_error(acknowledged, count, phase))
+    }
+
+    fn instruction_step_deadline_error(
+        &self,
+        acknowledged: u64,
+        count: u64,
+        phase: &str,
+    ) -> BridgeError {
+        BridgeError::Emulator(format!(
+            "instruction step deadline exceeded {phase} after {acknowledged} acknowledged of {count}; the CPU remains halted"
+        ))
     }
 
     /// Drain PPSSPP's spontaneous events, keep the `cpu.stepping` stops (a breakpoint hit or a

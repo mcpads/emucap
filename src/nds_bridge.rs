@@ -312,3 +312,7 @@ use support::*;
 #[cfg(test)]
 #[path = "nds_bridge_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "nds_bridge_temporal_tests.rs"]
+mod temporal_tests;

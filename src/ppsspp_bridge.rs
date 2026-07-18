@@ -411,3 +411,7 @@ use support::*;
 #[cfg(test)]
 #[path = "ppsspp_bridge_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "ppsspp_bridge_temporal_tests.rs"]
+mod temporal_tests;

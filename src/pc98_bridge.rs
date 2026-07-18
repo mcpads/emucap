@@ -350,3 +350,7 @@ use support::*;
 #[cfg(test)]
 #[path = "pc98_bridge_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "pc98_bridge_temporal_tests.rs"]
+mod temporal_tests;

@@ -68,6 +68,16 @@ impl WsTransport for FakeWs {
         Ok(reply)
     }
 
+    fn call_and_wait_for_with_timeout(
+        &mut self,
+        event: &str,
+        params: Value,
+        expect_event: &str,
+        _timeout: Duration,
+    ) -> Result<Value, BridgeError> {
+        self.call_and_wait_for(event, params, expect_event)
+    }
+
     fn call_with_timeout(
         &mut self,
         event: &str,

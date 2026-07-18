@@ -1,4 +1,5 @@
-use super::finish_with_cleanup;
+use super::{finish_with_cleanup, OperationDeadline};
+use std::time::Duration;
 
 fn combine(primary: Option<&'static str>, cleanup: &'static str) -> &'static str {
     match primary {
@@ -29,4 +30,15 @@ fn primary_failure_survives_successful_cleanup() {
         finish_with_cleanup::<(), _>(Err("primary"), Ok(()), combine),
         Err("primary")
     );
+}
+
+#[test]
+fn operation_deadline_expires_and_never_returns_a_zero_socket_timeout() {
+    let deadline = OperationDeadline::after(Duration::from_millis(5));
+    assert!(deadline
+        .remaining_timeout()
+        .is_some_and(|value| !value.is_zero()));
+    std::thread::sleep(Duration::from_millis(10));
+    assert!(deadline.expired());
+    assert_eq!(deadline.remaining_timeout(), None);
 }
