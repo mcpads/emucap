@@ -1,0 +1,78 @@
+diff --git a/Source/Core/VideoCommon/FrameDumper.cpp b/Source/Core/VideoCommon/FrameDumper.cpp
+index 8bb9883..b44f759 100644
+--- a/Source/Core/VideoCommon/FrameDumper.cpp
++++ b/Source/Core/VideoCommon/FrameDumper.cpp
+@@ -342,9 +342,37 @@ void FrameDumper::SaveScreenshot(std::string filename)
+ {
+   std::lock_guard<std::mutex> lk(m_screenshot_lock);
+   m_screenshot_name = std::move(filename);
++  m_screenshot_completed.Reset();
+   m_screenshot_request.Set();
+ }
+ 
++ScreenshotWaitResult FrameDumper::SaveScreenshotAndWait(std::string filename,
++                                                        std::chrono::milliseconds timeout)
++{
++  {
++    std::lock_guard<std::mutex> lk(m_screenshot_lock);
++    if (m_screenshot_request.IsSet())
++      return ScreenshotWaitResult::Busy;
++    m_screenshot_name = filename;
++    m_screenshot_completed.Reset();
++    m_screenshot_request.Set();
++  }
++
++  if (m_screenshot_completed.WaitFor(timeout))
++    return ScreenshotWaitResult::Completed;
++
++  // If the video thread has not claimed the request, cancel it before returning. If it already
++  // claimed the request, it owns the local filename and may finish encoding, but it cannot affect
++  // a later request.
++  if (m_screenshot_request.TestAndClear())
++  {
++    std::lock_guard<std::mutex> lk(m_screenshot_lock);
++    if (m_screenshot_name == filename)
++      m_screenshot_name.clear();
++  }
++  return ScreenshotWaitResult::TimedOut;
++}
++
+ bool FrameDumper::IsFrameDumping() const
+ {
+   if (m_screenshot_request.IsSet())
+diff --git a/Source/Core/VideoCommon/FrameDumper.h b/Source/Core/VideoCommon/FrameDumper.h
+index abf3bac..447f5be 100644
+--- a/Source/Core/VideoCommon/FrameDumper.h
++++ b/Source/Core/VideoCommon/FrameDumper.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <chrono>
++
+ #include "Common/CommonTypes.h"
+ #include "Common/Event.h"
+ #include "Common/Flag.h"
+@@ -16,6 +18,13 @@ class AbstractStagingTexture;
+ class AbstractTexture;
+ class AbstractFramebuffer;
+ 
++enum class ScreenshotWaitResult
++{
++  Completed,
++  TimedOut,
++  Busy,
++};
++
+ class FrameDumper
+ {
+ public:
+@@ -31,6 +40,8 @@ public:
+                         const MathUtil::Rectangle<int>& target_rect, u64 ticks, int frame_number);
+ 
+   void SaveScreenshot(std::string filename);
++  ScreenshotWaitResult SaveScreenshotAndWait(std::string filename,
++                                             std::chrono::milliseconds timeout);
+ 
+   bool IsFrameDumping() const;
+   int GetRequiredResolutionLeastCommonMultiple() const;

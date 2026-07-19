@@ -7,13 +7,16 @@
 
 #include "Core/EmuCap.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
@@ -36,6 +39,7 @@ using SOCKET = int;
 
 #include "Common/Config/Config.h"
 #include "Common/Event.h"
+#include "Common/FileUtil.h"
 #include "Common/SocketContext.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Core.h"
@@ -67,6 +71,8 @@ std::deque<picojson::value> s_events;
 std::mutex s_bp_mutex;
 std::map<int, u32> s_breakpoints;  // id -> address
 int s_next_bp = 1;
+std::atomic<u64> s_screenshot_sequence{0};
+std::string s_handler_error_kind;
 std::string s_handler_error;
 
 // set_input 오버라이드(패드별). engaged면 GCPad::GetStatus 결과를 이 값으로 덮는다.
@@ -212,6 +218,14 @@ picojson::value MakeError(const std::string& kind, const std::string& msg)
 
 picojson::object Fail(const std::string& message)
 {
+  s_handler_error_kind = "emulator_error";
+  s_handler_error = message;
+  return {};
+}
+
+picojson::object Fail(const std::string& kind, const std::string& message)
+{
+  s_handler_error_kind = kind;
   s_handler_error = message;
   return {};
 }
@@ -237,7 +251,7 @@ picojson::object Hello(Core::System&, const picojson::object&)
   for (const char* m :
        {"read_memory", "write_memory", "get_state", "status", "pause", "resume",
         "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
-        "poll_events"})
+        "poll_events", "screenshot"})
   {
     methods.push_back(picojson::value(std::string(m)));
   }
@@ -577,41 +591,74 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
   return r;
 }
 
-picojson::object Screenshot(Core::System&, const picojson::object&)
+picojson::object Screenshot(Core::System& system, const picojson::object&)
 {
-  // emucap 서버는 응답에 png_base64 를 요구한다. Dolphin 의 SaveScreenShot 은 다음 present
-  // 에 지정 파일로 PNG 를 쓰므로(코어 실행 중일 때), 임시 파일로 저장→읽어 base64 로 돌려준다.
-  const char* tmpdir = std::getenv("TEMP");
-  std::string path = (tmpdir ? std::string(tmpdir) : std::string(".")) + "/emucap_shot.png";
-  std::remove(path.c_str());
+  // Dolphin fulfills screenshot requests on the next present. Reject a frozen core before arming
+  // a request: resuming behind the caller's back would make this observation mutate guest time,
+  // while arming and timing out would leave work owned by a completed request.
+  if (Core::GetState(system) == Core::State::Paused)
+    return Fail("bad_state", "screenshot requires a running core");
   if (!g_frame_dumper)
-    return Fail("frame dumper is not initialized");
-  // Core::SaveScreenShot 은 name 을 "<폴더>/<name>.png" 로 조합해버리므로, 전체 경로를 그대로
-  // 쓰도록 FrameDumper 를 직접 호출한다. 다음 present 에 이 경로로 PNG 가 써진다.
-  g_frame_dumper->SaveScreenshot(path);
+    return Fail("bad_state", "frame dumper is not initialized");
+
+  const u64 sequence = s_screenshot_sequence.fetch_add(1);
+  const std::string path =
+      File::GetUserPath(D_CACHE_IDX) + "emucap-screenshot-" + std::to_string(sequence) + ".png";
+  if (!File::CreateFullPath(path))
+    return Fail("io_error", "failed to create the screenshot directory");
+  std::remove(path.c_str());
+
+  const ScreenshotWaitResult wait_result =
+      g_frame_dumper->SaveScreenshotAndWait(path, std::chrono::seconds(2));
+  if (wait_result == ScreenshotWaitResult::Busy)
+    return Fail("bad_state", "another screenshot request is active");
+  if (wait_result == ScreenshotWaitResult::TimedOut)
+  {
+    std::remove(path.c_str());
+    return Fail("emulator_error", "screenshot did not complete within 2 seconds");
+  }
 
   std::vector<uint8_t> bytes;
-  for (int i = 0; i < 60; ++i)  // 최대 ~1.5s 대기(실행 중이면 한두 프레임 내 도착)
   {
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f)
-      continue;
-    const std::streamsize sz = f.tellg();
-    if (sz <= 0)
-      continue;
-    f.seekg(0);
-    bytes.resize(static_cast<size_t>(sz));
-    f.read(reinterpret_cast<char*>(bytes.data()), sz);
-    break;
+    if (f)
+    {
+      const std::streamsize size = f.tellg();
+      if (size > 0)
+      {
+        f.seekg(0);
+        bytes.resize(static_cast<size_t>(size));
+        f.read(reinterpret_cast<char*>(bytes.data()), size);
+        if (!f)
+          bytes.clear();
+      }
+    }
   }
   std::remove(path.c_str());
-  if (bytes.empty())
-    return Fail("screenshot failed because the core did not present a frame");
+  static constexpr uint8_t png_signature[] = {0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+  if (bytes.size() < 24 ||
+      !std::equal(std::begin(png_signature), std::end(png_signature), bytes.begin()))
+  {
+    return Fail("io_error", "screenshot output was missing or was not a PNG");
+  }
+  const auto read_be32 = [&bytes](size_t offset) {
+    return (static_cast<u32>(bytes[offset]) << 24) |
+           (static_cast<u32>(bytes[offset + 1]) << 16) |
+           (static_cast<u32>(bytes[offset + 2]) << 8) |
+           static_cast<u32>(bytes[offset + 3]);
+  };
 
   picojson::object r;
   r["png_base64"] = picojson::value(Base64(bytes.data(), bytes.size()));
   r["bytes"] = picojson::value(static_cast<double>(bytes.size()));
+  r["format"] = picojson::value(std::string("png"));
+  r["width"] = picojson::value(static_cast<double>(read_be32(16)));
+  r["height"] = picojson::value(static_cast<double>(read_be32(20)));
+  r["freshness"] = picojson::value(std::string("current"));
+  r["state"] = picojson::value(std::string("running"));
+  const std::string launch_id = EnvOr("EMUCAP_LAUNCH_ID", "");
+  if (!launch_id.empty())
+    r["generation"] = picojson::value(launch_id);
   return r;
 }
 
@@ -696,6 +743,7 @@ void ServeSession(Core::System& system, SOCKET sock)
       }
       else
       {
+        s_handler_error_kind.clear();
         s_handler_error.clear();
         picojson::object result = h(system, params);
         if (s_handler_error.empty())
@@ -706,7 +754,9 @@ void ServeSession(Core::System& system, SOCKET sock)
         else
         {
           resp["ok"] = picojson::value(false);
-          resp["error"] = MakeError("emulator_error", s_handler_error);
+          resp["error"] =
+              MakeError(s_handler_error_kind.empty() ? "emulator_error" : s_handler_error_kind,
+                        s_handler_error);
         }
       }
       if (!SendLine(sock, picojson::value(resp).serialize()))

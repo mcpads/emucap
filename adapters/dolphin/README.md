@@ -73,11 +73,11 @@ The native adapter currently advertises:
 - `get_state`, `status`;
 - `pause`, `resume`, instruction-unit `step`;
 - `set_breakpoint`, `clear_breakpoint`, `list_breakpoints`, `poll_events`;
+- running core only: `screenshot`;
 - GameCube only: `set_input`.
 
-It does not currently advertise savestates, screenshots, frame stepping, read/write watchpoints,
-tracing, call stacks, or Wii input injection. These methods must not be inferred from dormant
-handler code.
+It does not currently advertise savestates, frame stepping, read/write watchpoints, tracing, call
+stacks, or Wii input injection. These methods must not be inferred from dormant handler code.
 
 The adapter does not yet publish a feature-contract declaration, so the Control MCP reports its
 contract state as `unreported`. Its atomic methods remain available, but contract-gated composite
@@ -107,6 +107,12 @@ GameCube controller port 0 accepts lowercase `a`, `b`, `x`, `y`, `z`, `l`, `r`, 
 native input path. Other ports and unknown buttons fail before changing the active override.
 
 Wii input is not advertised.
+
+### Screenshots
+
+`screenshot` captures the next frame presented after the request and returns a PNG with dimensions,
+launch generation, and `freshness="current"` provenance. It is bounded to two seconds. A frozen
+core is rejected before a capture is armed; the adapter never resumes guest execution implicitly.
 
 ## Legacy GDB-stub bridge
 
