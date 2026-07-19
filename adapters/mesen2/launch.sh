@@ -87,11 +87,12 @@ fi
 # nohup)가 상속한다 — open 모드는 아래 --env로도 전달한다.
 export EMUCAP_ADAPTER_DIR="$HERE"
 # 빌드 hash: 스크립트 어댑터(Lua)는 로드시가 곧 버전이라 launch 시점 emucap git hash를 넘긴다 — hello/
-# status.emulator_build로 노출해 사용자가 git HEAD와 대조한다. emucap-core.lua(+엔트리)가 HEAD와 다르면 -dirty.
+# status.emulator_build로 노출해 사용자가 git HEAD와 대조한다. production Lua가 HEAD와 다르면 -dirty.
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
-  git -C "$HERE" diff --quiet HEAD -- emucap-core.lua "$(basename "$LUA")" 2>/dev/null \
+  git -C "$HERE" diff --quiet HEAD -- \
+    emucap-core.lua emucap_tx.lua emucap_state_io.lua "$(basename "$LUA")" 2>/dev/null \
     || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
 else
   EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
@@ -357,6 +358,33 @@ copy_app_bundle_replace() {
   fi
 }
 
+isolate_macos_app_identity() {
+  local app="$1"
+  [ "$(uname -s)" = "Darwin" ] || return 0
+
+  local plist identifier actual plutil_bin
+  plist="$app/Contents/Info.plist"
+  identifier="ca.mesen.emucap.p${PORT}"
+  if [ -L "$app/Contents" ] || [ -L "$plist" ] || [ ! -f "$plist" ]; then
+    echo "ERROR: portable Mesen app has an unsafe or missing Info.plist: $plist" >&2
+    return 1
+  fi
+  plutil_bin="$(command -v plutil 2>/dev/null || true)"
+  if [ -z "$plutil_bin" ]; then
+    echo "ERROR: plutil is required to isolate the portable Mesen app identity" >&2
+    return 1
+  fi
+  "$plutil_bin" -replace CFBundleIdentifier -string "$identifier" "$plist" || {
+    echo "ERROR: failed to set portable Mesen bundle identifier: $plist" >&2
+    return 1
+  }
+  actual="$("$plutil_bin" -extract CFBundleIdentifier raw -o - "$plist" 2>/dev/null || true)"
+  if [ "$actual" != "$identifier" ]; then
+    echo "ERROR: portable Mesen bundle identifier did not persist: $actual" >&2
+    return 1
+  fi
+}
+
 prepare_portable_mesen() {
   local source_bin="$1"
   local emu_home="$RUN_DIR"
@@ -377,6 +405,7 @@ prepare_portable_mesen() {
     }
     MESEN_BIN="$portable_app/$rel"
     MESEN_APP_BUNDLE="$portable_app"
+    isolate_macos_app_identity "$portable_app" || exit 1
   elif [ -f "$(dirname "$source_bin")/emucap-mesen-build.json" ]; then
     local portable_dir source_dir
     portable_dir="$emu_home/portable"
@@ -391,15 +420,18 @@ prepare_portable_mesen() {
     MESEN_BIN="$portable_dir/$(basename "$source_bin")"
     chmod +x "$MESEN_BIN" 2>/dev/null || true
     MESEN_APP_BUNDLE="$(find_app_bundle "$MESEN_BIN" 2>/dev/null || true)"
+    if [ -n "$MESEN_APP_BUNDLE" ]; then
+      isolate_macos_app_identity "$MESEN_APP_BUNDLE" || exit 1
+    fi
   else
     echo "ERROR: mesen-patch-required — publish directory metadata가 없다: $source_bin" >&2
     exit 1
   fi
 
   MESEN_SETTINGS="$(dirname "$MESEN_BIN")/settings.json"
-  if is_gba_launch; then
-    write_portable_settings "$MESEN_SETTINGS"
-  fi
+  # This adjacent file is Mesen's portable-home marker, not a GBA-only setting. Without it, every
+  # other system falls back to the user's Mesen home and can load stale native libraries/config.
+  write_portable_settings "$MESEN_SETTINGS"
   [ -x "$MESEN_BIN" ] || { echo "ERROR: portable Mesen 바이너리 실행 불가: $MESEN_BIN" >&2; exit 1; }
   export EMUCAP_MESEN_HOME="$emu_home"
 }

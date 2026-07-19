@@ -24,6 +24,10 @@ assert(count("poll_line%(") == 1, "one callback must poll at most one request")
 assert(count("flush_tx%(") == 1, "one callback must flush TX at most once")
 assert(count("connect%(") == 1, "one callback must attempt reconnect at most once")
 assert(source:match("emu%.eventType%.codeBreakIdle"), "patched native idle event must be registered")
+assert(source:match("emu%.eventType%.codeBreakIdleSavestate"),
+  "safe native halt savestate event must be registered")
+assert(source:match('reply_err%(id, "unsafe_halt"'),
+  "unsafe halt kinds must reject savestate operations explicitly")
 assert(not source:match("FREEZE_BUDGET_MS"), "watchdog rearm budget must be removed")
 assert(not source:match("os%.clock"), "freeze deadlines must use wall clock")
 

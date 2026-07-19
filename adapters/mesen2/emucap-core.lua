@@ -22,15 +22,17 @@ local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
 
 local socket = require("socket.core")
 local Tx = require("emucap_tx")
+local StateIo = require("emucap_state_io")
 
-assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil,
-  "emucap-core: codeBreakIdle이 없는 Mesen host는 live control 미지원 — adapters/mesen2/build.sh로 호환 host를 빌드하라")
+assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
+    and emu.eventType.codeBreakIdleSavestate ~= nil,
+  "emucap-core: safe native halt event가 없는 Mesen host는 live control 미지원 — adapters/mesen2/build.sh로 호환 host를 빌드하라")
 
 local HOST = "127.0.0.1"
 -- 포트: 교차-ROM 2-인스턴스를 위해 EMUCAP_PORT로 덮어쓸 수 있다(없으면 47800).
 local PORT = tonumber(os.getenv("EMUCAP_PORT") or "") or 47800
 local PROTOCOL_VERSION = 1
-local MESEN_HOST_API = 1
+local MESEN_HOST_API = 2
 local MESEN_UPSTREAM_COMMIT = os.getenv("EMUCAP_MESEN_UPSTREAM_COMMIT")
 local MESEN_PATCHSET_SHA256 = os.getenv("EMUCAP_MESEN_PATCHSET_SHA256")
 -- 데드맨은 operator opt-in이다. pause/BP 성공 뒤 agent 왕복 지연만으로 실행을 재개하면 frozen
@@ -61,6 +63,10 @@ local prev_freeze_key = false  -- 라이징 에지 검출(running→freeze, froz
 local STATE = "running"       -- "running" | "frozen"
 local freeze_start_ms = nil   -- 마지막 명령 이후 경과 측정(데드맨). frozen 진입/명령 수신 시 갱신.
 local freeze_reason = "paused"
+-- true only while the patched host services a main-CPU instruction-boundary halt. Frame/PPU steps,
+-- read/write breakpoints, and other mid-instruction halts use the ordinary idle event and keep this
+-- false, so savestate calls fail loudly instead of serializing an unsafe core state.
+local halt_savestate_safe = false
 -- frozen 중 get_state를 서빙하는 freeze 시점 스냅샷. freeze 진입 첫 codeBreak에서 한 번 캡처해
 -- 정지 진입의 linearization point를 고정하고, 비싼 emu.getState() 직렬화를 요청마다 반복하지 않는다.
 -- native halt 중 guest time은 불변이므로 명시적 step/resume에서만 이 스냅샷을 무효화한다.
@@ -316,9 +322,8 @@ local function flush_tx()
     emu.log("[emucap] TX 오류(" .. tostring(err) .. ") — 재연결")
     disconnect()
   elseif status == "complete" and reset_after_reply then
-    -- Mesen reset은 Lua context와 TCP session을 다시 만든다. 응답보다 먼저 호출하면 reset은
-    -- 적용되지만 host에는 EOF만 보여 다음 호출까지 실패한다. terminal line이 kernel에 모두
-    -- 전달된 뒤 reset을 예약하고, host는 새 session의 status를 확인해 reset 호출을 닫는다.
+    -- Some Mesen systems power cycle by recreating the debugger and Lua context. Send the terminal
+    -- response first; the host then waits for the replacement script session before closing reset.
     reset_after_reply = false
     emu.reset()
     if STATE == "frozen" then resume_from_freeze() end
@@ -441,7 +446,7 @@ function handlers.hello()
     adapter = "mesen2-live",
     build = os.getenv("EMUCAP_BUILD_HASH") or "unknown",  -- launch가 넘긴 emucap git hash(status.emulator_build)
     mesen_host_api = MESEN_HOST_API,
-    host_features = { "code_break_idle", "native_halt_service" },
+    host_features = { "code_break_idle", "native_halt_service", "native_halt_savestate" },
     methods = method_list,
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
@@ -597,6 +602,8 @@ function handlers.status()
   r.freeze_policy = {
     mode = "native_halt_service",
     service_event = "codeBreakIdle",
+    savestate_event = "codeBreakIdleSavestate",
+    savestate_safe = halt_savestate_safe,
     service_interval_ms = HALT_SERVICE_INTERVAL_MS,
     instruction_drift = 0,
     idle_auto_resume_ms = MAX_FREEZE_MS,
@@ -689,8 +696,7 @@ local function on_io_exec()
   -- 결정론적이다(loadSavestate가 상태를 정확 복원하므로 주입 시점은 무관).
   if op.kind == "probe" then
     local ok, err = pcall(function()
-      local f = assert(io.open(op.path, "rb")); local data = f:read("*a"); f:close()
-      emu.loadSavestate(data)
+      StateIo.load(emu, op.path)
     end)
     if not ok then reply_err(op.id, "io_error", err); return end
     if op.probe.frame <= 0 then
@@ -702,11 +708,9 @@ local function on_io_exec()
   end
   local ok, err = pcall(function()
     if op.kind == "save" then
-      local data = emu.createSavestate()
-      local f = assert(io.open(op.path, "wb")); f:write(data); f:close()
+      StateIo.save(emu, op.path, op.id)
     else
-      local f = assert(io.open(op.path, "rb")); local data = f:read("*a"); f:close()
-      emu.loadSavestate(data)
+      StateIo.load(emu, op.path)
     end
   end)
   if ok then reply_ok(op.id, { status = "completed", path = op.path })
@@ -730,6 +734,66 @@ local function arm_probe(id, p)
     probe = { frame = frames, mem = p.memory_type, addr = p.address or 0, len = p.length or 1 },
   }
   pending_io.ref = emu.addMemoryCallback(on_io_exec, emu.callbackType.exec, IO_LO, IO_HI, CPU)
+end
+
+-- Frozen save/load is legal only in the host's explicit instruction-boundary idle event. The
+-- operation runs before this callback returns, so no guest time or host-composition gap appears
+-- between the halt point and serialization/restoration.
+local function frozen_state_io(method, id, p)
+  if not halt_savestate_safe then
+    reply_err(id, "unsafe_halt",
+      method .. " requires a main-CPU instruction-boundary halt; frame/PPU step and breakpoint halts are not savestate-safe")
+    return nil
+  end
+
+  local path = method == "probe" and p.state or p.path
+  if not path then
+    reply_err(id, "bad_params", method == "probe" and "state 필요" or "path 필요")
+    return nil
+  end
+
+  local probe = nil
+  if method == "probe" then
+    local frames, err = bounded_sync_count(p.frame, 0, true)
+    if not frames then reply_err(id, "bad_params", err); return nil end
+    probe = {
+      frame = frames,
+      mem = p.memory_type,
+      addr = p.address or 0,
+      len = p.length or 1,
+    }
+  end
+
+  local ok, bytes_or_err = pcall(function()
+    if method == "save_state" then
+      return StateIo.save(emu, path, id)
+    end
+    return StateIo.load(emu, path)
+  end)
+  if not ok then
+    reply_err(id, "io_error", bytes_or_err)
+    return nil
+  end
+
+  if method == "save_state" then
+    reply_ok(id, { status = "completed", path = path, bytes = bytes_or_err })
+    return nil
+  end
+
+  -- loadSavestate changes the live CPU immediately while the native halt remains owned. Replace
+  -- the old freeze projection before replying so every later frozen read observes the restored state.
+  freeze_snapshot = emu.getState()
+  if method == "load_state" then
+    reply_ok(id, { status = "completed", path = path, bytes = bytes_or_err, state = "frozen" })
+    return nil
+  end
+
+  if probe.frame <= 0 then
+    reply_ok(id, { hex = read_target(probe), frame = frame })
+    return nil
+  end
+  deferred = { id = id, kind = "probe", remaining = probe.frame, age = 0, probe = probe }
+  return "resume"
 end
 
 -- A TCP session is also the response-id namespace. Once it is gone, an unfinished response cannot
@@ -1549,7 +1613,7 @@ local function handle_in_freeze(line)
     deferred = { id = id, kind = "press", remaining = frames, age = 0 }
     return "resume"
   elseif method == "save_state" or method == "load_state" or method == "probe" then
-    reply_err(id, "frozen", "frozen 상태에서는 불가 — step/resume 사용")
+    return frozen_state_io(method, id, p)
   else
     local h = handlers[method]
     if not h then reply_err(id, "unknown_method", tostring(method))
@@ -1655,13 +1719,24 @@ end
 
 -- 최초 codeBreak는 freeze 진입 또는 explicit step 청크 완료의 linearization point다.
 emu.addEventCallback(function()
-  service_frozen_once()
+  if STATE ~= "frozen" then return end
+  if not freeze_start_ms then freeze_start_ms = wall_ms() end
+  if not freeze_snapshot then freeze_snapshot = emu.getState() end
 end, emu.eventType.codeBreak)
 
--- compatible host의 native debugger wait loop가 guest를 전진시키지 않고 반복 호출한다.
+-- Unsafe halt kinds are still serviceable, but savestate operations remain disabled.
 emu.addEventCallback(function()
+  halt_savestate_safe = false
   service_frozen_once()
 end, emu.eventType.codeBreakIdle)
+
+-- Main-CPU Pause/CpuStep halts use a distinct host event whose scripting context permits
+-- createSavestate/loadSavestate. This is the only frozen callback that enables state I/O.
+emu.addEventCallback(function()
+  halt_savestate_safe = true
+  service_frozen_once()
+  halt_savestate_safe = false
+end, emu.eventType.codeBreakIdleSavestate)
 
 -- 입력 적용: ROM이 읽기 직전인 inputPolled에서 주입한 입력을 덮어쓴다.
 emu.addEventCallback(function()
@@ -1670,6 +1745,7 @@ end, emu.eventType.inputPolled)
 
 -- RUNNING 프레임 루프
 emu.addEventCallback(function()
+  halt_savestate_safe = false
   frame = frame + 1
   if not conn then connect(); return end
   if Tx.pending(tx) and flush_tx() == "resetting" then return end

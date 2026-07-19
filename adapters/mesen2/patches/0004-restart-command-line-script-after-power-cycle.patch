@@ -1,0 +1,77 @@
+diff --git i/UI/Debugger/Windows/ScriptWindow.axaml.cs w/UI/Debugger/Windows/ScriptWindow.axaml.cs
+index ed56e7c..2f5eac8 100644
+--- i/UI/Debugger/Windows/ScriptWindow.axaml.cs
++++ w/UI/Debugger/Windows/ScriptWindow.axaml.cs
+@@ -25,6 +25,7 @@ using System.Collections.Generic;
+ using System.ComponentModel;
+ using System.Linq;
+ using System.Reflection;
++using System.Runtime.InteropServices;
+ using System.Xml;
+ 
+ namespace Mesen.Debugger.Windows
+@@ -37,6 +38,7 @@ namespace Mesen.Debugger.Windows
+ 		private MesenTextEditor _txtScriptLog;
+ 		private DispatcherTimer _timer;
+ 		private ScriptWindowViewModel _model;
++		private readonly bool _resumeAfterPowerCycle;
+ 
+ 		public ScriptWindowViewModel Model => _model;
+ 
+@@ -49,8 +51,9 @@ namespace Mesen.Debugger.Windows
+ 		[Obsolete("For designer only")]
+ 		public ScriptWindow() : this(new(null)) { }
+ 
+-		public ScriptWindow(ScriptWindowViewModel model)
++		public ScriptWindow(ScriptWindowViewModel model, bool resumeAfterPowerCycle = false)
+ 		{
++			_resumeAfterPowerCycle = resumeAfterPowerCycle;
+ 			InitializeComponent();
+ #if DEBUG
+ 			this.AttachDevTools();
+@@ -156,11 +159,22 @@ namespace Mesen.Debugger.Windows
+ 		{
+ 			switch(e.NotificationType) {
+ 				case ConsoleNotificationType.GameLoaded:
+-					if(_model.ScriptId >= 0 && _model.Config.AutoRestartScriptAfterPowerCycle) {
+-						_model.RestartScript();
+-					} else {
+-						_model.StopScript();
+-					}
++					// ReloadRom sends this notification before it leaves its paused initialization
++					// section. Defer core calls until the UI loop. Command-line scripts own an
++					// automation session, so resume a power cycle after the replacement script loads.
++					bool restart = _model.ScriptId >= 0 && _model.Config.AutoRestartScriptAfterPowerCycle;
++					GameLoadedEventParams evtParams = Marshal.PtrToStructure<GameLoadedEventParams>(e.Parameter);
++					bool resume = restart && _resumeAfterPowerCycle && evtParams.IsPowerCycle;
++					Dispatcher.UIThread.Post(() => {
++						if(restart) {
++							_model.RestartScript();
++						} else {
++							_model.StopScript();
++						}
++						if(resume) {
++							EmuApi.Resume();
++						}
++					});
+ 					break;
+ 			}
+ 		}
+diff --git i/UI/Utilities/CommandLineHelper.cs w/UI/Utilities/CommandLineHelper.cs
+index e3e2e85..c9739a6 100644
+--- i/UI/Utilities/CommandLineHelper.cs
++++ w/UI/Utilities/CommandLineHelper.cs
+@@ -139,8 +139,12 @@ public class CommandLineHelper
+ 				}
+ 
+ 				ScriptWindowViewModel model = new(null);
++				// Register the window before its script can connect, while preserving the original
++				// load-before-show order. Some systems reset by replacing the debugger; a reset
++				// immediately after hello must restart the command-line script and resume execution.
++				ScriptWindow scriptWindow = DebugWindowManager.CreateDebugWindow(() => new ScriptWindow(model, true));
+ 				model.LoadScript(luaScript);
+-				DebugWindowManager.OpenDebugWindow(() => new ScriptWindow(model));
++				scriptWindow.Show();
+ 			}
+ 
+ 			//Shift focus back to main window after opening the script window(s)

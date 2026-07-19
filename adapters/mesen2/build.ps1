@@ -111,7 +111,9 @@ try {
 
     $Patches = @(
         (Join-Path $Here "patches/0001-fix-numeric-cli-settings.patch"),
-        (Join-Path $Here "patches/0002-add-code-break-idle-event.patch")
+        (Join-Path $Here "patches/0002-add-code-break-idle-event.patch"),
+        (Join-Path $Here "patches/0003-enable-safe-halt-savestates.patch"),
+        (Join-Path $Here "patches/0004-restart-command-line-script-after-power-cycle.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {
@@ -153,7 +155,7 @@ try {
     Write-Host "Building MesenCE locally with Visual Studio Release/x64"
     Get-ChildItem -Recurse -File -Filter "emucap-mesen-build.json" -Path (Join-Path $Source "bin") -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
-    Invoke-Native $MsBuild @((Join-Path $Source "Mesen.sln"), "/m", "/p:Configuration=Release", "/p:Platform=x64")
+    Invoke-Native $MsBuild @((Join-Path $Source "Mesen.sln"), "/m", "/t:Rebuild", "/p:Configuration=Release", "/p:Platform=x64")
     $Binary = Get-ChildItem -Recurse -File -Filter "Mesen.exe" -Path (Join-Path $Source "bin/win-x64/Release") |
         Select-Object -First 1
     if (-not $Binary) { throw "Mesen build completed without Mesen.exe under bin/win-x64/Release" }

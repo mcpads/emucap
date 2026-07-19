@@ -3,16 +3,15 @@
 //! The emucap Lua's socket needs Mesen's script I/O + network access enabled, a script timeout large
 //! enough for one big read (dump_memory reads a whole region in a single call), and SingleInstance off
 //! so starting an emucap instance doesn't take over the user's other open ROM, and a controller
-//! connected on the game port (emu.setInput reaches no device otherwise). The launcher normally
-//! leaves settings.json absent so Mesen inherits the user's keymaps/controller (hands-on HITL works);
-//! GBA is the narrow exception: Mesen must enter portable-data mode to discover the staged BIOS next
-//! to the copied app, so that launch gets a minimal settings.json. Required values are still passed
-//! as CLI overrides with `--donotSaveSettings` and never persist to the user's file.
+//! connected on the game port (emu.setInput reaches no device otherwise). A minimal settings.json
+//! keeps every launch in the copied portable home instead of loading the user's config or native
+//! libraries. Required values are also passed as CLI overrides with `--donotSaveSettings`; neither
+//! path modifies the user's file.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-pub const REQUIRED_HOST_API: u32 = 1;
+pub const REQUIRED_HOST_API: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -233,6 +232,55 @@ fn app_bundle_root(binary: &Path) -> Option<(&Path, PathBuf)> {
     None
 }
 
+#[cfg(target_os = "macos")]
+fn isolate_app_bundle_identity(app_root: &Path, port: u16) -> std::io::Result<()> {
+    let info_plist = app_root.join("Contents/Info.plist");
+    if super::has_symlink_component_under(app_root, &info_plist) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "portable Mesen Info.plist contains a symlink, refusing to modify it: {}",
+                info_plist.display()
+            ),
+        ));
+    }
+    if !info_plist.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "portable Mesen app is missing Contents/Info.plist: {}",
+                app_root.display()
+            ),
+        ));
+    }
+
+    // LaunchServices and macOS saved-state storage key off this identifier. Sharing upstream's
+    // identifier can strand a rapid relaunch behind another port's or the user's open Mesen app.
+    let identifier = format!("ca.mesen.emucap.p{port}");
+    let output = std::process::Command::new("/usr/bin/plutil")
+        .args(["-replace", "CFBundleIdentifier", "-string", &identifier])
+        .arg(&info_plist)
+        .output()
+        .map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "failed to run plutil for portable Mesen identity at {}: {e}",
+                    info_plist.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(format!(
+            "failed to set portable Mesen bundle identifier at {}: {}",
+            info_plist.display(),
+            stderr.trim()
+        )));
+    }
+    Ok(())
+}
+
 /// Copy Mesen into an emucap-owned portable directory and locate its optional settings path. The
 /// source binary/app is read-only input; system-specific launch preparation decides whether a
 /// settings file is needed.
@@ -314,10 +362,13 @@ pub fn prepare_portable_binary(
         (binary, settings)
     };
 
-    // settings.json을 만들지 않는다: 그러면 Mesen이 사용자 기본 settings(~/Library 등)를 로드해
-    // 사용자의 키매핑/컨트롤러를 그대로 상속한다(사람이 GUI로 조작 가능). emucap 필수 설정
-    // (script I/O·network, SingleInstance, 컨트롤러 타입)은 mesen_spec의 CLI config override로
-    // 넣고, --donotSaveSettings로 그 override가 사용자 파일에 저장되는 것을 막는다.
+    #[cfg(target_os = "macos")]
+    if let Some((app_root, _)) = app_bundle_root(&binary) {
+        isolate_app_bundle_identity(app_root, port)?;
+    }
+
+    // launch() installs the per-port portable marker after validating this
+    // copied runtime, preserving any regular settings file bundled with it.
     Ok(PreparedPortable {
         binary,
         settings,
@@ -343,7 +394,7 @@ pub struct Launch<'a> {
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let host_build = read_build_metadata(l.binary)?;
     let portable = prepare_portable_binary(l.binary, l.port)?;
-    ensure_gba_portable_settings(l, &portable)?;
+    ensure_portable_settings(&portable)?;
     provision_gba_bios(l, &portable)?;
     let opts = crate::launch::spec::SpecOpts {
         content: l.content,
@@ -362,7 +413,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     Ok(pid)
 }
 
-const GBA_PORTABLE_SETTINGS: &str = r#"{
+const PORTABLE_SETTINGS: &str = r#"{
   "Debug": {
     "ScriptWindow": {
       "AllowIoOsAccess": true,
@@ -384,14 +435,10 @@ fn is_gba_launch(l: &Launch) -> bool {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("gba"))
 }
 
-/// A settings.json beside the executable is Mesen's portable-data marker. GBA needs that marker so
-/// its `Firmware/gba_bios.bin` staging path and Mesen's lookup path are the same. Other systems keep
-/// the file absent and continue inheriting the user's native key bindings. An existing regular file
-/// copied from the source app is preserved verbatim.
-fn ensure_gba_portable_settings(l: &Launch, portable: &PreparedPortable) -> std::io::Result<()> {
-    if !is_gba_launch(l) {
-        return Ok(());
-    }
+/// A settings.json beside the executable is Mesen's portable-data marker. It keeps configuration and
+/// native-library lookup in the per-port copy; for GBA it also makes the staged Firmware directory
+/// the lookup path. An existing regular file copied from the source app is preserved verbatim.
+fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> {
     if super::has_symlink_component_under(&portable.home, &portable.settings) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -417,7 +464,7 @@ fn ensure_gba_portable_settings(l: &Launch, portable: &PreparedPortable) -> std:
         std::fs::create_dir_all(parent)?;
     }
     let tmp = super::unique_sibling_path(&portable.settings, "tmp");
-    if let Err(err) = std::fs::write(&tmp, GBA_PORTABLE_SETTINGS.as_bytes()) {
+    if let Err(err) = std::fs::write(&tmp, PORTABLE_SETTINGS.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }

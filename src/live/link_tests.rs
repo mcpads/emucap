@@ -42,3 +42,24 @@ fn link_error_messages() {
     )
     .contains("b"));
 }
+
+#[test]
+fn mesen_host_features_distinguish_native_halt_from_safe_savestates() {
+    let halt_only = EmulatorIdentity::from_hello(&json!({
+        "mesen_host_api": 1,
+        "host_features": ["code_break_idle", "native_halt_service"]
+    }));
+    assert!(halt_only.has_mesen_native_halt());
+    assert!(!halt_only.has_mesen_native_halt_savestate());
+
+    let safe_state = EmulatorIdentity::from_hello(&json!({
+        "mesen_host_api": 2,
+        "host_features": [
+            "code_break_idle",
+            "native_halt_service",
+            "native_halt_savestate"
+        ]
+    }));
+    assert!(safe_state.has_mesen_native_halt());
+    assert!(safe_state.has_mesen_native_halt_savestate());
+}

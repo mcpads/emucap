@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify native-halt zero drift and same-process reconnect with the compatible Mesen host.
 
-Usage: live-reconnect-test.py <bootable.sfc|smc|nes|gba> [mesen-binary]
+Usage: live-reconnect-test.py <bootable.sfc|smc|nes|gb|gbc|gg|gba> [mesen-binary]
 """
 
 from __future__ import annotations
@@ -122,9 +122,10 @@ def accept(listener: socket.socket, token: str) -> Session:
     if result.get("session_token") != token or result.get("adapter") != "mesen2-live":
         raise RuntimeError(f"identity mismatch: {result}")
     features = set(result.get("host_features", []))
-    if result.get("mesen_host_api") != 1 or not {
+    if result.get("mesen_host_api") != 2 or not {
         "code_break_idle",
         "native_halt_service",
+        "native_halt_savestate",
     }.issubset(features):
         raise RuntimeError(f"mesen-patch-required: runtime hello lacks native halt: {result}")
     return session
@@ -149,7 +150,10 @@ def main() -> int:
     parser.add_argument("content")
     parser.add_argument("binary", nargs="?")
     parser.add_argument("--hold-seconds", type=float, default=FREEZE_HOLD_SECONDS)
+    parser.add_argument("--reset-repeats", type=int, default=1)
     args = parser.parse_args()
+    if args.reset_repeats < 1:
+        raise SystemExit("--reset-repeats must be at least 1")
     content = Path(args.content).resolve()
     binary = Path(args.binary).resolve() if args.binary else default_binary().resolve()
     if not content.is_file() or not binary.is_file():
@@ -163,7 +167,7 @@ def main() -> int:
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
     listener.listen(4)
-    listener.settimeout(90)
+    listener.settimeout(float(os.environ.get("EMUCAP_TEST_ACCEPT_TIMEOUT", "90")))
     port = listener.getsockname()[1]
     token = "mesen-live-reconnect-token"
     owned_pid: int | None = None
@@ -172,8 +176,26 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="emucap-mesen-reconnect-") as temp:
         home = Path(temp)
         wrapper = home / "idle-error-once.lua"
+        load_error_path = home / "adapter-load-error.txt"
+        lifecycle_path = home / "adapter-lifecycle.txt"
         wrapper.write_text(
-            """dofile(assert(os.getenv("EMUCAP_IDLE_PROBE_ENTRY")))
+            """local entry = assert(os.getenv("EMUCAP_IDLE_PROBE_ENTRY"))
+local loaded, load_error = pcall(dofile, entry)
+if not loaded then
+  local file = io.open(assert(os.getenv("EMUCAP_IDLE_PROBE_ERROR")), "wb")
+  if file then file:write(tostring(load_error)); file:close() end
+  error(load_error)
+end
+local lifecycle = io.open(assert(os.getenv("EMUCAP_IDLE_PROBE_LIFECYCLE")), "ab")
+if lifecycle then lifecycle:write("loaded\\n"); lifecycle:close() end
+local first_frame = true
+emu.addEventCallback(function()
+  if first_frame then
+    first_frame = false
+    local frame_file = io.open(assert(os.getenv("EMUCAP_IDLE_PROBE_LIFECYCLE")), "ab")
+    if frame_file then frame_file:write("frame\\n"); frame_file:close() end
+  end
+end, emu.eventType.startFrame)
 local fail_once = true
 emu.addEventCallback(function()
   if fail_once then
@@ -181,6 +203,12 @@ emu.addEventCallback(function()
     error("emucap intentional one-shot codeBreakIdle test error")
   end
 end, emu.eventType.codeBreakIdle)
+emu.addEventCallback(function()
+  if fail_once then
+    fail_once = false
+    error("emucap intentional one-shot codeBreakIdleSavestate test error")
+  end
+end, emu.eventType.codeBreakIdleSavestate)
 """,
             encoding="utf-8",
         )
@@ -194,7 +222,9 @@ end, emu.eventType.codeBreakIdle)
                 "EMUCAP_SESSION_TOKEN": token,
                 "EMUCAP_MESEN_LUA": str(wrapper),
                 "EMUCAP_IDLE_PROBE_ENTRY": str(entry),
-                "EMUCAP_LAUNCH_WAIT": "45",
+                "EMUCAP_IDLE_PROBE_ERROR": str(load_error_path),
+                "EMUCAP_IDLE_PROBE_LIFECYCLE": str(lifecycle_path),
+                "EMUCAP_LAUNCH_WAIT": os.environ.get("EMUCAP_TEST_LAUNCH_WAIT", "45"),
                 "EMUCAP_POST_CONNECT_GRACE": "0",
                 "EMUCAP_LOG": str(home / "mesen-live-reconnect.log"),
             }
@@ -208,7 +238,15 @@ end, emu.eventType.codeBreakIdle)
             check=False,
         )
         if launched.returncode != 0:
-            raise RuntimeError(f"launch failed:\n{launched.stdout}\n{launched.stderr}")
+            load_error = (
+                load_error_path.read_text(encoding="utf-8", errors="replace")
+                if load_error_path.is_file()
+                else "<no adapter load error artifact>"
+            )
+            raise RuntimeError(
+                f"launch failed:\n{launched.stdout}\n{launched.stderr}"
+                f"\nadapter load error: {load_error}"
+            )
         pidfile = home / "mesen2" / str(port) / "mesen.pid"
         owned_pid = int(pidfile.read_text().strip())
 
@@ -225,14 +263,23 @@ end, emu.eventType.codeBreakIdle)
             ) != 0:
                 raise RuntimeError(f"default freeze persistence is not indefinite: {freeze_policy}")
 
-            reset = session.request("reset")
-            if not reset.get("ok") or reset.get("result", {}).get("reconnect") is not True:
-                raise RuntimeError(f"reset was not acknowledged before reconnect: {reset}")
-            session.close()
-            session = accept(listener, token)
-            after_reset = session.request("status")
-            if not after_reset.get("ok") or after_reset.get("result", {}).get("state") != "running":
-                raise RuntimeError(f"post-reset session is not usable: {after_reset}")
+            after_reset = {}
+            for reset_index in range(args.reset_repeats):
+                reset = session.request("reset")
+                if not reset.get("ok") or reset.get("result", {}).get("reconnect") is not True:
+                    raise RuntimeError(
+                        f"reset {reset_index + 1} was not acknowledged before reconnect: {reset}"
+                    )
+                session.close()
+                session = accept(listener, token)
+                after_reset = session.request("status")
+                if (
+                    not after_reset.get("ok")
+                    or after_reset.get("result", {}).get("state") != "running"
+                ):
+                    raise RuntimeError(
+                        f"post-reset session {reset_index + 1} is not usable: {after_reset}"
+                    )
 
             paused = session.request("pause")
             if not paused.get("ok") or paused.get("result", {}).get("state") != "frozen":
@@ -269,6 +316,30 @@ end, emu.eventType.codeBreakIdle)
             if not screenshot.get("ok") or not screenshot.get("result", {}).get("png_base64"):
                 raise RuntimeError(f"screenshot failed while frozen: {screenshot}")
 
+            state_path = home / "safe-halt.mss"
+            old_state = b"previous-state-must-not-be-truncated"
+            state_path.write_bytes(old_state)
+            saved = session.request("save_state", {"path": str(state_path)})
+            if not saved.get("ok"):
+                raise RuntimeError(f"safe frozen save failed: {saved}")
+            if state_path.read_bytes() == old_state:
+                raise RuntimeError("safe frozen save did not replace the previous state file")
+            after_save = freeze_signature(session)
+            if after_save != baseline:
+                raise RuntimeError(
+                    f"safe frozen save changed guest state: before={baseline} after={after_save}"
+                )
+            safe_status = session.request("status")
+            if (
+                safe_status.get("result", {})
+                .get("freeze_policy", {})
+                .get("savestate_safe")
+                is not True
+            ):
+                raise RuntimeError(
+                    f"pause halt did not advertise its savestate-safe boundary: {safe_status}"
+                )
+
             stepped_frame = session.request("step", {"frames": 1, "unit": "frames"})
             if not stepped_frame.get("ok") or stepped_frame.get("result", {}).get(
                 "status"
@@ -278,6 +349,16 @@ end, emu.eventType.codeBreakIdle)
             if after_frame_step["frame"] != baseline["frame"] + 1:
                 raise RuntimeError(
                     f"frame step was not exact: before={baseline} after={after_frame_step}"
+                )
+            unsafe_state_path = home / "unsafe-halt.mss"
+            unsafe_save = session.request("save_state", {"path": str(unsafe_state_path)})
+            if (
+                unsafe_save.get("ok")
+                or unsafe_save.get("error", {}).get("kind") != "unsafe_halt"
+                or unsafe_state_path.exists()
+            ):
+                raise RuntimeError(
+                    f"frame-step halt did not fail-loud before serialization: {unsafe_save}"
                 )
 
             stepped_instruction = session.request(
@@ -292,6 +373,19 @@ end, emu.eventType.codeBreakIdle)
             # may be unchanged (e.g. a self-branch or a console HALT/interrupt boundary). Mesen's
             # native StepRequest owns the exact instruction count; this live gate verifies that its
             # completed reply returns to the compatible native halt instead of free-running.
+            loaded = session.request("load_state", {"path": str(state_path)})
+            if (
+                not loaded.get("ok")
+                or loaded.get("result", {}).get("state") != "frozen"
+            ):
+                raise RuntimeError(f"safe frozen load failed or lost halt ownership: {loaded}")
+            after_load = freeze_signature(session)
+            if after_load["cpu"] != baseline["cpu"]:
+                raise RuntimeError(
+                    f"safe frozen load did not restore CPU projection: before={baseline} "
+                    f"after={after_load}"
+                )
+
             resumed = session.request("resume")
             if not resumed.get("ok") or resumed.get("result", {}).get("state") != "running":
                 raise RuntimeError(f"explicit resume failed after persistent freeze: {resumed}")
@@ -325,6 +419,7 @@ end, emu.eventType.codeBreakIdle)
                         "same_process": True,
                         "replacement_hello": True,
                         "reset_ack_before_reconnect": True,
+                        "running_reset_repeats": args.reset_repeats,
                         "post_reset_status": after_reset["result"]["state"],
                         "frozen_reset_ack_before_reconnect": True,
                         "post_frozen_reset_status": after_frozen_reset["result"]["state"],
@@ -335,11 +430,37 @@ end, emu.eventType.codeBreakIdle)
                         "burst_requests": burst_count,
                         "one_frame_step_exact": True,
                         "one_instruction_step_refroze": True,
+                        "safe_frozen_save_preserved_halt": True,
+                        "unsafe_frame_halt_rejected_save": True,
+                        "safe_frozen_load_restored_cpu": True,
                         "recovered_after_one_shot_idle_error": True,
                     },
                     separators=(",", ":"),
                 )
             )
+        except Exception as error:
+            alive = False
+            if owned_pid is not None:
+                try:
+                    os.kill(owned_pid, 0)
+                    alive = True
+                except ProcessLookupError:
+                    pass
+            log_path = home / "mesen-live-reconnect.log"
+            log_tail = (
+                "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-80:])
+                if log_path.is_file()
+                else "<missing Mesen log>"
+            )
+            lifecycle = (
+                lifecycle_path.read_text(encoding="utf-8", errors="replace")
+                if lifecycle_path.is_file()
+                else "<missing lifecycle artifact>"
+            )
+            raise RuntimeError(
+                f"{error}\nowned_pid={owned_pid} alive={alive}"
+                f"\nadapter lifecycle:\n{lifecycle}\nMesen log tail:\n{log_tail}"
+            ) from error
         finally:
             if session is not None:
                 session.close()

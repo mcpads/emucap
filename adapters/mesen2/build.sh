@@ -85,6 +85,8 @@ fi
 PATCHES=(
   "$HERE/patches/0001-fix-numeric-cli-settings.patch"
   "$HERE/patches/0002-add-code-break-idle-event.patch"
+  "$HERE/patches/0003-enable-safe-halt-savestates.patch"
+  "$HERE/patches/0004-restart-command-line-script-after-power-cycle.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -129,6 +131,10 @@ export DOTNET_CLI_TELEMETRY_OPTOUT=1
 export DOTNET_NOLOGO=1
 JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 echo "→ building MesenCE locally with make (-j$JOBS)"
+# Upstream's makefile does not emit header dependencies. A new EventType value can otherwise leave
+# LuaApi.o stale while Debugger.o uses the new enum, producing a host that builds but cannot expose
+# the capability to Lua. Patch-stack builds therefore start from clean native objects.
+make -C "$SRC" clean
 # A previous build's sidecar must never be copied into a fresh app bundle before the new patch stack
 # is verified. The selected artifact receives exactly one current sidecar after the build succeeds.
 find "$SRC/bin" -name emucap-mesen-build.json -type f -delete 2>/dev/null || true

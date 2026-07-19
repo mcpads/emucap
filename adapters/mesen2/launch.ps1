@@ -240,9 +240,7 @@ if ($portableFull.Equals($sourceDir, [System.StringComparison]::OrdinalIgnoreCas
 Replace-PortableDirectory $sourceDir $portableDir
 
 $settings = Join-Path $portableDir "settings.json"
-$isGba = ((Split-Path -Leaf $lua) -eq "emucap-gba.lua") -or ([System.IO.Path]::GetExtension($Rom) -ieq ".gba")
-if ($isGba) {
-  @'
+@'
 {
   "Debug": {
     "ScriptWindow": {
@@ -257,6 +255,8 @@ if ($isGba) {
 }
 '@ | Set-Content $settings -Encoding UTF8
 
+$isGba = ((Split-Path -Leaf $lua) -eq "emucap-gba.lua") -or ([System.IO.Path]::GetExtension($Rom) -ieq ".gba")
+if ($isGba) {
   $firmwareDir = Join-Path $portableDir "Firmware"
   $firmwareDestination = Join-Path $firmwareDir "gba_bios.bin"
   $explicitBios = $env:EMUCAP_GBA_BIOS
@@ -295,7 +295,7 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    & git -C $here diff --quiet HEAD -- emucap-core.lua $entryName 2>$null
+    & git -C $here diff --quiet HEAD -- emucap-core.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null
     if ($LASTEXITCODE -ne 0) {
       $buildHash = "$buildHash-dirty"
     }

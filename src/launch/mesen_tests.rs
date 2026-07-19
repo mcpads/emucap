@@ -119,6 +119,25 @@ fn test_build_metadata() -> BuildMetadata {
 }
 
 #[test]
+fn build_metadata_rejects_host_without_safe_halt_savestates() {
+    let publish = tempfile::tempdir().unwrap();
+    let binary = publish.path().join("Mesen");
+    std::fs::write(&binary, "fake").unwrap();
+    let mut metadata = test_build_metadata();
+    metadata.host_api = 1;
+    std::fs::write(
+        publish.path().join("emucap-mesen-build.json"),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    let error = read_build_metadata(&binary).unwrap_err();
+
+    assert!(error.to_string().contains("host API 1 is incompatible"));
+    assert!(error.to_string().contains("expected 2"));
+}
+
+#[test]
 fn portable_patched_publish_copies_runtime_dependencies_and_sidecar() {
     let src = tempfile::tempdir().unwrap();
     let emu_home = tempfile::tempdir().unwrap();
@@ -236,11 +255,22 @@ fn portable_app_bundle_copies_bundle_and_keeps_source_settings() {
     let emu_home = tempfile::tempdir().unwrap();
     let app = src.path().join("Mesen.app");
     let source_bin = app.join("Contents/MacOS/Mesen");
+    let source_info = app.join("Contents/Info.plist");
     let source_settings = app.join("Contents/MacOS/settings.json");
     let source_resource = app.join("Contents/Resources/icon.txt");
     std::fs::create_dir_all(source_bin.parent().unwrap()).unwrap();
     std::fs::create_dir_all(source_resource.parent().unwrap()).unwrap();
     std::fs::write(&source_bin, "fake app mesen").unwrap();
+    std::fs::write(
+        &source_info,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>ca.mesen</string>
+</dict></plist>
+"#,
+    )
+    .unwrap();
     std::fs::write(&source_resource, "resource").unwrap();
     std::fs::write(
         &source_settings,
@@ -273,6 +303,15 @@ fn portable_app_bundle_copies_bundle_and_keeps_source_settings() {
         json!({"Video": {"Scale": 4}}),
         "source app settings must remain untouched"
     );
+    #[cfg(target_os = "macos")]
+    {
+        let portable_info = portable.home.join("Mesen.app/Contents/Info.plist");
+        let portable_plist = std::fs::read_to_string(portable_info).unwrap();
+        let source_plist = std::fs::read_to_string(source_info).unwrap();
+        assert!(portable_plist.contains("ca.mesen.emucap.p47912"));
+        assert!(source_plist.contains("<string>ca.mesen</string>"));
+        assert!(!source_plist.contains("ca.mesen.emucap"));
+    }
     // app bundle copy는 source .app의 settings.json을 그대로 옮길 뿐, 우리가 키를 주입하지
     // 않는다(필수값은 CLI override). source에 있던 값은 유지되고 우리 키는 없다.
     let v = read(&portable.settings);
@@ -327,9 +366,9 @@ fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let lua = dir.path().join("emucap-gba.lua");
     let log = dir.path().join("launch.log");
-    let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+    let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
 
-    ensure_gba_portable_settings(&l, &portable).unwrap();
+    ensure_portable_settings(&portable).unwrap();
 
     let settings = read(&portable.settings);
     assert_eq!(settings["Debug"]["ScriptWindow"]["AllowIoOsAccess"], true);
@@ -347,46 +386,49 @@ fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
 }
 
 #[test]
-fn gba_preserves_existing_portable_settings() {
+fn portable_setup_preserves_existing_settings() {
     let dir = tempfile::tempdir().unwrap();
     let lua = dir.path().join("emucap-gba.lua");
     let log = dir.path().join("launch.log");
-    let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+    let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
     std::fs::create_dir_all(portable.settings.parent().unwrap()).unwrap();
     std::fs::write(&portable.settings, br#"{"Video":{"Scale":4}}"#).unwrap();
 
-    ensure_gba_portable_settings(&l, &portable).unwrap();
+    ensure_portable_settings(&portable).unwrap();
 
     assert_eq!(read(&portable.settings), json!({"Video": {"Scale": 4}}));
 }
 
 #[test]
-fn non_gba_keeps_portable_settings_absent() {
+fn non_gba_also_gets_the_portable_settings_marker() {
     let dir = tempfile::tempdir().unwrap();
     let lua = dir.path().join("emucap-snes.lua");
     let log = dir.path().join("launch.log");
-    let (mut l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
-    l.content = "/unused/rom.sfc";
+    let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
 
-    ensure_gba_portable_settings(&l, &portable).unwrap();
+    ensure_portable_settings(&portable).unwrap();
 
-    assert!(!portable.settings.exists());
+    assert!(portable.settings.is_file());
+    assert_eq!(
+        read(&portable.settings)["Preferences"]["SingleInstance"],
+        false
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn gba_refuses_symlinked_portable_settings() {
+fn portable_setup_refuses_symlinked_settings() {
     let dir = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let lua = dir.path().join("emucap-gba.lua");
     let log = dir.path().join("launch.log");
-    let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
+    let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
     std::fs::create_dir_all(portable.settings.parent().unwrap()).unwrap();
     let target = outside.path().join("settings.json");
     std::fs::write(&target, b"user settings").unwrap();
     std::os::unix::fs::symlink(&target, &portable.settings).unwrap();
 
-    let err = ensure_gba_portable_settings(&l, &portable).unwrap_err();
+    let err = ensure_portable_settings(&portable).unwrap_err();
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(&target).unwrap(), b"user settings");
@@ -504,16 +546,4 @@ fn provision_skips_non_gba_lua_entry() {
     l.content = "/unused/rom.sfc";
     // No BIOS anywhere, but a non-GBA entry must not attempt provisioning.
     with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
-}
-
-#[test]
-fn gba_content_provisions_even_when_entry_is_wrapped() {
-    let dir = tempfile::tempdir().unwrap();
-    let lua = dir.path().join("idle-error-once.lua");
-    let log = dir.path().join("launch.log");
-    let (l, portable) = gba_provision_inputs(dir.path(), &lua, &log);
-
-    ensure_gba_portable_settings(&l, &portable).unwrap();
-
-    assert!(portable.settings.is_file());
 }

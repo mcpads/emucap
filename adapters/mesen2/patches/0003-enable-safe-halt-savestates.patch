@@ -1,0 +1,65 @@
+diff --git i/Core/Debugger/Debugger.cpp w/Core/Debugger/Debugger.cpp
+index e78a5be..084114c 100644
+--- i/Core/Debugger/Debugger.cpp
++++ w/Core/Debugger/Debugger.cpp
+@@ -522,7 +522,13 @@ void Debugger::SleepUntilResume(CpuType sourceCpu, BreakSource source, MemoryOpe
+ 			// Scripts normally receive CodeBreak once, immediately before this native halt loop. An
+ 			// opt-in CodeBreakIdle callback lets a bounded control script service external commands
+ 			// while the guest remains stopped, without holding one Lua callback past the watchdog.
+-			ProcessEvent(EventType::CodeBreakIdle, sourceCpu);
++			bool savestateSafe = sourceCpu == _mainCpuType
++				&& (source == BreakSource::Pause || source == BreakSource::CpuStep)
++				&& (!operation || operation->Type == MemoryOperationType::ExecOpCode);
++			ProcessEvent(
++				savestateSafe ? EventType::CodeBreakIdleSavestate : EventType::CodeBreakIdle,
++				sourceCpu
++			);
+ 		}
+ 		if((!_waitForBreakResume || _suspendRequestCount) && !_breakRequestCount) {
+ 			break;
+diff --git i/Core/Debugger/ScriptingContext.cpp w/Core/Debugger/ScriptingContext.cpp
+index e8a6437..c2f7c7f 100644
+--- i/Core/Debugger/ScriptingContext.cpp
++++ w/Core/Debugger/ScriptingContext.cpp
+@@ -399,6 +399,8 @@ int ScriptingContext::CallEventCallback(EventType type, CpuType cpuType)
+ 		return 0;
+ 	}
+ 
++	bool previousAllowSaveState = _allowSaveState;
++	_allowSaveState = type == EventType::CodeBreakIdleSavestate;
+ 	_timer.Reset();
+ 	_context = this;
+ 	lua_setwatchdogtimer(_lua, ScriptingContext::ExecutionCountHook, 1000);
+@@ -411,6 +413,7 @@ int ScriptingContext::CallEventCallback(EventType type, CpuType cpuType)
+ 			ProcessLuaError();
+ 		}
+ 	}
++	_allowSaveState = previousAllowSaveState;
+ 	return l.ReturnCount();
+ }
+
+diff --git i/Core/Debugger/LuaApi.cpp w/Core/Debugger/LuaApi.cpp
+index 179a2a0..f5fec8a 100644
+--- i/Core/Debugger/LuaApi.cpp
++++ w/Core/Debugger/LuaApi.cpp
+@@ -53,7 +53,7 @@
+ #define checkparams() if(!l.CheckParamCount()) { return 0; }
+ #define checkminparams(x) if(!l.CheckParamCount(x)) { return 0; }
+ #define checkinitdone() if(!_context->CheckInitDone()) { error("This function cannot be called outside a callback"); }
+-#define checksavestateconditions() if(!_context->IsSaveStateAllowed()) { error("This function must be called inside an exec memory operation callback for the main CPU"); }
++#define checksavestateconditions() if(!_context->IsSaveStateAllowed()) { error("This function requires a main CPU exec callback or a savestate-safe native halt callback"); }
+ 
+ Debugger* LuaApi::_debugger = nullptr;
+ Emulator* LuaApi::_emu = nullptr;
+diff --git i/Core/Shared/EventType.h w/Core/Shared/EventType.h
+index e3f2058..2534d79 100644
+--- i/Core/Shared/EventType.h
++++ w/Core/Shared/EventType.h
+@@ -13,6 +13,7 @@ enum class EventType
+ 	StateSaved,
+ 	CodeBreak,
+ 	CodeBreakIdle,
++	CodeBreakIdleSavestate,
+ 
+ 	LastValue
+ };

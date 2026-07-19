@@ -112,12 +112,20 @@ impl EmulatorIdentity {
     }
 
     pub fn has_mesen_native_halt(&self) -> bool {
-        self.mesen_host_api == Some(1)
+        self.mesen_host_api.unwrap_or(0) >= 1
             && self.host_features.iter().any(|v| v == "code_break_idle")
             && self
                 .host_features
                 .iter()
                 .any(|v| v == "native_halt_service")
+    }
+
+    pub fn has_mesen_native_halt_savestate(&self) -> bool {
+        self.mesen_host_api.unwrap_or(0) >= 2
+            && self
+                .host_features
+                .iter()
+                .any(|v| v == "native_halt_savestate")
     }
 }
 
