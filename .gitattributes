@@ -1,1 +1,2 @@
 adapters/mesen2/patches/*.patch text eol=lf -whitespace
+adapters/pcsx2/patches/*.patch text eol=lf -whitespace

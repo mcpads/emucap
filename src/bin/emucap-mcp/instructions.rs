@@ -1,9 +1,11 @@
 /// Self-contained runtime guidance returned to MCP clients.
-pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS), PPSSPP 포크(PSP), Dolphin 포크(GameCube·Wii), MAME(PC-98).
+pub(crate) const SERVER_INSTRUCTIONS: &str = r#"실행 중 레트로 에뮬레이터를 라이브 디버깅한다 — 메모리·상태·화면을 읽고, 메모리/입력을 쓰고, 세이브스테이트·프레임·브레이크포인트를 제어한다. ROM 패치 디버깅용. 대상: Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS), PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME(PC-98).
 
 **[사용 가능 기능] 연결한 뒤 `status.methods`에 나온 도구만 사용하고, read/write_memory에는 `status.memory_types`에 나온 memory_type만 쓴다. 예를 들어 PCE가 `pce_fast`로 실행되어 디버거를 쓸 수 없으면 메모리·브레이크포인트 도구가 목록에서 빠진다. 이때는 Mednafen `status.debugger`를 확인하고 필요하면 `force_module=pce`로 다시 실행한다. PC-98 실행 방식별 차이는 `status.backend`와 `status.capability_notes`에 나온다. 시스템별 버튼명과 제한도 status 및 도구 오류에 나온 값을 따른다. hello는 어댑터와 서버가 연결될 때 쓰는 메시지이므로 직접 호출하지 않는다.**
 
 **[호출 전 확인] `status.contracts.state="validated"`이면 `status.methods`와 `status.contracts.active_exceptions`에 나온 내용에 따라 여러 도구를 이어서 쓸 수 있다. 값이 `unreported` 또는 `unvalidated`이면 기본 도구가 보이더라도 그 호출 순서가 안전하다고 가정하지 않는다. 지원하지 않는 port·groups·pulse 크기는 상태를 바꾸기 전에 `bad_params`로 거부된다.**
+
+**[호출 순서] 서로 의존하는 호출은 이전 호출의 최종 응답을 확인한 뒤 다음 호출을 보낸다. 여러 JSON-RPC 요청을 한꺼번에 보내면 완료 순서가 보장되지 않으므로 write→readback, load→inspect, pause→step 같은 순서를 메시지 전송 순서만으로 가정하지 않는다.**
 
 [연결] 에뮬레이터가 *이 서버의 listening_port*로 떠 있어야 한다(서버가 포트 자동선택 — 47800 하드코딩·캐시 금지).
   0) 새 emucap 작업은 `bootstrap()`이 첫 도구다 — 에뮬이 없어도 listener를 세우고 listening_port·runtime_paths·지원 시스템·물어볼 질문을 준다. content_path가 있으면 `launch_plan(content_path, system?)`(CUE/CHD처럼 애매한 media는 추측 말고 시스템을 묻는 결과를 준다). 로컬 디렉터리를 찾기 전에 runtime_paths부터 확인한다.

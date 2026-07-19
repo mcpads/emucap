@@ -273,16 +273,45 @@ fn app_bundle_env_preconditions_report_env_source() {
 
 #[test]
 fn legacy_fallback_availability_follows_host_script_type() {
-    let sh = Path::new("launch.sh");
-    let ps1 = Path::new("launch.ps1");
+    let temporary = tempfile::tempdir().unwrap();
+    let sh = temporary.path().join("launch.sh");
+    let ps1 = temporary.path().join("launch.ps1");
+    std::fs::write(&sh, "#!/bin/sh\n").unwrap();
+    std::fs::write(&ps1, "exit 0\n").unwrap();
 
-    assert_eq!(native_legacy_script(sh), !cfg!(windows));
-    assert_eq!(native_legacy_script(ps1), cfg!(windows));
+    assert_eq!(native_legacy_script(&sh), !cfg!(windows));
+    assert_eq!(native_legacy_script(&ps1), cfg!(windows));
+    assert!(!native_legacy_script(&temporary.path().join(
+        if cfg!(windows) {
+            "missing.ps1"
+        } else {
+            "missing.sh"
+        }
+    )));
 
-    let non_native = if cfg!(windows) { sh } else { ps1 };
+    let non_native = if cfg!(windows) { &sh } else { &ps1 };
     let details = legacy_fallback_details(non_native, &["launch".into()]);
     assert_eq!(details["available_on_this_host"], false);
+    assert_eq!(details["launcher"], serde_json::Value::Null);
     assert_eq!(details["argv"], serde_json::Value::Null);
+}
+
+#[test]
+fn launch_plan_for_ps2_has_no_nonexistent_legacy_fallback() {
+    let plan = make_launch_plan(
+        Some(47805),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/game.iso".into()),
+            system: Some("ps2".into()),
+        },
+    );
+    assert_eq!(plan["adapter"], "pcsx2");
+    assert_eq!(plan["preferred_launcher"]["tool"], "launch");
+    assert_eq!(plan["legacy_fallback"]["available_on_this_host"], false);
+    assert_eq!(plan["legacy_fallback"]["launcher"], serde_json::Value::Null);
+    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
+    assert_eq!(plan["legacy_fallback_argv"], serde_json::Value::Null);
+    assert_eq!(plan["legacy_fallback_command"], serde_json::Value::Null);
 }
 
 #[test]
@@ -337,6 +366,11 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
         .unwrap()
         .iter()
         .any(|v| v.as_str() == Some("psp")));
+    assert!(inferred["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("ps2")));
     assert!(inferred["candidates"]
         .as_array()
         .unwrap()
@@ -453,6 +487,51 @@ fn normalize_system_accepts_psp_aliases() {
     for alias in ["psp", "ppsspp", "playstation-portable"] {
         let inferred = infer_system(None, Some(alias));
         assert_eq!(inferred["system"], "psp", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
+}
+
+#[test]
+fn infer_system_uses_ps2_boot2_from_iso9660_system_cnf() {
+    const SECTOR: usize = 2048;
+    let tmp = tempfile::tempdir().unwrap();
+    let iso = tmp.path().join("game.iso");
+    let mut image = vec![0u8; 24 * SECTOR];
+    let descriptor = &mut image[16 * SECTOR..17 * SECTOR];
+    descriptor[0] = 1;
+    descriptor[1..6].copy_from_slice(b"CD001");
+    let root = &mut descriptor[156..190];
+    root[0] = 34;
+    root[2..6].copy_from_slice(&20u32.to_le_bytes());
+    root[10..14].copy_from_slice(&(SECTOR as u32).to_le_bytes());
+    root[32] = 1;
+
+    let name = b"SYSTEM.CNF;1";
+    let record = &mut image[20 * SECTOR..20 * SECTOR + 46];
+    record[0] = 46;
+    record[2..6].copy_from_slice(&21u32.to_le_bytes());
+    let system_cnf = b"BOOT2 = cdrom0:\\SLPM_000.00;1\r\nVER = 1.00\r\n";
+    record[10..14].copy_from_slice(&(system_cnf.len() as u32).to_le_bytes());
+    record[32] = name.len() as u8;
+    record[33..33 + name.len()].copy_from_slice(name);
+    image[21 * SECTOR..21 * SECTOR + system_cnf.len()].copy_from_slice(system_cnf);
+    std::fs::write(&iso, image).unwrap();
+
+    assert_eq!(
+        read_iso9660_system_cnf(&iso).as_deref(),
+        Some(system_cnf.as_slice())
+    );
+    let inferred = infer_system(iso.to_str(), None);
+    assert_eq!(inferred["system"], "ps2");
+    assert_eq!(inferred["confidence"], "filesystem");
+    assert_eq!(inferred["needs_user_input"], false);
+}
+
+#[test]
+fn normalize_system_accepts_ps2_aliases() {
+    for alias in ["ps2", "pcsx2", "playstation2", "playstation-2"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "ps2", "alias {alias}");
         assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
     }
 }

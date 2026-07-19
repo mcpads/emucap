@@ -1,5 +1,16 @@
 # Changelog
 
+Prerelease software — interfaces may still change.
+
+## 0.10.0-alpha.1
+
+### Added
+- Added a source-built PCSX2 adapter for PlayStation 2 with isolated per-session data, EE memory and registers, bounded frame stepping, disassembly, frozen savestates, screenshots, controller input, pausing execution/read/write breakpoints with hit-time registers, best-effort call stacks, and synchronous reset through a Rust PINE bridge.
+
+### Fixed
+- The PCSX2 build applies and verifies the macOS JIT entitlements required by local Ninja builds, and fresh headless sessions no longer open a locale-font download dialog.
+- Launch discovery no longer reports a missing legacy script as available or emits executable fallback arguments for it.
+
 ## 0.9.0
 
 ### Added

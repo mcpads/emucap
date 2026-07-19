@@ -262,6 +262,125 @@
       ]
     },
     {
+      "id": "pcsx2.execution.instruction-step-absent",
+      "feature": "execution.step",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.INSTR.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {"native_instruction_step": false},
+      "constraints": {
+        "execution.step.units": ["frames"],
+        "execution.step.max_count": 15,
+        "execution.step.execution_states.allowed": ["frozen"]
+      },
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": [
+        "contract-test:pcsx2-step-units",
+        "runtime-test:pcsx2-frame-step-exact"
+      ]
+    },
+    {
+      "id": "pcsx2.state-save.frozen-only",
+      "feature": "state.save",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.save.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:pcsx2-save-running-rejected",
+        "runtime-test:pcsx2-save-frozen-completes"
+      ]
+    },
+    {
+      "id": "pcsx2.state-load.frozen-only",
+      "feature": "state.load",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.load.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:pcsx2-load-running-rejected",
+        "runtime-test:pcsx2-load-frozen-restores-one-snapshot"
+      ]
+    },
+    {
+      "id": "pcsx2.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:pcsx2-set-input-port-rejected"]
+    },
+    {
+      "id": "pcsx2.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.RESPONSE.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {"port": "not_zero_or_frames_out_of_range"},
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.pulse.max_frames": 240
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:pcsx2-press-buttons-port-rejected",
+        "contract-test:pcsx2-press-buttons-frame-cap",
+        "runtime-test:pcsx2-press-buttons-terminal-cleanup"
+      ]
+    },
+    {
+      "id": "pcsx2.breakpoint.pausing-subset",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {
+        "kind": "not_exec_read_write",
+        "exec_range": "not_exact",
+        "pause_on_hit": false,
+        "conditions_or_snapshot": "present"
+      },
+      "constraints": {
+        "breakpoint.kinds.allowed": ["exec", "read", "write"],
+        "breakpoint.exec.range": "exact",
+        "breakpoint.pause_on_hit.allowed": [true],
+        "breakpoint.conditions.supported": false,
+        "breakpoint.snapshot.supported": false,
+        "breakpoint.memory.max_span": 65536
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:pcsx2-breakpoint-subset-rejected-before-mutation",
+        "runtime-test:pcsx2-breakpoint-hit-freezes-with-registers"
+      ]
+    },
+    {
+      "id": "pcsx2.call-stack.frozen-best-effort",
+      "feature": "debug.call-stack",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "pcsx2-rust-pine", "systems": ["ps2"]},
+      "activation": {"method": "call_stack", "execution_state": "not_frozen"},
+      "constraints": {
+        "debug.call-stack.execution_states.allowed": ["frozen"],
+        "debug.call-stack.max_depth": 256
+      },
+      "authority": {"debug.call-stack": "best_effort"},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:pcsx2-call-stack-running-rejected",
+        "runtime-test:pcsx2-call-stack-frozen-best-effort"
+      ]
+    },
+    {
       "id": "pc98.call-stack.best-effort",
       "feature": "debug.call-stack",
       "kind": "variation_binding",

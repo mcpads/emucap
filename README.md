@@ -8,11 +8,12 @@ problem a human described in plain language. A common Core plus per-emulator
 adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy · GBC ·
 GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
-(Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a Dolphin fork
-(GameCube · Wii), and MAME (PC-98).
+(Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
+(PlayStation 2), a Dolphin fork (GameCube · Wii), and MAME (PC-98).
 
-**v0.9.0.** Stable source release. Adapter availability remains host-dependent and is
-reported by `status`.
+**v0.10.0-alpha.1 — alpha.** This repository is under active, continuous development;
+interfaces and behavior may change between prereleases. Adapter availability remains
+host-dependent and is reported by `status`.
 
 Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
@@ -61,7 +62,7 @@ From the repo root:
 cargo build --release \
   --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
   --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge \
-  --bin emucap-ppsspp-bridge
+  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge
 ```
 
 Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
@@ -69,7 +70,8 @@ Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap` (case-bundle CLI), `emucap-broker` (multi-session broker),
 `emucap-mame-pc98-bridge` (PC-98 launch helper),
 `emucap-desmume-nds-bridge` (NDS launch helper), and
-`emucap-ppsspp-bridge` (PSP launch helper). All dependencies come from
+`emucap-ppsspp-bridge` (PSP launch helper), and
+`emucap-pcsx2-bridge` (PS2 launch helper). All dependencies come from
 crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
 required** for a source build. The first build is slower while dependencies
 download; later builds are fast.
@@ -193,6 +195,13 @@ debugger halt to service requests without advancing the guest.
   CMake and a C++ toolchain). No PSP firmware is needed. The adapter is a pure
   WebSocket client against PPSSPP's own debugger protocol, so it's a single
   headless process plus the bridge — no GDB stub. → `adapters/ppsspp/README.md`
+- **PCSX2 (PlayStation 2)** — build the pinned fork with
+  `adapters/pcsx2/build.sh`, then set `EMUCAP_PCSX2_BIOS` to an absolute path to
+  an operator-supplied BIOS dump. The isolated headless path supports EE memory
+  and registers, pattern search and dumps, frame stepping, disassembly, frozen
+  savestates, screenshots, controller input, pausing EE breakpoints with register
+  snapshots, best-effort call stacks, and synchronous reset through a bounded PINE bridge.
+  → `adapters/pcsx2/README.md`
 - **Dolphin (GameCube · Wii)** — build the pinned native fork with
   `adapters/dolphin/build.sh` (Windows: `build.ps1`). The default launch is
   headless; `display: true` uses DolphinQt when the GUI build is available. The
@@ -212,5 +221,5 @@ debugger halt to service requests without advancing the guest.
 Binaries: `emucap` (case bundles: `finalize` / `inspect`), `emucap-mcp` (Control
 MCP — live emulator control, stdio), `emucap-track-mcp` (Tracking MCP —
 experiment ledger, emulator-less, stdio), `emucap-broker` (multi-session
-connection sharing), and the PC-98/NDS/PSP launch bridges listed in the build
+connection sharing), and the PC-98/NDS/PSP/PS2 launch bridges listed in the build
 section.

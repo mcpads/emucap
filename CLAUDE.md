@@ -29,6 +29,7 @@ composes them (they do not call each other).
 - `emucap-mame-pc98-bridge` — PC-98 launch helper used by the Rust MAME launcher.
 - `emucap-desmume-nds-bridge` — NDS launch helper used by the Rust DeSmuME launcher.
 - `emucap-ppsspp-bridge` — PSP launch helper used by the Rust PPSSPP launcher.
+- `emucap-pcsx2-bridge` — PS2 launch helper used by the Rust PCSX2 launcher.
 
 ## MCP operating notes
 
@@ -52,5 +53,5 @@ when the connected adapter advertises that method.
 
 If tool discovery lacks the Control MCP's `bootstrap`/`launch_plan`, or `status` has no
 `runtime_paths` (or the Tracking MCP's `run_start` is missing), the running release is stale. Rebuild
-with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge --bin emucap-ppsspp-bridge`
+with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge`
 and restart both MCPs.

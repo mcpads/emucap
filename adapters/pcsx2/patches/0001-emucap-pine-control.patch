@@ -1,0 +1,1104 @@
+diff --git i/pcsx2/DebugTools/Breakpoints.cpp w/pcsx2/DebugTools/Breakpoints.cpp
+index c6b7a5e62..8bc669fd7 100644
+--- i/pcsx2/DebugTools/Breakpoints.cpp
++++ w/pcsx2/DebugTools/Breakpoints.cpp
+@@ -15,10 +15,44 @@ bool CBreakPoints::pendingClearSkipFirstAtEE_ = false;
+ bool CBreakPoints::pendingClearSkipFirstAtIop_ = false;
+ std::vector<MemCheck> CBreakPoints::memChecks_;
+ std::vector<MemCheck*> CBreakPoints::cleanupMemChecks_;
++std::deque<BreakpointHit> CBreakPoints::breakpointHits_;
++u32 CBreakPoints::droppedBreakpointHits_ = 0;
+ bool CBreakPoints::breakpointTriggered_ = false;
+ BreakPointCpu CBreakPoints::breakpointTriggeredCpu_;
+ bool CBreakPoints::corePaused = false;
+ 
++void CBreakPoints::RecordBreakpointHit(BreakpointHitKind kind, u32 pc, u32 address, u32 size)
++{
++	constexpr size_t MAX_BREAKPOINT_HITS = 256;
++	BreakpointHit hit;
++	hit.kind = kind;
++	hit.pc = pc;
++	hit.address = address;
++	hit.size = size;
++	for (int index = 0; index < 32; index++)
++		hit.registers[index] = r5900Debug.getRegister(EECAT_GPR, index).lo;
++	hit.registers[32] = r5900Debug.getHI().lo;
++	hit.registers[33] = r5900Debug.getLO().lo;
++	if (breakpointHits_.size() == MAX_BREAKPOINT_HITS)
++	{
++		breakpointHits_.pop_front();
++		droppedBreakpointHits_++;
++	}
++	breakpointHits_.push_back(std::move(hit));
++}
++
++BreakpointHitBatch CBreakPoints::TakeBreakpointHits()
++{
++	BreakpointHitBatch batch;
++	batch.hits.assign(
++		std::make_move_iterator(breakpointHits_.begin()),
++		std::make_move_iterator(breakpointHits_.end()));
++	breakpointHits_.clear();
++	batch.dropped = droppedBreakpointHits_;
++	droppedBreakpointHits_ = 0;
++	return batch;
++}
++
+ // called from the dynarec
+ u32 standardizeBreakpointAddress(u32 addr)
+ {
+diff --git i/pcsx2/DebugTools/Breakpoints.h w/pcsx2/DebugTools/Breakpoints.h
+index b65506c88..b84a2624d 100644
+--- i/pcsx2/DebugTools/Breakpoints.h
++++ w/pcsx2/DebugTools/Breakpoints.h
+@@ -4,6 +4,8 @@
+ #pragma once
+ 
+ #include <algorithm>
++#include <array>
++#include <deque>
+ #include <iterator>
+ #include <vector>
+ 
+@@ -68,6 +70,28 @@ enum MemCheckResult
+ 	MEMCHECK_BOTH = 0x03,
+ };
+ 
++enum class BreakpointHitKind : u32
++{
++	Execution = 0,
++	Read = 1,
++	Write = 2,
++};
++
++struct BreakpointHit
++{
++	BreakpointHitKind kind = BreakpointHitKind::Execution;
++	u32 pc = 0;
++	u32 address = 0;
++	u32 size = 0;
++	std::array<u64, 34> registers = {};
++};
++
++struct BreakpointHitBatch
++{
++	std::vector<BreakpointHit> hits;
++	u32 dropped = 0;
++};
++
+ struct MemCheck
+ {
+ 	MemCheck();
+@@ -152,6 +176,9 @@ public:
+ 
+ 	static void Update(BreakPointCpu cpu = BREAKPOINT_IOP_AND_EE, u32 addr = 0);
+ 
++	static void RecordBreakpointHit(BreakpointHitKind kind, u32 pc, u32 address, u32 size);
++	static BreakpointHitBatch TakeBreakpointHits();
++
+ 	static void SetBreakpointTriggered(bool triggered, BreakPointCpu cpu = BreakPointCpu::BREAKPOINT_IOP_AND_EE)
+ 	{
+ 		breakpointTriggered_ = triggered;
+@@ -180,6 +207,8 @@ private:
+ 
+ 	static std::vector<MemCheck> memChecks_;
+ 	static std::vector<MemCheck*> cleanupMemChecks_;
++	static std::deque<BreakpointHit> breakpointHits_;
++	static u32 droppedBreakpointHits_;
+ };
+ 
+ 
+diff --git i/pcsx2/Interpreter.cpp w/pcsx2/Interpreter.cpp
+index f538cf7cf..0cce0c2ce 100644
+--- i/pcsx2/Interpreter.cpp
++++ w/pcsx2/Interpreter.cpp
+@@ -77,6 +77,7 @@ void intBreakpoint(bool memcheck)
+ 		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_EE, pc);
+ 		if (cond && !cond->Evaluate())
+ 			return;
++		CBreakPoints::RecordBreakpointHit(BreakpointHitKind::Execution, pc, pc, 4);
+ 	}
+ 
+ 	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_EE);
+@@ -115,7 +116,13 @@ void intMemcheck(u32 op, u32 bits, bool store)
+ 		}
+ 
+ 		if (start < check.end && check.start < end)
++		{
++			CBreakPoints::RecordBreakpointHit(
++				store ? BreakpointHitKind::Write : BreakpointHitKind::Read,
++				cpuRegs.pc, start, bits / 8);
+ 			intBreakpoint(true);
++			return;
++		}
+ 	}
+ }
+ 
+diff --git i/pcsx2/PINE.cpp w/pcsx2/PINE.cpp
+index f8d251cf8..925cf6297 100644
+--- i/pcsx2/PINE.cpp
++++ w/pcsx2/PINE.cpp
+@@ -3,16 +3,25 @@
+ 
+ #include "BuildVersion.h"
+ #include "Common.h"
++#include "DebugTools/Breakpoints.h"
++#include "DebugTools/DebugInterface.h"
++#include "DebugTools/MipsStackWalk.h"
+ #include "Host.h"
+ #include "Memory.h"
++#include "MTGS.h"
+ #include "Elfheader.h"
++#include "PerformanceMetrics.h"
+ #include "SaveState.h"
++#include "SIO/Pad/Pad.h"
+ #include "PINE.h"
+ #include "VMManager.h"
+ #include "common/Error.h"
++#include "common/Image.h"
++#include "common/Path.h"
+ #include "common/Threading.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <span>
+@@ -68,6 +77,13 @@
+ #endif
+ 
+ #define PINE_EMULATOR_NAME "pcsx2"
++#define EMUCAP_HOST_API 3
++#define EMUCAP_EE_RAM_SIZE 0x02000000
++#define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
++#define EMUCAP_MAX_FRAME_ADVANCE 15
++#define EMUCAP_MAX_INPUT_FRAMES 240
++#define EMUCAP_MAX_STATE_PATH 4096
++#define EMUCAP_MAX_CAPTURE_PATH 4096
+ 
+ #ifdef _WIN32
+ 
+@@ -90,8 +106,16 @@ static bool InitializeWinsock()
+ 
+ namespace PINEServer
+ {
++	struct EmuCapBreakpoint
++	{
++		u32 kind;
++		u32 start;
++		u32 end;
++	};
++
+ 	static std::thread s_thread;
+ 	static int s_slot;
++	static std::vector<EmuCapBreakpoint> s_emucap_breakpoints;
+ 
+ #ifdef _WIN32
+ 	// windows claim to have support for AF_UNIX sockets but that is a blatant lie,
+@@ -159,6 +183,25 @@ namespace PINEServer
+ 		MsgUUID = 0xD, /**< Returns the game UUID. */
+ 		MsgGameVersion = 0xE, /**< Returns the game verion. */
+ 		MsgStatus = 0xF, /**< Returns the emulator status. */
++		MsgEmuCapVersion = 0x80, /**< Returns the emucap host API version. */
++		MsgEmuCapPause = 0x81, /**< Pauses at a CPU-thread boundary. */
++		MsgEmuCapResume = 0x82, /**< Resumes from a CPU-thread boundary. */
++		MsgEmuCapFrameAdvance = 0x83, /**< Advances an exact number of video frames. */
++		MsgEmuCapEEState = 0x84, /**< Returns a stable EE register snapshot. */
++		MsgEmuCapReadBytes = 0x85, /**< Reads an EE RAM byte range on the CPU thread. */
++		MsgEmuCapWriteBytes = 0x86, /**< Writes an EE RAM byte range on the CPU thread. */
++		MsgEmuCapDisassemble = 0x87, /**< Disassembles EE instructions on the CPU thread. */
++		MsgEmuCapSaveState = 0x88, /**< Saves synchronously to an explicit path. */
++		MsgEmuCapLoadState = 0x89, /**< Loads synchronously from an explicit path. */
++		MsgEmuCapSetInput = 0x8A, /**< Replaces or releases the controller-zero input override. */
++		MsgEmuCapInputStatus = 0x8B, /**< Returns the current controller-zero input override. */
++		MsgEmuCapPressButtons = 0x8C, /**< Applies and releases a frame-counted input pulse. */
++		MsgEmuCapScreenshot = 0x8D, /**< Captures the current GS image to an explicit PNG path. */
++		MsgEmuCapSetBreakpoint = 0x8E, /**< Adds one emucap-owned EE breakpoint. */
++		MsgEmuCapClearBreakpoint = 0x8F, /**< Removes one emucap-owned EE breakpoint. */
++		MsgEmuCapPollEvents = 0x90, /**< Drains breakpoint-hit snapshots. */
++		MsgEmuCapCallStack = 0x91, /**< Walks the frozen EE thread stack. */
++		MsgEmuCapReset = 0x92, /**< Resets synchronously and remains paused. */
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -258,6 +301,27 @@ namespace PINEServer
+ 		return !((command_len + command_size) > buf_size ||
+ 				 (reply_len + reply_size) >= MAX_IPC_RETURN_SIZE);
+ 	}
++
++	static void ClearEmuCapState()
++	{
++		if (!VMManager::HasValidVM())
++		{
++			s_emucap_breakpoints.clear();
++			return;
++		}
++		Host::RunOnCPUThread([]() {
++			for (const EmuCapBreakpoint& breakpoint : s_emucap_breakpoints)
++			{
++				if (breakpoint.kind == 0)
++					CBreakPoints::RemoveBreakPoint(BREAKPOINT_EE, breakpoint.start);
++				else
++					CBreakPoints::RemoveMemCheck(BREAKPOINT_EE, breakpoint.start, breakpoint.end + 1);
++			}
++			s_emucap_breakpoints.clear();
++			CBreakPoints::TakeBreakpointHits();
++			Pad::SetEmuCapInput(0, 0);
++		}, true);
++	}
+ } // namespace PINEServer
+ 
+ bool PINEServer::Initialize(int slot)
+@@ -424,6 +488,7 @@ void PINEServer::MainLoop()
+ 		ClientLoop();
+ 
+ 		Console.WriteLn("PINE: Client disconnected.");
++		ClearEmuCapState();
+ 		safe_close_portable(s_msgsock);
+ 	}
+ }
+@@ -748,6 +813,551 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				ret_cnt += 4;
+ 				break;
+ 			}
++			case MsgEmuCapVersion:
++			{
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++				ToResultVector(ret_buffer, static_cast<u32>(EMUCAP_HOST_API), ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
++			case MsgEmuCapPause:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				Host::RunOnCPUThread([]() { VMManager::SetPaused(true); }, true);
++				if (VMManager::GetState() != VMState::Paused)
++					goto error;
++				break;
++			}
++			case MsgEmuCapResume:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				Host::RunOnCPUThread([]() { VMManager::SetPaused(false); }, true);
++				if (VMManager::GetState() != VMState::Running)
++					goto error;
++				break;
++			}
++			case MsgEmuCapFrameAdvance:
++			{
++				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Paused)
++					goto error;
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 count = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				if (count == 0 || count > EMUCAP_MAX_FRAME_ADVANCE)
++					goto error;
++
++				Host::RunOnCPUThread([count]() { VMManager::FrameAdvance(count); }, true);
++				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++				while (VMManager::GetState() == VMState::Running && std::chrono::steady_clock::now() < deadline)
++					std::this_thread::sleep_for(std::chrono::milliseconds(1));
++				if (VMManager::GetState() != VMState::Paused)
++				{
++					if (VMManager::HasValidVM())
++						Host::RunOnCPUThread([]() { VMManager::SetPaused(true); }, true);
++					goto error;
++				}
++				break;
++			}
++			case MsgEmuCapEEState:
++			{
++				constexpr u32 reply_size = 4 + (32 * 8) + 8 + 8;
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, reply_size, buf_size)) [[unlikely]]
++					goto error;
++
++				Host::RunOnCPUThread([&ret_buffer, &ret_cnt]() {
++					ToResultVector(ret_buffer, r5900Debug.getPC(), ret_cnt);
++					ret_cnt += 4;
++					for (int index = 0; index < 32; index++)
++					{
++						ToResultVector(ret_buffer, r5900Debug.getRegister(EECAT_GPR, index).lo, ret_cnt);
++						ret_cnt += 8;
++					}
++					ToResultVector(ret_buffer, r5900Debug.getHI().lo, ret_cnt);
++					ret_cnt += 8;
++					ToResultVector(ret_buffer, r5900Debug.getLO().lo, ret_cnt);
++					ret_cnt += 8;
++				}, true);
++				break;
++			}
++			case MsgEmuCapReadBytes:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 address = FromSpan<u32>(buf, buf_cnt);
++				const u32 length = FromSpan<u32>(buf, buf_cnt + 4);
++				buf_cnt += 8;
++				const u64 end = static_cast<u64>(address) + length;
++				if (length > EMUCAP_MAX_MEMORY_TRANSFER || end > EMUCAP_EE_RAM_SIZE)
++					goto error;
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, length, buf_size)) [[unlikely]]
++					goto error;
++
++				bool success = false;
++				Host::RunOnCPUThread([&ret_buffer, ret_cnt, address, length, &success]() {
++					if (!eeMem)
++						return;
++					std::memcpy(&ret_buffer[ret_cnt], &eeMem->Main[address], length);
++					success = true;
++				}, true);
++				if (!success)
++					goto error;
++				ret_cnt += length;
++				break;
++			}
++			case MsgEmuCapWriteBytes:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++				const u32 address = FromSpan<u32>(buf, buf_cnt);
++				const u32 length = FromSpan<u32>(buf, buf_cnt + 4);
++				buf_cnt += 8;
++				const u64 end = static_cast<u64>(address) + length;
++				if (length > EMUCAP_MAX_MEMORY_TRANSFER || end > EMUCAP_EE_RAM_SIZE)
++					goto error;
++				if (!SafetyChecks(buf_cnt, length, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++
++				bool success = false;
++				Host::RunOnCPUThread([&buf, buf_cnt, address, length, &success]() {
++					if (!eeMem)
++						return;
++					std::memcpy(&eeMem->Main[address], &buf[buf_cnt], length);
++					VMManager::Internal::ClearCPUExecutionCaches();
++					success = true;
++				}, true);
++				if (!success)
++					goto error;
++				buf_cnt += length;
++				ToResultVector(ret_buffer, length, ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
++			case MsgEmuCapDisassemble:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++				const u32 address = FromSpan<u32>(buf, buf_cnt);
++				const u32 count = FromSpan<u32>(buf, buf_cnt + 4);
++				buf_cnt += 8;
++				if ((address & 3) != 0 || count == 0 || count > 256)
++					goto error;
++
++				struct DisassemblyRow
++				{
++					u32 address;
++					u32 encoding;
++					std::string text;
++				};
++				std::vector<DisassemblyRow> rows;
++				rows.reserve(count);
++				Host::RunOnCPUThread([address, count, &rows]() {
++					u32 current = address;
++					for (u32 index = 0; index < count; index++)
++					{
++						bool valid = false;
++						const u32 encoding = r5900Debug.read32(current, valid);
++						if (!valid)
++							break;
++						rows.push_back({current, encoding, r5900Debug.disasm(current, true)});
++						if (current > UINT32_MAX - 4)
++							break;
++						current += 4;
++					}
++				}, true);
++
++				ToResultVector(ret_buffer, static_cast<u32>(rows.size()), ret_cnt);
++				ret_cnt += 4;
++				for (const DisassemblyRow& row : rows)
++				{
++					if (row.text.size() > 4096 ||
++						ret_cnt + 12 + row.text.size() >= MAX_IPC_RETURN_SIZE)
++						goto error;
++					ToResultVector(ret_buffer, row.address, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, row.encoding, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, static_cast<u32>(row.text.size()), ret_cnt);
++					ret_cnt += 4;
++					memcpy(&ret_buffer[ret_cnt], row.text.data(), row.text.size());
++					ret_cnt += static_cast<u32>(row.text.size());
++				}
++				break;
++			}
++			case MsgEmuCapSaveState:
++			case MsgEmuCapLoadState:
++			{
++				const bool save = static_cast<IPCCommand>(buf[buf_cnt - 1]) == MsgEmuCapSaveState;
++				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Paused)
++					goto error;
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 length = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				if (length == 0 || length > EMUCAP_MAX_STATE_PATH ||
++					!SafetyChecks(buf_cnt, length, ret_cnt, 0, buf_size))
++					goto error;
++				const std::string path(reinterpret_cast<const char*>(&buf[buf_cnt]), length);
++				buf_cnt += length;
++				if (path.find('\0') != std::string::npos)
++					goto error;
++
++				bool success = false;
++				if (save)
++				{
++					std::string state_error;
++					Host::RunOnCPUThread([&path, &state_error]() {
++						VMManager::SaveState(path.c_str(), false, false,
++							[&state_error](const std::string& error) { state_error = error; });
++					}, true);
++					success = state_error.empty();
++				}
++				else
++				{
++					Error state_error;
++					Host::RunOnCPUThread([&path, &state_error, &success]() {
++						success = VMManager::LoadState(path.c_str(), &state_error);
++						if (success)
++							VMManager::SetPaused(true);
++					}, true);
++				}
++				if (!success || VMManager::GetState() != VMState::Paused)
++					goto error;
++				break;
++			}
++			case MsgEmuCapSetInput:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 mask = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				if ((mask & 0xFFFF0000u) != 0)
++					goto error;
++				Host::RunOnCPUThread([mask]() { Pad::SetEmuCapInput(mask, 0); }, true);
++				break;
++			}
++			case MsgEmuCapInputStatus:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16, buf_size)) [[unlikely]]
++					goto error;
++				Pad::EmuCapInputStatus status = {};
++				Host::RunOnCPUThread([&status]() { status = Pad::GetEmuCapInputStatus(); }, true);
++				ToResultVector(ret_buffer, static_cast<u32>(status.engaged), ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, status.mask, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, status.remaining_frames, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, status.total_frames, ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
++			case MsgEmuCapPressButtons:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 12, buf_size)) [[unlikely]]
++					goto error;
++				const u32 mask = FromSpan<u32>(buf, buf_cnt);
++				const u32 frames = FromSpan<u32>(buf, buf_cnt + 4);
++				buf_cnt += 8;
++				if (mask == 0 || (mask & 0xFFFF0000u) != 0 ||
++					frames == 0 || frames > EMUCAP_MAX_INPUT_FRAMES)
++					goto error;
++
++				const bool was_paused = (VMManager::GetState() == VMState::Paused);
++				Host::RunOnCPUThread([mask, frames, was_paused]() {
++					Pad::SetEmuCapInput(mask, frames);
++					if (was_paused)
++						VMManager::FrameAdvance(frames);
++				}, true);
++
++				u32 terminal = 0;
++				u32 elapsed = 0;
++				VMState final_state = VMManager::GetState();
++				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++				for (;;)
++				{
++					Pad::EmuCapInputStatus status = {};
++					Host::RunOnCPUThread([&status]() { status = Pad::GetEmuCapInputStatus(); }, true);
++					final_state = VMManager::GetState();
++					elapsed = status.total_frames - status.remaining_frames;
++					if (!status.engaged)
++					{
++						elapsed = frames;
++						break;
++					}
++					if (final_state != VMState::Running)
++					{
++						terminal = 1;
++						Host::RunOnCPUThread([]() { Pad::SetEmuCapInput(0, 0); }, true);
++						break;
++					}
++					if (std::chrono::steady_clock::now() >= deadline)
++					{
++						Host::RunOnCPUThread([]() { Pad::SetEmuCapInput(0, 0); }, true);
++						if (was_paused && VMManager::GetState() == VMState::Running)
++							Host::RunOnCPUThread([]() { VMManager::SetPaused(true); }, true);
++						goto error;
++					}
++					std::this_thread::sleep_for(std::chrono::milliseconds(1));
++				}
++
++				final_state = VMManager::GetState();
++				ToResultVector(ret_buffer, terminal, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, elapsed, ret_cnt);
++				ret_cnt += 4;
++				const u32 final_status = (final_state == VMState::Running) ? 0 :
++					(final_state == VMState::Paused) ? 1 : 2;
++				ToResultVector(ret_buffer, final_status, ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
++			case MsgEmuCapScreenshot:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 24, buf_size)) [[unlikely]]
++					goto error;
++				const u32 length = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				if (length == 0 || length > EMUCAP_MAX_CAPTURE_PATH ||
++					!SafetyChecks(buf_cnt, length, ret_cnt, 24, buf_size))
++					goto error;
++				const std::string path(reinterpret_cast<const char*>(&buf[buf_cnt]), length);
++				buf_cnt += length;
++				if (path.find('\0') != std::string::npos || !Path::IsAbsolute(path) ||
++					Path::GetExtension(path) != "png")
++					goto error;
++
++				bool success = false;
++				u32 width = 0;
++				u32 height = 0;
++				u64 frame_before = 0;
++				u64 frame_after = 0;
++				std::vector<u32> pixels;
++				const bool was_running = (VMManager::GetState() == VMState::Running);
++				if (was_running)
++					Host::RunOnCPUThread([]() { VMManager::SetPaused(true); }, true);
++				if (VMManager::GetState() != VMState::Paused)
++					goto error;
++				Host::RunOnCPUThread([&success, &width, &height, &pixels, &frame_before, &frame_after]() {
++					frame_before = PerformanceMetrics::GetFrameNumber();
++					success = MTGS::SaveMemorySnapshot(0, 0, true, false, &width, &height, &pixels);
++					frame_after = PerformanceMetrics::GetFrameNumber();
++				}, true);
++				if (was_running)
++					Host::RunOnCPUThread([]() { VMManager::SetPaused(false); }, true);
++				if (!success || width == 0 || height == 0 || frame_before != frame_after ||
++					(was_running && VMManager::GetState() != VMState::Running) ||
++					!RGBA8Image(width, height, std::move(pixels)).SaveToFile(path.c_str()))
++					goto error;
++
++				ToResultVector(ret_buffer, width, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, height, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, frame_before, ret_cnt);
++				ret_cnt += 8;
++				ToResultVector(ret_buffer, frame_after, ret_cnt);
++				ret_cnt += 8;
++				break;
++			}
++			case MsgEmuCapSetBreakpoint:
++			{
++				if (!VMManager::HasValidVM() || !SafetyChecks(buf_cnt, 12, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 kind = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				const u32 start = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				const u32 end = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				if (kind > 2 || end < start)
++					goto error;
++				if (kind != 0 && (end >= EMUCAP_EE_RAM_SIZE || (end - start + 1) > 0x10000))
++					goto error;
++
++				bool armed = false;
++				Host::RunOnCPUThread([kind, start, end, &armed]() {
++					const auto duplicate = std::find_if(
++						s_emucap_breakpoints.begin(), s_emucap_breakpoints.end(),
++						[kind, start, end](const EmuCapBreakpoint& breakpoint) {
++							return breakpoint.kind == kind && breakpoint.start == start && breakpoint.end == end;
++						});
++					if (duplicate != s_emucap_breakpoints.end())
++						return;
++					if (kind == 0)
++					{
++						bool enabled = false;
++						if (CBreakPoints::IsAddressBreakPoint(BREAKPOINT_EE, start, &enabled))
++							return;
++						CBreakPoints::AddBreakPoint(BREAKPOINT_EE, start);
++					}
++					else
++					{
++						const auto existing = CBreakPoints::GetMemChecks(BREAKPOINT_EE);
++						const u32 exclusive_end = end + 1;
++						if (std::any_of(existing.begin(), existing.end(), [start, exclusive_end](const MemCheck& check) {
++								return standardizeBreakpointAddress(check.start) == standardizeBreakpointAddress(start) &&
++									standardizeBreakpointAddress(check.end) == standardizeBreakpointAddress(exclusive_end);
++							}))
++							return;
++						CBreakPoints::AddMemCheck(
++							BREAKPOINT_EE, start, exclusive_end,
++							kind == 1 ? MEMCHECK_READ : MEMCHECK_WRITE, MEMCHECK_BREAK);
++					}
++					s_emucap_breakpoints.push_back({kind, start, end});
++					armed = true;
++				}, true);
++				if (!armed)
++					goto error;
++				break;
++			}
++			case MsgEmuCapClearBreakpoint:
++			{
++				if (!VMManager::HasValidVM() || !SafetyChecks(buf_cnt, 12, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 kind = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				const u32 start = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				const u32 end = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				bool cleared = false;
++				Host::RunOnCPUThread([kind, start, end, &cleared]() {
++					const auto owned = std::find_if(
++						s_emucap_breakpoints.begin(), s_emucap_breakpoints.end(),
++						[kind, start, end](const EmuCapBreakpoint& breakpoint) {
++							return breakpoint.kind == kind && breakpoint.start == start && breakpoint.end == end;
++						});
++					if (owned == s_emucap_breakpoints.end())
++						return;
++					if (kind == 0)
++						CBreakPoints::RemoveBreakPoint(BREAKPOINT_EE, start);
++					else
++						CBreakPoints::RemoveMemCheck(BREAKPOINT_EE, start, end + 1);
++					s_emucap_breakpoints.erase(owned);
++					cleared = true;
++				}, true);
++				if (!cleared)
++					goto error;
++				break;
++			}
++			case MsgEmuCapPollEvents:
++			{
++				if (!VMManager::HasValidVM() || !SafetyChecks(buf_cnt, 0, ret_cnt, 8, buf_size)) [[unlikely]]
++					goto error;
++				BreakpointHitBatch batch;
++				Host::RunOnCPUThread([&batch]() { batch = CBreakPoints::TakeBreakpointHits(); }, true);
++				constexpr u32 hit_size = 16 + (34 * 8);
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 8 + (batch.hits.size() * hit_size), buf_size)) [[unlikely]]
++					goto error;
++				ToResultVector(ret_buffer, static_cast<u32>(batch.hits.size()), ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, batch.dropped, ret_cnt);
++				ret_cnt += 4;
++				for (const BreakpointHit& hit : batch.hits)
++				{
++					ToResultVector(ret_buffer, static_cast<u32>(hit.kind), ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, hit.pc, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, hit.address, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, hit.size, ret_cnt);
++					ret_cnt += 4;
++					for (u64 value : hit.registers)
++					{
++						ToResultVector(ret_buffer, value, ret_cnt);
++						ret_cnt += 8;
++					}
++				}
++				break;
++			}
++			case MsgEmuCapCallStack:
++			{
++				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Paused ||
++					!SafetyChecks(buf_cnt, 0, ret_cnt, 8, buf_size)) [[unlikely]]
++					goto error;
++				std::vector<MipsStackWalk::StackFrame> frames;
++				bool valid = false;
++				Host::RunOnCPUThread([&frames, &valid]() {
++					for (const auto& thread : r5900Debug.GetThreadList())
++					{
++						if (thread->Status() != ThreadStatus::THS_RUN)
++							continue;
++						frames = MipsStackWalk::Walk(
++							&r5900Debug, r5900Debug.getPC(),
++							r5900Debug.getRegister(EECAT_GPR, 31).lo,
++							r5900Debug.getRegister(EECAT_GPR, 29).lo,
++							thread->EntryPoint(), thread->StackTop());
++						valid = true;
++						break;
++					}
++				}, true);
++				constexpr size_t MAX_STACK_DEPTH = 256;
++				if (frames.size() > MAX_STACK_DEPTH)
++				{
++					frames.resize(MAX_STACK_DEPTH);
++					valid = false;
++				}
++				std::reverse(frames.begin(), frames.end());
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 8 + (frames.size() * 16), buf_size)) [[unlikely]]
++					goto error;
++				ToResultVector(ret_buffer, static_cast<u32>(valid), ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, static_cast<u32>(frames.size()), ret_cnt);
++				ret_cnt += 4;
++				for (const MipsStackWalk::StackFrame& frame : frames)
++				{
++					ToResultVector(ret_buffer, frame.pc, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, frame.entry, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, frame.sp, ret_cnt);
++					ret_cnt += 4;
++					ToResultVector(ret_buffer, static_cast<s32>(frame.stackSize), ret_cnt);
++					ret_cnt += 4;
++				}
++				break;
++			}
++			case MsgEmuCapReset:
++			{
++				if (!VMManager::HasValidVM() || !SafetyChecks(buf_cnt, 0, ret_cnt, 4, buf_size)) [[unlikely]]
++					goto error;
++				Host::RunOnCPUThread([]() { VMManager::SetPaused(true); }, true);
++				u32 post_reset_pc = 0;
++				Host::RunOnCPUThread([&post_reset_pc]() {
++					Pad::SetEmuCapInput(0, 0);
++					CBreakPoints::TakeBreakpointHits();
++					CBreakPoints::SetBreakpointTriggered(false, BREAKPOINT_IOP_AND_EE);
++					CBreakPoints::ClearSkipFirst(BREAKPOINT_IOP_AND_EE);
++					VMManager::Reset(true);
++					post_reset_pc = r5900Debug.getPC();
++				}, true);
++				if (VMManager::GetState() != VMState::Paused)
++					goto error;
++				ToResultVector(ret_buffer, post_reset_pc, ret_cnt);
++				ret_cnt += 4;
++				break;
++			}
+ 			default:
+ 			{
+ 			error:
+diff --git i/pcsx2/Pcsx2Config.cpp w/pcsx2/Pcsx2Config.cpp
+index 51ec1f788..9e60e8149 100644
+--- i/pcsx2/Pcsx2Config.cpp
++++ w/pcsx2/Pcsx2Config.cpp
+@@ -18,6 +18,7 @@
+ #include "USB/USB.h"
+ 
+ #include "fmt/format.h"
++#include <cstdlib>
+ #ifdef _WIN32
+ #include "common/RedtapeWindows.h"
+ #include <KnownFolders.h>
+@@ -2183,7 +2184,14 @@ std::string EmuFolders::GetPortableModePath()
+ 
+ bool EmuFolders::SetDataDirectory(Error* error)
+ {
+-	if (!ShouldUsePortableMode())
++	// emucap launches each PCSX2 process with a private data root. This keeps settings, memory
++	// cards, logs, and caches out of both the user's profile and other concurrent sessions.
++	const char* emucap_data_root = std::getenv("EMUCAP_PCSX2_DATAROOT");
++	if (emucap_data_root && Path::IsAbsolute(emucap_data_root))
++	{
++		DataRoot = Path::RealPath(emucap_data_root);
++	}
++	else if (!ShouldUsePortableMode())
+ 	{
+ #if defined(_WIN32)
+ 		// On Windows, use My Documents\PCSX2 to match old installs.
+diff --git i/pcsx2/SIO/Pad/Pad.cpp w/pcsx2/SIO/Pad/Pad.cpp
+index 92eea97ee..4cdd6bb31 100644
+--- i/pcsx2/SIO/Pad/Pad.cpp
++++ w/pcsx2/SIO/Pad/Pad.cpp
+@@ -26,6 +26,7 @@
+ 
+ #include "fmt/format.h"
+ 
++#include <array>
+ #include <vector>
+ 
+ //Map of actively pressed keys so that chords work
+@@ -55,6 +56,13 @@ namespace Pad
+ 
+ 	static std::array<std::array<MacroButton, NUM_MACRO_BUTTONS_PER_CONTROLLER>, NUM_CONTROLLER_PORTS> s_macro_buttons;
+ 	static std::array<std::unique_ptr<PadBase>, NUM_CONTROLLER_PORTS> s_controllers;
++	static constexpr u32 EMUCAP_BUTTON_COUNT = 16;
++	static constexpr u32 EMUCAP_BUTTON_MASK = (1u << EMUCAP_BUTTON_COUNT) - 1;
++	static std::array<float, EMUCAP_BUTTON_COUNT> s_emucap_native_input;
++	static u32 s_emucap_input_mask;
++	static u32 s_emucap_input_remaining;
++	static u32 s_emucap_input_total;
++	static bool s_emucap_input_engaged;
+ 
+ 	bool mtapPort0LastState;
+ 	bool mtapPort1LastState;
+@@ -62,11 +70,21 @@ namespace Pad
+ 
+ bool Pad::Initialize()
+ {
++	s_emucap_native_input = {};
++	s_emucap_input_mask = 0;
++	s_emucap_input_remaining = 0;
++	s_emucap_input_total = 0;
++	s_emucap_input_engaged = false;
+ 	return true;
+ }
+ 
+ void Pad::Shutdown()
+ {
++	s_emucap_native_input = {};
++	s_emucap_input_mask = 0;
++	s_emucap_input_remaining = 0;
++	s_emucap_input_total = 0;
++	s_emucap_input_engaged = false;
+ 	for (auto& port : s_controllers)
+ 		port.reset();
+ }
+@@ -547,9 +565,51 @@ void Pad::SetControllerState(u32 controller, u32 bind, float value)
+ 	if (controller >= NUM_CONTROLLER_PORTS)
+ 		return;
+ 
++	if (controller == 0 && bind < EMUCAP_BUTTON_COUNT)
++	{
++		s_emucap_native_input[bind] = value;
++		if (s_emucap_input_engaged)
++			return;
++	}
+ 	s_controllers[controller]->Set(bind, value);
+ }
+ 
++void Pad::SetEmuCapInput(u32 mask, u32 frames)
++{
++	PadBase* const pad = Pad::GetPad(0);
++	if (!pad)
++		return;
++
++	mask &= EMUCAP_BUTTON_MASK;
++	if (mask == 0)
++	{
++		s_emucap_input_engaged = false;
++		s_emucap_input_mask = 0;
++		s_emucap_input_remaining = 0;
++		s_emucap_input_total = 0;
++		for (u32 bind = 0; bind < EMUCAP_BUTTON_COUNT; bind++)
++			pad->Set(bind, s_emucap_native_input[bind]);
++		return;
++	}
++
++	s_emucap_input_engaged = true;
++	s_emucap_input_mask = mask;
++	s_emucap_input_remaining = frames;
++	s_emucap_input_total = frames;
++	for (u32 bind = 0; bind < EMUCAP_BUTTON_COUNT; bind++)
++		pad->Set(bind, (mask & (1u << bind)) ? 1.0f : 0.0f);
++}
++
++Pad::EmuCapInputStatus Pad::GetEmuCapInputStatus()
++{
++	return {
++		s_emucap_input_engaged,
++		s_emucap_input_mask,
++		s_emucap_input_remaining,
++		s_emucap_input_total,
++	};
++}
++
+ bool Pad::Freeze(StateWrapper& sw)
+ {
+ 	if (sw.IsReading())
+@@ -729,10 +789,9 @@ void Pad::SetMacroButtonState(InputBindingKey& key, u32 pad, u32 index, bool sta
+ void Pad::ApplyMacroButton(u32 controller, const Pad::MacroButton& mb)
+ {
+ 	const float value = mb.toggle_state ? mb.pressure : 0.0f;
+-	PadBase* const pad = Pad::GetPad(controller);
+ 
+ 	for (const u32 btn : mb.buttons)
+-		pad->Set(btn, value);
++		Pad::SetControllerState(controller, btn, value);
+ }
+ 
+ void Pad::UpdateMacroButtons()
+@@ -760,4 +819,23 @@ void Pad::UpdateMacroButtons()
+ 			ApplyMacroButton(pad, mb);
+ 		}
+ 	}
++
++	if (!s_emucap_input_engaged)
++		return;
++
++	PadBase* const pad = Pad::GetPad(0);
++	if (!pad)
++	{
++		s_emucap_input_engaged = false;
++		s_emucap_input_mask = 0;
++		s_emucap_input_remaining = 0;
++		s_emucap_input_total = 0;
++		return;
++	}
++
++	for (u32 bind = 0; bind < EMUCAP_BUTTON_COUNT; bind++)
++		pad->Set(bind, (s_emucap_input_mask & (1u << bind)) ? 1.0f : 0.0f);
++
++	if (s_emucap_input_remaining > 0 && --s_emucap_input_remaining == 0)
++		Pad::SetEmuCapInput(0, 0);
+ }
+diff --git i/pcsx2/SIO/Pad/Pad.h w/pcsx2/SIO/Pad/Pad.h
+index 97114274c..d6ba73645 100644
+--- i/pcsx2/SIO/Pad/Pad.h
++++ w/pcsx2/SIO/Pad/Pad.h
+@@ -66,6 +66,19 @@ namespace Pad
+ 	// Sets the specified bind on a controller to the specified pressure (normalized to 0..1).
+ 	void SetControllerState(u32 controller, u32 bind, float value);
+ 
++	struct EmuCapInputStatus
++	{
++		bool engaged;
++		u32 mask;
++		u32 remaining_frames;
++		u32 total_frames;
++	};
++
++	// Replaces the first controller's digital buttons without discarding the latest native state.
++	// A zero mask releases the override. Nonzero `frames` makes it release after that many VSyncs.
++	void SetEmuCapInput(u32 mask, u32 frames);
++	EmuCapInputStatus GetEmuCapInputStatus();
++
+ 	bool Freeze(StateWrapper& sw);
+ 
+ 	// Sets the state of the specified macro button.
+diff --git i/pcsx2/VMManager.cpp w/pcsx2/VMManager.cpp
+index 3e13593a4..b3d5826b0 100644
+--- i/pcsx2/VMManager.cpp
++++ w/pcsx2/VMManager.cpp
+@@ -1698,7 +1698,7 @@ void VMManager::Shutdown(bool save_resume_state)
+ 	LoadSettings();
+ }
+ 
+-void VMManager::Reset()
++void VMManager::Reset(bool force)
+ {
+ 	pxAssert(HasValidVM());
+ 
+@@ -1713,7 +1713,7 @@ void VMManager::Reset()
+ 		return;
+ 	}
+ 
+-	if (!Achievements::ConfirmSystemReset())
++	if (!force && !Achievements::ConfirmSystemReset())
+ 		return;
+ 
+ 	// Re-enforce hardcode mode constraints if we're now enabling it.
+diff --git i/pcsx2/VMManager.h w/pcsx2/VMManager.h
+index 8df625386..5a3c57ed6 100644
+--- i/pcsx2/VMManager.h
++++ w/pcsx2/VMManager.h
+@@ -121,8 +121,8 @@ namespace VMManager
+ 	/// Destroys all system components.
+ 	void Shutdown(bool save_resume_state);
+ 
+-	/// Resets all subsystems to a cold boot.
+-	void Reset();
++	/// Resets all subsystems to a cold boot. Force bypasses the interactive achievements confirmation.
++	void Reset(bool force = false);
+ 
+ 	/// Runs the VM until the CPU execution is canceled.
+ 	void Execute();
+diff --git i/pcsx2/x86/ix86-32/iR5900.cpp w/pcsx2/x86/ix86-32/iR5900.cpp
+index 06f957fdd..26f9abafa 100644
+--- i/pcsx2/x86/ix86-32/iR5900.cpp
++++ w/pcsx2/x86/ix86-32/iR5900.cpp
+@@ -1505,6 +1505,7 @@ void dynarecCheckBreakpoint()
+ 
+ 	const int bpFlags = isBreakpointNeeded(pc);
+ 	bool hit = false;
++	u32 hit_pc = pc;
+ 	//check breakpoint at current pc
+ 	if (bpFlags & 1)
+ 	{
+@@ -1515,16 +1516,20 @@ void dynarecCheckBreakpoint()
+ 		}
+ 	}
+ 	//check breakpoint in delay slot
+-	if (bpFlags & 2)
++	if (!hit && (bpFlags & 2))
+ 	{
+ 		auto cond = CBreakPoints::GetBreakPointCondition(BREAKPOINT_EE, pc + 4);
+ 		if (cond == NULL || cond->Evaluate())
++		{
+ 			hit = true;
++			hit_pc = pc + 4;
++		}
+ 	}
+ 
+ 	if (!hit)
+ 		return;
+ 
++	CBreakPoints::RecordBreakpointHit(BreakpointHitKind::Execution, hit_pc, hit_pc, 4);
+ 	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_EE);
+ 	VMManager::SetPaused(true);
+ 	recExitExecution();
+@@ -1556,6 +1561,33 @@ void dynarecMemcheck(size_t i)
+ 			DevCon.WriteLn("Hit load breakpoint @0x%x", cpuRegs.pc);
+ 	}
+ 
++	u32 address = cpuRegs.GPR.r[(op >> 21) & 0x1F].UL[0] + static_cast<s16>(op);
++	u32 size = 0;
++	switch (opcode.flags & MEMTYPE_MASK)
++	{
++		case MEMTYPE_BYTE:
++			size = 1;
++			break;
++		case MEMTYPE_HALF:
++			size = 2;
++			break;
++		case MEMTYPE_WORD:
++			size = 4;
++			break;
++		case MEMTYPE_DWORD:
++			size = 8;
++			break;
++		case MEMTYPE_QWORD:
++			size = 16;
++			address &= ~0x0F;
++			break;
++		default:
++			break;
++	}
++	address = standardizeBreakpointAddress(address);
++	CBreakPoints::RecordBreakpointHit(
++		(opcode.flags & IS_STORE) ? BreakpointHitKind::Write : BreakpointHitKind::Read,
++		cpuRegs.pc, address, size);
+ 	CBreakPoints::SetBreakpointTriggered(true, BREAKPOINT_EE);
+ 	VMManager::SetPaused(true);
+ 	recExitExecution();

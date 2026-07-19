@@ -360,6 +360,25 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
             .and_then(|v| v.as_str()),
         Some("launch(content_path, system?, name?)")
     );
+    assert!(paths.pointer("/adapters/pcsx2/launch").is_none());
+    assert_eq!(
+        paths.pointer("/command_templates/legacy_pcsx2"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(
+        paths
+            .pointer("/legacy_fallbacks/pcsx2/available_on_this_host")
+            .and_then(|v| v.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        paths.pointer("/legacy_fallbacks/pcsx2/launcher"),
+        Some(&serde_json::Value::Null)
+    );
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems.iter().find(|system| system["system"] == "ps2"))
+        .is_some_and(|system| system.get("legacy_launcher").is_none()));
     assert!(
         supported_systems_value()
             .as_array()

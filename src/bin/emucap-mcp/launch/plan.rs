@@ -1,3 +1,4 @@
+use super::media::{content_markers, ext_lower};
 use super::*;
 
 pub(super) fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
@@ -8,6 +9,7 @@ pub(super) fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
         "flycast" => "adapters/flycast",
         "desmume_nds" => "adapters/desmume-nds",
         "ppsspp" => "adapters/ppsspp",
+        "pcsx2" => "adapters/pcsx2",
         "dolphin" => {
             return root.join("adapters/dolphin/launch-native.ps1");
         }
@@ -41,11 +43,12 @@ pub(super) fn path_matches_candidates(path: &Path, candidates: Vec<PathBuf>) -> 
 
 pub(super) fn native_legacy_script(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str());
-    if cfg!(windows) {
-        ext.is_some_and(|e| e.eq_ignore_ascii_case("ps1"))
-    } else {
-        ext == Some("sh")
-    }
+    path.is_file()
+        && if cfg!(windows) {
+            ext.is_some_and(|e| e.eq_ignore_ascii_case("ps1"))
+        } else {
+            ext == Some("sh")
+        }
 }
 
 pub(super) fn legacy_command(argv: &[String]) -> String {
@@ -65,7 +68,11 @@ pub(super) fn legacy_fallback_details(launcher: &Path, argv: &[String]) -> serde
     let available = native_legacy_script(launcher);
     serde_json::json!({
         "available_on_this_host": available,
-        "launcher": launcher.display().to_string(),
+        "launcher": if available {
+            serde_json::json!(launcher.display().to_string())
+        } else {
+            serde_json::Value::Null
+        },
         "argv": if available {
             serde_json::json!(argv)
         } else {
@@ -349,6 +356,73 @@ pub(super) fn ppsspp_binary_precondition(root: &Path) -> serde_json::Value {
     }
 }
 
+pub(super) fn pcsx2_binary_precondition_from(
+    root: &Path,
+    resolved: Option<PathBuf>,
+    bridge: Option<PathBuf>,
+    bios: std::io::Result<PathBuf>,
+) -> serde_json::Value {
+    let Some(path) = resolved else {
+        return serde_json::json!({
+            "available": false,
+            "source": null,
+            "kind": "binary-not-found",
+            "bridge_available": bridge.is_some(),
+            "bios_available": bios.is_ok(),
+        });
+    };
+    let source = if env_path_matches("EMUCAP_PCSX2_BIN", &path) {
+        "EMUCAP_PCSX2_BIN"
+    } else if path_matches_candidates(&path, pcsx2_launch::local_build_candidates(root)) {
+        "repo_build"
+    } else {
+        "PATH"
+    };
+    match pcsx2_launch::require_compatible_build(root, &path) {
+        Ok(build) if bridge.is_some() && bios.is_ok() => serde_json::json!({
+            "available": true,
+            "path": path.display().to_string(),
+            "source": source,
+            "bridge": bridge.map(|path| path.display().to_string()),
+            "bridge_available": true,
+            "bios": bios.ok().map(|path| path.display().to_string()),
+            "bios_available": true,
+            "host_api": build.host_api,
+            "upstream_commit": build.commit,
+            "patchset_sha256": build.patchset_sha256,
+        }),
+        Ok(build) => serde_json::json!({
+            "available": false,
+            "path": path.display().to_string(),
+            "source": source,
+            "kind": if bridge.is_none() { "bridge-not-found" } else { "bios-not-configured" },
+            "bridge_available": bridge.is_some(),
+            "bios_available": bios.is_ok(),
+            "host_api": build.host_api,
+            "upstream_commit": build.commit,
+            "patchset_sha256": build.patchset_sha256,
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "path": path.display().to_string(),
+            "source": source,
+            "kind": "pcsx2-patch-required",
+            "bridge_available": bridge.is_some(),
+            "bios_available": bios.is_ok(),
+            "error": error.to_string(),
+        }),
+    }
+}
+
+pub(super) fn pcsx2_binary_precondition(root: &Path) -> serde_json::Value {
+    pcsx2_binary_precondition_from(
+        root,
+        pcsx2_launch::resolve_binary(root),
+        pcsx2_launch::resolve_bridge(root),
+        pcsx2_launch::resolve_bios(),
+    )
+}
+
 pub(super) fn mame_bridge_precondition(root: &Path) -> serde_json::Value {
     match mame_launch::resolve_bridge_runtime(root) {
         Ok(runtime) => serde_json::json!({
@@ -377,6 +451,7 @@ pub(super) fn adapter_binary_precondition_for(
         "mame_pc98" => mame_binary_precondition(root),
         "desmume_nds" => desmume_nds_binary_precondition(root),
         "ppsspp" => ppsspp_binary_precondition(root),
+        "pcsx2" => pcsx2_binary_precondition(root),
         _ => serde_json::Value::Null,
     }
 }
@@ -429,6 +504,12 @@ pub(super) fn build_required_precondition(
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
+        )),
+        "pcsx2" => serde_json::json!(format!(
+            "{}로 pinned compatible PCSX2 fork를 빌드하고 emucap-pcsx2-bridge를 빌드한 뒤 EMUCAP_PCSX2_BIOS를 설정해야 함",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/pcsx2/build.sh")
         )),
         "dolphin" => serde_json::json!(format!(
             "{}로 pinned compatible Dolphin native fork를 먼저 빌드해야 함(override도 matching sidecar 필요)",
@@ -534,116 +615,11 @@ pub(super) fn normalize_system(system: &str) -> Option<&'static str> {
         "dc" | "dreamcast" | "flycast" | "sega-dreamcast" => Some("dc"),
         "nds" | "ds" | "nintendo-ds" | "nintendods" | "desmume" => Some("nds"),
         "psp" | "ppsspp" | "playstation-portable" => Some("psp"),
+        "ps2" | "pcsx2" | "playstation2" | "playstation-2" => Some("ps2"),
         "gamecube" | "game-cube" | "gc" | "ngc" | "dolphin-gc" => Some("gamecube"),
         "wii" | "nintendo-wii" | "dolphin-wii" => Some("wii"),
         _ => None,
     }
-}
-
-pub(super) fn ext_lower(path: &str) -> Option<String> {
-    Path::new(path)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|s| s.to_ascii_lowercase())
-}
-
-pub(super) fn read_prefix(path: &Path, max: usize) -> Option<Vec<u8>> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buf = vec![0; max];
-    let n = file.read(&mut buf).ok()?;
-    buf.truncate(n);
-    Some(buf)
-}
-
-pub(super) fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| {
-        w.iter()
-            .zip(needle.iter())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-    })
-}
-
-pub(super) fn cue_file_refs(path: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    text.lines()
-        .filter_map(|line| {
-            let t = line.trim_start();
-            if !t.to_ascii_uppercase().starts_with("FILE ") {
-                return None;
-            }
-            let rest = t.get(5..)?.trim_start();
-            let file_name = if let Some(after_quote) = rest.strip_prefix('"') {
-                after_quote.split('"').next()
-            } else {
-                rest.split_whitespace().next()
-            }?;
-            Some(base.join(file_name))
-        })
-        .collect()
-}
-
-pub(super) fn content_markers(path: Option<&str>) -> serde_json::Value {
-    let Some(path) = path else {
-        return serde_json::json!({"available": false});
-    };
-    let p = Path::new(path);
-    let exists = p.exists();
-    let mut markers = Vec::new();
-    let mut scanned_files = Vec::new();
-    let mut candidates = Vec::new();
-
-    if ext_lower(path).as_deref() == Some("cue") {
-        candidates.extend(cue_file_refs(p));
-    } else {
-        candidates.push(p.to_path_buf());
-    }
-
-    for candidate in candidates.into_iter().take(4) {
-        if let Some(bytes) = read_prefix(&candidate, 1024 * 1024) {
-            scanned_files.push(candidate.display().to_string());
-            if contains_ascii_case_insensitive(&bytes, b"PSP GAME") {
-                markers.push("psp_game_marker");
-            }
-            if contains_ascii_case_insensitive(&bytes, b"SEGA SEGASATURN") {
-                markers.push("sega_saturn_header");
-            }
-            if contains_ascii_case_insensitive(&bytes, b"PLAYSTATION")
-                || contains_ascii_case_insensitive(&bytes, b"SYSTEM.CNF")
-            {
-                markers.push("playstation_marker");
-            }
-            if contains_ascii_case_insensitive(&bytes, b"PC Engine") {
-                markers.push("pc_engine_marker");
-            }
-            if contains_ascii_case_insensitive(&bytes, b"SEGA MEGA DRIVE")
-                || contains_ascii_case_insensitive(&bytes, b"SEGA GENESIS")
-            {
-                markers.push("sega_megadrive_header");
-            }
-            if bytes.get(0x1c..0x20) == Some(&[0xc2, 0x33, 0x9f, 0x3d]) {
-                markers.push("gamecube_disc_magic");
-            }
-            if bytes.get(0x18..0x1c) == Some(&[0x5d, 0x1c, 0x9e, 0xa3]) {
-                markers.push("wii_disc_magic");
-            }
-        }
-    }
-
-    markers.sort_unstable();
-    markers.dedup();
-    serde_json::json!({
-        "available": exists,
-        "scanned_files": scanned_files,
-        "markers": markers,
-    })
 }
 
 pub(super) fn infer_system(
@@ -695,6 +671,15 @@ pub(super) fn infer_system(
             "markers": markers,
         });
     }
+    if has_marker("ps2_system_cnf") {
+        return serde_json::json!({
+            "system": "ps2",
+            "confidence": "filesystem",
+            "reason": "ISO9660 SYSTEM.CNF contains a PS2 BOOT2 entry",
+            "needs_user_input": false,
+            "markers": markers,
+        });
+    }
     if has_marker("sega_saturn_header") {
         return serde_json::json!({
             "system": "saturn",
@@ -704,7 +689,7 @@ pub(super) fn infer_system(
             "markers": markers,
         });
     }
-    if has_marker("playstation_marker") {
+    if has_marker("playstation_marker") || has_marker("psx_system_cnf") {
         return serde_json::json!({
             "system": "psx",
             "confidence": "header",
@@ -863,7 +848,7 @@ pub(super) fn infer_system(
                 "reason": "disc/binary image extension can map to multiple systems; do not guess without header evidence",
                 "needs_user_input": true,
                 "required_user_input": "이 image의 시스템을 명시적으로 지정하라",
-                "candidates": ["saturn", "psx", "pce", "md", "psp", "dc", "gamecube", "wii"],
+                "candidates": ["saturn", "psx", "ps2", "pce", "md", "psp", "dc", "gamecube", "wii"],
                 "markers": markers,
             })
         }
@@ -895,6 +880,7 @@ pub(super) fn adapter_for_system(system: &str) -> (&'static str, Option<&'static
         "dc" => ("flycast", None),
         "nds" => ("desmume_nds", None),
         "psp" => ("ppsspp", None),
+        "ps2" => ("pcsx2", None),
         "gamecube" | "wii" => ("dolphin", None),
         _ => ("", None),
     }
@@ -959,6 +945,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         preferred_launcher_args["sound"] = serde_json::json!(false);
     }
     let fallback_launcher = adapter_script_launcher(&root, adapter);
+    let legacy_available = native_legacy_script(&fallback_launcher);
     let is_ps1 = fallback_launcher.extension().and_then(|e| e.to_str()) == Some("ps1");
     let mut argv: Vec<String> = if is_ps1 {
         vec![
@@ -1070,11 +1057,23 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "args": preferred_launcher_args,
             "reason": "cross-platform Rust launch path; uses emucap-owned config/data roots"
         },
-        "legacy_fallback_launcher": fallback_launcher.display().to_string(),
-        "legacy_fallback_argv": argv,
+        "legacy_fallback_launcher": if legacy_available {
+            serde_json::json!(fallback_launcher.display().to_string())
+        } else {
+            serde_json::Value::Null
+        },
+        "legacy_fallback_argv": if legacy_available {
+            serde_json::json!(argv)
+        } else {
+            serde_json::Value::Null
+        },
         "legacy_fallback": legacy_fallback_details(&fallback_launcher, &argv),
         "environment_defaults": environment_defaults,
-        "legacy_fallback_command": legacy_command(&argv),
+        "legacy_fallback_command": if legacy_available {
+            serde_json::json!(legacy_command(&argv))
+        } else {
+            serde_json::Value::Null
+        },
         "inference": inference,
         "runtime_paths": paths,
         "button_hint": button_hint_for_system(Some(system)),

@@ -17,6 +17,7 @@ pub mod flycast;
 pub mod mame;
 pub mod mednafen;
 pub mod mesen;
+pub mod pcsx2;
 pub mod ppsspp;
 pub mod spec;
 

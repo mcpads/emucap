@@ -51,5 +51,21 @@ PPSSPP
   armips, udis86, cityhash, sha1, sfmt, cpu_features, rapidjson, pugixml, gason, sol/lua,
   imgui, portable-file-dialogs, discord-rpc, miniupnp, rcheevos, OpenXR-SDK, libadrenotools.
 
+PCSX2
+  Upstream: https://github.com/PCSX2/pcsx2
+  Pinned source: v2.6.3 (bc8151d2a46d4aba039ea5580afbfc7bfcf6d730)
+  License:  GPL-3.0-or-later (per source-file SPDX headers)
+  Used by:  adapters/pcsx2 (GPL-3.0-or-later patch stack; PlayStation 2)
+  The separate Rust PINE bridge is GPL-2.0-or-later project code.
+  Distribution: emucap ships source patches and a build recipe, not PCSX2
+                binaries, BIOS files, or game media.
+
+Dolphin
+  Upstream: https://github.com/dolphin-emu/dolphin
+  License:  GPL-2.0-or-later
+  Used by:  adapters/dolphin (native patch stack; GameCube and Wii)
+  Distribution: emucap ships source patches and a build recipe, not Dolphin
+                binaries, keys, firmware, or game media.
+
 Upstream license determinations were made from each project's source-file SPDX
 headers and README, not from the bare COPYING boilerplate.

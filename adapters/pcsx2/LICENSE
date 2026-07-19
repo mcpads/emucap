@@ -1,0 +1,15 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The PCSX2 adapter has two license boundaries:
+
+- The Rust bridge and launcher communicate with PCSX2 as separate processes and
+  are licensed GPL-2.0-or-later, the project default.
+- `patches/*.patch` modifies and is compiled into PCSX2. That patch stack is a
+  derivative of PCSX2 and is licensed GPL-3.0-or-later.
+
+The repository distributes pinned source patches and build recipes, not PCSX2
+binaries, game media, or BIOS files. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)
+Full GPL-3.0 text: ../../licenses/GPL-3.0.txt (https://www.gnu.org/licenses/gpl-3.0.txt)

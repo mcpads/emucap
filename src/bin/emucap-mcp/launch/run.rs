@@ -190,6 +190,7 @@ pub(crate) fn make_launch(
         "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
         "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
         "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
+        "pcsx2" => launch_pcsx2(port, direct_reclaim, runtime, a),
         "dolphin" => launch_dolphin(port, direct_reclaim, runtime, system, a),
         _ => serde_json::json!({
             "launched": false,
@@ -346,6 +347,15 @@ where
 }
 
 pub(super) fn backend_endpoint_from_launch(outcome: &serde_json::Value) -> Option<String> {
+    if let Some(path) = outcome
+        .get("pine_socket")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(path.to_string());
+    }
+    if let Some(slot) = outcome.get("pine_slot").and_then(serde_json::Value::as_u64) {
+        return Some(format!("pine:{slot}"));
+    }
     for key in ["ws_port", "gdb_port", "arm9_gdb_port"] {
         if let Some(port) = outcome.get(key).and_then(serde_json::Value::as_u64) {
             return Some(format!("127.0.0.1:{port}"));
@@ -519,6 +529,90 @@ pub(super) fn launch_ppsspp(
             "next_action": "adapter가 연결되면 launch가 반환한다",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
+    }
+}
+
+/// PCSX2/PS2 leg of `make_launch`: start the pinned PINE fork with an isolated data root and relay
+/// its PINE socket through the Rust bridge.
+pub(super) fn launch_pcsx2(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
+    let Some(root) = find_repo_root() else {
+        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+    };
+    let Some(binary) = pcsx2_launch::resolve_binary(&root) else {
+        return serde_json::json!({
+            "launched": false,
+            "kind": "pcsx2-patch-required",
+            "reason": "compatible PCSX2 binary not found; run adapters/pcsx2/build.sh or set EMUCAP_PCSX2_BIN",
+        });
+    };
+    let host_build = match pcsx2_launch::require_compatible_build(&root, &binary) {
+        Ok(build) => build,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "kind": "pcsx2-patch-required",
+                "error": error.to_string(),
+                "next_action": "adapters/pcsx2/build.sh",
+            });
+        }
+    };
+    let Some(bridge) = pcsx2_launch::resolve_bridge(&root) else {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "PS2 bridge binary not found; run cargo build --release --bin emucap-pcsx2-bridge or set EMUCAP_PCSX2_BRIDGE_BIN",
+        });
+    };
+    let bios = match pcsx2_launch::resolve_bios() {
+        Ok(path) => path,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": error.to_string(),
+                "required_user_input": "Set EMUCAP_PCSX2_BIOS to an absolute path for a legally obtained PS2 BIOS file.",
+            });
+        }
+    };
+    let display = a.display.unwrap_or(false);
+    let log = adapter_log_path("pcsx2", port, "pcsx2.log");
+    let launch = pcsx2_launch::Launch {
+        binary: &binary,
+        bridge: &bridge,
+        bios: &bios,
+        content: &a.content_path,
+        log_path: &log,
+        port,
+        name: a.name.as_deref(),
+        session_token: token,
+        runtime: Some(runtime),
+        display,
+    };
+    match pcsx2_launch::launch(&launch) {
+        Ok(launched) => serde_json::json!({
+            "launched": true,
+            "adapter": "pcsx2",
+            "system": "ps2",
+            "pid": launched.pcsx2_pid,
+            "pcsx2_pid": launched.pcsx2_pid,
+            "bridge_pid": launched.bridge_pid,
+            "pine_slot": launched.pine_slot,
+            "pine_socket": launched.pine_socket.map(|path| path.display().to_string()),
+            "data_root": launched.data_root.display().to_string(),
+            "display": display,
+            "port": port,
+            "binary": binary.display().to_string(),
+            "bridge": bridge.display().to_string(),
+            "host_build": host_build,
+            "bios": bios.display().to_string(),
+            "log": log.display().to_string(),
+            "isolation": "PCSX2 uses an emucap-owned per-port data root; the selected BIOS is referenced in place.",
+            "next_action": "adapter가 연결되면 launch가 반환한다",
+        }),
+        Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
 }
 

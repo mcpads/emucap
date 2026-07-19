@@ -441,11 +441,12 @@ fn legacy_mesen_command(root: &Path, port: u16) -> String {
 
 fn native_legacy_script(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str());
-    if cfg!(windows) {
-        ext.is_some_and(|e| e.eq_ignore_ascii_case("ps1"))
-    } else {
-        ext == Some("sh")
-    }
+    path.is_file()
+        && if cfg!(windows) {
+            ext.is_some_and(|e| e.eq_ignore_ascii_case("ps1"))
+        } else {
+            ext == Some("sh")
+        }
 }
 
 fn legacy_command_template(launcher: &Path, command: String) -> serde_json::Value {
@@ -460,7 +461,11 @@ fn legacy_fallback_entry(launcher: &Path, command: String) -> serde_json::Value 
     let available = native_legacy_script(launcher);
     serde_json::json!({
         "available_on_this_host": available,
-        "launcher": launcher.display().to_string(),
+        "launcher": if available {
+            serde_json::json!(launcher.display().to_string())
+        } else {
+            serde_json::Value::Null
+        },
         "command_template": if available {
             serde_json::json!(command)
         } else {
@@ -495,6 +500,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
     let flycast_launcher = repo_path(&root, &["adapters", "flycast", "launch.sh"]);
     let desmume_launcher = repo_path(&root, &["adapters", "desmume-nds", "launch.sh"]);
     let ppsspp_launcher = repo_path(&root, &["adapters", "ppsspp", "launch.sh"]);
+    let pcsx2_launcher = repo_path(&root, &["adapters", "pcsx2", "launch.sh"]);
     let dolphin_launcher = repo_path(&root, &["adapters", "dolphin", "launch-native.ps1"]);
     serde_json::json!({
         "repo_root": root.display().to_string(),
@@ -540,6 +546,11 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "build": abs_path_json(&root, &["adapters", "ppsspp", "build.sh"]),
                 "launch": abs_path_json(&root, &["adapters", "ppsspp", "launch.sh"]),
             },
+            "pcsx2": {
+                "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "pcsx2", "build.sh"]),
+                "bios_env": "EMUCAP_PCSX2_BIOS",
+            },
             "dolphin": {
                 "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "dolphin", if cfg!(windows) { "build.ps1" } else { "build.sh" }]),
@@ -554,6 +565,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "legacy_flycast": legacy_command_template(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
             "legacy_desmume_nds": legacy_command_template(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
             "legacy_ppsspp": legacy_command_template(&ppsspp_launcher, format!("{} <game.iso|game.cso|game.pbp> {p} [name]", ppsspp_launcher.display())),
+            "legacy_pcsx2": legacy_command_template(&pcsx2_launcher, format!("{} <game.iso> {p} [name]", pcsx2_launcher.display())),
             "legacy_dolphin": legacy_command_template(&dolphin_launcher, format!("powershell -ExecutionPolicy Bypass -File {} <game.gcm|game.iso|game.wbfs> {p} [name]", dolphin_launcher.display())),
         })),
         "legacy_fallbacks": port.map(|p| serde_json::json!({
@@ -563,6 +575,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "flycast": legacy_fallback_entry(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
             "desmume_nds": legacy_fallback_entry(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
             "ppsspp": legacy_fallback_entry(&ppsspp_launcher, format!("{} <game.iso|game.cso|game.pbp> {p} [name]", ppsspp_launcher.display())),
+            "pcsx2": legacy_fallback_entry(&pcsx2_launcher, format!("{} <game.iso> {p} [name]", pcsx2_launcher.display())),
             "dolphin": legacy_fallback_entry(&dolphin_launcher, format!("powershell -ExecutionPolicy Bypass -File {} <game.gcm|game.iso|game.wbfs> {p} [name]", dolphin_launcher.display())),
         })),
     })
@@ -687,6 +700,15 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.ppsspp.launch",
             "notes": ".iso is shared with Saturn/PSX/PCE/MD/Dreamcast — a PSP GAME ISO9660 header disambiguates automatically; otherwise pass system=psp explicitly."
+        },
+        {
+            "system": "ps2",
+            "aliases": ["pcsx2", "playstation2", "playstation-2"],
+            "adapter": "pcsx2",
+            "content": ["iso"],
+            "launcher": "MCP tool: launch",
+            "required_environment": ["EMUCAP_PCSX2_BIOS"],
+            "notes": "An ISO9660 SYSTEM.CNF BOOT2 entry is inferred automatically. The pinned PCSX2 fork and Rust bridge are required."
         },
         {
             "system": "gamecube",
@@ -932,6 +954,7 @@ fn emu_dir_for_system(system: &str) -> Option<&'static str> {
     match system {
         "nds" => Some("desmume-nds"),
         "psp" => Some("ppsspp"),
+        "ps2" => Some("pcsx2"),
         _ => None,
     }
 }
