@@ -1,0 +1,20 @@
+diff --git a/Source/Core/Core/PowerPC/PowerPC.cpp b/Source/Core/Core/PowerPC/PowerPC.cpp
+index fbc00a09f3..d86e3bd843 100644
+--- a/Source/Core/Core/PowerPC/PowerPC.cpp
++++ b/Source/Core/Core/PowerPC/PowerPC.cpp
+@@ -14,6 +14,7 @@
+ #include "Core/CPUThreadConfigCallback.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
++#include "Core/EmuCap.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/CPU.h"
+ #include "Core/HW/SystemTimers.h"
+@@ -660,6 +661,7 @@ bool PowerPCManager::CheckAndHandleBreakPoints()
+ {
+   if (CheckBreakPoints())
+   {
++    EmuCap::NotifyBreakpointHit(m_ppc_state.pc);
+     m_system.GetCPU().Break();
+     if (GDBStub::IsActive())
+       GDBStub::TakeControl();

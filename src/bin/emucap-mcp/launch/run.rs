@@ -86,7 +86,8 @@ pub(crate) fn make_launch(
         });
     }
     if let Some(root) = find_repo_root() {
-        let adapter_binary = adapter_binary_precondition(adapter, &root);
+        let adapter_binary =
+            adapter_binary_precondition_for(adapter, &root, a.display.unwrap_or(false));
         if !adapter_binary["available"].as_bool().unwrap_or(false) {
             return missing_adapter_binary_response(adapter, system, port, &root, adapter_binary);
         }
@@ -189,6 +190,7 @@ pub(crate) fn make_launch(
         "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
         "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
         "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
+        "dolphin" => launch_dolphin(port, direct_reclaim, runtime, system, a),
         _ => serde_json::json!({
             "launched": false,
             "reason": format!("{system} 시스템은 Rust 런처 대상이 아니다"),
@@ -554,6 +556,72 @@ pub(super) fn launch_flycast(
             "next_action": "adapter가 연결되면 launch가 반환한다",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
+    }
+}
+
+/// Dolphin leg of `make_launch`: select the compatible no-GUI or DolphinQt fork, copy it into the
+/// per-port runtime, and launch with an isolated `--user` directory.
+pub(super) fn launch_dolphin(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    system: &str,
+    a: &LaunchArgs,
+) -> serde_json::Value {
+    let Some(root) = find_repo_root() else {
+        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+    };
+    let display = a.display.unwrap_or(false);
+    let Some(binary) = dolphin_launch::resolve_binary(&root, display) else {
+        return serde_json::json!({
+            "launched": false,
+            "kind": "dolphin-patch-required",
+            "reason": if display {
+                "compatible DolphinQt binary not found; run adapters/dolphin/build.sh or set EMUCAP_DOLPHIN_GUI_BIN"
+            } else {
+                "compatible dolphin-emu-nogui binary not found; run adapters/dolphin/build.sh or set EMUCAP_DOLPHIN_HEADLESS_BIN"
+            },
+        });
+    };
+    let host_build = match dolphin_launch::require_compatible_build(&root, &binary) {
+        Ok(build) => build,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "kind": "dolphin-patch-required",
+                "error": error.to_string(),
+                "next_action": if cfg!(windows) { "adapters/dolphin/build.ps1" } else { "adapters/dolphin/build.sh" },
+            });
+        }
+    };
+    let log = adapter_log_path("dolphin", port, "dolphin.log");
+    let launch = dolphin_launch::Launch {
+        binary: &binary,
+        content: &a.content_path,
+        system,
+        log_path: &log,
+        port,
+        name: a.name.as_deref(),
+        session_token: token,
+        runtime: Some(runtime),
+        display,
+    };
+    match dolphin_launch::launch(&launch) {
+        Ok(pid) => serde_json::json!({
+            "launched": true,
+            "adapter": "dolphin",
+            "system": system,
+            "pid": pid,
+            "display": display,
+            "port": port,
+            "binary": binary.display().to_string(),
+            "host_build": host_build,
+            "log": log.display().to_string(),
+            "emucap_home": emucap::launch::emu_home_dir("dolphin", port).display().to_string(),
+            "isolation": "Dolphin runs from an emucap-owned portable copy with a per-port --user directory.",
+            "next_action": "adapter가 연결되면 launch가 반환한다",
+        }),
+        Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
 }
 

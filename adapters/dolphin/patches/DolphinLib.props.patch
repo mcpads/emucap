@@ -1,0 +1,20 @@
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index d343d4b..3ae5b4b 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -216,6 +216,7 @@
+     <ClInclude Include="Core\Core.h" />
+     <ClInclude Include="Core\CoreTiming.h" />
+     <ClInclude Include="Core\CPUThreadConfigCallback.h" />
++    <ClInclude Include="Core\EmuCap.h" />
+     <ClInclude Include="Core\Debugger\BranchWatch.h" />
+     <ClInclude Include="Core\Debugger\CodeTrace.h" />
+     <ClInclude Include="Core\Debugger\DebugInterface.h" />
+@@ -926,6 +927,7 @@
+     <ClCompile Include="Core\Core.cpp" />
+     <ClCompile Include="Core\CoreTiming.cpp" />
+     <ClCompile Include="Core\CPUThreadConfigCallback.cpp" />
++    <ClCompile Include="Core\EmuCap.cpp" />
+     <ClCompile Include="Core\Debugger\BranchWatch.cpp" />
+     <ClCompile Include="Core\Debugger\CodeTrace.cpp" />
+     <ClCompile Include="Core\Debugger\Debugger_SymbolMap.cpp" />

@@ -1,0 +1,24 @@
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index 1b50796..7cee94e 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -45,6 +45,7 @@
+ #include "Core/ConfigManager.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/DSPEmulator.h"
++#include "Core/EmuCap.h"
+ #include "Core/DolphinAnalytics.h"
+ #include "Core/FifoPlayer/FifoPlayer.h"
+ #include "Core/FreeLookManager.h"
+@@ -673,6 +674,11 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+ 
+   UpdateTitle(system);
+ 
++  // emucap: 코어가 완비된 뒤 어댑터 서버 스레드를 띄우고, EmuThread 종료 시(HW 종료 전)
++  // 정리한다. EMUCAP_PORT 미설정이면 무동작.
++  EmuCap::Start(system);
++  Common::ScopeGuard emucap_guard{[] { EmuCap::Stop(); }};
++
+   // Become the CPU thread.
+   cpu_thread_func(system, savestate_path, delete_savestate);
+ }

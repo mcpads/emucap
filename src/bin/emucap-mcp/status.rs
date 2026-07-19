@@ -54,6 +54,12 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"enter": "start", "return": "start"},
             "notes": "Dreamcast pad buttons are lowercase: a/b/x/y/start + up/down/left/right are standard; c/z/d exist on some pads. Analog triggers/stick are not injectable by name. Input is injected at the maple GetInput consumer; only controller port 0 is supported."
         }),
+        "gamecube" | "gc" | "ngc" => serde_json::json!({
+            "system": "gamecube",
+            "buttons": ["a", "b", "x", "y", "z", "l", "r", "start", "up", "down", "left", "right"],
+            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r"},
+            "notes": "GameCube controller button names are lowercase. Only controller port 0 is supported by the native adapter."
+        }),
         "snes" | "sfc" => serde_json::json!({
             "system": "snes",
             "buttons": ["a", "b", "x", "y", "l", "r", "start", "select", "up", "down", "left", "right"],
@@ -484,6 +490,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
     let flycast_launcher = repo_path(&root, &["adapters", "flycast", "launch.sh"]);
     let desmume_launcher = repo_path(&root, &["adapters", "desmume-nds", "launch.sh"]);
     let ppsspp_launcher = repo_path(&root, &["adapters", "ppsspp", "launch.sh"]);
+    let dolphin_launcher = repo_path(&root, &["adapters", "dolphin", "launch-native.ps1"]);
     serde_json::json!({
         "repo_root": root.display().to_string(),
         "repo_root_env": "EMUCAP_REPO_ROOT",
@@ -527,6 +534,11 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "ppsspp", "build.sh"]),
                 "launch": abs_path_json(&root, &["adapters", "ppsspp", "launch.sh"]),
+            },
+            "dolphin": {
+                "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "dolphin", if cfg!(windows) { "build.ps1" } else { "build.sh" }]),
+                "windows_script": abs_path_json(&root, &["adapters", "dolphin", "launch-native.ps1"]),
             }
         },
         "command_templates": port.map(|p| serde_json::json!({
@@ -537,6 +549,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "legacy_flycast": legacy_command_template(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
             "legacy_desmume_nds": legacy_command_template(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
             "legacy_ppsspp": legacy_command_template(&ppsspp_launcher, format!("{} <game.iso|game.cso|game.pbp> {p} [name]", ppsspp_launcher.display())),
+            "legacy_dolphin": legacy_command_template(&dolphin_launcher, format!("powershell -ExecutionPolicy Bypass -File {} <game.gcm|game.iso|game.wbfs> {p} [name]", dolphin_launcher.display())),
         })),
         "legacy_fallbacks": port.map(|p| serde_json::json!({
             "mesen2": legacy_fallback_entry(&mesen_launcher, legacy_mesen_command(&root, p)),
@@ -545,6 +558,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "flycast": legacy_fallback_entry(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
             "desmume_nds": legacy_fallback_entry(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
             "ppsspp": legacy_fallback_entry(&ppsspp_launcher, format!("{} <game.iso|game.cso|game.pbp> {p} [name]", ppsspp_launcher.display())),
+            "dolphin": legacy_fallback_entry(&dolphin_launcher, format!("powershell -ExecutionPolicy Bypass -File {} <game.gcm|game.iso|game.wbfs> {p} [name]", dolphin_launcher.display())),
         })),
     })
 }
@@ -668,6 +682,24 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.ppsspp.launch",
             "notes": ".iso is shared with Saturn/PSX/PCE/MD/Dreamcast — a PSP GAME ISO9660 header disambiguates automatically; otherwise pass system=psp explicitly."
+        },
+        {
+            "system": "gamecube",
+            "aliases": ["gc", "ngc", "game-cube"],
+            "adapter": "dolphin",
+            "content": ["gcm", "iso", "rvz", "gcz"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.dolphin.windows_script",
+            "notes": ".gcm and the GameCube disc magic are inferred automatically; shared container extensions require system=gamecube."
+        },
+        {
+            "system": "wii",
+            "aliases": ["nintendo-wii"],
+            "adapter": "dolphin",
+            "content": ["wbfs", "iso", "rvz", "wia", "gcz"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.dolphin.windows_script",
+            "notes": ".wbfs and the Wii disc magic are inferred automatically; shared container extensions require system=wii."
         }
     ])
 }

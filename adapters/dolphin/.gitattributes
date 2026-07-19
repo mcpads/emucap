@@ -1,0 +1,5 @@
+# 패치는 git apply 가 먹도록 LF 유지. C++/py 소스도 Dolphin 트리(LF)와 일관되게 LF.
+*.patch text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.py text eol=lf

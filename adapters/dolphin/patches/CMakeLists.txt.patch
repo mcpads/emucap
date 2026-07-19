@@ -1,0 +1,13 @@
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 996b63e..ef28aa6 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -62,6 +62,8 @@ add_library(core
+   CoreTiming.h
+   CPUThreadConfigCallback.cpp
+   CPUThreadConfigCallback.h
++  EmuCap.cpp
++  EmuCap.h
+   Debugger/BranchWatch.cpp
+   Debugger/BranchWatch.h
+   Debugger/CodeTrace.cpp

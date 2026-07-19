@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub mod desmume_nds;
+pub mod dolphin;
 pub mod flycast;
 pub mod mame;
 pub mod mednafen;

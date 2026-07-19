@@ -107,6 +107,50 @@ fn flycast_spec_leaves_os_specific_isolation_to_launcher() {
 }
 
 #[test]
+fn dolphin_headless_spec_uses_isolated_user_and_headless_platform() {
+    let spec = dolphin_spec(
+        Path::new("/run/dolphin-emu-nogui"),
+        Path::new("/tmp/dolphin.log"),
+        Path::new("/tmp/dolphin-user"),
+        "gamecube",
+        &opts("game.gcm"),
+    );
+    assert!(spec
+        .args
+        .windows(2)
+        .any(|args| args == ["--user".to_string(), "/tmp/dolphin-user".to_string()]));
+    assert!(spec
+        .args
+        .windows(2)
+        .any(|args| args == ["--exec".to_string(), "game.gcm".to_string()]));
+    assert!(spec.args.iter().any(|arg| arg == "--platform=headless"));
+    assert!(!spec.args.iter().any(|arg| arg == "--batch"));
+    assert!(spec
+        .env
+        .contains(&("EMUCAP_SYSTEM".to_string(), "gamecube".to_string())));
+}
+
+#[test]
+fn dolphin_gui_spec_uses_batch_render_window() {
+    let mut options = opts("game.wbfs");
+    options.headless = false;
+    let spec = dolphin_spec(
+        Path::new("/run/DolphinQt"),
+        Path::new("/tmp/dolphin.log"),
+        Path::new("/tmp/dolphin-user"),
+        "wii",
+        &options,
+    );
+
+    assert!(spec.args.iter().any(|arg| arg == "--batch"));
+    assert!(!spec.args.iter().any(|arg| arg == "--platform=headless"));
+    assert!(spec
+        .args
+        .iter()
+        .any(|arg| arg == "--config=Dolphin.DSP.Backend=No Audio Output"));
+}
+
+#[test]
 fn mesen_spec_passes_rom_lua_and_cli_config_overrides() {
     let spec = mesen_spec(
         Path::new("/run/Mesen"),

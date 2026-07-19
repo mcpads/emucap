@@ -818,7 +818,9 @@ fn input_buttons_uses_fallback_system_when_top_level_missing() {
 #[test]
 fn button_hint_none_for_unknown_or_absent_system() {
     assert!(button_hint_for_system(None).is_none());
-    assert!(button_hint_for_system(Some("gamecube")).is_none());
+    assert!(button_hint_for_system(Some("unknown")).is_none());
+    assert!(button_hint_for_system(Some("gamecube")).is_some());
+    assert!(button_hint_for_system(Some("wii")).is_none());
     assert!(button_hint_for_system(Some("snes")).is_some());
     assert!(button_hint_for_system(Some("dreamcast")).is_some());
 }

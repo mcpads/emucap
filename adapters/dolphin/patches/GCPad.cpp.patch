@@ -1,0 +1,24 @@
+diff --git a/Source/Core/Core/HW/GCPad.cpp b/Source/Core/Core/HW/GCPad.cpp
+index 188882c..5c5fcfe 100644
+--- a/Source/Core/Core/HW/GCPad.cpp
++++ b/Source/Core/Core/HW/GCPad.cpp
+@@ -4,6 +4,7 @@
+ #include "Core/HW/GCPad.h"
+ 
+ #include "Common/Common.h"
++#include "Core/EmuCap.h"
+ #include "Core/HW/GCPadEmu.h"
+ #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
+ #include "InputCommon/GCPadStatus.h"
+@@ -55,7 +56,10 @@ bool IsInitialized()
+ 
+ GCPadStatus GetStatus(int pad_num)
+ {
+-  return static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
++  GCPadStatus status = static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
++  // emucap set_input 오버라이드가 걸려 있으면 결정론적으로 덮어쓴다.
++  EmuCap::ApplyInputOverride(pad_num, &status);
++  return status;
+ }
+ 
+ ControllerEmu::ControlGroup* GetGroup(int pad_num, PadGroup group)

@@ -72,6 +72,28 @@ fn write_mesen_sidecar(binary: &Path) {
     .unwrap();
 }
 
+fn write_dolphin_sidecar(binary: &Path) {
+    let root = find_repo_root().expect("repo root");
+    let lock = std::fs::read_to_string(root.join("adapters/dolphin/upstream.lock")).unwrap();
+    let value = |key: &str| {
+        lock.lines()
+            .find_map(|line| line.strip_prefix(&format!("{key}=")))
+            .unwrap()
+            .to_string()
+    };
+    let sidecar = serde_json::json!({
+        "upstream": value("DOLPHIN_REPO"),
+        "commit": value("DOLPHIN_COMMIT"),
+        "host_api": value("DOLPHIN_HOST_API").parse::<u32>().unwrap(),
+        "patchset_sha256": value("DOLPHIN_PATCHSET_SHA256"),
+    });
+    std::fs::write(
+        dolphin_launch::build_metadata_path(binary),
+        serde_json::to_vec(&sidecar).unwrap(),
+    )
+    .unwrap();
+}
+
 fn path_ends_with_parts(path: &str, parts: &[&str]) -> bool {
     let mut suffix = PathBuf::new();
     for part in parts {
@@ -88,6 +110,7 @@ fn adapter_logs_live_under_per_port_emucap_home() {
         ("mame-pc98", "mame-pc98.log"),
         ("mednafen", "mednafen.log"),
         ("ppsspp", "ppsspp.log"),
+        ("dolphin", "dolphin.log"),
     ];
     for (adapter, file) in cases {
         let path = adapter_log_path(adapter, 47911, file);
@@ -314,6 +337,87 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
         .unwrap()
         .iter()
         .any(|v| v.as_str() == Some("psp")));
+    assert!(inferred["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("gamecube")));
+    assert!(inferred["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("wii")));
+}
+
+#[test]
+fn infer_system_maps_dolphin_specific_extensions() {
+    for (ext, expected) in [("gcm", "gamecube"), ("wbfs", "wii")] {
+        let inferred = infer_system(Some(&format!("/tmp/game.{ext}")), None);
+        assert_eq!(inferred["system"], expected, "extension .{ext}");
+        assert_eq!(inferred["confidence"], "extension", "extension .{ext}");
+        assert_eq!(inferred["needs_user_input"], false, "extension .{ext}");
+    }
+}
+
+#[test]
+fn infer_system_uses_gamecube_and_wii_disc_magic() {
+    for (offset, magic, expected) in [
+        (0x1c, [0xc2, 0x33, 0x9f, 0x3d], "gamecube"),
+        (0x18, [0x5d, 0x1c, 0x9e, 0xa3], "wii"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("game.iso");
+        let mut data = vec![0u8; 0x40];
+        data[offset..offset + magic.len()].copy_from_slice(&magic);
+        std::fs::write(&image, data).unwrap();
+
+        let inferred = infer_system(image.to_str(), None);
+        assert_eq!(inferred["system"], expected);
+        assert_eq!(inferred["confidence"], "header");
+        assert_eq!(inferred["needs_user_input"], false);
+    }
+}
+
+#[test]
+fn normalize_system_accepts_dolphin_aliases() {
+    for (alias, expected) in [
+        ("gc", "gamecube"),
+        ("ngc", "gamecube"),
+        ("game-cube", "gamecube"),
+        ("nintendo-wii", "wii"),
+    ] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], expected, "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
+}
+
+#[test]
+fn dolphin_precondition_requires_matching_build_sidecar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join(if cfg!(windows) {
+        "Dolphin.exe"
+    } else {
+        "dolphin-emu-nogui"
+    });
+    std::fs::write(&binary, b"fake dolphin").unwrap();
+    make_executable(&binary);
+
+    let missing = dolphin_binary_precondition_from(tmp.path(), false, Some(binary.clone()));
+    assert_eq!(missing["available"], false);
+    assert_eq!(missing["kind"], "dolphin-patch-required");
+
+    write_dolphin_sidecar(&binary);
+    let compatible = dolphin_binary_precondition_from(
+        &find_repo_root().expect("repo root"),
+        false,
+        Some(binary),
+    );
+    assert_eq!(compatible["available"], true);
+    assert_eq!(
+        compatible["host_api"],
+        serde_json::json!(dolphin_launch::REQUIRED_HOST_API)
+    );
 }
 
 #[test]

@@ -8,6 +8,9 @@ pub(super) fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
         "flycast" => "adapters/flycast",
         "desmume_nds" => "adapters/desmume-nds",
         "ppsspp" => "adapters/ppsspp",
+        "dolphin" => {
+            return root.join("adapters/dolphin/launch-native.ps1");
+        }
         _ => return root.join("adapters"),
     };
     let ps1 = root.join(dir).join("launch.ps1");
@@ -215,6 +218,63 @@ pub(super) fn flycast_binary_precondition() -> serde_json::Value {
     flycast_binary_precondition_from(flycast_launch::resolve_binary())
 }
 
+pub(super) fn dolphin_binary_precondition_from(
+    root: &Path,
+    display: bool,
+    resolved: Option<PathBuf>,
+) -> serde_json::Value {
+    let Some(path) = resolved else {
+        return serde_json::json!({
+            "available": false,
+            "source": null,
+            "kind": "binary-not-found",
+            "display": display,
+        });
+    };
+    let source = if env_path_or_app_matches("EMUCAP_DOLPHIN_BIN", &path, "DolphinQt")
+        || env_path_or_app_matches(
+            if display {
+                "EMUCAP_DOLPHIN_GUI_BIN"
+            } else {
+                "EMUCAP_DOLPHIN_HEADLESS_BIN"
+            },
+            &path,
+            "DolphinQt",
+        ) {
+        "environment"
+    } else if path_matches_candidates(&path, dolphin_launch::local_build_candidates(root, display))
+    {
+        "repo_build"
+    } else if path_matches_candidates(&path, dolphin_launch::default_install_candidates(display)) {
+        "default_install"
+    } else {
+        "PATH"
+    };
+    match dolphin_launch::require_compatible_build(root, &path) {
+        Ok(build) => serde_json::json!({
+            "available": true,
+            "path": path.display().to_string(),
+            "source": source,
+            "display": display,
+            "host_api": build.host_api,
+            "upstream_commit": build.commit,
+            "patchset_sha256": build.patchset_sha256,
+        }),
+        Err(error) => serde_json::json!({
+            "available": false,
+            "path": path.display().to_string(),
+            "source": source,
+            "display": display,
+            "kind": "dolphin-patch-required",
+            "error": error.to_string(),
+        }),
+    }
+}
+
+pub(super) fn dolphin_binary_precondition(root: &Path, display: bool) -> serde_json::Value {
+    dolphin_binary_precondition_from(root, display, dolphin_launch::resolve_binary(root, display))
+}
+
 pub(super) fn mame_binary_precondition_from(
     root: &Path,
     resolved: Option<PathBuf>,
@@ -304,16 +364,25 @@ pub(super) fn mame_bridge_precondition(root: &Path) -> serde_json::Value {
     }
 }
 
-pub(super) fn adapter_binary_precondition(adapter: &str, root: &Path) -> serde_json::Value {
+pub(super) fn adapter_binary_precondition_for(
+    adapter: &str,
+    root: &Path,
+    display: bool,
+) -> serde_json::Value {
     match adapter {
         "mesen2" => mesen_binary_precondition(root),
         "mednafen" => mednafen_binary_precondition(root),
         "flycast" => flycast_binary_precondition(),
+        "dolphin" => dolphin_binary_precondition(root, display),
         "mame_pc98" => mame_binary_precondition(root),
         "desmume_nds" => desmume_nds_binary_precondition(root),
         "ppsspp" => ppsspp_binary_precondition(root),
         _ => serde_json::Value::Null,
     }
+}
+
+pub(super) fn adapter_binary_precondition(adapter: &str, root: &Path) -> serde_json::Value {
+    adapter_binary_precondition_for(adapter, root, false)
 }
 
 pub(super) fn build_required_precondition(
@@ -360,6 +429,12 @@ pub(super) fn build_required_precondition(
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
+        )),
+        "dolphin" => serde_json::json!(format!(
+            "{}로 pinned compatible Dolphin native fork를 먼저 빌드해야 함(override도 matching sidecar 필요)",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/dolphin/build.sh")
         )),
         _ => serde_json::Value::Null,
     }
@@ -459,6 +534,8 @@ pub(super) fn normalize_system(system: &str) -> Option<&'static str> {
         "dc" | "dreamcast" | "flycast" | "sega-dreamcast" => Some("dc"),
         "nds" | "ds" | "nintendo-ds" | "nintendods" | "desmume" => Some("nds"),
         "psp" | "ppsspp" | "playstation-portable" => Some("psp"),
+        "gamecube" | "game-cube" | "gc" | "ngc" | "dolphin-gc" => Some("gamecube"),
+        "wii" | "nintendo-wii" | "dolphin-wii" => Some("wii"),
         _ => None,
     }
 }
@@ -550,6 +627,12 @@ pub(super) fn content_markers(path: Option<&str>) -> serde_json::Value {
                 || contains_ascii_case_insensitive(&bytes, b"SEGA GENESIS")
             {
                 markers.push("sega_megadrive_header");
+            }
+            if bytes.get(0x1c..0x20) == Some(&[0xc2, 0x33, 0x9f, 0x3d]) {
+                markers.push("gamecube_disc_magic");
+            }
+            if bytes.get(0x18..0x1c) == Some(&[0x5d, 0x1c, 0x9e, 0xa3]) {
+                markers.push("wii_disc_magic");
             }
         }
     }
@@ -648,6 +731,24 @@ pub(super) fn infer_system(
             "markers": markers,
         });
     }
+    if has_marker("gamecube_disc_magic") {
+        return serde_json::json!({
+            "system": "gamecube",
+            "confidence": "header",
+            "reason": "media header contains the GameCube disc magic",
+            "needs_user_input": false,
+            "markers": markers,
+        });
+    }
+    if has_marker("wii_disc_magic") {
+        return serde_json::json!({
+            "system": "wii",
+            "confidence": "header",
+            "reason": "media header contains the Wii disc magic",
+            "needs_user_input": false,
+            "markers": markers,
+        });
+    }
 
     match ext_lower(path).as_deref() {
         Some("sfc" | "smc") => serde_json::json!({
@@ -741,15 +842,31 @@ pub(super) fn infer_system(
             "needs_user_input": false,
             "markers": markers,
         }),
-        Some("cue" | "chd" | "bin" | "iso" | "img" | "ccd") => serde_json::json!({
-            "system": null,
-            "confidence": "ambiguous_media",
-            "reason": "disc/binary image extension can map to Saturn, PSX, PCE, MD, PSP, or Dreamcast; do not guess without header evidence",
-            "needs_user_input": true,
-            "required_user_input": "이 image가 saturn, psx, pce, md, psp, dc 중 무엇인지 지정하라",
-            "candidates": ["saturn", "psx", "pce", "md", "psp", "dc"],
+        Some("gcm") => serde_json::json!({
+            "system": "gamecube",
+            "confidence": "extension",
+            "reason": "GameCube disc image extension",
+            "needs_user_input": false,
             "markers": markers,
         }),
+        Some("wbfs") => serde_json::json!({
+            "system": "wii",
+            "confidence": "extension",
+            "reason": "Wii Backup File System image extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
+        Some("cue" | "chd" | "bin" | "iso" | "img" | "ccd" | "rvz" | "wia" | "gcz") => {
+            serde_json::json!({
+                "system": null,
+                "confidence": "ambiguous_media",
+                "reason": "disc/binary image extension can map to multiple systems; do not guess without header evidence",
+                "needs_user_input": true,
+                "required_user_input": "이 image의 시스템을 명시적으로 지정하라",
+                "candidates": ["saturn", "psx", "pce", "md", "psp", "dc", "gamecube", "wii"],
+                "markers": markers,
+            })
+        }
         other => serde_json::json!({
             "system": null,
             "confidence": "unknown_extension",
@@ -778,6 +895,7 @@ pub(super) fn adapter_for_system(system: &str) -> (&'static str, Option<&'static
         "dc" => ("flycast", None),
         "nds" => ("desmume_nds", None),
         "psp" => ("ppsspp", None),
+        "gamecube" | "wii" => ("dolphin", None),
         _ => ("", None),
     }
 }
@@ -968,6 +1086,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "Flycast renders a GUI window and needs the display awake. Rust launch uses an emucap-owned isolated config copy and forces the interpreter when needed; do not run Flycast.app directly."
         } else if adapter == "ppsspp" {
             "Headless PPSSPP boots the content positionally (not -m/--mount, which only mounts a second image) and is never passed --timeout (that flag aborts the run on a wall-clock deadline regardless of debugger activity); the Rust launch path manages the process lifecycle instead."
+        } else if adapter == "dolphin" {
+            "Dolphin is headless by default. launch(display:true) selects the compatible DolphinQt build and opens its render window. Both modes use a per-port portable runtime and --user directory."
         } else {
             "Use the Rust launch tool from this plan."
         },

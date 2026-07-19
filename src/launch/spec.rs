@@ -68,6 +68,45 @@ pub fn flycast_spec(binary: &Path, log_path: &Path, opts: &SpecOpts) -> LaunchSp
     spec.runtime_env(opts.runtime)
 }
 
+/// Dolphin (GameCube / Wii). The launcher resolves and copies the compatible native fork, then
+/// provides a per-port user directory. GUI batch mode hides only the game list while retaining the
+/// render window; the no-GUI build explicitly selects the headless window platform.
+pub fn dolphin_spec(
+    binary: &Path,
+    log_path: &Path,
+    user_dir: &Path,
+    system: &str,
+    opts: &SpecOpts,
+) -> LaunchSpec {
+    let mut spec = LaunchSpec::new(binary, log_path)
+        .args([
+            "--user".to_string(),
+            user_dir.to_string_lossy().into_owned(),
+            "--exec".to_string(),
+            opts.content.to_string(),
+            "--config=Dolphin.Interface.ConfirmStop=False".to_string(),
+            "--config=Dolphin.Interface.UsePanicHandlers=False".to_string(),
+            "--config=Dolphin.Analytics.Enabled=False".to_string(),
+            "--config=Dolphin.Analytics.PermissionAsked=True".to_string(),
+            "--config=Dolphin.DSP.Backend=No Audio Output".to_string(),
+        ])
+        .env("EMUCAP_PORT", opts.port.to_string())
+        .env("EMUCAP_CONTENT", opts.content)
+        .env("EMUCAP_SYSTEM", system);
+    if opts.headless {
+        spec = spec.arg("--platform=headless");
+    } else {
+        spec = spec.arg("--batch");
+    }
+    if let Some(name) = opts.name {
+        spec = spec.env("EMUCAP_NAME", name);
+    }
+    if let Some(token) = opts.session_token {
+        spec = spec.env("EMUCAP_SESSION_TOKEN", token);
+    }
+    spec.runtime_env(opts.runtime)
+}
+
 /// Mesen2 (SNES). The ROM and the adapter Lua script are positional args; the port, name,
 /// and content are passed via the environment. args = [rom, lua].
 pub fn mesen_spec(binary: &Path, log_path: &Path, lua: &Path, opts: &SpecOpts) -> LaunchSpec {
