@@ -1,74 +1,119 @@
-# Dolphin (GameCube / Wii) 어댑터
+# emucap — Dolphin (GameCube / Wii) adapter
 
-emucap 을 GameCube/Wii(PowerPC Gekko/Broadway)로 확장한다. **두 가지 방식**을 제공한다.
+The Dolphin adapter adds live PowerPC debugging for GameCube and Wii. The supported path is a
+repo-owned native fork: a small emucap service runs inside Dolphin and connects directly to the
+Control MCP listener over NDJSON. A legacy GDB-stub bridge remains available for manual use.
 
-| | 네이티브 포크 (권장) | GDB-스텁 브리지 |
-|---|---|---|
-| 빌드 | Dolphin 소스 빌드 필요 (`build.ps1`) | 불필요 (mainline Dolphin) |
-| CPU | JIT 가능 (빠름) | CachedInterpreter 강제 (GDB 한계) |
-| 메모리·레지스터·BP·step·pause/resume | ✅ | ✅ |
-| **savestate · screenshot · 입력(set_input)** | ✅ | ❌ (GDB RSP에 없음) |
-| 레지스터 | pc·GPR·lr·ctr·xer·msr·cr | GPR 위주 |
+`status.methods` and `status.memory_types` are authoritative for every live session.
 
-둘 다 emucap-mcp 리스너에 TCP 클라이언트로 접속해 NDJSON `{"v":1,"id","method","params"}`
-요청에 `{"id","ok","result|error"}` 로 답한다(다른 어댑터와 동일). `system:"gc"`.
+## Native adapter
 
----
+The native adapter keeps Dolphin's normal JIT for free-running execution. It temporarily switches
+to the interpreter only while servicing instruction-step requests, so
+`step(unit="instructions")` remains instruction-exact without making normal execution slow.
 
-## 1) 네이티브 포크 (풀 제어)
+The patch stack adds:
 
-emucap 서버(`EmuCap.cpp`/`.h`)를 Dolphin 소스에 임베드한다. 별도 스레드 소켓 서버가
-Dolphin 내부 API(`CPUThreadGuard`·`Memory::CopyFromEmu`·`PowerPC` 레지스터·`BreakPoints`·
-`State::Save/Load`·`FrameDumper`·`GCPad` 오버라이드)로 각 메서드를 처리한다.
+- native service startup and shutdown hooks;
+- GameCube controller override support;
+- exact PowerPC exec-breakpoint events;
+- build-system entries for the native service.
 
-**빌드:**
-```powershell
-powershell -ExecutionPolicy Bypass -File build.ps1
-# Dolphin 소스를 핀 커밋으로 클론 → EmuCap.cpp/h 배치 → patches/ 적용 → MSBuild Release x64
-# 산출물: <src>\Binary\x64\Dolphin.exe   (전제: VS2022 + MSVC + Windows SDK, Git)
+The upstream revision and patchset digest are pinned in `upstream.lock`. The launcher accepts only a
+binary whose `emucap-dolphin-build.json` sidecar matches that lock.
+
+## Build
+
+On macOS or Linux:
+
+```sh
+adapters/dolphin/build.sh
 ```
 
-**실행:**
-```powershell
-# emucap-mcp status 로 listening_port 확보 후:
-powershell -ExecutionPolicy Bypass -File launch-native.ps1 "<ISO>" <EMUCAP_PORT>
+The script checks out the pinned Dolphin revision under `adapters/dolphin/work`, applies the patch
+stack, and builds:
+
+- `dolphin-emu-nogui` for the default headless path;
+- `DolphinQt` for `display=true`, when the Qt dependencies are available.
+
+The headless target is required. The GUI target is best-effort and may be skipped with
+`EMUCAP_DOLPHIN_BUILD_GUI=0`.
+
+`build.ps1` is a legacy Windows build helper. It is not yet part of the metadata-checked native
+launcher path; Windows native launch therefore remains unverified.
+
+## Launch
+
+Use the MCP launcher:
+
+```text
+launch(content_path="<game.iso|game.gcm|game.rvz|game.wbfs>", system="gamecube")
+launch(content_path="<game.wbfs|game.iso|game.rvz>", system="wii")
 ```
-`launch-native.ps1` 은 세션 토큰/포트/콘텐츠를 환경변수(EMUCAP_PORT / EMUCAP_SESSION_TOKEN /
-EMUCAP_NAME / EMUCAP_CONTENT)로 넘겨 포크 Dolphin 을 `--batch --exec` 로 띄운다. 포크의
-`EmuCap::Start`(EMUCAP_PORT 있을 때만) 가 리스너로 접속한다. 브리지 프로세스·GDB 불필요.
 
-**패치 파일**(`patches/`, Dolphin 415ec4de 기준):
-- `DolphinLib.props.patch` — EmuCap.cpp/h 를 프로젝트에 등록
-- `Core.cpp.patch` — EmuThread(run loop 직전)에 `EmuCap::Start`/Stop 훅
-- `GCPad.cpp.patch` — `GetStatus` 폴 지점에 `EmuCap::ApplyInputOverride` (set_input)
+GameCube and Wii share several container extensions. Pass `system` explicitly when media inference
+cannot distinguish them.
 
-**제공 메서드:** read/write_memory · get_state · pause · resume · step · set/clear/list_breakpoint ·
-poll_events · save_state · load_state · screenshot · set_input.
-- `memory_type: main`(MEM1), **address 는 절대 EA**(0x8000_0000 기반, 디스어셈블 그대로).
-- `set_input`: 버튼명 A/B/X/Y/START/Z/L/R/UP/DOWN/LEFT/RIGHT + stickX/Y·substickX/Y·triggerL/R.
-  빈 배열이면 중립(뗌). GCPad::GetStatus 에서 덮으므로 running·frozen 무관하게 결정론적.
-- `screenshot`: 다음 present 에 임시 PNG 저장→읽어 `png_base64` 반환(코어 실행 중일 때).
+Headless mode is the default. `display=true` selects the compatible DolphinQt build and opens its
+render window. Both modes run from an emucap-owned portable copy with a per-port `--user`
+directory, leaving an installed Dolphin and its profile untouched. Audio output is disabled.
 
-## 2) GDB-스텁 브리지 (빌드 없이)
+Follow the normal connection sequence:
 
-mainline Dolphin 내장 GDB 스텁을 `emucap-gdb-bridge.py` 로 중계한다. 포크/빌드 불필요.
+1. Call `bootstrap`.
+2. Call `launch_plan` with the content path and system.
+3. Call `status` immediately before `launch`.
+4. After launch returns, call `status` again and use only the reported methods and memory types.
 
-**실행:**
-```powershell
-powershell -ExecutionPolicy Bypass -File launch.ps1 "<ISO>" <EMUCAP_PORT>
-```
-Dolphin.ini 에 `GDBPort=2159`, `CPUCore=5`(CachedInterpreter; JIT 는 GDB 미지원)를 심고
-`--batch --exec` 로 띄운 뒤 GDB 포트가 열리면 브리지를 붙인다. GDB 스텁은 **단발**(첫 클라이언트
-분리 시 리스너를 닫음)이라 브리지가 유일한 지속 클라이언트여야 한다 — 별도 GDB 접속 금지.
+## Tool surface
 
-## 공통 주의
+The native adapter currently advertises:
 
-- **ISO 경로는 반드시 인용**한다. 공백이 있으면 잘려 "파일 없음" 경고로 부팅 실패한다.
-- 이미 떠 있는 Dolphin 인스턴스는 건드리지 않는다(다중 세션 안전). 이 스크립트가 띄운 pid 만
-  `<user>\dolphin.pid` 로 추적한다.
+- `read_memory`, `write_memory`;
+- `get_state`, `status`;
+- `pause`, `resume`, instruction-unit `step`;
+- `set_breakpoint`, `clear_breakpoint`, `list_breakpoints`, `poll_events`;
+- GameCube only: `set_input`.
 
-## 이 어댑터가 만들어진 이유
+It does not currently advertise savestates, screenshots, frame stepping, read/write watchpoints,
+tracing, call stacks, or Wii input injection. These methods must not be inferred from dormant
+handler code.
 
-GameCube Biohazard 4 일본판 MDT 텍스트가 병렬 2-스트림(디인터리버 `0x800B01B8`)으로 저장돼
-정적 디코드가 뒤섞인다. 런타임에 그 출력 버퍼를 덤프해 base 텍스트를 확정하려면 GameCube 라이브
-제어가 필요했고, emucap 이 GC 를 지원하지 않아 이 어댑터를 추가했다.
+The adapter does not yet publish a feature-contract declaration, so the Control MCP reports its
+contract state as `unreported`. Its atomic methods remain available, but contract-gated composite
+tools are not admitted.
+
+### Memory and registers
+
+`memory_type="main"` uses absolute PowerPC effective addresses, such as `0x80000000`. `get_state`
+returns `pc`, all 32 general-purpose registers, `lr`, `ctr`, `xer`, `msr`, and `cr`.
+
+### Execution
+
+`pause` synchronously reaches a frozen CPU boundary. Instruction stepping starts from that frozen
+state and returns frozen. Frame-unit stepping is unsupported.
+
+### Breakpoints
+
+Only exact-address exec breakpoints are supported. On a hit, Dolphin freezes before the matching
+instruction and `poll_events` returns the adapter breakpoint ID together with the exact address and
+PC. Adding or removing a breakpoint clears the relevant JIT cache state so an already compiled
+block cannot bypass it.
+
+### GameCube input
+
+GameCube controller port 0 accepts lowercase `a`, `b`, `x`, `y`, `z`, `l`, `r`, `start`, `up`,
+`down`, `left`, and `right`. `set_input([])` releases the override and returns control to Dolphin's
+native input path. Other ports and unknown buttons fail before changing the active override.
+
+Wii input is not advertised.
+
+## Legacy GDB-stub bridge
+
+`emucap-gdb-bridge.py` can relay Dolphin's built-in PowerPC GDB stub to the emucap wire protocol.
+This path does not require the native fork, but it forces a non-JIT CPU core and exposes a smaller,
+less precise surface. It is not integrated with the preferred cross-platform MCP launcher.
+
+The PowerShell launch scripts are retained for this manual Windows workflow. They must be given the
+current listener port; do not assume a fixed port, and do not attach another GDB client because
+Dolphin's stub accepts a single persistent debugger connection.
