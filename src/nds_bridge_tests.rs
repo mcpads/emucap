@@ -11,6 +11,10 @@ struct FakeGdb {
     fail_interrupt: bool,
     /// When set, `recv_nonblocking()` returns an error — models a drain-stops socket failure.
     fail_nonblocking: bool,
+    interrupts: usize,
+    /// Stop packets that become readable only after the next continue packet. This models a
+    /// breakpoint reached by resumed execution without pretending the stop existed beforehand.
+    nonblocking_after_continue: VecDeque<String>,
 }
 
 impl FakeGdb {
@@ -46,10 +50,15 @@ impl GdbTransport for FakeGdb {
 
     fn send_no_reply(&mut self, payload: &str) -> Result<(), GdbError> {
         self.calls.push(payload.into());
+        if payload == "c" {
+            self.nonblocking
+                .append(&mut self.nonblocking_after_continue);
+        }
         Ok(())
     }
 
     fn interrupt(&mut self) -> Result<String, GdbError> {
+        self.interrupts += 1;
         if self.fail_interrupt {
             return Err(GdbError::Emulator("fake interrupt failure".into()));
         }
@@ -429,6 +438,27 @@ fn reset_while_running_halts_core_without_resuming() {
 }
 
 #[test]
+fn reset_while_both_running_stops_scheduler_through_arm9_only() {
+    let arm9 = FakeGdb::with(&[("?", "S05"), ("QEmucap,reset", "OK")]);
+    let arm7 = FakeGdb::with(&[("?", "S05")]);
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
+    bridge.arm9.frozen = false;
+    bridge.arm7.as_mut().unwrap().frozen = false;
+
+    let response = bridge.handle_request(Request::new(9, "reset", json!({})));
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(response.result.unwrap()["state"], "frozen");
+    assert!(bridge.arm9.frozen);
+    let arm7 = bridge.arm7.as_ref().unwrap();
+    assert!(arm7.frozen);
+    assert_eq!(
+        arm7.gdb.calls,
+        vec!["?".to_string()],
+        "global reset must not issue a second-core interrupt"
+    );
+}
+
+#[test]
 fn reset_from_frozen_completes_without_resuming() {
     // The normal path (already frozen) must still work and never emit a resume.
     let mut bridge = bridge_arm9_only(&[("?", "S05"), ("QEmucap,reset", "OK")]);
@@ -792,7 +822,11 @@ fn timed_input_interruption_releases_override_before_reply() {
     ]);
     // The request starts frozen, arms input, then resumes. A real stop waiting at the first
     // terminal-status poll must halt the core and force a release before interrupted returns.
-    bridge.arm9.gdb.nonblocking.push_back("S05".into());
+    bridge
+        .arm9
+        .gdb
+        .nonblocking_after_continue
+        .push_back("S05".into());
     let response = bridge.handle_request(Request::new(
         1,
         "press_buttons",
@@ -825,7 +859,11 @@ fn timed_input_release_and_stop_same_poll_reports_interrupted() {
         ("qEmucap,inputstatus", "0"),
         ("QEmucap,input:0", "OK"),
     ]);
-    bridge.arm9.gdb.nonblocking.push_back("S05".into());
+    bridge
+        .arm9
+        .gdb
+        .nonblocking_after_continue
+        .push_back("S05".into());
 
     let response = bridge.handle_request(Request::new(
         1,
@@ -923,9 +961,9 @@ fn write_memory_rejects_error_reply() {
 }
 
 #[test]
-fn resume_defaults_to_arm9_only() {
-    // ARM9-primary: continuing both cores is racy in DeSmuME's lockstep (the un-broken core
-    // drags the broken one past its breakpoint), so a bare resume continues only ARM9.
+fn resume_uses_one_arm9_packet_and_marks_the_shared_scheduler_running() {
+    // One ARM9 `c` packet resumes DeSmuME's global scheduler. The fork synchronizes ARM7's stub
+    // state without requiring a second packet, so both bridge-visible CPU states must change.
     let mut bridge = NdsBridge::new(
         FakeGdb::with(&[("?", "S05")]),
         Some(FakeGdb::with(&[("?", "S05")])),
@@ -935,14 +973,105 @@ fn resume_defaults_to_arm9_only() {
     assert!(response.ok);
     let cpus = response.result.unwrap()["cpus"].clone();
     assert_eq!(cpus.get("arm9").and_then(|v| v.as_str()), Some("running"));
-    assert!(
-        cpus.get("arm7").is_none(),
-        "arm7 must not resume by default"
+    assert_eq!(cpus.get("arm7").and_then(|v| v.as_str()), Some("running"));
+    assert_eq!(
+        bridge.arm7.as_ref().unwrap().gdb.calls,
+        vec!["?".to_string()],
+        "the sibling endpoint must not receive a second continue packet"
     );
 }
 
 #[test]
-fn resume_both_opts_into_dual_continue() {
+fn pause_uses_one_arm9_interrupt_and_marks_the_shared_scheduler_frozen() {
+    // Pausing ARM9 stops global execution. The fork silently synchronizes ARM7's stub state, and
+    // the bridge must not send a second interrupt that cannot run after the scheduler has stopped.
+    let mut bridge = NdsBridge::new(
+        FakeGdb::with(&[("?", "S05")]),
+        Some(FakeGdb::with(&[("?", "S05")])),
+        GdbBridgeEnv::default(),
+    );
+    bridge.arm9.frozen = false;
+    bridge.arm7.as_mut().unwrap().frozen = false;
+    let response = bridge.handle_request(Request::new(1, "pause", json!({})));
+    assert!(response.ok, "{:?}", response.error);
+    let cpus = response.result.unwrap()["cpus"].clone();
+    assert_eq!(cpus.get("arm9").and_then(Value::as_str), Some("frozen"));
+    assert_eq!(cpus.get("arm7").and_then(Value::as_str), Some("frozen"));
+    assert!(bridge.arm9.frozen);
+    let arm7 = bridge.arm7.as_ref().unwrap();
+    assert!(arm7.frozen);
+    assert_eq!(
+        arm7.gdb.calls,
+        vec!["?".to_string()],
+        "the sibling endpoint must not receive a second interrupt"
+    );
+
+    let status = bridge
+        .handle_request(Request::new(2, "status", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(status["state"], "frozen");
+    assert_eq!(status["cpus"]["arm7"]["state"], "frozen");
+}
+
+#[test]
+fn pause_drains_a_sibling_breakpoint_before_issuing_an_interrupt() {
+    // ARM7 can hit a breakpoint between requests. Its stop packet proves the shared scheduler is
+    // already frozen; a second ARM9 interrupt would wait forever on a stopped target.
+    let arm9 = FakeGdb::with(&[("?", "S05")]);
+    let arm7 = FakeGdb::with(&[("?", "S05")]);
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
+    bridge.arm9.frozen = false;
+    let arm7 = bridge.arm7.as_mut().unwrap();
+    arm7.frozen = false;
+    arm7.gdb
+        .nonblocking
+        .push_back("T05hwbreak:03800000;".into());
+
+    let response = bridge.handle_request(Request::new(3, "pause", json!({})));
+    assert!(response.ok, "{:?}", response.error);
+    assert!(bridge.arm9.frozen);
+    let arm7 = bridge.arm7.as_ref().unwrap();
+    assert!(arm7.frozen);
+    assert_eq!(
+        bridge.arm9.gdb.interrupts, 0,
+        "an already-stopped scheduler must not receive another interrupt"
+    );
+    assert_eq!(arm7.events.len(), 1, "the ARM7 breakpoint must be retained");
+}
+
+#[test]
+fn resume_drains_a_sibling_breakpoint_then_restarts_the_scheduler_once() {
+    let arm9 = FakeGdb::with(&[("?", "S05")]);
+    let arm7 = FakeGdb::with(&[("?", "S05")]);
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
+    bridge.arm9.frozen = false;
+    let arm7 = bridge.arm7.as_mut().unwrap();
+    arm7.frozen = false;
+    arm7.gdb
+        .nonblocking
+        .push_back("T05hwbreak:03800000;".into());
+
+    let response = bridge.handle_request(Request::new(4, "resume", json!({})));
+    assert!(response.ok, "{:?}", response.error);
+    assert!(!bridge.arm9.frozen);
+    let arm7 = bridge.arm7.as_ref().unwrap();
+    assert!(!arm7.frozen);
+    assert_eq!(
+        bridge
+            .arm9
+            .gdb
+            .calls
+            .iter()
+            .filter(|call| call.as_str() == "c")
+            .count(),
+        1
+    );
+    assert_eq!(arm7.events.len(), 1, "the ARM7 breakpoint must be retained");
+}
+
+#[test]
+fn resume_both_is_a_single_packet_shared_scheduler_alias() {
     let mut bridge = NdsBridge::new(
         FakeGdb::with(&[("?", "S05")]),
         Some(FakeGdb::with(&[("?", "S05")])),
@@ -953,6 +1082,10 @@ fn resume_both_opts_into_dual_continue() {
     let cpus = response.result.unwrap()["cpus"].clone();
     assert_eq!(cpus.get("arm9").and_then(|v| v.as_str()), Some("running"));
     assert_eq!(cpus.get("arm7").and_then(|v| v.as_str()), Some("running"));
+    assert_eq!(
+        bridge.arm7.as_ref().unwrap().gdb.calls,
+        vec!["?".to_string()]
+    );
 }
 
 #[test]
@@ -1229,11 +1362,9 @@ fn dump_memory_short_read_fails_without_partial_bin() {
 }
 
 #[test]
-fn shared_read_freezes_running_arm7_then_restores_it() {
-    // `main` is shared Main RAM both cores write. ARM7 is an independent core that HITL resumes
-    // alongside ARM9, so a bulk read (find_pattern/dump_memory) must freeze ARM7 too — else a
-    // running ARM7 mutates `main` mid-read and tears the snapshot. A running ARM7 must be paused
-    // for the read and restored to running after (proven by the resume `c` it receives).
+fn shared_read_stops_scheduler_once_and_restores_both_running_states() {
+    // Both CPU endpoints are logically running, but one ARM9 interrupt stops DeSmuME's shared
+    // scheduler. ARM7 must not receive a second interrupt/continue while the scheduler is stopped.
     let arm9 = FakeGdb::with(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
     let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
@@ -1246,9 +1377,10 @@ fn shared_read_freezes_running_arm7_then_restores_it() {
     ));
     assert!(resp.ok, "{:?}", resp.error);
     let a7 = bridge.arm7.as_ref().unwrap();
-    assert!(
-        a7.gdb.calls.iter().any(|c| c == "c"),
-        "a running ARM7 must be frozen for the shared read and resumed after: {:?}",
+    assert_eq!(
+        a7.gdb.calls,
+        vec!["?".to_string()],
+        "ARM7 must not receive a redundant interrupt/continue: {:?}",
         a7.gdb.calls
     );
     assert!(
@@ -1262,13 +1394,11 @@ fn shared_read_freezes_running_arm7_then_restores_it() {
 }
 
 #[test]
-fn shared_read_leaves_already_frozen_arm7_frozen() {
-    // If ARM7 is already halted, the bulk read must not spuriously resume it (that would drift a
-    // core the agent deliberately paused). Only ARM9 is running here.
+fn shared_read_while_frozen_does_not_resume_the_scheduler() {
+    // Both endpoints start frozen. A bulk read must not spuriously resume the shared scheduler.
     let arm9 = FakeGdb::with(&[("?", "S05"), ("m2000000,8", "1122334455667788")]);
-    let arm7 = FakeGdb::with(&[("?", "S05")]); // stays frozen after the handshake
+    let arm7 = FakeGdb::with(&[("?", "S05")]);
     let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
-    bridge.arm9.frozen = false;
     let resp = bridge.handle_request(Request::new(
         2,
         "find_pattern",
@@ -1276,7 +1406,8 @@ fn shared_read_leaves_already_frozen_arm7_frozen() {
     ));
     assert!(resp.ok, "{:?}", resp.error);
     let a7 = bridge.arm7.as_ref().unwrap();
-    assert!(a7.frozen, "an already-frozen ARM7 must stay frozen");
+    assert!(bridge.arm9.frozen, "ARM9 must remain frozen");
+    assert!(a7.frozen, "ARM7 must remain frozen");
     assert!(
         !a7.gdb.calls.iter().any(|c| c == "c"),
         "an already-frozen ARM7 must not be resumed by a shared read: {:?}",
@@ -1365,13 +1496,9 @@ fn write_memory_chunks_large_write_into_buffer_sized_packets() {
 }
 
 #[test]
-fn shared_main_write_leaves_running_arm7_untouched() {
-    // A `main` (shared Main RAM) write freezes ONLY the routed ARM9, never the sibling ARM7.
-    // Freezing both cores would guard a running ARM7 against a partially-applied multi-packet
-    // write, but the only interrupt available is 0x03 + a `?` query whose retransmits burst SIGINT
-    // echoes: pausing ARM7 on every write desyncs later reads into multi-second stalls and can
-    // leave ARM7 pinned "frozen" after a resume. A correct running debugger state beats a
-    // theoretical tearing guard, so a HITL-resumed ARM7 keeps running: no interrupt, no `c`.
+fn shared_main_write_uses_one_global_scheduler_stop() {
+    // A Main RAM write pauses the routed ARM9 endpoint. That stops DeSmuME's shared scheduler, so
+    // the ARM7 endpoint must not receive a second interrupt while global execution is stopped.
     let size = MAX_WRITE_CHUNK + 0x10;
     let hexstr = "ab".repeat(size);
     let hex1 = "ab".repeat(MAX_WRITE_CHUNK);
@@ -1397,17 +1524,16 @@ fn shared_main_write_leaves_running_arm7_untouched() {
     assert!(response.ok, "{:?}", response.error);
     assert_eq!(response.result.unwrap()["written"], size);
 
-    // ARM7 is never touched by the write: it keeps running and sees nothing past the construction
-    // handshake `?` — no interrupt, no resume `c`.
+    // ARM7's debugger state stays running; global execution was guarded by ARM9's scheduler stop.
     let a7 = bridge.arm7.as_ref().unwrap();
     assert!(
         !a7.frozen,
-        "a running ARM7 must stay running across a shared-Main write"
+        "a running ARM7 must remain logically running across a shared-Main write"
     );
     assert_eq!(
         a7.gdb.calls,
         vec!["?".to_string()],
-        "a shared-Main write must not send ARM7 anything past the handshake: {:?}",
+        "a shared-Main write must not issue a second-core interrupt/continue: {:?}",
         a7.gdb.calls
     );
 
@@ -1437,10 +1563,8 @@ fn shared_main_write_leaves_running_arm7_untouched() {
 
 #[test]
 fn shared_read_does_not_phantom_freeze_arm7_when_stale_sigint_drains_after_resume() {
-    // A shared bulk READ (find_pattern/dump) still runs under with_all_cores_frozen, which pauses
-    // then resumes a running ARM7 (`c`). But a SIGINT (S02) — a residual async interrupt echo —
-    // then surfaces on ARM7's socket, and the NEXT drain_stops (status/poll) reads it. It must be
-    // dropped WITHOUT flipping the genuinely-running, already-resumed ARM7 back to "frozen".
+    // A shared bulk read stops the scheduler through ARM9 only. If a delayed SIGINT nevertheless
+    // surfaces on ARM7's socket, it must not flip the logically-running ARM7 to "frozen".
     // note_stop keys `frozen` off reportable stops only (S05), never our SIGINT (S02); the pause/
     // resume bookkeeping owns frozen explicitly. Before that fix, this stale S02 pinned ARM7
     // "frozen" (pc pinned) even though the core was running — the exact live shared-write symptom.
@@ -1460,11 +1584,12 @@ fn shared_read_does_not_phantom_freeze_arm7_when_stale_sigint_drains_after_resum
         json!({"memory_type": "main", "start": 0, "length": 8, "hex": "55"}),
     ));
     assert!(r.ok, "{:?}", r.error);
-    // The shared read paused+resumed ARM7 (proven by the `c`), leaving it running.
+    // The shared read leaves ARM7's endpoint untouched and logically running.
     let a7 = bridge.arm7.as_ref().unwrap();
-    assert!(
-        a7.gdb.calls.iter().any(|c| c == "c"),
-        "shared read must resume ARM7: {:?}",
+    assert_eq!(
+        a7.gdb.calls,
+        vec!["?".to_string()],
+        "shared read must not interrupt ARM7: {:?}",
         a7.gdb.calls
     );
     assert!(
@@ -1494,10 +1619,9 @@ fn shared_read_does_not_phantom_freeze_arm7_when_stale_sigint_drains_after_resum
 }
 
 #[test]
-fn nonshared_write_does_not_freeze_running_arm7() {
-    // A per-core write (memory_type=arm9) must NOT pause the sibling ARM7 — freezing every core
-    // on every write would needlessly halt a HITL-resumed ARM7. Only the routed core is frozen
-    // for the write and resumed after; ARM7 is left untouched.
+fn routed_write_uses_one_endpoint_and_restores_running_state() {
+    // A per-core write uses the routed ARM9 endpoint to stop and restart the shared scheduler.
+    // ARM7's socket is intentionally untouched; both bridge states remain running afterwards.
     let arm9 = FakeGdb::with(&[("?", "S05"), ("M2000000,4:deadbeef", "OK")]);
     let arm7 = FakeGdb::with(&[("?", "S05")]);
     let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
@@ -1510,7 +1634,7 @@ fn nonshared_write_does_not_freeze_running_arm7() {
     ));
     assert!(response.ok, "{:?}", response.error);
     let a7 = bridge.arm7.as_ref().unwrap();
-    assert!(!a7.frozen, "ARM7 stays running for a non-shared write");
+    assert!(!a7.frozen, "ARM7 must be labeled running after the write");
     assert_eq!(
         a7.gdb.calls,
         vec!["?".to_string()],
@@ -1530,35 +1654,6 @@ fn write_memory_rejects_length_over_cap() {
     ));
     assert!(!r.ok);
     assert_eq!(r.error.unwrap().kind, "bad_params");
-}
-
-#[test]
-fn shared_read_arm7_pause_failure_resumes_arm9() {
-    // with_all_cores_frozen pauses ARM9 first, then ARM7. If ARM7's pause errors, the helper must
-    // roll back the ARM9 pause it injected — otherwise a failed find_pattern/dump_memory leaves
-    // ARM9 wrongly frozen. Assert ARM9 ends running (a resume `c` was sent) and the error surfaces.
-    let arm9 = FakeGdb::with(&[("?", "S05")]);
-    let mut arm7 = FakeGdb::with(&[("?", "S05")]);
-    arm7.fail_interrupt = true; // ARM7's pause (SIGINT) will error
-    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
-    bridge.arm9.frozen = false; // both running (HITL)
-    bridge.arm7.as_mut().unwrap().frozen = false;
-    let resp = bridge.handle_request(Request::new(
-        1,
-        "find_pattern",
-        json!({"memory_type": "main", "start": 0, "length": 8, "hex": "aa"}),
-    ));
-    assert!(!resp.ok, "an ARM7 pause failure must propagate as an error");
-    assert_eq!(resp.error.unwrap().kind, "emulator_error");
-    assert!(
-        !bridge.arm9.frozen,
-        "ARM9 paused by the helper must be resumed after the ARM7 pause fails"
-    );
-    assert!(
-        bridge.arm9.gdb.calls.iter().any(|c| c == "c"),
-        "a rollback resume (continue) must be sent to ARM9: {:?}",
-        bridge.arm9.gdb.calls
-    );
 }
 
 #[test]

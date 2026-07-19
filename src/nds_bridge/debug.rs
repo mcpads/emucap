@@ -89,34 +89,16 @@ impl<G: GdbTransport> NdsBridge<G> {
         }))
     }
 
-    /// Cores to resume. DeSmuME runs the two CPUs in lockstep behind independent stubs, so
-    /// continuing BOTH lets the un-broken core drag the broken one past its breakpoint — a
-    /// nondeterministic overshoot. Continuing ARM9 alone makes ARM9 breakpoints
-    /// deterministic while ARM7 stays frozen and inspectable.
-    ///
-    /// The DEFAULT (no `cpu`) depends on the session: **HITL windowed sessions default to
-    /// `both`** because NDS input is largely read by ARM7 (the touchscreen TSC is on ARM7's SPI
-    /// bus; ARM7 also mirrors the keypad) — leaving ARM7 frozen kills the human's touch/input
-    /// while the demo (ARM9 video) keeps running. Headless (agent) sessions default to
-    /// **ARM9-primary** for deterministic breakpoints. Either way the agent can force a specific
-    /// core with `cpu:"arm9"` / `"arm7"` / `"both"`.
-    pub(super) fn resume_targets(&self, params: &Value) -> NdsResult<Vec<CpuId>> {
-        let both = || {
-            let mut targets = vec![CpuId::Arm9];
-            if self.arm7.is_some() {
-                targets.push(CpuId::Arm7);
-            }
-            targets
-        };
+    /// Select the GDB endpoint that initiates a scheduler resume. DeSmuME exposes one endpoint per
+    /// CPU but has one execution scheduler, so exactly one `c` packet resumes both CPUs and both
+    /// endpoint states. `both` remains an accepted compatibility spelling and uses ARM9.
+    pub(super) fn resume_target(&self, params: &Value) -> NdsResult<CpuId> {
         match params.get("cpu").and_then(Value::as_str) {
-            None => Ok(if hitl_display() {
-                both()
-            } else {
-                vec![CpuId::Arm9]
-            }),
-            Some("arm9") => Ok(vec![CpuId::Arm9]),
-            Some("arm7") => Ok(vec![CpuId::Arm7]),
-            Some("both") | Some("all") => Ok(both()),
+            None | Some("arm9") | Some("both") | Some("all") => Ok(CpuId::Arm9),
+            Some("arm7") if self.arm7.is_some() => Ok(CpuId::Arm7),
+            Some("arm7") => Err(NdsBridgeError::Emulator(
+                "ARM7 GDB connection is not attached".into(),
+            )),
             Some(other) => Err(NdsBridgeError::BadParams(format!(
                 "unsupported cpu: {other}; valid: arm9, arm7, both"
             ))),
@@ -133,10 +115,7 @@ impl<G: GdbTransport> NdsBridge<G> {
         // already drained from an earlier core (ARM9) stay safe in that core's queue and surface on
         // the next poll — harvesting ARM9 into a local between the two drains (the previous order)
         // would drop them when the ARM7 drain's `?` returns.
-        self.arm9.drain_stops()?;
-        if let Some(a7) = self.arm7.as_mut() {
-            a7.drain_stops()?;
-        }
+        self.drain_scheduler_stops()?;
         let mut fresh = std::mem::take(&mut self.arm9.events);
         if let Some(a7) = self.arm7.as_mut() {
             fresh.append(&mut std::mem::take(&mut a7.events));
@@ -214,25 +193,42 @@ impl<G: GdbTransport> NdsBridge<G> {
         set_event_field(event, "_enriched", json!(true));
     }
 
-    pub(super) fn pause_targets(&self, params: &Value) -> NdsResult<Vec<CpuId>> {
+    pub(super) fn pause_target(&self, params: &Value) -> NdsResult<CpuId> {
         match params.get("cpu").and_then(Value::as_str) {
-            Some("arm9") => Ok(vec![CpuId::Arm9]),
-            Some("arm7") => Ok(vec![CpuId::Arm7]),
+            None | Some("arm9") => Ok(CpuId::Arm9),
+            Some("arm7") if self.arm7.is_some() => Ok(CpuId::Arm7),
+            Some("arm7") => Err(NdsBridgeError::Emulator(
+                "ARM7 GDB connection is not attached".into(),
+            )),
             Some(other) => Err(NdsBridgeError::BadParams(format!(
                 "unsupported cpu: {other}; valid: arm9, arm7"
             ))),
-            None => {
-                let mut targets = vec![CpuId::Arm9];
-                if self.arm7.is_some() {
-                    targets.push(CpuId::Arm7);
-                }
-                Ok(targets)
-            }
         }
     }
 
-    pub(super) fn all_frozen(&self) -> bool {
-        self.arm9.frozen && self.arm7.as_ref().map(|c| c.frozen).unwrap_or(true)
+    pub(super) fn set_scheduler_frozen(&mut self, frozen: bool) {
+        self.arm9.frozen = frozen;
+        if let Some(arm7) = self.arm7.as_mut() {
+            arm7.frozen = frozen;
+        }
+    }
+
+    /// Drain asynchronous stops from both debugger endpoints before trusting either endpoint's
+    /// execution flag. A stop on one CPU halts DeSmuME's shared scheduler, so one reportable stop
+    /// makes both bridge-visible CPU states frozen. Events stay in their owning CPU queue.
+    pub(super) fn drain_scheduler_stops(&mut self) -> NdsResult<()> {
+        self.arm9.drain_stops()?;
+        if let Some(arm7) = self.arm7.as_mut() {
+            arm7.drain_stops()?;
+        }
+        if self.arm9.frozen || self.arm7.as_ref().is_some_and(|arm7| arm7.frozen) {
+            self.set_scheduler_frozen(true);
+        }
+        Ok(())
+    }
+
+    pub(super) fn primary_frozen(&self) -> bool {
+        self.arm9.frozen
     }
 
     pub(super) fn cpu_status(&self) -> Value {
@@ -296,6 +292,8 @@ impl<G: GdbTransport> NdsBridge<G> {
             "disassemble": true,
             "call_stack": true,
             "dual_cpu": true,
+            "shared_scheduler": true,
+            "default_cpu": "arm9",
             "cpus": self.connected_cpu_names(),
         })
     }

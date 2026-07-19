@@ -1,0 +1,168 @@
+diff --git a/desmume/src/gdbstub/gdbstub.cpp b/desmume/src/gdbstub/gdbstub.cpp
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -65,6 +65,11 @@
+ 
+ slock *cpu_mutex = NULL;
+ 
++// The Nintendo DS scheduler is shared by ARM9 and ARM7, while DeSmuME exposes
++// one GDB stub per CPU. Keep both states synchronized when that scheduler starts,
++// stops, or resets.
++static struct gdb_stub_state *emucap_gdb_stubs[2] = { NULL, NULL };
++
+ #ifdef __GNUC__
+ #define UNUSED_PARM( parm) parm __attribute__((unused))
+ #else
+@@ -352,7 +357,60 @@ static void infopipe_send(struct gdb_stub_state* g, int status) {
+ 	int resp = status;
+ 	if (g->info_pipe_enabled)
+ 		SEND(g->info_pipe[1], &resp, 4);
++}
++
++static void emucap_start_gdb_stubs() {
++  for (int i = 0; i < 2; i++) {
++    struct gdb_stub_state *stub = emucap_gdb_stubs[i];
++    if (stub == NULL) continue;
++
++    stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
++    stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
++    stub->main_stop_flag = 0;
++    stub->cpu_ctrl->unstall(stub->cpu_ctrl->data);
++  }
++  NDS_debug_continue();
++}
++
++static void emucap_stop_sibling_gdb_stubs(struct gdb_stub_state *source) {
++  for (int i = 0; i < 2; i++) {
++    struct gdb_stub_state *stub = emucap_gdb_stubs[i];
++    if (stub == NULL) continue;
++
++    stub->emu_stub_state = gdb_stub_state::STOPPED_EMU_GDB_STATE;
++    stub->main_stop_flag = 1;
++    if (stub == source) continue;
++
++    // The source endpoint sends the one asynchronous stop reply. Silently move
++    // its sibling to the same stopped state so it can serve debugger commands
++    // without creating a second stop packet that nobody is waiting to ACK.
++    stub->cpu_ctrl->remove_post_ex_fn(stub->cpu_ctrl->data);
++    stub->cpu_ctrl->stall(stub->cpu_ctrl->data);
++    stub->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
++    stub->stop_type = STOP_UNKNOWN;
++    stub->stop_address = 0;
++  }
++}
++
++static void emucap_reset_and_stop_gdb_stubs() {
++  NDS_Reset();
++
++  for (int i = 0; i < 2; i++) {
++    struct gdb_stub_state *stub = emucap_gdb_stubs[i];
++    if (stub == NULL) continue;
++
++    // NDS_Reset() reinitializes both CPUs and clears their debug stalls. Restore
++    // one coherent stopped state without emitting unsolicited stop packets: the
++    // QEmucap,reset caller receives the only reply that needs acknowledging.
++    stub->cpu_ctrl->remove_post_ex_fn(stub->cpu_ctrl->data);
++    stub->cpu_ctrl->stall(stub->cpu_ctrl->data);
++    stub->emu_stub_state = gdb_stub_state::STOPPED_EMU_GDB_STATE;
++    stub->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
++    stub->main_stop_flag = 1;
++    stub->stop_type = STOP_UNKNOWN;
++    stub->stop_address = 0;
++  }
+ }
+ /*
+  *
+  *
+@@ -368,6 +426,8 @@ break_execution( void *data, UNUSED_PARM(uint32_t addr), UNUSED_PARM(int thunmb)
+ 
+   /* remove the post execution function */
+   stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
++
++  emucap_stop_sibling_gdb_stubs(stub);
+ 
+   /* indicate the halt */
+   stub->stop_type = STOP_HOST_BREAK;
+@@ -389,6 +449,8 @@ step_instruction_watch( void *data, uint32_t addr, UNUSED_PARM(int thunmb)) {
+ 
+     /* remove the post execution function */
+     stub->cpu_ctrl->remove_post_ex_fn( stub->cpu_ctrl->data);
++
++    emucap_stop_sibling_gdb_stubs(stub);
+ 
+     /* indicate the halt */
+     stub->stop_type = STOP_STEP_BREAK;
+@@ -1144,9 +1206,9 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       strcpy( (char *)out_ptr, ok ? "OK" : "E01");
+       send_size = ok ? 2 : 3;
+     }
+-    // emucap reset: QEmucap,reset -> NDS_Reset (power-cycle; re-runs HLE direct-boot).
++    // emucap reset: power-cycle and leave both GDB endpoints stopped.
+     else if ( strncmp( (const char *)packet, "QEmucap,reset", 13) == 0) {
+-      NDS_Reset();
++      emucap_reset_and_stop_gdb_stubs();
+       strcpy( (char *)out_ptr, "OK");
+       send_size = 2;
+     }
+@@ -1154,13 +1216,8 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+ 
+   case 'c':
+   case 'k':
+-	stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
+-    stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
+-    stub->main_stop_flag = 0;
+-    send_reply = 0;
+-    /* remove the cpu stall */
+-    stub->cpu_ctrl->unstall( stub->cpu_ctrl->data);
+-	NDS_debug_continue();
++    send_reply = 0;
++    emucap_start_gdb_stubs();
+ 	infopipe_send(stub, 1);
+     break;
+ 
+@@ -1177,15 +1234,9 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+                                         step_instruction_watch,
+                                         stub);
+ 
+-    stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
+-    stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
+-    stub->main_stop_flag = 0;
+     send_reply = 0;
+ 
+-    /* remove the cpu stall */
+-    stub->cpu_ctrl->unstall( stub->cpu_ctrl->data);
+-	//NDS_debug_step();
+-	NDS_debug_continue();
++    emucap_start_gdb_stubs();
+ 	infopipe_send(stub, 2);
+     break;
+   }
+@@ -1622,6 +1673,7 @@ check_breaks_gdb( struct gdb_stub_state *gdb_state,
+         /* stall the processor */
+         gdb_state->cpu_ctrl->stall( gdb_state->cpu_ctrl->data);
+ 		NDS_debug_break();
++        emucap_stop_sibling_gdb_stubs(gdb_state);
+ 
+ 
+         /* indicate the break to the GDB stub thread */
+@@ -2080,6 +2132,11 @@ createStub_gdb( uint16_t port,
+   else {
+     delete stub;
+     stub = NULL;
++  }
++
++  if (stub != NULL) {
++    if (theCPU == &NDS_ARM9) emucap_gdb_stubs[0] = stub;
++    else if (theCPU == &NDS_ARM7) emucap_gdb_stubs[1] = stub;
+   }
+ 
+   return stub;
+@@ -2092,6 +2149,8 @@ destroyStub_gdb( gdbstub_handle_t instance) {
+ 
+   struct gdb_stub_state *stub = (struct gdb_stub_state *)instance;
+   armcpu_t *theCPU = (armcpu_t *)stub->arm_cpu_object;
++  if (theCPU == &NDS_ARM9 && emucap_gdb_stubs[0] == stub) emucap_gdb_stubs[0] = NULL;
++  else if (theCPU == &NDS_ARM7 && emucap_gdb_stubs[1] == stub) emucap_gdb_stubs[1] = NULL;
+ 
+   causeQuit_gdb( stub);
+   

@@ -30,7 +30,8 @@ adapters/desmume-nds/build.sh
 Clones TASEmulators/desmume into an emucap-owned work tree (`adapters/desmume-nds/work`) pinned to a
 known-good commit, applies the patch stack in order (`0001` headless → `0002` screenshot/input →
 `0003` savestate/disasm → `0004` reset → `0005` touch → `0006` GDB buffers → `0007` input status →
-`0008` GDB I/O deadlines → `0009` SIGPIPE suppression), and builds `desmume-cli` with meson
+`0008` GDB I/O deadlines → `0009` SIGPIPE suppression → `0010` shared-scheduler GDB state),
+and builds `desmume-cli` with meson
 (`-Dfrontend-cli -Dgdb-stub`; the gdb-stub build disables the JIT and runs the interpreter). Because
 later patches extend the same `gdbstub.cpp` regions, build.sh resets the tree and re-applies the whole
 stack every build. Point it at a read-only upstream checkout with `EMUCAP_DESMUME_SRC=/path/to/desmume`.
@@ -112,8 +113,9 @@ adapter's `step_instructions` wire method), `set_breakpoint`
   frame0=pc, frame1=lr, and walks the ARM APCS r11 frame-pointer chain (`[fp-4]`=saved lr,
   `[fp-12]`=saved fp) via `m`. It ends shallow when the game doesn't keep r11 as a frame pointer — the
   reply carries `method:"lr+fp-walk (best-effort)"`, a `note`, and an `in_code_region` flag per frame.
-- `reset` — the fork's `QEmucap,reset` calls DeSmuME `NDS_Reset` (a power cycle). Both cores return to
-  the HLE direct-boot entry (PC=`0x02000800`) and stay halted (stub breakpoints survive the reset).
+- `reset` — the fork's `QEmucap,reset` calls DeSmuME `NDS_Reset` (a power cycle). ARM9 returns to
+  `0x02000800`, ARM7 returns to `0x02380000`, and both stay halted (stub breakpoints survive the
+  reset).
 
 **Not yet supported (needs more fork hooks)**: `run_frames` (a frame counter), `watch_register`,
 `set_trace` / `get_trace`, `break_on_reset`. `status.capability_notes` is authoritative — the
@@ -121,18 +123,21 @@ interface doesn't accumulate caveats: names are shared, availability is in `stat
 
 ## Dual-CPU execution model (important)
 
-DeSmuME runs ARM9/ARM7 in lockstep, but the GDB stubs are independent per CPU. **Continuing both CPUs
-at once races: the un-broken CPU drags the broken one past its breakpoint.** So `resume` continues
-**only ARM9 (the main CPU) by default** — ARM9 breakpoints are then deterministic, and ARM7 stays
-frozen so its memory and registers read cleanly.
+DeSmuME exposes separate ARM9 and ARM7 GDB endpoints, but both CPUs share one execution scheduler.
+They therefore transition together: a session is either running on both CPUs or frozen on both.
+The fork keeps both stub states synchronized without sending duplicate stop packets.
 
-- `resume` (default) → ARM9 only. An exec BP hits deterministically at the exact address.
-- `resume(cpu:"arm7")` → ARM7 only.
-- `resume(cpu:"both")` → both (racy — no deterministic BP guarantee). Only for stretches where ARM7
-  must actually run, e.g. reading the touchscreen for human-in-the-loop input.
+- `resume` and `pause` use the ARM9 endpoint by default and change both CPUs' execution state.
+- `cpu:"arm7"` selects the ARM7 debugger endpoint for the operation; it does not create an
+  independently running ARM7.
+- `resume(cpu:"both")` remains a compatibility alias. It sends one ARM9 continue packet, not one
+  packet per endpoint.
+- A breakpoint or instruction step on either CPU stops the shared scheduler and leaves both
+  endpoints available for inspection.
 
-Reads, writes, registers, and stepping all work with both CPUs frozen. Pick the target CPU with
-`memory_type` / `cpu`.
+Reads, writes, registers, disassembly, breakpoints, and stepping are still routed to a selected CPU.
+A temporary routed stop guards shared Main RAM without a second interrupt, then restores the
+session's prior running or frozen state. `status.cpus` reports both endpoint states explicitly.
 
 ## Operational notes
 

@@ -121,21 +121,29 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     pub(super) fn pause(&mut self, params: &Value) -> NdsResult<Value> {
-        let targets = self.pause_targets(params)?;
+        self.drain_scheduler_stops()?;
+        let target = self.pause_target(params)?;
+        if !self.primary_frozen() {
+            self.cpu_mut(target)?.pause()?;
+        }
+        self.set_scheduler_frozen(true);
         let mut states = serde_json::Map::new();
-        for cpu in targets {
-            self.cpu_mut(cpu)?.pause()?;
-            states.insert(cpu.as_str().into(), json!("frozen"));
+        states.insert("arm9".into(), json!("frozen"));
+        if self.arm7.is_some() {
+            states.insert("arm7".into(), json!("frozen"));
         }
         Ok(json!({ "state": "frozen", "cpus": Value::Object(states) }))
     }
 
     pub(super) fn resume(&mut self, params: &Value) -> NdsResult<Value> {
-        let targets = self.resume_targets(params)?;
+        self.drain_scheduler_stops()?;
+        let target = self.resume_target(params)?;
+        self.cpu_mut(target)?.resume()?;
+        self.set_scheduler_frozen(false);
         let mut states = serde_json::Map::new();
-        for cpu in targets {
-            self.cpu_mut(cpu)?.resume()?;
-            states.insert(cpu.as_str().into(), json!("running"));
+        states.insert("arm9".into(), json!("running"));
+        if self.arm7.is_some() {
+            states.insert("arm7".into(), json!("running"));
         }
         Ok(json!({ "state": "running", "cpus": Value::Object(states) }))
     }

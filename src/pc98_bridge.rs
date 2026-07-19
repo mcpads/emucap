@@ -240,11 +240,6 @@ pub struct Bridge<G> {
     bps: BTreeMap<u64, Breakpoint>,
     next_bp: u64,
     input_fields: Option<Vec<String>>,
-    /// Count of trailing interrupt-echo stops that `interrupt()` left buffered and that `note_stop`
-    /// must drop instead of surfacing as phantom poll_events. PC-98's own pause reports `S05` (same
-    /// as a breakpoint), so signal number cannot distinguish it — this counter is the equivalent of
-    /// the NDS bridge's `is_interrupt_stop` (which keys off SIGINT `S02`).
-    pending_interrupt_stops: u32,
 }
 
 impl<G: GdbTransport> Bridge<G> {
@@ -260,7 +255,6 @@ impl<G: GdbTransport> Bridge<G> {
             bps: BTreeMap::new(),
             next_bp: 1,
             input_fields: None,
-            pending_interrupt_stops: 0,
         }
     }
 

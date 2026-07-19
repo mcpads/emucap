@@ -261,8 +261,11 @@ impl GdbTransport for GdbRspClient {
         self.ensure_usable()?;
         let result = self.stream.write_all(&[0x03]);
         self.finish_io(result)?;
-        std::thread::sleep(Duration::from_millis(10));
-        self.send("?")
+        // A GDB remote interrupt is not a request packet: the stub answers the raw 0x03 byte
+        // asynchronously with a stop packet. Read and acknowledge that packet before writing
+        // anything else. Sending `?` first makes bounded stubs interpret its leading `$` as the
+        // missing ACK for the stop reply, after which they may close the connection.
+        self.recv_reply()
     }
 
     fn get_timeout(&self) -> GdbResult<Duration> {

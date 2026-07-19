@@ -27,6 +27,7 @@ PATCH6="$HERE/patches/0006-emucap-gdb-bufmax.patch"
 PATCH7="$HERE/patches/0007-emucap-input-status.patch"
 PATCH8="$HERE/patches/0008-emucap-gdb-io-deadline.patch"
 PATCH9="$HERE/patches/0009-emucap-gdb-no-sigpipe.patch"
+PATCH10="$HERE/patches/0010-emucap-shared-scheduler-state.patch"
 WORK_INPUT="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 [ ! -L "$WORK_INPUT" ] || { echo "ERROR: DeSmuME work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
 mkdir -p "$WORK_INPUT"
@@ -45,6 +46,7 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 [ -f "$PATCH7" ] || { echo "ERROR: emucap input-status patch not found: $PATCH7" >&2; exit 1; }
 [ -f "$PATCH8" ] || { echo "ERROR: emucap gdb I/O deadline patch not found: $PATCH8" >&2; exit 1; }
 [ -f "$PATCH9" ] || { echo "ERROR: emucap gdb SIGPIPE patch not found: $PATCH9" >&2; exit 1; }
+[ -f "$PATCH10" ] || { echo "ERROR: emucap shared-scheduler state patch not found: $PATCH10" >&2; exit 1; }
 
 for tool in meson ninja git; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing build tool: $tool (macOS: brew install $tool)" >&2; exit 1; }
@@ -52,7 +54,7 @@ done
 
 emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "DeSmuME"
 
-# DeSmuME upstream is pinned to a known-good revision — the patch stack (0001-0009) is written
+# DeSmuME upstream is pinned to a known-good revision — the patch stack (0001-0010) is written
 # against exactly this tree. Cloning a moving HEAD would silently build an untested revision, and any
 # upstream edit near the patch hunks would break fresh installs with no repo change. Bump this
 # deliberately (and re-verify the patch stack) when moving to a newer DeSmuME.
@@ -100,7 +102,8 @@ for entry in \
   "$PATCH6|emucap gdb-bufmax patch (0006)" \
   "$PATCH7|emucap input-status patch (0007)" \
   "$PATCH8|emucap gdb I/O deadline patch (0008)" \
-  "$PATCH9|emucap gdb SIGPIPE patch (0009)"; do
+  "$PATCH9|emucap gdb SIGPIPE patch (0009)" \
+  "$PATCH10|emucap shared-scheduler state patch (0010)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"

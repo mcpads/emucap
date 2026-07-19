@@ -24,15 +24,10 @@ impl<G: GdbTransport> Bridge<G> {
 
     pub(super) fn pause(&mut self) -> BridgeResult<Value> {
         if !self.frozen {
-            // interrupt() = 0x03 브레이크 + `?` → 스텁이 두 개의 stop(S05)을 보낸다. interrupt()가 하나를
-            // 반환값으로 소비하고 나머지 하나(우리가 만든 인터럽트 에코)가 버퍼에 남는다. pc98 에코는
-            // S05라 signal로 실제 BP 히트와 구분 불가하므로, interrupt() 전에 버퍼의 실제 pending stop
-            // (직전 pause_on_hit BP 등)을 먼저 이벤트 큐로 걷어낸다(step_instruction_count/frames_op와
-            // 동일). 그러면 카운터가 억제할 대상은 인터럽트 자신의 에코 하나뿐이라, 앞서 버퍼된 실제
-            // 히트가 카운트되어 드롭되지 않는다.
+            // Preserve a breakpoint stop that arrived just before this explicit pause. The raw
+            // 0x03 interrupt itself returns one stop packet, which the transport consumes and ACKs.
             self.drain_buffered_stops()?;
             let _ = self.gdb.interrupt()?;
-            self.pending_interrupt_stops = self.pending_interrupt_stops.saturating_add(1);
             self.frozen = true;
         }
         Ok(json!({ "state": "frozen" }))

@@ -665,8 +665,6 @@ impl<G: GdbTransport> Bridge<G> {
         for _ in 0..12 {
             match self.gdb.recv_nonblocking()? {
                 Some(stop) if is_stop_packet(&stop) => {
-                    // note_stop이 인터럽트 에코로 억제하면(true) 이 stop은 우리가 만든 에코일 뿐이므로
-                    // 프레임 명령 결과(first)로 오소비하지 않는다.
                     let suppressed = self.note_stop(stop.clone(), false);
                     if !suppressed && first.is_none() {
                         first = Some(stop);
@@ -679,16 +677,11 @@ impl<G: GdbTransport> Bridge<G> {
         Ok(first)
     }
 
-    /// stop을 이벤트 큐에 넣는다. 단, 우리가 pause/interrupt로 주입한 인터럽트 에코 stop은 async
-    /// 이벤트가 아니므로 큐에 넣으면 phantom stop으로 샌다 — interrupt()가 남긴 트레일링 stop 개수만큼
-    /// 억제한다(pc98 인터럽트는 S05라 signal로 구분 불가 — NDS is_interrupt_stop(S02)에 상응하는 카운터
-    /// 방식). 억제했으면 `true`를 반환해 호출부가 이 stop을 명령 결과로 오소비하지 않게 한다.
+    /// Record an asynchronous stop. Returns whether the packet was suppressed; the current
+    /// transport consumes and acknowledges the explicit interrupt stop itself, so ordinary
+    /// buffered stops are always reportable.
     pub(super) fn note_stop(&mut self, stop: String, enrich: bool) -> bool {
         self.frozen = true;
-        if self.pending_interrupt_stops > 0 && is_stop_packet(&stop) {
-            self.pending_interrupt_stops -= 1;
-            return true;
-        }
         let mut event = stop_event(&stop);
         if enrich {
             self.enrich_event(&mut event);

@@ -208,14 +208,10 @@ impl<G: GdbTransport> NdsBridge<G> {
     /// return to the HLE direct-boot entry and stay halted; issued on the ARM9 connection
     /// (reset is global). Stub-side breakpoints survive the reset, so `bps` is left intact.
     pub(super) fn reset(&mut self, _params: &Value) -> NdsResult<Value> {
-        // reset의 계약은 state:"frozen" — 코어를 halt 상태로 남긴다. 하지만 send_cmd는 with_frozen을 거쳐
-        // running 코어를 잠깐 pause했다가 reset 후 resume해버린다. 그러면 frozen=true는 거짓이 되고(실제 running)
-        // 다음 명령이 with_frozen을 건너뛰어 running 스텁에 나가 desync된다. 그래서 send_cmd 전에 두 코어를
-        // 명시적으로 pause해 frozen에서 보내고, reset 후에도 halt가 유지되게 한다.
+        // Reset is global and must leave the scheduler stopped. Halt it through ARM9 only: once
+        // that interrupt stops global execution, a second ARM7 interrupt cannot be serviced until
+        // execution resumes. NDS_Reset resets both CPUs, so both bridge-visible states become frozen.
         self.arm9.pause()?;
-        if let Some(a7) = self.arm7.as_mut() {
-            a7.pause()?;
-        }
         self.arm9.drain_stops()?;
         let resp = self.arm9.send_cmd("QEmucap,reset")?;
         if resp != "OK" {

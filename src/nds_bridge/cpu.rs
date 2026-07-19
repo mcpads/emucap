@@ -13,14 +13,9 @@ impl<G: GdbTransport> CpuConn<G> {
     }
 
     pub(super) fn note_stop(&mut self, stop: String) {
-        // S02(SIGINT)는 async 이벤트가 아니라 우리가 건 pause/interrupt다. 두 가지를 지운다:
-        //   1) 이벤트 큐 — with_frozen이 데이터 명령마다 pause하면 이 SIGINT가 쌓여 poll_events에서 실제 BP
-        //      히트(S05=SIGTRAP)를 가린다.
-        //   2) frozen — interrupt()는 0x03의 async stop을 소비하지만 뒤이은 `?` 조회가 만든 *중복* SIGINT가
-        //      소켓에 남는다. 그 잔류를 (이미 resume한 뒤) 나중 drain_stops가 읽어 frozen=true로 되돌리면
-        //      running 코어를 phantom freeze시킨다(공유 write 후 비-라우팅 ARM7이 그렇게 굳었다). 그래서
-        //      frozen은 reportable stop에서만 세우고, 우리 pause/interrupt의 frozen 부기는 pause()/resume()가
-        //      명시적으로 소유한다.
+        // SIGINT is the terminal response to a pause requested by this bridge, not a game event.
+        // The transport normally consumes it directly; ignoring any duplicate here also prevents
+        // a delayed backend echo from turning a resumed core into a phantom frozen state.
         if is_interrupt_stop(&stop) {
             return;
         }

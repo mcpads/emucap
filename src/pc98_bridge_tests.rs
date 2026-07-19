@@ -12,10 +12,6 @@ struct FakeGdb {
     /// `nonblocking`. Models an async stop that arrives *after* a command (e.g. a frame-target
     /// stop that coincides with a BP hit), which a pre-command drain must not see early.
     nonblocking_after: Vec<(String, String)>,
-    /// Trailing interrupt-echo stops the stub leaves buffered after a 0x03 break. `interrupt()`
-    /// enqueues these to `nonblocking` so the echo arrives *after* the interrupt, exactly as the
-    /// real stub does — a pre-interrupt drain must never mistake them for a pre-existing hit.
-    interrupt_echo: Vec<String>,
     timeout: Duration,
     timeouts: Vec<Duration>,
     interrupts: usize,
@@ -48,11 +44,6 @@ impl FakeGdb {
         self.nonblocking_after.push((trigger.into(), stop.into()));
         self
     }
-
-    fn with_interrupt_echo(mut self, echoes: &[&str]) -> Self {
-        self.interrupt_echo = echoes.iter().map(|s| (*s).into()).collect();
-        self
-    }
 }
 
 impl GdbTransport for FakeGdb {
@@ -82,11 +73,6 @@ impl GdbTransport for FakeGdb {
 
     fn interrupt(&mut self) -> GdbResult<String> {
         self.interrupts += 1;
-        // The real stub leaves its trailing echo stop(s) buffered *after* the 0x03 break, so
-        // enqueue them to nonblocking here rather than pre-seeding them ahead of the interrupt.
-        for echo in &self.interrupt_echo {
-            self.nonblocking.push_back(echo.clone());
-        }
         Ok("S05".into())
     }
 
@@ -1272,43 +1258,16 @@ fn step_framestep_drains_pre_command_stale_stop() {
 }
 
 #[test]
-fn interrupt_trailing_stop_does_not_produce_phantom_event() {
-    // pause() → interrupt() = 0x03 break + `?`, so the stub emits two S05 stops; interrupt()
-    // consumes one as its reply and leaves the other buffered (modeled by with_interrupt_echo,
-    // which enqueues it *after* the interrupt). That trailing stop is our own interrupt echo,
-    // not an async game event — the counter must suppress it so it never surfaces as a phantom.
-    let gdb =
-        FakeGdb::with(&[("?", "S05"), ("qEmucap,pollreset", "NONE")]).with_interrupt_echo(&["S05"]);
-    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
-    bridge.frozen = false; // core running, so pause() actually injects an interrupt
-    bridge.pause().unwrap();
-    bridge.resume().unwrap();
-    let response = bridge.handle_request(Request::new(70, "poll_events", json!({})));
-    let events = response.result.unwrap()["events"]
-        .as_array()
-        .unwrap()
-        .clone();
-    assert!(
-        events.is_empty(),
-        "the interrupt echo must not surface as a phantom event: {events:?}"
-    );
-}
-
-#[test]
 fn pause_preserves_real_bp_hit_buffered_before_interrupt() {
     // A pause_on_hit BP fired and its stop is buffered just before pause() injects an interrupt.
-    // The echo is S05 — indistinguishable by signal from the real hit — so pause() must drain
-    // the real hit to the event queue BEFORE arming the counter; only the interrupt's own echo
-    // then remains for the counter to suppress. Counting FIFO-first instead would drop the real
-    // hit while the bare echo surfaced as a phantom.
+    // Pause must drain that real hit to the event queue before issuing its own interrupt.
     let regs = i386_regs_hex(&[("eip", 0x1234), ("cs", 0)]);
     let gdb = FakeGdb::from_pairs(vec![
         ("?".into(), "S05".into()),
         ("qEmucap,pollreset".into(), "NONE".into()),
         ("g".into(), regs),
     ])
-    .with_nonblocking(&["T05hwbreak:00100000;idx:2"]) // real hit already buffered
-    .with_interrupt_echo(&["S05"]); // interrupt's own trailing echo, enqueued after interrupt
+    .with_nonblocking(&["T05hwbreak:00100000;idx:2"]);
     let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
     bridge.frozen = false; // core running, so pause() actually injects an interrupt
     bridge.pause().unwrap();
@@ -1325,26 +1284,6 @@ fn pause_preserves_real_bp_hit_buffered_before_interrupt() {
     );
     assert_eq!(events[0]["raw"], "T05hwbreak:00100000;idx:2");
     assert_eq!(events[0]["type"], "breakpoint_hit");
-}
-
-#[test]
-fn drain_immediate_stops_does_not_return_suppressed_echo() {
-    // A buffered interrupt echo (counted in pending_interrupt_stops) that lands as a frame
-    // command's immediate stop must be suppressed by note_stop, not returned as the frame's
-    // stop result — otherwise a completed frame is mis-reported as interrupted+frozen.
-    let gdb = FakeGdb::with(&[("?", "S05")]).with_nonblocking(&["S05"]);
-    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
-    bridge.pending_interrupt_stops = 1;
-    let stop = bridge.drain_immediate_stops().unwrap();
-    assert_eq!(
-        stop, None,
-        "a suppressed interrupt echo must not be returned as a frame stop"
-    );
-    assert!(
-        bridge.events.is_empty(),
-        "the echo must not surface as an event either"
-    );
-    assert_eq!(bridge.pending_interrupt_stops, 0, "the echo was consumed");
 }
 
 #[test]

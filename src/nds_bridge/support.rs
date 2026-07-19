@@ -55,8 +55,7 @@ pub(super) fn memory_region(name: &str) -> Option<&'static NdsRegion> {
 
 /// Resolve a request's `(cpu, absolute_address, region)` from `memory_type` + `address`/`start`.
 /// The routing CPU is the memory_type's default unless an explicit `cpu` param overrides it; the
-/// resolved region is returned so callers can honor its freeze discipline (e.g. a shared-RAM write
-/// freezes every core, not just the routed one).
+/// resolved region is returned so callers can apply its bounds and snapshot policy.
 pub(super) fn route(params: &Value, len: u64) -> NdsResult<(CpuId, u64, &'static NdsRegion)> {
     let memory_type = params
         .get("memory_type")
@@ -435,14 +434,6 @@ pub(super) fn sha1_file(path: &Path) -> std::io::Result<String> {
         hasher.update(&buf[..n]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-/// True for a HITL windowed session — the launcher sets `EMUCAP_NDS_DISPLAY=1` on the bridge when
-/// `display=true`, which flips the default resume to `both` so ARM7 (which reads NDS input) advances.
-pub(super) fn hitl_display() -> bool {
-    std::env::var("EMUCAP_NDS_DISPLAY")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
 }
 
 pub(super) fn absolute_display(path: &Path) -> String {

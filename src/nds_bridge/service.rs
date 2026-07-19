@@ -58,10 +58,7 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     pub(super) fn status(&mut self) -> NdsResult<Value> {
-        self.arm9.drain_stops()?;
-        if let Some(a7) = self.arm7.as_mut() {
-            a7.drain_stops()?;
-        }
+        self.drain_scheduler_stops()?;
         // The fork owns persistent/timed overrides, so query it instead of trusting bridge-local
         // bookkeeping that would be lost on a bridge reconnect. Older binaries remain observable=false.
         let input_override =
@@ -74,7 +71,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             "adapter": "desmume-nds-rust-gdb",
             "backend": "desmume-gdbstub",
             "debugger": true,
-            "state": if self.all_frozen() { "frozen" } else { "running" },
+            "state": if self.primary_frozen() { "frozen" } else { "running" },
             "memory_types": self.memory_type_names(),
             "contracts": crate::contracts::advertisement_value(&[
                 "nds.execution.frame-step-absent",
@@ -143,17 +140,10 @@ impl<G: GdbTransport> NdsBridge<G> {
             )));
         }
         let (cpu, addr, _region) = route(params, size as u64)?;
-        // The chunked write freezes ONLY the routed core (write_abs_hex's own with_frozen), never the
-        // sibling. Freezing every core for a shared-Main write (to guard a running ARM7 against
-        // observing a partially-applied multi-packet write) was tried and reverted: our only interrupt
-        // path is 0x03 + a `?` query, and that `?` is retransmitted while the core breaks, so ONE
-        // interrupt emits a burst of SIGINT (S02) echoes. Pausing the un-routed ARM7 on every write
-        // doubled that burst pressure and its trailing echoes desynced a later data read into a
-        // multi-second blocking-read stall AND left ARM7 pinned "frozen" after a resume — a running
-        // debugger core reported halted. A correct, running debugger state beats a purely theoretical
-        // multi-packet tearing guard on shared Main RAM, so the write freezes only the routed core and
-        // a HITL-resumed ARM7 keeps running (a torn shared-Main write is possible in principle but was
-        // never observed; bulk READS still take the all-core freeze for snapshot consistency).
+        // DeSmuME's CPU stubs have separate sockets but share one emulation scheduler. Interrupting
+        // the routed core stops that scheduler for the whole chunked write. Do not also interrupt
+        // the sibling endpoint: once the first core stops global execution, the second endpoint
+        // cannot complete another interrupt until emulation resumes and would time out.
         self.cpu_mut(cpu)?.write_abs_hex(addr, hexstr)?;
         Ok(json!({ "written": size, "cpu": cpu.as_str() }))
     }
@@ -289,12 +279,10 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     /// Read `length` bytes at region-relative `start` from `memory_type` over the routed CPU's GDB
-    /// `m` path, in bounded chunks. `main` is shared Main RAM that BOTH cores write and ARM7 is an
-    /// independent core HITL resumes alongside ARM9, so the read is taken under a freeze of *every*
-    /// attached core — a running ARM7 would otherwise mutate `main` mid-read and tear the snapshot
-    /// (false find_pattern results / an inconsistent dump). Each chunk's decoded length is checked
-    /// against the request, so a short or failed stub read errors cleanly instead of yielding
-    /// truncated bytes (dump/scan integrity).
+    /// `m` path, in bounded chunks. Both CPU endpoints share one emulation scheduler, so a single
+    /// routed interrupt stops mutation of shared Main RAM for the whole read. Each chunk's decoded
+    /// length is checked against the request, so a short or failed stub read errors cleanly instead
+    /// of yielding truncated bytes.
     pub(super) fn read_region_bytes(
         &mut self,
         memory_type: &str,
@@ -310,12 +298,12 @@ impl<G: GdbTransport> NdsBridge<G> {
                 size = region.size
             )));
         }
-        self.with_all_cores_frozen(|bridge| bridge.read_region_chunks(region, start, length))
+        self.with_shared_scheduler_frozen(|bridge| bridge.read_region_chunks(region, start, length))
     }
 
-    /// The chunked `m`-read loop for a bulk read, assuming every core is already frozen (see
-    /// `with_all_cores_frozen`). `read_abs_hex`'s own `with_frozen` is a no-op here since the core is
-    /// held, so no chunk re-pauses/resumes and the whole read is one consistent snapshot.
+    /// The chunked `m`-read loop for a bulk read, assuming the shared scheduler is already stopped
+    /// (see `with_shared_scheduler_frozen`). `read_abs_hex`'s own `with_frozen` is a no-op here since
+    /// the routed core is held, so the whole read is one consistent snapshot.
     pub(super) fn read_region_chunks(
         &mut self,
         region: NdsRegion,
@@ -344,47 +332,45 @@ impl<G: GdbTransport> NdsBridge<G> {
         Ok(out)
     }
 
-    /// Run `f` with every attached core frozen, then restore each core to its prior running/frozen
-    /// state. Used for shared-RAM bulk reads (dump_memory/find_pattern) AND shared-RAM writes
-    /// (write_memory to `main`): ARM9 and ARM7 run behind independent stubs, so freezing only the
-    /// routed core leaves the other free to mutate — or read a partially-applied write of — shared
-    /// `main` RAM mid-access. A core the bridge pauses here is resumed afterwards; a core that was
-    /// already halted — or one whose pause drained a real breakpoint stop (`pause` returns `true`) —
-    /// is left halted, so this never resumes past a genuine stop or un-pauses a deliberately frozen core.
-    pub(super) fn with_all_cores_frozen<T>(
+    /// Run `f` while DeSmuME's shared scheduler is stopped, then restore the prior logical CPU
+    /// states. Interrupting either running core stops global execution. Only one endpoint may be
+    /// interrupted: after the first stop, another endpoint cannot service a second interrupt until
+    /// execution resumes.
+    pub(super) fn with_shared_scheduler_frozen<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> NdsResult<T>,
     ) -> NdsResult<T> {
-        let resume_arm9 = if self.arm9.frozen {
-            false
-        } else {
-            !self.arm9.pause()?
-        };
-        // ARM7's pause can fail. ARM9 is already paused above, so a bare `?` here would return with
-        // ARM9 left wrongly frozen after a failed find_pattern/dump_memory. Roll back the ARM9 pause
-        // this helper injected before propagating the error.
-        let arm7_running = self.arm7.as_ref().is_some_and(|a7| !a7.frozen);
-        let resume_arm7 = if arm7_running {
-            match self.arm7.as_mut().expect("checked running above").pause() {
-                Ok(drained_reportable) => !drained_reportable,
-                Err(e) => {
-                    if resume_arm9 {
-                        let _ = self.arm9.resume();
-                    }
-                    return Err(e);
-                }
+        let paused = if !self.arm9.frozen {
+            if self.arm9.pause()? {
+                None
+            } else {
+                Some(CpuId::Arm9)
+            }
+        } else if self.arm7.as_ref().is_some_and(|arm7| !arm7.frozen) {
+            if self
+                .arm7
+                .as_mut()
+                .expect("checked attached ARM7 above")
+                .pause()?
+            {
+                None
+            } else {
+                Some(CpuId::Arm7)
             }
         } else {
-            false
+            None
         };
         let r = f(self);
-        if resume_arm7 {
-            if let Some(a7) = self.arm7.as_mut() {
-                let _ = a7.resume();
+        match paused {
+            Some(CpuId::Arm9) => {
+                let _ = self.arm9.resume();
             }
-        }
-        if resume_arm9 {
-            let _ = self.arm9.resume();
+            Some(CpuId::Arm7) => {
+                if let Some(arm7) = self.arm7.as_mut() {
+                    let _ = arm7.resume();
+                }
+            }
+            None => {}
         }
         r
     }
@@ -443,6 +429,7 @@ impl<G: GdbTransport> NdsBridge<G> {
         let cpu = cpu_from_params(params)?;
         let conn = self.cpu_mut(cpu)?;
         let state = conn.step_instructions_and_read_state(count, budget)?;
+        self.set_scheduler_frozen(true);
         let pc = state.get("cpu.pc").and_then(Value::as_u64);
         Ok(json!({
             "status": "completed",
