@@ -172,7 +172,8 @@ debugger halt to service requests without advancing the guest.
   local directory excluded from version control, applies the GPLv3 patch stack, and builds locally;
   no emulator binary is distributed. Per-system Lua entries cover them (65816 for SNES,
   Z80 for Game Gear / Master System, SM83 for Game Boy / GBC, ARM7 for GBA, 6502 for
-  NES). An unmodified Mesen build is rejected for live control because it lacks `codeBreakIdle`.
+  NES). An unmodified Mesen build is rejected for live control because it lacks the patched native
+  halt service and safe savestate event.
   GBA needs a real BIOS (`gba_bios.bin`, not committed); SNES / Game Gear / GB /
   GBC / NES need none. → `adapters/mesen2/README.md`
 - **Mednafen (Saturn · PSX · PCE · MD · WonderSwan/WSC)** — build the fork with

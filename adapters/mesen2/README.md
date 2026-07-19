@@ -11,8 +11,7 @@ the macOS/Linux difference if that is the user's system.
 ## 1. Build the compatible MesenCE host
 
 Live control requires the compatible MesenCE 2.2.1 host built by this repository. Unmodified Mesen
-does not expose the native `codeBreakIdle` service event and is rejected with
-`mesen-patch-required`.
+does not expose the native halt service events and is rejected with `mesen-patch-required`.
 
 ```bash
 adapters/mesen2/build.sh
@@ -23,17 +22,18 @@ POSIX build needs the upstream Mesen prerequisites (C++ toolchain, SDL2, and .NE
 script uses Homebrew's keg-only `dotnet@8` automatically when present.
 
 The build scripts fetch the commit pinned in `upstream.lock`, apply every patch in the declared order
-after `git apply --check`, and build only inside ignored `adapters/mesen2/work/`. `EMUCAP_MESEN_SRC`
-may name a local git checkout, but it is used only as a read-only clone origin. The output sidecar
-records the upstream commit, host API, and patch-set digest. This repository distributes source,
-patches, and the recipe—not Mesen binaries.
+after `git apply --check`, remove old native objects, and build only inside ignored
+`adapters/mesen2/work/`. The clean rebuild is required because the upstream POSIX makefile does not
+track header dependencies. `EMUCAP_MESEN_SRC` may name a local git checkout, but it is used only as a
+read-only clone origin. The output sidecar records the upstream commit, host API, and patch-set
+digest. This repository distributes source, patches, and the recipe—not Mesen binaries.
 
 ## 2. Launch live control
 
 Start the Control MCP and call `bootstrap`, `launch_plan`, then `launch`. The launcher resolves an
 explicit compatible `MESEN_BIN` first, otherwise the local build output. A sidecar mismatch fails as
 `mesen-patch-required`; after connection, hello must independently advertise
-`code_break_idle` and `native_halt_service`.
+`code_break_idle`, `native_halt_service`, and `native_halt_savestate`.
 
 The per-system entries are `emucap-snes.lua`, `emucap-sms.lua`, `emucap-gb.lua`, `emucap-gba.lua`,
 and `emucap-nes.lua`. They share `emucap-core.lua`; the launcher selects the right entry. Required
@@ -63,8 +63,9 @@ after a crash, new launches are blocked until it is dismissed.
 
 Recommended path: call the MCP `launch` tool. It verifies the pinned compatible host, copies its
 complete app bundle (macOS) or publish directory into an emucap-owned portable directory, applies
-required options without modifying the user's default settings, and leaves native key mappings
-available. GBA alone creates a minimal portable `settings.json` so the staged BIOS is discoverable.
+required options without modifying the user's default settings, and keeps native input available.
+Every system gets a minimal portable `settings.json`; GBA also stages its BIOS into that same
+portable home.
 The legacy `adapters/mesen2/launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME] [SYSTEM]` helper follows the
 same portable copy rule and remains a fallback when the MCP tool is unavailable. `launch_plan`
 includes the normalized system in this fallback command. Direct use may omit `SYSTEM` for known ROM
@@ -103,10 +104,12 @@ that Mesen exited, so reconnect and query `status` before launching another proc
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
 - Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`hold_until`/`save_state`/`load_state`/
   `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`.
-  (⚠ `save_state`/`load_state` work **only while running**; a native halt is rejected because Mesen
-  requires a main-CPU execution callback. A save requested after a breakpoint is not an atomic
-  capture of the hit point; use breakpoint `snapshot` for hit-time memory. A `set_input` hold persists
-  until explicitly released with an empty set_input (resume/step do not release it).)
+  (`save_state`/`load_state` also work while frozen at a main-CPU instruction boundary created by
+  explicit `pause` or an instruction step. They preserve the native halt, and a load refreshes the
+  frozen CPU projection before replying. Frame/PPU-step and breakpoint halts return `unsafe_halt`
+  because they may be between instructions. Use breakpoint `snapshot` for exact hit-time memory. A
+  `set_input` hold persists until explicitly released with an empty set_input; resume/step do not
+  release it.)
 - Breakpoints · tracing: `set_breakpoint` (kind **exec/read/write/nmi/irq/dma**;
   pc_min/pc_max conditions, **value/value_mask/value_len value-conditions**; a write BP
   includes the $2118/$2119→**vram_addr** · $2122→cgram_addr · $2104→oam_addr destination
@@ -147,9 +150,12 @@ launch a `.gba` file with `system: "gba"`; for NES, launch a `.nes` file with `s
 ```
 
 The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
-data root. The Rust MCP launcher applies required options on the command line and creates a local
-`settings.json` only for GBA firmware discovery; fallback launchers use the same rule. Pidfiles and
-logs stay under the per-port directory unless `EMUCAP_LOG` overrides the log path.
+data root. Every system gets a local `settings.json` portable-home marker so Mesen cannot fall back to
+the user's ordinary configuration or native library. The Rust MCP launcher applies required options
+on the command line; fallback launchers use the same isolation rule. On macOS each portable app also
+gets a port-specific bundle identifier, keeping its LaunchServices and saved-state namespace separate
+from the user's Mesen and other emucap ports. Pidfiles and logs stay under the per-port directory
+unless `EMUCAP_LOG` overrides the log path.
 
 **macOS / Linux fallback** — use `launch.sh` only when the MCP `launch` tool is unavailable:
 
@@ -199,9 +205,9 @@ powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:
   (log path), `EMUCAP_DEADMAN_MS` (operator opt-in idle auto-resume; default 0 = disabled),
   `EMUCAP_RECONNECT_GIVEUP_MS` (operator opt-in auto-resume after MCP disconnect; default 0 =
   wait indefinitely). `status.freeze_policy` reports `mode=native_halt_service`, service interval,
-  zero instruction drift, and the effective release timers. Each Lua callback remains subject to
-  Mesen's script timeout; the native wait loop invokes subsequent bounded callbacks without advancing
-  guest time.
+  zero instruction drift, whether the current halt is savestate-safe, and the effective release
+  timers. Each Lua callback remains subject to Mesen's script timeout; the native wait loop invokes
+  subsequent bounded callbacks without advancing guest time.
 - `EMUCAP_PREARM` pre-arms a DMA write BP right after cold boot (form `dma` | `dma:<dest>` |
   `dma:<dest>:<vmin>-<vmax>`). When an agent round-trip cannot catch a DMA write that
   vanishes in an instant during boot (e.g. initialization before the attract), arm it ahead
