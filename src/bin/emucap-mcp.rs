@@ -268,17 +268,18 @@ impl Emucap {
                 // 미연결: 이 서버가 잡은 포트를 알려준다(에이전트가 거기로 에뮬레이터를 띄우게).
                 let port = link.endpoint_port();
                 let token = link.session_token().map(str::to_string);
+                let unknown_content_question = status::unknown_content_question();
                 let mut v = serde_json::json!({
                     "connected": false,
                     "server_build": status::BUILD_HASH,
                     "listening_port": port,
                     "first_tool_if_unknown": "bootstrap",
                     "start_new_task_with": "bootstrap",
-                    "required_user_input_if_content_unknown": "실행할 content_path와 시스템(snes/saturn/psx/pce/md/pc98/dc)을 물어본 뒤 launch_plan(content_path, system)을 호출하라",
-                    "question_to_user_if_content_unknown": "어떤 ROM/disc/disk 경로를 어떤 시스템(snes/saturn/psx/pce/md/pc98/dc)으로 실행할까요?",
+                    "required_user_input_if_content_unknown": status::required_unknown_content_input(),
+                    "question_to_user_if_content_unknown": unknown_content_question.clone(),
                     "workflow": {
                         "unknown_content": {
-                            "ask_user": "어떤 ROM/disc/disk 경로를 어떤 시스템(snes/saturn/psx/pce/md/pc98/dc)으로 실행할까요?",
+                            "ask_user": unknown_content_question,
                             "then_call": "launch_plan",
                             "required_args": ["content_path", "system"]
                         },

@@ -704,6 +704,30 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
     ])
 }
 
+pub(crate) fn supported_system_names() -> String {
+    supported_systems_value()
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|system| system["system"].as_str())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub(crate) fn unknown_content_question() -> String {
+    format!(
+        "어떤 ROM/disc/disk 경로를 어떤 시스템({})으로 실행할까요?",
+        supported_system_names()
+    )
+}
+
+pub(crate) fn required_unknown_content_input() -> String {
+    format!(
+        "실행할 content_path와 시스템({})을 물어본 뒤 launch_plan(content_path, system)을 호출하라",
+        supported_system_names()
+    )
+}
+
 pub(crate) fn make_bootstrap_value(
     link: &mut dyn EmulatorLink,
 ) -> Result<serde_json::Value, LinkError> {
@@ -761,6 +785,8 @@ pub(crate) fn make_bootstrap_value(
             .or_insert_with(|| port.map_or(serde_json::Value::Null, |p| serde_json::json!(p)));
     }
 
+    let unknown_content_question = unknown_content_question();
+
     Ok(serde_json::json!({
         "ok": true,
         "start_here": true,
@@ -773,11 +799,11 @@ pub(crate) fn make_bootstrap_value(
         "status": status_value,
         "runtime_paths": runtime_paths(port),
         "supported_systems": supported_systems_value(),
-        "required_user_input_if_content_unknown": "실행할 content_path와 시스템(snes/saturn/psx/pce/md/pc98/dc)을 물어본 뒤 launch_plan을 호출하라",
-        "question_to_user_if_content_unknown": "어떤 ROM/disc/disk 경로를 어떤 시스템(snes/saturn/psx/pce/md/pc98/dc)으로 실행할까요?",
+        "required_user_input_if_content_unknown": required_unknown_content_input(),
+        "question_to_user_if_content_unknown": unknown_content_question.clone(),
         "workflow": {
             "unknown_content": {
-                "ask_user": "어떤 ROM/disc/disk 경로를 어떤 시스템(snes/saturn/psx/pce/md/pc98/dc)으로 실행할까요?",
+                "ask_user": unknown_content_question,
                 "then_call": "launch_plan",
                 "required_args": ["content_path", "system"]
             },

@@ -409,10 +409,14 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
     let value = make_bootstrap_value(&mut link).unwrap();
     assert_eq!(value["first_tool"], "bootstrap");
     assert_eq!(value["listening_port"], 47855);
-    assert!(value["question_to_user_if_content_unknown"]
-        .as_str()
-        .unwrap()
-        .contains("어떤 ROM/disc/disk 경로"));
+    assert_eq!(
+        value["question_to_user_if_content_unknown"],
+        unknown_content_question()
+    );
+    assert_eq!(
+        value["required_user_input_if_content_unknown"],
+        required_unknown_content_input()
+    );
     assert_eq!(
         value
             .pointer("/workflow/unknown_content/then_call")
