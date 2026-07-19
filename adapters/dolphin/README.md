@@ -17,6 +17,7 @@ The patch stack adds:
 - native service startup and shutdown hooks;
 - GameCube controller override support;
 - exact PowerPC exec-breakpoint events;
+- PowerPC disassembly and ABI stack walking;
 - bounded current-frame screenshot capture;
 - synchronous savestate capture and restore;
 - build-system entries for the native service.
@@ -59,7 +60,9 @@ cannot distinguish them.
 
 Headless mode is the default. `display=true` selects the compatible DolphinQt build and opens its
 render window. Both modes run from an emucap-owned portable copy with a per-port `--user`
-directory, leaving an installed Dolphin and its profile untouched. Audio output is disabled.
+directory. The fork also routes DolphinQt state through that directory, and the launcher rejects
+redirecting symlinks inside the portable tree, leaving an installed Dolphin and its profile
+untouched. Audio output is disabled.
 
 Follow the normal connection sequence:
 
@@ -74,18 +77,19 @@ The native adapter currently advertises:
 
 - `read_memory`, `write_memory`;
 - `get_state`, `status`;
-- `pause`, `resume`, instruction-unit `step`;
-- `set_breakpoint`, `clear_breakpoint`, `list_breakpoints`, `poll_events`;
+- `pause`, `resume`, frame- and instruction-unit `step`;
+- `set_breakpoint`, `clear_breakpoint`, `clear_all_breakpoints`, `list_breakpoints`, `poll_events`;
+- `disassemble`, `call_stack`;
 - frozen core only: `save_state`, `load_state`;
 - running core only: `screenshot`;
 - GameCube only: `set_input`.
 
-It does not currently advertise frame stepping, read/write watchpoints, tracing, call stacks, or
-Wii input injection. These methods must not be inferred from dormant handler code.
+It does not currently advertise read/write watchpoints, tracing, or Wii input injection. These
+methods must not be inferred from dormant handler code.
 
 The adapter publishes its feature-contract declaration. The Control MCP validates the declared
-instruction-only step, exact exec breakpoint, GameCube port 0 input, frozen savestate, and running
-screenshot limits before admitting composite tools.
+exact exec breakpoint, GameCube port 0 input, frozen savestate, and running screenshot limits
+before admitting composite tools.
 
 ### Memory and registers
 
@@ -95,20 +99,34 @@ returns `pc`, all 32 general-purpose registers, `lr`, `ctr`, `xer`, `msr`, and `
 ### Execution
 
 `pause` synchronously reaches a frozen CPU boundary. Instruction stepping starts from that frozen
-state and returns frozen. Frame-unit stepping is unsupported.
+state and returns frozen. Frame stepping waits for Dolphin to present a non-duplicate frame, drains
+the GPU queue at the next emulated field boundary, and returns only after the CPU is frozen again.
+An emucap breakpoint hit interrupts the operation and leaves the core frozen. Both units accept at
+most 15 steps per request so the synchronous operation remains inside the control-link deadline.
+Split longer advances into checked calls.
 
 ### Breakpoints
 
 Only exact-address exec breakpoints are supported. On a hit, Dolphin freezes before the matching
-instruction and `poll_events` returns the adapter breakpoint ID together with the exact address and
-PC. Adding or removing a breakpoint clears the relevant JIT cache state so an already compiled
-block cannot bypass it.
+instruction and `poll_events` returns the adapter breakpoint ID together with the exact address,
+PC, and PowerPC register snapshot. Adding or removing a breakpoint clears the relevant JIT cache
+state so an already compiled block cannot bypass it.
+
+### Disassembly and call stacks
+
+`disassemble(address, count)` uses Dolphin's Gekko decoder and returns fixed-width PowerPC rows as
+`{addr, bytes, text}`. Addresses are absolute effective addresses and must be four-byte aligned.
+
+`call_stack()` uses Dolphin's ABI stack-chain walker and returns frames from outermost to innermost.
+Optimized code, a damaged stack, or a title that does not maintain the expected chain can produce a
+partial or invalid result, so the live contract reports `debug.call-stack="best_effort"`.
 
 ### GameCube input
 
 GameCube controller port 0 accepts lowercase `a`, `b`, `x`, `y`, `z`, `l`, `r`, `start`, `up`,
 `down`, `left`, and `right`. `set_input([])` releases the override and returns control to Dolphin's
-native input path. Other ports and unknown buttons fail before changing the active override.
+native input path. `status.input_override` reports whether the adapter currently owns the pad.
+Other ports, malformed axes, and unknown buttons fail before changing the active override.
 
 Wii input is not advertised.
 

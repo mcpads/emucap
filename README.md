@@ -197,8 +197,9 @@ debugger halt to service requests without advancing the guest.
   `adapters/dolphin/build.sh` (Windows: `build.ps1`). The default launch is
   headless; `display: true` uses DolphinQt when the GUI build is available. The
   adapter provides PowerPC memory and registers, exact instruction stepping,
-  exec breakpoints, bounded screenshots, and synchronous savestates. GameCube
-  also supports controller input injection. → `adapters/dolphin/README.md`
+  disassembly, best-effort call stacks, exec breakpoints with register snapshots,
+  bounded screenshots, and synchronous savestates. GameCube also supports
+  controller input injection. → `adapters/dolphin/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
 
