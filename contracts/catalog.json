@@ -318,7 +318,7 @@
       "methods": ["screenshot"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": ["VIDEO.CURRENT.1"]
+      "expectations": ["VIDEO.CURRENT.1", "TIME.COMPLETE.1"]
     },
     {
       "id": "video.inspect",
@@ -326,7 +326,7 @@
       "methods": ["get_video_state", "resolve_tile"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": []
+      "expectations": ["TIME.COMPLETE.1"]
     },
     {
       "id": "video.layer-control",
@@ -438,7 +438,7 @@
       "methods": ["load_state"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": ["STATE.LOAD.COHERENT.1"]
+      "expectations": ["STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"]
     },
     {
       "id": "state.probe",

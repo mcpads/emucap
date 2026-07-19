@@ -1,9 +1,8 @@
 // Copyright 2026 emucap
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Dolphin(GameCube/Wii) 네이티브 emucap 어댑터. 별도 스레드에서 emucap-mcp 리스너로
-// 접속해 NDJSON 요청을 Dolphin 내부 API로 번역한다. GDB-스텁 브리지와 달리 savestate/
-// screenshot 까지 제공한다(입력/frame 은 후속 훅 필요 — 아래 TODO).
+// Native Dolphin adapter for GameCube and Wii. A dedicated thread connects to the Control MCP
+// listener and translates NDJSON requests into Dolphin APIs.
 
 #include "Core/EmuCap.h"
 
@@ -75,12 +74,12 @@ std::atomic<u64> s_file_sequence{0};
 std::string s_handler_error_kind;
 std::string s_handler_error;
 
-// set_input 오버라이드(패드별). engaged면 GCPad::GetStatus 결과를 이 값으로 덮는다.
+// Per-controller set_input override. An engaged override replaces GCPad::GetStatus output.
 std::mutex s_input_mutex;
 struct InputOverride
 {
   bool engaged = false;
-  GCPadStatus status;  // 기본 생성자가 중립(스틱 중앙) 값으로 초기화
+  GCPadStatus status;  // The default constructor initializes a neutral controller state.
 };
 InputOverride s_input[4];
 
@@ -180,7 +179,7 @@ bool FromHex(const std::string& s, std::vector<uint8_t>& out)
   return true;
 }
 
-// params 에서 정수 얻기(숫자 또는 "0x.." 문자열 허용).
+// Read an integer parameter from either a JSON number or a prefixed string.
 bool GetU64(const picojson::object& p, const char* key, uint64_t& out)
 {
   auto it = p.find(key);
@@ -206,7 +205,7 @@ void PushEvent(picojson::value ev)
   s_events.push_back(std::move(ev));
 }
 
-// ── 메서드 핸들러 ── (성공 시 result object 반환, 실패 시 GdbError 대신 throw std::string)
+// Request handlers return a result object on success and set the request-scoped error on failure.
 
 picojson::value MakeError(const std::string& kind, const std::string& msg)
 {
@@ -230,7 +229,7 @@ picojson::object Fail(const std::string& kind, const std::string& message)
   return {};
 }
 
-// CPU 스레드와 경합 없이 PowerPC/메모리에 접근하기 위한 가드. 코어가 안 떠 있으면 실패.
+// Guard PowerPC and memory access against concurrent CPU-thread execution.
 struct SafeAccess
 {
   Core::System& system;
@@ -258,6 +257,24 @@ picojson::object Hello(Core::System&, const picojson::object&)
   if (gamecube)
     methods.push_back(picojson::value(std::string("set_input")));
   r["methods"] = picojson::value(methods);
+  picojson::array active_exceptions;
+  for (const char* id :
+       {"dolphin.execution.frame-step-absent", "dolphin.breakpoint.exact-exec-only",
+        "dolphin.state-save.frozen-only", "dolphin.state-load.frozen-only",
+        "dolphin.screenshot.running-only"})
+  {
+    active_exceptions.push_back(picojson::value(std::string(id)));
+  }
+  if (gamecube)
+  {
+    active_exceptions.push_back(
+        picojson::value(std::string("dolphin.input-hold.port-zero-only")));
+  }
+  picojson::object contracts;
+  contracts["catalog"] =
+      picojson::value(std::string("emucap-feature-contracts/v3"));
+  contracts["active_exceptions"] = picojson::value(active_exceptions);
+  r["contracts"] = picojson::value(contracts);
   picojson::object limits;
   limits["max_sync_advance_count"] = picojson::value(10000.0);
   r["execution_limits"] = picojson::value(limits);
@@ -283,9 +300,8 @@ picojson::object Status(Core::System& system, const picojson::object&)
   r["connected"] = picojson::value(true);
   r["state"] = picojson::value(std::string(st == Core::State::Paused ? "frozen" : "running"));
   r["adapter"] = picojson::value(std::string("dolphin-native"));
-  // exec BP 진단 필드(경량 — CPUThreadGuard 없이 읽는다): 브레이크포인트가 왜 히트/미히트
-  // 하는지 런타임 근거로 확인한다. dbg_effective 는 Config::IsDebuggingEnabled()(=
-  // MAIN_ENABLE_DEBUGGING && !achievements-hardcore) 로, 코어가 BP 를 체크하려면 true 여야 한다.
+  // Lightweight breakpoint diagnostics. dbg_effective is Config::IsDebuggingEnabled()
+  // (MAIN_ENABLE_DEBUGGING and not achievements-hardcore) and must be true for core checks.
   // cpu_core: 0=Interpreter, 1=JIT64, 4=JITARM64, 5=CachedInterpreter.
   r["dbg_config"] = picojson::value(Config::Get(Config::MAIN_ENABLE_DEBUGGING));
   r["dbg_effective"] = picojson::value(Config::IsDebuggingEnabled());
@@ -404,15 +420,38 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
 
 picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
 {
-  auto kind_it = p.find("kind");
-  if (kind_it != p.end() && kind_it->second.is<std::string>() &&
-      kind_it->second.get<std::string>() != "exec")
+  const auto kind_it = p.find("kind");
+  if (kind_it != p.end() &&
+      (!kind_it->second.is<std::string>() || kind_it->second.get<std::string>() != "exec"))
   {
-    return Fail("only exec breakpoints are supported");
+    return Fail("bad_params", "only exec breakpoints are supported");
   }
   uint64_t addr = 0;
   if (!GetU64(p, "start", addr))
-    return Fail("start required");
+    return Fail("bad_params", "start is required");
+  uint64_t end = addr;
+  if (p.count("end") && !GetU64(p, "end", end))
+    return Fail("bad_params", "end must be an integer");
+  if (end != addr)
+    return Fail("bad_params", "only exact-address breakpoints are supported");
+  const auto pause_it = p.find("pause_on_hit");
+  if (pause_it != p.end() &&
+      (!pause_it->second.is<bool>() || !pause_it->second.get<bool>()))
+  {
+    return Fail("bad_params", "Dolphin breakpoints must pause on hit");
+  }
+  const auto auto_state_it = p.find("auto_savestate");
+  if (auto_state_it != p.end() &&
+      (!auto_state_it->second.is<bool>() || auto_state_it->second.get<bool>()))
+  {
+    return Fail("bad_params", "auto_savestate is not supported");
+  }
+  for (const char* field :
+       {"value", "value_mask", "value_len", "pc_min", "pc_max", "snapshot"})
+  {
+    if (p.count(field))
+      return Fail("bad_params", std::string(field) + " is not supported for Dolphin breakpoints");
+  }
   const int id = s_next_bp++;
   {
     std::lock_guard<std::mutex> lk(s_bp_mutex);
@@ -423,8 +462,8 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
     auto& breakpoints = system.GetPowerPC().GetBreakPoints();
     breakpoints.EnableBreaking(true);
     breakpoints.Add(static_cast<u32>(addr));
-    // 캐시된 블록(JIT·CachedInterpreter)에는 BP 체크가 컴파일돼 있지 않으므로, 전체 캐시를
-    // 비워 재컴파일 시 체크가 삽입되게 한다(4바이트 InvalidateICache 만으로는 불충분).
+    // Existing JIT and CachedInterpreter blocks may lack the new breakpoint check. Clear the
+    // complete cache so recompilation inserts it; invalidating one instruction is insufficient.
     system.GetJitInterface().ClearCache(sa.guard);
   }
   picojson::object r;
@@ -579,7 +618,7 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
   if (GetU64(p, "port", v) || GetU64(p, "pad", v))
     port = static_cast<int>(v);
   if (port != 0)
-    return Fail("only controller port 0 is supported");
+    return Fail("bad_params", "only controller port 0 is supported");
 
   std::lock_guard<std::mutex> lk(s_input_mutex);
   auto engaged = p.find("engaged");
@@ -597,17 +636,17 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
     return r;
   }
 
-  GCPadStatus st;  // 중립 기본값
+  GCPadStatus st;  // Neutral defaults.
   if (buttons != p.end() && buttons->second.is<picojson::array>())
   {
     u16 bits = 0;
     for (const auto& button : buttons->second.get<picojson::array>())
     {
       if (!button.is<std::string>())
-        return Fail("buttons must contain strings");
+        return Fail("bad_params", "buttons must contain strings");
       u16 bit = 0;
       if (!ButtonBit(button.get<std::string>(), bit))
-        return Fail("unsupported GameCube button: " + button.get<std::string>());
+        return Fail("bad_params", "unsupported GameCube button: " + button.get<std::string>());
       bits |= bit;
     }
     st.button = bits;
@@ -888,8 +927,8 @@ void Start(Core::System& system)
   const unsigned short port = static_cast<unsigned short>(std::atoi(port_env));
   if (port == 0)
     return;
-  // exec 브레이크포인트는 IsDebuggingEnabled() 일 때만 코어가 체크한다(config 의존 제거 —
-  // emucap 어댑터가 붙으면 항상 디버깅을 켠다). CachedInterpreter/JIT 모두 이 플래그를 본다.
+  // Dolphin checks exec breakpoints only while debugging is enabled. Turn it on whenever this
+  // adapter is active so breakpoint behavior does not depend on a user-profile setting.
   Config::SetBaseOrCurrent(Config::MAIN_ENABLE_DEBUGGING, true);
   s_stop.store(false);
   s_thread = std::thread([&system, port] { ThreadMain(system, port); });

@@ -338,6 +338,113 @@
         "contract-test:pc98-legacy-press-buttons-port-rejected",
         "contract-test:pc98-legacy-press-buttons-frame-cap"
       ]
+    },
+    {
+      "id": "dolphin.execution.frame-step-absent",
+      "feature": "execution.step",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {"native_frame_step": false},
+      "constraints": {"execution.step.units": ["instructions"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:dolphin-step-units"]
+    },
+    {
+      "id": "dolphin.breakpoint.exact-exec-only",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "BP.ARMED.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {
+        "kind": "not_exec",
+        "range": "not_exact",
+        "pause_on_hit": false,
+        "conditions": "present"
+      },
+      "constraints": {
+        "breakpoint.kinds.allowed": ["exec"],
+        "breakpoint.range": "exact",
+        "breakpoint.pause_on_hit.allowed": [true],
+        "breakpoint.conditions.supported": false
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:dolphin-breakpoint-kind-rejected",
+        "contract-test:dolphin-breakpoint-range-rejected",
+        "contract-test:dolphin-breakpoint-options-rejected"
+      ]
+    },
+    {
+      "id": "dolphin.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc"]
+      },
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:dolphin-set-input-port-rejected"]
+    },
+    {
+      "id": "dolphin.state-save.frozen-only",
+      "feature": "state.save",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TIME.COMPLETE.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.save.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "runtime-test:dolphin-save-frozen-completes",
+        "runtime-test:dolphin-save-running-rejected"
+      ]
+    },
+    {
+      "id": "dolphin.state-load.frozen-only",
+      "feature": "state.load",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.load.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "runtime-test:dolphin-load-frozen-restores-one-snapshot",
+        "runtime-test:dolphin-load-running-rejected"
+      ]
+    },
+    {
+      "id": "dolphin.screenshot.running-only",
+      "feature": "video.capture",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "VIDEO.CURRENT.1", "TIME.COMPLETE.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {"execution_state": "not_running"},
+      "constraints": {"video.capture.execution_states.allowed": ["running"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "runtime-test:dolphin-screenshot-running-current",
+        "runtime-test:dolphin-screenshot-frozen-rejected"
+      ]
     }
   ]
 }

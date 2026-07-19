@@ -16,7 +16,7 @@ index 188882c..5c5fcfe 100644
  {
 -  return static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
 +  GCPadStatus status = static_cast<GCPad*>(s_config.GetController(pad_num))->GetInput();
-+  // emucap set_input 오버라이드가 걸려 있으면 결정론적으로 덮어쓴다.
++  // Apply the emucap set_input override when one owns this controller.
 +  EmuCap::ApplyInputOverride(pad_num, &status);
 +  return status;
  }

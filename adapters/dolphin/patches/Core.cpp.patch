@@ -14,8 +14,8 @@ index 1b50796..7cee94e 100644
  
    UpdateTitle(system);
  
-+  // emucap: 코어가 완비된 뒤 어댑터 서버 스레드를 띄우고, EmuThread 종료 시(HW 종료 전)
-+  // 정리한다. EMUCAP_PORT 미설정이면 무동작.
++  // Start the adapter after core initialization and stop it before hardware shutdown.
++  // EmuCap::Start is a no-op when EMUCAP_PORT is absent.
 +  EmuCap::Start(system);
 +  Common::ScopeGuard emucap_guard{[] { EmuCap::Stop(); }};
 +
