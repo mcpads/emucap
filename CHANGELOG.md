@@ -2,6 +2,11 @@
 
 Prerelease software — interfaces may still change.
 
+## 0.10.0-alpha.2
+
+### Fixed
+- PCSX2 rejects same-kind read or write breakpoint ranges that could match one maximum-width EE access before changing native or local breakpoint state, keeping hit attribution deterministic.
+
 ## 0.10.0-alpha.1
 
 ### Added
