@@ -1,4 +1,18 @@
 use super::*;
+
+#[test]
+fn emulator_dependency_records_pid_and_start_identity() {
+    let spec = LaunchSpec::new("bridge", "bridge.log")
+        .emulator_dependency(std::process::id())
+        .unwrap();
+
+    assert!(spec.env.iter().any(
+        |(key, value)| key == "EMUCAP_EMULATOR_PID" && value == &std::process::id().to_string()
+    ));
+    assert!(spec.env.iter().any(|(key, value)| {
+        key == "EMUCAP_EMULATOR_START_IDENTITY" && !value.trim().is_empty()
+    }));
+}
 use std::path::Path;
 
 #[cfg(unix)]

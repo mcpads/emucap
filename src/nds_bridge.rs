@@ -296,6 +296,14 @@ impl<G: GdbTransport> NdsBridge<G> {
             },
         }
     }
+
+    pub fn backend_terminal(&self) -> bool {
+        self.arm9.gdb.is_terminal()
+            || self
+                .arm7
+                .as_ref()
+                .is_some_and(|connection| connection.gdb.is_terminal())
+    }
 }
 
 mod breakpoints;

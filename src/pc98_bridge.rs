@@ -312,6 +312,10 @@ impl<G: GdbTransport> Bridge<G> {
             },
         }
     }
+
+    pub fn backend_terminal(&self) -> bool {
+        self.gdb.is_terminal()
+    }
 }
 
 mod breakpoints;

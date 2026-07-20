@@ -216,7 +216,14 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
         // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
         super::spawn_display_caffeinate(desmume_pid);
     }
-    let bridge_pid = match spawn_detached(&bridge_spec(l, arm9, arm7)) {
+    let bridge = match bridge_spec(l, arm9, arm7).emulator_dependency(desmume_pid) {
+        Ok(spec) => spec,
+        Err(e) => {
+            let _ = terminate_detached(desmume_pid);
+            return Err(e);
+        }
+    };
+    let bridge_pid = match spawn_detached(&bridge) {
         Ok(pid) => pid,
         Err(e) => {
             let _ = terminate_detached(desmume_pid);

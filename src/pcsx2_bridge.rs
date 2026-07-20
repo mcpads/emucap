@@ -130,6 +130,12 @@ type BridgeResult<T> = Result<T, Pcsx2BridgeError>;
 
 pub trait PineTransport {
     fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>>;
+
+    /// True once the current PINE stream can no longer preserve frame boundaries. A caller must
+    /// replace the bridge/backend generation rather than retrying on the same stream.
+    fn is_terminal(&self) -> bool {
+        false
+    }
 }
 
 enum PineStream {
@@ -172,6 +178,7 @@ impl Write for PineStream {
 
 pub struct PineSocket {
     stream: PineStream,
+    terminal: bool,
 }
 
 impl PineSocket {
@@ -202,37 +209,62 @@ impl PineSocket {
             PineStream::Unix(stream)
         };
 
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            terminal: false,
+        })
     }
 }
 
 impl PineTransport for PineSocket {
     fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>> {
-        let packet_len = request
-            .len()
-            .checked_add(4)
-            .and_then(|length| u32::try_from(length).ok())
-            .ok_or_else(|| Pcsx2BridgeError::BadParams("PINE request is too large".into()))?;
-        self.stream.write_all(&packet_len.to_le_bytes())?;
-        self.stream.write_all(request)?;
-        self.stream.flush()?;
-
-        let mut header = [0u8; 5];
-        self.stream.read_exact(&mut header)?;
-        let reply_len = u32::from_le_bytes(header[..4].try_into().expect("four bytes")) as usize;
-        if !(5..=PINE_MAX_REPLY).contains(&reply_len) {
-            return Err(Pcsx2BridgeError::Protocol(format!(
-                "PINE reply length {reply_len} is outside 5..={PINE_MAX_REPLY}"
+        if self.terminal {
+            return Err(Pcsx2BridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "PINE transport is terminal",
             )));
         }
-        let mut payload = vec![0u8; reply_len - 5];
-        self.stream.read_exact(&mut payload)?;
-        if header[4] != 0 {
-            return Err(Pcsx2BridgeError::Emulator(
-                "PCSX2 rejected the PINE command".into(),
-            ));
+        let outcome = (|| {
+            let packet_len = request
+                .len()
+                .checked_add(4)
+                .and_then(|length| u32::try_from(length).ok())
+                .ok_or_else(|| Pcsx2BridgeError::BadParams("PINE request is too large".into()))?;
+            self.stream.write_all(&packet_len.to_le_bytes())?;
+            self.stream.write_all(request)?;
+            self.stream.flush()?;
+
+            let mut header = [0u8; 5];
+            self.stream.read_exact(&mut header)?;
+            let reply_len =
+                u32::from_le_bytes(header[..4].try_into().expect("four bytes")) as usize;
+            if !(5..=PINE_MAX_REPLY).contains(&reply_len) {
+                return Err(Pcsx2BridgeError::Protocol(format!(
+                    "PINE reply length {reply_len} is outside 5..={PINE_MAX_REPLY}"
+                )));
+            }
+            let mut payload = vec![0u8; reply_len - 5];
+            self.stream.read_exact(&mut payload)?;
+            if header[4] != 0 {
+                return Err(Pcsx2BridgeError::Emulator(
+                    "PCSX2 rejected the PINE command".into(),
+                ));
+            }
+            Ok(payload)
+        })();
+        if outcome.as_ref().is_err_and(|error| {
+            matches!(
+                error,
+                Pcsx2BridgeError::Io(_) | Pcsx2BridgeError::Protocol(_)
+            )
+        }) {
+            self.terminal = true;
         }
-        Ok(payload)
+        outcome
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal
     }
 }
 
@@ -297,6 +329,10 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             )));
         }
         Ok(bridge)
+    }
+
+    pub fn backend_terminal(&self) -> bool {
+        self.pine.is_terminal()
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {

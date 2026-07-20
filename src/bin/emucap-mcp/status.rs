@@ -886,7 +886,18 @@ pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLi
             serde_json::json!("select an explicit runtime candidate; automatic attach refused"),
         );
     }
-    if let Some(runtime) = object
+    let refreshed_current = link.endpoint_port().and_then(|port| {
+        emucap::live::runtime::RuntimeStore::discover()
+            .read_current(port)
+            .ok()
+            .flatten()
+    });
+    if let Some(current) = refreshed_current {
+        object.insert(
+            "runtime_instance".into(),
+            current.public_value_with_lease(&continuity.lease),
+        );
+    } else if let Some(runtime) = object
         .get_mut("runtime_instance")
         .and_then(serde_json::Value::as_object_mut)
     {

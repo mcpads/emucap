@@ -126,3 +126,80 @@ fn frontend_disconnect_does_not_abandon_backend_terminal_cleanup() {
         "a dead frontend must not detach a still-mutating backend handler"
     );
 }
+
+#[test]
+fn backend_terminal_reply_closes_front_and_exits_instead_of_reconnecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let worker = std::thread::spawn(move || {
+        serve_reconnecting_controlled_inner(
+            port,
+            "test-bridge",
+            |request| {
+                BridgeReply::terminate_with(Response {
+                    id: request.id,
+                    ok: false,
+                    result: None,
+                    error: Some(ProtocolError {
+                        kind: "bridge_error".into(),
+                        message: "backend closed".into(),
+                    }),
+                })
+            },
+            || None,
+            None,
+        )
+    });
+
+    let (mut socket, _) = listener.accept().unwrap();
+    socket
+        .write_all(b"{\"v\":1,\"id\":11,\"method\":\"status\",\"params\":{}}\n")
+        .unwrap();
+    let mut reader = BufReader::new(socket.try_clone().unwrap());
+    let mut response = String::new();
+    reader.read_line(&mut response).unwrap();
+    let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["id"], 11);
+    assert_eq!(response["error"]["kind"], "bridge_error");
+    let mut eof = String::new();
+    assert_eq!(reader.read_line(&mut eof).unwrap(), 0);
+    worker.join().unwrap().unwrap();
+}
+
+#[test]
+fn idle_front_is_closed_when_process_dependency_ends() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let terminal = Arc::new(AtomicBool::new(false));
+    let terminal_in_probe = Arc::clone(&terminal);
+    let worker = std::thread::spawn(move || {
+        serve_reconnecting_controlled_inner(
+            port,
+            "test-bridge",
+            |request| {
+                BridgeReply::continue_with(Response {
+                    id: request.id,
+                    ok: true,
+                    result: Some(serde_json::json!({})),
+                    error: None,
+                })
+            },
+            move || {
+                terminal_in_probe
+                    .load(Ordering::SeqCst)
+                    .then(|| "emulator exited".to_string())
+            },
+            None,
+        )
+    });
+
+    let (socket, _) = listener.accept().unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    terminal.store(true, Ordering::SeqCst);
+    let mut reader = BufReader::new(socket);
+    let mut eof = String::new();
+    assert_eq!(reader.read_line(&mut eof).unwrap(), 0);
+    worker.join().unwrap().unwrap();
+}

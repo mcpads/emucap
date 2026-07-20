@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use emucap::gdb_rsp::{GdbBridgeEnv, GdbRspClient};
-use emucap::live::reconnect::serve_reconnecting;
+use emucap::live::reconnect::{serve_reconnecting_controlled, BridgeReply, ProcessDependency};
 use emucap::pc98_bridge::Bridge;
 
 fn main() -> anyhow::Result<()> {
@@ -29,10 +29,26 @@ fn main() -> anyhow::Result<()> {
     )
     .with_context(|| format!("connect GDB stub at {gdb_host}:{gdb_port}"))?;
     let mut bridge = Bridge::new(gdb, GdbBridgeEnv::from_process_env());
+    let dependency =
+        ProcessDependency::from_process_env().context("load emulator process dependency")?;
 
-    serve_reconnecting(emucap_port, "mame-pc98-rust", move |request| {
-        bridge.handle_request(request)
-    })
+    serve_reconnecting_controlled(
+        emucap_port,
+        "mame-pc98-rust",
+        move |request| {
+            let response = bridge.handle_request(request);
+            if bridge.backend_terminal() {
+                BridgeReply::terminate_with(response)
+            } else {
+                BridgeReply::continue_with(response)
+            }
+        },
+        move || {
+            dependency
+                .as_ref()
+                .and_then(ProcessDependency::terminal_reason)
+        },
+    )
     .context("serve reconnecting emucap session")
 }
 

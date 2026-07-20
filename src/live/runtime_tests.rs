@@ -133,6 +133,95 @@ fn process_state_requires_matching_start_identity() {
     assert_eq!(process_state(&reused), ProcessState::Exited);
 }
 
+#[test]
+fn next_action_distinguishes_a_dead_emulator_from_its_live_bridge() {
+    assert_eq!(
+        next_safe_action(
+            ProcessState::Exited,
+            Some(ProcessState::Alive),
+            LeaseState::Held
+        ),
+        "cleanup_owned_bridge_then_launch"
+    );
+    assert_eq!(
+        next_safe_action(
+            ProcessState::Alive,
+            Some(ProcessState::Exited),
+            LeaseState::Held
+        ),
+        "recover_bridge_or_replace"
+    );
+    assert_eq!(
+        next_safe_action(
+            ProcessState::Exited,
+            Some(ProcessState::Unknown),
+            LeaseState::Held
+        ),
+        "inspect_bridge_identity_before_launch"
+    );
+    assert_eq!(
+        next_safe_action(
+            ProcessState::Exited,
+            Some(ProcessState::Exited),
+            LeaseState::Held
+        ),
+        "launch_allowed"
+    );
+    assert_eq!(
+        next_safe_action(
+            ProcessState::Exited,
+            Some(ProcessState::Alive),
+            LeaseState::Occupied
+        ),
+        "coordinate_with_current_controller"
+    );
+    assert_eq!(
+        next_safe_action(
+            ProcessState::Exited,
+            Some(ProcessState::Alive),
+            LeaseState::Unknown
+        ),
+        "inspect_lease_before_generation_transition"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_cleanup_terminates_a_live_bridge_after_the_emulator_exits() {
+    let mut emulator = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let emulator_identity = capture_process(emulator.id());
+    emulator.kill().unwrap();
+    emulator.wait().unwrap();
+
+    let mut bridge = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let bridge_identity = capture_process(bridge.id());
+    let current = CurrentManifest {
+        schema_version: SCHEMA_VERSION,
+        launch_id: "launch-cleanup-test".into(),
+        port: 47810,
+        adapter: "mame-pc98".into(),
+        system: "pc98".into(),
+        content: "/games/test.hdi".into(),
+        build: None,
+        emulator: emulator_identity,
+        bridge: Some(bridge_identity),
+        backend_endpoint: Some("127.0.0.1:48810".into()),
+        created_at_unix_ms: 1,
+    };
+
+    assert_eq!(current.process_state(), ProcessState::Exited);
+    assert_eq!(current.bridge_process_state(), Some(ProcessState::Alive));
+    current.terminate_owned_processes().unwrap();
+    bridge.wait().unwrap();
+    assert_eq!(current.bridge_process_state(), Some(ProcessState::Exited));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_process_identity_uses_kernel_microseconds_and_accepts_legacy_capsules() {

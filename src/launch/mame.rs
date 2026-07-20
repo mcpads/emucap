@@ -225,11 +225,15 @@ fn resolve_bridge_launch(l: &Launch, gdb_port: u16) -> std::io::Result<BridgeLau
     })
 }
 
-/// Spawn the bridge that relays to emucap on `port`, then MAME with the emucap GDB-stub plugin on
-/// `port + 1000`.
+/// Spawn MAME with the emucap GDB-stub plugin on `port + 1000`, then the bridge that relays it to
+/// emucap on `port`. The bridge receives MAME's exact process identity and exits when that
+/// generation ends, including while the front connection is idle.
 pub fn launch(l: &Launch) -> std::io::Result<Launched> {
     let gdb_port = gdb_port_for_emucap_port(l.port)?;
-    let bridge = resolve_bridge_launch(l, gdb_port)?;
+    let BridgeLaunch {
+        kind: bridge_kind,
+        spec: bridge_spec,
+    } = resolve_bridge_launch(l, gdb_port)?;
     let mame_home = emu_home_dir("mame-pc98", l.port);
     std::fs::create_dir_all(&mame_home)?;
     let rompath = if let Some(explicit) = std::env::var_os("MAME_ROMPATH") {
@@ -261,14 +265,20 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
         name: l.name,
         session_token: l.session_token,
     };
-    let bridge_pid = spawn_detached(&bridge.spec)?;
-
     let mame = mame_spec(l.binary, l.log_path, &opts).env("MAME_GDB_PORT", gdb_port.to_string());
-    let mame_pid = match spawn_detached(&mame) {
+    let mame_pid = spawn_detached(&mame)?;
+    let bridge_spec = match bridge_spec.emulator_dependency(mame_pid) {
+        Ok(spec) => spec,
+        Err(error) => {
+            let _ = terminate_detached(mame_pid);
+            return Err(error);
+        }
+    };
+    let bridge_pid = match spawn_detached(&bridge_spec) {
         Ok(pid) => pid,
-        Err(e) => {
-            let _ = terminate_detached(bridge_pid);
-            return Err(e);
+        Err(error) => {
+            let _ = terminate_detached(mame_pid);
+            return Err(error);
         }
     };
     if !l.headless {
@@ -279,7 +289,7 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
         mame_pid,
         bridge_pid,
         gdb_port,
-        bridge_kind: bridge.kind,
+        bridge_kind,
     })
 }
 

@@ -26,6 +26,11 @@ pub trait GdbTransport {
     fn send(&mut self, payload: &str) -> GdbResult<String>;
     fn send_no_reply(&mut self, payload: &str) -> GdbResult<()>;
     fn interrupt(&mut self) -> GdbResult<String>;
+    /// True once this transport can no longer carry another request. Front-session reconnect must
+    /// not reuse a terminal backend connection.
+    fn is_terminal(&self) -> bool {
+        false
+    }
     /// Reads the next RSP packet without first writing a command.
     ///
     /// Adapter demultiplexers use this after discarding an asynchronous stop that arrived before
@@ -236,6 +241,10 @@ impl GdbRspClient {
 }
 
 impl GdbTransport for GdbRspClient {
+    fn is_terminal(&self) -> bool {
+        self.poisoned
+    }
+
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.ensure_usable()?;
         let result = (|| {

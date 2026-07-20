@@ -7,12 +7,14 @@ use crate::live::protocol::Request;
 
 struct FakePine {
     expected: VecDeque<(Vec<u8>, BridgeResult<Vec<u8>>)>,
+    terminal: bool,
 }
 
 impl FakePine {
     fn new(items: Vec<(Vec<u8>, BridgeResult<Vec<u8>>)>) -> Self {
         Self {
             expected: items.into(),
+            terminal: false,
         }
     }
 }
@@ -22,6 +24,10 @@ impl PineTransport for FakePine {
         let (expected, response) = self.expected.pop_front().expect("unexpected PINE request");
         assert_eq!(request, expected);
         response
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal
     }
 }
 
@@ -52,6 +58,43 @@ fn pine_string(value: &str) -> Vec<u8> {
     reply.extend_from_slice(value.as_bytes());
     reply.push(0);
     reply
+}
+
+#[test]
+fn reports_terminal_backend_state_from_transport() {
+    let pine = FakePine {
+        expected: vec![(
+            vec![MSG_EMUCAP_VERSION],
+            Ok(REQUIRED_HOST_API.to_le_bytes().to_vec()),
+        )]
+        .into(),
+        terminal: true,
+    };
+    let bridge = Pcsx2Bridge::with_identity(pine, None, None, None).unwrap();
+    assert!(bridge.backend_terminal());
+}
+
+#[cfg(unix)]
+#[test]
+fn pine_eof_marks_the_real_transport_terminal() {
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("pine.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut packet = [0u8; 5];
+        stream.read_exact(&mut packet).unwrap();
+        assert_eq!(u32::from_le_bytes(packet[..4].try_into().unwrap()), 5);
+        assert_eq!(packet[4], MSG_STATUS);
+    });
+
+    let mut pine = PineSocket::connect(0, Some(&path), Duration::from_secs(1)).unwrap();
+    assert!(pine.transact(&[MSG_STATUS]).is_err());
+    assert!(pine.is_terminal());
+    server.join().unwrap();
 }
 
 #[test]

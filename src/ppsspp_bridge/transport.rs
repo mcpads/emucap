@@ -9,6 +9,13 @@ use tungstenite::{ClientRequestBuilder, Message, WebSocket};
 use super::{BridgeError, BridgeResult, PPSSPP_SUBPROTOCOL};
 
 pub trait WsTransport {
+    /// Whether this transport can no longer preserve request/reply ordering for the current
+    /// backend generation. Test doubles default to recoverable; the real socket sets this after
+    /// EOF, close, or a non-timeout I/O failure.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
     /// Send `{"event": event, ...params}` and block for the reply carrying the same event name and
     /// request identity. A correlated `{"event":"error", ...}` reply becomes `Err`. Any other
     /// event observed while waiting (a spontaneous notification or a late reply to an earlier
@@ -64,6 +71,7 @@ pub trait WsTransport {
 pub struct TungsteniteWs {
     socket: WebSocket<TcpStream>,
     pending_events: VecDeque<Value>,
+    terminal: bool,
     /// The default per-read socket timeout set at connect, restored after any `call_with_timeout`
     /// widens it for a single slow exchange.
     default_timeout: Duration,
@@ -97,6 +105,7 @@ impl TungsteniteWs {
         Ok(Self {
             socket,
             pending_events: VecDeque::new(),
+            terminal: false,
             default_timeout: timeout,
             next_ticket: 1,
         })
@@ -104,6 +113,13 @@ impl TungsteniteWs {
 }
 
 impl TungsteniteWs {
+    fn finish_transport<T>(&mut self, outcome: BridgeResult<T>) -> BridgeResult<T> {
+        if outcome.as_ref().is_err_and(transport_error_is_terminal) {
+            self.terminal = true;
+        }
+        outcome
+    }
+
     fn mint_ticket(&mut self) -> String {
         let ticket = format!("emucap-ws-{}", self.next_ticket);
         self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
@@ -151,6 +167,7 @@ impl TungsteniteWs {
                     self.pending_events.push_back(value);
                 }
                 Message::Close(_) => {
+                    self.terminal = true;
                     return Err(BridgeError::Emulator(
                         "PPSSPP debugger closed the websocket".into(),
                     ));
@@ -176,9 +193,12 @@ impl TungsteniteWs {
                 .set_read_timeout(Some(self.default_timeout));
             return match rollback {
                 Ok(()) => Err(BridgeError::from(error)),
-                Err(rollback_error) => Err(BridgeError::Emulator(format!(
-                    "failed to set the WebSocket write timeout: {error}; additionally failed to restore the read timeout: {rollback_error}"
-                ))),
+                Err(rollback_error) => {
+                    self.terminal = true;
+                    Err(BridgeError::Emulator(format!(
+                        "failed to set the WebSocket write timeout: {error}; additionally failed to restore the read timeout: {rollback_error}"
+                    )))
+                }
             };
         }
 
@@ -198,20 +218,30 @@ impl TungsteniteWs {
                 "failed to restore WebSocket read timeout: {read_error}; failed to restore write timeout: {write_error}"
             ))),
         };
-        crate::live::temporal::finish_with_cleanup(outcome, restore, |primary, cleanup| {
-            match primary {
-                Some(primary) => BridgeError::Emulator(format!(
+        let restore_failed = restore.is_err();
+        let combined =
+            crate::live::temporal::finish_with_cleanup(outcome, restore, |primary, cleanup| {
+                match primary {
+                    Some(primary) => BridgeError::Emulator(format!(
                     "{primary}; additionally failed to restore the WebSocket timeout: {cleanup}"
                 )),
-                None => BridgeError::Emulator(format!(
+                    None => BridgeError::Emulator(format!(
                     "backend call completed but failed to restore the WebSocket timeout: {cleanup}"
                 )),
-            }
-        })
+                }
+            });
+        if restore_failed {
+            self.terminal = true;
+        }
+        combined
     }
 }
 
 impl WsTransport for TungsteniteWs {
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     fn call(&mut self, event: &str, params: Value) -> BridgeResult<Value> {
         let ticket = self.mint_ticket();
         self.call_ticketed(event, params, &ticket)
@@ -223,11 +253,14 @@ impl WsTransport for TungsteniteWs {
         params: Value,
         expect_event: &str,
     ) -> BridgeResult<Value> {
-        let ticket = self.mint_ticket();
-        let mut obj = object_params(event, params)?;
-        obj.insert("ticket".into(), json!(ticket));
-        self.send_request(event, Value::Object(obj))?;
-        self.read_until_ticketed(expect_event, &ticket)
+        let outcome = (|| {
+            let ticket = self.mint_ticket();
+            let mut obj = object_params(event, params)?;
+            obj.insert("ticket".into(), json!(ticket));
+            self.send_request(event, Value::Object(obj))?;
+            self.read_until_ticketed(expect_event, &ticket)
+        })();
+        self.finish_transport(outcome)
     }
 
     fn call_with_timeout(
@@ -238,14 +271,17 @@ impl WsTransport for TungsteniteWs {
     ) -> BridgeResult<Value> {
         // Bound both the write and read. Applying the timeout only after send_request would let a
         // blocked socket write outlive the caller's operation deadline.
-        let ticket = self.mint_ticket();
-        let mut obj = object_params(event, params)?;
-        obj.insert("ticket".into(), json!(ticket));
-        self.with_socket_timeout(timeout, |transport| {
-            transport
-                .send_request(event, Value::Object(obj))
-                .and_then(|()| transport.read_until_ticketed(event, &ticket))
-        })
+        let outcome = (|| {
+            let ticket = self.mint_ticket();
+            let mut obj = object_params(event, params)?;
+            obj.insert("ticket".into(), json!(ticket));
+            self.with_socket_timeout(timeout, |transport| {
+                transport
+                    .send_request(event, Value::Object(obj))
+                    .and_then(|()| transport.read_until_ticketed(event, &ticket))
+            })
+        })();
+        self.finish_transport(outcome)
     }
 
     fn call_and_wait_for_with_timeout(
@@ -255,26 +291,33 @@ impl WsTransport for TungsteniteWs {
         expect_event: &str,
         timeout: Duration,
     ) -> BridgeResult<Value> {
-        let ticket = self.mint_ticket();
-        let mut obj = object_params(event, params)?;
-        obj.insert("ticket".into(), json!(ticket));
-        self.with_socket_timeout(timeout, |transport| {
-            transport
-                .send_request(event, Value::Object(obj))
-                .and_then(|()| transport.read_until_ticketed(expect_event, &ticket))
-        })
+        let outcome = (|| {
+            let ticket = self.mint_ticket();
+            let mut obj = object_params(event, params)?;
+            obj.insert("ticket".into(), json!(ticket));
+            self.with_socket_timeout(timeout, |transport| {
+                transport
+                    .send_request(event, Value::Object(obj))
+                    .and_then(|()| transport.read_until_ticketed(expect_event, &ticket))
+            })
+        })();
+        self.finish_transport(outcome)
     }
 
     fn call_ticketed(&mut self, event: &str, params: Value, ticket: &str) -> BridgeResult<Value> {
-        let mut obj = object_params(event, params)?;
-        obj.insert("ticket".into(), json!(ticket));
-        self.send_request(event, Value::Object(obj))?;
-        self.read_until_ticketed(event, ticket)
+        let outcome = (|| {
+            let mut obj = object_params(event, params)?;
+            obj.insert("ticket".into(), json!(ticket));
+            self.send_request(event, Value::Object(obj))?;
+            self.read_until_ticketed(event, ticket)
+        })();
+        self.finish_transport(outcome)
     }
 
     fn drain_events(&mut self) -> Vec<Value> {
         let mut out: Vec<Value> = self.pending_events.drain(..).collect();
         if self.socket.get_mut().set_nonblocking(true).is_err() {
+            self.terminal = true;
             return out;
         }
         loop {
@@ -284,12 +327,44 @@ impl WsTransport for TungsteniteWs {
                         out.push(value);
                     }
                 }
+                Ok(Message::Close(_)) => {
+                    self.terminal = true;
+                    break;
+                }
                 Ok(_) => continue,
-                Err(_) => break,
+                Err(error) => {
+                    if tungstenite_error_is_terminal(&error) {
+                        self.terminal = true;
+                    }
+                    break;
+                }
             }
         }
-        let _ = self.socket.get_mut().set_nonblocking(false);
+        if self.socket.get_mut().set_nonblocking(false).is_err() {
+            self.terminal = true;
+        }
         out
+    }
+}
+
+fn transport_error_is_terminal(error: &BridgeError) -> bool {
+    match error {
+        BridgeError::Io(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        BridgeError::Ws(error) => tungstenite_error_is_terminal(error),
+        _ => false,
+    }
+}
+
+fn tungstenite_error_is_terminal(error: &tungstenite::Error) -> bool {
+    match error {
+        tungstenite::Error::Io(error) => !matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        _ => true,
     }
 }
 

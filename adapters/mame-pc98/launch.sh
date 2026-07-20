@@ -220,7 +220,40 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
-# 이 포트에 에뮬레이터/브리지가 이미 연결(ESTABLISHED)돼 있으면 아무것도 죽이지 않고 거부한다.
+# A dead MAME generation may leave only its bridge connected to the MCP. Clean that bridge before
+# the generic in-use check, but only when both sides of the ownership proof agree: the recorded
+# emulator PID is no longer alive, and the recorded bridge command names this bridge with this
+# emucap/GDB endpoint. A live or ambiguous PID is never killed by an ordinary launch.
+OLD_BRIDGE="$(cat "$BRIDGE_PIDFILE" 2>/dev/null || true)"
+OLD_MAME="$(cat "$MAME_PIDFILE" 2>/dev/null || true)"
+case "$OLD_MAME" in
+  ''|*[!0-9]*) OLD_MAME_ALIVE=0 ;;
+  *) if kill -0 "$OLD_MAME" 2>/dev/null; then OLD_MAME_ALIVE=1; else OLD_MAME_ALIVE=0; fi ;;
+esac
+case "$OLD_BRIDGE" in
+  ''|*[!0-9]*) OLD_BRIDGE_ALIVE=0 ;;
+  *) if kill -0 "$OLD_BRIDGE" 2>/dev/null; then OLD_BRIDGE_ALIVE=1; else OLD_BRIDGE_ALIVE=0; fi ;;
+esac
+if [ "$OLD_BRIDGE_ALIVE" = "1" ]; then
+  OLD_BRIDGE_COMMAND="$(ps -p "$OLD_BRIDGE" -o command= 2>/dev/null || true)"
+  if [ "$OLD_MAME_ALIVE" = "0" ] \
+     && printf '%s\n' "$OLD_BRIDGE_COMMAND" | grep -F 'emucap-mame-pc98-bridge' >/dev/null \
+     && printf '%s\n' "$OLD_BRIDGE_COMMAND" | grep -F " $PORT " >/dev/null \
+     && printf '%s\n' "$OLD_BRIDGE_COMMAND" | grep -E "127\\.0\\.0\\.1:${GDB_PORT}([[:space:]]|$)" >/dev/null; then
+    kill_ours "$OLD_BRIDGE"
+    OLD_BRIDGE_ALIVE=0
+  else
+    echo "ERROR: recorded bridge PID $OLD_BRIDGE is live but its generation is live or ambiguous; inspect status before replacing it." >&2
+    exit 3
+  fi
+fi
+if [ "$OLD_MAME_ALIVE" = "1" ]; then
+  echo "ERROR: recorded MAME PID $OLD_MAME is still live; use the MCP replace path or stop that exact generation first." >&2
+  exit 3
+fi
+
+# Once the exact dead-generation orphan is gone, any remaining established connection is foreign
+# or lacks enough identity evidence. Refuse without killing it.
 if command -v lsof >/dev/null 2>&1; then
   INUSE="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED 2>/dev/null \
     | awk 'NR > 1 && $1 ~ /(python|mame|MAME|mednafen|Mesen|Flycast)/ { print $2 }' \
@@ -230,19 +263,6 @@ if command -v lsof >/dev/null 2>&1; then
     echo "ERROR: port $PORT already has an emulator/bridge connection (PID: $INUSE)." >&2
     exit 3
   fi
-fi
-
-# 이 launcher가 띄운 고아만 정리한다: pidfile의 PID가 실제 그 프로세스일 때만 죽여, stale pidfile +
-# PID 재사용으로 무관한 프로세스를 죽이는 것을 막는다.
-OLD_BRIDGE="$(cat "$BRIDGE_PIDFILE" 2>/dev/null || true)"
-OLD_MAME="$(cat "$MAME_PIDFILE" 2>/dev/null || true)"
-if [ -n "$OLD_BRIDGE" ] && kill -0 "$OLD_BRIDGE" 2>/dev/null \
-   && ps -p "$OLD_BRIDGE" -o command= 2>/dev/null | grep -qi 'emucap-mame-pc98-bridge'; then
-  kill_ours "$OLD_BRIDGE"
-fi
-if [ -n "$OLD_MAME" ] && kill -0 "$OLD_MAME" 2>/dev/null \
-   && ps -p "$OLD_MAME" -o command= 2>/dev/null | grep -qi 'mame'; then
-  kill_ours "$OLD_MAME"
 fi
 
 mkdir -p "$RUN_DIR" "$(dirname "$LOG")" "$MAME_HOME"
@@ -349,7 +369,7 @@ if command -v lsof >/dev/null 2>&1; then
 fi
 
 EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$MEDIA" \
-  EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" \
+  EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$MAME_PID" \
   nohup "$BRIDGE" "$PORT" "127.0.0.1:$GDB_PORT" </dev/null >>"$LOG" 2>&1 &
 BRIDGE_PID="$!"
 echo "$BRIDGE_PID" >"$BRIDGE_PIDFILE"

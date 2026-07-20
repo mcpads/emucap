@@ -310,7 +310,14 @@ pub fn launch(l: &Launch) -> io::Result<Launched> {
         let _ = terminate_detached(ppsspp_pid);
         return Err(e);
     }
-    let bridge_pid = match spawn_detached(&bridge_spec(l, ws_port)) {
+    let bridge = match bridge_spec(l, ws_port).emulator_dependency(ppsspp_pid) {
+        Ok(spec) => spec,
+        Err(e) => {
+            let _ = terminate_detached(ppsspp_pid);
+            return Err(e);
+        }
+    };
+    let bridge_pid = match spawn_detached(&bridge) {
         Ok(pid) => pid,
         Err(e) => {
             let _ = terminate_detached(ppsspp_pid);

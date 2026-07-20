@@ -485,11 +485,7 @@ impl CurrentManifest {
             "bridge_process_state": bridge_state,
             "backend_endpoint": self.backend_endpoint,
             "lease": lease,
-            "next_safe_action": match emulator_state {
-                ProcessState::Alive => "reattach_or_inspect",
-                ProcessState::Exited => "launch_allowed",
-                ProcessState::Unknown => "inspect_process_identity_before_replace",
-            },
+            "next_safe_action": next_safe_action(emulator_state, bridge_state, lease.state),
         })
     }
 
@@ -517,6 +513,32 @@ impl CurrentManifest {
             crate::launch::terminate_detached(self.emulator.pid)?;
         }
         Ok(())
+    }
+}
+
+fn next_safe_action(
+    emulator_state: ProcessState,
+    bridge_state: Option<ProcessState>,
+    lease_state: LeaseState,
+) -> &'static str {
+    if lease_state == LeaseState::Occupied {
+        return "coordinate_with_current_controller";
+    }
+    if emulator_state == ProcessState::Exited && lease_state == LeaseState::Unknown {
+        return "inspect_lease_before_generation_transition";
+    }
+    match (emulator_state, bridge_state) {
+        (ProcessState::Alive, Some(ProcessState::Exited)) => "recover_bridge_or_replace",
+        (ProcessState::Alive, Some(ProcessState::Unknown)) => {
+            "inspect_bridge_identity_before_recovery"
+        }
+        (ProcessState::Alive, _) => "reattach_or_inspect",
+        (ProcessState::Exited, Some(ProcessState::Alive)) => "cleanup_owned_bridge_then_launch",
+        (ProcessState::Exited, Some(ProcessState::Unknown)) => {
+            "inspect_bridge_identity_before_launch"
+        }
+        (ProcessState::Exited, _) => "launch_allowed",
+        (ProcessState::Unknown, _) => "inspect_process_identity_before_replace",
     }
 }
 

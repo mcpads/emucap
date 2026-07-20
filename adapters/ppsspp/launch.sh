@@ -98,18 +98,43 @@ kill_ours() {
 }
 connected_pid() { command -v lsof >/dev/null 2>&1 || return 2; lsof -nP -a -p "$1" -iTCP:"$PORT" -sTCP:ESTABLISHED >/dev/null 2>&1; }
 
-# MCP listener must be up; refuse if the port already has an emulator/bridge connection.
+# MCP listener must be up.
 if command -v lsof >/dev/null 2>&1; then
   lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || { echo "ERROR: no MCP listener on port $PORT; call emucap status first." >&2; exit 3; }
+fi
+
+# Clean only a bridge whose recorded emulator is dead and whose command matches this complete
+# endpoint tuple. A live or ambiguous recorded process requires an explicit replace decision.
+OLD_BRIDGE="$(cat "$BRIDGE_PIDFILE" 2>/dev/null || true)"
+OLD_EMU="$(cat "$EMU_PIDFILE" 2>/dev/null || true)"
+case "$OLD_EMU" in
+  ''|*[!0-9]*) OLD_EMU_ALIVE=0 ;;
+  *) if kill -0 "$OLD_EMU" 2>/dev/null; then OLD_EMU_ALIVE=1; else OLD_EMU_ALIVE=0; fi ;;
+esac
+case "$OLD_BRIDGE" in
+  ''|*[!0-9]*) OLD_BRIDGE_ALIVE=0 ;;
+  *) if kill -0 "$OLD_BRIDGE" 2>/dev/null; then OLD_BRIDGE_ALIVE=1; else OLD_BRIDGE_ALIVE=0; fi ;;
+esac
+if [ "$OLD_BRIDGE_ALIVE" = "1" ]; then
+  OLD_BRIDGE_COMMAND="$(ps -p "$OLD_BRIDGE" -o command= 2>/dev/null || true)"
+  if [ "$OLD_EMU_ALIVE" = "0" ] \
+     && printf '%s\n' "$OLD_BRIDGE_COMMAND" | grep -F "$BRIDGE_NAME" >/dev/null \
+     && printf '%s\n' "$OLD_BRIDGE_COMMAND" | grep -F " $PORT " >/dev/null \
+     && printf '%s\n' "$OLD_BRIDGE_COMMAND" | grep -E "[[:space:]]${WS_PORT}([[:space:]]|$)" >/dev/null; then
+    kill_ours "$OLD_BRIDGE"
+  else
+    echo "ERROR: recorded bridge PID $OLD_BRIDGE is live but its generation is live or ambiguous; inspect status before replacing it." >&2
+    exit 3
+  fi
+fi
+if [ "$OLD_EMU_ALIVE" = "1" ]; then
+  echo "ERROR: recorded PPSSPP PID $OLD_EMU is still live; use the MCP replace path or stop that exact generation first." >&2
+  exit 3
+fi
+if command -v lsof >/dev/null 2>&1; then
   INUSE="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED 2>/dev/null | awk 'NR>1 && $1 ~ /(PPSSPP|emucap-ppsspp|desmume|python|mednafen|Mesen|Flycast|mame)/ {print $2}' | sort -u | tr '\n' ' ' || true)"
   [ -z "$INUSE" ] || { echo "ERROR: port $PORT already has an emulator/bridge connection (PID: $INUSE)." >&2; exit 3; }
 fi
-
-# Clean up only orphans this launcher started (pidfile PID must still be the right process).
-OLD_BRIDGE="$(cat "$BRIDGE_PIDFILE" 2>/dev/null || true)"
-OLD_EMU="$(cat "$EMU_PIDFILE" 2>/dev/null || true)"
-[ -n "$OLD_BRIDGE" ] && kill -0 "$OLD_BRIDGE" 2>/dev/null && ps -p "$OLD_BRIDGE" -o command= 2>/dev/null | grep -qi "$BRIDGE_NAME" && kill_ours "$OLD_BRIDGE" || true
-[ -n "$OLD_EMU" ] && kill -0 "$OLD_EMU" 2>/dev/null && ps -p "$OLD_EMU" -o command= 2>/dev/null | grep -qi 'PPSSPPHeadless' && kill_ours "$OLD_EMU" || true
 
 mkdir -p "$RUN_DIR"
 : >"$LOG"
@@ -153,7 +178,7 @@ fi
 # 2. Spawn the bridge; wait for it to connect to the emucap port. Unlike the NDS bridge, this
 #    bridge makes a single WebSocket connect attempt with no retry, so step 1's readiness wait is
 #    load-bearing here (not just a liveness check).
-BRIDGE_PID="$(EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$CONTENT" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" \
+BRIDGE_PID="$(EMUCAP_NAME="$NAME" EMUCAP_SESSION_TOKEN="$SESSION_TOKEN" EMUCAP_CONTENT="$CONTENT" EMUCAP_BUILD_HASH="$EMUCAP_BUILD_HASH" EMUCAP_EMULATOR_PID="$EMU_PID" \
   spawn_detached "$BRIDGE_PIDFILE" "$BRIDGE_BIN" "$PORT" "$WS_PORT")"
 if command -v lsof >/dev/null 2>&1; then
   for ((i = 0; i < WAIT; i++)); do

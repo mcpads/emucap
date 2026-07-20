@@ -126,6 +126,23 @@ impl LaunchSpec {
         self
     }
 
+    /// Bind a generation-scoped helper to the exact emulator process it serves. The helper polls
+    /// this identity while its front connection is idle and exits if the emulator ends or the PID
+    /// is reused, so a dead backend cannot leave a live bridge occupying the control link.
+    pub fn emulator_dependency(mut self, pid: u32) -> std::io::Result<Self> {
+        let identity = crate::live::runtime::capture_process(pid);
+        let start_identity = identity.start_identity.ok_or_else(|| {
+            std::io::Error::other(format!(
+                "could not capture process start identity for emulator pid {pid}"
+            ))
+        })?;
+        self.env
+            .push(("EMUCAP_EMULATOR_PID".into(), pid.to_string()));
+        self.env
+            .push(("EMUCAP_EMULATOR_START_IDENTITY".into(), start_identity));
+        Ok(self)
+    }
+
     pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
         self

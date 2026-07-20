@@ -20,6 +20,7 @@ struct FakeWs {
     /// a reply — models a breakpoint halting the CPU mid-press so the timed release ack never
     /// fires, reproducing the desync/stuck-button.
     timeout_events: std::collections::HashSet<String>,
+    terminal: bool,
 }
 
 impl FakeWs {
@@ -41,6 +42,10 @@ impl FakeWs {
 }
 
 impl WsTransport for FakeWs {
+    fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+
     fn call(&mut self, event: &str, params: Value) -> Result<Value, BridgeError> {
         self.calls.push((event.to_string(), params));
         let Some((expected, reply)) = self.replies.pop_front() else {
@@ -139,6 +144,15 @@ impl WsTransport for FakeWs {
     fn drain_events(&mut self) -> Vec<Value> {
         self.pending_events.drain(..).collect()
     }
+}
+
+#[test]
+fn reports_terminal_backend_state_from_transport() {
+    let bridge = PpssppBridge::new(FakeWs {
+        terminal: true,
+        ..Default::default()
+    });
+    assert!(bridge.backend_terminal());
 }
 
 #[test]

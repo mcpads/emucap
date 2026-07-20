@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use emucap::live::reconnect::serve_reconnecting;
+use emucap::live::reconnect::{serve_reconnecting_controlled, BridgeReply, ProcessDependency};
 use emucap::ppsspp_bridge::{PpssppBridge, TungsteniteWs};
 
 fn main() -> anyhow::Result<()> {
@@ -34,10 +34,26 @@ fn main() -> anyhow::Result<()> {
     let ws = TungsteniteWs::connect(ppsspp_port, Duration::from_secs(8))
         .with_context(|| format!("connect PPSSPP debugger websocket at 127.0.0.1:{ppsspp_port}"))?;
     let mut bridge = PpssppBridge::new(ws);
+    let dependency =
+        ProcessDependency::from_process_env().context("load emulator process dependency")?;
 
-    serve_reconnecting(emucap_port, "ppsspp-rust", move |request| {
-        bridge.handle_request(request)
-    })
+    serve_reconnecting_controlled(
+        emucap_port,
+        "ppsspp-rust",
+        move |request| {
+            let response = bridge.handle_request(request);
+            if bridge.backend_terminal() {
+                BridgeReply::terminate_with(response)
+            } else {
+                BridgeReply::continue_with(response)
+            }
+        },
+        move || {
+            dependency
+                .as_ref()
+                .and_then(ProcessDependency::terminal_reason)
+        },
+    )
     .context("serve reconnecting emucap session")
 }
 

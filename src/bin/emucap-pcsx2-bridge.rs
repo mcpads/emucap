@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use emucap::live::reconnect::serve_reconnecting;
+use emucap::live::reconnect::{serve_reconnecting_controlled, BridgeReply, ProcessDependency};
 use emucap::pcsx2_bridge::{Pcsx2Bridge, PineSocket};
 
 fn main() -> anyhow::Result<()> {
@@ -19,10 +19,26 @@ fn main() -> anyhow::Result<()> {
     let pine = PineSocket::connect(pine_slot, socket_path.as_deref(), Duration::from_secs(12))
         .context("connect compatible PCSX2 PINE fork")?;
     let mut bridge = Pcsx2Bridge::new(pine).context("verify PCSX2 host API")?;
+    let dependency =
+        ProcessDependency::from_process_env().context("load emulator process dependency")?;
 
-    serve_reconnecting(emucap_port, "pcsx2-rust", move |request| {
-        bridge.handle_request(request)
-    })
+    serve_reconnecting_controlled(
+        emucap_port,
+        "pcsx2-rust",
+        move |request| {
+            let response = bridge.handle_request(request);
+            if bridge.backend_terminal() {
+                BridgeReply::terminate_with(response)
+            } else {
+                BridgeReply::continue_with(response)
+            }
+        },
+        move || {
+            dependency
+                .as_ref()
+                .and_then(ProcessDependency::terminal_reason)
+        },
+    )
     .context("serve reconnecting emucap session")
 }
 

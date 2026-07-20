@@ -508,7 +508,14 @@ pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
         super::spawn_display_caffeinate(pcsx2_pid);
     }
 
-    let bridge_pid = match spawn_detached(&bridge_spec(launch, &prepared, pine.slot)) {
+    let bridge = match bridge_spec(launch, &prepared, pine.slot).emulator_dependency(pcsx2_pid) {
+        Ok(spec) => spec,
+        Err(error) => {
+            let _ = terminate_detached(pcsx2_pid);
+            return Err(error);
+        }
+    };
+    let bridge_pid = match spawn_detached(&bridge) {
         Ok(pid) => pid,
         Err(error) => {
             let _ = terminate_detached(pcsx2_pid);

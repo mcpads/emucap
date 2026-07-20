@@ -6,7 +6,7 @@ use emucap::launch::{
     ppsspp as ppsspp_launch, RuntimeEnv,
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};
-use emucap::live::runtime::{ManifestSpec, ProcessState, RuntimeStore};
+use emucap::live::runtime::{LeaseState, ManifestSpec, ProcessState, RuntimeStore};
 
 use crate::args::{LaunchArgs, LaunchPlanArgs};
 use crate::status::{

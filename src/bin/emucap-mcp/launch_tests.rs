@@ -1,5 +1,9 @@
 use super::*;
+#[cfg(unix)]
+use emucap::live::continuity::ContinuitySnapshot;
 use emucap::live::link::{Capabilities, LinkError};
+#[cfg(unix)]
+use emucap::live::runtime::LeaseView;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -1135,6 +1139,7 @@ struct RuntimeLaunchLink {
     token: String,
     calls: usize,
     available: bool,
+    lease_state: LeaseState,
 }
 
 #[cfg(unix)]
@@ -1146,6 +1151,7 @@ impl RuntimeLaunchLink {
             token: "legacy-control-token".into(),
             calls: 0,
             available: true,
+            lease_state: LeaseState::Held,
         }
     }
 
@@ -1188,6 +1194,154 @@ impl EmulatorLink for RuntimeLaunchLink {
         self.token = token.to_string();
         Ok(true)
     }
+
+    fn continuity(&self) -> ContinuitySnapshot {
+        ContinuitySnapshot {
+            lease: LeaseView {
+                state: self.lease_state,
+                holder_pid: Some(std::process::id()),
+            },
+            ..ContinuitySnapshot::default()
+        }
+    }
+}
+
+#[cfg(unix)]
+struct ConnectedRuntimeLaunchLink {
+    caps: Capabilities,
+    port: u16,
+    token: String,
+    lease_state: LeaseState,
+}
+
+#[cfg(unix)]
+impl ConnectedRuntimeLaunchLink {
+    fn new(port: u16) -> Self {
+        Self {
+            caps: Capabilities::empty(),
+            port,
+            token: "orphan-control-token".into(),
+            lease_state: LeaseState::Held,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl EmulatorLink for ConnectedRuntimeLaunchLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        Ok(serde_json::json!({
+            "connected": true,
+            "state": "running"
+        }))
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(self.port)
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        Some(&self.token)
+    }
+
+    fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.token = token.to_string();
+        Ok(true)
+    }
+
+    fn continuity(&self) -> ContinuitySnapshot {
+        ContinuitySnapshot {
+            lease: LeaseView {
+                state: self.lease_state,
+                holder_pid: Some(std::process::id()),
+            },
+            ..ContinuitySnapshot::default()
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn launch_cleans_exact_bridge_orphan_before_starting_the_next_generation() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let publish = tmp.path().join("publish");
+    std::fs::create_dir_all(&publish).unwrap();
+    let binary = publish.join("fake-mesen");
+    let content = tmp.path().join("game.sfc");
+    std::fs::write(&binary, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    make_executable(&binary);
+    write_mesen_sidecar(&binary);
+    std::fs::write(&content, b"rom").unwrap();
+
+    let _env = EnvRestore::new(&["MESEN_BIN", "EMUCAP_EMU_HOME"]);
+    std::env::set_var("MESEN_BIN", &binary);
+    std::env::set_var("EMUCAP_EMU_HOME", tmp.path().join("emu-home"));
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let store = emucap::live::runtime::RuntimeStore::discover();
+    let old = store.prepare(port).unwrap();
+
+    let mut exited_emulator = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let emulator_pid = exited_emulator.id();
+    exited_emulator.kill().unwrap();
+    exited_emulator.wait().unwrap();
+    let mut orphan_bridge = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let orphan_bridge_pid = orphan_bridge.id();
+    let old_manifest = old.manifest(ManifestSpec {
+        adapter: "mame_pc98".into(),
+        system: "pc98".into(),
+        content: "/games/old.hdi".into(),
+        emulator_pid,
+        bridge_pid: Some(orphan_bridge_pid),
+        backend_endpoint: Some("127.0.0.1:48800".into()),
+        build: Some("old-build".into()),
+    });
+    assert_eq!(old_manifest.process_state(), ProcessState::Exited);
+    assert_eq!(
+        old_manifest.bridge_process_state(),
+        Some(ProcessState::Alive)
+    );
+    old.commit(&old_manifest).unwrap();
+
+    let mut link = ConnectedRuntimeLaunchLink::new(port);
+    let outcome = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: Some("after-orphan".into()),
+            display: None,
+            sound: None,
+            replace: false,
+        },
+    );
+    assert_eq!(outcome["launched"], true, "{outcome}");
+    orphan_bridge.wait().unwrap();
+    assert_eq!(
+        old_manifest.bridge_process_state(),
+        Some(ProcessState::Exited)
+    );
+
+    let current = store.read_current(port).unwrap().unwrap();
+    assert_ne!(current.launch_id, old_manifest.launch_id);
+    current.terminate_owned_processes().unwrap();
 }
 
 #[cfg(unix)]
@@ -1274,6 +1428,19 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     );
 
     args.replace = true;
+    link.lease_state = LeaseState::Occupied;
+    let occupied = make_launch(&mut link, &args);
+    assert_eq!(occupied["launched"], false, "{occupied}");
+    assert!(occupied["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("lease")));
+    assert_eq!(
+        store.read_current(port).unwrap().unwrap().launch_id,
+        launch_id,
+        "a foreign live lease must prevent replacement"
+    );
+
+    link.lease_state = LeaseState::Held;
     let replacement = make_launch(&mut link, &args);
     assert_eq!(replacement["launched"], true, "{replacement}");
     let replacement_id = replacement["launch_id"].as_str().unwrap();

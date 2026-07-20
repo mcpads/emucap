@@ -346,6 +346,10 @@ impl<T: WsTransport> PpssppBridge<T> {
         }
     }
 
+    pub fn backend_terminal(&self) -> bool {
+        self.ws.is_terminal()
+    }
+
     pub fn handle_request(&mut self, req: Request) -> Response {
         let id = req.id;
         let result = match req.method.as_str() {

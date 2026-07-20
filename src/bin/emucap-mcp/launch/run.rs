@@ -34,22 +34,6 @@ pub(crate) fn make_launch(
             "next_action": status.get("recovery").cloned().unwrap_or_else(|| serde_json::json!("call status/bootstrap and resolve the occupied port before launch")),
         });
     }
-    // A live emulator is already connected on this session's port. Launching again would spawn a
-    // second emulator that, sharing the session token, takes over the connection and leaves the
-    // first one orphaned. Refuse and let the agent tear down the current one deliberately.
-    let already_connected = status
-        .get("connected")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if already_connected && !a.replace {
-        return serde_json::json!({
-            "launched": false,
-            "reason": "an emulator is already connected on this session's listening_port; not launching another (it would orphan the current one)",
-            "connected_emulator": status.get("emulator_identity").cloned().unwrap_or(serde_json::Value::Null),
-            "status": status,
-            "next_action": "교체하려면 기존 에뮬을 정리한 뒤 다시 launch하라(save_state 후 connected_emulator를 참조해 그 PID만 종료; 광역 kill 금지). 연결이 이미 죽었으면 status가 connected=false가 된 뒤 재시도하면 새 연결로 자동 채택된다.",
-        });
-    }
     let Some(port) = bootstrap
         .get("listening_port")
         .and_then(|v| v.as_u64())
@@ -58,6 +42,42 @@ pub(crate) fn make_launch(
         return serde_json::json!({ "launched": false, "reason": "listening_port 미확정 — status를 먼저 호출하라" });
     };
     let token = link.session_token().map(str::to_string);
+    let store = RuntimeStore::discover();
+    let previous = match store.read_current(port) {
+        Ok(value) => value,
+        Err(e) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "runtime current capsule is unreadable; refusing to guess ownership",
+                "error": e.to_string(),
+                "listening_port": port,
+            })
+        }
+    };
+
+    // A front connection normally means the current generation must be preserved. The only
+    // launch-time exception is a capsule proving that the emulator exited while its exact bridge
+    // remains alive: that bridge is an owned orphan, not a live emulator session, and is cleaned
+    // below after the new launch has passed its non-mutating preflight.
+    let already_connected = status
+        .get("connected")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let lease = link.continuity().lease;
+    let cleanup_authorized = matches!(lease.state, LeaseState::Held | LeaseState::Available);
+    let exact_owned_bridge_orphan = previous.as_ref().is_some_and(|current| {
+        current.process_state() == ProcessState::Exited
+            && current.bridge_process_state() == Some(ProcessState::Alive)
+    }) && cleanup_authorized;
+    if already_connected && !a.replace && !exact_owned_bridge_orphan {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "an emulator is already connected on this session's listening_port; not launching another (it would orphan the current one)",
+            "connected_emulator": status.get("emulator_identity").cloned().unwrap_or(serde_json::Value::Null),
+            "status": status,
+            "next_action": "교체하려면 기존 에뮬을 정리한 뒤 다시 launch하라(save_state 후 connected_emulator를 참조해 그 PID만 종료; 광역 kill 금지). 연결이 이미 죽었으면 status가 connected=false가 된 뒤 재시도하면 새 연결로 자동 채택된다.",
+        });
+    }
 
     if !Path::new(&a.content_path).exists() {
         return serde_json::json!({
@@ -98,29 +118,26 @@ pub(crate) fn make_launch(
             }
         }
     }
-    let store = RuntimeStore::discover();
-    let previous = match store.read_current(port) {
-        Ok(value) => value,
-        Err(e) => {
-            return serde_json::json!({
-                "launched": false,
-                "reason": "runtime current capsule is unreadable; refusing to guess ownership",
-                "error": e.to_string(),
-                "listening_port": port,
-            })
-        }
-    };
     if let Some(current) = previous.as_ref() {
         match current.process_state() {
             ProcessState::Alive if !a.replace => {
                 return serde_json::json!({
                     "launched": false,
-                    "reason": "current launch generation is still alive; reattach instead of launching a duplicate",
+                    "reason": "current launch generation is still alive and may already be connected; reattach instead of launching a duplicate",
                     "runtime_instance": current.public_value(),
                     "next_action": "status/bootstrap으로 같은 launch_id에 재부착하라. 의도적 교체만 replace=true로 다시 호출한다.",
                 })
             }
             ProcessState::Alive => {
+                if !cleanup_authorized {
+                    return serde_json::json!({
+                        "launched": false,
+                        "reason": "current generation is controlled by another or unverifiable lease; refusing replacement",
+                        "lease": lease,
+                        "runtime_instance": current.public_value_with_lease(&lease),
+                        "next_action": "현재 제어 임대가 반환되거나 같은 제어 세션임을 확인한 뒤 replace를 다시 요청하라.",
+                    });
+                }
                 if let Err(e) = current.terminate_owned_processes() {
                     return serde_json::json!({
                         "launched": false,
@@ -138,7 +155,38 @@ pub(crate) fn make_launch(
                     "next_action": "프로세스 identity를 확인하고 명시적으로 정리한 뒤 다시 launch하라.",
                 })
             }
-            ProcessState::Exited => {}
+            ProcessState::Exited => {
+                if !cleanup_authorized {
+                    return serde_json::json!({
+                        "launched": false,
+                        "reason": "the exited generation is controlled by another or unverifiable lease; refusing cleanup or replacement",
+                        "lease": lease,
+                        "runtime_instance": current.public_value_with_lease(&lease),
+                        "next_action": "제어 임대가 반환된 뒤 exact generation만 정리하거나 새 launch를 요청하라.",
+                    });
+                }
+                match current.bridge_process_state() {
+                    Some(ProcessState::Alive) => {
+                        if let Err(e) = current.terminate_owned_processes() {
+                            return serde_json::json!({
+                                "launched": false,
+                                "reason": "the emulator exited but its verified bridge could not be cleaned up",
+                                "error": e.to_string(),
+                                "runtime_instance": current.public_value(),
+                            });
+                        }
+                    }
+                    Some(ProcessState::Unknown) => {
+                        return serde_json::json!({
+                            "launched": false,
+                            "reason": "the emulator exited but bridge ownership is unknown; refusing unsafe cleanup",
+                            "runtime_instance": current.public_value_with_lease(&lease),
+                            "next_action": "브리지 process identity를 확인하고 그 세대만 정리한 뒤 다시 launch하라.",
+                        })
+                    }
+                    Some(ProcessState::Exited) | None => {}
+                }
+            }
         }
     } else if already_connected {
         return serde_json::json!({

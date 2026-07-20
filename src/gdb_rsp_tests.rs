@@ -111,7 +111,9 @@ fn stream_error_poisons_only_the_failed_client_and_replacement_is_clean() {
         Duration::from_secs(2),
     )
     .unwrap();
+    assert!(!failed.is_terminal());
     assert!(matches!(failed.send("g"), Err(GdbError::Io(_))));
+    assert!(failed.is_terminal());
     assert!(matches!(failed.send("g"), Err(GdbError::Poisoned)));
     drop(failed);
 
@@ -122,6 +124,7 @@ fn stream_error_poisons_only_the_failed_client_and_replacement_is_clean() {
         Duration::from_secs(2),
     )
     .unwrap();
+    assert!(!replacement.is_terminal());
     assert_eq!(replacement.send("g").unwrap(), "OK");
     handle.join().unwrap();
 }

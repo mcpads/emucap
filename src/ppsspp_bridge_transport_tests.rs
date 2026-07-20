@@ -78,9 +78,14 @@ fn delayed_error_cannot_become_the_next_calls_error() {
     let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
     let first = ws.call_with_timeout("slow.command", json!({}), Duration::from_millis(30));
     assert!(first.as_ref().is_err_and(is_timeout_error));
+    assert!(
+        !ws.is_terminal(),
+        "a ticketed read timeout remains recoverable"
+    );
 
     let second = ws.call("version", json!({})).unwrap();
     assert_eq!(second["version"], "test");
+    assert!(!ws.is_terminal());
 
     let queued = ws.drain_events();
     assert!(queued.iter().any(|event| {
@@ -112,5 +117,19 @@ fn asynchronous_ack_must_echo_the_requests_ticket() {
         .call_and_wait_for("cpu.stepInto", json!({}), "cpu.stepping")
         .unwrap();
     assert_eq!(response["pc"], 0x0880_4004u64);
+    server.join().unwrap();
+}
+
+#[test]
+fn websocket_close_marks_the_transport_terminal() {
+    let (port, server) = websocket_server(|socket| {
+        let request = read_json(socket);
+        assert_eq!(request["event"], "version");
+        socket.close(None).unwrap();
+    });
+
+    let mut ws = TungsteniteWs::connect(port, Duration::from_secs(1)).unwrap();
+    assert!(ws.call("version", json!({})).is_err());
+    assert!(ws.is_terminal());
     server.join().unwrap();
 }
