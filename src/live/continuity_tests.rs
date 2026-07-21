@@ -520,3 +520,51 @@ fn live_foreign_lease_rejects_mutation_without_calling_inner_link() {
     let _ = holder.kill();
     let _ = holder.wait();
 }
+
+#[cfg(unix)]
+#[test]
+fn exited_anonymous_lease_is_available_without_editing_link_record() {
+    let mut holder = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let holder_identity = capture_process(holder.id());
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert_eq!(process_state(&holder_identity), ProcessState::Exited);
+
+    let lease = LeaseRecord {
+        control_session_key: None,
+        holder: holder_identity,
+        acquired_at_unix_ms: 1,
+        refreshed_at_unix_ms: 1,
+    };
+    let current_holder = capture_process(std::process::id());
+    assert_eq!(
+        lease_view(&lease, &current_holder).state,
+        LeaseState::Available
+    );
+}
+
+#[test]
+fn lease_acquisition_is_bound_to_the_expected_current_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let first = current(&store, 47829);
+    let inner = SequenceLink::new(47829, &first.launch_id, []);
+    let mut link = ObservedLink::with_store(inner, store.clone());
+
+    let second = current(&store, 47829);
+    let error = link
+        .acquire_control_lease(&first.launch_id)
+        .expect_err("a changed current generation must not lend its lease to stale cleanup");
+
+    assert!(
+        matches!(error, LinkError::Protocol(message) if message.contains("current generation changed"))
+    );
+    let second_record: Option<LinkRecord> = store.read_link_json(47829, &second.launch_id).unwrap();
+    assert!(
+        second_record.and_then(|record| record.lease).is_none(),
+        "the newer generation's lease must remain untouched"
+    );
+}

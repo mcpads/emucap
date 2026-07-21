@@ -338,7 +338,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             .record
             .as_ref()
             .and_then(|record| record.lease.as_ref())
-            .map(|lease| lease_view(lease, &self.holder, self.control_key.as_deref()))
+            .map(|lease| lease_view(lease, &self.holder))
             .unwrap_or_else(LeaseView::unknown);
         let transport = self.record.as_ref().map_or(
             TransportContinuity {
@@ -426,6 +426,10 @@ impl<L: EmulatorLink> ObservedLink<L> {
     }
 
     fn claim_lease(&mut self) -> io::Result<LeaseView> {
+        self.claim_lease_for(None)
+    }
+
+    fn claim_lease_for(&mut self, expected_launch_id: Option<&str>) -> io::Result<LeaseView> {
         self.refresh_runtime();
         let Some((port, launch_id)) = self
             .current_location()
@@ -433,6 +437,12 @@ impl<L: EmulatorLink> ObservedLink<L> {
         else {
             return Ok(LeaseView::unknown());
         };
+        if expected_launch_id.is_some_and(|expected| expected != launch_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "runtime current generation changed before lease acquisition",
+            ));
+        }
         let holder = self.holder.clone();
         let control_key = self.control_key.clone();
         let record_launch_id = launch_id.clone();
@@ -454,7 +464,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                                     "runtime lease is held by a live controller",
                                 ));
                             }
-                            ProcessState::Exited if control_key.is_some() => {
+                            ProcessState::Exited => {
                                 *lease = LeaseRecord {
                                     control_session_key: control_key.clone(),
                                     holder: holder.clone(),
@@ -462,7 +472,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                                     refreshed_at_unix_ms: now,
                                 };
                             }
-                            ProcessState::Exited | ProcessState::Unknown => {
+                            ProcessState::Unknown => {
                                 return Err(io::Error::new(
                                     io::ErrorKind::PermissionDenied,
                                     "runtime lease cannot be reclaimed safely",
@@ -489,7 +499,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                     .record
                     .as_ref()
                     .and_then(|record| record.lease.as_ref())
-                    .map(|lease| lease_view(lease, &self.holder, self.control_key.as_deref()))
+                    .map(|lease| lease_view(lease, &self.holder))
                     .unwrap_or_else(LeaseView::unknown));
             }
             Err(error) => return Err(error),
@@ -497,7 +507,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
         let view = updated
             .lease
             .as_ref()
-            .map(|lease| lease_view(lease, &self.holder, self.control_key.as_deref()))
+            .map(|lease| lease_view(lease, &self.holder))
             .unwrap_or_else(LeaseView::unknown);
         self.record = Some(updated);
         self.rebuild_snapshot();
@@ -764,6 +774,11 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         self.inner.replace_reclaim_token(token)
     }
 
+    fn acquire_control_lease(&mut self, expected_launch_id: &str) -> Result<LeaseView, LinkError> {
+        self.claim_lease_for(Some(expected_launch_id))
+            .map_err(|error| LinkError::Protocol(format!("lease: {error}")))
+    }
+
     fn continuity(&self) -> ContinuitySnapshot {
         self.snapshot.clone()
     }
@@ -873,18 +888,14 @@ fn adapter_failure_execution(failure: &Value) -> ExecutionState {
     }
 }
 
-fn lease_view(
-    lease: &LeaseRecord,
-    holder: &ProcessIdentity,
-    control_key: Option<&str>,
-) -> LeaseView {
+fn lease_view(lease: &LeaseRecord, holder: &ProcessIdentity) -> LeaseView {
     let state = if &lease.holder == holder {
         LeaseState::Held
     } else {
         match process_state(&lease.holder) {
             ProcessState::Alive => LeaseState::Occupied,
-            ProcessState::Exited if control_key.is_some() => LeaseState::Available,
-            ProcessState::Exited | ProcessState::Unknown => LeaseState::Unknown,
+            ProcessState::Exited => LeaseState::Available,
+            ProcessState::Unknown => LeaseState::Unknown,
         }
     };
     LeaseView {

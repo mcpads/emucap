@@ -109,6 +109,21 @@
       "expression": "G(persistent_owned and status_requested => status_reports_owner) and G(persistent_owned => persistent_owned W (explicit_release or generation_terminated))"
     },
     {
+      "id": "LIFE.LEASE.1",
+      "category": "temporal",
+      "expression": "G(acquire_lease(g,c) => current = g) and G(lease_held(g,c1) and c1 != c2 => not mutation_authorized(g,c2)) and G(holder_exited(g) => F<=D_h lease_available(g))"
+    },
+    {
+      "id": "LIFE.PUBLISH.1",
+      "category": "invariant",
+      "expression": "publish(g2) => current_before = prepared_predecessor(g2) and unique_current"
+    },
+    {
+      "id": "LIFE.TERMINATE.1",
+      "category": "invariant",
+      "expression": "terminate(p,g) => owned_by(p,g) and identity_matches_now(p,g) and ((current(g) and lease_held(g)) or (unpublished(g) and prepared_owned(g)))"
+    },
+    {
       "id": "MEM.READ.EXACT.1",
       "category": "postcondition",
       "expression": "read.ok => len(read.bytes) = request.length and read.space = request.memory_type"
@@ -245,7 +260,13 @@
       "methods": ["launch"],
       "temporal_classes": ["T3"],
       "disposition": "retain",
-      "expectations": ["TIME.RESPONSE.1", "TIME.GENERATION.1"]
+      "expectations": [
+        "TIME.RESPONSE.1",
+        "TIME.GENERATION.1",
+        "LIFE.LEASE.1",
+        "LIFE.PUBLISH.1",
+        "LIFE.TERMINATE.1"
+      ]
     },
     {
       "id": "runtime.status",

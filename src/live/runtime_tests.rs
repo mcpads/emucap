@@ -82,6 +82,23 @@ fn commit_atomically_switches_current_and_prunes_old_generation() {
 }
 
 #[test]
+fn prepared_generation_cannot_overwrite_a_concurrent_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let first = store.prepare(47808).unwrap();
+    let second = store.prepare(47808).unwrap();
+
+    first.commit(&manifest(&first)).unwrap();
+    let error = second.commit(&manifest(&second)).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        store.read_current(47808).unwrap().unwrap().launch_id,
+        first.launch_id()
+    );
+}
+
+#[test]
 fn commit_rejects_manifest_from_another_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let store = RuntimeStore::new(tmp.path().join("sessions"));

@@ -63,12 +63,15 @@ pub(crate) fn make_launch(
         .get("connected")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let lease = link.continuity().lease;
-    let cleanup_authorized = matches!(lease.state, LeaseState::Held | LeaseState::Available);
+    let observed_lease = link.continuity().lease;
+    let observed_cleanup_authorized = matches!(
+        observed_lease.state,
+        LeaseState::Held | LeaseState::Available
+    );
     let exact_owned_bridge_orphan = previous.as_ref().is_some_and(|current| {
         current.process_state() == ProcessState::Exited
             && current.bridge_process_state() == Some(ProcessState::Alive)
-    }) && cleanup_authorized;
+    }) && observed_cleanup_authorized;
     if already_connected && !a.replace && !exact_owned_bridge_orphan {
         return serde_json::json!({
             "launched": false,
@@ -118,6 +121,58 @@ pub(crate) fn make_launch(
             }
         }
     }
+    if let Some(current) = previous.as_ref() {
+        match (current.process_state(), current.bridge_process_state()) {
+            (ProcessState::Alive, _) if !a.replace => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "current launch generation is still alive and may already be connected; reattach instead of launching a duplicate",
+                    "runtime_instance": current.public_value_with_lease(&observed_lease),
+                    "next_action": "status/bootstrap으로 같은 launch_id에 재부착하라. 의도적 교체만 replace=true로 다시 호출한다.",
+                })
+            }
+            (ProcessState::Alive, Some(ProcessState::Unknown)) => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "current bridge process identity is unknown; refusing unsafe replacement",
+                    "runtime_instance": current.public_value_with_lease(&observed_lease),
+                    "next_action": "브리지 process identity를 확인하고 그 세대만 정리한 뒤 다시 launch하라.",
+                })
+            }
+            (ProcessState::Unknown, _) => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "current process liveness is unknown; refusing duplicate launch or unsafe replacement",
+                    "runtime_instance": current.public_value_with_lease(&observed_lease),
+                    "next_action": "프로세스 identity를 확인하고 명시적으로 정리한 뒤 다시 launch하라.",
+                })
+            }
+            (ProcessState::Exited, Some(ProcessState::Unknown)) => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "the emulator exited but bridge ownership is unknown; refusing unsafe cleanup",
+                    "runtime_instance": current.public_value_with_lease(&observed_lease),
+                    "next_action": "브리지 process identity를 확인하고 그 세대만 정리한 뒤 다시 launch하라.",
+                })
+            }
+            _ => {}
+        }
+    }
+    let lease = if let Some(current) = previous.as_ref() {
+        match link.acquire_control_lease(&current.launch_id) {
+            Ok(lease) => lease,
+            Err(error) => {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "failed to acquire the runtime generation lease",
+                    "error": error.to_string(),
+                })
+            }
+        }
+    } else {
+        observed_lease
+    };
+    let cleanup_authorized = lease.state == LeaseState::Held;
     if let Some(current) = previous.as_ref() {
         match current.process_state() {
             ProcessState::Alive if !a.replace => {

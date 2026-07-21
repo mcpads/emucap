@@ -23,6 +23,7 @@ pub struct PreparedGeneration {
     port: u16,
     launch_id: String,
     reclaim_token: String,
+    expected_current_launch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,6 +225,7 @@ impl RuntimeStore {
     }
 
     pub fn prepare(&self, port: u16) -> io::Result<PreparedGeneration> {
+        let expected_current_launch_id = self.read_current(port)?.map(|current| current.launch_id);
         let launch_id = format!("launch-{}", ulid::Ulid::new().to_string().to_lowercase());
         let reclaim_token = format!(
             "reclaim-{}{}",
@@ -238,6 +240,7 @@ impl RuntimeStore {
             port,
             launch_id,
             reclaim_token,
+            expected_current_launch_id,
         })
     }
 
@@ -434,11 +437,28 @@ impl PreparedGeneration {
                 "runtime manifest does not match prepared generation",
             ));
         }
-        write_atomic_json(&self.store.current_path(self.port), manifest)?;
-        let _ = self
-            .store
-            .cleanup_other_generations(self.port, &self.launch_id);
-        Ok(())
+        let current_lock = self.store.session_dir(self.port).join(".current.lock");
+        let lock = open_private_lock(&current_lock)?;
+        lock_with_deadline(&lock, std::time::Duration::from_millis(250))?;
+        let result = (|| {
+            let observed_current = self
+                .store
+                .read_current(self.port)?
+                .map(|current| current.launch_id);
+            if observed_current != self.expected_current_launch_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime current generation changed after launch preparation",
+                ));
+            }
+            write_atomic_json(&self.store.current_path(self.port), manifest)?;
+            let _ = self
+                .store
+                .cleanup_other_generations(self.port, &self.launch_id);
+            Ok(())
+        })();
+        let _ = fs2::FileExt::unlock(&lock);
+        result
     }
 
     pub fn abort(&self) -> io::Result<()> {
@@ -490,8 +510,7 @@ impl CurrentManifest {
     }
 
     pub fn terminate_owned_processes(&self) -> io::Result<()> {
-        let emulator_state = self.process_state();
-        if emulator_state == ProcessState::Unknown {
+        if self.process_state() == ProcessState::Unknown {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "emulator process identity is unknown",
@@ -509,8 +528,15 @@ impl CurrentManifest {
                 }
             }
         }
-        if emulator_state == ProcessState::Alive {
-            crate::launch::terminate_detached(self.emulator.pid)?;
+        match self.process_state() {
+            ProcessState::Alive => crate::launch::terminate_detached(self.emulator.pid)?,
+            ProcessState::Exited => {}
+            ProcessState::Unknown => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "emulator process identity became unknown before termination",
+                ))
+            }
         }
         Ok(())
     }

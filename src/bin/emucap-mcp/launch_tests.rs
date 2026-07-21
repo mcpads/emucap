@@ -1195,6 +1195,16 @@ impl EmulatorLink for RuntimeLaunchLink {
         Ok(true)
     }
 
+    fn acquire_control_lease(&mut self, _expected_launch_id: &str) -> Result<LeaseView, LinkError> {
+        if self.lease_state == LeaseState::Available {
+            self.lease_state = LeaseState::Held;
+        }
+        Ok(LeaseView {
+            state: self.lease_state,
+            holder_pid: Some(std::process::id()),
+        })
+    }
+
     fn continuity(&self) -> ContinuitySnapshot {
         ContinuitySnapshot {
             lease: LeaseView {
@@ -1256,6 +1266,16 @@ impl EmulatorLink for ConnectedRuntimeLaunchLink {
         Ok(true)
     }
 
+    fn acquire_control_lease(&mut self, _expected_launch_id: &str) -> Result<LeaseView, LinkError> {
+        if self.lease_state == LeaseState::Available {
+            self.lease_state = LeaseState::Held;
+        }
+        Ok(LeaseView {
+            state: self.lease_state,
+            holder_pid: Some(std::process::id()),
+        })
+    }
+
     fn continuity(&self) -> ContinuitySnapshot {
         ContinuitySnapshot {
             lease: LeaseView {
@@ -1269,7 +1289,7 @@ impl EmulatorLink for ConnectedRuntimeLaunchLink {
 
 #[cfg(unix)]
 #[test]
-fn launch_cleans_exact_bridge_orphan_before_starting_the_next_generation() {
+fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
     let _guard = env_lock();
     let tmp = tempfile::tempdir().unwrap();
     let publish = tmp.path().join("publish");
@@ -1342,6 +1362,53 @@ fn launch_cleans_exact_bridge_orphan_before_starting_the_next_generation() {
     let current = store.read_current(port).unwrap().unwrap();
     assert_ne!(current.launch_id, old_manifest.launch_id);
     current.terminate_owned_processes().unwrap();
+    assert_eq!(current.process_state(), ProcessState::Exited);
+    assert_eq!(current.bridge_process_state(), None);
+
+    let retired_launch_id = current.launch_id.clone();
+    let mut unverifiable_link = RuntimeLaunchLink::new(port);
+    unverifiable_link.lease_state = LeaseState::Unknown;
+    let refused = make_launch(
+        &mut unverifiable_link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: Some("after-unverifiable-lease".into()),
+            display: None,
+            sound: None,
+            replace: false,
+        },
+    );
+    assert_eq!(refused["launched"], false, "{refused}");
+    assert_eq!(
+        store.read_current(port).unwrap().unwrap().launch_id,
+        retired_launch_id,
+        "an unverifiable holder identity must still block the generation transition"
+    );
+
+    let mut recovered_link = RuntimeLaunchLink::new(port);
+    recovered_link.lease_state = LeaseState::Available;
+    let recovered = make_launch(
+        &mut recovered_link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: Some("after-retired-generation".into()),
+            display: None,
+            sound: None,
+            replace: false,
+        },
+    );
+    assert_eq!(recovered["launched"], true, "{recovered}");
+    let recovered_current = store.read_current(port).unwrap().unwrap();
+    assert_ne!(recovered_current.launch_id, retired_launch_id);
+    assert!(
+        !store.generation_dir(port, &retired_launch_id).exists(),
+        "a fully exited generation must not require manual link.json lease edits"
+    );
+    recovered_current.terminate_owned_processes().unwrap();
 }
 
 #[cfg(unix)]
@@ -1416,6 +1483,16 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         )
     );
     assert_eq!(runtime_lines.next(), None);
+
+    let mut offline_observer = RuntimeLaunchLink::new(port);
+    offline_observer.lease_state = LeaseState::Available;
+    let offline_duplicate = make_launch(&mut offline_observer, &args);
+    assert_eq!(offline_duplicate["launched"], false, "{offline_duplicate}");
+    assert_eq!(
+        offline_observer.lease_state,
+        LeaseState::Available,
+        "a non-replacing duplicate request must not acquire a returned lease"
+    );
 
     let duplicate = make_launch(&mut link, &args);
     assert_eq!(duplicate["launched"], false, "{duplicate}");

@@ -182,6 +182,15 @@ pub trait EmulatorLink {
     fn replace_reclaim_token(&mut self, _token: &str) -> Result<bool, LinkError> {
         Ok(false)
     }
+    /// Atomically acquire the current runtime generation's control lease when the concrete link
+    /// owns a durable runtime capsule. The default is observation-only and cannot promote an
+    /// available lease to held.
+    fn acquire_control_lease(
+        &mut self,
+        _expected_launch_id: &str,
+    ) -> Result<super::runtime::LeaseView, LinkError> {
+        Ok(self.continuity().lease)
+    }
     /// Last host-side observation, available even when the adapter socket is gone.
     fn continuity(&self) -> super::continuity::ContinuitySnapshot {
         super::continuity::ContinuitySnapshot::default()
