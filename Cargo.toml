@@ -32,6 +32,14 @@ name = "emucap-mame-pc98-bridge"
 path = "src/bin/emucap-mame-pc98-bridge.rs"
 
 [[bin]]
+name = "emucap-mame-neogeo-bridge"
+path = "src/bin/emucap-mame-neogeo-bridge.rs"
+
+[[bin]]
+name = "emucap-mupen64plus"
+path = "src/bin/emucap-mupen64plus.rs"
+
+[[bin]]
 name = "emucap-desmume-nds-bridge"
 path = "src/bin/emucap-desmume-nds-bridge.rs"
 

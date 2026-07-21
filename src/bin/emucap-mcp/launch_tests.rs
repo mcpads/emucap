@@ -431,6 +431,33 @@ fn normalize_system_accepts_dolphin_aliases() {
 }
 
 #[test]
+fn infer_system_and_aliases_map_n64_cartridges() {
+    for extension in ["z64", "n64", "v64"] {
+        let inferred = infer_system(Some(&format!("/tmp/game.{extension}")), None);
+        assert_eq!(inferred["system"], "n64", "extension .{extension}");
+        assert_eq!(inferred["confidence"], "extension");
+        assert_eq!(inferred["needs_user_input"], false);
+    }
+    for alias in ["n64", "nintendo64", "nintendo-64"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "n64", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit");
+    }
+}
+
+#[test]
+fn normalize_system_requires_an_explicit_neogeo_family() {
+    for alias in ["neogeo_mvs", "neo-geo-mvs", "neogeo-mvs", "mvs"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "neogeo_mvs", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
+    let ambiguous = infer_system(None, Some("neogeo"));
+    assert_eq!(ambiguous["system"], serde_json::Value::Null);
+    assert_eq!(ambiguous["needs_user_input"], true);
+}
+
+#[test]
 fn dolphin_precondition_requires_matching_build_sidecar() {
     let tmp = tempfile::tempdir().unwrap();
     let binary = tmp.path().join(if cfg!(windows) {
@@ -832,6 +859,53 @@ fn launch_plan_for_pc98_uses_repo_launcher_and_headless_contract() {
         .as_str()
         .unwrap()
         .contains("cbus:0"));
+}
+
+#[test]
+fn launch_plan_for_neogeo_mvs_uses_dedicated_adapter_without_zip_inference() {
+    let plan = make_launch_plan(
+        Some(47803),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/mslug.zip".into()),
+            system: Some("neogeo_mvs".into()),
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "neogeo_mvs");
+    assert_eq!(plan["adapter"], "mame_neogeo");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "neogeo_mvs");
+    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .contains("neogeo.zip"));
+
+    let inferred = infer_system(Some("/tmp/mslug.zip"), None);
+    assert_eq!(inferred["system"], serde_json::Value::Null);
+}
+
+#[test]
+fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/test.v64".into()),
+            system: Some("n64".into()),
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "n64");
+    assert_eq!(plan["adapter"], "mupen64plus");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "n64");
+    assert_eq!(
+        plan["preconditions"]["bios_required"],
+        serde_json::Value::Null
+    );
+    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
+    assert!(plan["headless_contract"]
+        .as_str()
+        .unwrap()
+        .contains("headless by default"));
 }
 
 #[test]

@@ -566,6 +566,199 @@
       "constraints": {},
       "authority": {"debug.call-stack": "best_effort"},
       "verification": ["contract-test:dolphin-call-stack-authority"]
+    },
+    {
+      "id": "neogeo.state-read.frozen-only",
+      "feature": "state.read",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.read.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:neogeo-state-running-rejected"]
+    },
+    {
+      "id": "neogeo.memory-read.frozen-only",
+      "feature": "memory.read",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "MEM.READ.EXACT.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"memory.read.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:neogeo-read-running-rejected"]
+    },
+    {
+      "id": "neogeo.memory-read.bounded",
+      "feature": "memory.read",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.BOUND.1", "CORE.PARAM.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"length": "above_16384"},
+      "constraints": {"memory.read.max_bytes": 16384},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:neogeo-read-length-cap"]
+    },
+    {
+      "id": "neogeo.memory-write.frozen-only",
+      "feature": "memory.write",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "MEM.WRITE.APPLY.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"memory.write.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:neogeo-write-running-rejected"]
+    },
+    {
+      "id": "neogeo.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:neogeo-set-input-port-rejected"]
+    },
+    {
+      "id": "neogeo.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {
+        "input.ports.allowed": [0],
+        "input.pulse.max_frames": 120
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:neogeo-press-buttons-port-rejected",
+        "contract-test:neogeo-press-buttons-frame-cap"
+      ]
+    },
+    {
+      "id": "neogeo.execution-step.main-cpu-only",
+      "feature": "execution.step",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "EXEC.STEP.INSTR.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"cpu": "not_m68000"},
+      "constraints": {"execution.step.cpus.allowed": ["m68000"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:neogeo-step-secondary-cpu-rejected"]
+    },
+    {
+      "id": "neogeo.execution-pause.machine-global",
+      "feature": "execution.pause",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "EXEC.PAUSE.HALT.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"cpu": "not_m68000"},
+      "constraints": {"execution.pause.cpus.allowed": ["m68000"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:neogeo-pause-secondary-cpu-rejected"]
+    },
+    {
+      "id": "neogeo.execution-resume.machine-global",
+      "feature": "execution.resume",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs"]},
+      "activation": {"cpu": "not_m68000"},
+      "constraints": {"execution.resume.cpus.allowed": ["m68000"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:neogeo-resume-secondary-cpu-rejected"]
+    },
+    {
+      "id": "n64.execution.frame-step-absent",
+      "feature": "execution.step",
+      "kind": "capability_absent",
+      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"native_frame_step": false},
+      "constraints": {"execution.step.units": ["instructions"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:n64-step-units"]
+    },
+    {
+      "id": "n64.state-read.frozen-only",
+      "feature": "state.read",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.read.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:n64-state-running-rejected"]
+    },
+    {
+      "id": "n64.memory-read.frozen-only",
+      "feature": "memory.read",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "MEM.READ.EXACT.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"memory.read.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:n64-read-running-rejected"]
+    },
+    {
+      "id": "n64.memory-read.bounded",
+      "feature": "memory.read",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.BOUND.1", "CORE.PARAM.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"length": "above_16384"},
+      "constraints": {"memory.read.max_bytes": 16384},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:n64-read-length-cap"]
+    },
+    {
+      "id": "n64.memory-write.frozen-only",
+      "feature": "memory.write",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "MEM.WRITE.APPLY.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"memory.write.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:n64-write-running-rejected"]
+    },
+    {
+      "id": "n64.execution-step.r4300-only",
+      "feature": "execution.step",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "EXEC.STEP.INSTR.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"cpu": "not_r4300"},
+      "constraints": {"execution.step.cpus.allowed": ["r4300"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:n64-step-rsp-rejected"]
+    },
+    {
+      "id": "n64.execution-pause.r4300-only",
+      "feature": "execution.pause",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "EXEC.PAUSE.HALT.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"cpu": "not_r4300"},
+      "constraints": {"execution.pause.cpus.allowed": ["r4300"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:n64-pause-rsp-rejected"]
+    },
+    {
+      "id": "n64.execution-resume.r4300-only",
+      "feature": "execution.resume",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"cpu": "not_r4300"},
+      "constraints": {"execution.resume.cpus.allowed": ["r4300"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:n64-resume-rsp-rejected"]
     }
   ]
 }

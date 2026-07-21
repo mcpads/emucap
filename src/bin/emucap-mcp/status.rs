@@ -48,6 +48,11 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"start": "enter", "return": "enter", "escape": "esc", "select": "space"},
             "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. step(frames) is frame-based, so tap can drive deterministic frozen input."
         }),
+        "neogeo_mvs" => serde_json::json!({
+            "system": "neogeo_mvs",
+            "buttons": ["a", "b", "c", "d", "start", "coin", "service", "up", "down", "left", "right"],
+            "notes": "Neo Geo MVS controller port 0. Timed input is released by emulator frame count."
+        }),
         "dc" | "dreamcast" => serde_json::json!({
             "system": "dreamcast",
             "buttons": ["a", "b", "c", "x", "y", "z", "d", "start", "up", "down", "left", "right"],
@@ -553,6 +558,17 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "work_wrapper": abs_path_json(&root, &["adapters", "mame-pc98", "work", "mame"]),
                 "work_raw_binary": abs_path_json(&root, &["adapters", "mame-pc98", "work", "mame.raw"]),
             },
+            "mame_neogeo": {
+                "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "mame-neogeo", "build.sh"]),
+                "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
+            },
+            "mupen64plus": {
+                "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "mupen64plus", "build.sh"]),
+                "adapter_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mupen64plus.exe" } else { "emucap-mupen64plus" }]),
+                "plugin_root": emucap::launch::mupen64plus::default_root(&root).display().to_string(),
+            },
             "flycast": {
                 "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "flycast", "build.sh"]),
@@ -656,6 +672,14 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "notes": "6502/2A03: disassemble/call_stack/break_on_reset supported; memory/state/BP/save/input/screenshot supported."
         },
         {
+            "system": "n64",
+            "aliases": ["nintendo64", "nintendo-64"],
+            "adapter": "mupen64plus",
+            "content": ["z64", "n64", "v64"],
+            "launcher": "MCP tool: launch",
+            "notes": "Initial Unix support uses the pinned Mupen64Plus pure interpreter. Pause/resume, R4300 instruction step, CPU state, and bounded frozen RDRAM access are available; input, screenshot, save states, frame step, breakpoints, and RSP state are not yet exposed."
+        },
+        {
             "system": "saturn",
             "aliases": ["ss"],
             "adapter": "mednafen",
@@ -697,6 +721,15 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "content": ["hdi", "hdm", "d88"],
             "launcher": "MCP tool: launch",
             "legacy_launcher": "runtime_paths.adapters.mame_pc98.launch"
+        },
+        {
+            "system": "neogeo_mvs",
+            "aliases": ["neo-geo-mvs", "neogeo-mvs", "mvs"],
+            "adapter": "mame_neogeo",
+            "content": ["zip"],
+            "launcher": "MCP tool: launch",
+            "required_firmware": ["neogeo.zip"],
+            "notes": ".zip is not auto-inferred; pass system=neogeo_mvs explicitly. AES, CD, Pocket/Color, and Hyper Neo Geo 64 are separate targets and are not accepted as aliases."
         },
         {
             "system": "dc",

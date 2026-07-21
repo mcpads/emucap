@@ -4,7 +4,10 @@ pub mod contracts;
 pub mod gdb_rsp;
 pub mod launch;
 pub mod live;
+#[cfg(unix)]
+pub mod n64_adapter;
 pub mod nds_bridge;
+pub mod neogeo_bridge;
 pub mod numparse;
 pub mod offload;
 pub mod pc98_bridge;

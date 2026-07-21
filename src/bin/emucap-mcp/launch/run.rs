@@ -119,6 +119,21 @@ pub(crate) fn make_launch(
             if !bridge["available"].as_bool().unwrap_or(false) {
                 return missing_mame_bridge_response(system, port, &root, adapter_binary, bridge);
             }
+        } else if adapter == "mame_neogeo" {
+            let bridge = neogeo_bridge_precondition(&root);
+            if !bridge["available"].as_bool().unwrap_or(false) {
+                return serde_json::json!({
+                    "launched": false,
+                    "reason": "mame_neogeo bridge is unavailable",
+                    "system": system,
+                    "adapter": adapter,
+                    "preconditions": {
+                        "adapter_binary": adapter_binary,
+                        "bridge": bridge,
+                    },
+                    "next_action": "build emucap-mame-neogeo-bridge and retry launch_plan",
+                });
+            }
         }
     }
     if let Some(current) = previous.as_ref() {
@@ -291,6 +306,8 @@ pub(crate) fn make_launch(
         "mednafen" => launch_mednafen(port, direct_reclaim, runtime, module, a),
         "flycast" => launch_flycast(port, direct_reclaim, runtime, a),
         "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
+        "mame_neogeo" => launch_mame_neogeo(port, direct_reclaim, runtime, a),
+        "mupen64plus" => launch_mupen64plus(port, direct_reclaim, runtime, a),
         "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
         "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
         "pcsx2" => launch_pcsx2(port, direct_reclaim, runtime, a),
@@ -524,6 +541,132 @@ pub(super) fn launch_mame(
             "next_action": "adapter가 연결되면 launch가 반환한다",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
+    }
+}
+
+/// Neo Geo MVS leg of `make_launch`: spawn isolated MAME and the dedicated 68000 bridge.
+pub(super) fn launch_mame_neogeo(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
+    let Some(root) = find_repo_root() else {
+        return serde_json::json!({ "launched": false, "error": "emucap repo root not found; set EMUCAP_REPO_ROOT" });
+    };
+    let content = Path::new(&a.content_path);
+    let Some(binary) = mame_neogeo_launch::resolve_binary(&root) else {
+        return serde_json::json!({ "launched": false, "reason": "MAME binary not found; run adapters/mame-neogeo/build.sh or set MAME_BIN" });
+    };
+    let Some(bridge) = mame_neogeo_launch::resolve_bridge(&root) else {
+        return serde_json::json!({ "launched": false, "reason": "Neo Geo bridge binary not found; build emucap-mame-neogeo-bridge or set EMUCAP_NEOGEO_BRIDGE_BIN" });
+    };
+    let Some(bios) = mame_neogeo_launch::resolve_bios(content) else {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "Neo Geo MVS BIOS neogeo.zip not found",
+            "next_action": "set EMUCAP_NEOGEO_BIOS to neogeo.zip or place it beside the game ROM set",
+        });
+    };
+    let log = adapter_log_path("mame-neogeo", port, "mame-neogeo.log");
+    let display = a.display.unwrap_or(false);
+    let launch = mame_neogeo_launch::Launch {
+        binary: &binary,
+        bridge: &bridge,
+        repo_root: &root,
+        content,
+        bios: &bios,
+        log_path: &log,
+        port,
+        name: a.name.as_deref(),
+        session_token: token,
+        runtime: Some(runtime),
+        display,
+    };
+    match mame_neogeo_launch::launch(&launch) {
+        Ok(launched) => serde_json::json!({
+            "launched": true,
+            "adapter": "mame_neogeo",
+            "pid": launched.mame_pid,
+            "mame_pid": launched.mame_pid,
+            "bridge_pid": launched.bridge_pid,
+            "display": display,
+            "driver": launched.driver,
+            "gdb_port": launched.gdb_port,
+            "port": port,
+            "binary": binary.display().to_string(),
+            "bios": bios.display().to_string(),
+            "log": log.display().to_string(),
+            "next_action": "adapter가 연결되면 launch가 반환한다",
+        }),
+        Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
+    }
+}
+
+/// Nintendo 64 leg of `make_launch`: run the native adapter against the pinned debugger core.
+pub(super) fn launch_mupen64plus(
+    port: u16,
+    token: Option<&str>,
+    runtime: RuntimeEnv<'_>,
+    a: &LaunchArgs,
+) -> serde_json::Value {
+    let Some(root) = find_repo_root() else {
+        return serde_json::json!({ "launched": false, "error": "emucap repo root not found; set EMUCAP_REPO_ROOT" });
+    };
+    let display = a.display.unwrap_or(false);
+    let Some(binary) = mupen64plus_launch::resolve_binary(&root) else {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "emucap-mupen64plus binary not found",
+            "next_action": "build emucap-mupen64plus and run adapters/mupen64plus/build.sh",
+        });
+    };
+    let plugin_root = std::env::var_os("EMUCAP_M64P_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| mupen64plus_launch::default_root(&root));
+    let host_build = match mupen64plus_launch::require_compatible_root(&root, &plugin_root, display)
+    {
+        Ok(build) => build,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "compatible debugger-enabled Mupen64Plus build not found",
+                "error": error.to_string(),
+                "next_action": "run adapters/mupen64plus/build.sh",
+            })
+        }
+    };
+    let content = Path::new(&a.content_path);
+    let log = adapter_log_path("mupen64plus", port, "mupen64plus.log");
+    let launch = mupen64plus_launch::Launch {
+        binary: &binary,
+        repo_root: &root,
+        root: &plugin_root,
+        content,
+        log_path: &log,
+        port,
+        name: a.name.as_deref(),
+        session_token: token,
+        build: Some(BUILD_HASH),
+        runtime: Some(runtime),
+        display,
+    };
+    match mupen64plus_launch::launch(&launch) {
+        Ok(launched) => serde_json::json!({
+            "launched": true,
+            "adapter": "mupen64plus",
+            "pid": launched.pid,
+            "display": display,
+            "port": port,
+            "binary": binary.display().to_string(),
+            "plugin_root": plugin_root.display().to_string(),
+            "emucap_home": launched.runtime_home.display().to_string(),
+            "host_build": host_build,
+            "log": log.display().to_string(),
+            "isolation": "Mupen64Plus uses an emucap-owned per-port configuration and does not read or change the user's emulator settings.",
+            "next_action": "adapter가 연결되면 launch가 반환한다",
+        }),
+        Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
 }
 

@@ -4,7 +4,7 @@
 local exports = {
   name = "emucap_gdbstub",
   version = "0.1.0",
-  description = "emucap PC-98 GDB bridge helper",
+  description = "emucap MAME GDB bridge helper",
   license = "BSD-3-Clause",
   author = { name = "emucap" }
 }
@@ -26,11 +26,27 @@ local regmaps = {
   }
 }
 
+regmaps.m68000 = {
+  togdb = {
+    D0 = 1, D1 = 2, D2 = 3, D3 = 4, D4 = 5, D5 = 6, D6 = 7, D7 = 8,
+    A0 = 9, A1 = 10, A2 = 11, A3 = 12, A4 = 13, A5 = 14, A6 = 15, SP = 16,
+    SR = 17, PC = 18
+  },
+  fromgdb = {
+    "D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7",
+    "A0", "A1", "A2", "A3", "A4", "A5", "A6", "SP", "SR", "PC"
+  },
+  regsize = 4,
+  addrsize = 4,
+  pcreg = "PC"
+}
+
 regmaps.i386sx = regmaps.i386
 regmaps.i486 = regmaps.i386
 regmaps.pentium = regmaps.i386
 
 local reset_subscription, stop_subscription, frame_subscription
+local mame_profile = os.getenv("EMUCAP_MAME_PROFILE") or "pc98"
 local input_aliases = {
   escape = "esc",
   return_key = "enter",
@@ -86,7 +102,27 @@ end
 local function norm_key(str)
   local s = trim(str):lower()
   s = s:gsub("%s+", " ")
+  if mame_profile == "neogeo" and s == "start" then
+    return "start"
+  end
   return input_aliases[s] or s
+end
+
+local function neogeo_input_name(field)
+  if field.player ~= 0 then
+    return nil
+  end
+  local name = trim(field.name):lower()
+  local button = name:match("^p1 ([abcd])$")
+  if button then return button end
+  local direction = name:match("^p1 (%a+)$")
+  if direction == "up" or direction == "down" or direction == "left" or direction == "right" then
+    return direction
+  end
+  if name == "1 player start" then return "start" end
+  if name == "coin 1" then return "coin" end
+  if name == "service 1" then return "service" end
+  return nil
 end
 
 local function split_csv(str)
@@ -200,7 +236,12 @@ function emucap_gdbstub.startplugin()
     end
     for _, port in pairs(manager.machine.ioport.ports) do
       for _, field in pairs(port.fields) do
-        if field.type_class == "keyboard" then
+        if mame_profile == "neogeo" then
+          local key = neogeo_input_name(field)
+          if key and not input_fields[key] then
+            input_fields[key] = field
+          end
+        elseif field.type_class == "keyboard" then
           local names = { field.name, field.default_name }
           for _, name in ipairs(names) do
             local n = norm_key(name)

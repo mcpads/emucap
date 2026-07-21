@@ -109,7 +109,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "resolved 어댑터로 에뮬레이터를 직접 띄운다(크로스플랫폼 Rust 런처) — Mesen·Mednafen·Flycast·MAME PC-98을 detached spawn하고 pid를 반환한다. 몇 초 뒤 status로 connected를 확인하라."
+        description = "resolved 어댑터로 에뮬레이터를 직접 띄운다(크로스플랫폼 Rust 런처) — 지원 에뮬레이터와 필요한 bridge를 detached spawn하고 pid를 반환한다. 몇 초 뒤 status로 connected를 확인하라."
     )]
     async fn launch(&self, Parameters(a): Parameters<LaunchArgs>) -> CallToolResult {
         let mut link = self.link();

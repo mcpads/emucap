@@ -9,7 +9,8 @@ adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy ·
 GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
-(PlayStation 2), a Dolphin fork (GameCube · Wii), and MAME (PC-98).
+(PlayStation 2), a Dolphin fork (GameCube · Wii), MAME (PC-98 and experimental Neo Geo
+MVS), and an experimental Mupen64Plus frontend (Nintendo 64).
 
 **v0.10.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
@@ -61,7 +62,8 @@ From the repo root:
 ```sh
 cargo build --release \
   --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
-  --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge \
+  --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
+  --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
   --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge
 ```
 
@@ -69,6 +71,8 @@ Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap-track-mcp` (**Tracking MCP** — experiment ledger, emulator-less),
 `emucap` (case-bundle CLI), `emucap-broker` (multi-session broker),
 `emucap-mame-pc98-bridge` (PC-98 launch helper),
+`emucap-mame-neogeo-bridge` (Neo Geo MVS launch helper),
+`emucap-mupen64plus` (N64 frontend and adapter),
 `emucap-desmume-nds-bridge` (NDS launch helper), and
 `emucap-ppsspp-bridge` (PSP launch helper), and
 `emucap-pcsx2-bridge` (PS2 launch helper). All dependencies come from
@@ -212,6 +216,17 @@ debugger halt to service requests without advancing the guest.
   controller input injection. → `adapters/dolphin/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
+- **MAME (Neo Geo MVS, experimental)** — reuse the pinned MAME build and build
+  `emucap-mame-neogeo-bridge`. Launch requires a user-supplied `neogeo.zip` BIOS and
+  a game ROM set; `.zip` files are never auto-detected as Neo Geo. The current adapter
+  exposes MVS work RAM, 68000 state and stepping, frame control, screenshot, and port-0
+  input. Game-ROM and save-state validation is still pending. → `adapters/mame-neogeo/README.md`
+- **Mupen64Plus (Nintendo 64, experimental; Unix)** — run
+  `adapters/mupen64plus/build.sh`, then build `emucap-mupen64plus`. Standard cartridge
+  ROMs need no BIOS. The current pure-interpreter adapter supports isolated headless or
+  visible launch, pause/resume, R4300 instruction stepping, CPU state, and bounded frozen
+  RDRAM access. Input, screenshots, save states, frame stepping, breakpoints, and RSP state
+  are not yet exposed. → `adapters/mupen64plus/README.md`
 
 ## Learn more
 
@@ -222,5 +237,5 @@ debugger halt to service requests without advancing the guest.
 Binaries: `emucap` (case bundles: `finalize` / `inspect`), `emucap-mcp` (Control
 MCP — live emulator control, stdio), `emucap-track-mcp` (Tracking MCP —
 experiment ledger, emulator-less, stdio), `emucap-broker` (multi-session
-connection sharing), and the PC-98/NDS/PSP/PS2 launch bridges listed in the build
-section.
+connection sharing), the N64 frontend, and the PC-98/Neo Geo/NDS/PSP/PS2 launch bridges
+listed in the build section.

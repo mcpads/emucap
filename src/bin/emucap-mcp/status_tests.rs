@@ -379,6 +379,13 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
         .as_array()
         .and_then(|systems| systems.iter().find(|system| system["system"] == "ps2"))
         .is_some_and(|system| system.get("legacy_launcher").is_none()));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems.iter().find(|system| system["system"] == "n64"))
+        .is_some_and(|system| {
+            system["adapter"] == "mupen64plus"
+                && system["content"] == serde_json::json!(["z64", "n64", "v64"])
+        }));
     assert!(
         supported_systems_value()
             .as_array()

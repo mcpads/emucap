@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use emucap::launch::{
     desmume_nds as desmume_nds_launch, dolphin as dolphin_launch, flycast as flycast_launch,
-    mame as mame_launch, mednafen as mednafen_launch, mesen as mesen_launch, pcsx2 as pcsx2_launch,
+    mame as mame_launch, mame_neogeo as mame_neogeo_launch, mednafen as mednafen_launch,
+    mesen as mesen_launch, mupen64plus as mupen64plus_launch, pcsx2 as pcsx2_launch,
     ppsspp as ppsspp_launch, RuntimeEnv,
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};

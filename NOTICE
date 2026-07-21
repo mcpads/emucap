@@ -22,7 +22,8 @@ Flycast
 MAME
   Upstream: https://github.com/mamedev/mame
   License:  GPL-2.0-or-later as a whole (majority of files BSD-3-Clause)
-  Used by:  adapters/mame-pc98 (patches + Lua plugin + GDB bridge; PC-98)
+  Used by:  adapters/mame-pc98 and adapters/mame-neogeo
+            (patches + Lua plugin + GDB bridges; PC-98 and Neo Geo MVS)
   Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
 
 MesenCE
@@ -66,6 +67,17 @@ Dolphin
   Used by:  adapters/dolphin (native patch stack; GameCube and Wii)
   Distribution: emucap ships source patches and a build recipe, not Dolphin
                 binaries, keys, firmware, or game media.
+
+Mupen64Plus
+  Upstream: https://github.com/mupen64plus
+  Pinned source: 2.6.0 (core b0d68c20f49b8f833afa21450e0e8874c87c13c4)
+  License: GPL-2.0-or-later for the core; bundled plugins retain their own
+           compatible licenses recorded in the locally built bundle.
+  Used by: adapters/mupen64plus (source-build recipe and dynamically loaded
+           debugger core/plugins; Nintendo 64)
+  Distribution: emucap ships the frontend source and build recipe, not emulator
+                binaries or game media. The upstream GPL test ROM remains in the
+                ignored local build tree.
 
 Upstream license determinations were made from each project's source-file SPDX
 headers and README, not from the bare COPYING boilerplate.
