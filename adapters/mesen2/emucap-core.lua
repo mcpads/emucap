@@ -10,6 +10,9 @@ assert(SYS.snapshot_regs,
 -- SP모델과 안 맞는 ISA는 이 셋을 비우면 disassemble·call_stack을 미지원으로 광고·거부한다.
 local HAS_DISASM = SYS.disassemble ~= nil
 local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
+local HAS_SNES_PPU_OBJ_EVENTS = SYS.system == "snes"
+  and emu.eventType.snesPpuObjEvaluationStart ~= nil
+  and emu.eventType.snesPpuObjScanlineHandoff ~= nil
 
 -- emucap Mesen2 라이브 클라이언트 (능동 제어)
 -- 필요 옵션: "Allow network access" + "Allow access to I/O and OS functions".
@@ -441,14 +444,34 @@ function handlers.hello()
                 "break_on_reset", "dump_memory", "find_pattern", "probe", "reset" }
   if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
   if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
+  local host_features = { "code_break_idle", "native_halt_service", "native_halt_savestate" }
+  if HAS_SNES_PPU_OBJ_EVENTS then host_features[#host_features + 1] = "snes_ppu_obj_events" end
+  local breakpoint_kinds = {
+    { kind = "exec", range_unit = "address", range_mode = "inclusive", memory_type_used = true, snapshot = true },
+    { kind = "read", range_unit = "address", range_mode = "inclusive", memory_type_used = true, snapshot = true },
+    { kind = "write", range_unit = "address", range_mode = "inclusive", memory_type_used = true, snapshot = true },
+    { kind = "nmi", range_unit = "none", range_mode = "none", memory_type_used = false, snapshot = false },
+    { kind = "irq", range_unit = "none", range_mode = "none", memory_type_used = false, snapshot = false },
+  }
+  if SYS.dma_supported then
+    breakpoint_kinds[#breakpoint_kinds + 1] =
+      { kind = "dma", range_unit = "register_address", range_mode = "exact", memory_type_used = false, snapshot = false }
+  end
+  if HAS_SNES_PPU_OBJ_EVENTS then
+    breakpoint_kinds[#breakpoint_kinds + 1] =
+      { kind = "snes_obj_eval_start", range_unit = "ppu_scanline", range_mode = "inclusive", memory_type_used = false, snapshot = true }
+    breakpoint_kinds[#breakpoint_kinds + 1] =
+      { kind = "snes_obj_handoff", range_unit = "ppu_scanline", range_mode = "inclusive", memory_type_used = false, snapshot = true }
+  end
   local result = {
     protocol_version = PROTOCOL_VERSION,
     system = SYS.system,
     adapter = "mesen2-live",
     build = os.getenv("EMUCAP_BUILD_HASH") or "unknown",  -- launch가 넘긴 emucap git hash(status.emulator_build)
     mesen_host_api = MESEN_HOST_API,
-    host_features = { "code_break_idle", "native_halt_service", "native_halt_savestate" },
+    host_features = host_features,
     methods = method_list,
+    breakpoint_kinds = breakpoint_kinds,
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
   local active_exceptions = { "mesen.execution.instruction-step-absent" }
@@ -832,6 +855,52 @@ local function snum(s)
   return tonumber(s)
 end
 
+local function parse_snapshot_specs(raw)
+  if raw == nil then return nil end
+  if type(raw) ~= "table" then return nil, "snapshot은 memory_type:address:length 문자열 배열이어야 한다" end
+  local specs = {}
+  for _, raw_spec in ipairs(raw) do
+    local mt_name, addr_text, len_text = tostring(raw_spec):match("^%s*([^:]+):([^:]+):([^:]+)%s*$")
+    if not mt_name then return nil, "잘못된 snapshot 스펙: " .. tostring(raw_spec) end
+    local mt = emu.memType[mt_name]
+    if mt == nil then return nil, "지원하지 않는 snapshot memory_type: " .. mt_name end
+    local addr, len = snum(addr_text), snum(len_text)
+    if addr == nil or addr < 0 or addr ~= math.floor(addr) then
+      return nil, "snapshot address는 0 이상의 정수여야 한다: " .. addr_text
+    end
+    if len == nil or len < 1 or len ~= math.floor(len) then
+      return nil, "snapshot length는 1 이상의 정수여야 한다: " .. len_text
+    end
+    if len > READ_CAP then
+      return nil, string.format("snapshot length %d가 상한 %d 초과", len, READ_CAP)
+    end
+    local region_size = SYS.region_sizes and SYS.region_sizes[mt_name]
+    if region_size and (addr >= region_size or len > region_size - addr) then
+      return nil, string.format("snapshot %s 범위 0x%X+0x%X가 영역 크기 0x%X 초과",
+        mt_name, addr, len, region_size)
+    end
+    specs[#specs + 1] = { mt = mt, mt_name = mt_name, addr = addr, len = len }
+  end
+  return specs
+end
+
+local function capture_snapshot_specs(specs)
+  if specs == nil then return nil end
+  local snapshots = {}
+  for _, spec in ipairs(specs) do
+    local bytes = {}
+    for offset = 0, spec.len - 1 do
+      bytes[#bytes + 1] = string.format("%02x", emu.read(spec.addr + offset, spec.mt, false))
+    end
+    snapshots[#snapshots + 1] = {
+      memory_type = spec.mt_name,
+      address = spec.addr,
+      hex = table.concat(bytes),
+    }
+  end
+  return as_array(snapshots)
+end
+
 -- ROM 뱅크 태깅: pc가 페이징된 ROM 뱅크(GG/GB). SYS.bank_of 있는 시스템만, 없으면 nil(SNES는 뱅크가 pc
 -- 안, NES 등 미해당). pc는 16비트 실행주소(full_pc가 GG/GB에선 cpu.pc로 축약이라 st["cpu.pc"] 사용).
 -- 모든 breakpoint_hit 생성 사이트(record_hit + 인라인 nmi/irq/dma)가 공유해 동일 이벤트타입 내 균일 보장.
@@ -876,15 +945,7 @@ local function record_hit(bp, addr, value)
     ev.regs = SYS.snapshot_regs(st)
     ev.regs.pc = full_pc(st)
     ev.bank = bank_for_pc(st)              -- pc의 ROM 뱅크(GG/GB), 아니면 nil. addr 아닌 pc 기준
-    if bp.snapshot_specs then
-      local snaps = {}
-      for _, sp in ipairs(bp.snapshot_specs) do
-        local out = {}
-        for i = 0, sp.len - 1 do out[#out + 1] = string.format("%02x", emu.read(sp.addr + i, sp.mt, false)) end
-        snaps[#snaps + 1] = { memory_type = sp.mt_name, address = sp.addr, hex = table.concat(out) }
-      end
-      ev.snapshot = as_array(snaps)
-    end
+    if bp.snapshot_specs then ev.snapshot = capture_snapshot_specs(bp.snapshot_specs) end
     events[#events + 1] = ev
   end
   if bp.pause_on_hit and STATE ~= "frozen" then
@@ -1078,6 +1139,65 @@ function handlers.set_breakpoint(p)
       .. "히트 순간 원자 캡처는 snapshot= 스펙을 써라. 실행 중 save_state는 히트 시점과 원자적이지 않다."
   end
   local id = next_bp_id; next_bp_id = next_bp_id + 1
+  if p.kind == "snes_obj_eval_start" or p.kind == "snes_obj_handoff" then
+    if not HAS_SNES_PPU_OBJ_EVENTS then
+      return false, "unsupported", "SNES OBJ boundary events require host feature snes_ppu_obj_events"
+    end
+    local start_scanline, end_scanline = snum(p.start), snum(p["end"])
+    if start_scanline == nil or end_scanline == nil
+        or start_scanline < 0 or end_scanline < start_scanline
+        or start_scanline ~= math.floor(start_scanline) or end_scanline ~= math.floor(end_scanline)
+        or end_scanline > 0xFFFF then
+      return false, "bad_params", "SNES OBJ event start/end는 0..65535 범위의 오름차순 scanline이어야 한다"
+    end
+    local snapshot_specs, snapshot_error = parse_snapshot_specs(p.snapshot)
+    if snapshot_error then return false, "bad_params", snapshot_error end
+    local is_start = p.kind == "snes_obj_eval_start"
+    local event_type = is_start and emu.eventType.snesPpuObjEvaluationStart
+      or emu.eventType.snesPpuObjScanlineHandoff
+    local bp = {
+      id = id,
+      kind = p.kind,
+      is_event = true,
+      evtype = event_type,
+      start = start_scanline,
+      end_ = end_scanline,
+      pause_on_hit = p.pause_on_hit,
+      snapshot_specs = snapshot_specs,
+    }
+    bp.ref = emu.addEventCallback(function()
+      local state = emu.getState()
+      local scanline = state["ppu.scanline"]
+      if scanline == nil or scanline < bp.start or scanline > bp.end_ then return end
+      if #events >= EVENT_CAP then
+        if not bp.pause_on_hit then dropped = dropped + 1; return end
+        table.remove(events, 1)
+        dropped = dropped + 1
+      end
+      local event = {
+        type = "device_event",
+        breakpoint_id = id,
+        kind = bp.kind,
+        device = "snes_ppu_obj",
+        ppu = {
+          frame = state["ppu.frameCount"],
+          scanline = scanline,
+          dot = state["ppu.cycle"],
+          hclock = state["ppu.hClock"],
+          master_clock = emu.getMasterClock(),
+        },
+        forced_blank = state["ppu.forcedBlank"] or false,
+      }
+      if bp.snapshot_specs then event.snapshot = capture_snapshot_specs(bp.snapshot_specs) end
+      events[#events + 1] = event
+      if bp.pause_on_hit and STATE ~= "frozen" then
+        flush_deferred("interrupted", bp.kind, id)
+        STATE = "frozen"; freeze_reason = bp.kind; emu.breakExecution()
+      end
+    end, event_type)
+    breakpoints[id] = bp
+    return true, { id = id, mechanism = "snes_ppu_obj_event" }
+  end
   -- NMI/IRQ: 메모리 접근이 아니라 이벤트(인터럽트 진입). exec BP가 못 잡는 NMI/VBlank 컨텍스트를
   -- 그 진입에서 freeze해 핸들러 상태를 검사·step하게 한다.
   if p.kind == "nmi" or p.kind == "irq" then
@@ -1155,7 +1275,9 @@ function handlers.set_breakpoint(p)
     return true, { id = id }
   end
   local cbtype = emu.callbackType[p.kind]
-  if not cbtype then return false, "bad_params", "kind는 exec/read/write/nmi/irq/dma" end
+  if not cbtype then
+    return false, "bad_params", "지원하지 않는 breakpoint kind: " .. tostring(p.kind)
+  end
   -- 값-조건: read/write BP에서 접근 값이 (value & value_mask)와 같을 때만 발화.
   -- exec BP엔 접근 값 개념이 없어 무시. value 미지정이면 종전대로 모든 접근에 발화.
   local has_value = (p.value ~= nil) and (p.kind ~= "exec")
@@ -1192,16 +1314,9 @@ function handlers.set_breakpoint(p)
   end
   -- snapshot: 히트 순간 atomic 캡처할 메모리 스펙 리스트("mt:addr:len", addr는 0x/$/10진). record_hit이
   -- 레지스터(항상)와 함께 이벤트에 싣는다 → 워치독 드리프트/데드맨 무관하게 히트 순간 보존.
-  if p.snapshot then
-    bp.snapshot_specs = {}
-    for _, spec in ipairs(p.snapshot) do
-      local mt_s, addr_s, len_s = tostring(spec):match("^%s*([^:]+):([^:]+):([^:]+)%s*$")
-      if mt_s then
-        bp.snapshot_specs[#bp.snapshot_specs + 1] =
-          { mt = emu.memType[mt_s] or mt_s, mt_name = mt_s, addr = snum(addr_s) or 0, len = snum(len_s) or 1 }
-      end
-    end
-  end
+  local snapshot_specs, snapshot_error = parse_snapshot_specs(p.snapshot)
+  if snapshot_error then return false, "bad_params", snapshot_error end
+  bp.snapshot_specs = snapshot_specs
   -- non-CPU-버스 memtype 라우팅: VDP VRAM/CRAM 등은 CPU 버스에 없어 Mesen memory
   -- 콜백이 절대 안 잡는다(실측). SYS.non_bus_write_memtypes로 (a) 재구성 경로 또는 (b) 에러로 보낸다 —
   -- 조용히 ROM 주소에 걸려 영영 미발동하는 것을 막는다. 선언 안 한 시스템(SNES 등)은 종전 CPU-버스 경로 그대로.

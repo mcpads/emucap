@@ -136,6 +136,9 @@ pub struct Capabilities {
     /// read/write_memory에 유효한 memory_type 이름들 — 어댑터가 hello로 advertise(에뮬레이터의
     /// debugger address space에서; 없으면 빈 vec). MCP는 status에 표면화만 한다(정적 맵 금지).
     pub memory_types: Vec<String>,
+    /// set_breakpoint가 현재 연결에서 실제로 받는 kind별 구조화된 설명. 플랫폼별 이름과
+    /// 범위 의미를 공통 MCP 서버에 정적으로 복제하지 않고 hello 값을 그대로 전달한다.
+    pub breakpoint_kinds: Vec<Value>,
     pub contracts: ContractAdvertisement,
     pub identity: EmulatorIdentity,
 }
@@ -146,6 +149,7 @@ impl Capabilities {
             protocol_version: 0,
             methods: vec![],
             memory_types: vec![],
+            breakpoint_kinds: vec![],
             contracts: ContractAdvertisement::Unreported,
             identity: EmulatorIdentity::default(),
         }
@@ -212,6 +216,7 @@ impl FakeLink {
                 protocol_version: 1,
                 methods: vec!["read_memory".into()],
                 memory_types: vec![],
+                breakpoint_kinds: vec![],
                 contracts: ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },
@@ -227,6 +232,7 @@ impl FakeLink {
                 protocol_version: 1,
                 methods: vec![],
                 memory_types: vec![],
+                breakpoint_kinds: vec![],
                 contracts: ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },

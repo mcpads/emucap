@@ -213,6 +213,28 @@ pub(crate) fn enrich_status_value(
     }
 }
 
+pub(crate) fn enrich_breakpoint_kinds(
+    v: &mut serde_json::Value,
+    breakpoint_kinds: &[serde_json::Value],
+) {
+    let Some(obj) = v.as_object_mut() else {
+        return;
+    };
+    if !obj
+        .get("connected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+        || obj.contains_key("breakpoint_kinds")
+        || breakpoint_kinds.is_empty()
+    {
+        return;
+    }
+    obj.insert(
+        "breakpoint_kinds".into(),
+        serde_json::json!(breakpoint_kinds),
+    );
+}
+
 fn public_method_names(methods: &[String]) -> Vec<String> {
     let mut normalized = Vec::with_capacity(methods.len());
     for method in methods {
@@ -768,7 +790,9 @@ pub(crate) fn make_bootstrap_value(
         Ok(ToolOutput::Json(mut v)) => {
             let methods = link.capabilities().methods.clone();
             let memory_types = link.capabilities().memory_types.clone();
+            let breakpoint_kinds = link.capabilities().breakpoint_kinds.clone();
             enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
+            enrich_breakpoint_kinds(&mut v, &breakpoint_kinds);
             enrich_contract_status(&mut v, &identity, &contracts);
             enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
             enrich_continuity(&mut v, link);

@@ -72,6 +72,7 @@ pub fn connect(
             protocol_version: PROTOCOL_VERSION,
             methods: vec![],
             memory_types: vec![],
+            breakpoint_kinds: vec![],
             contracts: crate::contracts::ContractAdvertisement::Unreported,
             identity: EmulatorIdentity::default(),
         },
@@ -105,10 +106,22 @@ pub fn connect(
                 .collect()
         })
         .unwrap_or_default();
+    let breakpoint_kinds = res
+        .get("breakpoint_kinds")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter(|value| value.is_object())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     link.caps = Capabilities {
         protocol_version: PROTOCOL_VERSION,
         methods,
         memory_types,
+        breakpoint_kinds,
         contracts: crate::contracts::advertisement_from_hello(&res),
         identity: EmulatorIdentity::from_hello(&res),
     };
@@ -316,6 +329,7 @@ impl EmulatorLink for LazyBrokerLink {
                     protocol_version: PROTOCOL_VERSION,
                     methods: vec![],
                     memory_types: vec![],
+                    breakpoint_kinds: vec![],
                     contracts: crate::contracts::ContractAdvertisement::Unreported,
                     identity: EmulatorIdentity::default(),
                 })

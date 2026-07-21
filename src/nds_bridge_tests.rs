@@ -123,6 +123,9 @@ fn hello_advertises_only_tier1_truths() {
     assert_eq!(result["adapter"], "desmume-nds-rust-gdb");
     assert_eq!(result["system"], "nds");
     assert_eq!(result["memory_types"], json!(["main", "arm9", "arm7"]));
+    assert_eq!(result["breakpoint_kinds"][0]["kind"], "exec");
+    assert_eq!(result["breakpoint_kinds"][0]["range_mode"], "exact");
+    assert_eq!(result["breakpoint_kinds"][0]["snapshot"], false);
     assert_eq!(
         result["execution_limits"]["max_sync_advance_count"],
         crate::live::temporal::MAX_SYNC_ADVANCE_COUNT

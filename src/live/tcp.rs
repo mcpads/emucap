@@ -350,6 +350,17 @@ fn handshake_stream(
                 .collect()
         })
         .unwrap_or_default();
+    let breakpoint_kinds = caps_val
+        .get("breakpoint_kinds")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter(|value| value.is_object())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
     if protocol_version != PROTOCOL_VERSION {
         return Err(LinkError::Protocol(format!(
             "프로토콜 버전 불일치: 서버 {PROTOCOL_VERSION}, 클라이언트 {protocol_version}"
@@ -382,6 +393,7 @@ fn handshake_stream(
             protocol_version,
             methods,
             memory_types,
+            breakpoint_kinds,
             contracts: crate::contracts::advertisement_from_hello(&caps_val),
             identity,
         },

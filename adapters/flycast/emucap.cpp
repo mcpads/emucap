@@ -1054,6 +1054,8 @@ void handle(const std::string& line) {
 			r += "],"
 			     // Advertise the memory types accepted by read_memory, write_memory, and find_pattern.
 			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"],"
+			     "\"breakpoint_kinds\":[{\"kind\":\"exec\",\"range_unit\":\"address\","
+			     "\"range_mode\":\"exact\",\"memory_type_used\":false,\"snapshot\":false}],"
 			     "\"execution_limits\":{\"max_sync_advance_count\":";
 			r += std::to_string(MAX_SYNC_ADVANCE);
 			r += "},\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","

@@ -125,6 +125,9 @@ fn hello_reports_the_host_api_three_surface() {
     assert_eq!(result["adapter"], "pcsx2-rust-pine");
     assert_eq!(result["name"], "ps2-test");
     assert_eq!(result["session_token"], "token");
+    assert_eq!(result["breakpoint_kinds"][0]["range_mode"], "exact");
+    assert_eq!(result["breakpoint_kinds"][1]["range_mode"], "inclusive");
+    assert_eq!(result["breakpoint_kinds"][2]["snapshot"], false);
     assert_eq!(result["contracts"]["catalog"], crate::contracts::CATALOG_ID);
     let methods = METHODS
         .iter()

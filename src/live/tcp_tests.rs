@@ -200,6 +200,12 @@ fn tcp_link_preserves_contract_advertisement_from_hello() {
                     "adapter": "desmume-nds-rust-gdb",
                     "system": "nds",
                     "methods": ["status", "step_instructions", "call_stack"],
+                    "breakpoint_kinds": [{
+                        "kind": "exec",
+                        "range_unit": "address",
+                        "memory_type_used": true,
+                        "snapshot": true
+                    }],
                     "session_token": token,
                     "contracts": crate::contracts::advertisement_value(&[
                         "nds.execution.frame-step-absent",
@@ -239,6 +245,15 @@ fn tcp_link_preserves_contract_advertisement_from_hello() {
         }
         other => panic!("reported contracts expected, got {other:?}"),
     }
+    assert_eq!(
+        link.capabilities().breakpoint_kinds,
+        vec![serde_json::json!({
+            "kind": "exec",
+            "range_unit": "address",
+            "memory_type_used": true,
+            "snapshot": true
+        })]
+    );
     h.join().unwrap();
 }
 

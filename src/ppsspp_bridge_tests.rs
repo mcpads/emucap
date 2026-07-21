@@ -275,6 +275,9 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
     assert_eq!(result["backend"], "ppsspp-debugger-ws");
     assert_eq!(result["debugger"], true);
     assert_eq!(result["memory_types"], json!(["main"]));
+    assert_eq!(result["breakpoint_kinds"][0]["kind"], "exec");
+    assert_eq!(result["breakpoint_kinds"][0]["memory_type_used"], false);
+    assert_eq!(result["breakpoint_kinds"][2]["kind"], "write");
     assert_eq!(
         result["execution_limits"]["max_sync_advance_count"],
         crate::live::temporal::MAX_SYNC_ADVANCE_COUNT

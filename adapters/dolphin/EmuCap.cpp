@@ -324,6 +324,15 @@ picojson::object Hello(Core::System&, const picojson::object&)
   if (gamecube)
     methods.push_back(picojson::value(std::string("set_input")));
   r["methods"] = picojson::value(methods);
+  picojson::object breakpoint_kind;
+  breakpoint_kind["kind"] = picojson::value(std::string("exec"));
+  breakpoint_kind["range_unit"] = picojson::value(std::string("address"));
+  breakpoint_kind["range_mode"] = picojson::value(std::string("exact"));
+  breakpoint_kind["memory_type_used"] = picojson::value(false);
+  breakpoint_kind["snapshot"] = picojson::value(false);
+  picojson::array breakpoint_kinds;
+  breakpoint_kinds.push_back(picojson::value(breakpoint_kind));
+  r["breakpoint_kinds"] = picojson::value(breakpoint_kinds);
   picojson::array active_exceptions;
   for (const char* id :
        {"dolphin.breakpoint.exact-exec-only", "dolphin.state-save.frozen-only",

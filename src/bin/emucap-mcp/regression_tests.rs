@@ -19,6 +19,7 @@ impl DetReplayLink {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
+                breakpoint_kinds: vec![],
                 contracts: emucap::contracts::ContractAdvertisement::Unreported,
                 identity: emucap::live::link::EmulatorIdentity::default(),
             },
@@ -474,6 +475,7 @@ impl Pc98InputReplayLink {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
+                breakpoint_kinds: vec![],
                 contracts: emucap::contracts::ContractAdvertisement::Unreported,
                 identity: emucap::live::link::EmulatorIdentity {
                     system: Some("pc98".into()),

@@ -300,14 +300,14 @@ pub(crate) struct CpuArgs {
 }
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct BreakpointArgs {
-    /// 종류: exec | read | write | nmi | irq | dma (nmi/irq/dma는 Mesen 전용). exec/read/write는 메모리 접근,
-    /// nmi/irq는 인터럽트 진입 이벤트, dma는 $420B(MDMAEN) write 시 DMA 채널 스냅샷. SERVER_INSTRUCTIONS 참조
+    /// 현재 연결에서 허용되는 값은 `status.breakpoint_kinds`를 확인한다. 각 항목은 kind와 함께
+    /// start/end의 단위, memory_type 사용 여부, snapshot 지원 여부를 설명한다.
     pub(crate) kind: String,
-    /// 메모리 타입(read_memory 참조). exec는 snesMemory(24비트 CPU버스), read/write는 보통 snesWorkRam
+    /// 메모리 타입(read_memory 참조). 선택한 kind가 사용하는지는 `status.breakpoint_kinds`를 확인한다.
     pub(crate) memory_type: String,
-    /// 범위 시작 주소(10진 또는 '0x'/'$' 16진). exec는 24비트(뱅크 포함) — 16비트 PC가 아님
+    /// 포함 범위의 시작(10진 또는 '0x'/'$' 16진). 단위는 `status.breakpoint_kinds`를 확인한다.
     pub(crate) start: Num,
-    /// 범위 끝 주소(단일 주소면 start와 같게)
+    /// 포함 범위의 끝(단일 값이면 start와 같게). 단위는 `status.breakpoint_kinds`를 확인한다.
     pub(crate) end: Num,
     /// 히트 시 freeze(status가 frozen이 됨). 교차-ROM 정렬 앵커에 사용
     #[serde(default)]
@@ -331,7 +331,7 @@ pub(crate) struct BreakpointArgs {
     pub(crate) value_len: Option<Num>,
     /// 히트 순간 atomic 캡처할 메모리 리스트("memory_type:address:length", 예 "snesWorkRam:0x68:3").
     /// freeze 후 read 사이 명령단위 드리프트로 ZP 등을 못 잡는 문제 해결 — 이벤트의 snapshot/regs에 히트
-    /// 시점 상태가 보존된다(drift·deadman 무관). exec/read/write BP에 적용(Mesen)
+    /// 시점 상태가 보존된다(drift·deadman 무관). 지원 여부는 `status.breakpoint_kinds`를 확인한다.
     #[serde(default)]
     pub(crate) snapshot: Vec<String>,
 }

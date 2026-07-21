@@ -434,6 +434,11 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": ["ee"],
+            "breakpoint_kinds": [
+                {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
+                {"kind":"read", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":false},
+                {"kind":"write", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":false},
+            ],
             "input_buttons": pcsx2_input_buttons_json(),
             "pcsx2_host_api": self.host_api,
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),

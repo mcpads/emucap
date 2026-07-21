@@ -38,7 +38,8 @@ use crate::regression::{
 };
 use crate::result::{err_result, output_result, track_err};
 use crate::status::{
-    enrich_link_status, enrich_status_value, make_bootstrap_value, normalize_rom_sha1,
+    enrich_breakpoint_kinds, enrich_link_status, enrich_status_value, make_bootstrap_value,
+    normalize_rom_sha1,
 };
 
 type SharedLink = Arc<Mutex<dyn EmulatorLink + Send>>;
@@ -255,8 +256,10 @@ impl Emucap {
                 let identity = link.capabilities().identity.clone();
                 let methods = link.capabilities().methods.clone();
                 let memory_types = link.capabilities().memory_types.clone();
+                let breakpoint_kinds = link.capabilities().breakpoint_kinds.clone();
                 let contracts = link.capabilities().contracts.clone();
                 enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
+                enrich_breakpoint_kinds(&mut v, &breakpoint_kinds);
                 status::enrich_contract_status(&mut v, &identity, &contracts);
                 enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
                 status::enrich_continuity(&mut v, &*link);
@@ -523,7 +526,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "메모리 접근/실행에 브레이크포인트를 건다(히트 시 freeze). kind·pc/value 필터·snapshot 등 옵션은 인자 doc 참조(미지원 kind는 거부 에러)."
+        description = "메모리 접근·실행 또는 지원되는 장치 경계에 브레이크포인트를 건다(히트 시 freeze). kind·범위·pc/value 필터·snapshot 등 옵션은 인자 설명을 참조한다."
     )]
     async fn set_breakpoint(&self, Parameters(a): Parameters<BreakpointArgs>) -> CallToolResult {
         let mut l = self.link();

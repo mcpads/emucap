@@ -10,6 +10,12 @@ impl<G: GdbTransport> Bridge<G> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": memory_type_names(),
+            "breakpoint_kinds": [
+                {"kind":"exec", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
+                {"kind":"read", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
+                {"kind":"write", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
+                {"kind":"access", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
+            ],
             "contracts": crate::contracts::advertisement_value(&[
                 "pc98.call-stack.best-effort",
                 "pc98.input-hold.port-zero-only",

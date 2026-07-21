@@ -25,6 +25,7 @@ impl SequenceLink {
                 protocol_version: 1,
                 methods: vec!["status".into()],
                 memory_types: vec![],
+                breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity {
                     launch_id: Some(launch_id.into()),

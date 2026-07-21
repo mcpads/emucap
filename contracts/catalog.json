@@ -184,9 +184,19 @@
       "expression": "set_breakpoint.ok => armed(id,kind,space,range,condition)"
     },
     {
+      "id": "BP.CAPABILITY.1",
+      "category": "invariant",
+      "expression": "set_breakpoint.ok and device_kind(kind) => negotiated(kind)"
+    },
+    {
       "id": "EVENT.ONCE.1",
       "category": "invariant",
       "expression": "drained(event) => event not_in future_poll_events"
+    },
+    {
+      "id": "EVENT.ATOMIC.1",
+      "category": "observation",
+      "expression": "emitted(device_event) => one_callback(device_clock,event.snapshot)"
     },
     {
       "id": "TRACE.AUTHORITY.1",
@@ -459,7 +469,7 @@
       "methods": ["set_breakpoint", "clear_breakpoint", "list_breakpoints", "clear_all_breakpoints"],
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
-      "expectations": ["BP.ARMED.1", "TIME.PERSISTENT.1"]
+      "expectations": ["BP.ARMED.1", "BP.CAPABILITY.1", "TIME.PERSISTENT.1"]
     },
     {
       "id": "debug.events",
@@ -467,7 +477,7 @@
       "methods": ["poll_events"],
       "temporal_classes": ["T0"],
       "disposition": "retain",
-      "expectations": ["EVENT.ONCE.1"]
+      "expectations": ["EVENT.ONCE.1", "EVENT.ATOMIC.1"]
     },
     {
       "id": "debug.disassemble",

@@ -87,6 +87,7 @@ PATCHES=(
   "$HERE/patches/0002-add-code-break-idle-event.patch"
   "$HERE/patches/0003-enable-safe-halt-savestates.patch"
   "$HERE/patches/0004-restart-command-line-script-after-power-cycle.patch"
+  "$HERE/patches/0005-add-snes-ppu-obj-boundary-events.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

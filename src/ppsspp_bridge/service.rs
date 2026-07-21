@@ -68,6 +68,11 @@ impl<T: WsTransport> PpssppBridge<T> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": MEMORY_TYPES,
+            "breakpoint_kinds": [
+                {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":false, "snapshot":false},
+                {"kind":"read", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
+                {"kind":"write", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
+            ],
             "contracts": crate::contracts::advertisement_value(&[
                 "ppsspp.execution.frame-step-absent",
                 "ppsspp.input-hold.port-zero-only",

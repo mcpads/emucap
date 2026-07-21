@@ -421,6 +421,7 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
             protocol_version: 1,
             methods: vec![],
             memory_types: vec![],
+            breakpoint_kinds: vec![],
             contracts: emucap::contracts::ContractAdvertisement::Unreported,
             identity: EmulatorIdentity::default(),
         },
@@ -802,6 +803,23 @@ fn enrich_status_value_no_memory_types_when_empty() {
     let mut v = serde_json::json!({"connected": true});
     enrich_status_value(&mut v, &["status".to_string()], &[], None);
     assert!(v.get("memory_types").is_none());
+}
+
+#[test]
+fn breakpoint_kinds_are_connection_advertised_data() {
+    let advertised = vec![serde_json::json!({
+        "kind": "device_boundary",
+        "range_unit": "scanline",
+        "memory_type_used": false,
+        "snapshot": true
+    })];
+    let mut connected = serde_json::json!({"connected": true});
+    enrich_breakpoint_kinds(&mut connected, &advertised);
+    assert_eq!(connected["breakpoint_kinds"], serde_json::json!(advertised));
+
+    let mut disconnected = serde_json::json!({"connected": false});
+    enrich_breakpoint_kinds(&mut disconnected, &advertised);
+    assert!(disconnected.get("breakpoint_kinds").is_none());
 }
 
 #[test]

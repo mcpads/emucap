@@ -21,6 +21,9 @@ impl<G: GdbTransport> NdsBridge<G> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": self.memory_type_names(),
+            "breakpoint_kinds": [
+                {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
+            ],
             "contracts": crate::contracts::advertisement_value(&[
                 "nds.execution.frame-step-absent",
                 "nds.call-stack.best-effort",

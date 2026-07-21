@@ -1,0 +1,60 @@
+diff --git i/Core/Debugger/LuaApi.cpp w/Core/Debugger/LuaApi.cpp
+--- i/Core/Debugger/LuaApi.cpp
++++ w/Core/Debugger/LuaApi.cpp
+@@ -26,6 +26,7 @@
+ #include "Shared/BaseControlManager.h"
+ #include "Utilities/HexUtilities.h"
+ #include "Utilities/FolderUtilities.h"
++#include "SNES/SnesPpuTypes.h"
+ #include "Utilities/magic_enum.hpp"
+ #include "Shared/MemoryOperationType.h"
+ 
+@@ -1088,7 +1089,15 @@ int LuaApi::GetState(lua_State* lua)
+ 	uint32_t masterClock = _emu->GetMasterClock();
+ 	uint32_t clockRate = _emu->GetMasterClockRate();
+ 	string consoleType = string(magic_enum::enum_name<ConsoleType>(_emu->GetConsoleType()));
+ 	string region = string(magic_enum::enum_name<ConsoleRegion>(_emu->GetRegion()));
++	if(_context->GetDefaultCpuType() == CpuType::Snes) {
++		SnesPpuState ppuState;
++		_debugger->GetPpuState(ppuState, CpuType::Snes);
++		uint16_t ppuCycle = ppuState.Cycle;
++		uint16_t ppuHClock = ppuState.HClock;
++		s.Stream(ppuCycle, "ppu.cycle");
++		s.Stream(ppuHClock, "ppu.hClock");
++	}
+ 
+ 	SV(clockRate);
+ 	SV(consoleType);
+diff --git i/Core/SNES/SnesPpu.cpp w/Core/SNES/SnesPpu.cpp
+--- i/Core/SNES/SnesPpu.cpp
++++ w/Core/SNES/SnesPpu.cpp
+@@ -415,6 +415,7 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
+ 		//"In non-interlace mode scanline 240 of every other frame (those with $213f.7=1) is only 1360 cycles."
+ 		if(_scanline < _vblankStartScanline) {
+ 			RenderScanline();
++			_emu->ProcessEvent(EventType::SnesPpuObjScanlineHandoff, CpuType::Snes);
+ 
+ 			if(_scanline == 0) {
+ 				_overscanFrame = _state.OverscanMode;
+@@ -517,6 +518,9 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
+ 		}
+ 
+ 		UpdateSpcState();
++		if(_scanline < _vblankStartScanline) {
++			_emu->ProcessEvent(EventType::SnesPpuObjEvaluationStart, CpuType::Snes);
++		}
+ 		return true;
+ 	}
+ 	return false;
+diff --git i/Core/Shared/EventType.h w/Core/Shared/EventType.h
+--- i/Core/Shared/EventType.h
++++ w/Core/Shared/EventType.h
+@@ -14,6 +14,8 @@ enum class EventType
+ 	CodeBreak,
+ 	CodeBreakIdle,
+ 	CodeBreakIdleSavestate,
++	SnesPpuObjEvaluationStart,
++	SnesPpuObjScanlineHandoff,
+ 
+ 	LastValue
+ };

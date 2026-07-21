@@ -2262,13 +2262,19 @@ void handle(const std::string& line) {
     std::string contracts =
         "{\"catalog\":\"emucap-feature-contracts/v3\",\"active_exceptions\":[" +
         exception_ids + "]}";
+    const std::string breakpoint_kinds = has_debugger
+        ? "[{\"kind\":\"exec\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false},"
+          "{\"kind\":\"read\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false},"
+          "{\"kind\":\"write\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false}]"
+        : "[]";
     char head[224];
     snprintf(head, sizeof(head),
              "{\"protocol_version\":%d,\"system\":\"%s\",\"adapter\":\"mednafen\",\"build\":\"%s\","
              "\"debugger\":%s,",
              PROTOCOL_VERSION, sys, EMUCAP_BUILD_HASH, has_debugger ? "true" : "false");
     std::string hello_resp = std::string(head) + "\"methods\":[" + methods +
-                             "],\"memory_types\":[" + mtypes + "],\"contracts\":" +
+                             "],\"memory_types\":[" + mtypes + "],\"breakpoint_kinds\":" +
+                             breakpoint_kinds + ",\"contracts\":" +
                              contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
                              std::to_string(MAX_SYNC_ADVANCE) + "}}";
     // broker 등록용 name(EMUCAP_NAME 설정 시 포함, 직접 모드는 무시됨).

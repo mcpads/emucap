@@ -82,6 +82,12 @@ fn fake_mesen_emu(
                     "adapter": "mesen2-live",
                     "mesen_host_api": 1,
                     "host_features": host_features,
+                    "breakpoint_kinds": [{
+                        "kind": "device_boundary",
+                        "range_unit": "scanline",
+                        "memory_type_used": false,
+                        "snapshot": true
+                    }],
                     "host_build": {
                         "upstream_commit": "0123456789abcdef0123456789abcdef01234567",
                         "patchset_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
@@ -216,6 +222,15 @@ fn broker_forwards_mesen_native_halt_identity() {
     assert_eq!(
         result["host_features"],
         serde_json::json!(["code_break_idle", "native_halt_service"])
+    );
+    assert_eq!(
+        result["breakpoint_kinds"],
+        serde_json::json!([{
+            "kind": "device_boundary",
+            "range_unit": "scanline",
+            "memory_type_used": false,
+            "snapshot": true
+        }])
     );
     assert_eq!(
         result["host_build"]["upstream_commit"],

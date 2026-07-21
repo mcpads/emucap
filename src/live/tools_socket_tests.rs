@@ -67,6 +67,7 @@ fn session_cleanup_refuses_a_replacement_launch_generation() {
             protocol_version: 1,
             methods: vec!["status".into(), "set_input".into()],
             memory_types: vec![],
+            breakpoint_kinds: vec![],
             contracts: crate::contracts::ContractAdvertisement::Unreported,
             identity: EmulatorIdentity {
                 launch_id: Some("original-generation".into()),

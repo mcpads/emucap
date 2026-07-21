@@ -114,11 +114,21 @@ that Mesen exited, so reconnect and query `status` before launching another proc
   because they may be between instructions. Use breakpoint `snapshot` for exact hit-time memory. A
   `set_input` hold persists until explicitly released with an empty set_input; resume/step do not
   release it.)
-- Breakpoints · tracing: `set_breakpoint` (kind **exec/read/write/nmi/irq/dma**;
+- Breakpoints · tracing: `set_breakpoint` (the current system's exact kinds and argument semantics are
+  advertised by `status.breakpoint_kinds`; the SNES set includes
+  **exec/read/write/nmi/irq/dma/snes_obj_eval_start/snes_obj_handoff**;
   pc_min/pc_max conditions, **value/value_mask/value_len value-conditions**; a write BP
   includes the $2118/$2119→**vram_addr** · $2122→cgram_addr · $2104→oam_addr destination
   in the event) · `clear_breakpoint`/`list_breakpoints`/`clear_all_breakpoints`/`poll_events` ·
   `watch_register` · `set_trace`/`get_trace`/`call_stack` · `break_on_reset`.
+- SNES PPU OBJ boundaries: `snes_obj_eval_start` fires at H=0 before OAM evaluation for the active
+  scanline. `snes_obj_handoff` fires at the end of that scanline after lazy OBJ evaluation and sprite
+  fetch have caught up, immediately before their calculated buffers are copied into render state.
+  `start`/`end` select an inclusive scanline range. A `device_event` contains
+  `ppu.{frame,scanline,dot,hclock,master_clock}`, `forced_blank`, and any requested
+  `snapshot=["snesSpriteRam:0:0x220", "snesWorkRam:address:length"]` captured in the same callback.
+  These events observe PPU consumption boundaries, not CPU `$2104` writes. A forced-blank event is a
+  timing boundary but not positive evidence that OBJ data was consumed.
 - Disassembly: `disassemble(address, count)` → `[{addr,text,bytes}]`. Mesen2 Lua has no
   disassembly API, so a 65816 decoder is implemented directly in the adapter (M/X flags
   start from `cpu.ps` and track REP/SEP).

@@ -293,6 +293,8 @@ fn hello_advertises_only_implemented_rust_methods() {
     assert_eq!(result["name"], "pc98");
     assert_eq!(result["session_token"], "token");
     assert_eq!(result["build"], "abc123");
+    assert_eq!(result["breakpoint_kinds"][3]["kind"], "access");
+    assert_eq!(result["breakpoint_kinds"][0]["snapshot"], true);
     assert_eq!(result["contracts"]["catalog"], crate::contracts::CATALOG_ID);
     assert_eq!(
         result["contracts"]["active_exceptions"],

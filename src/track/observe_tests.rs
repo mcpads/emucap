@@ -14,6 +14,7 @@ impl ObsLink {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
+                breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 identity: EmulatorIdentity::default(),
             },
