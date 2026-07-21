@@ -12,7 +12,7 @@ GBA · NES), a Mednafen fork
 (PlayStation 2), a Dolphin fork (GameCube · Wii), MAME (PC-98 and experimental Neo Geo
 MVS), and an experimental Mupen64Plus frontend (Nintendo 64).
 
-**v0.10.0 — beta.** This repository remains under active development; interfaces and
+**v0.10.1 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 

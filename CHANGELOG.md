@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.1
+
+### Added
+- Added an experimental Mupen64Plus adapter for Nintendo 64 with isolated headless or visible launch, R4300 state, exact instruction stepping, and bounded frozen RDRAM access. Input, screenshots, save states, frame stepping, breakpoints, and RSP state remain unavailable until their timing contracts are proven.
+- Added an experimental MAME adapter for Neo Geo MVS with 68000 state and stepping, frame control, bounded work-RAM access, screenshots, port-0 input, and reset. AES and other Neo Geo families remain separate, and game-ROM input plus native save/load still require representative runtime validation.
+- Mesen can negotiate SNES PPU OBJ evaluation and commit boundary events with scanline filters and atomic event snapshots when the pinned host patch is present.
+
+### Fixed
+- Launchers reclaim only exited runtime generations whose ownership can be established, and clean up exact external bridge processes that outlive their emulator without replacing a live or unverifiable lease.
+- Mesen launch readiness is bound to the requested live generation instead of accepting stale runtime identity, and its patched host stops decoder threads before emulator teardown to avoid the observed shutdown crash.
+
 ## 0.10.0
 
 ### Added
