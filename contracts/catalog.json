@@ -111,7 +111,7 @@
     {
       "id": "LIFE.LEASE.1",
       "category": "temporal",
-      "expression": "G(acquire_lease(g,c) => current = g) and G(lease_held(g,c1) and c1 != c2 => not mutation_authorized(g,c2)) and G(holder_exited(g) => F<=D_h lease_available(g))"
+      "expression": "G(acquire_lease(g,c) => current = g) and G(lease_held(g,c1) and c1 != c2 => not mutation_authorized(g,c2)) and G(holder_exited(g) and lease_check_requested(g) => F<=D_h lease_available_reported(g))"
     },
     {
       "id": "LIFE.PUBLISH.1",
