@@ -1,0 +1,138 @@
+diff --git a/Core/Shared/Emulator.cpp b/Core/Shared/Emulator.cpp
+--- a/Core/Shared/Emulator.cpp
++++ b/Core/Shared/Emulator.cpp
+@@ -81,6 +81,15 @@ Emulator::Emulator()
+ 
+ Emulator::~Emulator()
+ {
++	// A signal-driven process exit can bypass the managed Release call.  Stop the emulation and
++	// renderer workers while every Emulator member is still alive; otherwise they can race member
++	// destruction through SoundMixer, VideoDecoder, or EmuSettings.
++	Stop(false, true, false);
++	_gameClient->Disconnect();
++	_gameServer->StopServer();
++	_videoRenderer->StopThread();
++	_videoDecoder->StopThread();
++	_shortcutKeyHandler.reset();
+ }
+ 
+ void Emulator::Initialize(bool enableShortcuts)
+diff --git a/InteropDLL/ConfigApiWrapper.cpp b/InteropDLL/ConfigApiWrapper.cpp
+--- a/InteropDLL/ConfigApiWrapper.cpp
++++ b/InteropDLL/ConfigApiWrapper.cpp
+@@ -7,7 +7,7 @@
+ #include "Utilities/StringUtilities.h"
+ 
+-extern unique_ptr<Emulator> _emu;
+-extern unique_ptr<IAudioDevice> _soundManager;
++extern unique_ptr<Emulator>& _emu;
++extern unique_ptr<IAudioDevice>& _soundManager;
+ 
+ extern "C"
+ {
+diff --git a/InteropDLL/DebugApiWrapper.cpp b/InteropDLL/DebugApiWrapper.cpp
+--- a/InteropDLL/DebugApiWrapper.cpp
++++ b/InteropDLL/DebugApiWrapper.cpp
+@@ -26,5 +26,5 @@
+ #include "Core/Gameboy/GbTypes.h"
+ #include "Utilities/StringUtilities.h"
+ 
+-extern unique_ptr<Emulator> _emu;
++extern unique_ptr<Emulator>& _emu;
+ 
+diff --git a/InteropDLL/EmuApiWrapper.cpp b/InteropDLL/EmuApiWrapper.cpp
+--- a/InteropDLL/EmuApiWrapper.cpp
++++ b/InteropDLL/EmuApiWrapper.cpp
+@@ -37,11 +37,14 @@
+ 
+ #include "Shared/Video/SoftwareRenderer.h"
+ 
+-unique_ptr<IRenderingDevice> _renderer;
+-unique_ptr<IAudioDevice> _soundManager;
+-unique_ptr<IKeyManager> _keyManager;
+-unique_ptr<IMouseManager> _mouseManager;
+-unique_ptr<Emulator> _emu(new Emulator());
++// .NET's signal-driven ExitProcess can unload native globals while the UI event loop is still
++// dispatching interop calls.  Keep explicitly released objects in process-lifetime slots so an
++// abrupt exit leaves reclamation to the OS instead of racing C++ global destruction.
++unique_ptr<IRenderingDevice>& _renderer = *new unique_ptr<IRenderingDevice>();
++unique_ptr<IAudioDevice>& _soundManager = *new unique_ptr<IAudioDevice>();
++unique_ptr<IKeyManager>& _keyManager = *new unique_ptr<IKeyManager>();
++unique_ptr<IMouseManager>& _mouseManager = *new unique_ptr<IMouseManager>();
++unique_ptr<Emulator>& _emu = *new unique_ptr<Emulator>(new Emulator());
+ bool _softwareRenderer = false;
+ 
+ static void* _windowHandle = nullptr;
+@@ -49,7 +52,7 @@
+ 
+ static constexpr char* _buildDateTime = __DATE__ ", " __TIME__;
+ 
+-static InteropNotificationListeners _listeners;
++static InteropNotificationListeners& _listeners = *new InteropNotificationListeners();
+ 
+ struct InteropRomInfo
+ {
+diff --git a/InteropDLL/HistoryApiWrapper.cpp b/InteropDLL/HistoryApiWrapper.cpp
+--- a/InteropDLL/HistoryApiWrapper.cpp
++++ b/InteropDLL/HistoryApiWrapper.cpp
+@@ -22,5 +22,5 @@
+ #endif
+ 
+-extern unique_ptr<Emulator> _emu;
++extern unique_ptr<Emulator>& _emu;
+ extern bool _softwareRenderer;
+ 
+diff --git a/InteropDLL/InputApiWrapper.cpp b/InteropDLL/InputApiWrapper.cpp
+--- a/InteropDLL/InputApiWrapper.cpp
++++ b/InteropDLL/InputApiWrapper.cpp
+@@ -8,5 +8,5 @@
+ 
+-extern unique_ptr<IKeyManager> _keyManager;
+-extern unique_ptr<IMouseManager> _mouseManager;
+-extern unique_ptr<Emulator> _emu;
++extern unique_ptr<IKeyManager>& _keyManager;
++extern unique_ptr<IMouseManager>& _mouseManager;
++extern unique_ptr<Emulator>& _emu;
+ 
+diff --git a/InteropDLL/NetplayApiWrapper.cpp b/InteropDLL/NetplayApiWrapper.cpp
+--- a/InteropDLL/NetplayApiWrapper.cpp
++++ b/InteropDLL/NetplayApiWrapper.cpp
+@@ -7,3 +7,3 @@
+ 
+-extern unique_ptr<Emulator> _emu;
++extern unique_ptr<Emulator>& _emu;
+ 
+diff --git a/InteropDLL/RecordApiWrapper.cpp b/InteropDLL/RecordApiWrapper.cpp
+--- a/InteropDLL/RecordApiWrapper.cpp
++++ b/InteropDLL/RecordApiWrapper.cpp
+@@ -6,3 +6,3 @@
+ 
+-extern unique_ptr<Emulator> _emu;
++extern unique_ptr<Emulator>& _emu;
+ 
+diff --git a/InteropDLL/TestApiWrapper.cpp b/InteropDLL/TestApiWrapper.cpp
+--- a/InteropDLL/TestApiWrapper.cpp
++++ b/InteropDLL/TestApiWrapper.cpp
+@@ -7,3 +7,3 @@
+ 
+-extern unique_ptr<Emulator> _emu;
++extern unique_ptr<Emulator>& _emu;
+ shared_ptr<RecordedRomTest> _recordedRomTest;
+diff --git a/UI/Windows/MainWindow.axaml.cs b/UI/Windows/MainWindow.axaml.cs
+--- a/UI/Windows/MainWindow.axaml.cs
++++ b/UI/Windows/MainWindow.axaml.cs
+@@ -160,13 +160,13 @@ namespace Mesen.Windows
+ 				return false;
+ 			}
+ 
++			_isClosing = true;
+ 			_timerBackgroundFlag.Stop();
+ 			EmuApi.Stop();
+ 			_listener?.Dispose();
+ 			EmuApi.Release();
+ 			ConfigManager.Config.MainWindow.SaveWindowSettings(this);
+ 			ConfigManager.Config.Save();
+-			_isClosing = true;
+ 
+ 			return true;
+ 		}

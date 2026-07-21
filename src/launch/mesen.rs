@@ -407,6 +407,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let spec = crate::launch::spec::mesen_spec(&portable.binary, l.log_path, l.lua, &opts)
         .env("EMUCAP_MESEN_UPSTREAM_COMMIT", &host_build.commit)
         .env("EMUCAP_MESEN_PATCHSET_SHA256", &host_build.patchset_sha256);
+    crate::launch::wake_display_before_gui_launch();
     let pid = crate::launch::spawn_detached(&spec)?;
     // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).
     crate::launch::spawn_display_caffeinate(pid);

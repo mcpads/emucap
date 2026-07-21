@@ -114,7 +114,8 @@ try {
         (Join-Path $Here "patches/0002-add-code-break-idle-event.patch"),
         (Join-Path $Here "patches/0003-enable-safe-halt-savestates.patch"),
         (Join-Path $Here "patches/0004-restart-command-line-script-after-power-cycle.patch"),
-        (Join-Path $Here "patches/0005-add-snes-ppu-obj-boundary-events.patch")
+        (Join-Path $Here "patches/0005-add-snes-ppu-obj-boundary-events.patch"),
+        (Join-Path $Here "patches/0006-stop-video-threads-before-emulator-destruction.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {

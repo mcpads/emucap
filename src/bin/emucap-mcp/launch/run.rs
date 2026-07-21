@@ -358,23 +358,19 @@ pub(crate) fn make_launch(
             "launcher_outcome": outcome,
         });
     }
-    let ready_status = match wait_for_adapter_ready(
-        link,
-        std::time::Duration::from_secs(15),
-        || {
-            let emulator_state = manifest.process_state();
-            let bridge_state = manifest.bridge_process_state();
-            if emulator_state != ProcessState::Alive
-                || bridge_state.is_some_and(|state| state != ProcessState::Alive)
-            {
-                Err(format!(
+    let ready_status = match wait_for_adapter_ready(link, adapter_ready_timeout(adapter), || {
+        let emulator_state = manifest.process_state();
+        let bridge_state = manifest.bridge_process_state();
+        if emulator_state != ProcessState::Alive
+            || bridge_state.is_some_and(|state| state != ProcessState::Alive)
+        {
+            Err(format!(
                     "launch process exited before adapter hello: emulator={emulator_state:?}, bridge={bridge_state:?}"
                 ))
-            } else {
-                Ok(())
-            }
-        },
-    ) {
+        } else {
+            Ok(())
+        }
+    }) {
         Ok(status) => status,
         Err(error) => {
             let _ = manifest.terminate_owned_processes();
@@ -414,6 +410,18 @@ pub(crate) fn make_launch(
         );
     }
     outcome
+}
+
+pub(super) fn adapter_ready_timeout(adapter: &str) -> std::time::Duration {
+    // Mesen starts an Avalonia window and then loads the command-line Lua script. On macOS a cold
+    // display wake can make that path exceed the generic bridge budget even though the process is
+    // healthy. The fallback launcher already allows 20 seconds; the built-in path keeps a little
+    // more margin while continuing to poll liveness and failing with a bounded deadline.
+    if adapter == "mesen2" {
+        std::time::Duration::from_secs(30)
+    } else {
+        std::time::Duration::from_secs(15)
+    }
 }
 
 pub(super) fn wait_for_adapter_ready<F>(

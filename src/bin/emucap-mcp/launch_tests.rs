@@ -1549,6 +1549,18 @@ fn adapter_readiness_wait_is_bounded() {
 }
 
 #[test]
+fn mesen_readiness_budget_covers_gui_cold_start_without_weakening_other_adapters() {
+    assert_eq!(
+        adapter_ready_timeout("mesen2"),
+        std::time::Duration::from_secs(30)
+    );
+    assert_eq!(
+        adapter_ready_timeout("mednafen"),
+        std::time::Duration::from_secs(15)
+    );
+}
+
+#[test]
 fn launch_refuses_missing_content_before_binary_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("missing.sfc");

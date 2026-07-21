@@ -137,6 +137,51 @@ fn timeout_preserves_last_good_and_success_recovers_failure() {
 }
 
 #[test]
+fn live_identity_mismatch_never_overwrites_the_current_capsule() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47834);
+    let mut inner = SequenceLink::new(
+        47834,
+        &current.launch_id,
+        [
+            Outcome::Ok(serde_json::json!({"state": "running", "frame": 41})),
+            Outcome::Ok(serde_json::json!({"written": 1})),
+        ],
+    );
+    // Shape the live hello like an official fallback launch: authenticated transport, but no
+    // generation id, and an identity that clearly is not the old capsule on this port.
+    inner.caps.identity = EmulatorIdentity {
+        system: Some("snes".into()),
+        adapter: Some("mesen2-live".into()),
+        content: Some("/anachron.sfc".into()),
+        launch_id: None,
+        ..Default::default()
+    };
+    let mut link = ObservedLink::with_store(inner, store.clone());
+
+    link.call("status", serde_json::json!({})).unwrap();
+    let snapshot = link.continuity();
+    assert_eq!(
+        snapshot.runtime_binding.state,
+        RuntimeBindingState::Mismatched
+    );
+    assert_eq!(snapshot.execution.state, ExecutionState::Running);
+    assert_eq!(snapshot.transport.state, TransportState::Connected);
+    assert_eq!(snapshot.lease.state, LeaseState::Unknown);
+
+    // A fallback-attached emulator remains usable, but its calls do not borrow or mutate the old
+    // generation's lease/evidence record.
+    link.call("write_memory", serde_json::json!({})).unwrap();
+    let persisted: Option<LinkRecord> = store.read_link_json(47834, &current.launch_id).unwrap();
+    assert!(persisted.is_none());
+    assert_eq!(
+        link.failure_context()["link_failure"]["last_status"]["frame"],
+        41
+    );
+}
+
+#[test]
 fn stale_adapter_failure_is_reported_but_not_promoted_to_exact() {
     let tmp = tempfile::tempdir().unwrap();
     let store = RuntimeStore::new(tmp.path().join("sessions"));

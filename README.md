@@ -159,7 +159,8 @@ checks `status` a few seconds later. Because **bootstrap also reveals the adapte
 install paths and fallbacks**, the agent never has to hunt around the filesystem.
 
 A timeout or `connected: false` reports transport state, not proof that the
-emulator exited. Inspect `status.continuity`, `status.runtime_instance`, and
+emulator exited. Inspect `status.continuity.runtime_binding`,
+`status.runtime_instance` or `status.stale_runtime_instance`, and
 `get_failure_context` before relaunching. Reattach to a live owned generation;
 use `launch(..., replace: true)` only for an intentional, identity-verified
 replacement. On a Flycast fatal quarantine, read the preserved context first and

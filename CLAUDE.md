@@ -45,11 +45,13 @@ MCP. Read `rom_sha1` from the Control MCP's `get_rom_info` and pass it to the Tr
 `log_intervention`.
 
 Treat transport, execution, and evidence as separate states. A timeout or disconnected socket does
-not prove that the emulator exited: inspect `status.continuity`, `status.runtime_instance`, and
-`get_failure_context` before launching again. Reattach to a live owned generation; use
-`launch(..., replace: true)` only for an intentional identity-verified replacement. Flycast can hold
-an exact fatal snapshot in read-only quarantine; inspect it first, then call `dismiss_failure` only
-when the connected adapter advertises that method.
+not prove that the emulator exited: inspect `status.continuity.runtime_binding`,
+`status.runtime_instance` or `status.stale_runtime_instance`, and `get_failure_context` before
+launching again. A `mismatched` or `unmanaged` live adapter can provide observations, but an older
+runtime record is not evidence that the current process is owned. Do not edit runtime files; use
+`launch(..., replace: true)` only for an intentional identity-verified replacement. Flycast can
+hold an exact fatal snapshot in read-only quarantine; inspect it first, then call `dismiss_failure`
+only when the connected adapter advertises that method.
 
 If tool discovery lacks the Control MCP's `bootstrap`/`launch_plan`, or `status` has no
 `runtime_paths` (or the Tracking MCP's `run_start` is missing), the running release is stale. Rebuild

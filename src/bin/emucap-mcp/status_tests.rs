@@ -489,6 +489,33 @@ fn bootstrap_is_total_when_status_times_out() {
     assert_eq!(value["listening_port"], 47856);
 }
 
+#[test]
+fn mismatched_live_identity_demotes_the_old_runtime_capsule() {
+    let mut value = serde_json::json!({
+        "connected": true,
+        "runtime_instance": {"launch_id": "old-pc98"}
+    });
+    let mut continuity = emucap::live::continuity::ContinuitySnapshot::default();
+    continuity.runtime_binding = emucap::live::continuity::RuntimeBinding {
+        state: emucap::live::continuity::RuntimeBindingState::Mismatched,
+        current_launch_id: Some("old-pc98".into()),
+        live_launch_id: None,
+        reason: "live identity differs".into(),
+    };
+
+    enrich_runtime_instance(
+        value.as_object_mut().unwrap(),
+        &continuity,
+        Some(serde_json::json!({"launch_id": "old-pc98", "system": "pc98"})),
+    );
+
+    assert!(value.get("runtime_instance").is_none());
+    assert_eq!(value["stale_runtime_instance"]["launch_id"], "old-pc98");
+    assert!(value["next_safe_action"]
+        .as_str()
+        .is_some_and(|message| message.contains("do not treat the stale capsule")));
+}
+
 struct DiagnosticLink {
     caps: emucap::live::link::Capabilities,
 }

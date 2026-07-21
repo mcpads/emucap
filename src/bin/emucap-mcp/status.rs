@@ -916,11 +916,36 @@ pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLi
             .ok()
             .flatten()
     });
-    if let Some(current) = refreshed_current {
-        object.insert(
-            "runtime_instance".into(),
-            current.public_value_with_lease(&continuity.lease),
-        );
+    enrich_runtime_instance(
+        object,
+        &continuity,
+        refreshed_current.map(|current| current.public_value_with_lease(&continuity.lease)),
+    );
+}
+
+fn enrich_runtime_instance(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    continuity: &emucap::live::continuity::ContinuitySnapshot,
+    current: Option<serde_json::Value>,
+) {
+    if let Some(current) = current {
+        if matches!(
+            continuity.runtime_binding.state,
+            emucap::live::continuity::RuntimeBindingState::Mismatched
+                | emucap::live::continuity::RuntimeBindingState::Unmanaged
+        ) {
+            object.remove("runtime_instance");
+            object.insert("stale_runtime_instance".into(), current);
+            object.insert(
+                "next_safe_action".into(),
+                serde_json::json!(
+                    "use the live emulator identity for observation; do not treat the stale capsule as ownership evidence or edit runtime files"
+                ),
+            );
+        } else {
+            object.remove("stale_runtime_instance");
+            object.insert("runtime_instance".into(), current);
+        }
     } else if let Some(runtime) = object
         .get_mut("runtime_instance")
         .and_then(serde_json::Value::as_object_mut)

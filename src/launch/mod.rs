@@ -242,6 +242,24 @@ pub(crate) fn spawn_display_caffeinate(target_pid: u32) {
     }
 }
 
+/// Wake the macOS display before starting a GUI emulator. Keeping the display awake only after the
+/// child exists is too late for Avalonia renderers that initialize while a sleeping display is
+/// still transitioning. This mirrors the guarded pre-launch wake used by the Mesen fallback
+/// launcher. No-op on other platforms.
+pub(crate) fn wake_display_before_gui_launch() {
+    #[cfg(target_os = "macos")]
+    {
+        let mut cmd = Command::new("caffeinate");
+        cmd.args(["-u", "-t", "5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if spawn_reaped(cmd).is_ok() {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    }
+}
+
 /// Whether a process is still alive. Unix uses `kill(pid, 0)`; Windows queries the process exit
 /// code through a limited-information handle. Runtime ownership additionally compares the process
 /// start identity before treating an alive PID as the launched process.

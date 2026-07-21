@@ -44,6 +44,36 @@ pub enum EvidenceState {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeBindingState {
+    Bound,
+    Mismatched,
+    Unmanaged,
+    Unobserved,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeBinding {
+    pub state: RuntimeBindingState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_launch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_launch_id: Option<String>,
+    pub reason: String,
+}
+
+impl Default for RuntimeBinding {
+    fn default() -> Self {
+        Self {
+            state: RuntimeBindingState::Unobserved,
+            current_launch_id: None,
+            live_launch_id: None,
+            reason: "no live adapter identity has been observed".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransportContinuity {
     pub state: TransportState,
@@ -84,6 +114,7 @@ pub struct RuntimeDiagnostic {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContinuitySnapshot {
+    pub runtime_binding: RuntimeBinding,
     pub transport: TransportContinuity,
     pub execution: ExecutionContinuity,
     pub evidence: EvidenceContinuity,
@@ -99,6 +130,7 @@ pub struct ContinuitySnapshot {
 impl Default for ContinuitySnapshot {
     fn default() -> Self {
         Self {
+            runtime_binding: RuntimeBinding::default(),
             transport: TransportContinuity {
                 state: TransportState::Disconnected,
                 last_response_unix_ms: None,
@@ -232,6 +264,8 @@ pub struct ObservedLink<L> {
     holder: ProcessIdentity,
     current: Option<CurrentManifest>,
     record: Option<LinkRecord>,
+    live_record: Option<LinkRecord>,
+    runtime_binding: RuntimeBinding,
     adapter_failure: Option<Value>,
     runtime_diagnostics: Vec<RuntimeDiagnostic>,
     snapshot: ContinuitySnapshot,
@@ -254,6 +288,8 @@ impl<L: EmulatorLink> ObservedLink<L> {
             holder: capture_process(std::process::id()),
             current: None,
             record: None,
+            live_record: None,
+            runtime_binding: RuntimeBinding::default(),
             adapter_failure: None,
             runtime_diagnostics: Vec::new(),
             snapshot: ContinuitySnapshot::default(),
@@ -263,6 +299,9 @@ impl<L: EmulatorLink> ObservedLink<L> {
     }
 
     fn current_location(&self) -> Option<(u16, &str)> {
+        if self.runtime_binding.state != RuntimeBindingState::Bound {
+            return None;
+        }
         let current = self.current.as_ref()?;
         Some((current.port, current.launch_id.as_str()))
     }
@@ -271,6 +310,11 @@ impl<L: EmulatorLink> ObservedLink<L> {
         self.runtime_diagnostics.clear();
         self.adapter_failure = None;
         let Some(port) = self.inner.endpoint_port() else {
+            self.runtime_binding = runtime_binding(
+                None,
+                &self.inner.capabilities().identity,
+                !self.inner.capabilities().methods.is_empty(),
+            );
             self.rebuild_snapshot();
             return;
         };
@@ -285,6 +329,11 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 None
             }
         };
+        self.runtime_binding = runtime_binding(
+            self.current.as_ref(),
+            &self.inner.capabilities().identity,
+            !self.inner.capabilities().methods.is_empty(),
+        );
         self.record = match self.current.as_ref() {
             Some(current) => {
                 match self
@@ -322,25 +371,31 @@ impl<L: EmulatorLink> ObservedLink<L> {
     }
 
     fn rebuild_snapshot(&mut self) {
+        let current_bound = self.runtime_binding.state == RuntimeBindingState::Bound;
+        let active_record = if current_bound {
+            self.record.as_ref()
+        } else {
+            self.live_record.as_ref()
+        };
         let adapter_failure = self.adapter_failure.as_ref();
-        let adapter_valid = self
-            .current
-            .as_ref()
-            .zip(adapter_failure)
-            .is_some_and(|(current, failure)| adapter_failure_is_current(current, failure));
+        let adapter_valid =
+            self.current
+                .as_ref()
+                .zip(adapter_failure)
+                .is_some_and(|(current, failure)| {
+                    current_bound && adapter_failure_is_current(current, failure)
+                });
         let adapter_exact = adapter_valid
             && adapter_failure.is_some_and(|failure| {
                 failure.get("kind").and_then(Value::as_str) != Some("adapter_internal_error")
             });
         let adapter_active =
             adapter_valid && adapter_failure.is_some_and(adapter_failure_is_active);
-        let lease = self
-            .record
-            .as_ref()
+        let lease = active_record
             .and_then(|record| record.lease.as_ref())
             .map(|lease| lease_view(lease, &self.holder))
             .unwrap_or_else(LeaseView::unknown);
-        let transport = self.record.as_ref().map_or(
+        let transport = active_record.map_or(
             TransportContinuity {
                 state: TransportState::Disconnected,
                 last_response_unix_ms: None,
@@ -352,11 +407,10 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 consecutive_timeouts: record.consecutive_timeouts,
             },
         );
-        let process = self.current.as_ref().map(CurrentManifest::process_state);
-        let last_status = self
-            .record
-            .as_ref()
-            .and_then(|record| record.last_status.as_ref());
+        let process = current_bound
+            .then(|| self.current.as_ref().map(CurrentManifest::process_state))
+            .flatten();
+        let last_status = active_record.and_then(|record| record.last_status.as_ref());
         let execution = if process == Some(ProcessState::Exited) {
             ExecutionContinuity {
                 state: ExecutionState::Exited,
@@ -380,9 +434,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 source: "host".into(),
             }
         };
-        let link_failure_available = self
-            .record
-            .as_ref()
+        let link_failure_available = active_record
             .and_then(|record| record.last_failure.as_ref())
             .is_some();
         let evidence = if adapter_exact && adapter_active {
@@ -416,27 +468,35 @@ impl<L: EmulatorLink> ObservedLink<L> {
             }
         };
         self.snapshot = ContinuitySnapshot {
+            runtime_binding: self.runtime_binding.clone(),
             transport,
             execution,
             evidence,
-            last_failure: self.record.as_ref().and_then(|r| r.last_failure.clone()),
+            last_failure: active_record.and_then(|r| r.last_failure.clone()),
             runtime_diagnostics: self.runtime_diagnostics.clone(),
             lease,
         };
     }
 
     fn claim_lease(&mut self) -> io::Result<LeaseView> {
+        self.refresh_runtime();
+        if self.runtime_binding.state != RuntimeBindingState::Bound {
+            return Ok(LeaseView::unknown());
+        }
         self.claim_lease_for(None)
     }
 
     fn claim_lease_for(&mut self, expected_launch_id: Option<&str>) -> io::Result<LeaseView> {
         self.refresh_runtime();
-        let Some((port, launch_id)) = self
-            .current_location()
-            .map(|(port, id)| (port, id.to_string()))
-        else {
+        if expected_launch_id.is_none() && self.runtime_binding.state != RuntimeBindingState::Bound
+        {
+            return Ok(LeaseView::unknown());
+        }
+        let Some(current) = self.current.as_ref() else {
             return Ok(LeaseView::unknown());
         };
+        let port = current.port;
+        let launch_id = current.launch_id.clone();
         if expected_launch_id.is_some_and(|expected| expected != launch_id) {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -523,7 +583,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             LeaseState::Held => Ok(()),
             // Before a launch generation exists there is no lease to guard; the launcher creates
             // the generation and rotates the reclaim capability atomically with its own checks.
-            LeaseState::Unknown if self.current.is_none() => Ok(()),
+            LeaseState::Unknown if self.current_location().is_none() => Ok(()),
             LeaseState::Occupied | LeaseState::Available | LeaseState::Unknown => {
                 Err(LinkError::Busy)
             }
@@ -532,7 +592,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
 
     fn record_success(&mut self, method: &str, result: &Value) {
         self.refresh_runtime();
-        if self.current.is_some()
+        if self.current_location().is_some()
             && self
                 .claim_lease()
                 .map(|lease| lease.state != LeaseState::Held)
@@ -547,7 +607,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             let now = super::runtime::now_unix_ms();
             let mut identity = self.inner.capabilities().identity.clone();
             identity.session_token = None;
-            let record = self.record.get_or_insert_with(|| {
+            let record = self.live_record.get_or_insert_with(|| {
                 LinkRecord::new(
                     identity
                         .launch_id
@@ -620,7 +680,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             return;
         }
         self.refresh_runtime();
-        if self.current.is_some()
+        if self.current_location().is_some()
             && self
                 .claim_lease()
                 .map(|lease| lease.state != LeaseState::Held)
@@ -647,7 +707,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 .clone()
                 .unwrap_or_else(|| "unmanaged".into());
             let record = self
-                .record
+                .live_record
                 .get_or_insert_with(|| LinkRecord::new(unmanaged_id));
             record.transport_state = transport;
             if matches!(error, LinkError::Timeout) {
@@ -710,9 +770,80 @@ impl<L: EmulatorLink> ObservedLink<L> {
             });
         serde_json::json!({
             "continuity": self.snapshot,
-            "link_failure": self.record.as_ref().map(LinkRecord::public_value),
+            "link_failure": if self.runtime_binding.state == RuntimeBindingState::Bound {
+                self.record.as_ref().map(LinkRecord::public_value)
+            } else {
+                self.live_record.as_ref().map(LinkRecord::public_value)
+            },
             "adapter_failure": adapter_failure,
         })
+    }
+}
+
+fn runtime_binding(
+    current: Option<&CurrentManifest>,
+    identity: &EmulatorIdentity,
+    live_identity_observed: bool,
+) -> RuntimeBinding {
+    let current_launch_id = current.map(|manifest| manifest.launch_id.clone());
+    let live_launch_id = identity.launch_id.clone();
+    if !live_identity_observed {
+        return RuntimeBinding {
+            state: RuntimeBindingState::Unobserved,
+            current_launch_id,
+            live_launch_id,
+            reason: "no live adapter identity has been observed".into(),
+        };
+    }
+    let Some(current) = current else {
+        return RuntimeBinding {
+            state: RuntimeBindingState::Unmanaged,
+            current_launch_id: None,
+            live_launch_id,
+            reason: "the live adapter has no current runtime capsule".into(),
+        };
+    };
+    if let Some(live) = identity.launch_id.as_deref() {
+        let bound = live == current.launch_id;
+        return RuntimeBinding {
+            state: if bound {
+                RuntimeBindingState::Bound
+            } else {
+                RuntimeBindingState::Mismatched
+            },
+            current_launch_id: Some(current.launch_id.clone()),
+            live_launch_id: Some(live.to_string()),
+            reason: if bound {
+                "live adapter launch_id matches the current runtime capsule".into()
+            } else {
+                "live adapter launch_id does not match the current runtime capsule".into()
+            },
+        };
+    }
+
+    let identity_disagrees = [
+        (identity.system.as_deref(), Some(current.system.as_str())),
+        (identity.adapter.as_deref(), Some(current.adapter.as_str())),
+        (identity.content.as_deref(), Some(current.content.as_str())),
+    ]
+    .into_iter()
+    .any(|(live, capsule)| {
+        live.zip(capsule)
+            .is_some_and(|(live, capsule)| live != capsule)
+    });
+    RuntimeBinding {
+        state: if identity_disagrees {
+            RuntimeBindingState::Mismatched
+        } else {
+            RuntimeBindingState::Unmanaged
+        },
+        current_launch_id: Some(current.launch_id.clone()),
+        live_launch_id: None,
+        reason: if identity_disagrees {
+            "live adapter identity disagrees with the current runtime capsule".into()
+        } else {
+            "live adapter did not advertise a launch_id, so capsule ownership is unproven".into()
+        },
     }
 }
 
