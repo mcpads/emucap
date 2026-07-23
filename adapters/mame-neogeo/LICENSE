@@ -1,0 +1,13 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The Neo Geo bridge, runtime Lua, structural probe, and build recipe are
+licensed GPL-2.0-or-later, the project default. The build recipe reuses the
+pinned MAME source and patch build. MAME as a whole and binaries built from
+the modified source remain governed by GPL-2.0-or-later and their retained
+upstream notices.
+
+This repository does not distribute MAME binaries, game media, or BIOS files.
+See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

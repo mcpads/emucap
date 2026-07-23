@@ -71,8 +71,9 @@ Dolphin
 Mupen64Plus
   Upstream: https://github.com/mupen64plus
   Pinned source: 2.6.0 (core b0d68c20f49b8f833afa21450e0e8874c87c13c4)
-  License: GPL-2.0-or-later for the core; bundled plugins retain their own
-           compatible licenses recorded in the locally built bundle.
+  License: GNU GPL version 2 for the core and selected plugins; representative
+           source-file headers permit version 2 or later. Bundled components
+           retain their LGPL, BSD, zlib/libpng, and Bitstream notices.
   Used by: adapters/mupen64plus (source-build recipe and dynamically loaded
            debugger core/plugins; Nintendo 64)
   Distribution: emucap ships the frontend source and build recipe, not emulator

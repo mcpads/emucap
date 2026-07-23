@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- Added adapter-specific license notices for Dolphin, MAME Neo Geo, and Mupen64Plus, and clarified Mupen64Plus's bundled component licenses.
+
 ## 0.10.1
 
 ### Added

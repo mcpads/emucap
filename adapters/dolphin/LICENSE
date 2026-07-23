@@ -1,0 +1,11 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+EmuCap.cpp, EmuCap.h, and patches/ modify and are compiled into Dolphin. They
+are derivative works of Dolphin and are licensed GPL-2.0-or-later. The build
+and launch recipes in this directory use the same project license.
+
+This repository distributes adapter source, pinned patches, and build recipes,
+not Dolphin binaries, game media, keys, or firmware. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

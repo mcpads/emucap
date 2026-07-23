@@ -1,0 +1,18 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The emucap N64 frontend, build recipe, and structural probe are licensed
+GPL-2.0-or-later, the project default.
+
+The pinned Mupen64Plus source bundle is downloaded into the ignored work tree
+and retains its own license notices. Its core and selected UI, audio, input,
+RSP, and video plugins state GNU GPL version 2; representative source-file
+headers permit version 2 or, at the recipient's option, a later version. The
+bundle also identifies components under LGPL, BSD, zlib/libpng, and Bitstream
+licenses. Those component notices remain authoritative and must accompany any
+redistribution of the upstream source or binaries.
+
+This repository does not distribute Mupen64Plus source, binaries, game media,
+or the upstream test ROM. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)
