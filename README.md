@@ -12,10 +12,10 @@ Neo Geo Pocket/Color), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
 (PlayStation 2), a Dolphin fork (GameCube · Wii), MAME (PC-98 and experimental Neo Geo
 MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
-Stock openMSX 21.0 provides the first experimental MSX profile (C-BIOS MSX2+
-cartridges) through a separate Rust XML-control bridge.
+Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
+MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.11.0-alpha.1 — beta.** This repository remains under active development; interfaces and
+**v0.11.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -194,9 +194,10 @@ debugger halt to service requests without advancing the guest.
   `libsdl2-dev`). Its source archive and checksum are pinned. One binary handles all seven system families.
   PSX, PCE-CD, and PC-FX need BIOS files (not committed to the repo). PC-FX requires an explicit
   version 1.00 BIOS and runs with an emucap-owned Mednafen profile. Neo Geo Pocket and
-  Pocket Color share the `ngp` module; base execution, save/load, screenshot, and input are
-  supported, but memory, breakpoints, disassembly, and instruction stepping are not advertised
-  because Mednafen exposes no debugger for that core.
+  Pocket Color share the patched `ngp` module. Its deliberately narrow TLCS-900/H debugger
+  exposes side-effect-free RAM/ROM/BIOS views, RAM writes, exact instruction stepping, safe
+  disassembly, and exec-only breakpoints. Sound-Z80 state, read/write breakpoints, trace, and
+  call-stack classification remain outside this profile.
   → `adapters/mednafen/README.md`
 - **Flycast (Dreamcast)** — build with `adapters/flycast/build.sh`; it builds in an
   emucap-owned work tree, pins the commit and recursive submodule graph, and treats any
@@ -222,8 +223,9 @@ debugger halt to service requests without advancing the guest.
   headless; `display: true` uses DolphinQt when the GUI build is available. The
   adapter provides PowerPC memory and registers, exact instruction stepping,
   disassembly, best-effort call stacks, exec breakpoints with register snapshots,
-  bounded screenshots, and synchronous savestates. GameCube also supports
-  controller input injection. → `adapters/dolphin/README.md`
+  bounded screenshots, and synchronous savestates. GameCube supports port-0
+  controller input; Wii supports emulated Wii Remote 1 core buttons without
+  claiming IR, motion, or extensions. → `adapters/dolphin/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
 - **MAME (Neo Geo MVS/AES/CD, experimental)** — build the dedicated pinned MAME subset with
@@ -233,28 +235,33 @@ debugger halt to service requests without advancing the guest.
   AES-compatible entry in MAME's pinned Neo Geo software list. CD uses an official
   `neocdz.zip` BIOS plus a CUE entry file whose referenced tracks all exist; its content
   identity covers the complete CUE graph. All three profiles expose bounded RAM, 68000
-  state and stepping, frame control, frozen-frame screenshots, and port-0 input. Native
-  save/load is advertised for MVS and AES; MAME 0.288 marks CDZ save states unsupported.
+  state and stepping, exec/read/write breakpoints with hit-time evidence, disassembly,
+  frame control, frozen-frame screenshots, and port-0 input. Native save/load is
+  advertised for MVS and AES; MAME 0.288 marks CDZ save states unsupported.
   → `adapters/mame-neogeo/README.md`
 - **Mupen64Plus (Nintendo 64, experimental; Unix)** — run
   `adapters/mupen64plus/build.sh`, then build `emucap-mupen64plus`. Standard cartridge
   ROMs need no BIOS. The current pure-interpreter adapter supports isolated headless or
   visible launch, pause/resume, R4300 instruction stepping, CPU state, and bounded frozen
   RDRAM access. Both modes expose port-0 input holds with explicit native-ownership release.
-  Visible launch also exposes exact rendered-frame stepping, bounded input pulses, current PNG
-  capture, and completion-checked native save/load. Headless launch remains instruction-only and
-  omits those rendered-frame operations. Breakpoints, reset, `run_frames`, and RSP state are not
-  yet exposed. → `adapters/mupen64plus/README.md`
-- **openMSX (MSX, experimental first profile)** — run
+  Both modes also expose synchronous reset, R4300 exec/read/write breakpoints with hit-time
+  evidence, event polling, and disassembly. Visible launch additionally exposes exact
+  rendered-frame stepping, bounded `run_frames` and input pulses, current PNG capture, and
+  completion-checked native save/load. Headless launch remains instruction-only and omits those
+  rendered-frame operations. RSP state remains outside this profile.
+  → `adapters/mupen64plus/README.md`
+- **openMSX (MSX cartridge profiles, experimental)** — run
   `adapters/openmsx/build.sh`, then build `emucap-openmsx-bridge`. The official
   launcher accepts a pinned stock openMSX 21.0 sidecar and runs it with an
   emucap-owned per-port `HOME`; it does not patch openMSX or read the user's
-  emulator profile. The current `msx` system is a `C-BIOS_MSX2+` cartridge
-  profile with Z80 state and instruction step, exact frame step, bounded CPU
-  memory/main RAM/VRAM access, frozen save/load, keyboard-matrix input, and
-  screenshots in `display: true`. Headless screenshots, disks, tapes,
-  real-machine firmware, joystick delivery, breakpoints, and turboR/R800 are
-  not exposed. Generic `.rom` files require `system=msx`.
+  emulator profile. `msx` is C-BIOS MSX2+; `msx1`, `msx2`, and `msx2p` select
+  explicit user-supplied real-firmware profiles. The cartridge surface includes Z80
+  state and instruction step, exact headless or visible frame step, bounded CPU
+  memory/main RAM/VRAM access, frozen save/load, keyboard-matrix and two-port
+  joystick input, exec/read/write breakpoints, event polling, and disassembly.
+  Screenshots require `display: true`. Disk/tape staging lacks representative runtime
+  proof, and turboR/R800 is not implemented. Generic `.rom` files require an explicit
+  MSX system ID.
   → `adapters/openmsx/README.md`
 
 ## Learn more

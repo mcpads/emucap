@@ -1,24 +1,29 @@
 # Changelog
 
-Prerelease software — interfaces may still change.
+Actively developed beta software — interfaces may still change.
 
-## 0.11.0-alpha.1
+## 0.11.0
 
 ### Added
-- Added PC-FX and Neo Geo Pocket/Color profiles through the existing Mednafen fork. PC-FX exposes its validated V810 debugger surface; Pocket/Color deliberately exposes only base execution, input, state, and screenshot operations because that Mednafen core has no debugger surface.
-- Added the first experimental MSX profile through stock openMSX 21.0 and a separate Rust XML-control bridge. The isolated C-BIOS MSX2+ cartridge profile supports Z80 state and stepping, bounded memory, save/load, keyboard-matrix input, and visible screenshots; disks, tapes, real-machine firmware, joystick delivery, and turboR/R800 remain outside this profile.
+- Added PC-FX and Neo Geo Pocket/Color profiles through the existing Mednafen fork. PC-FX exposes the validated V810 debugger surface and a best-effort trace-derived call stack. Pocket/Color exposes side-effect-free TLCS-900/H RAM/ROM/BIOS views, RAM writes, instruction stepping, disassembly, and execution breakpoints without claiming sound-Z80 state, data breakpoints, trace, or call-stack classification.
+- Added experimental MSX cartridge profiles through pinned openMSX 21.0 and a separate Rust XML-control bridge: isolated C-BIOS MSX2+, Philips VG 8020 MSX1, Philips NMS 8250 MSX2, and Panasonic FS-A1WSX MSX2+. The admitted surface includes exact frame and Z80 instruction control, bounded memory and VRAM, save/load, keyboard and two-port joystick input, Z80 execution/read/write breakpoints with atomic evidence, disassembly, and visible screenshots. Disk/tape staging lacks representative runtime proof, and turboR/R800 remains unimplemented.
 - Added separate experimental Neo Geo CDZ and AES profiles through the pinned MAME adapter. CD content identity covers the CUE and every referenced track and omits unsupported native save/load; AES validates cartridge ZIP names against the pinned Neo Geo software list and has its own BIOS, memory, input, state, and launch contract.
+- Added emulated Wii Remote 1 core-button input to the Dolphin fork. The isolated launcher selects and verifies the emulated source, while IR, motion, extensions, and real remotes remain outside the profile.
 
 ### Changed
-- Expanded the experimental Nintendo 64 adapter with port-0 input and explicit release in both modes. Visible sessions also expose exact rendered-frame stepping, bounded input pulses, current PNG capture, and completion-checked native save/load; headless sessions remain instruction-only.
-- Completed representative Neo Geo MVS control and native-state validation, moved its MAME subset to an adapter-owned build tree, and bound frame waits to notifier progress across machine resets.
+- Expanded the experimental Nintendo 64 adapter with synchronous reset, port-0 input and explicit release, R4300 execution/read/write breakpoints with hit-time evidence, event polling, and disassembly in both modes. Visible sessions additionally expose exact rendered-frame stepping, bounded free-run and input pulses, current PNG capture, and completion-checked native save/load; headless sessions remain instruction-only.
+- Completed representative Neo Geo MVS control and native-state validation, moved its MAME subset to an adapter-owned build tree, and added the shared profile-safe 68000 execution/read/write breakpoint, event, and disassembly surface to MVS, AES, and CD.
 - Compatible Mesen builds now adopt a host Pause as a serviceable frozen state, reconcile a host Resume, and remain responsive without advancing guest time.
+- Mesen deferred frame runs, timed input, and probes now share one explicit transition owner. Completion, interruption, disconnect, and replacement-session paths return transient input ownership before terminal response delivery.
 - Consumer-facing MCP guidance is English-first and capability-driven; safety-critical adapter exceptions remain explicit, while detailed capabilities stay in structured discovery and status results.
 
 ### Fixed
 - Added adapter-specific license notices for Dolphin, MAME Neo Geo, and Mupen64Plus, and clarified the licenses of the bundled Mupen64Plus components.
 - Mesen preserves failed-launch evidence and runtime continuity without publishing stale live identity.
 - N64 screenshots wait for native video capture completion before freezing at the next callback, preventing post-load capture from timing out and terminating an otherwise healthy launch. Ordinary one-frame stepping remains exact.
+- Mupen64Plus consumes a latched breakpoint before returning from the interpreter, so execution cannot escape a requested pausing hit.
+- Flycast failure artifacts on Windows use a protected owner-only DACL, verify it before sensitive writes and after atomic publication, and remove an artifact that fails either check.
+- External MAME bridge lifecycle evidence distinguishes a dead emulator from a live orphaned bridge and permits cleanup only for the exact verified generation.
 
 ## 0.10.1
 
