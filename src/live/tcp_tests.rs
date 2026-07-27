@@ -1177,6 +1177,92 @@ fn replacing_reclaim_token_updates_an_already_armed_preaccept() {
 }
 
 #[test]
+fn staged_reclaim_token_is_accepted_but_not_durable_until_commit() {
+    let _env = SessionEnv::with(Some("staged-reclaim-commit"));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let addr = link.local_addr().to_string();
+    let port = link.endpoint_port().unwrap();
+    let active = link.session_token().unwrap().to_string();
+    let staged = "reclaim-staged-generation".to_string();
+    assert!(link.stage_reclaim_token(&staged).unwrap());
+    assert_eq!(link.session_token(), Some(active.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(tcp::session_token_path(port)).unwrap(),
+        active,
+        "staging must not replace the durable compatibility token"
+    );
+
+    let expected = staged.clone();
+    let client = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        let (hello_id, token) = hello_parts(&hello);
+        assert_eq!(token, expected);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": hello_id,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "methods": ["status"],
+                    "session_token": token,
+                }
+            })
+        )
+        .unwrap();
+
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(request.trim()).unwrap()["id"].clone();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": id, "ok": true, "result": {"state": "running"}})
+        )
+        .unwrap();
+    });
+
+    let result = link.call("status", serde_json::json!({})).unwrap();
+    assert_eq!(result["state"], "running");
+    assert!(link.commit_staged_reclaim_token(&staged).unwrap());
+    assert_eq!(link.session_token(), Some(staged.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(tcp::session_token_path(port)).unwrap(),
+        staged
+    );
+    client.join().unwrap();
+}
+
+#[test]
+fn aborted_staged_reclaim_token_restores_active_acceptance() {
+    let _env = SessionEnv::with(Some("staged-reclaim-abort"));
+    let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(300));
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let port = link.endpoint_port().unwrap();
+    let active = link.session_token().unwrap().to_string();
+    let staged = "reclaim-aborted-generation";
+    assert!(link.stage_reclaim_token(staged).unwrap());
+    assert!(link.abort_staged_reclaim_token(staged).unwrap());
+    assert_eq!(link.session_token(), Some(active.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(tcp::session_token_path(port)).unwrap(),
+        active
+    );
+}
+
+#[test]
 fn persisted_control_port_recovers_live_generation_auth() {
     let _env = SessionEnv::with(Some("runtime-auth-reconnect"));
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

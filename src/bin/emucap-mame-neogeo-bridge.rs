@@ -8,7 +8,9 @@ use emucap::neogeo_bridge::NeoGeoBridge;
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: emucap-mame-neogeo-bridge <EMUCAP_PORT> <neogeo_mvs> [GDB_HOST:PORT]");
+        eprintln!(
+            "usage: emucap-mame-neogeo-bridge <EMUCAP_PORT> <neogeo_mvs|neogeo_aes|neogeo_cd> [GDB_HOST:PORT]"
+        );
         std::process::exit(2);
     }
     let emucap_port = parse_port(&args[1]).context("invalid EMUCAP_PORT")?;

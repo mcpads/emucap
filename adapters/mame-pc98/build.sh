@@ -26,7 +26,8 @@ if [ ! -d "$WORK_INPUT" ]; then
 fi
 mkdir -p "$WORK_INPUT"
 WORK="$(cd "$WORK_INPUT" && pwd -P)"
-OWNER_FILE="$WORK/.emucap-mame-pc98-work"
+BUILD_LABEL="${MAME_BUILD_LABEL:-MAME PC-98}"
+OWNER_FILE="$WORK/${MAME_WORK_OWNER_FILE:-.emucap-mame-pc98-work}"
 SRC="$WORK/mame-src"
 TARBALL="$WORK/${TAG}.tar.gz"
 PATCH_DIR="${MAME_PATCH_DIR:-$HERE/patches}"
@@ -75,7 +76,7 @@ if [ "$CUSTOM_WORK" = "1" ] && [ ! -f "$OWNER_FILE" ]; then
     exit 2
   fi
 fi
-emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "MAME PC-98"
+emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "$BUILD_LABEL"
 : >"$OWNER_FILE"
 
 if [ ! -f "$TARBALL" ]; then
@@ -144,4 +145,4 @@ export EMUCAP_MAME_RAW_BIN="\${EMUCAP_MAME_RAW_BIN:-\$DIR/mame.raw}"
 exec "$HERE/mame-headless.sh" "\$@"
 EOF
 chmod +x "$WRAPPER"
-echo "MAME PC-98 build ready: $WRAPPER (safe wrapper), $RAW_LINK (raw binary), source=$SRC"
+echo "$BUILD_LABEL build ready: $WRAPPER (safe wrapper), $RAW_LINK (raw binary), source=$SRC"

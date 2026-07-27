@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Mednafen 어댑터 재현 빌드(Saturn + PlayStation + PC Engine + Mega Drive).
+# Mednafen 어댑터 재현 빌드(Saturn + PlayStation + PC Engine + PC-FX + Mega Drive + WonderSwan).
 #
 # Mednafen은 GPL이라 통째 벤더링/재배포하지 않는다. emucap runtime source만 이 저장소에
 # 두고, 업스트림 Mednafen을 로컬에서 받아 패치·빌드한다.
 #
-# 한 바이너리가 ss(Saturn)·psx(PlayStation)·pce(PC Engine)·md(Mega Drive)를 모두 처리한다(모두 컴파일·링크).
+# 한 바이너리가 ss(Saturn)·psx(PlayStation)·pce(PC Engine)·pcfx(PC-FX)·md(Mega Drive)·
+# wswan(WonderSwan)을 모두 처리한다(모두 컴파일·링크).
 # emucap이 런타임에 CurGame->shortname으로 시스템을 분기한다(주소공간·버튼·엔디안). 이 스크립트는 fresh
 # 추출 후 모든 emucap 훅을 perl로 재주입하므로 손편집에 의존하지 않는다 — 재현 가능한 빌드.
 #
@@ -131,15 +132,19 @@ safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
 
 # 3. emucap 소켓 클라이언트
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" \
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
+  "$HERE/emucap_ngp.h" \
   "$HERE/emucap_json_num.h" "$SRC/src/drivers/"
+cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
+  "$SRC/src/ngp/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알리게 한다 —
 # 사용자가 `git rev-parse --short HEAD`와 대조해 재빌드 필요 여부를 확인한다(build-time 임베드라 재빌드
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
-  emucap.cpp emucap.h emucap_input.h emucap_json_num.h \
+  emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+  emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
@@ -151,7 +156,7 @@ inject_check() { grep -qF "$1" "$2" || { echo "ERROR: $3"; exit 1; }; }
 count_of() { grep -cF "$1" "$2" 2>/dev/null || true; }
 
 # 4. main.cpp 훅: emucap.h include + 프레임 루프 서비스 호출(MDFNI_Emulate 직후, SoftFB 직전).
-#    화면 캡처(emucap_capture)도 여기 — ss·psx·pce·md 공통 드라이버 경로라 screenshot 동작.
+#    화면 캡처(emucap_capture)도 여기 — 모든 Mednafen 코어의 공통 드라이버 경로라 screenshot 동작.
 perl -0777 -pi -e 's/(#include "main\.h"\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
   "$SRC/src/drivers/main.cpp"
 perl -0777 -pi -e \
@@ -161,7 +166,7 @@ inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp 훅 삽입 실
 
 # 4b. 입력 주입(코어-비특이): mednafen.cpp의 movie/netplay와 동일 위상(Emulate 직전 + MidSync)에서
 #     PortData[0]을 주입한다. 드라이버 Input_Update 주입은 게임 INTBACK이 읽는 스냅샷과 위상이
-#     어긋나 누락될 수 있어 폐기. PortData[0]은 ss·psx·pce·md 공통이라 한 곳으로 네 시스템을 커버한다.
+#     어긋나 누락될 수 있어 폐기. PortData[0]은 모든 대상 코어의 공통 입력 버퍼다.
 perl -0777 -pi -e 's/(#include "qtrecord\.h"\n)/${1}\nextern "C" void emucap_apply_input(unsigned char*, unsigned);\n/ unless m{emucap_apply_input}' \
   "$SRC/src/mednafen.cpp"
 # (a) Emulate 직전: movie/netplay ProcessInput 직후, if(qtrecorder) 앞.
@@ -274,7 +279,23 @@ perl -0777 -pi -e 's{(pce_jp_data\[x\] = new_data;\n)}{${1}   if(x == 0) emucap_
   "$SRC/src/pce_fast/input.cpp"
 inject_check 'emucap_game_data_store((unsigned short)new_data)' "$SRC/src/pce_fast/input.cpp" "pce_fast/input.cpp 입력진단 삽입 실패"
 
-# 4j. 값-조건 BP 기록 — MD(md/debug.cpp): 68000 read/write BP 매칭 지점에 접근 주소/길이 기록.
+# 4j. PC-FX(V810) CPU read/write BP의 실제 주소/길이/값을 공통 이벤트 경로에 기록한다.
+#     PCFXDBG_CheckBP의 value는 V810의 실제 접근값이며 코어가 호출 시점에 이미 폭을 함께 전달한다.
+perl -0777 -pi -e 's/(#include <mednafen\/cdrom\/scsicd\.h>\n)/${1}\nextern "C" void emucap_bp_record_value(unsigned len, unsigned addr, int is_write, unsigned value);\nextern "C" void emucap_bp_record_pcfx_aux(unsigned len, unsigned addr, int is_write, unsigned value);\n/ unless m{emucap_bp_record_value}' \
+  "$SRC/src/pcfx/debug.cpp"
+perl -0777 -pi -e 's{(void PCFXDBG_CheckBP\(int type, uint32 address, uint32 value, unsigned int len\).*?if\(tmp_address >= bpit->A\[0\] && tmp_address <= bpit->A\[1\]\)\n\s*\{\n)(\s*FoundBPoint = true;)}{${1}    if(type == BPOINT_READ || type == BPOINT_WRITE)\n     ::emucap_bp_record_value(len, address, type == BPOINT_WRITE, value);\n    else if(type == BPOINT_AUX_READ || type == BPOINT_AUX_WRITE)\n     ::emucap_bp_record_pcfx_aux(len, address, type == BPOINT_AUX_WRITE, value);\n${2}}s unless m{::emucap_bp_record_value\(len, address}' \
+  "$SRC/src/pcfx/debug.cpp"
+inject_check '::emucap_bp_record_value(len, address, type == BPOINT_WRITE, value)' "$SRC/src/pcfx/debug.cpp" "pcfx/debug.cpp BP 값기록 삽입 실패"
+inject_check '::emucap_bp_record_pcfx_aux(len, address, type == BPOINT_AUX_WRITE, value)' "$SRC/src/pcfx/debug.cpp" "pcfx/debug.cpp auxiliary BP 기록 삽입 실패"
+
+# 4k. PC-FX 게임패드가 매 프레임 소비한 16비트 입력을 status.last_game_input에 기록한다.
+perl -0777 -pi -e 's/(#include "gamepad\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \
+  "$SRC/src/pcfx/input/gamepad.cpp"
+perl -0777 -pi -e 's{(buttons = MDFN_de16lsb\(\(uint8 \*\)data\);\n)}{${1}  ::emucap_game_data_store((unsigned short)buttons);\n} unless m{::emucap_game_data_store}' \
+  "$SRC/src/pcfx/input/gamepad.cpp"
+inject_check '::emucap_game_data_store((unsigned short)buttons)' "$SRC/src/pcfx/input/gamepad.cpp" "pcfx/gamepad.cpp 입력진단 삽입 실패"
+
+# 4l. 값-조건 BP 기록 — MD(md/debug.cpp): 68000 read/write BP 매칭 지점에 접근 주소/길이 기록.
 #     write BP는 clone 68000으로 실제 쓰기 전 감지되므로, value filter 정확도를 위해 write 값을 직접 기록한다.
 perl -0777 -pi -e 's/(static bool FoundBPoint(?: = false)?;\n)/${1}extern "C" void emucap_bp_record(unsigned len, unsigned addr, int is_write);\nextern "C" void emucap_bp_record_value(unsigned len, unsigned addr, int is_write, unsigned value);\n/ unless m{emucap_bp_record}' \
   "$SRC/src/md/debug.cpp"
@@ -295,7 +316,7 @@ inject_check 'extern "C" void emucap_bp_record' "$SRC/src/md/debug.cpp" "md/debu
 inject_check 'emucap_bp_record_value(1, address, 1, value)' "$SRC/src/md/debug.cpp" "md/debug.cpp write8 값기록 삽입 실패"
 inject_check 'emucap_bp_record_value(2, address, 1, value)' "$SRC/src/md/debug.cpp" "md/debug.cpp write16 값기록 삽입 실패"
 
-# 4k. MD 디버거 address space 확장 — upstream md/debug.cpp는 cpu/ram만 등록한다.
+# 4m. MD 디버거 address space 확장 — upstream md/debug.cpp는 cpu/ram만 등록한다.
 #     분석 작업에 필요한 Z80 RAM, VDP VRAM/CRAM/VSRAM/register를 side-effect-aware accessor로 노출한다.
 perl -0777 -pi -e 's{(\n private:\n)}{\n void DBG_GetVRAM(uint32 Address, uint32 Length, uint8 *Buffer)\n {\n  while(Length--)\n  {\n   *Buffer++ = READ_BYTE_LSB(vram, Address \& 0xFFFF);\n   Address++;\n  }\n }\n\n void DBG_PutVRAM(uint32 Address, uint32 Length, const uint8 *Buffer)\n {\n  while(Length--)\n  {\n   const uint32 a = Address \& 0xFFFF;\n   const uint8 v = *Buffer++;\n   if((a \& sat_base_mask) == satb)\n    sat[a \& sat_addr_mask] = v;\n   if(v != READ_BYTE_LSB(vram, a))\n   {\n    WRITE_BYTE_LSB(vram, a, v);\n    MARK_BG_DIRTY(a);\n   }\n   Address++;\n  }\n }\n\n void DBG_GetCRAM(uint32 Address, uint32 Length, uint8 *Buffer)\n {\n  while(Length--)\n  {\n   const uint16 d = UNPACK_CRAM(cram[(Address >> 1) \& 0x3F]);\n   *Buffer++ = (Address \& 1) ? (d \& 0xFF) : ((d >> 8) \& 0xFF);\n   Address++;\n  }\n }\n\n void DBG_PutCRAM(uint32 Address, uint32 Length, const uint8 *Buffer)\n {\n  while(Length--)\n  {\n   const uint32 a = Address \& 0x7F;\n   uint16 d = UNPACK_CRAM(cram[(a >> 1) \& 0x3F]);\n   if(a \& 1) d = (d \& 0xFF00) | *Buffer++;\n   else d = (d \& 0x00FF) | (*Buffer++ << 8);\n   const uint16 old_addr = addr;\n   addr = a \& 0x7E;\n   WriteCRAM(d);\n   addr = old_addr;\n   Address++;\n  }\n }\n\n void DBG_GetVSRAM(uint32 Address, uint32 Length, uint8 *Buffer)\n {\n  while(Length--)\n  {\n   const uint16 d = vsram[(Address >> 1) \& 0x3F];\n   *Buffer++ = (Address \& 1) ? (d \& 0xFF) : ((d >> 8) \& 0xFF);\n   Address++;\n  }\n }\n\n void DBG_PutVSRAM(uint32 Address, uint32 Length, const uint8 *Buffer)\n {\n  while(Length--)\n  {\n   const uint32 a = Address \& 0x7F;\n   uint16 *p = &vsram[(a >> 1) \& 0x3F];\n   if(a \& 1) *p = (*p \& 0xFF00) | *Buffer++;\n   else *p = (*p \& 0x00FF) | (*Buffer++ << 8);\n   Address++;\n  }\n }\n\n void DBG_GetVDPReg(uint32 Address, uint32 Length, uint8 *Buffer)\n {\n  while(Length--)\n  {\n   *Buffer++ = reg[Address \& 0x1F];\n   Address++;\n  }\n }\n\n void DBG_PutVDPReg(uint32 Address, uint32 Length, const uint8 *Buffer)\n {\n  while(Length--)\n  {\n   vdp_reg_w(Address \& 0x1F, *Buffer++);\n   Address++;\n  }\n }\n${1}} unless m{DBG_GetVRAM}' \
   "$SRC/src/md/vdp.h"
@@ -510,9 +531,52 @@ perl -0777 -pi -e 's{(WSButtonStatus = MDFN_de16lsb\(PortDeviceData\);\n)}{${1} 
   "$SRC/src/wswan/main.cpp"
 inject_check '::emucap_game_data_store((unsigned short)WSButtonStatus)' "$SRC/src/wswan/main.cpp" "wswan/main.cpp 입력진단 삽입 실패"
 
-# 5. configure — ss+psx+pce+md+wswan 활성(한 바이너리 멀티시스템). Saturn은 host_cpu 자동탐지 실패라
-#    --enable-ss 명시 필수. psx/pce/md/wswan은 기본 on이나 명시해 의도를 고정한다.
-echo "→ configure (--enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-wswan --enable-debugger)"
+# 4r. Input diagnostics — Neo Geo Pocket/Color latches the one-byte built-in pad at the start
+#     of each emulated frame. Record that exact byte after the common PortData override is applied.
+perl -0777 -pi -e 's/(#include "neopop\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(\tNGPJoyLatch = \*chee;\n)}{${1}\t::emucap_game_data_store((unsigned short)NGPJoyLatch);\n} unless m{::emucap_game_data_store}' \
+  "$SRC/src/ngp/neopop.cpp"
+inject_check '::emucap_game_data_store((unsigned short)NGPJoyLatch)' "$SRC/src/ngp/neopop.cpp" "ngp/neopop.cpp input diagnostic injection failed"
+
+# 4s. Neo Geo Pocket/Color TLCS-900/H debugger. The public surface intentionally contains only
+#     side-effect-free RAM/ROM/BIOS views and execution breakpoints. The existing disassembler is
+#     compiled into the NGP build as its original separate translation units. All instruction-byte
+#     fetches are redirected to direct, observational views and shared interpreter scratch is
+#     restored by emucap_ngp_debug.inc.
+perl -0777 -pi -e 's{(#include "neopop\.h"\n)}{${1}#include "emucap_ngp_debug.h"\n#ifdef WANT_DEBUGGER\n#include "TLCS-900h/TLCS900h_disassemble.h"\n#endif\n} unless m{emucap_ngp_debug\.h}' \
+  "$SRC/src/ngp/neopop.cpp"
+inject_check '#include "emucap_ngp_debug.h"' "$SRC/src/ngp/neopop.cpp" "ngp debugger header injection failed"
+inject_check '#include "TLCS-900h/TLCS900h_disassemble.h"' "$SRC/src/ngp/neopop.cpp" "ngp disassembler header injection failed"
+
+perl -0777 -pi -e 's{loadB\(pc\+\+\)}{MDFN_IEN_NGP::NGPDBG_Peek8(pc++)}g; s{loadW\(pc\)}{MDFN_IEN_NGP::NGPDBG_Peek16(pc)}g; s{loadL\(pc\)}{MDFN_IEN_NGP::NGPDBG_Peek32(pc)}g' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp"
+perl -0777 -pi -e 's{(#include "TLCS900h_disassemble\.h"\n)}{${1}#include "../emucap_ngp_debug.h"\n} unless m{emucap_ngp_debug\.h}' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp"
+inject_check 'MDFN_IEN_NGP::NGPDBG_Peek8(pc++)' "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp" "ngp disassembler byte peek replacement failed"
+inject_check 'MDFN_IEN_NGP::NGPDBG_Peek16(pc)' "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp" "ngp disassembler word peek replacement failed"
+inject_check 'MDFN_IEN_NGP::NGPDBG_Peek32(pc)' "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp" "ngp disassembler long peek replacement failed"
+
+perl -0777 -pi -e 's{(#include "TLCS900h_interpret\.h"\n)}{${1}#include "../emucap_ngp_debug.h"\n} unless m{emucap_ngp_debug\.h}' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_interpret.cpp"
+perl -0777 -pi -e 's{(int32 TLCS900h_interpret\(void\)\n\{\n)}{${1}#ifdef WANT_DEBUGGER\n\tMDFN_IEN_NGP::NGPDBG_InstructionBoundary(pc);\n#endif\n} unless m{NGPDBG_InstructionBoundary}' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_interpret.cpp"
+inject_check 'NGPDBG_InstructionBoundary(pc)' "$SRC/src/ngp/TLCS-900h/TLCS900h_interpret.cpp" "ngp instruction-boundary hook injection failed"
+
+perl -0777 -pi -e 's{(static const FileExtensionSpecStruct KnownExtensions\[\] =)}{#include "emucap_ngp_debug.inc"\n\n${1}} unless m{emucap_ngp_debug\.inc}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(  bios_install\(\);\n)}{${1}\n#ifdef WANT_DEBUGGER\n  NGPDBG_Init();\n#endif\n} unless m{NGPDBG_Init\(\)}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(static MDFN_COLD void Cleanup\(void\)\n\{\n)}{${1}#ifdef WANT_DEBUGGER\n NGPDBG_Kill();\n#endif\n} unless m{NGPDBG_Kill\(\)}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(KnownExtensions,\n MODPRIO_INTERNAL_HIGH,\n) NULL,\n PortInfo,}{${1}#ifdef WANT_DEBUGGER\n \&NGPDBGInfo,\n#else\n NULL,\n#endif\n PortInfo,} unless m{KnownExtensions,\n MODPRIO_INTERNAL_HIGH,\n#ifdef WANT_DEBUGGER}' \
+  "$SRC/src/ngp/neopop.cpp"
+inject_check '#include "emucap_ngp_debug.inc"' "$SRC/src/ngp/neopop.cpp" "ngp debugger implementation injection failed"
+inject_check '&NGPDBGInfo' "$SRC/src/ngp/neopop.cpp" "ngp debugger capability injection failed"
+
+# 5. configure — ss+psx+pce+pcfx+md+wswan+ngp 활성(한 바이너리 멀티시스템). Saturn은 host_cpu 자동탐지 실패라
+#    --enable-ss 명시 필수. 나머지는 기본 on이지만 명시해 의도를 고정한다.
+echo "→ configure (--enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-ngp --enable-debugger)"
 cd "$SRC"
 if command -v brew >/dev/null 2>&1; then
   export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -522,19 +586,26 @@ fi
 case "$(uname -s 2>/dev/null || echo unknown)" in
   MINGW*|MSYS*|CYGWIN*) export LIBS="-lws2_32 ${LIBS:-}" ;;
 esac
-./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-wswan --enable-debugger >/dev/null
+./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-ngp --enable-debugger >/dev/null
 
 # 6. emucap sources를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
 perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) emucap_native_failure.\$(OBJEXT) /' \
   src/drivers/Makefile
+# Upstream ships the TLCS disassembler sources but does not build them. Keep each source as a
+# separate object because their file-local decoder names intentionally overlap.
+perl -0777 -pi -e 's{libngp_a_OBJECTS = \$\(am_libngp_a_OBJECTS\)}{libngp_a_OBJECTS = \$(am_libngp_a_OBJECTS) \\\n ngp/TLCS-900h/TLCS900h_disassemble_extra.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_src.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_dst.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_reg.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble.\$(OBJEXT)}' \
+  src/Makefile
+inject_check 'ngp/TLCS-900h/TLCS900h_disassemble.$(OBJEXT)' src/Makefile "ngp disassembler objects were not added"
 
 # 7. 빌드
 echo "→ make"
 make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
 
 echo ""
-echo "✓ 빌드 완료: $SRC/src/mednafen (ss + psx + pce + md + wswan)"
+echo "✓ 빌드 완료: $SRC/src/mednafen (ss + psx + pce + pcfx + md + wswan + ngp)"
 echo "  실행: adapters/mednafen/launch.sh <disc_or_rom> <status.listening_port> [name] [force_module]"
 echo "  예:   MEDNAFEN_FORCE_MODULE=pce adapters/mednafen/launch.sh <pce.cue|rom.pce> 47800"
+echo "  예:   MEDNAFEN_FORCE_MODULE=pcfx adapters/mednafen/launch.sh <pcfx.cue|pcfx.ccd|pcfx.toc> 47800"
 echo "  예:   MEDNAFEN_FORCE_MODULE=md adapters/mednafen/launch.sh <rom.md|rom.gen|rom.smd> 47800"
 echo "  예:   MEDNAFEN_FORCE_MODULE=wswan adapters/mednafen/launch.sh <rom.ws|rom.wsc> 47800"
+echo "  예:   MEDNAFEN_FORCE_MODULE=ngp adapters/mednafen/launch.sh <rom.ngp|rom.ngc> 47800"

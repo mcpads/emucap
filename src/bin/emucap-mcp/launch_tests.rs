@@ -170,9 +170,9 @@ fn mednafen_build_required_respects_resolved_binary() {
         build_required_precondition("mednafen", &paths, &serde_json::json!({"available": false}));
 
     assert!(available.is_null());
-    assert!(missing
-        .as_str()
-        .is_some_and(|s| s.contains("MEDNAFEN_BIN/default install/PATH")));
+    assert!(missing.as_str().is_some_and(|s| s.contains("MEDNAFEN_BIN")
+        && s.contains("default install")
+        && s.contains("PATH")));
 }
 
 #[test]
@@ -207,16 +207,18 @@ fn build_required_respects_existing_flycast_and_mame_binaries() {
         build_required_precondition("flycast", &paths, &serde_json::json!({"available": false}));
     assert!(flycast_missing
         .as_str()
-        .is_some_and(|s| s.contains("FLYCAST_APP/default install/PATH")));
+        .is_some_and(|s| s.contains("FLYCAST_APP")
+            && s.contains("default install")
+            && s.contains("PATH")));
 
     let mame_missing = build_required_precondition(
         "mame_pc98",
         &paths,
         &serde_json::json!({"available": false}),
     );
-    assert!(mame_missing
-        .as_str()
-        .is_some_and(|s| s.contains("MAME_BIN/default install/PATH")));
+    assert!(mame_missing.as_str().is_some_and(|s| s.contains("MAME_BIN")
+        && s.contains("default install")
+        && s.contains("PATH")));
 }
 
 #[test]
@@ -363,6 +365,11 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
         .unwrap()
         .iter()
         .any(|v| v.as_str() == Some("pce")));
+    assert!(inferred["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("pcfx")));
     // PSP also boots from .iso — registering it must not silently drop it from the ambiguous set
     // (guessing it without header evidence would be just as wrong as guessing saturn/psx/pce/md).
     assert!(inferred["candidates"]
@@ -385,6 +392,38 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
         .unwrap()
         .iter()
         .any(|v| v.as_str() == Some("wii")));
+}
+
+#[test]
+fn pcfx_requires_explicit_system_and_routes_to_mednafen() {
+    for alias in ["pcfx", "pc-fx"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "pcfx", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit");
+    }
+    assert_eq!(adapter_for_system("pcfx"), ("mednafen", Some("pcfx")));
+}
+
+#[test]
+fn infer_system_and_aliases_map_neo_geo_pocket_roms() {
+    for extension in ["ngp", "ngpc", "ngc", "npc"] {
+        let inferred = infer_system(Some(&format!("/tmp/game.{extension}")), None);
+        assert_eq!(inferred["system"], "ngp", "extension .{extension}");
+        assert_eq!(inferred["confidence"], "extension");
+        assert_eq!(inferred["needs_user_input"], false);
+    }
+    for alias in [
+        "ngp",
+        "ngpc",
+        "neo-geo-pocket",
+        "neo-geo-pocket-color",
+        "neogeo_pocket_color",
+    ] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "ngp", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit");
+    }
+    assert_eq!(adapter_for_system("ngp"), ("mednafen", Some("ngp")));
 }
 
 #[test]
@@ -446,15 +485,99 @@ fn infer_system_and_aliases_map_n64_cartridges() {
 }
 
 #[test]
+fn infer_system_maps_msx_specific_cartridges_but_not_generic_rom() {
+    for extension in ["mx1", "mx2"] {
+        let inferred = infer_system(Some(&format!("/tmp/game.{extension}")), None);
+        assert_eq!(inferred["system"], "msx", "extension .{extension}");
+        assert_eq!(inferred["confidence"], "extension");
+        assert_eq!(inferred["needs_user_input"], false);
+    }
+    for alias in ["msx", "msx2+", "msx2plus", "openmsx"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "msx", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit");
+    }
+    for machine in ["msx1", "msx2", "msx2p"] {
+        let inferred = infer_system(None, Some(machine));
+        assert_eq!(inferred["system"], machine);
+        assert_eq!(inferred["confidence"], "explicit");
+        assert_eq!(adapter_for_system(machine), ("openmsx", None));
+    }
+    let turbo_r = infer_system(None, Some("msxtr"));
+    assert_eq!(turbo_r["system"], serde_json::Value::Null);
+    assert_eq!(turbo_r["needs_user_input"], true);
+    let generic = infer_system(Some("/tmp/game.rom"), None);
+    assert_eq!(generic["system"], serde_json::Value::Null);
+    assert_eq!(generic["needs_user_input"], true);
+    assert_eq!(adapter_for_system("msx"), ("openmsx", None));
+}
+
+#[test]
 fn normalize_system_requires_an_explicit_neogeo_family() {
     for alias in ["neogeo_mvs", "neo-geo-mvs", "neogeo-mvs", "mvs"] {
         let inferred = infer_system(None, Some(alias));
         assert_eq!(inferred["system"], "neogeo_mvs", "alias {alias}");
         assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
     }
+    for alias in ["neogeo_aes", "neo-geo-aes", "neogeo-aes", "aes"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "neogeo_aes", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
+    for alias in ["neogeo_cd", "neo-geo-cd", "neogeo-cd", "ngcd"] {
+        let inferred = infer_system(None, Some(alias));
+        assert_eq!(inferred["system"], "neogeo_cd", "alias {alias}");
+        assert_eq!(inferred["confidence"], "explicit", "alias {alias}");
+    }
     let ambiguous = infer_system(None, Some("neogeo"));
     assert_eq!(ambiguous["system"], serde_json::Value::Null);
     assert_eq!(ambiguous["needs_user_input"], true);
+}
+
+#[test]
+fn launch_plan_for_neogeo_aes_requires_software_list_media_and_aes_bios() {
+    let plan = make_launch_plan(
+        Some(47805),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/mslug2.zip".into()),
+            system: Some("neogeo_aes".into()),
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "neogeo_aes");
+    assert_eq!(plan["adapter"], "mame_neogeo");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "neogeo_aes");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .contains("aes.zip"));
+
+    let inferred = infer_system(Some("/tmp/mslug2.zip"), None);
+    assert_eq!(inferred["system"], serde_json::Value::Null);
+    assert_eq!(inferred["needs_user_input"], true);
+}
+
+#[test]
+fn launch_plan_for_neogeo_cd_requires_explicit_cue_and_cdz_bios() {
+    let plan = make_launch_plan(
+        Some(47805),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/disc.cue".into()),
+            system: Some("neogeo_cd".into()),
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "neogeo_cd");
+    assert_eq!(plan["adapter"], "mame_neogeo");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "neogeo_cd");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .contains("neocdz.zip"));
+
+    let inferred = infer_system(Some("/tmp/disc.cue"), None);
+    assert_eq!(inferred["system"], serde_json::Value::Null);
+    assert_eq!(inferred["needs_user_input"], true);
 }
 
 #[test]
@@ -909,6 +1032,43 @@ fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
 }
 
 #[test]
+fn launch_plan_for_msx_uses_stock_openmsx_bridge_without_legacy_fallback() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/test.rom".into()),
+            system: Some("msx".into()),
+        },
+    );
+    assert_eq!(plan["ok"], true);
+    assert_eq!(plan["system"], "msx");
+    assert_eq!(plan["adapter"], "openmsx");
+    assert_eq!(plan["preferred_launcher"]["args"]["system"], "msx");
+    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
+    assert_eq!(
+        plan["preconditions"]["bios_required"],
+        serde_json::Value::Null
+    );
+}
+
+#[test]
+fn launch_plan_for_real_msx_machine_requires_operator_firmware() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/test.dsk".into()),
+            system: Some("msx2".into()),
+        },
+    );
+    assert_eq!(plan["system"], "msx2");
+    assert_eq!(plan["adapter"], "openmsx");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .contains("EMUCAP_OPENMSX_FIRMWARE"));
+}
+
+#[test]
 fn pc98_display_selects_visible_mame_launch() {
     let args = LaunchArgs {
         content_path: "/tmp/game.hdi".into(),
@@ -1114,7 +1274,7 @@ fn occupied_graceful_own_stale_token_labeled_not_foreign() {
     );
     assert_eq!(v["stale_own_token"], serde_json::json!(true));
     assert!(
-        v["recovery"].as_str().unwrap_or("").contains("재기동"),
+        v["recovery"].as_str().unwrap_or("").contains("relaunch"),
         "own stale이면 relaunch 복구를 안내해야(재연결 reclaim 아님)"
     );
 }
@@ -1211,6 +1371,7 @@ struct RuntimeLaunchLink {
     caps: Capabilities,
     port: u16,
     token: String,
+    staged_token: Option<String>,
     calls: usize,
     available: bool,
     lease_state: LeaseState,
@@ -1223,6 +1384,7 @@ impl RuntimeLaunchLink {
             caps: Capabilities::empty(),
             port,
             token: "legacy-control-token".into(),
+            staged_token: None,
             calls: 0,
             available: true,
             lease_state: LeaseState::Held,
@@ -1264,8 +1426,30 @@ impl EmulatorLink for RuntimeLaunchLink {
         Some(&self.token)
     }
 
+    fn stage_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.staged_token = Some(token.to_string());
+        Ok(true)
+    }
+
+    fn commit_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if self.staged_token.as_deref() != Some(token) {
+            return Err(LinkError::Protocol("staged token mismatch".into()));
+        }
+        self.token = token.to_string();
+        self.staged_token = None;
+        Ok(true)
+    }
+
+    fn abort_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if self.staged_token.as_deref() == Some(token) {
+            self.staged_token = None;
+        }
+        Ok(true)
+    }
+
     fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
         self.token = token.to_string();
+        self.staged_token = None;
         Ok(true)
     }
 
@@ -1295,6 +1479,7 @@ struct ConnectedRuntimeLaunchLink {
     caps: Capabilities,
     port: u16,
     token: String,
+    staged_token: Option<String>,
     lease_state: LeaseState,
 }
 
@@ -1305,6 +1490,7 @@ impl ConnectedRuntimeLaunchLink {
             caps: Capabilities::empty(),
             port,
             token: "orphan-control-token".into(),
+            staged_token: None,
             lease_state: LeaseState::Held,
         }
     }
@@ -1335,8 +1521,30 @@ impl EmulatorLink for ConnectedRuntimeLaunchLink {
         Some(&self.token)
     }
 
+    fn stage_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.staged_token = Some(token.to_string());
+        Ok(true)
+    }
+
+    fn commit_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if self.staged_token.as_deref() != Some(token) {
+            return Err(LinkError::Protocol("staged token mismatch".into()));
+        }
+        self.token = token.to_string();
+        self.staged_token = None;
+        Ok(true)
+    }
+
+    fn abort_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if self.staged_token.as_deref() == Some(token) {
+            self.staged_token = None;
+        }
+        Ok(true)
+    }
+
     fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
         self.token = token.to_string();
+        self.staged_token = None;
         Ok(true)
     }
 
@@ -1603,8 +1811,17 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     std::fs::write(&binary, b"#!/bin/sh\nexit 7\n").unwrap();
     make_executable(&binary);
     link.disconnect();
+    let token_before_failed_launch = link.token.clone();
     let failed = make_launch(&mut link, &args);
     assert_eq!(failed["launched"], false, "{failed}");
+    assert_eq!(
+        link.token, token_before_failed_launch,
+        "a failed replacement must preserve the active listener token"
+    );
+    assert_eq!(
+        link.staged_token, None,
+        "a failed replacement must discard its staged listener token"
+    );
     assert_eq!(
         store.read_current(port).unwrap().unwrap().launch_id,
         replacement_id,
@@ -1762,7 +1979,9 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
     );
     assert!(out["preconditions"]["build_required"]
         .as_str()
-        .is_some_and(|s| s.contains("FLYCAST_APP/default install/PATH")));
+        .is_some_and(|s| s.contains("FLYCAST_APP")
+            && s.contains("default install")
+            && s.contains("PATH")));
     assert_eq!(link.calls, 1);
 }
 

@@ -27,6 +27,7 @@ local socket = require("socket.core")
 local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
 local Dump = require("emucap_dump")
+local Deferred = require("emucap_deferred")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -51,13 +52,10 @@ local function wall_ms() return socket.gettime() * 1000 end
 local RECONNECT_GIVEUP_MS = tonumber(os.getenv("EMUCAP_RECONNECT_GIVEUP_MS") or "") or 0
 local freeze_disc_ms = nil    -- freeze 중 연결끊김 시작 시각(재접속 giveup 타이머)
 local last_reconnect_ms = 0   -- 마지막 재접속 시도 시각(throttle — 매 명령 connect 폭주 방지)
--- 로컬 freeze 핫키: 사용자가 GUI Pause 대신 이 호스트 키를 누르면 그 자리에서 emucap freeze가
--- 걸린다. GUI Pause는 에뮬 스레드를 통째로 멈춰 모든 Lua 콜백(startFrame·codeBreak)이 정지 →
--- emucap이 응답불가(연결 끊김처럼 보임)가 되고 GUI resume 전엔 자동 복구도 안 된다. 이 핫키는
--- emucap의 codeBreak freeze라 얼린 채 read_memory/screenshot/get_state/step이 모두 동작한다 —
--- transient 스프라이트 팝업의 정확한 프레임을 잡아 OAM/VRAM을 검사하는 워크플로용(같은 키로 토글
--- resume). EMUCAP_FREEZE_KEY로 키 이름 변경(기본 Home), "off"/"none"/""이면 비활성. 유효 키 이름은
--- F1~F12·단일 영문자·Home/End/Insert·Space/Enter/Esc 등.
+-- The local freeze hotkey enters the same native debugger halt used by MCP pause. Mesen already
+-- transfers a regular pause into its debugger when the command-line script attaches; the compatible
+-- host's recurring idle events let this adapter adopt and service that halt without further guest
+-- time. EMUCAP_FREEZE_KEY changes the key (default Home); "off", "none", or "" disables it.
 local FREEZE_KEY = os.getenv("EMUCAP_FREEZE_KEY")
 if FREEZE_KEY == nil then FREEZE_KEY = "Home" end
 do local lk = FREEZE_KEY:lower(); if lk == "" or lk == "off" or lk == "none" then FREEZE_KEY = nil end end
@@ -83,6 +81,7 @@ local INSTR_CHUNK = 20000      -- 명령 step 청크(≤1s 안에서 keepalive)
 local TX_CAP = tonumber(os.getenv("EMUCAP_TX_CAP") or "") or (8 * 1024 * 1024)
 if TX_CAP < 1024 then TX_CAP = 1024 end
 local conn = nil
+local session_epoch = 0       -- response IDs are scoped to one accepted frontend connection
 local rx_buf = ""
 local tx = Tx.new(TX_CAP)
 local frame = 0
@@ -306,6 +305,7 @@ local function connect()
   local c = socket.tcp()
   c:settimeout(0)
   c:connect(HOST, PORT)
+  session_epoch = session_epoch + 1
   conn = c
   rx_buf = ""
   Tx.reset(tx)
@@ -444,7 +444,12 @@ function handlers.hello()
                 "break_on_reset", "dump_memory", "find_pattern", "probe", "reset" }
   if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
   if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
-  local host_features = { "code_break_idle", "native_halt_service", "native_halt_savestate" }
+  local host_features = {
+    "code_break_idle",
+    "native_halt_service",
+    "native_halt_savestate",
+    "paused_start_service",
+  }
   if HAS_SNES_PPU_OBJ_EVENTS then host_features[#host_features + 1] = "snes_ppu_obj_events" end
   local breakpoint_kinds = {
     { kind = "exec", range_unit = "address", range_mode = "inclusive", memory_type_used = true, snapshot = true },
@@ -630,6 +635,7 @@ function handlers.status()
     savestate_safe = halt_savestate_safe,
     service_interval_ms = HALT_SERVICE_INTERVAL_MS,
     instruction_drift = 0,
+    host_pause_adoption = true,
     idle_auto_resume_ms = MAX_FREEZE_MS,
     disconnect_auto_resume_ms = RECONNECT_GIVEUP_MS,
   }
@@ -674,33 +680,41 @@ local function read_target(pr)
 end
 
 -- ── 지연 명령 (run_frames / press_buttons / probe): 프레임마다 진행, 끝나면 응답 ──
+local function apply_deferred_effect(effect)
+  Deferred.apply(effect, {
+    release_input = function() input_hold = nil end,
+    working = function(value)
+      send_line(string.format(
+        '{"id":%d,"ok":true,"result":{"status":"working"}}',
+        value.id))
+    end,
+    terminal = function(value)
+      if value.operation_kind == "probe" and value.status == "completed" then
+        reply_ok(value.id, { hex = read_target(value.probe), frame = value.frame })
+        return
+      end
+      local result = { status = value.status, frame = value.frame }
+      if value.reason then result.reason = value.reason end
+      if value.breakpoint_id then result.breakpoint_id = value.breakpoint_id end
+      reply_ok(value.id, result)
+    end,
+  })
+end
+
 local function tick_deferred()
-  deferred.remaining = deferred.remaining - 1
-  deferred.age = deferred.age + 1
-  if deferred.remaining <= 0 then
-    if deferred.kind == "press" then input_hold = nil end   -- 버튼 해제
-    if deferred.kind == "probe" then
-      reply_ok(deferred.id, { hex = read_target(deferred.probe), frame = frame })
-    else
-      reply_ok(deferred.id, { status = "completed", frame = frame })
-    end
-    deferred = nil
-  elseif deferred.age % KEEPALIVE_FRAMES == 0 and not Tx.pending(tx) then
-    send_line(string.format('{"id":%d,"ok":true,"result":{"status":"working"}}', deferred.id))
-  end
+  local effect
+  deferred, effect = Deferred.tick(deferred, frame, KEEPALIVE_FRAMES)
+  if effect and effect.kind == "working" and Tx.pending(tx) then return end
+  apply_deferred_effect(effect)
 end
 
 -- 백스톱: freeze(브레이크포인트 등)가 진행 중 지연 명령(press/run_frames/probe)을 가로채면
 -- frozen 동안 tick_deferred가 안 돌아 응답이 막힌다. freeze 진입 시 여기서 마무리해 클라이언트
 -- 타임아웃을 막는다. press면 버튼을 뗀다.
 local function flush_deferred(status, reason, bp_id)
-  if not deferred then return end
-  if deferred.kind == "press" then input_hold = nil end
-  local r = { status = status, frame = frame }
-  if reason then r.reason = reason end
-  if bp_id then r.breakpoint_id = bp_id end
-  reply_ok(deferred.id, r)
-  deferred = nil
+  local effect
+  deferred, effect = Deferred.interrupt(deferred, status, reason, bp_id, frame)
+  apply_deferred_effect(effect)
 end
 
 -- full-range exec 콜백(save/load/probe·watch_register·set_trace)의 상한. 대부분 24비트(0xFFFFFF)면 CPU 실행
@@ -726,7 +740,8 @@ local function on_io_exec()
     if op.probe.frame <= 0 then
       reply_ok(op.id, { hex = read_target(op.probe), frame = frame })
     else
-      deferred = { id = op.id, kind = "probe", remaining = op.probe.frame, age = 0, probe = op.probe }
+      deferred = Deferred.start(
+        session_epoch, op.id, "probe", op.probe.frame, op.probe)
     end
     return
   end
@@ -816,7 +831,7 @@ local function frozen_state_io(method, id, p)
     reply_ok(id, { hex = read_target(probe), frame = frame })
     return nil
   end
-  deferred = { id = id, kind = "probe", remaining = probe.frame, age = 0, probe = probe }
+  deferred = Deferred.start(session_epoch, id, "probe", probe.frame, probe)
   return "resume"
 end
 
@@ -826,8 +841,9 @@ end
 -- only request-scoped work and release a transient press hold.
 abort_inflight = function()
   local cancelled = deferred ~= nil or pending_step_id ~= nil or pending_io ~= nil
-  if deferred and deferred.kind == "press" then input_hold = nil end
-  deferred = nil
+  local deferred_effect
+  deferred, deferred_effect = Deferred.cancel(deferred)
+  apply_deferred_effect(deferred_effect)
   pending_step_id = nil
   step_remaining = 0
   if pending_io and pending_io.ref then
@@ -1654,7 +1670,7 @@ local function dispatch(line)
   if method == "run_frames" then
     local frames, err = bounded_sync_count(p.n, 1, false)
     if not frames then reply_err(id, "bad_params", err); return end
-    deferred = { id = id, kind = "run", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "run", frames)
     return
   end
   if method == "press_buttons" then
@@ -1663,7 +1679,7 @@ local function dispatch(line)
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = { id = id, kind = "press", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "press", frames)
     return
   end
   if method == "save_state" then arm_io("save", id, p.path); return end
@@ -1699,7 +1715,7 @@ local function handle_in_freeze(line)
     -- free-run으로 one-shot watch/BP를 조기 소진시키는 레이스라 제거됨 — Mednafen과 동일 원자 resume 규약).
     local frames, err = bounded_sync_count(p.n, 1, false)
     if not frames then reply_err(id, "bad_params", err); return nil end
-    deferred = { id = id, kind = "run", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "run", frames)
     return "resume"
   elseif method == "press_buttons" then
     local frames, frame_err = bounded_sync_count(p.frames, 1, false)
@@ -1707,7 +1723,7 @@ local function handle_in_freeze(line)
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return nil end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = { id = id, kind = "press", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "press", frames)
     return "resume"
   elseif method == "save_state" or method == "load_state" or method == "probe" then
     return frozen_state_io(method, id, p)
@@ -1745,6 +1761,24 @@ resume_from_freeze = function()
   freeze_disc_ms = nil
   freeze_snapshot = nil
   emu.resume()
+end
+
+-- A command-line script can be loaded after Mesen is already paused. In that case the initial
+-- CodeBreak callback predates this Lua context, but the patched host keeps emitting CodeBreakIdle.
+-- Adopt that observed native halt as the adapter's frozen state instead of waiting for a frame that
+-- cannot occur. This is also the reconciliation path for a GUI pause while the adapter is running.
+local function adopt_host_halt(reason)
+  if STATE == "frozen" then return end
+  STATE = "frozen"
+  freeze_reason = reason
+  freeze_start_ms = wall_ms()
+  freeze_disc_ms = nil
+  freeze_snapshot = nil
+  if #events < EVENT_CAP then
+    events[#events + 1] = { type = "user_freeze", reason = reason, frame = frame }
+  else
+    dropped = dropped + 1
+  end
 end
 
 -- Native halt callback 한 번의 작업량은 항상 bounded다. TX flush, request, reconnect, deadman을
@@ -1824,6 +1858,7 @@ end, emu.eventType.codeBreak)
 -- Unsafe halt kinds are still serviceable, but savestate operations remain disabled.
 emu.addEventCallback(function()
   halt_savestate_safe = false
+  adopt_host_halt("host_break")
   service_frozen_once()
 end, emu.eventType.codeBreakIdle)
 
@@ -1831,6 +1866,7 @@ end, emu.eventType.codeBreakIdle)
 -- createSavestate/loadSavestate. This is the only frozen callback that enables state I/O.
 emu.addEventCallback(function()
   halt_savestate_safe = true
+  adopt_host_halt("host_halt")
   service_frozen_once()
   halt_savestate_safe = false
 end, emu.eventType.codeBreakIdleSavestate)
@@ -1846,11 +1882,23 @@ emu.addEventCallback(function()
   frame = frame + 1
   if not conn then connect(); return end
   if Tx.pending(tx) and flush_tx() == "resetting" then return end
-  -- frozen이면(또는 step 청크 진행 중) 명령은 codeBreak가 서비스한다. 여기선 아무 것도 안 함.
-  if STATE == "frozen" then return end
-  -- 로컬 freeze 핫키(running 한정, 라이징 에지 1회): 사용자가 GUI Pause 대신 이 키로 그 프레임을
-  -- 얼린다 → codeBreak freeze라 emucap이 응답을 유지(read/screenshot/get_state/step 가능). 지연
-  -- 명령(run_frames 등) 중엔 그 응답이 묶여 있으니 건드리지 않는다(끝난 뒤 다시 누르면 됨).
+  -- A startFrame while frozen means the host was resumed outside the adapter. Explicit adapter
+  -- steps are the exception: they may cross a frame boundary before returning to the native halt.
+  if STATE == "frozen" then
+    if pending_step_id then return end
+    STATE = "running"
+    freeze_start_ms = nil
+    freeze_disc_ms = nil
+    freeze_snapshot = nil
+    freeze_reason = "paused"
+    if #events < EVENT_CAP then
+      events[#events + 1] = { type = "user_resume", reason = "host", frame = frame }
+    else
+      dropped = dropped + 1
+    end
+  end
+  -- The local freeze hotkey remains an explicit adapter-owned alternative to Mesen's regular Pause.
+  -- Deferred operations already own their execution interval, so do not let a host key interrupt one.
   do
     local fk = freeze_key_down()
     -- 라이징 에지에 freeze. 지연 명령(run_frames/press_buttons) 중에도 막지 않고 그걸 마무리(flush)한 뒤

@@ -96,6 +96,28 @@ fn dolphin_native_advertisement_exposes_its_composition_limits() {
 }
 
 #[test]
+fn dolphin_wii_input_uses_the_scoped_port_zero_contract() {
+    let value = advertisement_value(&[
+        "dolphin.breakpoint.exact-exec-only",
+        "dolphin.input-hold.port-zero-only",
+        "dolphin.state-save.frozen-only",
+        "dolphin.state-load.frozen-only",
+        "dolphin.screenshot.running-only",
+        "dolphin.call-stack.best-effort",
+    ]);
+    let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+    let methods = ["status", "pause", "step", "set_input"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let status = validate_advertisement(&ad, Some("dolphin-native"), Some("wii"), &methods);
+
+    assert_eq!(status.state, "validated", "{:?}", status.errors);
+    assert_eq!(status.constraints["input.ports.allowed"], json!([0]));
+}
+
+#[test]
 fn unknown_exception_is_unvalidated() {
     let ad = ContractAdvertisement::Reported(AdvertisedContracts {
         catalog: CATALOG_ID.to_string(),

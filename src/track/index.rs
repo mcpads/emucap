@@ -6,11 +6,11 @@ use crate::track::store::{self, TrackError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum IndexError {
-    #[error("SQLite 오류: {0}")]
+    #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error(transparent)]
     Track(#[from] TrackError),
-    #[error("직렬화 오류: {0}")]
+    #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
 }
 

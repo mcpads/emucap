@@ -210,7 +210,7 @@ $emuHome = Join-Path $emuBase "mesen2\$Port"
 $portableDir = Join-Path $emuHome "portable"
 $pidFile = Join-Path $emuHome "mesen.pid"
 $log = if ($env:EMUCAP_LOG) { $env:EMUCAP_LOG } else { Join-Path $emuHome "mesen.log" }
-$waitSeconds = if ($env:EMUCAP_LAUNCH_WAIT) { [int]$env:EMUCAP_LAUNCH_WAIT } else { 20 }
+$waitSeconds = if ($env:EMUCAP_LAUNCH_WAIT) { [int]$env:EMUCAP_LAUNCH_WAIT } else { 30 }
 $postConnectGraceSeconds = if ($env:EMUCAP_POST_CONNECT_GRACE) { [int]$env:EMUCAP_POST_CONNECT_GRACE } else { 2 }
 if ($waitSeconds -lt 0) {
   throw "EMUCAP_LAUNCH_WAIT must be 0 or greater"
@@ -295,7 +295,7 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    & git -C $here diff --quiet HEAD -- emucap-core.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null
+    & git -C $here diff --quiet HEAD -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null
     if ($LASTEXITCODE -ne 0) {
       $buildHash = "$buildHash-dirty"
     }

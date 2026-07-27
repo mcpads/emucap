@@ -351,7 +351,7 @@ fn log_artifact_reports_missing_path() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("아티팩트 경로 없음"));
+    assert!(err.contains("artifact path not found"));
     // 원장 미변경
     assert_eq!(
         store::load_run(root, "sha_a", &run.id)

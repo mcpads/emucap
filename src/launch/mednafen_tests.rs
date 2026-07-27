@@ -1,5 +1,4 @@
 use super::*;
-#[cfg(windows)]
 use crate::test_env::{lock_env, EnvGuard};
 
 #[cfg(unix)]
@@ -64,4 +63,29 @@ fn run_copy_preserves_source_binary_name() {
         run_binary_path(&src, &run_dir),
         run_dir.join(default_binary_name())
     );
+}
+
+#[test]
+fn pcfx_bios_resolution_rejects_wrong_hash_after_size_check() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_PCFX_BIOS", "EMUCAP_EMU_HOME"]);
+    let dir = tempfile::tempdir().unwrap();
+    let bios = dir.path().join("pcfx.rom");
+    // The hash check is tested independently below; this fixture first proves the size gate.
+    std::fs::write(&bios, vec![0u8; PCFX_BIOS_SIZE as usize]).unwrap();
+    std::env::set_var("EMUCAP_PCFX_BIOS", &bios);
+
+    let error = resolve_pcfx_bios().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("sha256="));
+}
+
+#[test]
+fn pcfx_bios_resolution_rejects_relative_override_before_io() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_PCFX_BIOS"]);
+    std::env::set_var("EMUCAP_PCFX_BIOS", "pcfx.rom");
+
+    let error = resolve_pcfx_bios().unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }

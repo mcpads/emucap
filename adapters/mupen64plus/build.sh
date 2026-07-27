@@ -67,6 +67,40 @@ fi
   exit 1
 }
 
+PATCHES=(
+  "$HERE/patches/0001-fail-closed-core-worker-init.patch"
+  "$HERE/patches/0002-consume-breakpoint-latch.patch"
+)
+if command -v shasum >/dev/null 2>&1; then
+  ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
+else
+  ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256sum | awk '{print $1}')"
+fi
+if [ "$ACTUAL_PATCHSET_SHA256" != "$M64P_PATCHSET_SHA256" ]; then
+  echo "ERROR: Mupen64Plus patch stack does not match upstream.lock" >&2
+  echo "  expected=$M64P_PATCHSET_SHA256" >&2
+  echo "  actual=$ACTUAL_PATCHSET_SHA256" >&2
+  exit 1
+fi
+
+# Restore every locally patched source from the verified archive before applying the patch stack.
+# This prevents an ignored generated tree from silently contributing hand edits to a signed build.
+PATCHED_MEMBERS=(
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/frontend.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/api_export.ver"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/debugger.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/m64p_debugger.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/workqueue.c"
+)
+tar -xzf "$ARCHIVE" -C "$WORK" "${PATCHED_MEMBERS[@]}"
+CORE_SRC="$SRC/source/mupen64plus-core"
+for source_patch in "${PATCHES[@]}"; do
+  echo "applying $(basename "$source_patch")"
+  patch -d "$CORE_SRC" -p1 --forward <"$source_patch"
+done
+
 if [ "$(uname)" = "Darwin" ]; then
   if ! command -v brew >/dev/null 2>&1; then
     echo "ERROR: debugger-enabled Mupen64Plus on macOS requires Homebrew binutils" >&2
@@ -130,6 +164,8 @@ else
 fi
 printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugSetCallbacks$'
 printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugStep$'
+printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugBreakpointConsume$'
+printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugDecodeOp$'
 
 ROM="$SRC/test/m64p_test_rom.v64"
 ROM_SHA="$(sha256_path "$ROM")"
@@ -145,6 +181,7 @@ ROM_SHA="$(sha256_path "$ROM")"
   printf '  "core_commit": "%s",\n' "$M64P_CORE_COMMIT"
   printf '  "host_api": %s,\n' "$M64P_HOST_API"
   printf '  "bundle_sha256": "%s",\n' "$M64P_BUNDLE_SHA256"
+  printf '  "patchset_sha256": "%s",\n' "$M64P_PATCHSET_SHA256"
   printf '  "test_rom_sha256": "%s",\n' "$ROM_SHA"
   printf '  "debugger": true\n'
   printf '}\n'

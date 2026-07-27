@@ -22,12 +22,30 @@ fn body_text(r: &CallToolResult) -> String {
         .join("")
 }
 
+fn contains_hangul(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{1100}'..='\u{11ff}' | '\u{3130}'..='\u{318f}' | '\u{ac00}'..='\u{d7af}'
+        )
+    })
+}
+
 #[test]
 fn server_info_identifies_the_tracking_binary() {
     let info = EmucapTrack::new().get_info();
     assert_eq!(info.server_info.name, "emucap-track-mcp");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.instructions.as_deref(), Some(SERVER_INSTRUCTIONS));
+}
+
+#[test]
+fn tracking_mcp_consumer_metadata_is_english() {
+    let server = EmucapTrack::new();
+    let instructions = server.get_info().instructions.unwrap_or_default();
+    let tools = serde_json::to_string(&server.tool_router.list_all()).unwrap();
+    assert!(!contains_hangul(&instructions), "{instructions}");
+    assert!(!contains_hangul(&tools), "{tools}");
 }
 
 #[tokio::test]

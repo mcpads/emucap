@@ -700,7 +700,7 @@ pub fn watch_register(
             return Err(LinkError::Emulator {
                 kind: "bad_params".into(),
                 message: format!(
-                    "watch_register max_instructions {budget}이 상한 {MAX_WATCH_INSTRUCTIONS} 초과"
+                    "watch_register max_instructions {budget} exceeds the limit {MAX_WATCH_INSTRUCTIONS}"
                 ),
             });
         }
@@ -769,19 +769,21 @@ pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput,
     // 거부한다 — 원자 스왑/폴백이 그 파일을 숨은 이름으로 밀어내 요청 경로에서 사라지게 하는 것을
     // 막는다(fail-fast, replace_dir와 동일 가드).
     ensure_replaceable_dir(dest).map_err(|e| {
-        LinkError::Protocol(format!("덤프 경로가 교체 가능한 디렉토리가 아님: {e}"))
+        LinkError::Protocol(format!(
+            "dump destination is not a replaceable directory: {e}"
+        ))
     })?;
     let staging = dump_sibling(dest, "dump-staging")
-        .map_err(|e| LinkError::Protocol(format!("덤프 스테이징 경로 실패: {e}")))?;
+        .map_err(|e| LinkError::Protocol(format!("failed to create dump staging path: {e}")))?;
     let staging_str = staging
         .to_str()
-        .ok_or_else(|| LinkError::Protocol("덤프 스테이징 경로가 UTF-8이 아님".into()))?
+        .ok_or_else(|| LinkError::Protocol("dump staging path is not valid UTF-8".into()))?
         .to_string();
 
     // 스테이징에 리전 파일 + state.json을 모은다. 실패하면 스테이징을 버리고 `dir`은 건드리지 않는다.
     let build = (|| -> Result<Value, LinkError> {
         std::fs::create_dir_all(&staging)
-            .map_err(|e| LinkError::Protocol(format!("스테이징 디렉토리 생성 실패: {e}")))?;
+            .map_err(|e| LinkError::Protocol(format!("failed to create staging directory: {e}")))?;
         let regions = link.call("dump_memory", json!({ "path": staging_str }))?;
         // 상태(레지스터/DMA/PPU) 스냅샷도 같은 디렉토리에 기록(교차-ROM 키-값 디프 입력).
         // 교차-ROM에서는 frozen 앵커 지점에서 덤프해야 두 호출이 일관된다.
@@ -791,7 +793,7 @@ pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput,
             staging.join("state.json"),
             serde_json::to_string(&state_map).unwrap_or_default(),
         )
-        .map_err(|e| LinkError::Protocol(format!("state.json 쓰기 실패: {e}")))?;
+        .map_err(|e| LinkError::Protocol(format!("failed to write state.json: {e}")))?;
         Ok(regions)
     })();
 
@@ -806,7 +808,9 @@ pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput,
     // 완성된 스테이징을 `dir`로 원자 스왑(직전 덤프는 스왑 성공 시에만 교체·실패 시 롤백).
     if let Err(e) = replace_dir(&staging, dest) {
         let _ = std::fs::remove_dir_all(&staging);
-        return Err(LinkError::Protocol(format!("덤프 배치(스왑) 실패: {e}")));
+        return Err(LinkError::Protocol(format!(
+            "failed to publish dump directory: {e}"
+        )));
     }
 
     // 브리지가 돌려준 path는 스테이징 경로이므로, 호출자가 요청한 `dir`로 정정해 보고한다.
@@ -965,12 +969,12 @@ pub fn screenshot(
     let b64 = result
         .get("png_base64")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| LinkError::Protocol("screenshot 응답에 png_base64 없음".into()))?
+        .ok_or_else(|| LinkError::Protocol("screenshot response has no png_base64 field".into()))?
         .to_string();
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
-        .map_err(|e| LinkError::Protocol(format!("base64 디코드 실패: {e}")))?;
+        .map_err(|e| LinkError::Protocol(format!("failed to decode base64 screenshot: {e}")))?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
     if let Some(reported) = result.get("sha256").and_then(Value::as_str) {
         if reported != sha256 {
@@ -982,7 +986,7 @@ pub fn screenshot(
     let saved_path = match save_path {
         Some(p) => {
             std::fs::write(p, &bytes)
-                .map_err(|e| LinkError::Protocol(format!("스크린샷 저장 실패: {e}")))?;
+                .map_err(|e| LinkError::Protocol(format!("failed to save screenshot: {e}")))?;
             Some(p.to_string_lossy().to_string())
         }
         None => None,

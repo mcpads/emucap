@@ -1,4 +1,4 @@
-# emu-monitor-hitl-adaptor (emucap)
+# emucap
 
 Emulator **capture** infrastructure for debugging retro-game patches (emucap = emulator capture).
 "Capture" here is not a narrow snapshot but a *broad surface for capturing a running emulator's
@@ -27,9 +27,12 @@ composes them (they do not call each other).
   `.emucap` at the working repo's git root).
 - `emucap-broker` — multi-session connection sharing (for the Control MCP).
 - `emucap-mame-pc98-bridge` — PC-98 launch helper used by the Rust MAME launcher.
+- `emucap-mame-neogeo-bridge` — Neo Geo MVS/AES/CD launch and debugger bridge for MAME.
+- `emucap-mupen64plus` — N64 adapter host for the debugger-enabled Mupen64Plus fork.
 - `emucap-desmume-nds-bridge` — NDS launch helper used by the Rust DeSmuME launcher.
 - `emucap-ppsspp-bridge` — PSP launch helper used by the Rust PPSSPP launcher.
 - `emucap-pcsx2-bridge` — PS2 launch helper used by the Rust PCSX2 launcher.
+- `emucap-openmsx-bridge` — MSX launch and XML-control bridge for stock openMSX.
 
 ## MCP operating notes
 
@@ -55,5 +58,5 @@ only when the connected adapter advertises that method.
 
 If tool discovery lacks the Control MCP's `bootstrap`/`launch_plan`, or `status` has no
 `runtime_paths` (or the Tracking MCP's `run_start` is missing), the running release is stale. Rebuild
-with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge --bin emucap-desmume-nds-bridge --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge`
+with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge --bin emucap-openmsx-bridge`
 and restart both MCPs.

@@ -26,7 +26,7 @@ pub fn parse_run_status(s: &str) -> Result<RunStatus, String> {
         "done" => Ok(RunStatus::Done),
         "aborted" => Ok(RunStatus::Aborted),
         "error" => Ok(RunStatus::Error),
-        other => Err(format!("알 수 없는 status: {other}")),
+        other => Err(format!("unknown run status: {other}")),
     }
 }
 
@@ -35,7 +35,7 @@ pub fn parse_gate_kind(s: &str) -> Result<GateKind, String> {
     match s {
         "machine" => Ok(GateKind::Machine),
         "judgment" => Ok(GateKind::Judgment),
-        other => Err(format!("알 수 없는 gate kind: {other}")),
+        other => Err(format!("unknown gate kind: {other}")),
     }
 }
 
@@ -117,10 +117,10 @@ pub fn find_resumable_run(
 pub fn resume_run_by_id(root: &Path, run_id: &str) -> Result<ResumeBinding, String> {
     let run = store::find_run_by_id(root, run_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("run_id 없음: {run_id}"))?;
+        .ok_or_else(|| format!("run_id not found: {run_id}"))?;
     if run.status != RunStatus::Running {
         return Err(format!(
-            "run {run_id}의 status가 {:?}라 resume 불가 — running run만 재바인딩할 수 있다(종료된 run은 새 run_start로 시작).",
+            "run {run_id} has status {:?} and cannot be resumed; only a running run can be rebound. Call run_start after a finished run.",
             run.status
         ));
     }
@@ -141,7 +141,7 @@ pub fn finish_run_by_id(
 ) -> Result<Value, String> {
     match ops::finish_run_by_id(root, run_id, status, now).map_err(|e| e.to_string())? {
         Some(id) => Ok(serde_json::json!({ "finished": id })),
-        None => Err(format!("run_id 없음: {run_id}")),
+        None => Err(format!("run_id not found: {run_id}")),
     }
 }
 
@@ -224,9 +224,9 @@ pub fn log_artifact(
     if !resolved.exists() {
         let base = git_root
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "현재 작업 디렉터리".into());
+            .unwrap_or_else(|| "current working directory".into());
         return Err(format!(
-            "아티팩트 경로 없음: {} — 상대경로는 repo root({}) 기준으로 해소된다. 절대경로를 넘기거나 repo root 기준 경로를 써라.",
+            "artifact path not found: {}. Relative paths are resolved from repository root ({}); provide an absolute path or a repository-relative path.",
             resolved.display(),
             base,
         ));

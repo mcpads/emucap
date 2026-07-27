@@ -17,6 +17,7 @@ pub struct TcpLink {
     conn: Option<Conn>,
     caps: Capabilities,
     session_token: String,
+    staged_reclaim_token: Option<String>,
     preaccept_token: Arc<RwLock<String>>,
     next_id: u64,
     preaccept: Option<Preaccept>,
@@ -65,6 +66,7 @@ fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLin
         caps: Capabilities::empty(),
         preaccept_token: Arc::new(RwLock::new(session_token.clone())),
         session_token,
+        staged_reclaim_token: None,
         next_id: 1,
         preaccept: None,
         runtime_store: super::runtime::RuntimeStore::discover(),
@@ -324,7 +326,9 @@ fn handshake_stream(
                 message: err.message,
             })
         } else {
-            Err(LinkError::Protocol("hello ok=false인데 error 없음".into()))
+            Err(LinkError::Protocol(
+                "hello returned ok=false without an error".into(),
+            ))
         };
     }
     let caps_val = resp.result.unwrap_or(Value::Null);
@@ -363,7 +367,7 @@ fn handshake_stream(
         .unwrap_or_default();
     if protocol_version != PROTOCOL_VERSION {
         return Err(LinkError::Protocol(format!(
-            "프로토콜 버전 불일치: 서버 {PROTOCOL_VERSION}, 클라이언트 {protocol_version}"
+            "protocol version mismatch: server {PROTOCOL_VERSION}, client {protocol_version}"
         )));
     }
     let identity = super::link::EmulatorIdentity::from_hello(&caps_val);
@@ -401,6 +405,12 @@ fn handshake_stream(
 }
 
 impl TcpLink {
+    fn expected_session_token(&self) -> &str {
+        self.staged_reclaim_token
+            .as_deref()
+            .unwrap_or(&self.session_token)
+    }
+
     pub fn local_addr(&self) -> SocketAddr {
         self.listener
             .as_ref()
@@ -432,6 +442,7 @@ impl TcpLink {
         if let Some(port) = self.endpoint_port() {
             write_session_token(port, token).map_err(io_to_link)?;
         }
+        self.staged_reclaim_token = None;
         self.session_token.clear();
         self.session_token.push_str(token);
         *self
@@ -460,7 +471,7 @@ impl TcpLink {
         };
 
         match msg {
-            Some(Ok((conn, caps, token))) if token == self.session_token => {
+            Some(Ok((conn, caps, token))) if token == self.expected_session_token() => {
                 self.conn = Some(conn);
                 self.caps = caps;
                 self.preaccept = None;
@@ -532,7 +543,7 @@ impl TcpLink {
             Ok((s, _)) => s,
             Err(_) => return, // WouldBlock(대기 없음)·기타 → 기존 conn 유지
         };
-        let expected = self.session_token.clone();
+        let expected = self.expected_session_token().to_string();
         if let Ok((conn, caps)) = handshake_stream(stream, self.timeout, Some(&expected)) {
             self.conn = Some(conn);
             self.caps = caps;
@@ -712,7 +723,7 @@ impl TcpLink {
         };
         // hello 교환. 실패하면 half-connected 상태를 남기지 않고 비운다(다음 시도가
         // 깨끗이 재수락하도록).
-        let expected = self.session_token.clone();
+        let expected = self.expected_session_token().to_string();
         let (conn, caps) = match handshake_stream(stream, self.timeout, Some(&expected)) {
             Ok(v) => v,
             Err(e) => {
@@ -793,7 +804,8 @@ impl TcpLink {
                         if mismatch > MAX_ID_MISMATCH {
                             self.drop_conn();
                             return Err(LinkError::Protocol(
-                                "id 불일치 프레임이 한도를 초과 — 스트림 desync".into(),
+                                "too many frames with a mismatched id; stream desynchronized"
+                                    .into(),
                             ));
                         }
                         // 이전에 타임아웃된 명령의 늦은 응답 등 — id가 안 맞으면 버리고 계속.
@@ -807,7 +819,9 @@ impl TcpLink {
                                 message: err.message,
                             })
                         } else {
-                            Err(LinkError::Protocol("ok=false인데 error 없음".into()))
+                            Err(LinkError::Protocol(
+                                "response returned ok=false without an error".into(),
+                            ))
                         };
                     }
                     let result = resp.result.unwrap_or(Value::Null);
@@ -869,6 +883,65 @@ impl EmulatorLink for TcpLink {
 
     fn session_token(&self) -> Option<&str> {
         Some(&self.session_token)
+    }
+
+    fn stage_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if token.is_empty() {
+            return Err(LinkError::Protocol(
+                "cannot stage an empty reclaim token".into(),
+            ));
+        }
+        if self
+            .staged_reclaim_token
+            .as_deref()
+            .is_some_and(|staged| staged != token)
+        {
+            return Err(LinkError::Busy);
+        }
+        self.drop_conn();
+        self.staged_reclaim_token = Some(token.to_string());
+        *self
+            .preaccept_token
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = token.to_string();
+        Ok(true)
+    }
+
+    fn commit_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        if self.staged_reclaim_token.as_deref() != Some(token) {
+            return Err(LinkError::Protocol(
+                "reclaim token commit does not match the staged launch".into(),
+            ));
+        }
+        if let Some(port) = self.endpoint_port() {
+            write_session_token(port, token).map_err(io_to_link)?;
+        }
+        self.session_token.clear();
+        self.session_token.push_str(token);
+        self.staged_reclaim_token = None;
+        *self
+            .preaccept_token
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = token.to_string();
+        Ok(true)
+    }
+
+    fn abort_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        match self.staged_reclaim_token.as_deref() {
+            Some(staged) if staged == token => {
+                self.drop_conn();
+                self.staged_reclaim_token = None;
+                *self
+                    .preaccept_token
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = self.session_token.clone();
+                Ok(true)
+            }
+            None => Ok(true),
+            Some(_) => Err(LinkError::Protocol(
+                "reclaim token abort does not match the staged launch".into(),
+            )),
+        }
     }
 
     fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {

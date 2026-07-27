@@ -9,16 +9,16 @@ pub enum LinkError {
     NotConnected,
     /// 포트를 다른 emucap-mcp 인스턴스(다른 세션)가 이미 점유 중. 이 세션은 그 에뮬레이터를
     /// 쓸 수 없다. 세션마다 `EMUCAP_PORT`를 다르게 두고 에뮬레이터도 그 포트로 띄워야 격리된다.
-    #[error("port {addr} busy — 다른 emucap-mcp 인스턴스가 점유 중(세션별 EMUCAP_PORT 분리 필요)")]
+    #[error("port {addr} is busy; another emucap-mcp instance owns it (use a distinct EMUCAP_PORT per session)")]
     PortBusy { addr: String },
     /// 에뮬레이터가 이미 살아있는 다른 세션에 attach됨(broker 모드).
-    #[error("emulator busy — 다른 세션이 제어 중")]
+    #[error("emulator is busy; another session controls it")]
     Busy,
     /// 지정한 name의 에뮬레이터가 broker에 없음.
-    #[error("no such emulator (가용: {names:?})")]
+    #[error("no such emulator (available: {names:?})")]
     NoSuchEmulator { names: Vec<String> },
     /// 이름 없이 attach인데 에뮬레이터가 다중.
-    #[error("ambiguous emulator — 이름 지정 필요 (가용: {names:?})")]
+    #[error("ambiguous emulator; specify a name (available: {names:?})")]
     Ambiguous { names: Vec<String> },
     #[error("request timed out")]
     Timeout,
@@ -176,6 +176,22 @@ pub trait EmulatorLink {
     /// 이 MCP 세션의 direct-mode guard token. status가 launcher env로 안내한다.
     fn session_token(&self) -> Option<&str> {
         None
+    }
+    /// Stage a launch-generation capability without replacing the active generation's token.
+    /// Direct listeners may accept this token while launch readiness is being checked, but must
+    /// leave the durable compatibility token unchanged until commit.
+    fn stage_reclaim_token(&mut self, _token: &str) -> Result<bool, LinkError> {
+        Ok(false)
+    }
+    /// Promote the exact staged capability after adapter readiness succeeds. Implementations must
+    /// reject a token that is not the currently staged value.
+    fn commit_staged_reclaim_token(&mut self, _token: &str) -> Result<bool, LinkError> {
+        Ok(false)
+    }
+    /// Discard the exact staged capability after launch failure and restore acceptance of the
+    /// previous active token. This operation is idempotent for an already-aborted token.
+    fn abort_staged_reclaim_token(&mut self, _token: &str) -> Result<bool, LinkError> {
+        Ok(false)
     }
     /// 새 launch generation의 서버 외부에 노출하지 않는 reclaim capability를 direct listener에 설치한다.
     /// broker 등 capability를 직접 소유하지 않는 링크는 false로 강등한다.

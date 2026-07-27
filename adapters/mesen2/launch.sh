@@ -11,7 +11,7 @@
 #   EMUCAP_MESEN_LUA=/path/to/entry.lua       기본: SYSTEM 또는 ROM 확장자로 시스템 엔트리 선택
 #   EMUCAP_MESEN_LAUNCH_MODE=auto|open|direct 기본: auto(격리 copy를 direct 실행)
 #   EMUCAP_EMU_HOME=/path/to/emucap/home      기본: OS별 사용자 데이터 아래 emucap/
-#   EMUCAP_LAUNCH_WAIT=<seconds>              기본: 20
+#   EMUCAP_LAUNCH_WAIT=<seconds>              default: 30
 #   EMUCAP_POST_CONNECT_GRACE=<seconds>       기본: 2
 #   EMUCAP_LOG=/path/to/custom.log            기본: <emucap-data>/mesen2/<port>/mesen.log
 set -euo pipefail
@@ -92,7 +92,8 @@ EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo u
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   git -C "$HERE" diff --quiet HEAD -- \
-    emucap-core.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua "$(basename "$LUA")" 2>/dev/null \
+    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua \
+    "$(basename "$LUA")" 2>/dev/null \
     || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
 else
   EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
@@ -183,7 +184,7 @@ RUN_DIR="$EMUCAP_MESEN_BASE/mesen2/$PORT"
 PORTABLE_SAFE_ROOT="$RUN_DIR"
 PIDFILE="$RUN_DIR/mesen.pid"
 LOG="${EMUCAP_LOG:-$RUN_DIR/mesen.log}"
-WAIT="${EMUCAP_LAUNCH_WAIT:-20}"
+WAIT="${EMUCAP_LAUNCH_WAIT:-30}"
 POST_CONNECT_GRACE="${EMUCAP_POST_CONNECT_GRACE:-2}"
 MESEN_BIN="${MESEN_BIN:-$(resolve_default_mesen || true)}"
 case "$MESEN_BIN" in

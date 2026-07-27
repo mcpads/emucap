@@ -14,99 +14,9 @@ pub(crate) const BUILD_HASH: &str = include_str!(concat!(env!("OUT_DIR"), "/emuc
 #[path = "status_tests.rs"]
 mod tests;
 
-pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json::Value> {
-    Some(match system? {
-        "ss" | "saturn" => serde_json::json!({
-            "system": "saturn",
-            "buttons": ["a", "b", "c", "x", "y", "z", "l", "r", "start", "up", "down", "left", "right"],
-            "aliases": {"ls": "l", "rs": "r", "l1": "l", "r1": "r", "lb": "l", "rb": "r", "enter": "start", "return": "start"},
-            "notes": "Saturn pad buttons are lowercase. Directions are up/down/left/right."
-        }),
-        "psx" | "ps1" | "playstation" => serde_json::json!({
-            "system": "psx",
-            "buttons": ["cross", "circle", "triangle", "square", "l1", "l2", "r1", "r2", "start", "select", "up", "down", "left", "right"],
-            "aliases": {"x": "cross", "o": "circle", "l": "l1", "r": "r1", "enter": "start", "return": "start"},
-            "optional": ["l3", "r3"],
-            "notes": "Use PlayStation names, not SNES/Saturn a/b."
-        }),
-        "pce" | "pce_fast" | "pcengine" | "pc-engine" => serde_json::json!({
-            "system": "pce",
-            "buttons": ["i", "ii", "run", "select", "up", "down", "left", "right"],
-            "aliases": {"a": "i", "b": "ii", "start": "run", "enter": "run", "return": "run"},
-            "six_button": ["iii", "iv", "v", "vi"],
-            "notes": "Prefer PCE button names i/ii/run/select. a/b/start are accepted aliases."
-        }),
-        "md" | "genesis" | "megadrive" | "mega-drive" => serde_json::json!({
-            "system": "md",
-            "buttons": ["a", "b", "c", "x", "y", "z", "mode", "start", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start"},
-            "notes": "Mega Drive/Genesis uses Mednafen md.input.port1=gamepad6 through the launcher so x/y/z/mode are available."
-        }),
-        "pc98" => serde_json::json!({
-            "system": "pc98",
-            "buttons": ["enter", "esc", "space", "up", "down", "left", "right", "backspace", "tab", "del", "ins", "home", "help", "stop", "copy", "shift", "ctrl", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "vf1", "vf2", "vf3", "vf4", "vf5", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
-            "aliases": {"start": "enter", "return": "enter", "escape": "esc", "select": "space"},
-            "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. step(frames) is frame-based, so tap can drive deterministic frozen input."
-        }),
-        "neogeo_mvs" => serde_json::json!({
-            "system": "neogeo_mvs",
-            "buttons": ["a", "b", "c", "d", "start", "coin", "service", "up", "down", "left", "right"],
-            "notes": "Neo Geo MVS controller port 0. Timed input is released by emulator frame count."
-        }),
-        "dc" | "dreamcast" => serde_json::json!({
-            "system": "dreamcast",
-            "buttons": ["a", "b", "c", "x", "y", "z", "d", "start", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start"},
-            "notes": "Dreamcast pad buttons are lowercase: a/b/x/y/start + up/down/left/right are standard; c/z/d exist on some pads. Analog triggers/stick are not injectable by name. Input is injected at the maple GetInput consumer; only controller port 0 is supported."
-        }),
-        "gamecube" | "gc" | "ngc" => serde_json::json!({
-            "system": "gamecube",
-            "buttons": ["a", "b", "x", "y", "z", "l", "r", "start", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r"},
-            "notes": "GameCube controller button names are lowercase. Only controller port 0 is supported by the native adapter."
-        }),
-        "snes" | "sfc" => serde_json::json!({
-            "system": "snes",
-            "buttons": ["a", "b", "x", "y", "l", "r", "start", "select", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r", "lb": "l", "rb": "r"},
-            "notes": "Mesen SNES uses lowercase SNES button names."
-        }),
-        "gamegear" | "gg" | "sms" => serde_json::json!({
-            "system": "gamegear",
-            "buttons": ["up", "down", "left", "right", "one", "two", "pause"],
-            "aliases": {"start": "pause", "enter": "pause", "return": "pause", "a": "two", "b": "one", "1": "one", "2": "two", "button1": "one", "button2": "two"},
-            "notes": "Mesen Game Gear (SMS controller): one=Button1(B), two=Button2(A), pause=Start. Aliases let you use start/a/b/1/2."
-        }),
-        "gb" | "gbc" | "gameboy" | "game-boy" | "dmg" | "gbcolor" | "gameboycolor" | "cgb" => {
-            serde_json::json!({
-                "system": "gb",
-                "buttons": ["a", "b", "start", "select", "up", "down", "left", "right"],
-                "aliases": {"enter": "start", "return": "start"},
-                "notes": "Mesen Game Boy / Game Boy Color (gameboy console): a/b/start/select + directions, lowercase. No X/Y/L/R."
-            })
-        }
-        "gba" | "gameboyadvance" | "game-boy-advance" | "agb" => serde_json::json!({
-            "system": "gba",
-            "buttons": ["a", "b", "l", "r", "start", "select", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r", "lb": "l", "rb": "r"},
-            "notes": "Mesen Game Boy Advance (ARM7): a/b/l/r/start/select + directions, lowercase. No X/Y."
-        }),
-        "nes" | "famicom" | "fc" | "nintendo" => serde_json::json!({
-            "system": "nes",
-            "buttons": ["a", "b", "start", "select", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start"},
-            "notes": "Mesen NES / Famicom (nes console / 6502-2A03 CPU): a/b/start/select + directions, lowercase. No X/Y/L/R."
-        }),
-        "nds" | "ds" | "nintendo-ds" => serde_json::json!({
-            "system": "nds",
-            "buttons": ["a", "b", "x", "y", "l", "r", "start", "select", "up", "down", "left", "right"],
-            "aliases": {"enter": "start", "return": "start", "l1": "l", "r1": "r"},
-            "notes": "Nintendo DS buttons are injected through the DeSmuME bridge; only controller port 0 is supported. Use the dedicated touch tool for the lower screen. Microphone input is not injectable."
-        }),
-        // 알 수 없는 system은 어느 패드로도 위장하지 않는다 — 거짓 버튼 힌트 대신 input_buttons를 생략한다.
-        _ => return None,
-    })
-}
+#[path = "status/button_hints.rs"]
+mod button_hints;
+pub(crate) use button_hints::button_hint_for_system;
 
 /// get_rom_info 응답에 균일 `rom_sha1` 필드를 삽입한다 — 정규화된 콘텐츠 해시(content_md5 우선,
 /// 없으면 sha1; 빈값·"skipped:too_large"는 무효로 보고 폴백). 어댑터가 어떤 해시를 쓰든 에이전트가
@@ -209,7 +119,7 @@ pub(crate) fn enrich_status_value(
                 } else {
                     "frozen step(unit=frames)"
                 };
-                notes.push(format!("{} 없음 — exec BP를 호출자로 한 홉씩 옮겨 콜체인 역추적 + {step_kind} + disassemble로 부분 대체(간접점프·자기수정·점프테이블 동적복구는 정적 disasm 병행)", missing.join("·")));
+                notes.push(format!("{} unavailable; partially substitute by moving an exec breakpoint backward one caller at a time, then use {step_kind} and disassemble. Pair this with static disassembly for indirect jumps, self-modifying code, and jump-table recovery.", missing.join(", ")));
             }
             if !notes.is_empty() {
                 obj.insert("capability_notes".into(), serde_json::json!(notes));
@@ -569,6 +479,12 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
                 "adapter_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mupen64plus.exe" } else { "emucap-mupen64plus" }]),
                 "plugin_root": emucap::launch::mupen64plus::default_root(&root).display().to_string(),
             },
+            "openmsx": {
+                "preferred_launcher": "MCP tool: launch",
+                "build": abs_path_json(&root, &["adapters", "openmsx", "build.sh"]),
+                "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-openmsx-bridge.exe" } else { "emucap-openmsx-bridge" }]),
+                "work_dir": abs_path_json(&root, &["adapters", "openmsx", "work"]),
+            },
             "flycast": {
                 "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "flycast", "build.sh"]),
@@ -677,7 +593,39 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "adapter": "mupen64plus",
             "content": ["z64", "n64", "v64"],
             "launcher": "MCP tool: launch",
-            "notes": "Initial Unix support uses the pinned Mupen64Plus pure interpreter. Pause/resume, R4300 instruction step, CPU state, and bounded frozen RDRAM access are available; input, screenshot, save states, frame step, breakpoints, and RSP state are not yet exposed."
+            "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded run_frames and input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
+        },
+        {
+            "system": "msx",
+            "aliases": ["msx2+", "msx2plus", "openmsx"],
+            "adapter": "openmsx",
+            "content": ["rom", "mx1", "mx2", "ri", "sg"],
+            "launcher": "MCP tool: launch",
+            "notes": "Pinned openMSX 21.0 C-BIOS MSX2+ cartridge profile. It exposes Z80 exec/read/write breakpoints with atomic evidence and disassembly in addition to frame/instruction control, memory, state, input, and visible frozen screenshots. Generic .rom files require system=msx."
+        },
+        {
+            "system": "msx1",
+            "aliases": [],
+            "adapter": "openmsx",
+            "content": ["rom", "mx1", "mx2", "ri", "sg", "cas", "tsx", "wav"],
+            "launcher": "MCP tool: launch",
+            "notes": "Pinned Philips VG 8020 real-firmware profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute firmware directory. Cartridge and cassette media are admitted; disk is not."
+        },
+        {
+            "system": "msx2",
+            "aliases": [],
+            "adapter": "openmsx",
+            "content": ["rom", "mx1", "mx2", "ri", "sg", "dsk", "cas", "tsx", "wav"],
+            "launcher": "MCP tool: launch",
+            "notes": "Pinned Philips NMS 8250 real-firmware profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute firmware directory. Mutable media is mounted from an isolated working copy."
+        },
+        {
+            "system": "msx2p",
+            "aliases": [],
+            "adapter": "openmsx",
+            "content": ["rom", "mx1", "mx2", "ri", "sg", "dsk", "cas", "tsx", "wav"],
+            "launcher": "MCP tool: launch",
+            "notes": "Pinned Panasonic FS-A1WSX real-firmware profile. It is not the legacy msx2+ alias. Set EMUCAP_OPENMSX_FIRMWARE to an absolute firmware directory."
         },
         {
             "system": "saturn",
@@ -705,6 +653,17 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "force_module": "pce"
         },
         {
+            "system": "pcfx",
+            "aliases": ["pc-fx"],
+            "adapter": "mednafen",
+            "content": ["cue", "ccd", "toc", "m3u"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
+            "force_module": "pcfx",
+            "required_firmware": ["pcfx.rom"],
+            "notes": "Disc formats are ambiguous; pass system=pcfx explicitly. V810 call_stack is a best-effort trace-derived shadow stack."
+        },
+        {
             "system": "md",
             "aliases": ["genesis", "megadrive", "mega-drive"],
             "adapter": "mednafen",
@@ -713,6 +672,26 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
             "force_module": "md",
             "notes": ".bin is only inferred as MD when a Mega Drive/Genesis header is present; otherwise pass system=md explicitly"
+        },
+        {
+            "system": "wswan",
+            "aliases": ["ws", "wsc", "wonderswan", "wonderswan-color", "wonderswancolor", "wonderswan_color"],
+            "adapter": "mednafen",
+            "content": ["ws", "wsc", "wsr"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
+            "force_module": "wswan",
+            "notes": "WonderSwan and WonderSwan Color share the Mednafen wswan module."
+        },
+        {
+            "system": "ngp",
+            "aliases": ["ngpc", "neo-geo-pocket", "neo-geo-pocket-color", "neogeo-pocket", "neogeo-pocket-color"],
+            "adapter": "mednafen",
+            "content": ["ngp", "ngpc", "ngc", "npc"],
+            "launcher": "MCP tool: launch",
+            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
+            "force_module": "ngp",
+            "notes": "Neo Geo Pocket and Pocket Color share the patched Mednafen ngp module. Its TLCS-900/H profile exposes side-effect-free RAM/ROM/BIOS views, RAM writes, exact instruction step, safe disassembly, and exec-only breakpoints. Sound-Z80 state, read/write breakpoints, trace, and call-stack classification are not exposed."
         },
         {
             "system": "pc98",
@@ -730,6 +709,24 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "launcher": "MCP tool: launch",
             "required_firmware": ["neogeo.zip"],
             "notes": ".zip is not auto-inferred; pass system=neogeo_mvs explicitly. AES, CD, Pocket/Color, and Hyper Neo Geo 64 are separate targets and are not accepted as aliases."
+        },
+        {
+            "system": "neogeo_aes",
+            "aliases": ["neo-geo-aes", "neogeo-aes", "aes"],
+            "adapter": "mame_neogeo",
+            "content": ["zip"],
+            "launcher": "MCP tool: launch",
+            "required_firmware": ["aes.zip"],
+            "notes": ".zip is not auto-inferred; pass system=neogeo_aes explicitly. The ZIP stem must name an AES-compatible entry in the pinned MAME Neo Geo software list."
+        },
+        {
+            "system": "neogeo_cd",
+            "aliases": ["neo-geo-cd", "neogeo-cd", "ngcd"],
+            "adapter": "mame_neogeo",
+            "content": ["cue"],
+            "launcher": "MCP tool: launch",
+            "required_firmware": ["neocdz.zip"],
+            "notes": "CUE is ambiguous; pass system=neogeo_cd explicitly. The content identity covers the CUE and every referenced file. Native save/load is not advertised."
         },
         {
             "system": "dc",
@@ -798,14 +795,14 @@ pub(crate) fn supported_system_names() -> String {
 
 pub(crate) fn unknown_content_question() -> String {
     format!(
-        "어떤 ROM/disc/disk 경로를 어떤 시스템({})으로 실행할까요?",
+        "Which ROM, disc, or disk path should be launched, and for which system ({})?",
         supported_system_names()
     )
 }
 
 pub(crate) fn required_unknown_content_input() -> String {
     format!(
-        "실행할 content_path와 시스템({})을 물어본 뒤 launch_plan(content_path, system)을 호출하라",
+        "Ask for content_path and a system ({}) before calling launch_plan(content_path, system).",
         supported_system_names()
     )
 }
@@ -900,8 +897,8 @@ pub(crate) fn make_bootstrap_value(
                 "then_call": "status"
             }
         },
-        "next_action": "content_path가 있으면 launch_plan(content_path, system?)을 호출한다. 없으면 사용자에게 question_to_user_if_content_unknown을 그대로 물어본다.",
-        "do_not": "content_path/system이 없으면 runtime_paths command_template만 보고 추측 실행하지 말라"
+        "next_action": "When content_path is known, call launch_plan(content_path, system?). Otherwise ask question_to_user_if_content_unknown verbatim.",
+        "do_not": "Do not infer and execute a runtime_paths command_template when content_path or system is unknown."
     }))
 }
 
@@ -1078,8 +1075,6 @@ fn owned_instance_json(emu_dir: &str, port: u16) -> serde_json::Value {
         "run_dir": run_dir.display().to_string(),
         "pids": pids,
         "pidfiles": pidfiles,
-        "cleanup": "이 인스턴스를 멈추려면 여기 pids만 종료하라(포트별 pidfile 기록) — Unix `kill <pid>`, \
-                    Windows `taskkill /PID <pid> /F`. 바이너리 이름/경로로 광역 종료(Unix `pkill -f`·`killall`· \
-                    `pkill -i`, Windows `taskkill /IM`)는 절대 금지 — 같은 바이너리를 쓰는 타 세션 에뮬레이터까지 죽인다.",
+        "cleanup": "To stop this instance, terminate only the PIDs listed here and recorded in the per-port pidfiles. On Unix use `kill <pid>`; on Windows use `taskkill /PID <pid> /F`. Never use name- or path-based broad termination such as pkill, killall, or taskkill /IM because another session may use the same binary.",
     })
 }

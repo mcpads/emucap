@@ -6,9 +6,64 @@
 #include <fstream>
 #include <iterator>
 #include <utility>
+#include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <aclapi.h>
+#include <windows.h>
+#else
 #include <sys/stat.h>
+#endif
+
+#ifdef _WIN32
+namespace {
+
+std::vector<unsigned char> current_token_user()
+{
+	HANDLE token = nullptr;
+	assert(::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &token));
+	DWORD bytes = 0;
+	(void)::GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+	assert(::GetLastError() == ERROR_INSUFFICIENT_BUFFER);
+	std::vector<unsigned char> buffer(bytes);
+	assert(::GetTokenInformation(token, TokenUser, buffer.data(), bytes, &bytes));
+	::CloseHandle(token);
+	return buffer;
+}
+
+void assert_private_file(const std::filesystem::path& path)
+{
+	auto token_user = current_token_user();
+	PSID expected_sid = reinterpret_cast<TOKEN_USER*>(token_user.data())->User.Sid;
+	PSID owner = nullptr;
+	PACL dacl = nullptr;
+	PSECURITY_DESCRIPTOR descriptor = nullptr;
+	assert(::GetNamedSecurityInfoW(
+		const_cast<wchar_t*>(path.c_str()),
+		SE_FILE_OBJECT,
+		OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+		&owner,
+		nullptr,
+		&dacl,
+		nullptr,
+		&descriptor) == ERROR_SUCCESS);
+	assert(descriptor != nullptr);
+	assert(owner != nullptr && ::EqualSid(owner, expected_sid));
+	assert(dacl != nullptr && dacl->AceCount == 1);
+	SECURITY_DESCRIPTOR_CONTROL control = 0;
+	DWORD revision = 0;
+	assert(::GetSecurityDescriptorControl(descriptor, &control, &revision));
+	assert((control & SE_DACL_PROTECTED) != 0);
+	void* raw_ace = nullptr;
+	assert(::GetAce(dacl, 0, &raw_ace));
+	const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw_ace);
+	assert(ace->Header.AceType == ACCESS_ALLOWED_ACE_TYPE);
+	assert((ace->Mask & FILE_ALL_ACCESS) == FILE_ALL_ACCESS);
+	assert(::EqualSid(const_cast<DWORD*>(&ace->SidStart), expected_sid));
+	::LocalFree(descriptor);
+}
+
+} // namespace
 #endif
 
 int main()
@@ -94,9 +149,22 @@ int main()
 		/ ("emucap-failure-test-" + std::to_string(unique));
 	std::filesystem::remove_all(dir);
 	std::filesystem::create_directories(dir);
+#ifdef _WIN32
+	const std::filesystem::path output =
+		dir / std::filesystem::u8path(u8"adapter-failure-한글-測試.json");
+#else
 	const std::filesystem::path output = dir / "adapter-failure.json";
+#endif
+	{
+		std::ofstream permissive_old(output, std::ios::binary);
+		permissive_old << "old";
+	}
 	std::string error;
+#ifdef _WIN32
+	assert(emucap_write_failure_atomic_wide(output.wstring(), json, &error));
+#else
 	assert(emucap_write_failure_atomic(output.string(), json, &error));
+#endif
 	std::ifstream file(output, std::ios::binary);
 	const std::string read((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 	assert(read == json);
@@ -104,6 +172,8 @@ int main()
 	struct stat status{};
 	assert(::stat(output.c_str(), &status) == 0);
 	assert((status.st_mode & 0777) == 0600);
+#else
+	assert_private_file(output);
 #endif
 	for (const auto& entry : std::filesystem::directory_iterator(dir))
 		assert(entry.path() == output);

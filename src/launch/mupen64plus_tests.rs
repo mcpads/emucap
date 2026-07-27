@@ -7,17 +7,21 @@ fn write_root(repo: &Path) -> PathBuf {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         adapter.join("upstream.lock"),
-        "M64P_VERSION=2.6.0\n\
+        format!(
+            "M64P_VERSION=2.6.0\n\
          M64P_BUNDLE_URL=https://example.invalid/m64p.tar.gz\n\
          M64P_BUNDLE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
+         M64P_PATCHSET_SHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n\
          M64P_CORE_COMMIT=1111111111111111111111111111111111111111\n\
          M64P_TEST_ROM_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
-         M64P_HOST_API=1\n",
+         M64P_HOST_API={REQUIRED_HOST_API}\n"
+        ),
     )
     .unwrap();
     for name in [
         "libmupen64plus.dylib",
         "mupen64plus-rsp-hle.dylib",
+        "mupen64plus-input-sdl.dylib",
         "mupen64plus-video-rice.dylib",
     ] {
         std::fs::write(root.join(name), b"fixture").unwrap();
@@ -30,6 +34,7 @@ fn write_root(repo: &Path) -> PathBuf {
             core_commit: "1111111111111111111111111111111111111111".into(),
             host_api: REQUIRED_HOST_API,
             bundle_sha256: "a".repeat(64),
+            patchset_sha256: "c".repeat(64),
             test_rom_sha256: "b".repeat(64),
             debugger: true,
         })
@@ -46,6 +51,15 @@ fn compatible_root_requires_pinned_metadata_and_display_plugin_only_when_visible
     assert!(require_compatible_root(repo.path(), &root, true).is_ok());
     std::fs::remove_file(root.join("mupen64plus-video-rice.dylib")).unwrap();
     assert!(require_compatible_root(repo.path(), &root, false).is_ok());
+    assert!(require_compatible_root(repo.path(), &root, true).is_err());
+}
+
+#[test]
+fn compatible_root_requires_the_input_plugin_in_every_mode() {
+    let repo = tempfile::tempdir().unwrap();
+    let root = write_root(repo.path());
+    std::fs::remove_file(root.join("mupen64plus-input-sdl.dylib")).unwrap();
+    assert!(require_compatible_root(repo.path(), &root, false).is_err());
     assert!(require_compatible_root(repo.path(), &root, true).is_err());
 }
 

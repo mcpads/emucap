@@ -1,0 +1,22 @@
+diff --git a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
+index 770b146..b7570a6 100644
+--- a/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
++++ b/Source/Core/Core/HW/WiimoteEmu/WiimoteEmu.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
++#include "Core/EmuCap.h"
+ #include "Core/HW/Wiimote.h"
+ 
+ #include "Core/HW/WiimoteCommon/DataReport.h"
+@@ -494,6 +495,9 @@ void Wiimote::BuildDesiredWiimoteState(DesiredWiimoteState* target_state,
+                    IsSideways() ? dpad_sideways_bitmasks : dpad_bitmasks,
+                    m_input_override_function);
+ 
++  // Keep motion, IR, and extension ownership in Dolphin; emucap may replace core buttons only.
++  EmuCap::ApplyWiimoteInputOverride(static_cast<int>(m_index), target_state);
++
+   // Calculate accelerometer state.
+   // Calibration values are 8-bit but we want 10-bit precision, so << 2.
+   target_state->acceleration =

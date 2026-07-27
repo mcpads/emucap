@@ -5,6 +5,7 @@
 // listener and translates NDJSON requests into Dolphin APIs.
 
 #include "Core/EmuCap.h"
+#include "Core/EmuCapInput.h"
 
 #include <algorithm>
 #include <atomic>
@@ -45,11 +46,15 @@ using SOCKET = int;
 #include "Common/FileUtil.h"
 #include "Common/SocketContext.h"
 #include "Core/Config/MainSettings.h"
+#include "Core/Config/WiimoteSettings.h"
 #include "Core/Core.h"
 #include "Core/Debugger/Debugger_SymbolMap.h"
 #include "Core/Debugger/PPCDebugInterface.h"
 #include "Core/HW/CPU.h"
 #include "Core/HW/Memmap.h"
+#include "Core/HW/Wiimote.h"
+#include "Core/HW/WiimoteEmu/DesiredWiimoteState.h"
+#include "Core/HW/WiimoteEmu/WiimoteEmu.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -90,14 +95,30 @@ std::condition_variable s_frame_step_cv;
 u64 s_frame_step_completions = 0;
 u64 s_breakpoint_interruptions = 0;
 
-// Per-controller set_input override. An engaged override replaces GCPad::GetStatus output.
+// GameCube and Wii input have separate identities and consumer clocks.
 std::mutex s_input_mutex;
-struct InputOverride
+struct GameCubeInputOverride
 {
   bool engaged = false;
   GCPadStatus status;  // The default constructor initializes a neutral controller state.
 };
-InputOverride s_input[4];
+GameCubeInputOverride s_gamecube_input[4];
+Input::WiiOverride s_wii_input;
+uint64_t s_wii_sample_sequence = 0;
+uint16_t s_wii_last_core_buttons = 0;
+bool s_wii_last_sample_overridden = false;
+
+static_assert(Input::WII_PAD_LEFT == WiimoteEmu::Wiimote::PAD_LEFT);
+static_assert(Input::WII_PAD_RIGHT == WiimoteEmu::Wiimote::PAD_RIGHT);
+static_assert(Input::WII_PAD_DOWN == WiimoteEmu::Wiimote::PAD_DOWN);
+static_assert(Input::WII_PAD_UP == WiimoteEmu::Wiimote::PAD_UP);
+static_assert(Input::WII_BUTTON_PLUS == WiimoteEmu::Wiimote::BUTTON_PLUS);
+static_assert(Input::WII_BUTTON_TWO == WiimoteEmu::Wiimote::BUTTON_TWO);
+static_assert(Input::WII_BUTTON_ONE == WiimoteEmu::Wiimote::BUTTON_ONE);
+static_assert(Input::WII_BUTTON_B == WiimoteEmu::Wiimote::BUTTON_B);
+static_assert(Input::WII_BUTTON_A == WiimoteEmu::Wiimote::BUTTON_A);
+static_assert(Input::WII_BUTTON_MINUS == WiimoteEmu::Wiimote::BUTTON_MINUS);
+static_assert(Input::WII_BUTTON_HOME == WiimoteEmu::Wiimote::BUTTON_HOME);
 
 std::string Base64(const uint8_t* data, size_t n)
 {
@@ -159,6 +180,35 @@ std::string EnvOr(const char* key, const char* fallback)
 {
   const char* v = std::getenv(key);
   return v ? std::string(v) : std::string(fallback);
+}
+
+bool IsGameCubeSystem(const std::string& system)
+{
+  return system == "gamecube" || system == "gc" || system == "ngc";
+}
+
+bool IsWiiSystem(const std::string& system)
+{
+  return system == "wii";
+}
+
+bool WiiInputAvailable()
+{
+  return Config::Get(Config::WIIMOTE_1_SOURCE) == WiimoteSource::Emulated;
+}
+
+const char* WiiSourceName()
+{
+  switch (Config::Get(Config::WIIMOTE_1_SOURCE))
+  {
+  case WiimoteSource::None:
+    return "none";
+  case WiimoteSource::Emulated:
+    return "emulated";
+  case WiimoteSource::Real:
+    return "real";
+  }
+  return "unknown";
 }
 
 std::string ToHex(const uint8_t* data, size_t n)
@@ -306,7 +356,8 @@ void AddExecutionLimits(picojson::object& result)
 picojson::object Hello(Core::System&, const picojson::object&)
 {
   const std::string system = EnvOr("EMUCAP_SYSTEM", "gamecube");
-  const bool gamecube = system == "gamecube" || system == "gc" || system == "ngc";
+  const bool gamecube = IsGameCubeSystem(system);
+  const bool wii_input = IsWiiSystem(system) && WiiInputAvailable();
   picojson::object r;
   r["protocol_version"] = picojson::value(1.0);
   r["name"] = picojson::value(EnvOr("EMUCAP_NAME", "dolphin"));
@@ -321,7 +372,7 @@ picojson::object Hello(Core::System&, const picojson::object&)
   {
     methods.push_back(picojson::value(std::string(m)));
   }
-  if (gamecube)
+  if (gamecube || wii_input)
     methods.push_back(picojson::value(std::string("set_input")));
   r["methods"] = picojson::value(methods);
   picojson::object breakpoint_kind;
@@ -341,7 +392,7 @@ picojson::object Hello(Core::System&, const picojson::object&)
   {
     active_exceptions.push_back(picojson::value(std::string(id)));
   }
-  if (gamecube)
+  if (gamecube || wii_input)
   {
     active_exceptions.push_back(
         picojson::value(std::string("dolphin.input-hold.port-zero-only")));
@@ -355,6 +406,16 @@ picojson::object Hello(Core::System&, const picojson::object&)
   picojson::array mt;
   mt.push_back(picojson::value(std::string("main")));
   r["memory_types"] = picojson::value(mt);
+  if (IsWiiSystem(system))
+  {
+    picojson::object input_device;
+    input_device["port"] = picojson::value(0.0);
+    input_device["device"] = picojson::value(std::string("wii_remote"));
+    input_device["source"] = picojson::value(std::string(WiiSourceName()));
+    input_device["surface"] = picojson::value(std::string("core_buttons"));
+    input_device["clock"] = picojson::value(std::string("wiimote_prepare_input"));
+    r["input_device"] = picojson::value(input_device);
+  }
   const std::string tok = EnvOr("EMUCAP_SESSION_TOKEN", "");
   if (!tok.empty())
     r["session_token"] = picojson::value(tok);
@@ -370,8 +431,10 @@ picojson::object Hello(Core::System&, const picojson::object&)
 picojson::object Status(Core::System& system, const picojson::object&)
 {
   picojson::object r;
+  const std::string active_system = EnvOr("EMUCAP_SYSTEM", "gamecube");
   const Core::State st = Core::GetState(system);
   r["connected"] = picojson::value(true);
+  r["system"] = picojson::value(active_system);
   r["state"] = picojson::value(std::string(st == Core::State::Paused ? "frozen" : "running"));
   r["adapter"] = picojson::value(std::string("dolphin-native"));
   // Lightweight breakpoint diagnostics. dbg_effective is Config::IsDebuggingEnabled()
@@ -388,13 +451,38 @@ picojson::object Status(Core::System& system, const picojson::object&)
   }
   {
     std::lock_guard<std::mutex> lk(s_input_mutex);
+    const bool wii = IsWiiSystem(active_system);
+    const bool engaged = wii ? s_wii_input.engaged : s_gamecube_input[0].engaged;
     picojson::object input_override;
     input_override["observable"] = picojson::value(true);
     input_override["authority"] = picojson::value(std::string("adapter_local"));
-    input_override["engaged"] = picojson::value(s_input[0].engaged);
+    input_override["engaged"] = picojson::value(engaged);
     input_override["mode"] =
-        picojson::value(std::string(s_input[0].engaged ? "persistent" : "native"));
+        picojson::value(std::string(engaged ? "persistent" : "native"));
+    input_override["port"] = picojson::value(0.0);
+    input_override["surface"] =
+        picojson::value(std::string(wii ? "core_buttons" : "gamecube_pad"));
     r["input_override"] = picojson::value(input_override);
+  }
+  if (IsWiiSystem(active_system))
+  {
+    picojson::object input_device;
+    input_device["port"] = picojson::value(0.0);
+    input_device["device"] = picojson::value(std::string("wii_remote"));
+    input_device["source"] = picojson::value(std::string(WiiSourceName()));
+    input_device["surface"] = picojson::value(std::string("core_buttons"));
+    input_device["clock"] = picojson::value(std::string("wiimote_prepare_input"));
+    {
+      std::lock_guard<std::mutex> lk(s_input_mutex);
+      picojson::object last_sample;
+      last_sample["sequence"] =
+          picojson::value(static_cast<double>(s_wii_sample_sequence));
+      last_sample["core_buttons"] =
+          picojson::value(static_cast<double>(s_wii_last_core_buttons));
+      last_sample["overridden"] = picojson::value(s_wii_last_sample_overridden);
+      input_device["last_sample"] = picojson::value(last_sample);
+    }
+    r["input_device"] = picojson::value(input_device);
   }
   AddExecutionLimits(r);
   return r;
@@ -921,6 +1009,24 @@ picojson::object LoadState(Core::System& system, const picojson::object& p)
 
 picojson::object SetInput(Core::System&, const picojson::object& p)
 {
+  const std::string system = EnvOr("EMUCAP_SYSTEM", "gamecube");
+  if (IsWiiSystem(system))
+  {
+    if (!WiiInputAvailable())
+      return Fail("bad_state", "Wii Remote 1 is not using Dolphin's emulated source");
+    std::lock_guard<std::mutex> lk(s_input_mutex);
+    const Input::ApplyResult applied = Input::ApplyWiiRequest(p, s_wii_input);
+    if (!applied.ok)
+      return Fail("bad_params", applied.error);
+    picojson::object r;
+    r["engaged"] = picojson::value(applied.engaged);
+    r["port"] = picojson::value(0.0);
+    r["surface"] = picojson::value(std::string("core_buttons"));
+    return r;
+  }
+  if (!IsGameCubeSystem(system))
+    return Fail("bad_state", "set_input is not available for this Dolphin system");
+
   int port = 0;
   uint64_t v = 0;
   const char* port_field = p.count("port") ? "port" : (p.count("pad") ? "pad" : nullptr);
@@ -946,7 +1052,7 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
   if ((engaged != p.end() && engaged->second.is<bool>() && !engaged->second.get<bool>()) ||
       empty_buttons)
   {
-    s_input[port].engaged = false;
+    s_gamecube_input[port].engaged = false;
     picojson::object r;
     r["engaged"] = picojson::value(false);
     r["port"] = picojson::value(static_cast<double>(port));
@@ -982,8 +1088,8 @@ picojson::object SetInput(Core::System&, const picojson::object& p)
   {
     return Fail("bad_params", "controller axes and triggers must be integers in 0..255");
   }
-  s_input[port].status = st;
-  s_input[port].engaged = true;
+  s_gamecube_input[port].status = st;
+  s_gamecube_input[port].engaged = true;
 
   picojson::object r;
   r["engaged"] = picojson::value(true);
@@ -1218,8 +1324,26 @@ void ApplyInputOverride(int pad_num, GCPadStatus* status)
   if (pad_num < 0 || pad_num > 3 || status == nullptr)
     return;
   std::lock_guard<std::mutex> lk(s_input_mutex);
-  if (s_input[pad_num].engaged)
-    *status = s_input[pad_num].status;
+  if (s_gamecube_input[pad_num].engaged)
+    *status = s_gamecube_input[pad_num].status;
+}
+
+void ApplyWiimoteInputOverride(int wiimote_num, WiimoteEmu::DesiredWiimoteState* state)
+{
+  if (wiimote_num != 0 || state == nullptr)
+    return;
+  std::lock_guard<std::mutex> lk(s_input_mutex);
+  if (s_wii_input.engaged)
+  {
+    state->buttons.hex = s_wii_input.buttons;
+    s_wii_last_sample_overridden = true;
+  }
+  else
+  {
+    s_wii_last_sample_overridden = false;
+  }
+  s_wii_last_core_buttons = state->buttons.hex;
+  ++s_wii_sample_sequence;
 }
 
 void NotifyBreakpointHit(Core::System& system, u32 address)

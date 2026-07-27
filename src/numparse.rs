@@ -25,10 +25,10 @@ pub fn parse_num_str(s: &str) -> Result<u64, String> {
     };
     let digits = digits.replace('_', "");
     if digits.is_empty() {
-        return Err(format!("빈 숫자: {s:?}"));
+        return Err(format!("empty numeric value: {s:?}"));
     }
     u64::from_str_radix(&digits, radix)
-        .map_err(|e| format!("숫자 파싱 실패 {s:?} (10진 또는 0x/$ 16진): {e}"))
+        .map_err(|e| format!("failed to parse {s:?} as decimal or 0x/$ hexadecimal: {e}"))
 }
 
 #[cfg(test)]

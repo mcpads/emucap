@@ -1345,10 +1345,18 @@ void emucap_capture_fatal_sh4(
 		const char* content = getenv("EMUCAP_CONTENT");
 		snapshot.content = content != nullptr ? content : "";
 		const std::string failure_json = emucap_failure_json(snapshot);
+		#ifdef _WIN32
+		const wchar_t* failure_path = _wgetenv(L"EMUCAP_FAILURE_FILE");
+		if (failure_path != nullptr && failure_path[0] != L'\0') {
+			std::string error;
+			g_failure_file_written = emucap_write_failure_atomic_wide(
+				failure_path, failure_json, &error);
+		#else
 		const char* failure_path = getenv("EMUCAP_FAILURE_FILE");
 		if (failure_path != nullptr && failure_path[0] != '\0') {
 			std::string error;
 			g_failure_file_written = emucap_write_failure_atomic(failure_path, failure_json, &error);
+		#endif
 			if (!g_failure_file_written)
 				fprintf(stderr, "emucap: cannot persist fatal context: %s\n", error.c_str());
 		} else {

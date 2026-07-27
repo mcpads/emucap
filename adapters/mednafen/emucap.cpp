@@ -1,6 +1,7 @@
-// Mednafen 포크의 emucap 라이브 제어 소켓 클라이언트. emucap-mcp(서버)에 접속해 NDJSON
-// 프로토콜을 서비스한다 — Mesen의 emucap-core.lua에 대응하는 C++판. Rust 측(TcpLink·tools·
-// MCP)은 그대로 동작한다. 대상은 Saturn(ss), PSX(psx), PC Engine(pce), Mega Drive(md)이다.
+// emucap live-control socket client for the maintained Mednafen fork. It connects to
+// emucap-mcp and serves the same NDJSON protocol as Mesen's emucap-core.lua. The supported
+// Mednafen modules are Saturn (ss), PSX (psx), PC Engine (pce), PC-FX (pcfx),
+// Mega Drive (md), WonderSwan (wswan), and Neo Geo Pocket/Color (ngp).
 //
 // 빌드 통합: src/drivers/로 복사 + Makefile.am에 추가 + main.cpp 프레임 루프에서 호출.
 #include "main.h"            // CurGame, MDFNGI, Mednafen 타입, MDFNI_Reset
@@ -13,7 +14,11 @@
 #include "emucap.h"
 #include "emucap_input.h"
 #include "emucap_json_num.h"
+#include "emucap_ngp.h"
+#include "emucap_pcfx.h"
 #include "emucap_native_failure.h"
+
+extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 
 // 빌드 hash(build.sh가 생성; 없으면 unknown 폴백 — LSP·build.sh 밖 직접 컴파일 대비).
 #if defined(__has_include)
@@ -100,12 +105,16 @@ const int PROTOCOL_VERSION = 1;
 // 명령 단위로 정확히 freeze한다. emucap_cpu_cb는 serve_socket_once 뒤에 정의(여기선 전방선언).
 void emucap_cpu_cb(uint32 PC, bool bpoint);
 void serve_socket_once();
-struct BP { long id; int type; uint32 a1, a2; bool logical = true; bool pause_on_hit = true;
+struct BP { long id; int type; uint32 a1, a2; uint32 public_a1, public_a2;
+            bool logical = true; bool pause_on_hit = true;
             uint32 value = 0, value_mask = 0xFFFFFFFF; int val_len = 1; bool has_value = false;
             bool adapter_bp = false; std::string memory_type;
+            std::vector<EmucapSnapshotSpec> snapshots;
             bool has_pc_filter = false; uint32 pc_min = 0, pc_max = 0xFFFFFFFF; };
 struct BPHit {
   uint32 pc = 0;
+  bool has_breakpoint_id = false;
+  long breakpoint_id = 0;
   bool has_access = false;
   uint32 addr = 0;
   unsigned len = 0;
@@ -114,6 +123,8 @@ struct BPHit {
   uint32 value = 0;
   std::string memory_type;
   std::string source;
+  std::string snapshot_json;
+  std::string snapshot_error;
   bool has_source_addr = false;
   uint32 source_addr = 0;
   std::string registers;  // 히트 순간 CPU 레지스터 {name:value}(exec BP 한정 — pc만으론 D0 등 못 봄)
@@ -122,13 +133,16 @@ std::vector<BP> g_bps;
 long g_bp_next_id = 1;
 std::vector<BPHit> g_bp_hits;  // 누적 히트(poll_events가 드레인)
 const size_t EVENT_CAP = 4096;
+const size_t BREAKPOINT_CAP = 128;
+const size_t SNAPSHOT_CAP = 16;
+const uint64 SNAPSHOT_BYTE_CAP = 16 * 1024;
 uint64_t g_bp_dropped = 0;
 // 값-조건 BP: debug.inc의 read/write BP 매칭 시 emucap_bp_record가 접근 주소/길이/유형을 기록하고,
 // emucap_cpu_cb가 freeze 전 그 주소의 값을 읽어 BP value/value_mask와 비교한다(불일치면 freeze 스킵).
 // debug.inc(코어 GameThread)와 emucap_cpu_cb(같은 GameThread)는 동일 스레드라 atomic 불필요.
 uint32 g_bp_hit_addr = 0;
 unsigned g_bp_hit_len = 0;
-bool g_bp_hit_is_write = false;
+int g_bp_hit_type = BPOINT_PC;
 bool g_bp_hit_valid = false;
 bool g_bp_hit_has_value = false;
 uint32 g_bp_hit_value = 0;
@@ -589,9 +603,10 @@ AddressSpaceType* find_aspace(const std::string& name) {
   return nullptr;
 }
 
-// 시스템 식별: 한 바이너리가 ss/psx/pce/md를 모두 처리하므로(모두 컴파일·링크됨), 시스템 특화
+// 시스템 식별: 한 바이너리가 ss/psx/pce/pcfx/md/wswan/ngp를 모두 처리하므로(모두 컴파일·링크됨), 시스템 특화
 // 코드(주소공간 매핑·버튼 테이블·엔디안)를 런타임에 분기한다. shortname은 MDFNGI 멤버이고
-// psx.cpp는 "psx", ss.cpp는 "ss", pce.cpp는 "pce", md/system.cpp는 "md"로 설정한다.
+// psx.cpp는 "psx", ss.cpp는 "ss", pce.cpp는 "pce", pcfx.cpp는 "pcfx",
+// md/system.cpp는 "md", wswan/main.cpp는 "wswan", ngp/neopop.cpp는 "ngp"로 설정한다.
 const char* system_shortname() {
   return (CurGame && CurGame->shortname) ? CurGame->shortname : "";
 }
@@ -603,6 +618,10 @@ bool is_psx() {
 bool is_pce() {
   const char* s = system_shortname();
   return !strcmp(s, "pce") || !strcmp(s, "pce_fast");
+}
+
+bool is_pcfx() {
+  return !strcmp(system_shortname(), "pcfx");
 }
 
 bool is_ss() {
@@ -617,6 +636,10 @@ bool is_ws() {
   return !strcmp(system_shortname(), "wswan");
 }
 
+bool is_ngp() {
+  return !strcmp(system_shortname(), "ngp");
+}
+
 std::string hex_bytes(const uint8* data, size_t len) {
   std::string out;
   out.reserve(len * 2);
@@ -626,6 +649,61 @@ std::string hex_bytes(const uint8* data, size_t len) {
     out += h;
   }
   return out;
+}
+
+bool validate_snapshot_specs(
+    long id,
+    const std::string& line,
+    std::vector<EmucapSnapshotSpec>& snapshots) {
+  std::string error;
+  const EmucapSnapshotParseStatus status =
+      emucap_parse_snapshot_specs(line, snapshots, error);
+  if (status == EmucapSnapshotParseStatus::invalid) {
+    reply_err(id, "bad_params", error.c_str());
+    return false;
+  }
+  if (snapshots.empty()) return true;
+  if (!is_pcfx()) {
+    reply_err(id, "unsupported", "breakpoint snapshots are currently supported only for PC-FX");
+    return false;
+  }
+  if (snapshots.size() > SNAPSHOT_CAP) {
+    reply_err(id, "bad_params", "breakpoint snapshot range limit exceeded");
+    return false;
+  }
+  uint64 total = 0;
+  for (const EmucapSnapshotSpec& snapshot : snapshots) {
+    AddressSpaceType* space = find_aspace(snapshot.memory_type);
+    const uint64 end = (uint64)snapshot.address + snapshot.length;
+    if (!space || end > space->size) {
+      reply_err(id, "bad_params", "breakpoint snapshot range is outside its memory type");
+      return false;
+    }
+    total += snapshot.length;
+    if (total > SNAPSHOT_BYTE_CAP) {
+      reply_err(id, "bad_params", "breakpoint snapshot byte limit exceeded");
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string capture_snapshot_json(const std::vector<EmucapSnapshotSpec>& snapshots) {
+  std::string output = "[";
+  for (size_t index = 0; index < snapshots.size(); index++) {
+    const EmucapSnapshotSpec& snapshot = snapshots[index];
+    AddressSpaceType* space = find_aspace(snapshot.memory_type);
+    if (!space) throw std::runtime_error("snapshot memory type disappeared");
+    std::vector<uint8> bytes(snapshot.length);
+    space->GetAddressSpaceBytes(
+        snapshot.memory_type.c_str(), snapshot.address, snapshot.length, bytes.data());
+    if (index) output += ",";
+    output += "{\"memory_type\":\"" + json_escape(snapshot.memory_type) + "\",\"address\":"
+        + std::to_string(snapshot.address) + ",\"length\":" + std::to_string(snapshot.length)
+        + ",\"hex\":\"" + hex_bytes(bytes.data(), bytes.size()) + "\"}";
+  }
+  output += "]";
+  return output;
 }
 
 void reset_input_diagnostics() {
@@ -666,6 +744,7 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
   uint32 off;
   bool psx = is_psx();
   bool pce = is_pce();
+  bool pcfx = is_pcfx();
   bool md = is_md();
   bool ws = is_ws();
   if (psx) {
@@ -678,6 +757,10 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
     // cpu aspace는 현재 MPR 매핑을 반영한다. 값 조립은 65C02 계열 리틀엔디언.
     asname = bp.logical ? "cpu" : "physical";
     off = bp.logical ? (addr & 0xFFFF) : (addr & 0x1FFFFF);
+  } else if (pcfx) {
+    // PC-FX(V810): debugger read/write BP는 32비트 CPU physical 주소를 보고한다.
+    // V810은 little-endian이고 cpu aspace가 RAM/backup/BIOS 버스를 디코드한다.
+    asname = "cpu"; off = addr;
   } else if (md) {
     // Mega Drive/Genesis(68000): debugger read/write BP가 24비트 CPU physical 주소를 보고한다.
     // Work RAM은 0xFF0000~0xFFFFFF mirror이며, 다바이트 값은 68000 big-endian으로 조립한다.
@@ -702,8 +785,8 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
   unsigned n = len > 4 ? 4 : (len < 1 ? 1 : len);
   sp->GetAddressSpaceBytes(asname, off, n, buf);
   uint32 v = 0;
-  if (psx || pce || ws)
-    for (unsigned i = 0; i < n; i++) v |= (uint32)buf[i] << (i * 8);  // MIPS/HuC6280/V30MZ little-endian
+  if (psx || pce || pcfx || ws)
+    for (unsigned i = 0; i < n; i++) v |= (uint32)buf[i] << (i * 8);  // MIPS/HuC6280/V810/V30MZ little-endian
   else
     for (unsigned i = 0; i < n; i++) v = (v << 8) | buf[i];           // SH-2/68000 big-endian
   return v;
@@ -713,6 +796,17 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
 // 68000(BSR/JSR·RTS/RTR), SH-2(BSR/BSRF/JSR·RTS), MIPS(JAL/JALR·JR $ra), HuC6280(JSR·RTS).
 enum CallKind { CK_OTHER = 0, CK_CALL, CK_RETURN };
 CallKind classify_instr(uint32 pc) {
+  if (is_pcfx()) {
+    AddressSpaceType* space = find_aspace("cpu");
+    if (!space) return CK_OTHER;
+    uint8 bytes[2] = {0, 0};
+    space->GetAddressSpaceBytes("cpu", pc, sizeof(bytes), bytes);
+    const uint16 first_halfword = (uint16)bytes[0] | ((uint16)bytes[1] << 8);
+    const EmucapV810CallKind kind = emucap_v810_classify(first_halfword);
+    if (kind == EmucapV810CallKind::call) return CK_CALL;
+    if (kind == EmucapV810CallKind::return_from_call) return CK_RETURN;
+    return CK_OTHER;
+  }
   const char* asname = "cpu";
   uint32 off = pc;
   if (is_pce()) {
@@ -876,6 +970,10 @@ void enqueue_bp_hit(const BPHit& hit_in, bool should_freeze) {
   // 드롭될 이벤트에도 매 히트 full-register JSON을 빌드하면 게임 스레드가 굶어 소켓이 링크 타임아웃(5s) 안에
   // 서비스되지 못하고 연결이 끊긴다. freezing BP(should_freeze)는 첫 히트에서 멈추므로 영향 없다.
   if (g_bp_hits.size() >= EVENT_CAP && !should_freeze) { g_bp_dropped++; return; }
+  if (g_bp_hits.size() >= EVENT_CAP) {
+    g_bp_hits.erase(g_bp_hits.begin());
+    g_bp_dropped++;
+  }
   BPHit hit = hit_in;
   // exec BP는 pc만이라 D0 등을 못 본다 — 히트 순간 CPU 레지스터를 캡처한다. access BP는 addr/value가 이미
   // 있고 write-BP firehose 증폭을 피하려 제외. 히트는 이산 이벤트라 비용 낮음.
@@ -996,7 +1094,6 @@ void handle_find_pattern(long id, const std::string& line) {
     reply_err(id, "bad_params", "hex는 비어 있지 않은 짝수 길이 hex 문자열이어야");
     return;
   }
-
   uint32 start = 0;
   if (!json_u32_arg(id, line, "start", start, false)) return;
   long length = -1, max_matches = 256, align = 1;
@@ -1080,6 +1177,16 @@ void handle_write_memory(long id, const std::string& line) {
   std::string hex = json_str(line, "hex");
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
+  if (is_pcfx() && (mt == "cpu" || mt == "bios" || mt.rfind("track", 0) == 0)) {
+    reply_err(id, "unsupported",
+              "PC-FX write_memory rejects cpu because it can mutate BIOS, and rejects bios/track views as protected or read-only");
+    return;
+  }
+  if (is_ngp() && !emucap_ngp_memory_writable(emucap_ngp_memory(mt))) {
+    reply_err(id, "unsupported",
+              "Neo Geo Pocket write_memory supports ram only; rom and bios are observational views");
+    return;
+  }
   if (is_md() && mt == "cpu") {
     reply_err(id, "unsupported", "Mednafen MD cpu address space write is a no-op; use memory_type=ram");
     return;
@@ -1231,8 +1338,9 @@ void resolve_sp_reg() {
   static const char* psx_names[] = {"SP", "sp", "R29", "r29", nullptr};
   static const char* pce_names[] = {"SP", "S", nullptr};
   static const char* ws_names[] = {"SP", nullptr};  // V30MZ 스택 포인터(debug.cpp V30MZ_Regs)
+  static const char* pcfx_names[] = {"SP", "PR3", nullptr};  // V810 PR3 is the stack pointer.
   const char** names = is_md() ? md_names : is_ss() ? ss_names : is_psx() ? psx_names
-                     : is_ws() ? ws_names : pce_names;
+                     : is_ws() ? ws_names : is_pcfx() ? pcfx_names : pce_names;
   uint32 v;
   for (int i = 0; names[i]; i++) {
     if (read_register_by_name(names[i], v)) {
@@ -1368,6 +1476,17 @@ const BtnOff g_pcebtn[] = {
   {nullptr, 0}
 };
 
+// PC-FX pad. gamepad.cpp's IDII declaration order is the raw little-endian input bit:
+// I..VI, SELECT, RUN, directions, mode1, padding, mode2.
+const BtnOff g_pcfxbtn[] = {
+  {"i", 0}, {"a", 0}, {"ii", 1}, {"b", 1},
+  {"iii", 2}, {"iv", 3}, {"v", 4}, {"vi", 5},
+  {"select", 6}, {"run", 7}, {"start", 7}, {"enter", 7}, {"return", 7},
+  {"up", 8}, {"right", 9}, {"down", 10}, {"left", 11},
+  {"mode1", 12}, {"mode2", 14},
+  {nullptr, 0}
+};
+
 // Mega Drive/Genesis pad. Mednafen MD IDII 선언 순서가 raw bit offset이다.
 // 기본 launcher는 md.input.port1=gamepad6으로 고정해 x/y/z/mode까지 2바이트 버퍼로 받는다.
 const BtnOff g_mdbtn[] = {
@@ -1395,12 +1514,23 @@ const BtnOff g_wsbtn[] = {
   {nullptr, 0}
 };
 
+// Neo Geo Pocket/Color built-in pad. ngp/neopop.cpp declares the raw one-byte input in this
+// order: directions, A, B, OPTION. Both monochrome and color cartridges use the same module.
+const BtnOff g_ngpbtn[] = {
+  {"up", 0}, {"down", 1}, {"left", 2}, {"right", 3},
+  {"a", 4}, {"b", 5},
+  {"option", 6}, {"start", 6}, {"enter", 6}, {"return", 6},
+  {nullptr, 0}
+};
+
 // 활성 시스템의 버튼 테이블(런타임 분기). buttons_to_mask/mask_to_buttons가 사용.
 const BtnOff* active_btntab() {
   if (is_psx()) return g_psxbtn;
   if (is_pce()) return g_pcebtn;
+  if (is_pcfx()) return g_pcfxbtn;
   if (is_md()) return g_mdbtn;
   if (is_ws()) return g_wsbtn;
+  if (is_ngp()) return g_ngpbtn;
   return g_satbtn;
 }
 
@@ -2204,8 +2334,10 @@ void handle(const std::string& line) {
       methods +=
           ",\"get_state\",\"read_memory\",\"find_pattern\",\"dump_memory\",\"write_memory\",\"probe\","
           "\"set_breakpoint\",\"clear_breakpoint\",\"clear_all_breakpoints\",\"list_breakpoints\","
-          "\"poll_events\",\"disassemble\",\"step_instructions\","
-          "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\"";
+          "\"poll_events\",\"disassemble\",\"step_instructions\",\"watch_register\"";
+      // NGP exposes TLCS execution observation only. Without TLCS call classification and a
+      // sound-Z80 clock, generic trace and call-stack results would mix incompatible meanings.
+      if (!is_ngp()) methods += ",\"set_trace\",\"get_trace\",\"call_stack\"";
     }
     // Saturn 전용 VDP2 디코드 메서드. SS일 때만 advertise(다른 시스템엔 미advertise — 발견 표면 최소화).
     // PeekRawReg는 ss 코어 심볼이라 ss 외엔 의미 없음. has_debugger와 함께 조건을 확인한다.
@@ -2247,10 +2379,16 @@ void handle(const std::string& line) {
     add_exception("mednafen.input-hold.port-zero-only");
     add_exception("mednafen.input-pulse.port-zero-only");
     if (has_debugger) {
-      add_exception("mednafen.call-stack.best-effort");
+      if (!is_ngp()) add_exception("mednafen.call-stack.best-effort");
       add_exception("mednafen.state.groups-absent");
       if (is_md()) {
         add_exception("mednafen.md.cpu-write-absent");
+      }
+      if (is_pcfx()) {
+        add_exception("mednafen.pcfx.protected-write-spaces");
+      }
+      if (is_ngp()) {
+        add_exception("mednafen.ngp.protected-write-spaces");
       }
       if (is_ss()) {
         add_exception("mednafen.ss.physical-read-absent");
@@ -2258,15 +2396,23 @@ void handle(const std::string& line) {
       }
     } else if (is_pce()) {
       add_exception("mednafen.pce-fast.debugger-absent");
+    } else if (is_ngp()) {
+      add_exception("mednafen.ngp.debugger-absent");
     }
     std::string contracts =
         "{\"catalog\":\"emucap-feature-contracts/v3\",\"active_exceptions\":[" +
         exception_ids + "]}";
-    const std::string breakpoint_kinds = has_debugger
-        ? "[{\"kind\":\"exec\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false},"
-          "{\"kind\":\"read\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false},"
-          "{\"kind\":\"write\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false}]"
-        : "[]";
+    const char* snapshot_capability = is_pcfx() ? "true" : "false";
+    const std::string breakpoint_kinds = !has_debugger
+        ? "[]"
+        : is_ngp()
+            ? "[{\"kind\":\"exec\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":false,\"snapshot_timing\":\"backend_stop\"}]"
+            : "[{\"kind\":\"exec\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":" +
+              std::string(snapshot_capability) + ",\"snapshot_timing\":\"backend_stop\"},"
+              "{\"kind\":\"read\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":" +
+              snapshot_capability + ",\"snapshot_timing\":\"backend_stop\"},"
+              "{\"kind\":\"write\",\"range_unit\":\"address\",\"range_mode\":\"inclusive\",\"memory_type_used\":true,\"snapshot\":" +
+              snapshot_capability + ",\"snapshot_timing\":\"backend_stop\"}]";
     char head[224];
     snprintf(head, sizeof(head),
              "{\"protocol_version\":%d,\"system\":\"%s\",\"adapter\":\"mednafen\",\"build\":\"%s\","
@@ -2512,6 +2658,10 @@ void handle(const std::string& line) {
     g_probe_addr = probe_addr;
     g_probe_len = probe_len;
   } else if (method == "set_breakpoint") {
+    if (g_bps.size() >= BREAKPOINT_CAP) {
+      reply_err(id, "bad_params", "breakpoint limit exceeded");
+      return;
+    }
     std::string kind = json_str(line, "kind");
     if (kind.empty()) kind = "exec";  // kind 생략 시 기본 exec
     // exec/read/write만 지원한다. nmi/irq/dma 등은 이 디버거에 없다 — 조용히 exec로 처리(silent-wrong,
@@ -2521,16 +2671,34 @@ void handle(const std::string& line) {
       reply_err(id, "unsupported", m.c_str());
       return;
     }
+    if (is_ngp() && kind != "exec") {
+      reply_err(id, "unsupported",
+                "Neo Geo Pocket supports TLCS-900/H exec breakpoints only");
+      return;
+    }
     std::string mt = json_str(line, "memory_type");
     uint32 start = 0, end = 0;
     if (!json_u32_arg(id, line, "start", start, true)
         || !json_u32_arg(id, line, "end", end, true))
       return;
     if (end < start) end = start;
+    const uint32 public_start = start;
+    const uint32 public_end = end;
     int type = (kind == "read") ? BPOINT_READ : (kind == "write") ? BPOINT_WRITE : BPOINT_PC;
     bool logical = true;
     bool adapter_bp = false;
-    if (is_pce()) {
+    if (is_ngp()) {
+      if (!mt.empty() && mt != "cpu") {
+        reply_err(id, "unsupported",
+                  "Neo Geo Pocket exec breakpoints use memory_type=cpu and absolute 24-bit TLCS addresses");
+        return;
+      }
+      if (start > 0xFFFFFF || end > 0xFFFFFF) {
+        reply_err(id, "bad_params",
+                  "Neo Geo Pocket TLCS exec breakpoint addresses are 24-bit");
+        return;
+      }
+    } else if (is_pce()) {
       // HuC6280 exec BP는 16비트 논리 주소(MPR 뱅킹) — 코어(pce/debug.cpp)가 i<65536만 arm하고 거대 span은
       // O(span) 루프라, MD/SS/WS처럼 범위 밖을 조용히 드롭하지 않고 명확히 거부한다(exec 상한이 DoS도 캡).
       if (type == BPOINT_PC) {
@@ -2559,6 +2727,61 @@ void handle(const std::string& line) {
           reply_err(id, "bad_params", "PCE 논리 read/write BP는 16비트(0x0000..0xFFFF); 물리는 memory_type=physical");
           return;
         }
+      }
+    } else if (is_pcfx()) {
+      // PC-FX V810 uses 32-bit physical addresses. Exec BP must be an aligned V810 instruction
+      // address. Read/write BP accepts raw CPU bus addresses, plus linear RAM/BIOS offset views.
+      if (type == BPOINT_PC) {
+        if (!mt.empty() && mt != "cpu") {
+          reply_err(id, "unsupported", "PC-FX exec BP uses memory_type=cpu and absolute V810 addresses");
+          return;
+        }
+        if ((start & 1) || (end & 1)) {
+          reply_err(id, "bad_params", "PC-FX V810 exec BP addresses must be 2-byte aligned");
+          return;
+        }
+      } else if (mt.empty() || mt == "cpu") {
+        logical = false;
+      } else if (mt == "ram") {
+        if (start > 0x1FFFFF || end > 0x1FFFFF) {
+          reply_err(id, "bad_params", "PC-FX ram BP offsets are 0x000000..0x1FFFFF");
+          return;
+        }
+        logical = false;  // RAM is linearly mapped at CPU bus 0x00000000.
+      } else if (mt == "bios") {
+        if (start > 0xFFFFF || end > 0xFFFFF) {
+          reply_err(id, "bad_params", "PC-FX bios BP offsets are 0x00000..0xFFFFF");
+          return;
+        }
+        start += 0xFFF00000u;
+        end += 0xFFF00000u;
+        logical = false;
+      } else if (mt == "backup" || mt == "exbackup") {
+        reply_err(id, "unsupported",
+                  "PC-FX backup BP views are interleaved on the CPU bus; use memory_type=cpu with an exact physical address");
+        return;
+      } else if (mt == "kram0" || mt == "kram1"
+                 || mt == "vdcvram0" || mt == "vdcvram1") {
+        EmucapPcfxAuxRange mapped{};
+        const EmucapPcfxAuxMapStatus status =
+            emucap_pcfx_aux_range(mt, start, end, mapped);
+        if (status == EmucapPcfxAuxMapStatus::unaligned) {
+          reply_err(id, "bad_params",
+                    "PC-FX auxiliary breakpoint ranges must cover complete 16-bit words");
+          return;
+        }
+        if (status != EmucapPcfxAuxMapStatus::mapped) {
+          reply_err(id, "bad_params", "PC-FX auxiliary breakpoint range is out of bounds");
+          return;
+        }
+        start = mapped.start;
+        end = mapped.end;
+        type = type == BPOINT_READ ? BPOINT_AUX_READ : BPOINT_AUX_WRITE;
+        logical = true;
+      } else {
+        reply_err(id, "unsupported",
+                  "PC-FX read/write BP supports cpu, ram, bios, kram0/1, and vdcvram0/1; CD track address spaces are read-only debugger views");
+        return;
       }
     } else if (is_md()) {
       if (type == BPOINT_READ || type == BPOINT_WRITE) {
@@ -2713,6 +2936,8 @@ void handle(const std::string& line) {
       return;
     if (pc_max < pc_min) pc_max = pc_min;
     bool has_pc_filter = has_pc_min || has_pc_max;
+    std::vector<EmucapSnapshotSpec> snapshots;
+    if (!validate_snapshot_specs(id, line, snapshots)) return;
 
     if (!adapter_bp && (!CurGame || !CurGame->Debugger || !CurGame->Debugger->AddBreakPoint)) {
       reply_err(id, "no_debugger", "디버거 미초기화");
@@ -2723,10 +2948,13 @@ void handle(const std::string& line) {
       b.type = type;
       b.a1 = start;
       b.a2 = end;
+      b.public_a1 = public_start;
+      b.public_a2 = public_end;
       b.logical = logical;
       json_bool(line, "pause_on_hit", b.pause_on_hit);
       b.adapter_bp = adapter_bp;
       b.memory_type = mt;
+      b.snapshots = snapshots;
       b.has_value = has_value && (type == BPOINT_READ || type == BPOINT_WRITE);
       b.value = value;
       b.value_mask = value_mask;
@@ -2790,6 +3018,15 @@ void handle(const std::string& line) {
     }
     arr += "]";
     reply_ok(id, "{\"breakpoints\":" + arr + "}");
+  } else if (method == "set_trace" && is_ngp()) {
+    reply_err(id, "unsupported",
+              "Neo Geo Pocket does not expose trace or call-stack classification");
+  } else if (method == "get_trace" && is_ngp()) {
+    reply_err(id, "unsupported",
+              "Neo Geo Pocket does not expose trace or call-stack classification");
+  } else if (method == "call_stack" && is_ngp()) {
+    reply_err(id, "unsupported",
+              "Neo Geo Pocket does not expose trace or call-stack classification");
   } else if (method == "set_trace") {
     handle_set_trace(id, line);
   } else if (method == "get_trace") {
@@ -2815,9 +3052,19 @@ void handle(const std::string& line) {
       uint32 A = addr;
       std::string out = "[";
       for (long i = 0; i < count; i++) {
+        if (is_ngp() && !emucap_ngp_disasm_safe(A, 16)) {
+          reply_err(id, "unsupported",
+                    "Neo Geo Pocket disassembly requires a complete 16-byte window in RAM, cartridge ROM, or BIOS");
+          return;
+        }
         char tbuf[256]; tbuf[0] = 0;
         uint32 ia = A;
         CurGame->Debugger->Disassemble(A, A, tbuf);  // A 증가
+        if (is_ngp() && A <= ia) {
+          reply_err(id, "adapter_error",
+                    "Neo Geo Pocket disassembler did not advance to the next instruction");
+          return;
+        }
         char ab[20]; snprintf(ab, sizeof(ab), "0x%08X", (unsigned)ia);
         out += i ? ",{\"addr\":\"" : "{\"addr\":\"";
         out += ab; out += "\",\"text\":\"";
@@ -2839,6 +3086,11 @@ void handle(const std::string& line) {
       char b[192];
       snprintf(b, sizeof(b), "%s{\"pc\":%u", i ? "," : "", (unsigned)h.pc);
       arr += b;
+      if (h.has_breakpoint_id) {
+        snprintf(b, sizeof(b), ",\"id\":%ld,\"breakpoint_id\":%ld",
+                 h.breakpoint_id, h.breakpoint_id);
+        arr += b;
+      }
       if (h.has_access) {
         snprintf(b, sizeof(b), ",\"kind\":\"%s\",\"address\":%u,\"length\":%u",
                  h.is_write ? "write" : "read", (unsigned)h.addr, h.len);
@@ -2865,6 +3117,15 @@ void handle(const std::string& line) {
       if (!h.registers.empty()) {
         arr += ",\"registers\":";
         arr += h.registers;  // 이미 {name:value} JSON 오브젝트(exec BP 히트 순간 CPU 레지스터)
+      }
+      if (!h.snapshot_json.empty()) {
+        arr += ",\"snapshot\":";
+        arr += h.snapshot_json;
+      }
+      if (!h.snapshot_error.empty()) {
+        arr += ",\"snapshot_error\":\"";
+        arr += json_escape(h.snapshot_error);
+        arr += "\"";
       }
       arr += "}";
     }
@@ -3022,11 +3283,12 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
   }
   bool matched = false;
   bool should_freeze = false;
+  std::vector<const BP*> matched_breakpoints;
   // 값-조건 BP 필터: read/write BP가 매칭(g_bp_hit_valid)됐고 그 주소를 덮는 has_value BP가 있으면,
   // 접근 주소의 값을 읽어 value/value_mask와 비교한다. 불일치면 그 BP만 스킵(노이즈 격리).
   // read는 읽을 값=메모리 현재라 정확. 일부 코어(MD)는 write 콜백에서 실제 write 값을 함께 기록한다.
   if (g_bp_hit_valid) {
-    int hit_type = g_bp_hit_is_write ? BPOINT_WRITE : BPOINT_READ;
+    int hit_type = g_bp_hit_type;
     for (auto& b : g_bps) {
       if (b.adapter_bp) continue;
       if (b.type != hit_type || g_bp_hit_addr < b.a1 || g_bp_hit_addr > b.a2) continue;
@@ -3039,6 +3301,7 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
         }
       }
       matched = true;
+      matched_breakpoints.push_back(&b);
       if (b.pause_on_hit) should_freeze = true;
     }
   } else {
@@ -3047,6 +3310,7 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
       if (b.type != BPOINT_PC || PC < b.a1 || PC > b.a2) continue;
       if (!bp_pc_allows(b, PC)) continue;
       matched = true;
+      matched_breakpoints.push_back(&b);
       if (b.pause_on_hit) should_freeze = true;
     }
   }
@@ -3055,19 +3319,100 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
     g_bp_hit_has_value = false;
     return;
   }
-  BPHit hit{};
-  hit.pc = PC;
+  BPHit base_hit{};
+  base_hit.pc = PC;
   if (g_bp_hit_valid) {
-    hit.has_access = true;
-    hit.addr = g_bp_hit_addr;
-    hit.len = g_bp_hit_len;
-    hit.is_write = g_bp_hit_is_write;
-    hit.has_value = g_bp_hit_has_value;
-    hit.value = g_bp_hit_value;
+    base_hit.has_access = true;
+    base_hit.addr = g_bp_hit_addr;
+    base_hit.len = g_bp_hit_len;
+    base_hit.is_write = g_bp_hit_type == BPOINT_WRITE
+                        || g_bp_hit_type == BPOINT_AUX_WRITE;
+    base_hit.has_value = g_bp_hit_has_value;
+    base_hit.value = g_bp_hit_value;
   }
   g_bp_hit_valid = false;
   g_bp_hit_has_value = false;
-  enqueue_bp_hit(hit, should_freeze);
+  // PC-FX breakpoint evidence uses one callback window for CPU registers, access metadata,
+  // and requested memory snapshots. Other Mednafen systems retain the older exec-only
+  // register capture to avoid multiplying hot read/write event cost.
+  if (is_pcfx() || !base_hit.has_access) base_hit.registers = capture_registers_json();
+  std::vector<BPHit> events;
+  for (const BP* matched_breakpoint : matched_breakpoints) {
+    const BP& breakpoint = *matched_breakpoint;
+    BPHit hit = base_hit;
+    hit.has_breakpoint_id = true;
+    hit.breakpoint_id = breakpoint.id;
+    if (is_pcfx() && hit.has_access) {
+      if (breakpoint.type == BPOINT_AUX_READ || breakpoint.type == BPOINT_AUX_WRITE) {
+        std::string memory_type;
+        uint32 public_address = 0;
+        uint32 public_length = 0;
+        if (!emucap_pcfx_aux_public_range(
+                hit.addr, hit.len, memory_type, public_address, public_length)
+            || memory_type != breakpoint.memory_type) {
+          g_bp_dropped++;
+          continue;
+        }
+        hit.memory_type = memory_type;
+        hit.addr = public_address;
+        hit.len = public_length;
+      } else {
+        hit.memory_type = breakpoint.memory_type.empty() ? "cpu" : breakpoint.memory_type;
+        if (hit.memory_type == "bios") hit.addr -= 0xFFF00000u;
+      }
+      if (!ranges_overlap(
+              hit.addr, hit.len, breakpoint.public_a1, breakpoint.public_a2)) {
+        g_bp_dropped++;
+        continue;
+      }
+    }
+    if (!breakpoint.snapshots.empty()) {
+      try {
+        hit.snapshot_json = capture_snapshot_json(breakpoint.snapshots);
+      } catch (const std::exception& error) {
+        hit.snapshot_error = error.what();
+      } catch (...) {
+        hit.snapshot_error = "unknown snapshot capture failure";
+      }
+    }
+    events.push_back(hit);
+  }
+  if (events.empty()) {
+    // Accepted PC-FX mappings are required to round-trip. Reaching this branch means the
+    // adapter can no longer prove which public breakpoint fired, so do not turn it into a
+    // normal queue overflow. Persist the native failure and close the debugger surface.
+    contain_service_exception(
+        "breakpoint_event",
+        "accepted PC-FX breakpoint hit could not be mapped back to its public range");
+    return;
+  }
+
+  // A single backend hit may match several public breakpoint records. Preserve that set
+  // atomically: a pausing hit evicts older evidence to make room for the complete current
+  // set, while a non-pausing hit either admits the whole set or accounts the whole set as
+  // dropped. Partial sibling events would make breakpoint_id evidence ambiguous.
+  if (events.size() > EVENT_CAP) {
+    contain_service_exception(
+        "breakpoint_event",
+        "one backend breakpoint hit exceeded the public event queue capacity");
+    return;
+  }
+  if (should_freeze) {
+    const size_t required =
+        g_bp_hits.size() + events.size() > EVENT_CAP
+            ? g_bp_hits.size() + events.size() - EVENT_CAP
+            : 0;
+    if (required > 0) {
+      g_bp_hits.erase(g_bp_hits.begin(), g_bp_hits.begin() + required);
+      g_bp_dropped += required;
+    }
+  } else if (g_bp_hits.size() + events.size() > EVENT_CAP) {
+    g_bp_dropped += events.size();
+    return;
+  }
+  for (size_t index = 0; index < events.size(); index++) {
+    enqueue_bp_hit(events[index], should_freeze && index + 1 == events.size());
+  }
 }
 
 }  // namespace
@@ -3095,7 +3440,7 @@ extern "C" void emucap_smpc_read_store(unsigned addr, unsigned value, const unsi
 extern "C" void emucap_bp_record(unsigned len, unsigned addr, int is_write) {
   g_bp_hit_addr = addr;
   g_bp_hit_len = len;
-  g_bp_hit_is_write = (is_write != 0);
+  g_bp_hit_type = is_write ? BPOINT_WRITE : BPOINT_READ;
   g_bp_hit_has_value = false;
   g_bp_hit_value = 0;
   g_bp_hit_valid = true;
@@ -3104,8 +3449,21 @@ extern "C" void emucap_bp_record(unsigned len, unsigned addr, int is_write) {
 extern "C" void emucap_bp_record_value(unsigned len, unsigned addr, int is_write, unsigned value) {
   g_bp_hit_addr = addr;
   g_bp_hit_len = len;
-  g_bp_hit_is_write = (is_write != 0);
+  g_bp_hit_type = is_write ? BPOINT_WRITE : BPOINT_READ;
   g_bp_hit_has_value = true;
+  g_bp_hit_value = value;
+  g_bp_hit_valid = true;
+}
+
+extern "C" void emucap_bp_record_pcfx_aux(
+    unsigned len,
+    unsigned addr,
+    int is_write,
+    unsigned value) {
+  g_bp_hit_addr = addr;
+  g_bp_hit_len = len;
+  g_bp_hit_type = is_write ? BPOINT_AUX_WRITE : BPOINT_AUX_READ;
+  g_bp_hit_has_value = is_write && addr < 0x80000;
   g_bp_hit_value = value;
   g_bp_hit_valid = true;
 }

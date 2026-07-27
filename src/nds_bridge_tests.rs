@@ -388,7 +388,7 @@ fn step_method_rejects_bare_frames_as_unsupported_frame_step() {
         .error
         .unwrap()
         .message
-        .contains("프레임 step 미지원"));
+        .contains("frame stepping is unsupported"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "emucap"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 authors = ["mcpads"]
 # GPL-2.0-or-later is compatible with the adapters' upstream licenses — GPLv2 (Mednafen/Flycast),
@@ -50,6 +50,10 @@ path = "src/bin/emucap-ppsspp-bridge.rs"
 [[bin]]
 name = "emucap-pcsx2-bridge"
 path = "src/bin/emucap-pcsx2-bridge.rs"
+
+[[bin]]
+name = "emucap-openmsx-bridge"
+path = "src/bin/emucap-openmsx-bridge.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

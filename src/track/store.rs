@@ -4,15 +4,15 @@ use crate::track::model::{Finding, Rom, Run};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrackError {
-    #[error("입출력 오류: {0}")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("JSON 파싱 실패 {path}: {source}")]
+    #[error("failed to parse JSON at {path}: {source}")]
     Parse {
         path: PathBuf,
         #[source]
         source: serde_json::Error,
     },
-    #[error("JSON 직렬화 실패: {0}")]
+    #[error("failed to serialize JSON: {0}")]
     Serialize(serde_json::Error),
     #[error("{0}")]
     Conflict(String),
@@ -57,7 +57,7 @@ impl TrackRootSource {
     pub fn warning(self) -> Option<&'static str> {
         match self {
             TrackRootSource::CwdFallback => Some(
-                "비-git working dir라 ledger가 MCP 서버 cwd에 의존(위치 모호) — EMUCAP_TRACK_ROOT를 명시하거나 작업 디렉터리에서 git init을 권장한다.",
+                "The working directory is not a Git repository, so the ledger location depends on the MCP server's current directory. Set EMUCAP_TRACK_ROOT or initialize Git in the working directory.",
             ),
             _ => None,
         }
@@ -287,7 +287,7 @@ pub fn find_run_by_id(root: &Path, run_id: &str) -> Result<Option<Run>, TrackErr
         if rj.is_file() {
             if found.is_some() {
                 return Err(TrackError::Conflict(format!(
-                    "중복 run_id: {run_id} (여러 rom 디렉터리에 존재 — 전역 유일 위반)"
+                    "duplicate run_id {run_id} appears in multiple ROM directories; global uniqueness is violated"
                 )));
             }
             found = Some(rj);
