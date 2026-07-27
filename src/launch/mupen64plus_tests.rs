@@ -7,13 +7,15 @@ fn write_root(repo: &Path) -> PathBuf {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         adapter.join("upstream.lock"),
-        "M64P_VERSION=2.6.0\n\
+        format!(
+            "M64P_VERSION=2.6.0\n\
          M64P_BUNDLE_URL=https://example.invalid/m64p.tar.gz\n\
          M64P_BUNDLE_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
          M64P_PATCHSET_SHA256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n\
          M64P_CORE_COMMIT=1111111111111111111111111111111111111111\n\
          M64P_TEST_ROM_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
-         M64P_HOST_API=2\n",
+         M64P_HOST_API={REQUIRED_HOST_API}\n"
+        ),
     )
     .unwrap();
     for name in [

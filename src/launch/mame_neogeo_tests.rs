@@ -127,6 +127,46 @@ fn headless_spec_uses_isolated_home_and_neogeo_profile() {
         .iter()
         .any(|(key, value)| { key == "EMUCAP_MAME_PROFILE" && value == "neogeo_mvs" }));
     assert!(spec.args.iter().any(|v| v.contains("mame-neogeo/47822")));
+    let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap()).unwrap();
+    assert!(bridge.env.iter().any(|(key, value)| {
+        key == "EMUCAP_ADAPTER_HOME" && value.contains("mame-neogeo/47822")
+    }));
+}
+
+#[test]
+fn bridge_uses_the_runtime_generation_for_temporary_artifacts() {
+    let root = tempfile::tempdir().unwrap();
+    let game = root.path().join("game.zip");
+    let bios = root.path().join("neogeo.zip");
+    std::fs::write(&game, b"game").unwrap();
+    std::fs::write(&bios, b"bios").unwrap();
+    let log = root.path().join("mame.log");
+    let generation = root.path().join("sessions/47822/generations/launch-test");
+    let failure = generation.join("adapter-failure.json");
+    let runtime = RuntimeEnv {
+        launch_id: "launch-test",
+        adapter_failure_path: &failure,
+    };
+    let launch = Launch {
+        binary: Path::new("/mame"),
+        bridge: Path::new("/bridge"),
+        repo_root: root.path(),
+        content: &game,
+        bios: &bios,
+        system: "neogeo_mvs",
+        log_path: &log,
+        port: 47822,
+        name: None,
+        session_token: None,
+        runtime: Some(runtime),
+        display: false,
+    };
+
+    let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap()).unwrap();
+    assert!(bridge
+        .env
+        .iter()
+        .any(|(key, value)| { key == "EMUCAP_ADAPTER_HOME" && Path::new(value) == generation }));
 }
 
 #[test]

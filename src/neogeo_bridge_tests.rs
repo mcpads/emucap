@@ -10,20 +10,26 @@ use crate::live::protocol::Request;
 #[derive(Default)]
 struct FakeGdb {
     replies: VecDeque<String>,
+    async_packets: VecDeque<String>,
     sent: Vec<String>,
     timeout: Duration,
     timeout_changes: Vec<Duration>,
     write_state_fixture: bool,
+    write_dasm_fixture: bool,
+    write_oversized_dasm_fixture: bool,
 }
 
 impl FakeGdb {
     fn with(replies: &[&str]) -> Self {
         Self {
             replies: replies.iter().map(|v| (*v).into()).collect(),
+            async_packets: VecDeque::new(),
             sent: Vec::new(),
             timeout: Duration::from_secs(5),
             timeout_changes: Vec::new(),
             write_state_fixture: false,
+            write_dasm_fixture: false,
+            write_oversized_dasm_fixture: false,
         }
     }
 
@@ -31,6 +37,21 @@ impl FakeGdb {
         let mut gdb = Self::with(replies);
         gdb.write_state_fixture = true;
         gdb
+    }
+
+    fn with_async(mut self, packets: &[&str]) -> Self {
+        self.async_packets = packets.iter().map(|value| (*value).into()).collect();
+        self
+    }
+
+    fn with_dasm(mut self) -> Self {
+        self.write_dasm_fixture = true;
+        self
+    }
+
+    fn with_oversized_dasm(mut self) -> Self {
+        self.write_oversized_dasm_fixture = true;
+        self
     }
 }
 
@@ -44,6 +65,21 @@ impl GdbTransport for FakeGdb {
                         std::fs::write(path, b"MAMESAVE-fixture").unwrap();
                     }
                 }
+            }
+        }
+        if self.write_dasm_fixture || self.write_oversized_dasm_fixture {
+            if let Some(encoded) = payload.strip_prefix("qEmucap,dasm,") {
+                let decoded = hex::decode(encoded)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .unwrap();
+                let path = decoded.split('|').next().unwrap();
+                let bytes = if self.write_oversized_dasm_fixture {
+                    vec![b'x'; MAX_DASM_OUTPUT_BYTES as usize + 1]
+                } else {
+                    b"000100: 4e 71 nop\n000102: 4e 75 rts\n".to_vec()
+                };
+                std::fs::write(path, bytes).unwrap();
             }
         }
         Ok(self.replies.pop_front().unwrap_or_default())
@@ -68,6 +104,10 @@ impl GdbTransport for FakeGdb {
         self.timeout_changes.push(timeout);
         Ok(())
     }
+
+    fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
+        Ok(self.async_packets.pop_front())
+    }
 }
 
 fn request(id: u64, method: &str, params: Value) -> Request {
@@ -88,7 +128,28 @@ fn hello_advertises_only_proven_initial_surface() {
     let value = response.result.unwrap();
     assert_eq!(value["system"], "neogeo_mvs");
     assert_eq!(value["memory_types"], json!(["ram"]));
-    assert_eq!(value["breakpoint_kinds"], json!([]));
+    assert_eq!(value["breakpoint_kinds"][0]["kind"], "exec");
+    assert_eq!(value["breakpoint_kinds"][0]["range_mode"], "exact");
+    assert_eq!(value["breakpoint_kinds"][0]["memory_type_used"], false);
+    assert_eq!(value["breakpoint_kinds"][1]["kind"], "read");
+    assert_eq!(value["breakpoint_kinds"][1]["snapshot"], true);
+    for method in [
+        "set_breakpoint",
+        "clear_breakpoint",
+        "list_breakpoints",
+        "clear_all_breakpoints",
+        "poll_events",
+        "disassemble",
+    ] {
+        assert!(
+            value["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|advertised| advertised == method),
+            "{method} was not advertised"
+        );
+    }
     assert_eq!(
         value["execution_limits"]["frame"]["max_count"],
         max_sync_frame_count()
@@ -110,6 +171,241 @@ fn hello_advertises_only_proven_initial_surface() {
         &methods,
     );
     assert_eq!(status.state, "validated", "{:?}", status.errors);
+}
+
+#[test]
+fn breakpoint_subset_rejects_before_backend_mutation() {
+    let mut bridge =
+        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    for params in [
+        json!({"kind":"access", "start":0x100, "end":0x100, "pause_on_hit":true}),
+        json!({"kind":"exec", "start":0x100, "end":0x102, "pause_on_hit":true}),
+        json!({"kind":"exec", "start":0x100, "end":0x100, "pause_on_hit":false}),
+        json!({"kind":"read", "memory_type":"ram", "start":0xffff, "end":0x10000, "pause_on_hit":true}),
+        json!({"kind":"write", "memory_type":"cpu", "start":0, "end":0, "pause_on_hit":true}),
+    ] {
+        let response = bridge.handle_request(request(20, "set_breakpoint", params));
+        assert!(!response.ok);
+        assert!(matches!(
+            response.error.unwrap().kind.as_str(),
+            "bad_params" | "unsupported"
+        ));
+    }
+    assert!(bridge.gdb.sent.is_empty());
+}
+
+#[test]
+fn breakpoint_hit_is_published_once_and_rearmed_under_the_public_id() {
+    let mut regs = Vec::new();
+    for value in 0..REG_NAMES.len() as u32 {
+        regs.extend_from_slice(&value.to_le_bytes());
+    }
+    let stop = format!("T05hwbreak:00010000;idx:4;seq:1;regs:{}", hex::encode(regs));
+    let gdb = FakeGdb::with(&["BP:4", "BP:5"]).with_async(&[&stop]);
+    let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+
+    let armed = bridge.handle_request(request(
+        1,
+        "set_breakpoint",
+        json!({"kind":"exec", "start":0x100, "end":0x100, "pause_on_hit":true}),
+    ));
+    assert_eq!(armed.result.unwrap()["id"], 1);
+
+    let first = bridge
+        .handle_request(request(2, "poll_events", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(first["events"].as_array().unwrap().len(), 1);
+    let event = &first["events"][0];
+    assert_eq!(event["type"], "breakpoint_hit");
+    assert_eq!(event["id"], 1);
+    assert_eq!(event["kind"], "exec");
+    assert_eq!(event["address"], 0x100);
+    assert_eq!(event["hit_seq"], 1);
+    assert_eq!(event["regs"]["pc"], 17);
+    assert_eq!(event["rearmed"], true);
+    assert_eq!(event["backend_id_after"], 5);
+
+    let second = bridge
+        .handle_request(request(3, "poll_events", json!({})))
+        .result
+        .unwrap();
+    assert!(second["events"].as_array().unwrap().is_empty());
+
+    let listed = bridge
+        .handle_request(request(4, "list_breakpoints", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(listed["breakpoints"][0]["id"], 1);
+    assert_eq!(listed["breakpoints"][0]["arm_state"], "armed");
+    assert_eq!(listed["breakpoints"][0]["backend_id"], 5);
+
+    let spec = hex::encode("0|100|1|1|");
+    assert_eq!(
+        bridge.gdb.sent,
+        vec![
+            format!("qEmucap,setpoint,{spec}"),
+            format!("qEmucap,setpoint,{spec}"),
+        ]
+    );
+}
+
+#[test]
+fn breakpoint_stop_requires_the_plugin_callback_sequence() {
+    let mut regs = Vec::new();
+    for value in 0..REG_NAMES.len() as u32 {
+        regs.extend_from_slice(&value.to_le_bytes());
+    }
+    let stop = format!("T05hwbreak:00010000;idx:4;regs:{}", hex::encode(regs));
+    let gdb = FakeGdb::with(&["BP:4"]).with_async(&[&stop]);
+    let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    bridge
+        .handle_request(request(
+            1,
+            "set_breakpoint",
+            json!({"kind":"exec", "start":0x100, "pause_on_hit":true}),
+        ))
+        .result
+        .unwrap();
+
+    let response = bridge.handle_request(request(2, "poll_events", json!({})));
+    assert!(!response.ok);
+    assert!(response
+        .error
+        .unwrap()
+        .message
+        .contains("invalid Neo Geo breakpoint stop packet"));
+}
+
+#[test]
+fn clear_breakpoint_keeps_the_public_record_when_native_clear_fails() {
+    let gdb = FakeGdb::with(&["BP:4", "E00"]);
+    let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    bridge
+        .handle_request(request(
+            1,
+            "set_breakpoint",
+            json!({"kind":"exec", "start":0x100, "pause_on_hit":true}),
+        ))
+        .result
+        .unwrap();
+
+    let clear = bridge.handle_request(request(2, "clear_breakpoint", json!({"id":1})));
+    assert!(!clear.ok);
+    let listed = bridge
+        .handle_request(request(3, "list_breakpoints", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(listed["breakpoints"][0]["id"], 1);
+    assert_eq!(listed["breakpoints"][0]["backend_id"], 4);
+}
+
+#[test]
+fn breakpoint_interrupts_frame_advance_and_leaves_the_machine_frozen() {
+    let mut regs = Vec::new();
+    for value in 0..REG_NAMES.len() as u32 {
+        regs.extend_from_slice(&value.to_le_bytes());
+    }
+    let stop = format!("T05hwbreak:00010000;idx:4;seq:1;regs:{}", hex::encode(regs));
+    let gdb = FakeGdb::with(&["BP:4", "10", &stop, "BP:5"]);
+    let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    bridge
+        .handle_request(request(
+            1,
+            "set_breakpoint",
+            json!({"kind":"exec", "start":0x100, "end":0x100, "pause_on_hit":true}),
+        ))
+        .result
+        .unwrap();
+
+    let result = bridge
+        .handle_request(request(2, "run_frames", json!({"n":3})))
+        .result
+        .unwrap();
+    assert_eq!(result["status"], "interrupted");
+    assert_eq!(result["reason"], "breakpoint");
+    assert_eq!(result["breakpoint_id"], 1);
+    assert_eq!(result["state"], "frozen");
+    assert!(bridge.frozen);
+
+    let events = bridge
+        .handle_request(request(3, "poll_events", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(events["events"].as_array().unwrap().len(), 1);
+    assert_eq!(events["events"][0]["id"], 1);
+}
+
+#[test]
+fn disassemble_uses_the_mame_decoder_in_the_adapter_home() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["OK"]).with_dasm(),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    let result = bridge
+        .handle_request(request(
+            1,
+            "disassemble",
+            json!({"address":0x100, "count":2}),
+        ))
+        .result
+        .unwrap();
+    assert_eq!(result["instructions"][0]["addr"], 0x100);
+    assert_eq!(result["instructions"][0]["bytes"], "4e71");
+    assert_eq!(result["instructions"][0]["length"], 2);
+    assert_eq!(result["instructions"][0]["text"], "nop");
+    assert_eq!(result["instructions"][1]["text"], "rts");
+
+    let encoded = bridge.gdb.sent[0].strip_prefix("qEmucap,dasm,").unwrap();
+    let spec = String::from_utf8(hex::decode(encoded).unwrap()).unwrap();
+    let path = PathBuf::from(spec.split('|').next().unwrap());
+    assert!(path.starts_with(&bridge.adapter_home));
+    assert!(
+        !path.exists(),
+        "temporary disassembly output must be removed"
+    );
+}
+
+#[test]
+fn disassemble_rejects_unsafe_paths_before_backend_mutation() {
+    let mut bridge =
+        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    bridge.adapter_home = PathBuf::from("/tmp/emucap-unsafe\"path");
+
+    let response = bridge.handle_request(request(
+        1,
+        "disassemble",
+        json!({"address":0x100, "count":2}),
+    ));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_state");
+    assert!(bridge.gdb.sent.is_empty());
+}
+
+#[test]
+fn disassemble_rejects_oversized_backend_output_and_removes_it() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["OK"]).with_oversized_dasm(),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    let response = bridge.handle_request(request(
+        1,
+        "disassemble",
+        json!({"address":0x100, "count":2}),
+    ));
+    assert!(!response.ok);
+    assert!(response.error.unwrap().message.contains("output exceeds"));
+    let encoded = bridge.gdb.sent[0].strip_prefix("qEmucap,dasm,").unwrap();
+    let spec = String::from_utf8(hex::decode(encoded).unwrap()).unwrap();
+    let path = PathBuf::from(spec.split('|').next().unwrap());
+    assert!(
+        !path.exists(),
+        "the current request artifact must be removed"
+    );
 }
 
 #[test]
@@ -495,6 +791,107 @@ fn secondary_cpu_requests_are_rejected_before_backend_mutation() {
 }
 
 #[test]
+fn reset_waits_for_the_machine_reset_notifier() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["OK:1"]),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    let response = bridge.handle_request(request(1, "reset", json!({})));
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(
+        response.result.unwrap(),
+        json!({
+            "status":"completed",
+            "reset":"completed",
+            "state":"running",
+            "reset_seq":1,
+        })
+    );
+    assert_eq!(
+        bridge.gdb.sent,
+        vec![format!("qEmucap,resetsync,{}", hex::encode("1"))]
+    );
+    assert!(!bridge.frozen);
+}
+
+#[test]
+fn reset_rejects_a_stale_notifier_sequence() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["OK:0"]),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    let response = bridge.handle_request(request(1, "reset", json!({})));
+    assert!(!response.ok);
+    assert!(response
+        .error
+        .unwrap()
+        .message
+        .contains("expected sequence 1"));
+}
+
+#[test]
+fn reset_preserves_verified_native_breakpoint_identity() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["BP:4", "OK:1"]),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    bridge
+        .handle_request(request(
+            1,
+            "set_breakpoint",
+            json!({"kind":"exec", "start":0x100, "pause_on_hit":true}),
+        ))
+        .result
+        .unwrap();
+    bridge
+        .handle_request(request(2, "reset", json!({})))
+        .result
+        .unwrap();
+    let listed = bridge
+        .handle_request(request(3, "list_breakpoints", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(listed["breakpoints"][0]["backend_id"], 4);
+    assert_eq!(listed["breakpoints"][0]["arm_state"], "armed");
+}
+
+#[test]
+fn reset_verification_failure_marks_public_breakpoints_failed() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["BP:4", "E0E:1"]),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    bridge
+        .handle_request(request(
+            1,
+            "set_breakpoint",
+            json!({"kind":"exec", "start":0x100, "pause_on_hit":true}),
+        ))
+        .result
+        .unwrap();
+    let reset = bridge.handle_request(request(2, "reset", json!({})));
+    assert!(!reset.ok);
+    let listed = bridge
+        .handle_request(request(3, "list_breakpoints", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(listed["breakpoints"][0]["backend_id"], Value::Null);
+    assert_eq!(listed["breakpoints"][0]["arm_state"], "failed");
+    assert!(listed["breakpoints"][0]["arm_error"]
+        .as_str()
+        .unwrap()
+        .contains("reset could not verify"));
+}
+
+#[test]
 fn one_instruction_step_stays_frozen() {
     let mut bridge = NeoGeoBridge::new(
         FakeGdb::with(&["S05"]),
@@ -547,6 +944,27 @@ fn run_frames_accepts_a_terminal_overshoot_and_reports_it() {
     assert_eq!(result["frame_counter_delta"], 62);
     assert_eq!(result["frame_counter_continuous"], true);
     assert_eq!(result["state"], "running");
+}
+
+#[test]
+fn exact_frame_step_requires_the_declared_screen_counter_delta() {
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::with(&["10", "OK", "12"]),
+        GdbBridgeEnv::default(),
+        "neogeo_mvs",
+    )
+    .unwrap();
+    bridge.frozen = true;
+    let completed = bridge.handle_request(request(1, "step", json!({"unit":"frames", "count":2})));
+    assert!(completed.ok, "{:?}", completed.error);
+    assert_eq!(completed.result.unwrap()["frame_counter_delta"], 2);
+    assert!(bridge.frozen);
+
+    bridge.gdb.replies = ["12", "OK", "13"].into_iter().map(str::to_owned).collect();
+    let mismatch = bridge.handle_request(request(2, "step", json!({"unit":"frames", "count":2})));
+    assert!(!mismatch.ok);
+    assert_eq!(mismatch.error.unwrap().kind, "emulator_error");
+    assert!(bridge.frozen);
 }
 
 #[test]

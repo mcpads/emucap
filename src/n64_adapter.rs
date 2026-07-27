@@ -1,6 +1,6 @@
 //! Initial Nintendo 64 adapter backed by a debugger-enabled Mupen64Plus core.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs::File;
 use std::io::Read;
@@ -16,6 +16,8 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
 #[path = "n64_adapter_control.rs"]
 mod control;
+#[path = "n64_adapter_debug.rs"]
+mod debug;
 #[path = "n64_adapter_frame.rs"]
 mod frame;
 #[path = "n64_adapter_lifecycle.rs"]
@@ -23,9 +25,11 @@ mod lifecycle;
 #[path = "n64_adapter_prepare.rs"]
 mod prepare;
 
+#[cfg(test)]
+use frame::wait_frame_gate;
 use frame::{
     arm_frame_gate, cancel_frame_gate, frame_gate_is_blocked, release_frame_gate, reset_frame_gate,
-    wait_frame_gate, FrameGateTrigger,
+    wait_frame_gate_or_debug_update, FrameGateTrigger, FrameWaitOutcome,
 };
 use lifecycle::{
     current_readiness, debug_init_callback, debug_log_callback, debug_update_callback,
@@ -40,6 +44,7 @@ const M64CMD_ROM_OPEN: c_int = 1;
 const M64CMD_ROM_CLOSE: c_int = 2;
 const M64CMD_EXECUTE: c_int = 5;
 const M64CMD_STOP: c_int = 6;
+const M64CMD_RESET: c_int = 19;
 const M64CMD_STATE_LOAD: c_int = 10;
 const M64CMD_STATE_SAVE: c_int = 11;
 const M64CMD_SEND_SDL_KEYDOWN: c_int = 13;
@@ -99,6 +104,13 @@ const BASE_METHODS: &[&str] = &[
     "resume",
     "step_instructions",
     "set_input",
+    "reset",
+    "set_breakpoint",
+    "clear_breakpoint",
+    "list_breakpoints",
+    "clear_all_breakpoints",
+    "poll_events",
+    "disassemble",
 ];
 const ACTIVE_EXCEPTIONS: &[&str] = &[
     "n64.state-read.frozen-only",
@@ -109,6 +121,7 @@ const ACTIVE_EXCEPTIONS: &[&str] = &[
     "n64.execution-pause.r4300-only",
     "n64.execution-resume.r4300-only",
     "n64.input-set.port-zero-only",
+    "n64.breakpoint.pausing-subset",
 ];
 
 static DEBUG_READY: AtomicBool = AtomicBool::new(false);
@@ -147,6 +160,11 @@ type DebugStep = unsafe extern "C" fn() -> c_int;
 type DebugGetCpuDataPtr = unsafe extern "C" fn(c_int) -> *mut c_void;
 type DebugMemRead8 = unsafe extern "C" fn(u32) -> u8;
 type DebugMemWrite8 = unsafe extern "C" fn(u32, u8);
+type DebugBreakpointCommand =
+    unsafe extern "C" fn(c_int, u32, *mut debug::NativeBreakpoint) -> c_int;
+type DebugBreakpointLookup = unsafe extern "C" fn(u32, u32, u32) -> c_int;
+type DebugBreakpointConsume = unsafe extern "C" fn(*mut u32, *mut u32);
+type DebugDecodeOp = unsafe extern "C" fn(u32, *mut c_char, *mut c_char, c_int);
 type PluginStartup = unsafe extern "C" fn(
     *mut c_void,
     *mut c_void,
@@ -169,6 +187,10 @@ struct Api {
     debug_get_cpu_data_ptr: DebugGetCpuDataPtr,
     debug_mem_read8: DebugMemRead8,
     debug_mem_write8: DebugMemWrite8,
+    debug_breakpoint_command: DebugBreakpointCommand,
+    debug_breakpoint_lookup: DebugBreakpointLookup,
+    debug_breakpoint_consume: DebugBreakpointConsume,
+    debug_decode_op: DebugDecodeOp,
 }
 
 unsafe impl Send for Api {}
@@ -219,6 +241,12 @@ pub struct Mupen64PlusHost {
     frame_paused: bool,
     frame_clock_synchronized: bool,
     held_buttons: BTreeSet<String>,
+    breakpoints: BTreeMap<u64, debug::PublicBreakpoint>,
+    next_breakpoint_id: u64,
+    debug_events: VecDeque<Value>,
+    last_debug_update_seen: u64,
+    next_hit_seq: u64,
+    next_reset_seq: u64,
     started: bool,
 }
 
@@ -278,12 +306,20 @@ impl Mupen64PlusHost {
             "pause" => self.pause(&request.params),
             "resume" => self.resume(&request.params),
             "step" if self.display => self.step(&request.params),
+            "run_frames" if self.display => self.run_frames(&request.params),
             "step_instructions" => self.step_instructions(&request.params),
             "set_input" => self.set_input(&request.params),
             "press_buttons" if self.display => self.press_buttons(&request.params),
             "screenshot" if self.display => self.screenshot(),
             "save_state" if self.display => self.save_state(&request.params),
             "load_state" if self.display => self.load_state(&request.params),
+            "reset" => self.reset(&request.params),
+            "set_breakpoint" => self.set_breakpoint(&request.params),
+            "clear_breakpoint" => self.clear_breakpoint(&request.params),
+            "list_breakpoints" => self.list_breakpoints(),
+            "clear_all_breakpoints" => self.clear_all_breakpoints(),
+            "poll_events" => self.poll_events(&request.params),
+            "disassemble" => self.disassemble(&request.params),
             other => Err(N64Error::Unsupported(other.into())),
         };
         match result {
@@ -317,7 +353,7 @@ impl Mupen64PlusHost {
             "methods": methods,
             "memory_types": ["rdram"],
             "region_sizes": {"rdram": RDRAM_SIZE},
-            "breakpoint_kinds": [],
+            "breakpoint_kinds": debug::breakpoint_kinds(),
             "input_buttons": INPUT_BUTTONS,
             "execution_limits": {
                 "max_sync_advance_count": MAX_STEP_COUNT,
@@ -362,6 +398,7 @@ impl Mupen64PlusHost {
     }
 
     fn status(&mut self) -> N64Result<Value> {
+        self.drain_debug_update()?;
         let readiness = current_readiness(self.display);
         let connected = readiness.is_ready();
         if connected {
@@ -384,7 +421,7 @@ impl Mupen64PlusHost {
             "methods": self.methods(),
             "memory_types": ["rdram"],
             "region_sizes": {"rdram": RDRAM_SIZE},
-            "breakpoint_kinds": []
+            "breakpoint_kinds": debug::breakpoint_kinds()
             ,"display": self.display,
             "input_buttons": INPUT_BUTTONS,
             "execution_limits": {
@@ -443,6 +480,15 @@ impl Mupen64PlusHost {
     fn pause(&mut self, params: &Value) -> N64Result<Value> {
         require_r4300(params)?;
         self.require_connected()?;
+        if let Some(event) = self.drain_debug_update()? {
+            return Ok(json!({
+                "status":"completed",
+                "state":"frozen",
+                "reason":"breakpoint",
+                "breakpoint_id":event["id"],
+                "event":event,
+            }));
+        }
         if !self.frame_paused
             && unsafe { (self.api.debug_get_state)(M64P_DBG_RUN_STATE) } != M64P_DBG_RUNSTATE_PAUSED
         {
@@ -470,6 +516,7 @@ impl Mupen64PlusHost {
     fn resume(&mut self, params: &Value) -> N64Result<Value> {
         require_r4300(params)?;
         self.require_connected()?;
+        self.drain_debug_update()?;
         let was_paused =
             unsafe { (self.api.debug_get_state)(M64P_DBG_RUN_STATE) } == M64P_DBG_RUNSTATE_PAUSED;
         check_core("DebugSetRunState(running)", unsafe {
@@ -537,6 +584,17 @@ impl Mupen64PlusHost {
                 self.recover_instruction_failure(before.saturating_add(expected), &error)?;
                 return Err(error);
             }
+            if let Some(event) = self.drain_debug_update()? {
+                return Ok(json!({
+                    "status":"interrupted",
+                    "reason":"breakpoint",
+                    "breakpoint_id":event["id"],
+                    "event":event,
+                    "unit":"instructions",
+                    "completed":expected,
+                    "state":"frozen",
+                }));
+            }
         }
         self.frozen = true;
         Ok(json!({
@@ -582,6 +640,7 @@ impl Mupen64PlusHost {
             let continuing_from_frame_barrier = self.frame_paused;
             let observed_before = FRAME_COUNT.load(Ordering::Acquire);
             let observed_before_verified = self.frame_clock_synchronized;
+            let debug_before = UPDATE_COUNT.load(Ordering::Acquire);
             let trigger = if index == 0 {
                 first_trigger
             } else {
@@ -618,8 +677,31 @@ impl Mupen64PlusHost {
                     return Err(error);
                 }
             };
-            let observed = match wait_frame_gate(timeout) {
-                Ok(observed) => observed,
+            let observed = match wait_frame_gate_or_debug_update(timeout, debug_before) {
+                Ok(FrameWaitOutcome::Frame(observed)) => observed,
+                Ok(FrameWaitOutcome::DebugUpdate(update)) => {
+                    cancel_frame_gate();
+                    if let Some(event) = self.drain_debug_update()? {
+                        self.frozen = true;
+                        self.frame_paused = false;
+                        return Ok(json!({
+                            "status":"interrupted",
+                            "reason":"breakpoint",
+                            "breakpoint_id":event["id"],
+                            "event":event,
+                            "unit":"frames",
+                            "completed":index,
+                            "state":"frozen",
+                        }));
+                    }
+                    let error = N64Error::BadState(
+                        format!(
+                            "N64 frame advance was interrupted by unclassified debugger update {update}"
+                        ),
+                    );
+                    self.recover_frame_failure(&error)?;
+                    return Err(error);
+                }
                 Err(error) => {
                     self.recover_frame_failure(&error)?;
                     return Err(error);
@@ -830,6 +912,7 @@ fn methods_for(display: bool) -> Vec<&'static str> {
     if display {
         methods.extend([
             "step",
+            "run_frames",
             "press_buttons",
             "screenshot",
             "save_state",
@@ -880,6 +963,10 @@ unsafe fn load_api(handle: *mut c_void) -> N64Result<Api> {
         debug_get_cpu_data_ptr: symbol(handle, b"DebugGetCPUDataPtr\0")?,
         debug_mem_read8: symbol(handle, b"DebugMemRead8\0")?,
         debug_mem_write8: symbol(handle, b"DebugMemWrite8\0")?,
+        debug_breakpoint_command: symbol(handle, b"DebugBreakpointCommand\0")?,
+        debug_breakpoint_lookup: symbol(handle, b"DebugBreakpointLookup\0")?,
+        debug_breakpoint_consume: symbol(handle, b"DebugBreakpointConsume\0")?,
+        debug_decode_op: symbol(handle, b"DebugDecodeOp\0")?,
     })
 }
 

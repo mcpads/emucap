@@ -1,0 +1,52 @@
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -35,6 +35,7 @@
+ DebugBreakpointCommand;
+ DebugBreakpointLookup;
+ DebugBreakpointTriggeredBy;
++DebugBreakpointConsume;
+ DebugDecodeOp;
+ DebugGetCPUDataPtr;
+ DebugGetState;
+--- a/src/api/debugger.c
++++ b/src/api/debugger.c
+@@ -441,6 +441,20 @@ EXPORT void CALL DebugBreakpointTriggeredBy(uint32_t *flags, uint32_t *accessed)
+ #endif
+ }
+ 
++EXPORT void CALL DebugBreakpointConsume(uint32_t *flags, uint32_t *accessed)
++{
++#ifdef DBG
++    *flags = breakpointFlag;
++    *accessed = breakpointAccessed;
++    breakpointFlag = 0;
++    breakpointAccessed = 0;
++#else
++    *flags = 0;
++    *accessed = 0;
++    DebugMessage(M64MSG_ERROR, "Bug: DebugBreakpointConsume() called, but Debugger not supported in Core library");
++#endif
++}
++
+ EXPORT uint32_t CALL DebugVirtualToPhysical(uint32_t address)
+ {
+ #ifdef DBG
+--- a/src/api/m64p_debugger.h
++++ b/src/api/m64p_debugger.h
+@@ -205,6 +205,16 @@ typedef void (*ptr_DebugBreakpointTriggeredBy)(uint32_t *, uint32_t *);
+ EXPORT void CALL DebugBreakpointTriggeredBy(uint32_t *, uint32_t *);
+ #endif
+ 
++/* DebugBreakpointConsume()
++ *
++ * This function atomically retrieves and clears the trigger flags and address
++ * for the most recently triggered breakpoint.
++ */
++typedef void (*ptr_DebugBreakpointConsume)(uint32_t *, uint32_t *);
++#if defined(M64P_CORE_PROTOTYPES)
++EXPORT void CALL DebugBreakpointConsume(uint32_t *, uint32_t *);
++#endif
++
+ /* DebugVirtualToPhysical()
+  *
+  * This function is used to translate virtual addresses to physical addresses.

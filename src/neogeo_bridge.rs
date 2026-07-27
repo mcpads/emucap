@@ -1,5 +1,6 @@
 //! Neo Geo MVS, AES, and CD bridge for the repository-owned MAME Lua debugger plugin.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -12,6 +13,10 @@ use sha2::{Digest as Sha2Digest, Sha256};
 
 use crate::gdb_rsp::{GdbBridgeEnv, GdbError, GdbTransport};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
+
+#[path = "neogeo_bridge/breakpoints.rs"]
+mod breakpoints;
+use breakpoints::{breakpoint_kinds, is_breakpoint_stop};
 
 const MVS_METHODS: &[&str] = &[
     "hello",
@@ -31,6 +36,12 @@ const MVS_METHODS: &[&str] = &[
     "step_instructions",
     "run_frames",
     "reset",
+    "set_breakpoint",
+    "clear_breakpoint",
+    "list_breakpoints",
+    "clear_all_breakpoints",
+    "poll_events",
+    "disassemble",
 ];
 const CD_METHODS: &[&str] = &[
     "hello",
@@ -48,6 +59,12 @@ const CD_METHODS: &[&str] = &[
     "step_instructions",
     "run_frames",
     "reset",
+    "set_breakpoint",
+    "clear_breakpoint",
+    "list_breakpoints",
+    "clear_all_breakpoints",
+    "poll_events",
+    "disassemble",
 ];
 const MVS_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.state-read.frozen-only",
@@ -61,6 +78,7 @@ const MVS_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.execution-step.main-cpu-only",
     "neogeo.execution-pause.machine-global",
     "neogeo.execution-resume.machine-global",
+    "neogeo.breakpoint.pausing-subset",
 ];
 const CD_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.state-read.frozen-only",
@@ -72,6 +90,7 @@ const CD_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.execution-step.main-cpu-only",
     "neogeo.execution-pause.machine-global",
     "neogeo.execution-resume.machine-global",
+    "neogeo.breakpoint.pausing-subset",
 ];
 const MVS_RAM_BASE: u64 = 0x10_0000;
 const MVS_RAM_SIZE: u64 = 0x1_0000;
@@ -170,6 +189,32 @@ pub enum BridgeError {
 }
 
 type BridgeResult<T> = Result<T, BridgeError>;
+const MAX_DASM_OUTPUT_BYTES: u64 = 0x2_0000;
+
+#[derive(Debug, Clone)]
+struct NeoGeoSnapshot {
+    memory_type: String,
+    address: u64,
+    length: u64,
+}
+
+#[derive(Debug, Clone)]
+enum NeoGeoArmState {
+    Armed,
+    Failed(String),
+}
+
+#[derive(Debug, Clone)]
+struct NeoGeoBreakpoint {
+    kind: String,
+    start: u64,
+    end: u64,
+    absolute_start: u64,
+    backend_kind: String,
+    backend_id: Option<u64>,
+    snapshots: Vec<NeoGeoSnapshot>,
+    arm_state: NeoGeoArmState,
+}
 
 pub struct NeoGeoBridge<G> {
     gdb: G,
@@ -177,6 +222,12 @@ pub struct NeoGeoBridge<G> {
     system: String,
     profile: NeoGeoProfile,
     frozen: bool,
+    breakpoints: BTreeMap<u64, NeoGeoBreakpoint>,
+    next_breakpoint_id: u64,
+    events: VecDeque<Value>,
+    last_hit_seq: u64,
+    next_reset_seq: u64,
+    adapter_home: PathBuf,
 }
 
 impl<G: GdbTransport> NeoGeoBridge<G> {
@@ -188,6 +239,16 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             system: system.into(),
             profile,
             frozen: false,
+            breakpoints: BTreeMap::new(),
+            next_breakpoint_id: 1,
+            events: VecDeque::new(),
+            last_hit_seq: 0,
+            next_reset_seq: 1,
+            adapter_home: std::env::var_os("EMUCAP_ADAPTER_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("emucap-neogeo-{}", std::process::id()))
+                }),
         })
     }
 
@@ -211,6 +272,12 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "step_instructions" => self.step_instructions(&req.params),
             "run_frames" => self.run_frames(&req.params),
             "reset" => self.reset(),
+            "set_breakpoint" => self.set_breakpoint(&req.params),
+            "clear_breakpoint" => self.clear_breakpoint(&req.params),
+            "list_breakpoints" => self.list_breakpoints(),
+            "clear_all_breakpoints" => self.clear_all_breakpoints(),
+            "poll_events" => self.poll_events(&req.params),
+            "disassemble" => self.disassemble(&req.params),
             other => Err(BridgeError::UnknownMethod(other.into())),
         };
         match result {
@@ -263,7 +330,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "methods": methods,
             "memory_types": ["ram"],
             "region_sizes": {"ram": ram_size},
-            "breakpoint_kinds": [],
+            "breakpoint_kinds": breakpoint_kinds(),
             "contracts": crate::contracts::advertisement_value(self.profile.active_exceptions()),
             "input_buttons": {"system": self.system, "buttons": input_buttons},
             "capability_notes": {
@@ -305,6 +372,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     fn status(&mut self) -> BridgeResult<Value> {
+        self.drain_breakpoint_packets()?;
         let methods = self.profile.methods();
         let (_, ram_size) = self.profile.ram();
         let input_buttons = self.profile.input_buttons();
@@ -322,7 +390,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "methods": methods,
             "memory_types": ["ram"],
             "region_sizes": {"ram": ram_size},
-            "breakpoint_kinds": [],
+            "breakpoint_kinds": breakpoint_kinds(),
             "input_buttons": {"system": self.system, "buttons": input_buttons, "available": fields},
             "input_override": input_override,
             "execution_limits": {
@@ -534,6 +602,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn pause(&mut self, params: &Value) -> BridgeResult<Value> {
         require_main_cpu(params)?;
+        self.drain_breakpoint_packets()?;
         if !self.frozen {
             let response = self.gdb.interrupt()?;
             if !is_stop(&response) {
@@ -548,6 +617,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn resume(&mut self, params: &Value) -> BridgeResult<Value> {
         require_main_cpu(params)?;
+        self.drain_breakpoint_packets()?;
         if self.frozen {
             self.gdb.send_no_reply("c")?;
             self.frozen = false;
@@ -587,6 +657,16 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         self.require_frozen("instruction step")?;
         for _ in 0..count {
             let response = self.gdb.send("s")?;
+            if is_breakpoint_stop(&response) {
+                let event = self.record_breakpoint_hit(response)?;
+                return Ok(json!({
+                    "status":"interrupted",
+                    "reason":"breakpoint",
+                    "breakpoint_id":event["id"],
+                    "event":event,
+                    "state":"frozen",
+                }));
+            }
             if !is_stop(&response) {
                 return Err(BridgeError::Emulator(format!(
                     "MAME instruction step did not stop: {response}"
@@ -607,6 +687,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     fn frame_step(&mut self, count: u64, stop_on_done: bool) -> BridgeResult<Value> {
+        self.drain_breakpoint_packets()?;
         if stop_on_done {
             self.require_frozen("frame step")?;
         }
@@ -643,6 +724,17 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 )))
             }
         };
+        if is_breakpoint_stop(&response) {
+            let event = self.record_breakpoint_hit(response)?;
+            return Ok(json!({
+                "status":"interrupted",
+                "reason":"breakpoint",
+                "breakpoint_id":event["id"],
+                "event":event,
+                "frame_before":before,
+                "state":"frozen",
+            }));
+        }
         if response != "OK" {
             return Err(BridgeError::Emulator(format!(
                 "MAME {command} failed: {response}"
@@ -651,6 +743,12 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         self.frozen = stop_on_done;
         let after = self.current_frame()?;
         let frame_counter_delta = after.checked_sub(before);
+        if stop_on_done && frame_counter_delta != Some(count) {
+            self.frozen = true;
+            return Err(BridgeError::Emulator(format!(
+                "Neo Geo exact frame step completed with screen-frame delta {frame_counter_delta:?}, expected {count}"
+            )));
+        }
         Ok(json!({
             "status": "completed",
             "unit": "frames",
@@ -709,6 +807,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn press_buttons(&mut self, params: &Value) -> BridgeResult<Value> {
         require_port_zero(params)?;
+        self.drain_breakpoint_packets()?;
         let buttons = normalize_buttons(self.profile, params.get("buttons"))?;
         let frames = optional_num(params, "frames")?.unwrap_or(1).max(1);
         if frames > MAX_INPUT_FRAMES {
@@ -717,6 +816,18 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             )));
         }
         let response = self.lua_cmd("press", Some(&format!("{frames}:{}", buttons.join(","))))?;
+        if is_breakpoint_stop(&response) {
+            let event = self.record_breakpoint_hit(response)?;
+            return Ok(json!({
+                "status":"interrupted",
+                "reason":"breakpoint",
+                "breakpoint_id":event["id"],
+                "event":event,
+                "buttons":buttons,
+                "frames":frames,
+                "state":"frozen",
+            }));
+        }
         if response != "OK" {
             return Err(BridgeError::Emulator(format!(
                 "MAME input pulse failed: {response}"
@@ -727,9 +838,41 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     fn reset(&mut self) -> BridgeResult<Value> {
-        self.lua_cmd("reset", None)?;
+        let reset_seq = self.next_reset_seq;
+        self.next_reset_seq = self
+            .next_reset_seq
+            .checked_add(1)
+            .ok_or_else(|| BridgeError::BadState("Neo Geo reset sequence is exhausted".into()))?;
+        let response = match self.lua_cmd("resetsync", Some(&reset_seq.to_string())) {
+            Ok(response) => response,
+            Err(error) => {
+                self.fail_all_breakpoints_after_reset(&error.to_string());
+                return Err(error);
+            }
+        };
+        let expected = format!("OK:{reset_seq}");
+        if response != expected {
+            let message = format!(
+                "MAME synchronous reset expected sequence {reset_seq}, received {response}"
+            );
+            self.fail_all_breakpoints_after_reset(&message);
+            return Err(BridgeError::Emulator(message));
+        }
         self.frozen = false;
-        Ok(json!({"reset": "scheduled", "state": "running"}))
+        Ok(json!({
+            "status": "completed",
+            "reset": "completed",
+            "state": "running",
+            "reset_seq": reset_seq,
+        }))
+    }
+
+    fn fail_all_breakpoints_after_reset(&mut self, reason: &str) {
+        for breakpoint in self.breakpoints.values_mut() {
+            breakpoint.backend_id = None;
+            breakpoint.arm_state =
+                NeoGeoArmState::Failed(format!("reset could not verify native point: {reason}"));
+        }
     }
 
     fn current_frame(&mut self) -> BridgeResult<u64> {

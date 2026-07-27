@@ -1,29 +1,42 @@
-//! Stock openMSX XML-control bridge.
+//! Pinned openMSX XML-control bridge.
 //!
 //! openMSX already exposes the execution, debugger, input, screenshot, and
 //! savestate primitives needed by the first MSX cartridge profile.  This
-//! module keeps that emulator unmodified and translates its XML stdio control
-//! channel into emucap's NDJSON adapter protocol.
+//! module translates its XML stdio channel into emucap's NDJSON adapter
+//! protocol and uses the pinned host extension for readback-checked joystick
+//! ownership.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
 use serde_json::{json, Value};
-use sha1::{Digest as Sha1Digest, Sha1};
-use sha2::Sha256;
 
+use crate::launch::openmsx::{
+    MediaKind, OpenMsxProfile, PreparedSession, REQUIRED_HOST_API as OPENMSX_HOST_API,
+};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
+#[path = "openmsx_bridge/breakpoints.rs"]
+mod breakpoints;
+#[path = "openmsx_bridge/frame.rs"]
+mod frame;
 #[path = "openmsx_bridge/input.rs"]
 mod input;
+#[path = "openmsx_bridge/joystick.rs"]
+mod joystick;
+#[path = "openmsx_bridge/state.rs"]
+mod state;
 #[path = "openmsx_bridge/xml.rs"]
 mod xml;
 
+use breakpoints::{breakpoint_kinds, PublicBreakpoint, DEBUGGER_EXCEPTION};
 #[cfg(test)]
 use input::button_position;
-use input::{normalize_buttons, require_port_zero, row_masks, INPUT_BUTTONS};
+use input::{
+    input_port, joystick_buttons, joystick_mask, normalize_joystick_buttons,
+    normalize_keyboard_buttons, row_masks, InputPort, JOYSTICK_BUTTONS, KEYBOARD_BUTTONS,
+};
 pub use xml::XmlControl;
 
 const MAX_MEMORY_TRANSFER: u64 = 16 * 1024;
@@ -44,15 +57,21 @@ const BASE_METHODS: &[&str] = &[
     "save_state",
     "load_state",
     "reset",
+    "set_breakpoint",
+    "clear_breakpoint",
+    "list_breakpoints",
+    "clear_all_breakpoints",
+    "poll_events",
+    "disassemble",
 ];
 const BASE_EXCEPTIONS: &[&str] = &[
     "openmsx.state-read.frozen-only",
     "openmsx.memory-read.frozen-only",
     "openmsx.memory-read.bounded",
     "openmsx.memory-write.frozen-only",
-    "openmsx.input-hold.port-zero-only",
     "openmsx.input-pulse.constraints",
     "openmsx.execution-step.z80-only",
+    DEBUGGER_EXCEPTION,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -84,14 +103,19 @@ pub trait OpenMsxControl {
 
 pub struct OpenMsxBridge<C> {
     control: C,
-    content: PathBuf,
-    content_sha1: String,
-    content_size: u64,
+    session: PreparedSession,
     runtime_home: PathBuf,
     display: bool,
     frozen: bool,
     region_sizes: BTreeMap<&'static str, u64>,
     held_buttons: BTreeSet<String>,
+    joystick_owners: [Option<u8>; 2],
+    breakpoints: BTreeMap<u64, PublicBreakpoint>,
+    next_breakpoint_id: u64,
+    debug_events: VecDeque<Value>,
+    last_hit_seq: u64,
+    debugger_fatal: Option<String>,
+    frame_probe_native_id: Option<String>,
     screenshot_sequence: u64,
     name: Option<String>,
     session_token: Option<String>,
@@ -101,21 +125,28 @@ pub struct OpenMsxBridge<C> {
 impl<C: OpenMsxControl> OpenMsxBridge<C> {
     pub fn new(
         mut control: C,
-        content: &Path,
+        session: &PreparedSession,
         runtime_home: &Path,
         display: bool,
     ) -> BridgeResult<Self> {
+        let profile = session.verify()?;
+        if profile == OpenMsxProfile::MsxTurboR {
+            return Err(OpenMsxBridgeError::Unsupported(
+                "MSX turboR requires a separately proven active Z80/R800 bridge".into(),
+            ));
+        }
         if control.command("openmsx_info version")? != "openMSX 21.0" {
             return Err(OpenMsxBridgeError::Unsupported(
                 "the MSX adapter requires openMSX 21.0".into(),
             ));
         }
-        if control.command("machine_info config_name")? != "C-BIOS_MSX2+"
-            || control.command("machine_info type")? != "MSX2+"
+        if control.command("machine_info config_name")? != session.machine
+            || control.command("machine_info type")? != session.machine_type
         {
-            return Err(OpenMsxBridgeError::Unsupported(
-                "the first MSX profile requires the C-BIOS_MSX2+ machine".into(),
-            ));
+            return Err(OpenMsxBridgeError::Unsupported(format!(
+                "{} requires openMSX machine {} ({})",
+                session.system, session.machine, session.machine_type
+            )));
         }
         control.command("openmsx_update enable setting")?;
         control.command("set throttle off")?;
@@ -141,32 +172,49 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "ram",
             parse_decimal(&control.command("debug size {Main RAM}")?, "Main RAM size")?,
         );
-        if region_sizes["memory"] != 65_536
-            || region_sizes["vram"] != 131_072
-            || region_sizes["ram"] != 524_288
+        let (memory, ram, vram) = profile.expected_region_sizes();
+        if region_sizes["memory"] != memory
+            || region_sizes["vram"] != vram
+            || region_sizes["ram"] != ram
         {
             return Err(OpenMsxBridgeError::Unsupported(format!(
-                "C-BIOS_MSX2+ memory layout changed: {region_sizes:?}"
+                "{} memory layout changed: {region_sizes:?}",
+                session.machine
             )));
         }
+        if parse_decimal(
+            &control.command("debug size emucap_joystick_override")?,
+            "emucap joystick override size",
+        )? != 2
+        {
+            return Err(OpenMsxBridgeError::Unsupported(
+                "the MSX adapter requires the pinned joystick-override host API".into(),
+            ));
+        }
 
-        let bytes = fs::read(content)?;
-        let content_sha1 = format!("{:x}", Sha1::digest(&bytes));
-        Ok(Self {
+        let mut bridge = Self {
             control,
-            content: content.to_path_buf(),
-            content_sha1,
-            content_size: bytes.len() as u64,
+            session: session.clone(),
             runtime_home: runtime_home.to_path_buf(),
             display,
             frozen: true,
             region_sizes,
             held_buttons: BTreeSet::new(),
+            joystick_owners: [None; 2],
+            breakpoints: BTreeMap::new(),
+            next_breakpoint_id: 1,
+            debug_events: VecDeque::new(),
+            last_hit_seq: 0,
+            debugger_fatal: None,
+            frame_probe_native_id: None,
             screenshot_sequence: 0,
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
-        })
+        };
+        bridge.require_runtime_identity("initialization")?;
+        bridge.initialize_debugger()?;
+        Ok(bridge)
     }
 
     pub fn child_pid(&self) -> u32 {
@@ -174,7 +222,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.control.is_terminal()
+        self.control.is_terminal() || self.debugger_fatal.is_some()
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {
@@ -199,6 +247,12 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "save_state" => self.save_state(&request.params),
             "load_state" => self.load_state(&request.params),
             "reset" => self.reset(),
+            "set_breakpoint" => self.set_breakpoint(&request.params),
+            "clear_breakpoint" => self.clear_breakpoint(&request.params),
+            "list_breakpoints" => self.list_breakpoints(),
+            "clear_all_breakpoints" => self.clear_all_breakpoints(),
+            "poll_events" => self.poll_events(&request.params),
+            "disassemble" => self.disassemble(&request.params),
             other => Err(OpenMsxBridgeError::UnknownMethod(other.into())),
         };
         match result {
@@ -239,25 +293,33 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     fn hello(&self) -> BridgeResult<Value> {
         let mut value = json!({
             "protocol_version": PROTOCOL_VERSION,
-            "system": "msx",
+            "system": self.session.system,
             "adapter": "openmsx-rust-xml",
             "backend": "openMSX 21.0",
+            "host_api": OPENMSX_HOST_API,
             "debugger": true,
             "methods": self.methods(),
             "memory_types": ["memory", "ram", "vram"],
             "region_sizes": self.region_sizes,
-            "breakpoint_kinds": [],
+            "breakpoint_kinds": breakpoint_kinds(),
             "contracts": crate::contracts::advertisement_value(&self.active_exceptions()),
             "capability_notes": {
-                "machine": "C-BIOS_MSX2+",
-                "media": "cartridge",
+                "machine": self.session.machine,
+                "machine_type": self.session.machine_type,
+                "media": self.session.media.kind.as_str(),
+                "firmware_manifest_sha256": self.session.firmware_manifest_sha256,
                 "cpu": ["z80"],
                 "step_units": ["frames", "instructions"],
+                "input_ports": {
+                    "0": "keyboard",
+                    "1": "joystick",
+                    "2": "joystick"
+                },
                 "display": self.display,
                 "headless_screenshot": false,
             },
-            "content": self.content.display().to_string(),
-            "content_sha1": self.content_sha1,
+            "content": self.session.media.source_path.display().to_string(),
+            "content_sha1": self.session.media.source_sha1,
             "build": std::env::var("EMUCAP_BUILD_HASH").unwrap_or_else(|_| "openmsx-21.0".into()),
         });
         let object = value.as_object_mut().expect("openMSX hello is an object");
@@ -274,11 +336,16 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     }
 
     fn status(&mut self) -> BridgeResult<Value> {
+        self.drain_debug_events()?;
         self.refresh_execution_state()?;
         let input_matrix = self.input_matrix()?;
+        let joystick_owners = self.checked_joystick_owners()?;
+        let joystick_values = [self.guest_joystick_value(0)?, self.guest_joystick_value(1)?];
+        let any_input_override =
+            !self.held_buttons.is_empty() || joystick_owners.iter().any(Option::is_some);
         Ok(json!({
             "connected": !self.control.is_terminal(),
-            "system": "msx",
+            "system": self.session.system,
             "adapter": "openmsx-rust-xml",
             "backend": "openMSX 21.0",
             "state": if self.frozen { "frozen" } else { "running" },
@@ -286,19 +353,57 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "methods": self.methods(),
             "memory_types": ["memory", "ram", "vram"],
             "region_sizes": self.region_sizes,
-            "breakpoint_kinds": [],
-            "input_override": !self.held_buttons.is_empty(),
+            "breakpoint_kinds": breakpoint_kinds(),
+            "queued_events": self.debug_events.len(),
+            "debugger_fatal": self.debugger_fatal.as_deref(),
+            "input_override": any_input_override,
+            "input_owner": {
+                "keyboard": if self.held_buttons.is_empty() { "native" } else { "persistent" },
+                "joystick1": if joystick_owners[0].is_some() { "persistent" } else { "native" },
+                "joystick2": if joystick_owners[1].is_some() { "persistent" } else { "native" },
+            },
             "input_matrix": input_matrix,
+            "joystick_ports": [
+                {
+                    "port": 1,
+                    "engaged": joystick_owners[0].is_some(),
+                    "active_low_mask": joystick_owners[0],
+                    "guest_value": joystick_values[0],
+                    "buttons": joystick_owners[0].map(joystick_buttons).unwrap_or_default(),
+                },
+                {
+                    "port": 2,
+                    "engaged": joystick_owners[1].is_some(),
+                    "active_low_mask": joystick_owners[1],
+                    "guest_value": joystick_values[1],
+                    "buttons": joystick_owners[1].map(joystick_buttons).unwrap_or_default(),
+                }
+            ],
             "input_buttons": {
                 "system": "msx",
-                "buttons": INPUT_BUTTONS,
+                "buttons": KEYBOARD_BUTTONS,
                 "aliases": {
                     "start": "enter",
                     "return": "enter",
                     "fire1": "space",
                     "fire2": "ctrl"
                 },
-                "notes": "The first MSX profile injects the standard MSX keyboard matrix. A/B are keyboard letters, not joystick buttons."
+                "devices": [
+                    {"port": 0, "device": "keyboard", "buttons": KEYBOARD_BUTTONS},
+                    {
+                        "port": 1,
+                        "device": "joystick",
+                        "buttons": JOYSTICK_BUTTONS,
+                        "aliases": {"fire1": "a", "fire2": "b", "button1": "a", "button2": "b"}
+                    },
+                    {
+                        "port": 2,
+                        "device": "joystick",
+                        "buttons": JOYSTICK_BUTTONS,
+                        "aliases": {"fire1": "a", "fire2": "b", "button1": "a", "button2": "b"}
+                    }
+                ],
+                "notes": "Port 0 is the standard MSX keyboard matrix. Ports 1 and 2 are independent active-low MSX joysticks."
             },
             "backend_pid": self.control.child_pid(),
             "launch_id": self.launch_id,
@@ -307,12 +412,15 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn get_rom_info(&self) -> BridgeResult<Value> {
         Ok(json!({
-            "system": "msx",
-            "machine": "C-BIOS_MSX2+",
-            "media": "cartridge",
-            "path": self.content.display().to_string(),
-            "sha1": self.content_sha1,
-            "size": self.content_size,
+            "system": self.session.system,
+            "machine": self.session.machine,
+            "machine_type": self.session.machine_type,
+            "media": self.session.media.kind.as_str(),
+            "path": self.session.media.source_path.display().to_string(),
+            "sha1": self.session.media.source_sha1,
+            "size": self.session.media.source_size,
+            "mounted_path": self.session.media.mounted_path.display().to_string(),
+            "firmware_manifest_sha256": self.session.firmware_manifest_sha256,
         }))
     }
 
@@ -398,8 +506,33 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn pause(&mut self, params: &Value) -> BridgeResult<Value> {
         require_z80(params)?;
+        self.refresh_execution_state()?;
+        if self.frozen {
+            return Ok(json!({
+                "status": "completed",
+                "state": "frozen",
+                "frame": self.current_frame()?,
+            }));
+        }
         self.control.command("set pause on")?;
-        self.frozen = true;
+        if let Err(primary) = self.control.command("debug break") {
+            let cleanup = self
+                .release_debug_break()
+                .and_then(|_| self.control.command("set pause off").map(|_| ()))
+                .and_then(|_| self.refresh_execution_state());
+            return match cleanup {
+                Ok(()) if !self.frozen => Err(primary),
+                Ok(()) => self.fail_debugger(format!(
+                    "{primary}; pause rollback did not restore running state"
+                )),
+                Err(cleanup) => {
+                    self.fail_debugger(format!("{primary}; pause rollback also failed: {cleanup}"))
+                }
+            };
+        }
+        if let Err(error) = self.require_stop_conjunction("pause") {
+            return self.fail_debugger(error.to_string());
+        }
         Ok(json!({
             "status": "completed",
             "state": "frozen",
@@ -410,8 +543,21 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     fn resume(&mut self, params: &Value) -> BridgeResult<Value> {
         require_z80(params)?;
         self.release_debug_break()?;
-        self.control.command("set pause off")?;
-        self.frozen = false;
+        self.refresh_execution_state()?;
+        if self.frozen {
+            let dropped = self.drain_debug_events()?;
+            if !self.debug_events.is_empty() || dropped != 0 {
+                return Ok(json!({
+                    "status":"interrupted",
+                    "reason":"breakpoint",
+                    "state":"frozen",
+                    "event_pending":!self.debug_events.is_empty(),
+                }));
+            }
+            return Err(OpenMsxBridgeError::Emulator(
+                "openMSX resumed into a stop without a breakpoint event".into(),
+            ));
+        }
         Ok(json!({"status": "completed", "state": "running"}))
     }
 
@@ -445,11 +591,58 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn frame_step(&mut self, count: u64) -> BridgeResult<Value> {
         self.require_frozen("frame step")?;
-        self.release_debug_break()?;
+        self.prepare_temporal_request("frame step")?;
         let before = self.current_frame()?;
-        self.control.advance_frames(count)?;
-        self.frozen = true;
+        if let Err(primary) = self.control.advance_frames(count) {
+            let diagnostic = self
+                .control
+                .command("::emucap::frame_debug")
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            let cleanup = self
+                .control
+                .command("::emucap::cancel_frame")
+                .and_then(|_| self.control.command("set pause on"))
+                .and_then(|_| self.control.command("debug break"))
+                .and_then(|_| self.require_stop_conjunction("failed frame step cleanup"));
+            return match cleanup {
+                Ok(()) => Err(OpenMsxBridgeError::Emulator(format!(
+                    "{primary}; frame diagnostic: {diagnostic}"
+                ))),
+                Err(cleanup) => self.fail_debugger(format!(
+                    "{primary}; frame diagnostic: {diagnostic}; \
+                     frame target cleanup also failed: {cleanup}"
+                )),
+            };
+        }
         let after = self.current_frame()?;
+        let dropped = self.drain_debug_events()?;
+        if !self.debug_events.is_empty() || dropped != 0 {
+            if let Err(error) = self.control.command("::emucap::cancel_frame") {
+                return self.fail_debugger(format!(
+                    "breakpoint interrupted frame step but target cleanup failed: {error}"
+                ));
+            }
+            self.require_stop_conjunction("breakpoint-interrupted frame step")?;
+            return Ok(json!({
+                "status":"interrupted",
+                "reason":"breakpoint",
+                "unit":"frames",
+                "count":after.saturating_sub(before),
+                "requested":count,
+                "frame_before":before,
+                "frame":after,
+                "state":"frozen",
+                "event_pending":!self.debug_events.is_empty(),
+            }));
+        }
+        if self.control.command("debug breaked")?.trim() == "1" {
+            return self.fail_debugger(
+                "openMSX entered CPU debug break without a valid callback event".into(),
+            );
+        }
+        self.control.command("debug break")?;
+        self.control.command("set pause on")?;
+        self.require_stop_conjunction("frame step")?;
         if after != before + count {
             return Err(OpenMsxBridgeError::Emulator(format!(
                 "openMSX frame step mismatch: expected {}, observed {after}",
@@ -468,21 +661,34 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn instruction_step(&mut self, count: u64) -> BridgeResult<Value> {
         self.require_frozen("instruction step")?;
-        self.control.command("debug break")?;
-        if self.control.command("debug breaked")? != "1" {
-            return Err(OpenMsxBridgeError::Emulator(
-                "openMSX did not enter CPU debug break".into(),
-            ));
-        }
+        self.prepare_temporal_request("instruction step")?;
         let pc_before = parse_decimal(&self.control.command("reg PC")?, "PC")?;
+        let mut completed = 0_u64;
         for _ in 0..count {
             self.control.command("debug step")?;
+            completed += 1;
+            self.control.command("set pause on")?;
+            let dropped = self.drain_debug_events()?;
+            if !self.debug_events.is_empty() || dropped != 0 {
+                self.require_stop_conjunction("breakpoint-interrupted instruction step")?;
+                return Ok(json!({
+                    "status":"interrupted",
+                    "reason":"breakpoint",
+                    "unit":"instructions",
+                    "cpu":"z80",
+                    "count":completed,
+                    "requested":count,
+                    "pc_before":pc_before,
+                    "pc":parse_decimal(&self.control.command("reg PC")?, "PC")?,
+                    "frame":self.current_frame()?,
+                    "state":"frozen",
+                    "event_pending":!self.debug_events.is_empty(),
+                }));
+            }
         }
         let pc = parse_decimal(&self.control.command("reg PC")?, "PC")?;
-        // `debug break` owns the CPU stop, but it may release the global pause
-        // setting. Reassert the public frozen invariant before replying.
         self.control.command("set pause on")?;
-        self.frozen = true;
+        self.require_stop_conjunction("instruction step")?;
         Ok(json!({
             "status": "completed",
             "unit": "instructions",
@@ -496,46 +702,75 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     }
 
     fn set_input(&mut self, params: &Value) -> BridgeResult<Value> {
-        require_port_zero(params)?;
-        let buttons = normalize_buttons(params.get("buttons"))?;
-        self.apply_buttons(&buttons)?;
-        Ok(json!({
-            "buttons": buttons,
-            "mode": if self.held_buttons.is_empty() { "native" } else { "persistent" },
-            "input_override": !self.held_buttons.is_empty(),
-        }))
+        match input_port(params)? {
+            InputPort::Keyboard => {
+                let buttons = normalize_keyboard_buttons(params.get("buttons"))?;
+                self.apply_buttons(&buttons)?;
+                Ok(json!({
+                    "port": 0,
+                    "device": "keyboard",
+                    "buttons": buttons,
+                    "mode": if self.held_buttons.is_empty() { "native" } else { "persistent" },
+                    "input_override": !self.held_buttons.is_empty(),
+                }))
+            }
+            InputPort::Joystick(index) => {
+                let buttons = normalize_joystick_buttons(params.get("buttons"))?;
+                let desired = (!buttons.is_empty()).then(|| joystick_mask(&buttons));
+                self.apply_joystick_owner(index, desired)?;
+                Ok(json!({
+                    "port": index + 1,
+                    "device": "joystick",
+                    "buttons": buttons,
+                    "active_low_mask": desired,
+                    "mode": if desired.is_some() { "persistent" } else { "native" },
+                    "input_override": desired.is_some(),
+                }))
+            }
+        }
     }
 
     fn press_buttons(&mut self, params: &Value) -> BridgeResult<Value> {
-        require_port_zero(params)?;
-        let buttons = normalize_buttons(params.get("buttons"))?;
-        if buttons.is_empty() {
-            return Err(OpenMsxBridgeError::BadParams(
-                "press_buttons requires at least one button".into(),
-            ));
-        }
         let frames = optional_num(params, "frames")?.unwrap_or(1);
         if !(1..=MAX_INPUT_FRAMES).contains(&frames) {
             return Err(OpenMsxBridgeError::BadParams(format!(
                 "press_buttons frames must be in 1..={MAX_INPUT_FRAMES}"
             )));
         }
+        match input_port(params)? {
+            InputPort::Keyboard => {
+                let buttons = normalize_keyboard_buttons(params.get("buttons"))?;
+                self.press_keyboard_buttons(buttons, frames)
+            }
+            InputPort::Joystick(index) => {
+                let buttons = normalize_joystick_buttons(params.get("buttons"))?;
+                self.press_joystick_buttons(index, buttons, frames)
+            }
+        }
+    }
+
+    fn press_keyboard_buttons(
+        &mut self,
+        buttons: BTreeSet<String>,
+        frames: u64,
+    ) -> BridgeResult<Value> {
+        if buttons.is_empty() {
+            return Err(OpenMsxBridgeError::BadParams(
+                "press_buttons requires at least one button".into(),
+            ));
+        }
         self.refresh_execution_state()?;
         let was_running = !self.frozen;
         if was_running {
-            self.control.command("set pause on")?;
-            self.frozen = true;
+            self.pause(&json!({}))?;
         }
         let persistent = self.held_buttons.clone();
         let mut combined = persistent.clone();
         combined.extend(buttons.iter().cloned());
         if let Err(primary) = self.apply_buttons(&combined) {
             if was_running {
-                return match self.control.command("set pause off") {
-                    Ok(_) => {
-                        self.frozen = false;
-                        Err(primary)
-                    }
+                return match self.resume(&json!({})) {
+                    Ok(_) => Err(primary),
                     Err(restore) => Err(OpenMsxBridgeError::Emulator(format!(
                         "{primary}; execution-state restore also failed: {restore}"
                     ))),
@@ -544,17 +779,31 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             return Err(primary);
         }
         let pulse = self.frame_step(frames);
+        let interrupted = pulse
+            .as_ref()
+            .is_ok_and(|value| value.get("status").and_then(Value::as_str) == Some("interrupted"));
         let release = self.apply_buttons(&persistent);
-        let resume = if was_running {
-            self.control.command("set pause off").map(|_| {
-                self.frozen = false;
-            })
+        let resume = if was_running && !interrupted {
+            self.resume(&json!({})).map(|_| ())
         } else {
             Ok(())
         };
-        finish_input_pulse(pulse, release, resume)?;
+        let mut pulse = finish_input_pulse(pulse, release, resume)?;
+        if interrupted {
+            let object = pulse.as_object_mut().expect("step result is an object");
+            object.insert("port".into(), json!(0));
+            object.insert("device".into(), json!("keyboard"));
+            object.insert("buttons".into(), json!(buttons));
+            object.insert(
+                "input_override".into(),
+                json!(!self.held_buttons.is_empty()),
+            );
+            return Ok(pulse);
+        }
         Ok(json!({
             "status": "completed",
+            "port": 0,
+            "device": "keyboard",
             "buttons": buttons,
             "frames": frames,
             "state": if was_running { "running" } else { "frozen" },
@@ -562,120 +811,60 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         }))
     }
 
-    fn save_state(&mut self, params: &Value) -> BridgeResult<Value> {
-        self.require_frozen("save_state")?;
-        let path = state_path(params)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let path_var = tcl_utf8_value(&path)?;
-        self.control.command(&format!(
-            "set emucap_path {path_var}; store_machine [machine] $emucap_path"
-        ))?;
-        if !path.is_file() {
-            return Err(OpenMsxBridgeError::Emulator(format!(
-                "openMSX did not create savestate {}",
-                path.display()
-            )));
-        }
-        Ok(json!({
-            "status": "completed",
-            "saved": path.display().to_string(),
-            "state": "frozen",
-        }))
-    }
-
-    fn load_state(&mut self, params: &Value) -> BridgeResult<Value> {
-        self.require_frozen("load_state")?;
-        let path = state_path(params)?;
-        if !path.is_file() {
-            return Err(OpenMsxBridgeError::BadParams(format!(
-                "savestate does not exist: {}",
-                path.display()
-            )));
-        }
-        let path_var = tcl_utf8_value(&path)?;
-        self.control.command(&format!(
-            "set emucap_path {path_var}; set newID [restore_machine $emucap_path]; \
-             set oldID [machine]; if {{$oldID ne \"\"}} {{delete_machine $oldID}}; \
-             activate_machine $newID; set pause on"
-        ))?;
-        self.frozen = true;
-        let held = self.held_buttons.clone();
-        self.release_supported_keys()?;
-        self.press_key_set(&held)?;
-        Ok(json!({
-            "status": "completed",
-            "loaded": path.display().to_string(),
-            "state": "frozen",
-            "frame": self.current_frame()?,
-        }))
-    }
-
-    fn reset(&mut self) -> BridgeResult<Value> {
-        let held = self.held_buttons.clone();
-        self.release_supported_keys()?;
-        self.control.command("reset; set pause on")?;
-        self.frozen = true;
-        self.press_key_set(&held)?;
-        Ok(json!({
-            "status": "completed",
-            "state": "frozen",
-            "frame": self.current_frame()?,
-        }))
-    }
-
-    fn screenshot(&mut self) -> BridgeResult<Value> {
-        self.require_frozen("screenshot")?;
-        let before = self.current_frame()?;
-        self.screenshot_sequence += 1;
-        let directory = self.runtime_home.join("screenshots");
-        fs::create_dir_all(&directory)?;
-        let path = directory.join(format!(
-            "capture-{}-{}.png",
-            std::process::id(),
-            self.screenshot_sequence
-        ));
-        let result = (|| {
-            let path_var = tcl_utf8_value(&path)?;
-            self.control.command(&format!(
-                "set emucap_path {path_var}; screenshot -raw -size 320 $emucap_path"
-            ))?;
-            let png = fs::read(&path)?;
-            if png.len() < 24 || &png[..8] != b"\x89PNG\r\n\x1a\n" || &png[12..16] != b"IHDR" {
-                return Err(OpenMsxBridgeError::Protocol(
-                    "openMSX screenshot is not a complete PNG".into(),
-                ));
-            }
-            let after = self.current_frame()?;
-            if after != before {
-                return Err(OpenMsxBridgeError::Emulator(format!(
-                    "openMSX screenshot advanced guest time: {before} -> {after}"
-                )));
-            }
-            let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
-            let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
-            let sha256 = format!("{:x}", Sha256::digest(&png));
-            Ok(json!({
-                "png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
-                "sha256": sha256,
-                "byte_len": png.len(),
-                "width": width,
-                "height": height,
-                "frame": before,
-                "frame_before": before,
-                "frame_after": after,
-                "frame_stable": true,
-                "state": "frozen",
-                "freshness": "current_screen",
-            }))
-        })();
-        let _ = fs::remove_file(path);
-        result
-    }
-
     fn refresh_execution_state(&mut self) -> BridgeResult<()> {
-        self.frozen = matches!(self.control.command("set pause")?.as_str(), "true" | "1");
+        let (paused, breaked) = self.query_stop_state()?;
+        if paused != breaked {
+            self.frozen = false;
+            return Err(OpenMsxBridgeError::Emulator(format!(
+                "openMSX stop mechanisms diverged: pause={paused}, debug_break={breaked}"
+            )));
+        }
+        self.frozen = paused;
+        Ok(())
+    }
+
+    fn require_runtime_identity(&mut self, operation: &str) -> BridgeResult<()> {
+        let machine = self.control.command("machine_info config_name")?;
+        let machine_type = self.control.command("machine_info type")?;
+        if machine != self.session.machine || machine_type != self.session.machine_type {
+            return Err(OpenMsxBridgeError::Emulator(format!(
+                "openMSX identity drift during {operation}: expected {} ({}), observed {machine} ({machine_type})",
+                self.session.machine, self.session.machine_type
+            )));
+        }
+        let media_slot = match self.session.media.kind {
+            MediaKind::Cartridge => "carta",
+            MediaKind::Disk => "diska",
+            MediaKind::Cassette => "cassetteplayer",
+        };
+        let encoded = self.control.command(&format!(
+            "binary encode hex [encoding convertto utf-8 \
+             [dict get [machine_info media {media_slot}] target]]"
+        ))?;
+        let bytes = hex::decode(encoded.trim()).map_err(|error| {
+            OpenMsxBridgeError::Protocol(format!(
+                "openMSX returned invalid mounted-media path hex: {error}"
+            ))
+        })?;
+        let observed = PathBuf::from(String::from_utf8(bytes).map_err(|error| {
+            OpenMsxBridgeError::Protocol(format!(
+                "openMSX returned a non-UTF-8 mounted-media path: {error}"
+            ))
+        })?);
+        let expected = fs::canonicalize(&self.session.media.mounted_path)?;
+        let observed = fs::canonicalize(&observed).map_err(|error| {
+            OpenMsxBridgeError::Emulator(format!(
+                "openMSX mounted-media path is not accessible during {operation}: {}: {error}",
+                observed.display()
+            ))
+        })?;
+        if observed != expected {
+            return Err(OpenMsxBridgeError::Emulator(format!(
+                "openMSX media identity drift during {operation}: expected {}, observed {}",
+                expected.display(),
+                observed.display()
+            )));
+        }
         Ok(())
     }
 
@@ -692,8 +881,8 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn current_frame(&mut self) -> BridgeResult<u64> {
         parse_decimal(
-            &self.control.command("machine_info VDP_frame_count")?,
-            "VDP frame count",
+            &self.control.command("::emucap::frame_seq")?,
+            "emucap frame sequence",
         )
     }
 
@@ -764,7 +953,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     }
 
     fn release_supported_keys(&mut self) -> BridgeResult<()> {
-        for (row, mask) in row_masks(INPUT_BUTTONS.iter().copied()) {
+        for (row, mask) in row_masks(KEYBOARD_BUTTONS.iter().copied()) {
             self.control.command(&format!("keymatrixup {row} {mask}"))?;
         }
         Ok(())

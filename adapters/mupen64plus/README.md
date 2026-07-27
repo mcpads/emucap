@@ -21,18 +21,19 @@ emucap-owned configuration directory. Both modes load the pinned SDL input and R
 `display: true` also loads the pinned Rice video plugin. The frontend writes its controller and
 screenshot configuration only inside that runtime directory.
 
-The common surface is status and ROM identity, pause/resume, R4300 state and exact instruction
-stepping, bounded RDRAM reads/writes while frozen, and port-0 `set_input`. An empty input set
-releases the injected scancodes without disabling native keyboard state.
+The common surface is status and ROM identity, pause/resume, synchronous reset, R4300 state and
+exact instruction stepping, bounded RDRAM reads/writes while frozen, port-0 `set_input`,
+R4300 exec/read/write breakpoints with hit-time evidence, event polling, and disassembly. An empty
+input set releases the injected scancodes without disabling native keyboard state.
 
-Visible launch additionally advertises rendered-frame stepping, bounded `press_buttons`, PNG
-screenshot, and native save/load. Its callback barrier freezes inside the exact Mupen64Plus frame
-callback and rearms before releasing the preceding frame, so multiple display lists in one R4300
-task cannot escape between requests. The adapter does not combine that barrier with the core's
-separate frame-advance pause. Visible readiness remains false until the first rendered callback,
-so a caller cannot pause renderer initialization and move its latency into the first frame
-request. Frame and instruction counts use the shared 5,000-operation admission limit and a
-250-second total backend budget, below the outer deferred-request deadline.
+Visible launch additionally advertises rendered-frame stepping, bounded `run_frames`,
+`press_buttons`, PNG screenshot, and native save/load. Its callback barrier freezes inside the
+exact Mupen64Plus frame callback and rearms before releasing the preceding frame, so multiple
+display lists in one R4300 task cannot escape between requests. The adapter does not combine that
+barrier with the core's separate frame-advance pause. Visible readiness remains false until the
+first rendered callback, so a caller cannot pause renderer initialization and move its latency
+into the first frame request. Frame and instruction counts use the shared 5,000-operation
+admission limit and a 250-second total backend budget, below the outer deferred-request deadline.
 
 Screenshot and state requests are asynchronous upstream commands. Screenshot completion is
 reported by the video plugin after the core's display-list callback, so capture does not block the
@@ -64,7 +65,7 @@ callback registration fails after `CoreStartup`, the frontend detaches every att
 closes the ROM, shuts down the core, and unloads each library in reverse order. Dropping a prepared
 frontend before execution follows the same closure path.
 
-Headless launch has no video callback. It keeps instruction stepping and persistent input but
-omits frame step, input pulse, screenshot, and save/load because their completion currently
-depends on the rendered-frame barrier. Breakpoints, reset, `run_frames`, and RSP state remain
-unadvertised.
+Headless launch has no video callback. It keeps instruction stepping, persistent input, reset,
+R4300 breakpoints, event polling, and disassembly, but omits frame step, `run_frames`, input pulse,
+screenshot, and save/load because their completion currently depends on the rendered-frame
+barrier. RSP state remains unadvertised.

@@ -69,6 +69,7 @@ fi
 
 PATCHES=(
   "$HERE/patches/0001-fail-closed-core-worker-init.patch"
+  "$HERE/patches/0002-consume-breakpoint-latch.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -86,6 +87,9 @@ fi
 # This prevents an ignored generated tree from silently contributing hand edits to a signed build.
 PATCHED_MEMBERS=(
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/frontend.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/api_export.ver"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/debugger.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/m64p_debugger.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/workqueue.c"
@@ -160,6 +164,8 @@ else
 fi
 printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugSetCallbacks$'
 printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugStep$'
+printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugBreakpointConsume$'
+printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugDecodeOp$'
 
 ROM="$SRC/test/m64p_test_rom.v64"
 ROM_SHA="$(sha256_path "$ROM")"

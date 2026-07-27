@@ -147,7 +147,8 @@ pub(super) extern "C" fn debug_init_callback() {
 
 pub(super) extern "C" fn debug_update_callback(pc: u32) {
     LAST_PC.store(pc, Ordering::Release);
-    UPDATE_COUNT.fetch_add(1, Ordering::AcqRel);
+    let update = UPDATE_COUNT.fetch_add(1, Ordering::AcqRel) + 1;
+    frame::notify_debug_update(update);
 }
 
 pub(super) extern "C" fn debug_vi_callback() {

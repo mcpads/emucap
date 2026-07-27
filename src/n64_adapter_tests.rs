@@ -256,6 +256,90 @@ fn input_port_and_pulse_bound_are_fail_loud() {
 }
 
 #[test]
+fn breakpoint_specs_separate_virtual_exec_from_physical_rdram_access() {
+    let exec = debug::breakpoint_spec(&json!({
+        "kind":"exec",
+        "start":"0x80000100",
+        "pause_on_hit":true,
+    }))
+    .unwrap();
+    assert_eq!(exec.native.address, 0x8000_0100);
+    assert_eq!(exec.native.endaddr, 0x8000_0100);
+    assert_eq!(exec.native.flags, debug::BKP_ENABLED | debug::BKP_EXEC);
+
+    let read = debug::breakpoint_spec(&json!({
+        "kind":"read",
+        "memory_type":"rdram",
+        "start":0x20,
+        "end":0x23,
+        "pause_on_hit":true,
+        "snapshot":["rdram:0x40:4"],
+    }))
+    .unwrap();
+    assert_eq!(read.native.address, 0x20);
+    assert_eq!(read.native.endaddr, 0x23);
+    assert_eq!(read.native.flags, debug::BKP_ENABLED | debug::BKP_READ);
+    assert_eq!(read.snapshots[0].offset, 0x40);
+    assert_eq!(read.snapshots[0].length, 4);
+}
+
+#[test]
+fn breakpoint_specs_reject_ambiguous_or_unobservable_requests() {
+    for params in [
+        json!({"kind":"exec", "start":0x100, "end":0x104}),
+        json!({"kind":"access", "start":0x100}),
+        json!({"kind":"read", "memory_type":"rom", "start":0}),
+        json!({"kind":"write", "memory_type":"rdram", "start":RDRAM_SIZE}),
+        json!({"kind":"exec", "start":0x100, "pause_on_hit":false}),
+        json!({"kind":"exec", "start":0x100, "value":1}),
+    ] {
+        assert!(debug::breakpoint_spec(&params).is_err(), "{params}");
+    }
+}
+
+#[test]
+fn native_slot_identity_moves_only_after_a_lower_slot_is_removed() {
+    assert_eq!(debug::slot_after_clear(2, 1), Some(1));
+    assert_eq!(debug::slot_after_clear(1, 2), Some(1));
+    assert_eq!(debug::slot_after_clear(1, 1), None);
+}
+
+#[test]
+fn trigger_matching_requires_one_non_overlapping_public_range() {
+    let exec = debug::breakpoint_spec(&json!({"kind":"exec", "start":0x80000100_u64})).unwrap();
+    let same = debug::breakpoint_spec(&json!({"kind":"exec", "start":0x80000100_u64})).unwrap();
+    let other = debug::breakpoint_spec(&json!({"kind":"exec", "start":0x80000104_u64})).unwrap();
+    assert!(debug::ranges_overlap(&exec, &same));
+    assert!(!debug::ranges_overlap(&exec, &other));
+    assert!(debug::trigger_matches(
+        &exec,
+        debug::BKP_EXEC,
+        0,
+        0x8000_0100
+    ));
+    assert!(!debug::trigger_matches(
+        &exec,
+        debug::BKP_EXEC,
+        0,
+        0x8000_0104
+    ));
+}
+
+#[test]
+fn disassembly_uses_the_r4300_virtual_address_space_and_checks_its_boundary() {
+    assert_eq!(
+        debug::disassembly_range(&json!({"address":"0x80000100"}), 4).unwrap(),
+        (0x8000_0100, 16)
+    );
+    assert!(
+        debug::disassembly_range(&json!({"address":"0xfffffffc"}), 1).is_ok(),
+        "the final aligned instruction is within the 32-bit address space"
+    );
+    assert!(debug::disassembly_range(&json!({"address":"0xfffffffc"}), 2).is_err());
+    assert!(debug::disassembly_range(&json!({"address":0x1_0000_0000_u64}), 1).is_err());
+}
+
+#[test]
 fn png_header_validation_reports_dimensions() {
     let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
     png.extend_from_slice(&320u32.to_be_bytes());

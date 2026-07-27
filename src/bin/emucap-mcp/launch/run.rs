@@ -310,7 +310,7 @@ pub(crate) fn make_launch(
             super::mame_neogeo::launch_mame_neogeo(port, direct_reclaim, runtime, system, a)
         }
         "mupen64plus" => launch_mupen64plus(port, direct_reclaim, runtime, a),
-        "openmsx" => super::openmsx::launch_openmsx(port, direct_reclaim, runtime, a),
+        "openmsx" => super::openmsx::launch_openmsx(port, direct_reclaim, runtime, system, a),
         "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
         "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
         "pcsx2" => launch_pcsx2(port, direct_reclaim, runtime, a),

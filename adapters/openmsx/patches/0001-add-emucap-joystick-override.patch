@@ -1,0 +1,155 @@
+diff --git a/src/MSXMotherBoard.cc b/src/MSXMotherBoard.cc
+index 6df728bf4..4b77abe31 100644
+--- a/src/MSXMotherBoard.cc
++++ b/src/MSXMotherBoard.cc
+@@ -203,6 +203,14 @@ public:
+ 	void write(unsigned address, uint8_t value) override;
+ };
+ 
++class EmucapJoyOverrideDebuggable final : public SimpleDebuggable
++{
++public:
++	explicit EmucapJoyOverrideDebuggable(MSXMotherBoard& motherBoard);
++	[[nodiscard]] uint8_t read(unsigned address, EmuTime time) override;
++	void write(unsigned address, uint8_t value) override;
++};
++
+ class SettingObserver final : public Observer<Setting>
+ {
+ public:
+@@ -573,6 +581,8 @@ JoystickPortIf& MSXMotherBoard::getJoystickPort(unsigned port)
+ 			joystickPort[1] = std::make_unique<DummyJoystickPort>();
+ 		}
+ 		joyPortDebuggable = std::make_unique<JoyPortDebuggable>(*this);
++		emucapJoyOverrideDebuggable =
++			std::make_unique<EmucapJoyOverrideDebuggable>(*this);
+ 	}
+ 	return *joystickPort[port];
+ }
+@@ -1305,6 +1315,43 @@ void JoyPortDebuggable::write(unsigned /*address*/, uint8_t /*value*/)
+ }
+ 
+ 
++// class EmucapJoyOverrideDebuggable
++
++EmucapJoyOverrideDebuggable::EmucapJoyOverrideDebuggable(
++		MSXMotherBoard& motherBoard_)
++	: SimpleDebuggable(
++		motherBoard_, "emucap_joystick_override",
++		"emucap joystick input ownership", 2)
++{
++}
++
++uint8_t EmucapJoyOverrideDebuggable::read(unsigned address, EmuTime /*time*/)
++{
++	auto* port = dynamic_cast<JoystickPort*>(
++		&getMotherBoard().getJoystickPort(address));
++	if (!port || !port->isEmucapOverrideEngaged()) return 0;
++	return uint8_t(0x80 | port->getEmucapOverrideMask());
++}
++
++void EmucapJoyOverrideDebuggable::write(unsigned address, uint8_t value)
++{
++	auto* port = dynamic_cast<JoystickPort*>(
++		&getMotherBoard().getJoystickPort(address));
++	if (!port) {
++		throw CommandException(
++			"Joystick port ", address + 1, " is not available.");
++	}
++	if (value == 0xff) {
++		port->clearEmucapOverride();
++	} else if (value <= 0x3f) {
++		port->setEmucapOverride(value);
++	} else {
++		throw CommandException(
++			"emucap joystick override must be 0x00..0x3f or 0xff.");
++	}
++}
++
++
+ // class SettingObserver
+ 
+ SettingObserver::SettingObserver(MSXMotherBoard& motherBoard_)
+diff --git a/src/MSXMotherBoard.hh b/src/MSXMotherBoard.hh
+index fe6198a4c..4062b82c6 100644
+--- a/src/MSXMotherBoard.hh
++++ b/src/MSXMotherBoard.hh
+@@ -24,6 +24,7 @@ class CommandController;
+ class Debugger;
+ class DeviceInfo;
+ class EventDelay;
++class EmucapJoyOverrideDebuggable;
+ class ExtCmd;
+ class FastForwardHelper;
+ class HardwareConfig;
+@@ -320,6 +321,7 @@ private:
+ 	std::unique_ptr<CassettePortInterface> cassettePort;
+ 	std::array<std::unique_ptr<JoystickPortIf>, 2> joystickPort;
+ 	std::unique_ptr<JoyPortDebuggable> joyPortDebuggable;
++	std::unique_ptr<EmucapJoyOverrideDebuggable> emucapJoyOverrideDebuggable;
+ 	std::unique_ptr<RenShaTurbo> renShaTurbo;
+ 	std::unique_ptr<LedStatus> ledStatus;
+ 	VideoSourceSetting videoSourceSetting;
+diff --git a/src/input/JoystickPort.cc b/src/input/JoystickPort.cc
+index 0c29cae31..a9c199773 100644
+--- a/src/input/JoystickPort.cc
++++ b/src/input/JoystickPort.cc
+@@ -4,6 +4,7 @@
+ #include "PluggingController.hh"
+ #include "checked_cast.hh"
+ #include "serialize.hh"
++#include <cassert>
+ #include <memory>
+ 
+ namespace openmsx {
+@@ -38,7 +39,22 @@ void JoystickPort::plug(Pluggable& device, EmuTime time)
+ 
+ uint8_t JoystickPort::read(EmuTime time)
+ {
+-	return getPluggedJoyDev().read(time);
++	return emucapOverrideEngaged
++	     ? emucapOverrideMask
++	     : getPluggedJoyDev().read(time);
++}
++
++void JoystickPort::setEmucapOverride(uint8_t mask)
++{
++	assert(mask <= 0x3f);
++	emucapOverrideMask = mask;
++	emucapOverrideEngaged = true;
++}
++
++void JoystickPort::clearEmucapOverride()
++{
++	emucapOverrideMask = 0x3f;
++	emucapOverrideEngaged = false;
+ }
+ 
+ void JoystickPort::write(uint8_t value, EmuTime time)
+diff --git a/src/input/JoystickPort.hh b/src/input/JoystickPort.hh
+index 3d621b988..471793010 100644
+--- a/src/input/JoystickPort.hh
++++ b/src/input/JoystickPort.hh
+@@ -35,6 +35,13 @@ public:
+ 	[[nodiscard]] uint8_t read(EmuTime time) override;
+ 	void write(uint8_t value, EmuTime time) override;
+ 
++	void setEmucapOverride(uint8_t mask);
++	void clearEmucapOverride();
++	[[nodiscard]] bool isEmucapOverrideEngaged() const
++		{ return emucapOverrideEngaged; }
++	[[nodiscard]] uint8_t getEmucapOverrideMask() const
++		{ return emucapOverrideMask; }
++
+ 	template<typename Archive>
+ 	void serialize(Archive& ar, unsigned version);
+ 
+@@ -43,6 +49,8 @@ private:
+ 
+ private:
+ 	uint8_t lastValue = 255; // != 0
++	uint8_t emucapOverrideMask = 0x3f;
++	bool emucapOverrideEngaged = false;
+ 	std::string description;
+ };
+ 

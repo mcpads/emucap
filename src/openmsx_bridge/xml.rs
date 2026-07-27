@@ -8,6 +8,8 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::launch::openmsx::PreparedSession;
+
 use super::{tag_text, xml_escape, BridgeResult, OpenMsxBridgeError, OpenMsxControl};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,7 +34,7 @@ pub struct XmlControl {
 impl XmlControl {
     pub fn spawn(
         binary: &Path,
-        content: &Path,
+        session: &PreparedSession,
         runtime_home: &Path,
         display: bool,
     ) -> BridgeResult<Self> {
@@ -40,10 +42,13 @@ impl XmlControl {
         fs::create_dir_all(&isolated_home)?;
         let mut command = Command::new(binary);
         command
-            .args(["-machine", "C-BIOS_MSX2+", "-cart"])
-            .arg(content)
+            .args(["-machine", &session.machine])
+            .arg(session.media.kind.command_switch())
+            .arg(&session.media.mounted_path)
             .args(["-control", "stdio"])
             .env("HOME", &isolated_home)
+            .env("OPENMSX_HOME", &isolated_home)
+            .env("OPENMSX_USER_DATA", &session.user_data)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -93,6 +98,10 @@ impl XmlControl {
                         {
                             if let Some(value) = tag_text(trimmed, "update") {
                                 let _ = sender.send(XmlEvent::Pause(value == "true"));
+                            }
+                        } else if trimmed.starts_with("<log ") {
+                            if let Some(message) = tag_text(trimmed, "log") {
+                                eprintln!("[openMSX] {message}");
                             }
                         }
                     }
@@ -219,7 +228,7 @@ impl OpenMsxControl for XmlControl {
         // `advance_frame` preserves the current dot and can cross one extra
         // VDP frame counter boundary when restored exactly at a boundary.
         // `next_frame` targets the start of the Nth following frame instead.
-        self.command(&format!("next_frame {count}"))?;
+        self.command(&format!("::emucap::next_frame {count}"))?;
         let deadline = Instant::now() + ADVANCE_TIMEOUT;
         loop {
             if self.pause == Some(true) {

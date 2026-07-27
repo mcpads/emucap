@@ -20,6 +20,12 @@ struct FrameGate {
     blocked: bool,
     shutdown: bool,
     frame: u64,
+    debug_update: u64,
+}
+
+pub(super) enum FrameWaitOutcome {
+    Frame(u64),
+    DebugUpdate(u64),
 }
 
 fn frame_gate() -> &'static (Mutex<FrameGate>, Condvar) {
@@ -41,11 +47,22 @@ pub(super) fn arm_frame_gate(trigger: FrameGateTrigger) -> N64Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn wait_frame_gate(timeout: Duration) -> N64Result<u64> {
+    match wait_frame_gate_or_debug_update(timeout, u64::MAX)? {
+        FrameWaitOutcome::Frame(frame) => Ok(frame),
+        FrameWaitOutcome::DebugUpdate(_) => unreachable!("debug updates are disabled"),
+    }
+}
+
+pub(super) fn wait_frame_gate_or_debug_update(
+    timeout: Duration,
+    after_debug_update: u64,
+) -> N64Result<FrameWaitOutcome> {
     let (lock, condvar) = frame_gate();
     let mut gate = lock.lock().unwrap_or_else(|error| error.into_inner());
     let deadline = Instant::now() + timeout;
-    while !gate.blocked {
+    while !gate.blocked && gate.debug_update <= after_debug_update {
         let now = Instant::now();
         if now >= deadline || gate.shutdown {
             gate.arm_next = false;
@@ -58,7 +75,11 @@ pub(super) fn wait_frame_gate(timeout: Duration) -> N64Result<u64> {
             .unwrap_or_else(|error| error.into_inner());
         gate = next;
     }
-    Ok(gate.frame)
+    if gate.blocked {
+        Ok(FrameWaitOutcome::Frame(gate.frame))
+    } else {
+        Ok(FrameWaitOutcome::DebugUpdate(gate.debug_update))
+    }
 }
 
 pub(super) fn release_frame_gate() -> N64Result<u64> {
@@ -100,6 +121,14 @@ pub(super) fn reset_frame_gate() {
     gate.blocked = false;
     gate.shutdown = false;
     gate.frame = 0;
+    gate.debug_update = 0;
+    condvar.notify_all();
+}
+
+pub(super) fn notify_debug_update(update: u64) {
+    let (lock, condvar) = frame_gate();
+    let mut gate = lock.lock().unwrap_or_else(|error| error.into_inner());
+    gate.debug_update = update;
     condvar.notify_all();
 }
 

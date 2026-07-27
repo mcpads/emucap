@@ -440,11 +440,21 @@ pub fn mame_spec(launch: &Launch<'_>, driver: &str, gdb_port: u16) -> std::io::R
     Ok(spec)
 }
 
-fn bridge_spec(launch: &Launch<'_>, gdb_port: u16) -> LaunchSpec {
+fn bridge_spec(launch: &Launch<'_>, gdb_port: u16) -> std::io::Result<LaunchSpec> {
+    let system = NeoGeoSystem::parse(launch.system)?;
+    let adapter_home = launch
+        .runtime
+        .and_then(|runtime| runtime.adapter_failure_path.parent())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| emu_home_dir(system.home_component(), launch.port));
     let mut spec = LaunchSpec::new(launch.bridge, launch.log_path)
         .arg(launch.port.to_string())
         .arg(launch.system)
         .arg(format!("127.0.0.1:{gdb_port}"))
+        .env(
+            "EMUCAP_ADAPTER_HOME",
+            adapter_home.to_string_lossy().into_owned(),
+        )
         .env(
             "EMUCAP_CONTENT",
             launch.content.to_string_lossy().into_owned(),
@@ -455,7 +465,7 @@ fn bridge_spec(launch: &Launch<'_>, gdb_port: u16) -> LaunchSpec {
     if let Some(token) = launch.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
     }
-    spec.runtime_env(launch.runtime)
+    Ok(spec.runtime_env(launch.runtime))
 }
 
 pub fn launch(launch: &Launch<'_>) -> std::io::Result<Launched> {
@@ -484,7 +494,7 @@ pub fn launch(launch: &Launch<'_>) -> std::io::Result<Launched> {
         std::fs::create_dir_all(home.join(dir))?;
     }
     let mame_pid = spawn_detached(&mame_spec(launch, &driver, port)?)?;
-    let bridge = match bridge_spec(launch, port).emulator_dependency(mame_pid) {
+    let bridge = match bridge_spec(launch, port)?.emulator_dependency(mame_pid) {
         Ok(spec) => spec,
         Err(error) => {
             let _ = terminate_detached(mame_pid);

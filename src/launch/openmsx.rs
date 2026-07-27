@@ -1,19 +1,35 @@
-//! Isolated launcher for the stock openMSX XML-control adapter.
+//! Isolated launcher for the pinned openMSX XML-control adapter.
 //!
-//! The emulator remains unmodified. A separate Rust bridge owns openMSX's
-//! XML stdio channel and relays the supported control surface to emucap.
+//! A separate Rust bridge owns openMSX's XML stdio channel. The launcher
+//! accepts only the pinned build with the small joystick-ownership extension
+//! recorded in its sidecar.
 
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "openmsx/profile.rs"]
+mod profile;
+#[path = "openmsx/session.rs"]
+mod session;
+
+pub use profile::{MediaKind, OpenMsxProfile};
+#[cfg(test)]
+use session::{
+    prepare_media, resolve_firmware_inventory, validate_firmware_root, FirmwareRequirement,
+};
+pub use session::{
+    prepare_session, validate_content_for_profile, PreparedMedia, PreparedSession,
+    PreparedSessionPaths, StagedFirmware,
+};
+
 use super::{
-    emu_home_dir, find_on_path, is_runnable_file, process_alive, spawn_detached,
+    emu_home_base, emu_home_dir, find_on_path, is_runnable_file, process_alive, spawn_detached,
     terminate_detached, LaunchSpec, RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 1;
+pub const REQUIRED_HOST_API: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -22,6 +38,8 @@ pub struct BuildMetadata {
     pub host_api: u32,
     pub archive_sha256: String,
     pub sdl2_compat_patch_sha256: String,
+    pub emucap_patch_sha256: String,
+    pub frame_probe_patch_sha256: String,
     pub native_patch: bool,
 }
 
@@ -29,6 +47,7 @@ pub struct Launch<'a> {
     pub binary: &'a Path,
     pub bridge: &'a Path,
     pub repo_root: &'a Path,
+    pub system: &'a str,
     pub content: &'a Path,
     pub log_path: &'a Path,
     pub port: u16,
@@ -166,7 +185,11 @@ pub fn require_compatible_build(repo_root: &Path, binary: &Path) -> io::Result<B
         && metadata.archive_sha256 == required_lock_value(&lock, "OPENMSX_SHA256")?
         && metadata.sdl2_compat_patch_sha256
             == required_lock_value(&lock, "OPENMSX_SDL2_COMPAT_PATCH_SHA256")?
-        && !metadata.native_patch;
+        && metadata.emucap_patch_sha256
+            == required_lock_value(&lock, "OPENMSX_EMUCAP_PATCH_SHA256")?
+        && metadata.frame_probe_patch_sha256
+            == required_lock_value(&lock, "OPENMSX_FRAME_PROBE_PATCH_SHA256")?
+        && metadata.native_patch;
     if !matches_lock {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -179,43 +202,35 @@ pub fn require_compatible_build(repo_root: &Path, binary: &Path) -> io::Result<B
     Ok(metadata)
 }
 
-pub fn validate_content(content: &Path) -> io::Result<()> {
-    if !content.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("MSX cartridge not found: {}", content.display()),
-        ));
+pub fn resolve_firmware_root(profile: OpenMsxProfile) -> io::Result<Option<PathBuf>> {
+    if !profile.uses_real_firmware() {
+        return Ok(None);
     }
-    let supported = content
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "rom" | "mx1" | "mx2" | "ri" | "sg"
-            )
-        });
-    if !supported {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the first MSX profile accepts only cartridge files: .rom, .mx1, .mx2, .ri, or .sg",
-        ));
-    }
-    Ok(())
+    let root = std::env::var_os("EMUCAP_OPENMSX_FIRMWARE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| emu_home_base().join("firmware/openmsx"));
+    session::validate_firmware_root(&root)?;
+    Ok(Some(root))
 }
 
-pub fn launch_spec(launch: &Launch<'_>, runtime_home: &Path, pid_file: &Path) -> LaunchSpec {
+pub fn launch_spec(
+    launch: &Launch<'_>,
+    session_manifest: &Path,
+    runtime_home: &Path,
+    pid_file: &Path,
+) -> LaunchSpec {
     let mut spec = LaunchSpec::new(launch.bridge, launch.log_path)
         .arg(launch.port.to_string())
         .arg(launch.binary.to_string_lossy().into_owned())
-        .arg(launch.content.to_string_lossy().into_owned())
+        .arg(session_manifest.to_string_lossy().into_owned())
         .arg(runtime_home.to_string_lossy().into_owned())
         .arg(if launch.display { "1" } else { "0" })
         .arg(pid_file.to_string_lossy().into_owned())
         .env(
             "EMUCAP_CONTENT",
             launch.content.to_string_lossy().into_owned(),
-        );
+        )
+        .env("EMUCAP_SYSTEM", launch.system);
     if let Some(name) = launch.name {
         spec = spec.env("EMUCAP_NAME", name);
     }
@@ -262,10 +277,35 @@ fn wait_for_child_pid(bridge_pid: u32, pid_file: &Path, timeout: Duration) -> io
 }
 
 pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
-    validate_content(launch.content)?;
+    let profile = OpenMsxProfile::for_system(launch.system).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsupported openMSX system profile: {}", launch.system),
+        )
+    })?;
+    validate_content_for_profile(profile, launch.content)?;
     require_compatible_build(launch.repo_root, launch.binary)?;
     let runtime_home = emu_home_dir("openmsx", launch.port);
     std::fs::create_dir_all(&runtime_home)?;
+    let generation_key = launch
+        .runtime
+        .map(|runtime| runtime.launch_id.to_owned())
+        .unwrap_or_else(|| {
+            format!(
+                "standalone-{}-{}-{:?}",
+                launch.port,
+                std::process::id(),
+                std::time::SystemTime::now()
+            )
+        });
+    let firmware_root = resolve_firmware_root(profile)?;
+    let prepared = prepare_session(
+        profile,
+        launch.content,
+        &runtime_home,
+        &generation_key,
+        firmware_root.as_deref(),
+    )?;
     let pid_file = runtime_home.join("emulator.pid");
     if pid_file.exists() {
         std::fs::remove_file(&pid_file)?;
@@ -273,11 +313,23 @@ pub fn launch(launch: &Launch<'_>) -> io::Result<Launched> {
     if launch.display {
         super::wake_display_before_gui_launch();
     }
-    let bridge_pid = spawn_detached(&launch_spec(launch, &runtime_home, &pid_file))?;
+    let bridge_pid = match spawn_detached(&launch_spec(
+        launch,
+        &prepared.manifest,
+        &runtime_home,
+        &pid_file,
+    )) {
+        Ok(pid) => pid,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&prepared.root);
+            return Err(error);
+        }
+    };
     let openmsx_pid = match wait_for_child_pid(bridge_pid, &pid_file, Duration::from_secs(10)) {
         Ok(pid) => pid,
         Err(error) => {
             let _ = terminate_detached(bridge_pid);
+            let _ = std::fs::remove_dir_all(&prepared.root);
             return Err(error);
         }
     };

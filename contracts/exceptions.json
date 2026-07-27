@@ -76,6 +76,17 @@
       "verification": ["contract-test:mednafen-pcfx-protected-write-rejected"]
     },
     {
+      "id": "mednafen.ngp.protected-write-spaces",
+      "feature": "memory.write",
+      "kind": "parameter_constraint",
+      "targets": ["MEM.WRITE.APPLY.1"],
+      "scope": {"adapter": "mednafen", "systems": ["ngp"]},
+      "activation": {"memory_type": ["rom", "bios"]},
+      "constraints": {"memory.write.excluded_types": ["rom", "bios"]},
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mednafen-ngp-protected-write-rejected"]
+    },
+    {
       "id": "mednafen.ss.physical-read-absent",
       "feature": "memory.read",
       "kind": "parameter_constraint",
@@ -520,12 +531,15 @@
       "targets": ["CORE.PARAM.1"],
       "scope": {
         "adapter": "dolphin-native",
-        "systems": ["gamecube", "gc", "ngc"]
+        "systems": ["gamecube", "gc", "ngc", "wii"]
       },
       "activation": {"port": "not_zero"},
       "constraints": {"input.ports.allowed": [0]},
       "public_behavior": {"invalid": "bad_params"},
-      "verification": ["contract-test:dolphin-set-input-port-rejected"]
+      "verification": [
+        "contract-test:dolphin-set-input-port-rejected",
+        "contract-test:dolphin-wii-core-input-rejected-without-mutation"
+      ]
     },
     {
       "id": "dolphin.state-save.frozen-only",
@@ -637,25 +651,14 @@
       "verification": ["contract-test:openmsx-write-running-rejected"]
     },
     {
-      "id": "openmsx.input-hold.port-zero-only",
-      "feature": "input.hold",
-      "kind": "parameter_constraint",
-      "targets": ["CORE.PARAM.1"],
-      "scope": {"adapter": "openmsx-rust-xml", "systems": ["msx"]},
-      "activation": {"port": "not_zero"},
-      "constraints": {"input.ports.allowed": [0]},
-      "public_behavior": {"invalid": "bad_params"},
-      "verification": ["contract-test:openmsx-set-input-port-rejected"]
-    },
-    {
       "id": "openmsx.input-pulse.constraints",
       "feature": "input.pulse",
       "kind": "parameter_constraint",
       "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
       "scope": {"adapter": "openmsx-rust-xml", "systems": ["msx"]},
-      "activation": {"port": "not_zero", "frames": "above_120"},
+      "activation": {"port": "outside_0_1_2", "frames": "above_120"},
       "constraints": {
-        "input.ports.allowed": [0],
+        "input.ports.allowed": [0, 1, 2],
         "input.pulse.max_frames": 120
       },
       "public_behavior": {"invalid": "bad_params"},
@@ -674,6 +677,41 @@
       "constraints": {"execution.step.cpus.allowed": ["z80"]},
       "public_behavior": {"invalid": "bad_params"},
       "verification": ["contract-test:openmsx-step-secondary-cpu-rejected"]
+    },
+    {
+      "id": "openmsx.breakpoint.pausing-subset",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
+      "scope": {"adapter": "openmsx-rust-xml", "systems": ["msx"]},
+      "activation": {
+        "kind": "not_exec_read_write",
+        "exec_range": "not_exact",
+        "pause_on_hit": false,
+        "conditions": "present",
+        "read_write_memory_type": "not_memory",
+        "overlap": "same_kind"
+      },
+      "constraints": {
+        "breakpoint.kinds.allowed": ["exec", "read", "write"],
+        "breakpoint.exec.range": "exact",
+        "breakpoint.exec.address": "z80_logical_16_bit",
+        "breakpoint.read_write.memory_types.allowed": ["memory"],
+        "breakpoint.read_write.address": "z80_logical_16_bit",
+        "breakpoint.overlap.same_kind.allowed": false,
+        "breakpoint.pause_on_hit.allowed": [true],
+        "breakpoint.conditions.supported": false,
+        "breakpoint.snapshot.supported": true,
+        "breakpoint.snapshot.max_ranges": 16,
+        "breakpoint.snapshot.max_total_bytes": 16384,
+        "breakpoint.max_count": 128
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:openmsx-breakpoint-subset-rejected-before-mutation",
+        "contract-test:openmsx-breakpoint-trigger-identity-non-overlap",
+        "runtime-test:openmsx-breakpoint-hit-freezes-with-atomic-snapshot"
+      ]
     },
     {
       "id": "openmsx.screenshot.frozen-only",
@@ -820,6 +858,38 @@
       "verification": ["contract-test:neogeo-resume-secondary-cpu-rejected"]
     },
     {
+      "id": "neogeo.breakpoint.pausing-subset",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs", "neogeo_aes", "neogeo_cd"]},
+      "activation": {
+        "kind": "not_exec_read_write",
+        "exec_range": "not_exact",
+        "pause_on_hit": false,
+        "conditions": "present",
+        "read_write_memory_type": "not_ram"
+      },
+      "constraints": {
+        "breakpoint.kinds.allowed": ["exec", "read", "write"],
+        "breakpoint.exec.range": "exact",
+        "breakpoint.exec.address": "absolute_68000_24_bit",
+        "breakpoint.read_write.memory_types.allowed": ["ram"],
+        "breakpoint.pause_on_hit.allowed": [true],
+        "breakpoint.conditions.supported": false,
+        "breakpoint.snapshot.supported": true,
+        "breakpoint.snapshot.max_ranges": 16,
+        "breakpoint.snapshot.max_total_bytes": 16384,
+        "breakpoint.max_count": 128
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:neogeo-breakpoint-subset-rejected-before-mutation",
+        "contract-test:neogeo-breakpoint-hit-rearmed-under-public-id",
+        "runtime-test:neogeo-breakpoint-hit-freezes-with-atomic-snapshot"
+      ]
+    },
+    {
       "id": "n64.execution.frame-step-absent",
       "feature": "execution.step",
       "kind": "capability_absent",
@@ -917,6 +987,41 @@
       "constraints": {"input.hold.ports.allowed": [0]},
       "public_behavior": {"invalid": "bad_params"},
       "verification": ["contract-test:n64-set-input-port-rejected"]
+    },
+    {
+      "id": "n64.breakpoint.pausing-subset",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {
+        "kind": "not_exec_read_write",
+        "exec_range": "not_exact",
+        "pause_on_hit": false,
+        "conditions": "present",
+        "read_write_memory_type": "not_rdram",
+        "overlap": "same_kind"
+      },
+      "constraints": {
+        "breakpoint.kinds.allowed": ["exec", "read", "write"],
+        "breakpoint.exec.range": "exact",
+        "breakpoint.exec.address": "absolute_r4300_u32",
+        "breakpoint.read_write.memory_types.allowed": ["rdram"],
+        "breakpoint.read_write.address": "physical_rdram_offset",
+        "breakpoint.overlap.same_kind.allowed": false,
+        "breakpoint.pause_on_hit.allowed": [true],
+        "breakpoint.conditions.supported": false,
+        "breakpoint.snapshot.supported": true,
+        "breakpoint.snapshot.max_ranges": 16,
+        "breakpoint.snapshot.max_total_bytes": 16384,
+        "breakpoint.max_count": 128
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:n64-breakpoint-subset-rejected-before-mutation",
+        "contract-test:n64-breakpoint-trigger-identity-non-overlap",
+        "runtime-test:n64-breakpoint-hit-freezes-with-atomic-snapshot"
+      ]
     },
     {
       "id": "n64.input-pulse.bounded",

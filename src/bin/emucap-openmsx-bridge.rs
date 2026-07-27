@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use anyhow::{anyhow, Context};
+use emucap::launch::openmsx::PreparedSession;
 use emucap::live::reconnect::{serve_reconnecting_controlled, BridgeReply};
 use emucap::openmsx_bridge::{OpenMsxBridge, XmlControl};
 
@@ -10,7 +11,7 @@ fn main() -> anyhow::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
     if args.len() != 7 {
         eprintln!(
-            "usage: emucap-openmsx-bridge <EMUCAP_PORT> <OPENMSX_BIN> <ROM> \
+            "usage: emucap-openmsx-bridge <EMUCAP_PORT> <OPENMSX_BIN> <SESSION_MANIFEST> \
              <RUNTIME_HOME> <DISPLAY:0|1> <PID_FILE>"
         );
         std::process::exit(2);
@@ -22,7 +23,7 @@ fn main() -> anyhow::Result<()> {
         .filter(|port| *port != 0)
         .ok_or_else(|| anyhow!("EMUCAP_PORT must be a decimal port in 1..=65535"))?;
     let binary = PathBuf::from(&args[2]);
-    let content = PathBuf::from(&args[3]);
+    let session_manifest = PathBuf::from(&args[3]);
     let runtime_home = PathBuf::from(&args[4]);
     let display = match args[5].to_string_lossy().as_ref() {
         "0" => false,
@@ -30,11 +31,19 @@ fn main() -> anyhow::Result<()> {
         other => return Err(anyhow!("DISPLAY must be 0 or 1, got {other:?}")),
     };
     let pid_file = PathBuf::from(&args[6]);
+    let session: PreparedSession = serde_json::from_slice(
+        &fs::read(&session_manifest)
+            .with_context(|| format!("read {}", session_manifest.display()))?,
+    )
+    .context("parse openMSX session manifest")?;
+    session
+        .verify()
+        .context("verify openMSX session identity before process spawn")?;
 
-    let control = XmlControl::spawn(&binary, &content, &runtime_home, display)
+    let control = XmlControl::spawn(&binary, &session, &runtime_home, display)
         .context("start pinned openMSX XML control channel")?;
     let terminal = control.terminal_handle();
-    let mut bridge = OpenMsxBridge::new(control, &content, &runtime_home, display)
+    let mut bridge = OpenMsxBridge::new(control, &session, &runtime_home, display)
         .context("initialize openMSX bridge")?;
     write_pid_file(&pid_file, bridge.child_pid()).context("publish openMSX child pid")?;
 

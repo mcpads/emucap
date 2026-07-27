@@ -132,15 +132,19 @@ safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
 
 # 3. emucap 소켓 클라이언트
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" \
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
+  "$HERE/emucap_ngp.h" \
   "$HERE/emucap_json_num.h" "$SRC/src/drivers/"
+cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
+  "$SRC/src/ngp/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알리게 한다 —
 # 사용자가 `git rev-parse --short HEAD`와 대조해 재빌드 필요 여부를 확인한다(build-time 임베드라 재빌드
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
-  emucap.cpp emucap.h emucap_input.h emucap_json_num.h \
+  emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+  emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
@@ -277,11 +281,12 @@ inject_check 'emucap_game_data_store((unsigned short)new_data)' "$SRC/src/pce_fa
 
 # 4j. PC-FX(V810) CPU read/write BP의 실제 주소/길이/값을 공통 이벤트 경로에 기록한다.
 #     PCFXDBG_CheckBP의 value는 V810의 실제 접근값이며 코어가 호출 시점에 이미 폭을 함께 전달한다.
-perl -0777 -pi -e 's/(#include <mednafen\/cdrom\/scsicd\.h>\n)/${1}\nextern "C" void emucap_bp_record_value(unsigned len, unsigned addr, int is_write, unsigned value);\n/ unless m{emucap_bp_record_value}' \
+perl -0777 -pi -e 's/(#include <mednafen\/cdrom\/scsicd\.h>\n)/${1}\nextern "C" void emucap_bp_record_value(unsigned len, unsigned addr, int is_write, unsigned value);\nextern "C" void emucap_bp_record_pcfx_aux(unsigned len, unsigned addr, int is_write, unsigned value);\n/ unless m{emucap_bp_record_value}' \
   "$SRC/src/pcfx/debug.cpp"
-perl -0777 -pi -e 's{(void PCFXDBG_CheckBP\(int type, uint32 address, uint32 value, unsigned int len\).*?if\(tmp_address >= bpit->A\[0\] && tmp_address <= bpit->A\[1\]\)\n\s*\{\n)(\s*FoundBPoint = true;)}{${1}    if(type == BPOINT_READ || type == BPOINT_WRITE)\n     ::emucap_bp_record_value(len, address, type == BPOINT_WRITE, value);\n${2}}s unless m{::emucap_bp_record_value\(len, address}' \
+perl -0777 -pi -e 's{(void PCFXDBG_CheckBP\(int type, uint32 address, uint32 value, unsigned int len\).*?if\(tmp_address >= bpit->A\[0\] && tmp_address <= bpit->A\[1\]\)\n\s*\{\n)(\s*FoundBPoint = true;)}{${1}    if(type == BPOINT_READ || type == BPOINT_WRITE)\n     ::emucap_bp_record_value(len, address, type == BPOINT_WRITE, value);\n    else if(type == BPOINT_AUX_READ || type == BPOINT_AUX_WRITE)\n     ::emucap_bp_record_pcfx_aux(len, address, type == BPOINT_AUX_WRITE, value);\n${2}}s unless m{::emucap_bp_record_value\(len, address}' \
   "$SRC/src/pcfx/debug.cpp"
 inject_check '::emucap_bp_record_value(len, address, type == BPOINT_WRITE, value)' "$SRC/src/pcfx/debug.cpp" "pcfx/debug.cpp BP 값기록 삽입 실패"
+inject_check '::emucap_bp_record_pcfx_aux(len, address, type == BPOINT_AUX_WRITE, value)' "$SRC/src/pcfx/debug.cpp" "pcfx/debug.cpp auxiliary BP 기록 삽입 실패"
 
 # 4k. PC-FX 게임패드가 매 프레임 소비한 16비트 입력을 status.last_game_input에 기록한다.
 perl -0777 -pi -e 's/(#include "gamepad\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \
@@ -534,6 +539,41 @@ perl -0777 -pi -e 's{(\tNGPJoyLatch = \*chee;\n)}{${1}\t::emucap_game_data_store
   "$SRC/src/ngp/neopop.cpp"
 inject_check '::emucap_game_data_store((unsigned short)NGPJoyLatch)' "$SRC/src/ngp/neopop.cpp" "ngp/neopop.cpp input diagnostic injection failed"
 
+# 4s. Neo Geo Pocket/Color TLCS-900/H debugger. The public surface intentionally contains only
+#     side-effect-free RAM/ROM/BIOS views and execution breakpoints. The existing disassembler is
+#     compiled into the NGP build as its original separate translation units. All instruction-byte
+#     fetches are redirected to direct, observational views and shared interpreter scratch is
+#     restored by emucap_ngp_debug.inc.
+perl -0777 -pi -e 's{(#include "neopop\.h"\n)}{${1}#include "emucap_ngp_debug.h"\n#ifdef WANT_DEBUGGER\n#include "TLCS-900h/TLCS900h_disassemble.h"\n#endif\n} unless m{emucap_ngp_debug\.h}' \
+  "$SRC/src/ngp/neopop.cpp"
+inject_check '#include "emucap_ngp_debug.h"' "$SRC/src/ngp/neopop.cpp" "ngp debugger header injection failed"
+inject_check '#include "TLCS-900h/TLCS900h_disassemble.h"' "$SRC/src/ngp/neopop.cpp" "ngp disassembler header injection failed"
+
+perl -0777 -pi -e 's{loadB\(pc\+\+\)}{MDFN_IEN_NGP::NGPDBG_Peek8(pc++)}g; s{loadW\(pc\)}{MDFN_IEN_NGP::NGPDBG_Peek16(pc)}g; s{loadL\(pc\)}{MDFN_IEN_NGP::NGPDBG_Peek32(pc)}g' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp"
+perl -0777 -pi -e 's{(#include "TLCS900h_disassemble\.h"\n)}{${1}#include "../emucap_ngp_debug.h"\n} unless m{emucap_ngp_debug\.h}' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp"
+inject_check 'MDFN_IEN_NGP::NGPDBG_Peek8(pc++)' "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp" "ngp disassembler byte peek replacement failed"
+inject_check 'MDFN_IEN_NGP::NGPDBG_Peek16(pc)' "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp" "ngp disassembler word peek replacement failed"
+inject_check 'MDFN_IEN_NGP::NGPDBG_Peek32(pc)' "$SRC/src/ngp/TLCS-900h/TLCS900h_disassemble.cpp" "ngp disassembler long peek replacement failed"
+
+perl -0777 -pi -e 's{(#include "TLCS900h_interpret\.h"\n)}{${1}#include "../emucap_ngp_debug.h"\n} unless m{emucap_ngp_debug\.h}' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_interpret.cpp"
+perl -0777 -pi -e 's{(int32 TLCS900h_interpret\(void\)\n\{\n)}{${1}#ifdef WANT_DEBUGGER\n\tMDFN_IEN_NGP::NGPDBG_InstructionBoundary(pc);\n#endif\n} unless m{NGPDBG_InstructionBoundary}' \
+  "$SRC/src/ngp/TLCS-900h/TLCS900h_interpret.cpp"
+inject_check 'NGPDBG_InstructionBoundary(pc)' "$SRC/src/ngp/TLCS-900h/TLCS900h_interpret.cpp" "ngp instruction-boundary hook injection failed"
+
+perl -0777 -pi -e 's{(static const FileExtensionSpecStruct KnownExtensions\[\] =)}{#include "emucap_ngp_debug.inc"\n\n${1}} unless m{emucap_ngp_debug\.inc}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(  bios_install\(\);\n)}{${1}\n#ifdef WANT_DEBUGGER\n  NGPDBG_Init();\n#endif\n} unless m{NGPDBG_Init\(\)}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(static MDFN_COLD void Cleanup\(void\)\n\{\n)}{${1}#ifdef WANT_DEBUGGER\n NGPDBG_Kill();\n#endif\n} unless m{NGPDBG_Kill\(\)}' \
+  "$SRC/src/ngp/neopop.cpp"
+perl -0777 -pi -e 's{(KnownExtensions,\n MODPRIO_INTERNAL_HIGH,\n) NULL,\n PortInfo,}{${1}#ifdef WANT_DEBUGGER\n \&NGPDBGInfo,\n#else\n NULL,\n#endif\n PortInfo,} unless m{KnownExtensions,\n MODPRIO_INTERNAL_HIGH,\n#ifdef WANT_DEBUGGER}' \
+  "$SRC/src/ngp/neopop.cpp"
+inject_check '#include "emucap_ngp_debug.inc"' "$SRC/src/ngp/neopop.cpp" "ngp debugger implementation injection failed"
+inject_check '&NGPDBGInfo' "$SRC/src/ngp/neopop.cpp" "ngp debugger capability injection failed"
+
 # 5. configure — ss+psx+pce+pcfx+md+wswan+ngp 활성(한 바이너리 멀티시스템). Saturn은 host_cpu 자동탐지 실패라
 #    --enable-ss 명시 필수. 나머지는 기본 on이지만 명시해 의도를 고정한다.
 echo "→ configure (--enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-ngp --enable-debugger)"
@@ -551,6 +591,11 @@ esac
 # 6. emucap sources를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
 perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) emucap_native_failure.\$(OBJEXT) /' \
   src/drivers/Makefile
+# Upstream ships the TLCS disassembler sources but does not build them. Keep each source as a
+# separate object because their file-local decoder names intentionally overlap.
+perl -0777 -pi -e 's{libngp_a_OBJECTS = \$\(am_libngp_a_OBJECTS\)}{libngp_a_OBJECTS = \$(am_libngp_a_OBJECTS) \\\n ngp/TLCS-900h/TLCS900h_disassemble_extra.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_src.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_dst.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble_reg.\$(OBJEXT) \\\n ngp/TLCS-900h/TLCS900h_disassemble.\$(OBJEXT)}' \
+  src/Makefile
+inject_check 'ngp/TLCS-900h/TLCS900h_disassemble.$(OBJEXT)' src/Makefile "ngp disassembler objects were not added"
 
 # 7. 빌드
 echo "→ make"

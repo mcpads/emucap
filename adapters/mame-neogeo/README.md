@@ -30,6 +30,8 @@ remains headless. The supported surface includes:
 - machine-global pause/resume selected through the M68000 main CPU;
 - bounded profile-specific RAM reads and writes, 68000 state, instruction step, frame step, and
   run-frames;
+- pausing 68000 exec/read/write breakpoints with public IDs, hit-time registers, bounded atomic RAM
+  snapshots, one-shot event polling, and frozen-PC disassembly;
 - frozen-frame PNG capture with frame and SHA-256 provenance;
 - player-one A/B/C/D and directions with explicit ownership release; MVS adds coin/start/service,
   while AES and CD add start/select;
@@ -61,8 +63,11 @@ cargo run --release --example mame_neogeo_smoke -- \
 ```
 
 The maintained CD smoke uses a representative multi-track disc and verifies the complete CUE
-graph, the 2 MiB RAM boundary, exact frame step, frozen screenshots, and start/select input
-cleanup:
+graph, the 2 MiB RAM boundary, frozen-PC disassembly, exact frame step, frozen screenshots, and
+start/select input cleanup. Optional evidence settings add a no-input control interval and keep
+candidate/control/action PNGs. A semantic transition claim requires a stable no-input title
+class, a bounded released action, a recognizable destination, and two independent cold runs
+because the CD profile has no native savestate:
 
 ```sh
 cargo run --release --example mame_neogeo_cd_smoke -- \
@@ -71,5 +76,6 @@ cargo run --release --example mame_neogeo_cd_smoke -- \
 
 One synchronous frame advance is capped by `status.execution_limits.frame.max_count`; longer
 travel must be split into terminally acknowledged calls. The current adapter does not expose
-breakpoints, disassembly, trace, or the Z80 state. Results for MVS, AES, CD, and Pocket/Color
-remain profile-specific and do not establish Hyper Neo Geo 64 support.
+trace, call stacks, or the Z80 state. Breakpoint conditions, value filters, non-pausing hits, and
+memory types other than the profile RAM are rejected before mutation. Results for MVS, AES, CD,
+and Pocket/Color remain profile-specific and do not establish Hyper Neo Geo 64 support.

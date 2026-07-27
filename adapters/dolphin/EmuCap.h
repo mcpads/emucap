@@ -13,6 +13,11 @@
 
 struct GCPadStatus;
 
+namespace WiimoteEmu
+{
+struct DesiredWiimoteState;
+}
+
 namespace Core
 {
 class System;
@@ -29,6 +34,10 @@ void Stop();
 // Replace a polled GCPad status when set_input owns that controller. Leave native input unchanged
 // when no override is engaged.
 void ApplyInputOverride(int pad_num, GCPadStatus* status);
+
+// Replace only an emulated Wii Remote's core-button field when set_input owns it. Motion, IR, and
+// extension state remain owned by Dolphin.
+void ApplyWiimoteInputOverride(int wiimote_num, WiimoteEmu::DesiredWiimoteState* state);
 
 // Called by the PowerPC breakpoint handler after it has confirmed a real hit.
 // The adapter filters this against breakpoints registered through emucap.

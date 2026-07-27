@@ -207,6 +207,12 @@ impl Mupen64PlusHost {
             frame_paused: false,
             frame_clock_synchronized: false,
             held_buttons: BTreeSet::new(),
+            breakpoints: BTreeMap::new(),
+            next_breakpoint_id: 1,
+            debug_events: VecDeque::new(),
+            last_debug_update_seen: 0,
+            next_hit_seq: 1,
+            next_reset_seq: 1,
             started: false,
         })
     }

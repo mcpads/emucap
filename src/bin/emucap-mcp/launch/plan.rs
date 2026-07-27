@@ -580,7 +580,7 @@ pub(super) fn build_required_precondition(
                 .unwrap_or("adapters/mupen64plus/build.sh")
         )),
         "openmsx" => serde_json::json!(format!(
-            "Build pinned stock openMSX with {} and build emucap-openmsx-bridge with cargo build --release.",
+            "Build the pinned openMSX host with {} and build emucap-openmsx-bridge with cargo build --release.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/openmsx/build.sh")
@@ -1102,6 +1102,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "neogeo_mvs" => serde_json::json!("Requires MAME neogeo.zip BIOS and a game-specific MVS .zip ROM set. Set EMUCAP_NEOGEO_BIOS or place neogeo.zip beside the game set."),
         "neogeo_aes" => serde_json::json!("Requires MAME aes.zip and an AES-compatible cartridge .zip whose stem matches the pinned Neo Geo software list. Set EMUCAP_NEOGEO_AES_BIOS or place aes.zip beside the cartridge set."),
         "neogeo_cd" => serde_json::json!("Requires MAME neocdz.zip and a CUE whose referenced files all exist. Set EMUCAP_NEOGEO_CD_BIOS or place neocdz.zip beside the CUE."),
+        "msx1" | "msx2" | "msx2p" => serde_json::json!("Requires the exact system ROMs for the pinned real-machine profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute directory, or place them under <emucap-data>/firmware/openmsx. The launcher verifies the pinned SHA-1 manifest before spawn."),
         "n64" => serde_json::Value::Null,
         _ => serde_json::Value::Null, // snes·md·dc는 BIOS 불요(DC는 Flycast HLE 부팅)
     };

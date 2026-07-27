@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{emu_home_dir, find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
 
-pub const REQUIRED_HOST_API: u32 = 2;
+pub const REQUIRED_HOST_API: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {

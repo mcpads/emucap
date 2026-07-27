@@ -59,16 +59,34 @@ impl Mupen64PlusHost {
             self.step(&json!({"frames":frames, "cpu":"r4300"}))
         })();
         let release = self.apply_input_buttons(&persistent);
-        let resume = if was_frozen {
-            Ok(())
-        } else {
-            self.resume(&json!({"cpu":"r4300"})).map(|_| ())
-        };
         if let Err(error) = release {
             return Err(self.stop_generation_with_unresolved_effect("input-pulse cleanup", &error));
         }
-        resume?;
-        let stepped = outcome?;
+        let stepped = match outcome {
+            Ok(stepped) => stepped,
+            Err(error) => {
+                if !was_frozen {
+                    self.resume(&json!({"cpu":"r4300"}))?;
+                }
+                return Err(error);
+            }
+        };
+        if stepped.get("status").and_then(Value::as_str) == Some("interrupted") {
+            return Ok(json!({
+                "status":"interrupted",
+                "reason":"breakpoint",
+                "breakpoint_id":stepped["breakpoint_id"],
+                "event":stepped["event"],
+                "buttons":pulse.iter().collect::<Vec<_>>(),
+                "frames":frames,
+                "persistent_buttons":self.held_buttons.iter().collect::<Vec<_>>(),
+                "transient_override_engaged":false,
+                "state":"frozen",
+            }));
+        }
+        if !was_frozen {
+            self.resume(&json!({"cpu":"r4300"}))?;
+        }
         Ok(json!({
             "status": "completed",
             "buttons": pulse.iter().collect::<Vec<_>>(),
@@ -250,6 +268,13 @@ impl Mupen64PlusHost {
         Ok(())
     }
 
+    pub(super) fn reapply_held_buttons_after_reset(&self) -> N64Result<()> {
+        for button in &self.held_buttons {
+            self.send_input_button(button, true)?;
+        }
+        Ok(())
+    }
+
     fn send_input_button(&self, button: &str, pressed: bool) -> N64Result<()> {
         let key = input_key(button).ok_or_else(|| {
             N64Error::BadParams(format!("unsupported N64 input button: {button}"))
@@ -274,7 +299,7 @@ impl Mupen64PlusHost {
         )
     }
 
-    fn is_frozen_boundary(&self) -> bool {
+    pub(super) fn is_frozen_boundary(&self) -> bool {
         let debugger_paused =
             unsafe { (self.api.debug_get_state)(M64P_DBG_RUN_STATE) } == M64P_DBG_RUNSTATE_PAUSED;
         let frame_barrier_paused = self.frame_paused && frame_gate_is_blocked();

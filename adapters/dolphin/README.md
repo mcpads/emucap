@@ -15,7 +15,7 @@ to the interpreter only while servicing instruction-step requests, so
 The patch stack adds:
 
 - native service startup and shutdown hooks;
-- GameCube controller override support;
+- GameCube controller and emulated Wii Remote core-button override support;
 - exact PowerPC exec-breakpoint events;
 - PowerPC disassembly and ABI stack walking;
 - bounded current-frame screenshot capture;
@@ -82,14 +82,14 @@ The native adapter currently advertises:
 - `disassemble`, `call_stack`;
 - frozen core only: `save_state`, `load_state`;
 - running core only: `screenshot`;
-- GameCube only: `set_input`.
+- GameCube and Wii: `set_input`, with a system-specific port-0 button surface.
 
-It does not currently advertise read/write watchpoints, tracing, or Wii input injection. These
-methods must not be inferred from dormant handler code.
+It does not currently advertise read/write watchpoints, tracing, real Wii Remote input, IR,
+motion, or extension injection. These methods must not be inferred from dormant handler code.
 
 The adapter publishes its feature-contract declaration. The Control MCP validates the declared
-exact exec breakpoint, GameCube port 0 input, frozen savestate, and running screenshot limits
-before admitting composite tools.
+exact exec breakpoint, system-specific port 0 input, frozen savestate, and running screenshot
+limits before admitting composite tools.
 
 ### Memory and registers
 
@@ -128,7 +128,23 @@ GameCube controller port 0 accepts lowercase `a`, `b`, `x`, `y`, `z`, `l`, `r`, 
 native input path. `status.input_override` reports whether the adapter currently owns the pad.
 Other ports, malformed axes, and unknown buttons fail before changing the active override.
 
-Wii input is not advertised.
+### Wii input
+
+Wii Remote 1 accepts lowercase `a`, `b`, `one`, `two`, `minus`, `plus`, `home`, `up`, `down`,
+`left`, and `right`. The launcher selects an emulated Wii Remote for the current isolated run,
+without changing the user's installed Dolphin profile. The adapter verifies Dolphin's effective
+source after core initialization and advertises `set_input` only while that source is actually
+`Emulated`.
+
+The override owns only the core-button field. IR, acceleration, MotionPlus, extensions, and the
+rest of Dolphin's desired state remain Dolphin-owned. `set_input([])` releases the field back to
+the native emulated-controller path. `status.input_device` reports the effective source, surface,
+and last consumed sample; `status.input_override` reports persistent ownership. GameCube button
+names and analog axes are rejected for Wii before mutation.
+
+Run `adapters/dolphin/test-input.sh` for the production parser and ownership test. Runtime
+promotion also requires evidence that a bounded override is consumed, released, and followed by a
+native sample without carrying ownership into another launch.
 
 ### Savestates
 

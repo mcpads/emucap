@@ -6,8 +6,15 @@ pub(super) fn launch_openmsx(
     port: u16,
     token: Option<&str>,
     runtime: RuntimeEnv<'_>,
+    system: &str,
     args: &LaunchArgs,
 ) -> serde_json::Value {
+    let Some(profile) = openmsx_launch::OpenMsxProfile::for_system(system) else {
+        return serde_json::json!({
+            "launched": false,
+            "reason": format!("unsupported openMSX system profile: {system}"),
+        });
+    };
     let Some(root) = find_repo_root() else {
         return serde_json::json!({ "launched": false, "error": "emucap repo root not found; set EMUCAP_REPO_ROOT" });
     };
@@ -43,6 +50,7 @@ pub(super) fn launch_openmsx(
         binary: &binary,
         bridge: &bridge,
         repo_root: &root,
+        system,
         content,
         log_path: &log,
         port,
@@ -66,8 +74,12 @@ pub(super) fn launch_openmsx(
             "emucap_home": launched.runtime_home.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
-            "isolation": "openMSX runs with an emucap-owned per-port HOME and does not read or change the user's emulator settings.",
-            "profile": "C-BIOS_MSX2+ cartridge",
+            "isolation": "openMSX uses an emucap-owned HOME, user-data file pool, and generation media tree. Operator firmware and original mutable media are never mounted writable.",
+            "profile": {
+                "system": profile.system(),
+                "machine": profile.machine(),
+                "machine_type": profile.machine_type(),
+            },
             "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),

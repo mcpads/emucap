@@ -1,0 +1,43 @@
+diff --git a/src/video/VDP.cc b/src/video/VDP.cc
+index d1d17bc14..a782a28f6 100644
+--- a/src/video/VDP.cc
++++ b/src/video/VDP.cc
+@@ -86,6 +86,9 @@ VDP::VDP(const DeviceConfig& config)
+ 	, paletteLatchStatusDebug(*this)
+ 	, dataLatchDebug   (*this)
+ 	, frameCountInfo   (*this)
++	, emucapFrameBoundary(
++		getMotherBoard().getDebugger(), "emucap.vdp_frame_boundary",
++		"Signals the exact start of each VDP frame")
+ 	, cycleInFrameInfo (*this)
+ 	, lineInFrameInfo  (*this)
+ 	, cycleInLineInfo  (*this)
+@@ -372,6 +375,7 @@ void VDP::execVSync(EmuTime time)
+ 
+ 	// Start next frame.
+ 	frameStart(time);
++	emucapFrameBoundary.signal();
+ }
+ 
+ void VDP::execDisplayStart(EmuTime time)
+diff --git a/src/video/VDP.hh b/src/video/VDP.hh
+index 42cb34e7d..c32ce5e76 100644
+--- a/src/video/VDP.hh
++++ b/src/video/VDP.hh
+@@ -5,6 +5,7 @@
+ #include "Schedulable.hh"
+ #include "VideoSystemChangeListener.hh"
+ #include "SimpleDebuggable.hh"
++#include "Probe.hh"
+ #include "TclCallback.hh"
+ #include "InfoTopic.hh"
+ #include "IRQHelper.hh"
+@@ -1093,6 +1094,8 @@ private:
+ 		explicit FrameCountInfo(VDP& vdp);
+ 		[[nodiscard]] int calc(const EmuTime& time) const override;
+ 	} frameCountInfo;
++
++	Probe<void> emucapFrameBoundary;
+ 
+ 	struct CycleInFrameInfo final : Info {
+ 		explicit CycleInFrameInfo(VDP& vdp);

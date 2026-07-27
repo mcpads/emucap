@@ -125,6 +125,12 @@ pub fn dolphin_spec(
     } else {
         spec = spec.arg("--batch");
     }
+    if system == "wii" {
+        // The per-port user directory is intentionally reusable. Select the emulated source in
+        // Dolphin's current-run layer so a prior GUI choice cannot turn this generation into a
+        // real or absent Wii Remote while the adapter advertises core-button injection.
+        spec = spec.arg("--config=Wiimote.Wiimote1.Source=1");
+    }
     if let Some(name) = opts.name {
         spec = spec.env("EMUCAP_NAME", name);
     }

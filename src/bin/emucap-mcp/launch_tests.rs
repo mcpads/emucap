@@ -497,11 +497,15 @@ fn infer_system_maps_msx_specific_cartridges_but_not_generic_rom() {
         assert_eq!(inferred["system"], "msx", "alias {alias}");
         assert_eq!(inferred["confidence"], "explicit");
     }
-    for unsupported_machine in ["msx1", "msx2"] {
-        let inferred = infer_system(None, Some(unsupported_machine));
-        assert_eq!(inferred["system"], serde_json::Value::Null);
-        assert_eq!(inferred["needs_user_input"], true);
+    for machine in ["msx1", "msx2", "msx2p"] {
+        let inferred = infer_system(None, Some(machine));
+        assert_eq!(inferred["system"], machine);
+        assert_eq!(inferred["confidence"], "explicit");
+        assert_eq!(adapter_for_system(machine), ("openmsx", None));
     }
+    let turbo_r = infer_system(None, Some("msxtr"));
+    assert_eq!(turbo_r["system"], serde_json::Value::Null);
+    assert_eq!(turbo_r["needs_user_input"], true);
     let generic = infer_system(Some("/tmp/game.rom"), None);
     assert_eq!(generic["system"], serde_json::Value::Null);
     assert_eq!(generic["needs_user_input"], true);
@@ -1045,6 +1049,23 @@ fn launch_plan_for_msx_uses_stock_openmsx_bridge_without_legacy_fallback() {
         plan["preconditions"]["bios_required"],
         serde_json::Value::Null
     );
+}
+
+#[test]
+fn launch_plan_for_real_msx_machine_requires_operator_firmware() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/test.dsk".into()),
+            system: Some("msx2".into()),
+        },
+    );
+    assert_eq!(plan["system"], "msx2");
+    assert_eq!(plan["adapter"], "openmsx");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .contains("EMUCAP_OPENMSX_FIRMWARE"));
 }
 
 #[test]

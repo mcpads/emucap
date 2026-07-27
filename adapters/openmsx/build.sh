@@ -79,6 +79,24 @@ download_checked \
   "$OPENMSX_SDL2_COMPAT_PATCH_URL" \
   "$OPENMSX_SDL2_COMPAT_PATCH_SHA256" \
   "$SDL_PATCH"
+EMUCAP_PATCH="$HERE/patches/0001-add-emucap-joystick-override.patch"
+FRAME_PROBE_PATCH="$HERE/patches/0002-add-emucap-vdp-frame-probe.patch"
+[ -f "$EMUCAP_PATCH" ] || {
+  echo "ERROR: missing openMSX emucap patch: $EMUCAP_PATCH" >&2
+  exit 1
+}
+[ -f "$FRAME_PROBE_PATCH" ] || {
+  echo "ERROR: missing openMSX frame probe patch: $FRAME_PROBE_PATCH" >&2
+  exit 1
+}
+[ "$(sha256_path "$EMUCAP_PATCH")" = "$OPENMSX_EMUCAP_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX emucap patch digest does not match upstream.lock" >&2
+  exit 1
+}
+[ "$(sha256_path "$FRAME_PROBE_PATCH")" = "$OPENMSX_FRAME_PROBE_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX frame probe patch digest does not match upstream.lock" >&2
+  exit 1
+}
 
 SRC="$WORK/openmsx-$OPENMSX_VERSION"
 if [ ! -d "$SRC" ]; then
@@ -93,6 +111,18 @@ if patch -d "$SRC" -p1 --forward --dry-run <"$SDL_PATCH" >/dev/null 2>&1; then
   patch -d "$SRC" -p1 --forward <"$SDL_PATCH"
 elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$SDL_PATCH" >/dev/null 2>&1; then
   echo "ERROR: SDL2 compatibility patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+if patch -d "$SRC" -p1 --forward --dry-run <"$EMUCAP_PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward <"$EMUCAP_PATCH"
+elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$EMUCAP_PATCH" >/dev/null 2>&1; then
+  echo "ERROR: openMSX emucap patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+if patch -d "$SRC" -p1 --forward --dry-run <"$FRAME_PROBE_PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward <"$FRAME_PROBE_PATCH"
+elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$FRAME_PROBE_PATCH" >/dev/null 2>&1; then
+  echo "ERROR: openMSX frame probe patch is neither applicable nor already applied" >&2
   exit 1
 fi
 
@@ -145,7 +175,9 @@ SIDECAR="$BUILD_DIR/emucap-openmsx-build.json"
   printf '  "host_api": %s,\n' "$OPENMSX_HOST_API"
   printf '  "archive_sha256": "%s",\n' "$OPENMSX_SHA256"
   printf '  "sdl2_compat_patch_sha256": "%s",\n' "$OPENMSX_SDL2_COMPAT_PATCH_SHA256"
-  printf '  "native_patch": false\n'
+  printf '  "emucap_patch_sha256": "%s",\n' "$OPENMSX_EMUCAP_PATCH_SHA256"
+  printf '  "frame_probe_patch_sha256": "%s",\n' "$OPENMSX_FRAME_PROBE_PATCH_SHA256"
+  printf '  "native_patch": true\n'
   printf '}\n'
 } >"$SIDECAR"
 

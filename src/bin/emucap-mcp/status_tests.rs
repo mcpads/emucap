@@ -493,9 +493,13 @@ fn msx_button_hint_describes_keyboard_matrix_and_release() {
         .as_array()
         .is_some_and(|buttons| buttons.iter().any(|button| button == "space")));
     assert_eq!(hint["aliases"]["fire1"], "space");
+    assert_eq!(hint["devices"][0]["device"], "keyboard");
+    assert_eq!(hint["devices"][1]["device"], "joystick");
+    assert_eq!(hint["devices"][1]["port"], 1);
+    assert_eq!(hint["devices"][2]["port"], 2);
     assert!(hint["notes"]
         .as_str()
-        .is_some_and(|notes| notes.contains("set_input([])")));
+        .is_some_and(|notes| notes.contains("empty set") && notes.contains("native input")));
 }
 
 struct NotConnectedLink {
@@ -995,7 +999,14 @@ fn button_hint_none_for_unknown_or_absent_system() {
     assert!(button_hint_for_system(None).is_none());
     assert!(button_hint_for_system(Some("unknown")).is_none());
     assert!(button_hint_for_system(Some("gamecube")).is_some());
-    assert!(button_hint_for_system(Some("wii")).is_none());
+    let wii = button_hint_for_system(Some("wii")).unwrap();
+    assert_eq!(wii["system"], "wii");
+    assert_eq!(
+        wii["buttons"],
+        serde_json::json!([
+            "a", "b", "one", "two", "minus", "plus", "home", "up", "down", "left", "right"
+        ])
+    );
     assert!(button_hint_for_system(Some("snes")).is_some());
     assert!(button_hint_for_system(Some("dreamcast")).is_some());
 }

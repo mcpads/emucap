@@ -13,9 +13,9 @@ ROM, and at runtime emucap branches on `CurGame->shortname` ("ss"/"psx"/"pce"/
 endianness). The common debugger interface works where Mednafen exposes it. PCE
 analysis defaults to the accuracy/debugger-first `pce` core. `pce_fast` is also
 built, but since Mednafen provides no Debugger pointer there, the memory/register/
-breakpoint family of tools is demoted to `no_debugger`. The NGP core likewise has no
-Debugger pointer; it intentionally exposes only frame execution, pause/resume, reset,
-save/load, screenshot, ROM identity, and port-0 input.
+breakpoint family of tools is demoted to `no_debugger`. The patched NGP core has a
+separate, intentionally narrow TLCS-900/H debugger described below; it does not inherit
+the generic trace or call-stack claims.
 
 Mednafen is GPL, so we do not vendor/redistribute it wholesale. Only our
 additions (`emucap.cpp`/`.h`) live in this repository, and `build.sh` fetches
@@ -195,7 +195,8 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   put handlers; `cpu`, `bios`, and `track*` are rejected before mutation. Exec BP uses aligned absolute
   V810 addresses. Read/write BP accepts `cpu`, linear `ram`, and `bios` offsets; the interleaved
   `backup`/`exbackup` views require an exact physical `cpu` address. V810 trace and register
-  watches are available, but `call_stack` is not advertised.
+  watches are available. `call_stack` uses the advertised
+  `mednafen.call-stack.best-effort` shadow-stack exception; it is not an authoritative unwind.
 - **MD/Mega Drive**: `cpu` (68000 24-bit CPU physical — exec/read/write BP · value reads · disassemble happen here) ·
   `ram` (Work RAM 64KB, referenced at public offset 0x0000; read/write BP is internally mapped to CPU addresses 0xFF0000~0xFFFFFF) ·
   `zram` (Z80 RAM 8KB) · `vram` (VDP VRAM 64KB) · `cram` (VDP CRAM 128B, unpacked bus color word) ·
@@ -217,10 +218,12 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   classification with prefix skipping, no full instruction decode). Everything else in the Mednafen debugger surface
   (read/write, get\_state, disassemble via built-in zedis, screenshot, save/load, exec/read/write BP, find\_pattern,
   dump\_memory, step\_instructions, set\_trace, watch\_register, set\_layer\_enable) is inherited.
-- **Neo Geo Pocket/Color (`ngp`)**: no memory types. Mednafen's NGP module has no
-  Debugger object, so the adapter does not advertise memory, state registers,
-  breakpoints, disassembly, instruction stepping, trace, or call stacks. Frame execution,
-  pause/resume, reset, save/load, screenshot, ROM identity, and input remain available.
+- **Neo Geo Pocket/Color (`ngp`, TLCS-900/H)**: `ram` (16 KiB external RAM), `rom`
+  (the exact cartridge bytes), and `bios` (64 KiB HLE BIOS) are side-effect-free offset
+  views. Only `ram` is writable. Exec breakpoints and disassembly use absolute 24-bit TLCS
+  addresses; read/write breakpoints, the sound Z80, trace, and call-stack classification are
+  intentionally absent. The disassembler reads direct immutable views instead of the flash-
+  sensitive CPU bus and restores all shared decoder scratch state before returning.
 
 Button names: Saturn `a/b/c/x/y/z/l/r/start/directions` (`l`=`ls` · `r`=`rs` aliases), PSX `cross/circle/triangle/square/l1/l2/r1/r2/
 start/select/directions` (SNES-style `l`=`l1` · `r`=`r1` aliases, plus DualShock `l3/r3`), PCE `i/ii/run/select/directions` (convenience aliases `a/b/start`,
@@ -291,8 +294,10 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   This is runtime proof for the common surface, not proof that every game-specific CD timing path
   or every auxiliary breakpoint has been exercised.
 - **Neo Geo Pocket/Color status**: the representative `.ngc` smoke verifies exact `ngp`
-  identity, the explicit no-debugger downgrade, A+OPTION delivery to the core latch, input
-  ownership release, save/load completion, and a PNG screenshot:
+  identity, ROM byte identity, protected ROM/BIOS writes, RAM mutation/restore, register
+  state, side-effect-free disassembly, exact TLCS instruction step, pre-instruction exec
+  evidence, stable breakpoint identity across load/reset, A+OPTION delivery and release,
+  save/load completion, and a PNG screenshot:
   `cargo run --release --example mednafen_ngp_smoke -- <game.ngp|game.ngc> [mednafen]`.
 - **MD status**: added the `md` core build/branch/button/value-conditioned BP recording paths. Default verification order:
   `status.system=="md"` → check the SEGA header with `read_memory("cpu", 0x100, ...)` →

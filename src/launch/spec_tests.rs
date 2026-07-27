@@ -211,6 +211,10 @@ fn dolphin_headless_spec_uses_isolated_user_and_headless_platform() {
     assert!(spec
         .env
         .contains(&("EMUCAP_SYSTEM".to_string(), "gamecube".to_string())));
+    assert!(!spec
+        .args
+        .iter()
+        .any(|arg| arg == "--config=Wiimote.Wiimote1.Source=1"));
 }
 
 #[test]
@@ -231,6 +235,10 @@ fn dolphin_gui_spec_uses_batch_render_window() {
         .args
         .iter()
         .any(|arg| arg == "--config=Dolphin.DSP.Backend=No Audio Output"));
+    assert!(spec
+        .args
+        .iter()
+        .any(|arg| arg == "--config=Wiimote.Wiimote1.Source=1"));
 }
 
 #[test]
