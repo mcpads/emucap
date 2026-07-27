@@ -5,11 +5,13 @@
 레트로 게임 패치 디버깅을 위한 MCP 인프라. 실행 중인 에뮬레이터의 메모리·상태·화면을 AI
 에이전트가 읽고 제어해, 사람이 설명한 문제를 분석하도록 돕는다. 공통 Core + 어댑터로 여러
 에뮬레이터를 지원한다 — Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·
-PlayStation·PC Engine·Mega Drive/Genesis·WonderSwan/WSC), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
+PlayStation·PC Engine·PC-FX·Mega Drive/Genesis·WonderSwan/WSC·Neo Geo Pocket/Color), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME
-(PC-98·실험적 Neo Geo MVS), 실험적 Mupen64Plus frontend(Nintendo 64).
+(PC-98·실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
+Stock openMSX 21.0과 별도 Rust XML bridge로 첫 실험적 MSX profile(C-BIOS MSX2+ 카트리지)도
+제공한다.
 
-**v0.10.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.11.0-alpha.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -53,14 +55,16 @@ cargo build --release \
   --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
   --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
   --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
-  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge
+  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
+  --bin emucap-openmsx-bridge
 ```
 
 산출물: `target/release/emucap-mcp`(**제어 MCP** — 에뮬레이터 조작), `emucap-track-mcp`(**추적
 MCP** — 실험 원장, emulator-less), `emucap`(케이스 번들 CLI), `emucap-broker`(다중 세션 broker),
-`emucap-mame-pc98-bridge`(PC-98 launch helper), `emucap-mame-neogeo-bridge`(Neo Geo MVS launch helper),
+`emucap-mame-pc98-bridge`(PC-98 launch helper), `emucap-mame-neogeo-bridge`(Neo Geo MVS/AES/CD launch helper),
 `emucap-mupen64plus`(N64 frontend·adapter), `emucap-desmume-nds-bridge`(NDS launch helper),
-`emucap-ppsspp-bridge`(PSP launch helper), `emucap-pcsx2-bridge`(PS2 launch helper).
+`emucap-ppsspp-bridge`(PSP launch helper), `emucap-pcsx2-bridge`(PS2 launch helper),
+`emucap-openmsx-bridge`(stock openMSX XML-control helper).
 Source build의 의존성은 전부 crates.io이고
 SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필요 없다**(깨끗한 체크아웃에서 그대로
 빌드된다). 첫 빌드는 의존성을 내려받느라 더 걸리고, 이후는 빠르다.
@@ -149,9 +153,13 @@ timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종�
   실 BIOS(`gba_bios.bin`, 비커밋)가 필요하고 SNES/Game Gear/GB/GBC/NES는 필요 없다. 수정되지 않은
   Mesen 빌드는 native halt service와 안전한 savestate event가 없어 live control에서 명시적으로 거부한다.
   → `adapters/mesen2/README.md`
-- **Mednafen (Saturn·PSX·PCE·MD·WonderSwan/WSC)** — `adapters/mednafen/build.sh`로 포크를 빌드한다(SDL 필요:
-  macOS `brew install sdl2`, Linux `libsdl2-dev`). 소스 archive와 checksum을 고정하며 한 바이너리가 다섯 시스템을 모두 처리한다.
-  PSX·PCE-CD는 BIOS가 필요하다(저장소에 커밋하지 않음). → `adapters/mednafen/README.md`
+- **Mednafen (Saturn·PSX·PCE·PC-FX·MD·WonderSwan/WSC·Neo Geo Pocket/Color)** — `adapters/mednafen/build.sh`로 포크를 빌드한다(SDL 필요:
+  macOS `brew install sdl2`, Linux `libsdl2-dev`). 소스 archive와 checksum을 고정하며 한 바이너리가
+  일곱 시스템 계열을 처리한다. PSX·PCE-CD·PC-FX는 BIOS가 필요하다(저장소에 커밋하지 않음).
+  PC-FX는 version 1.00 BIOS를 명시적으로 검증하고 emucap 소유 Mednafen profile로 실행한다.
+  Neo Geo Pocket/Color는 `ngp` 모듈을 공유하며 기본 실행·save/load·screenshot·입력을 지원한다.
+  이 코어에는 Mednafen debugger가 없으므로 memory·breakpoint·disassemble·명령 step은 광고하지 않는다.
+  → `adapters/mednafen/README.md`
 - **Flycast (Dreamcast)** — `adapters/flycast/build.sh`로 빌드한다. 빌드는 emucap 소유 work tree에서
   수행하고 commit과 recursive submodule graph를 고정한다. `FLYCAST_SRC`가 있으면 읽기 전용 Git object
   source로만 쓴다. → `adapters/flycast/README.md`
@@ -175,16 +183,33 @@ timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종�
   → `adapters/dolphin/README.md`
 - **MAME PC-98** — `adapters/mame-pc98/build.sh`로 MAME을 소스에서 빌드한다(시간이 오래
   걸리고 디스크를 많이 쓴다). → `adapters/mame-pc98/README.md`
-- **MAME Neo Geo MVS (실험적)** — 고정된 MAME 빌드를 재사용하고
-  `emucap-mame-neogeo-bridge`를 빌드한다. 사용자가 준비한 `neogeo.zip` BIOS와 게임 ROM set이
-  필요하며 `.zip`만 보고 Neo Geo로 자동 판정하지 않는다. 현재 MVS 작업 RAM, 68000 상태·명령
-  스텝, 프레임 제어, 스크린샷, port-0 입력을 제공한다. 게임 ROM과 세이브스테이트 검증은 아직
-  남아 있다. → `adapters/mame-neogeo/README.md`
+- **MAME Neo Geo MVS/AES/CD (실험적)** — `adapters/mame-neogeo/build.sh`로 전용 고정 MAME subset을
+  빌드하고 `emucap-mame-neogeo-bridge`를 빌드한다. MVS는 사용자가 준비한 `neogeo.zip` BIOS와
+  해당 MAME 버전에 맞는 게임 ROM set을 사용한다. AES는 `aes.zip`과 ZIP stem이 고정된 MAME
+  Neo Geo software list의 AES 호환 항목을 가리키는 cartridge set을 사용한다. CD는 공식 BIOS가 든
+  `neocdz.zip`과 모든 참조 track이 존재하는 CUE entry file을 사용하며 콘텐츠 identity는 전체
+  CUE graph를 포함한다. 세 profile 모두 제한된 RAM, 68000 상태·명령 스텝, 프레임 제어,
+  frozen-frame 스크린샷과 port-0 입력을 제공한다. Native save/load는 MVS와 AES에서 광고하며
+  MAME 0.288이 unsupported로 표시하는 CDZ에서는 제외한다. 파일 확장자만 보고 어느 Neo Geo
+  profile로도 자동 판정하지 않는다.
+  → `adapters/mame-neogeo/README.md`
 - **Mupen64Plus Nintendo 64 (실험적, Unix)** — `adapters/mupen64plus/build.sh`를 실행하고
   `emucap-mupen64plus`를 빌드한다. 일반 카트리지 ROM은 BIOS가 필요 없다. 현재 pure interpreter로
   격리된 headless/창 실행, pause/resume, R4300 명령 스텝, CPU 상태, frozen RDRAM 제한 읽기·쓰기를
-  지원한다. 입력·스크린샷·세이브스테이트·프레임 스텝·브레이크포인트·RSP 상태는 아직 노출하지
-  않는다. → `adapters/mupen64plus/README.md`
+  지원한다. 두 모드 모두 port-0 입력 hold와 명시적인 native 입력권 반환을 제공한다. 창 실행은
+  callback barrier를 이용한 정확한 rendered-frame 스텝, 제한된 입력 pulse, 현재 PNG 캡처,
+  완료를 확인하는 native save/load도 제공한다. Headless 실행은 명령 스텝만 제공하며 이
+  rendered-frame 기능들을 노출하지 않는다. 브레이크포인트, reset, `run_frames`, RSP 상태는 아직
+  노출하지 않는다.
+  → `adapters/mupen64plus/README.md`
+- **openMSX MSX (실험적 첫 profile)** — `adapters/openmsx/build.sh`를 실행하고
+  `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 sidecar가 맞는 stock openMSX 21.0만
+  받아 emucap 소유 per-port `HOME`에서 실행하며 openMSX를 patch하거나 사용자의 emulator profile을
+  읽지 않는다. 현재 `msx` system은 `C-BIOS_MSX2+` 카트리지 profile이다. Z80 상태·명령 step,
+  정확한 frame step, 제한된 CPU memory/main RAM/VRAM 접근, frozen save/load, keyboard-matrix
+  입력, `display: true` screenshot을 제공한다. Headless screenshot, disk, tape, 실제 기기 firmware,
+  joystick 전달, breakpoint, turboR/R800은 아직 노출하지 않는다. 일반 `.rom` 파일은
+  `system=msx`를 명시한다. → `adapters/openmsx/README.md`
 
 ## 더 보기
 
@@ -192,5 +217,5 @@ timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종�
 - 에뮬레이터별 메모리 타입·버튼 이름·브레이크포인트·실행 트러블슈팅 → 각 `adapters/*/README.md`
 - 바이너리: `emucap`(케이스 번들 `finalize`/`inspect`), `emucap-mcp`(제어 MCP — 실행 중 에뮬레이터
   조작, stdio), `emucap-track-mcp`(추적 MCP — 실험 원장, emulator-less, stdio),
-  `emucap-broker`(다중 세션 연결 공유), N64 frontend, 그리고 빌드 절에 적은 PC-98/Neo Geo/NDS/PSP/PS2
+  `emucap-broker`(다중 세션 연결 공유), N64 frontend, 그리고 빌드 절에 적은 PC-98/Neo Geo/NDS/PSP/PS2/MSX
   launch bridge.

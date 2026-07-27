@@ -46,7 +46,13 @@ regmaps.i486 = regmaps.i386
 regmaps.pentium = regmaps.i386
 
 local reset_subscription, stop_subscription, frame_subscription
+local pre_save_subscription, post_load_subscription
 local mame_profile = os.getenv("EMUCAP_MAME_PROFILE") or "pc98"
+local is_neogeo_profile =
+  mame_profile == "neogeo"
+  or mame_profile == "neogeo_mvs"
+  or mame_profile == "neogeo_aes"
+  or mame_profile == "neogeo_cd"
 local input_aliases = {
   escape = "esc",
   return_key = "enter",
@@ -102,8 +108,8 @@ end
 local function norm_key(str)
   local s = trim(str):lower()
   s = s:gsub("%s+", " ")
-  if mame_profile == "neogeo" and s == "start" then
-    return "start"
+  if is_neogeo_profile and (s == "start" or s == "select") then
+    return s
   end
   return input_aliases[s] or s
 end
@@ -119,7 +125,8 @@ local function neogeo_input_name(field)
   if direction == "up" or direction == "down" or direction == "left" or direction == "right" then
     return direction
   end
-  if name == "1 player start" then return "start" end
+  if name == "1 player start" or name == "p1 start" then return "start" end
+  if name == "p1 select" then return "select" end
   if name == "coin 1" then return "coin" end
   if name == "service 1" then return "service" end
   return nil
@@ -170,6 +177,8 @@ function emucap_gdbstub.startplugin()
   local clear_inputs
   local break_on_reset_enabled = false
   local pending_reset
+  local pending_save
+  local pending_load
   local socket
   local regs_payload
   -- 진단 계측(env-gated): EMUCAP_GDBSTUB_TRACE=1일 때만 freeze 흐름을 MAME 로그로 찍는다.
@@ -216,16 +225,22 @@ function emucap_gdbstub.startplugin()
     regpoints = { byidx = {} }
     running = false
     rxbuf = ""
-    -- A reset can interrupt a deferred press before the frame notifier reaches its target.
-    -- Release that transient override while its field references are still available.
-    clear_frame_wait()
+    -- A machine reset restarts the screen frame counter. Generic frame advances count frame
+    -- notifier callbacks, so they remain valid across the reset. A transient input pulse cannot
+    -- keep its old ioport field references, however: terminate that operation before clearing the
+    -- fields so the caller receives a terminal error instead of waiting until transport timeout.
+    local interrupted_input_wait = frame_wait_target and frame_wait_release_input
+    if interrupted_input_wait then
+      clear_frame_wait()
+      if socket then
+        ack_packet(socket, "T05reset")
+      end
+    elseif clear_inputs then
+      clear_inputs()
+    end
     input_fields = {}
     active_input_fields = {}
     release_input_frame = nil
-    frame_wait_target = nil
-    frame_wait_stop = false
-    frame_wait_probe = nil
-    frame_wait_release_input = false
     if break_on_reset_enabled and socket and debugger and cpu then
       local map = regmaps[cpu.shortname]
       if map then
@@ -236,7 +251,7 @@ function emucap_gdbstub.startplugin()
     end
     for _, port in pairs(manager.machine.ioport.ports) do
       for _, field in pairs(port.fields) do
-        if mame_profile == "neogeo" then
+        if is_neogeo_profile then
           local key = neogeo_input_name(field)
           if key and not input_fields[key] then
             input_fields[key] = field
@@ -262,6 +277,11 @@ function emucap_gdbstub.startplugin()
   end)
 
   stop_subscription = emu.add_machine_stop_notifier(function()
+    if socket and (pending_save or pending_load) then
+      ack_packet(socket, "E17")
+    end
+    pending_save = nil
+    pending_load = nil
     consolelog = nil
     cpu = nil
     debugger = nil
@@ -279,6 +299,60 @@ function emucap_gdbstub.startplugin()
   local handle
   local service_frozen_socket
   local in_frozen_socket_service = false
+
+  local function finish_state_operation(payload)
+    pending_save = nil
+    pending_load = nil
+    running = false
+    if debugger then
+      debugger.execution_state = "stop"
+      hold_requested = true
+    end
+    ack_packet(socket, payload)
+  end
+
+  local function file_size(path)
+    local file = io.open(path, "rb")
+    if not file then
+      return nil
+    end
+    local size = file:seek("end")
+    file:close()
+    return size
+  end
+
+  pre_save_subscription = emu.add_machine_pre_save_notifier(function()
+    if pending_save then
+      pending_save.seen_pre_save = true
+    end
+  end)
+
+  post_load_subscription = emu.add_machine_post_load_notifier(function()
+    if pending_load then
+      finish_state_operation("OK")
+    end
+  end)
+
+  local function tick_state_operation()
+    if pending_save then
+      if pending_save.seen_pre_save then
+        local size = file_size(pending_save.path)
+        if size and size > 0 then
+          finish_state_operation("OK")
+          return
+        end
+      end
+      pending_save.remaining_frames = pending_save.remaining_frames - 1
+      if pending_save.remaining_frames <= 0 then
+        finish_state_operation("E03")
+      end
+    elseif pending_load then
+      pending_load.remaining_frames = pending_load.remaining_frames - 1
+      if pending_load.remaining_frames <= 0 then
+        finish_state_operation("E04")
+      end
+    end
+  end
 
   local function read_program_hex(addr, len)
     local out = {}
@@ -658,7 +732,10 @@ function emucap_gdbstub.startplugin()
       return false
     end
     frames = math.max(tonumber(frames) or 1, 1)
-    frame_wait_target = current_frame() + frames
+    -- This is a remaining callback count, not an absolute screen frame. MAME can reset the screen
+    -- frame number during boot; an absolute target would then become unreachable and strand the
+    -- pending request until its socket timeout.
+    frame_wait_target = frames
     frame_wait_stop = stop_on_done and true or false
     frame_wait_release_input = release_input_on_done and true or false
     trace("framewait start frames=" .. tostring(frames) .. " stop_on_done=" .. tostring(stop_on_done) .. " execstate_was=" .. tostring(debugger and debugger.execution_state))
@@ -672,10 +749,12 @@ function emucap_gdbstub.startplugin()
   end
 
   frame_subscription = emu.add_machine_frame_notifier(function()
+    tick_state_operation()
     if not frame_wait_target then
       return
     end
-    if current_frame() < frame_wait_target then
+    frame_wait_target = frame_wait_target - 1
+    if frame_wait_target > 0 then
       return
     end
 
@@ -1014,6 +1093,28 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E03")
       end
       return true
+    elseif name == "savesync" then
+      local path = hex_to_string(rest or "")
+      if not path or path == "" or pending_save or pending_load then
+        ack_packet(socket, "E00")
+        return true
+      end
+      os.remove(path)
+      pending_save = {
+        path = path,
+        remaining_frames = 120,
+        seen_pre_save = false
+      }
+      local ok, err = pcall(function() manager.machine:save(path) end)
+      if ok then
+        hold_requested = false
+        running = true
+      else
+        pending_save = nil
+        print("emucap_gdbstub: synchronous save scheduling failed " .. tostring(err))
+        ack_packet(socket, "E03")
+      end
+      return true
     elseif name == "statesave" then
       local slot = hex_to_string(rest or "")
       if not slot or slot == "" then
@@ -1053,6 +1154,32 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "OK")
       else
         print("emucap_gdbstub: load failed " .. tostring(err))
+        ack_packet(socket, "E04")
+      end
+      return true
+    elseif name == "loadsync" then
+      local path = hex_to_string(rest or "")
+      if not path or path == "" or pending_save or pending_load then
+        ack_packet(socket, "E00")
+        return true
+      end
+      local input = io.open(path, "rb")
+      if not input then
+        ack_packet(socket, "E04")
+        return true
+      end
+      input:close()
+      pending_load = {
+        path = path,
+        remaining_frames = 120
+      }
+      local ok, err = pcall(function() manager.machine:load(path) end)
+      if ok then
+        hold_requested = false
+        running = true
+      else
+        pending_load = nil
+        print("emucap_gdbstub: synchronous load scheduling failed " .. tostring(err))
         ack_packet(socket, "E04")
       end
       return true

@@ -1,18 +1,21 @@
-# emucap — Mednafen (Sega Saturn · Sony PlayStation · PC Engine · Mega Drive · WonderSwan/WSC) adapter
+# emucap — Mednafen (Saturn · PlayStation · PC Engine · PC-FX · Mega Drive · WonderSwan/WSC · Neo Geo Pocket/Color) adapter
 
 Mednafen has no Lua like Mesen, so **we patch Mednafen and inject a socket
 client (`emucap.cpp`)** — a C++ port of Mesen's `emucap-core.lua`. It connects to
 emucap-mcp and serves the same NDJSON protocol, so the Rust side (TcpLink · tools
 · MCP) stays unchanged.
 
-**One binary handles Saturn (ss) · PlayStation (psx) · PC Engine (pce) · Mega
-Drive (md) · WonderSwan/WSC (wswan), all of them.** Mednafen auto-detects the system from the loaded disc/
+**One binary handles Saturn (ss) · PlayStation (psx) · PC Engine (pce) · PC-FX
+(pcfx) · Mega Drive (md) · WonderSwan/WSC (wswan) · Neo Geo Pocket/Color (ngp),
+all of them.** Mednafen auto-detects the system from the loaded disc/
 ROM, and at runtime emucap branches on `CurGame->shortname` ("ss"/"psx"/"pce"/
-"md"/"wswan") for system-specific behavior (address-space mapping · button table ·
-endianness). The common debugger interface works on each system unmodified. PCE
+"pcfx"/"md"/"wswan"/"ngp") for system-specific behavior (address-space mapping · button table ·
+endianness). The common debugger interface works where Mednafen exposes it. PCE
 analysis defaults to the accuracy/debugger-first `pce` core. `pce_fast` is also
 built, but since Mednafen provides no Debugger pointer there, the memory/register/
-breakpoint family of tools is demoted to `no_debugger`.
+breakpoint family of tools is demoted to `no_debugger`. The NGP core likewise has no
+Debugger pointer; it intentionally exposes only frame execution, pause/resume, reset,
+save/load, screenshot, ROM identity, and port-0 input.
 
 Mednafen is GPL, so we do not vendor/redistribute it wholesale. Only our
 additions (`emucap.cpp`/`.h`) live in this repository, and `build.sh` fetches
@@ -29,7 +32,10 @@ upstream Mednafen locally to patch and build it.
 BIOS files are copyrighted console firmware. **emucap cannot and will not include them** — the user
 provides them from their own console or dumps. **Never commit BIOS files to the repository.**
 
-**Where they go.** On macOS/Linux the folder is `~/.mednafen/firmware/`. Create it first if it is
+**Where they go.** The PC-FX path is isolated from the user's Mednafen profile: set
+`EMUCAP_PCFX_BIOS` to an absolute path, or place `pcfx.rom` in the OS-specific emucap data
+root under `firmware/`. Other Mednafen systems retain the established Mednafen firmware lookup.
+On macOS/Linux that folder is `~/.mednafen/firmware/`. Create it first if it is
 missing (`mkdir -p ~/.mednafen/firmware`), then drop the file in with its exact name (below).
 On **Windows** the Mednafen adapter is BETA and building it from source is non-trivial — do not assume a
 firmware path there; see the **Platforms** note in the top-level `README.md` for the agent-driven fallback
@@ -41,9 +47,11 @@ firmware path there; see the **Platforms** note in the top-level `README.md` for
 |--------|--------------|--------------------|
 | **PlayStation** (psx) | **Required** — cannot boot without it | `scph5500.bin` (JP) · `scph5501.bin` (NA) · `scph5502.bin` (EU), matching the disc's region → `~/.mednafen/firmware/` |
 | **PC Engine CD** (pce, CD titles) | **Required** for CD titles | `syscard3.pce` → `~/.mednafen/firmware/` (default; to use another location set `pce.cdbios`/`pce_fast.cdbios`) |
+| **PC-FX** (pcfx) | **Required** — version 1.00 only | `pcfx.rom`, 1 MiB, SHA-256 `4b44ccf5d84cc83daa2e6a2bee00fdafa14eb58bdf5859e96d8861a891675417` → `<emucap-data>/firmware/pcfx.rom`, or set absolute `EMUCAP_PCFX_BIOS` |
 | **Saturn** (ss) | Recommended | `sega_101.bin` (JP), etc. → `~/.mednafen/firmware/`; point at it with `ss.bios_jp` in `~/.mednafen/mednafen.cfg` |
 | **PC Engine HuCard** (`.pce`) | **None** | boots without a BIOS |
 | **Mega Drive / Genesis** | **None** | cartridge ROMs (`.md`/`.gen`/`.smd`, or a `.bin` with a header) boot without a BIOS |
+| **Neo Geo Pocket / Color** | **None** | cartridge ROMs (`.ngp`/`.ngpc`/`.ngc`/`.npc`) use Mednafen's built-in HLE BIOS |
 
 If the user already runs RetroArch they can copy and reuse the same BIOS files, but the RetroArch system
 directory is a host-specific setting, so do not hardcode a local path into docs or scripts.
@@ -63,7 +71,7 @@ path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fa
 ./build.sh
 ```
 - Download Mednafen 1.32.1 → inject `emucap.cpp` → re-inject all emucap hooks into the fresh source with perl →
-  `./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-md --enable-debugger` → make.
+  `./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-debugger` → make.
   Output: `work/mednafen/src/mednafen`.
 - `upstream.lock` fixes the release URL and SHA-256. `build.sh` verifies both a newly downloaded archive and
   every cached archive before extraction. The adapter `build` identity combines the emucap revision and
@@ -72,11 +80,12 @@ path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fa
   but Apple Silicon reports as `arm` and gets dropped. psx is on by default, but `--enable-psx` pins the intent.
 - **Hooks injected by build.sh (no reliance on hand-edits · reproducible)**: ① the main.cpp frame loop (`emucap_service`/
   `emucap_capture`, common driver path), ② input injection `emucap_apply_input(PortData[0])` —
-  in the core-agnostic `mednafen.cpp`, at both the pre-Emulate and MidSync phases (common to ss · psx · pce · md), ③ value-conditioned BP recording
+  in the core-agnostic `mednafen.cpp`, at both the pre-Emulate and MidSync phases (common to every enabled module), ③ value-conditioned BP recording
   `emucap_bp_record` — for Saturn `ss/debug.inc` (2 read/write functions), for PSX `CheckCPUBPCallB`
   (a single callback) in `psx/debug.cpp`, for PCE the HuC6280 logical read/write match in `pce/debug.cpp`,
-  for MD the 68000 read/write match in `md/debug.cpp`, ④ input diagnostics `emucap_game_data_store` —
-  the gamepad update path of `ss` · `psx` · `pce` · `pce_fast` · `md`.
+  for PC-FX the V810 read/write match in `pcfx/debug.cpp`, and for MD the 68000 read/write match in
+  `md/debug.cpp`, ④ input diagnostics `emucap_game_data_store` — the gamepad update path of
+  `ss` · `psx` · `pce` · `pce_fast` · `pcfx` · `md` · `wswan`.
   Each injection is verified at build time against a fixed string.
 - automake not needed: added directly to OBJECTS in the generated Makefile.
 - Set `EMUCAP_MEDNAFEN_WORK=/path/to/build-dir` only to an empty directory or a
@@ -90,6 +99,15 @@ of display visibility. For example, a PC Engine CD launch with audio is:
 ```json
 {"content_path":"/path/to/pce.cue","system":"pce","sound":true}
 ```
+
+PC-FX uses an explicit system ID because its disc extensions overlap other CD systems:
+
+```json
+{"content_path":"/path/to/pcfx.cue","system":"pcfx","display":false}
+```
+
+The Rust launcher validates the version 1.00 BIOS before spawning and gives PC-FX a per-port
+`MEDNAFEN_HOME`, so it neither reads nor updates `~/.mednafen`.
 
 The launcher passes `-sound 1` only when `sound:true` is requested and reports the effective `sound` value in
 its result. `sound:true` is currently a Mednafen-only option; other adapters reject it rather than silently
@@ -123,6 +141,8 @@ proof that Mednafen exited, so reconnect and query `status` before launching ano
 ./launch.sh "/path/to/psx.cue" 47800
 # PC Engine CD-ROM2 / HuCard
 MEDNAFEN_FORCE_MODULE=pce ./launch.sh "/path/to/pce.cue" 47800
+# PC-FX
+EMUCAP_PCFX_BIOS="/path/to/pcfx.rom" MEDNAFEN_FORCE_MODULE=pcfx ./launch.sh "/path/to/pcfx.cue" 47800
 # Mega Drive / Genesis
 MEDNAFEN_FORCE_MODULE=md ./launch.sh "/path/to/game.md" 47800
 ```
@@ -140,7 +160,7 @@ launcher cleaned up its own process after a connection timeout. First re-query `
 launch and check whether the port is stale. On an older macOS launcher, a stack blocked in
 `Cocoa_GL_SwapWindow` identifies the SDL2-compat OpenGL startup deadlock; rebuild or update so the
 launcher selects `softfb`.
-For diagnosis by connection symptom — such as the PID disappearing after `Mednafen 연결됨`, `Broken pipe`, or
+For diagnosis by connection symptom — such as the PID disappearing after the connection confirmation, `Broken pipe`, or
 `CLOSE_WAIT` — check the Mednafen log tail and re-query `status`/`listening_port` right before launch.
 
 PCE analysis uses the exact `pce` core that has a Debugger. If auto-detection falls to `pce_fast` or the CUE is
@@ -169,6 +189,13 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   `physical` (21-bit physical) · `ram` (8KB, 32KB on SGX) · `vram0` (VDC VRAM, byte address) · `vram1` (SGX VDC-B VRAM, read/write BP) · `sat0` (VDC SAT) ·
   `pram` (VCE palette) · `adpcm` (CD ADPCM RAM, CD titles) · `acram` (Arcade Card) · `bram` · `psgram0..5`.
   HuC6280 is little-endian. `pce_fast` has no Debugger and does not expose these address spaces.
+- **PC-FX (`pcfx`, V810 little-endian)**: `cpu` (32-bit physical bus) · `ram` (2 MiB) ·
+  `backup` (32 KiB) · `exbackup` (128 KiB) · `bios` (1 MiB) · `track*` (data-track views) ·
+  KING/VDC/VCE auxiliary spaces. Writable dedicated RAM/video spaces use their debugger-backed
+  put handlers; `cpu`, `bios`, and `track*` are rejected before mutation. Exec BP uses aligned absolute
+  V810 addresses. Read/write BP accepts `cpu`, linear `ram`, and `bios` offsets; the interleaved
+  `backup`/`exbackup` views require an exact physical `cpu` address. V810 trace and register
+  watches are available, but `call_stack` is not advertised.
 - **MD/Mega Drive**: `cpu` (68000 24-bit CPU physical — exec/read/write BP · value reads · disassemble happen here) ·
   `ram` (Work RAM 64KB, referenced at public offset 0x0000; read/write BP is internally mapped to CPU addresses 0xFF0000~0xFFFFFF) ·
   `zram` (Z80 RAM 8KB) · `vram` (VDP VRAM 64KB) · `cram` (VDP CRAM 128B, unpacked bus color word) ·
@@ -190,10 +217,16 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   classification with prefix skipping, no full instruction decode). Everything else in the Mednafen debugger surface
   (read/write, get\_state, disassemble via built-in zedis, screenshot, save/load, exec/read/write BP, find\_pattern,
   dump\_memory, step\_instructions, set\_trace, watch\_register, set\_layer\_enable) is inherited.
+- **Neo Geo Pocket/Color (`ngp`)**: no memory types. Mednafen's NGP module has no
+  Debugger object, so the adapter does not advertise memory, state registers,
+  breakpoints, disassembly, instruction stepping, trace, or call stacks. Frame execution,
+  pause/resume, reset, save/load, screenshot, ROM identity, and input remain available.
 
 Button names: Saturn `a/b/c/x/y/z/l/r/start/directions` (`l`=`ls` · `r`=`rs` aliases), PSX `cross/circle/triangle/square/l1/l2/r1/r2/
 start/select/directions` (SNES-style `l`=`l1` · `r`=`r1` aliases, plus DualShock `l3/r3`), PCE `i/ii/run/select/directions` (convenience aliases `a/b/start`,
-6-button `iii/iv/v/vi`), MD `a/b/c/x/y/z/mode/start/directions`, WonderSwan `a/b/start` + two discrete cursor pads
+6-button `iii/iv/v/vi`), PC-FX `i/ii/iii/iv/v/vi/run/select/directions/mode1/mode2`
+(`a/b/start` aliases), MD `a/b/c/x/y/z/mode/start/directions`, Neo Geo Pocket/Color
+`a/b/option/directions` (`start` aliases `option`), WonderSwan `a/b/start` + two discrete cursor pads
 `up-x/right-x/down-x/left-x` (aliases `x1..x4` and the default `up/right/down/left`) and `up-y/right-y/down-y/left-y`
 (`y1..y4`) — the X and Y pads are independent buttons (up+down can be pressed together), matching the vertical/horizontal
 dual orientation. All are active-high. The third argument of Mednafen's `IDIIS_Button*` is
@@ -216,7 +249,7 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `physical` 21-bit physical, and `vram0/vram1` VDC AUX BPs. MD access BPs, in addition to `cpu`/`ram`/`zram`,
   support `vram`/`cram`/`vsram`/`vdpreg` write BPs via a VDP write hook. VDP read BPs are not yet supported.
   MD `ram` BP is mapped to CPU address 0xFF0000)/
-  `disassemble` (SH-2/MIPS/HuC6280/68000)/
+  `disassemble` (SH-2/MIPS/HuC6280/V810/68000/V30MZ)/
   `find_pattern` (pattern search in 128KB units inside the debugger address space)/
   `reset`/`set_input` · `press_buttons` (controller injection — overwrites `mednafen.cpp`'s PortData[0] with the button
   mask, active-high; tap/hold_until are assembled in Rust from set_input+step)/
@@ -250,6 +283,17 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `cargo run --example mednafen_pce_input_visual -- <game.cue|game.pce>`. Default verification order:
   `status.system=="pce"` → HuC6280/VDC groups exposed in `get_state` → `read_memory("cpu", 0xE060, ...)`
   → `disassemble(0xE060)` → `tap(["run"])` or `tap(["start"])`.
+- **PC-FX status**: the representative-disc smoke verifies exact `pcfx` identity, V810 state and
+  disassembly, one-instruction stepping with trace, exec BP freeze/event, BIOS offset↔CPU physical
+  agreement, protected-space write rejection, frozen RAM save/load restoration, gamepad delivery
+  and ownership release, and PNG screenshot:
+  `cargo run --example mednafen_pcfx_smoke -- <game.cue> <pcfx.rom> [mednafen]`.
+  This is runtime proof for the common surface, not proof that every game-specific CD timing path
+  or every auxiliary breakpoint has been exercised.
+- **Neo Geo Pocket/Color status**: the representative `.ngc` smoke verifies exact `ngp`
+  identity, the explicit no-debugger downgrade, A+OPTION delivery to the core latch, input
+  ownership release, save/load completion, and a PNG screenshot:
+  `cargo run --release --example mednafen_ngp_smoke -- <game.ngp|game.ngc> [mednafen]`.
 - **MD status**: added the `md` core build/branch/button/value-conditioned BP recording paths. Default verification order:
   `status.system=="md"` → check the SEGA header with `read_memory("cpu", 0x100, ...)` →
   read the reset vector and `disassemble(reset_pc)` → `write_memory("ram", ...)` round-trip →

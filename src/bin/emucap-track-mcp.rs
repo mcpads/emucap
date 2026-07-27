@@ -35,10 +35,12 @@ struct ActiveRun {
 
 #[derive(Deserialize, JsonSchema)]
 struct TrackRunStartArgs {
-    /// 필수 — 제어 MCP `get_rom_info`의 균일 `rom_sha1` 필드를 받아 전달한다(어댑터별 해시를 정규화한 불투명한 그룹 식별자). 이 MCP는 에뮬레이터를 모르므로 추론하지 않는다.
+    /// Required opaque ROM identifier from Control MCP `get_rom_info.rom_sha1`.
+    /// This server does not inspect the emulator or infer the value.
     rom_sha1: String,
-    /// 선택 — 어느 세션/연결의 run인지 표식(제어 MCP `status.emulator_identity.name` 또는 `"port:"`+
-    /// `status.listening_port`). 같은 connection_ref의 직전 미종료 run을 자동 마감(superseded)하는 데 쓴다.
+    /// Optional session marker: Control MCP `status.emulator_identity.name` or
+    /// `"port:" + status.listening_port`. It is used to resume or supersede the
+    /// previous unfinished run for that connection.
     #[serde(default)]
     connection_ref: Option<String>,
     #[serde(default)]
@@ -51,16 +53,18 @@ struct TrackRunStartArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct RunResumeArgs {
-    /// 재바인딩할 run_id(전역 유일). 디스크에서 status=running일 때만 resume된다(종료된 run은 새 run_start로).
+    /// Globally unique run ID to rebind. Only a stored run with status=running
+    /// can be resumed; start a new run after a finished run.
     run_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct RunFinishArgs {
-    /// done|aborted|error (기본 done)
+    /// done|aborted|error (default: done).
     #[serde(default)]
     status: Option<String>,
-    /// 특정 run을 id로 종료(전역 유일). 생략 시 활성 run. 서버 재시작 등으로 고아화된 run 복구용.
+    /// Finish a globally unique run by ID. When omitted, finish the active run.
+    /// This also supports recovery of orphaned running records after a restart.
     #[serde(default)]
     run_id: Option<String>,
 }
@@ -74,7 +78,7 @@ struct LogMetricArgs {
 #[derive(Deserialize, JsonSchema)]
 struct LogGateArgs {
     name: String,
-    /// machine | judgment
+    /// machine | judgment.
     kind: String,
     passed: Option<bool>,
     evidence_ref: Option<String>,
@@ -85,7 +89,8 @@ struct LogGateArgs {
 #[derive(Deserialize, JsonSchema)]
 struct LogArtifactArgs {
     kind: String,
-    /// 이미 캡처된 파일 경로. 상대경로는 작업 repo git root 기준으로 해소된다(MCP 서버 cwd 아님).
+    /// Path to an existing captured file. Relative paths are resolved from the
+    /// working repository root, not the MCP server's current directory.
     path: String,
 }
 
@@ -97,7 +102,8 @@ struct SetReproArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct LogFindingArgs {
-    /// 생략 시 활성 run의 rom_sha1. 둘 다 없으면 에러.
+    /// ROM identifier. When omitted, use the active run's rom_sha1. The call
+    /// fails if neither is available.
     rom_sha1: Option<String>,
     claim: String,
     #[serde(default)]
@@ -108,19 +114,20 @@ struct LogFindingArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct LogInterventionArgs {
-    /// 개입 종류 — write_memory|load_state|reset|input_burst 등 자유 라벨. 제어 MCP가 더는 자동
-    /// 기록하지 않으므로 에이전트가 상태변경을 직접 기록해 repro_status 충실도를 유지한다.
+    /// Free-form intervention label such as write_memory, load_state, reset, or
+    /// input_burst. Control MCP mutations are not logged automatically.
     op: String,
-    /// 개입의 구조화 인자(예: write_memory면 {memory_type,address,hex}). 생략 시 null.
+    /// Structured operation arguments, for example
+    /// {memory_type,address,hex} for write_memory. Defaults to null.
     #[serde(default)]
     args: Option<serde_json::Value>,
-    /// 개입 시점 프레임(선택).
+    /// Optional frame at which the intervention occurred.
     #[serde(default)]
     at_frame: Option<u64>,
-    /// 개입을 유발한 이벤트 참조(선택).
+    /// Optional reference to the event that triggered the intervention.
     #[serde(default)]
     at_event: Option<String>,
-    /// frozen 컨텍스트에서의 개입이면 true(기본 false).
+    /// True when the intervention occurred in a frozen context. Default: false.
     #[serde(default)]
     frozen_context: bool,
 }
@@ -130,7 +137,8 @@ struct QueryRunsArgs {
     rom_sha1: Option<String>,
     goal: Option<String>,
     status: Option<String>,
-    /// 결과를 이 경로에 JSON으로 저장하고 요약만 반환(큰 결과가 예상될 때 context 절약). 생략 시 인라인.
+    /// Write JSON results to this path and return only a summary. Omit to return
+    /// the full result inline.
     #[serde(default)]
     output_path: Option<String>,
 }
@@ -143,24 +151,25 @@ struct GetRunArgs {
 
 #[derive(Deserialize, JsonSchema)]
 struct CompareRunsArgs {
-    /// 비교 기준 run_id(A)
+    /// Baseline run ID (A).
     run_id_a: String,
-    /// 비교 대상 run_id(B)
+    /// Comparison run ID (B).
     run_id_b: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct SummarizeRunsArgs {
-    /// goal 정확 일치 필터(생략 시 무제약)
+    /// Exact goal filter. Omit for no goal restriction.
     #[serde(default)]
     goal: Option<String>,
-    /// tag 정확 원소 일치 필터(생략 시 무제약)
+    /// Exact tag-element filter. Omit for no tag restriction.
     #[serde(default)]
     tag: Option<String>,
-    /// rom_sha1 필터(생략 시 무제약)
+    /// ROM identifier filter. Omit for no ROM restriction.
     #[serde(default)]
     rom_sha1: Option<String>,
-    /// 결과를 이 경로에 JSON으로 저장하고 요약만 반환(큰 결과가 예상될 때 context 절약). 생략 시 인라인.
+    /// Write JSON results to this path and return only a summary. Omit to return
+    /// the full result inline.
     #[serde(default)]
     output_path: Option<String>,
 }
@@ -178,41 +187,44 @@ fn track_err(msg: impl std::fmt::Display) -> CallToolResult {
     r
 }
 
-/// MCP 서버 사용 가이드. 에이전트가 항상 보는 유일한 문서이므로 자기완결적이어야 한다.
-const SERVER_INSTRUCTIONS: &str = r#"emucap 실험 추적 MCP — 시도를 기록·재현·비교해 어떤 조건에서 패치가 성공하는지 찾기 위한 `.emucap/` 기록 저장소다. **이 서버는 에뮬레이터를 제어하지 않는다.** 메모리·상태·화면·입력 제어는 별도 제어 MCP(emucap-mcp)에서 한다. 두 서버는 서로 호출하지 않으므로 에이전트가 필요한 값을 직접 전달한다.
+/// Self-contained guidance shown to every Tracking MCP consumer.
+const SERVER_INSTRUCTIONS: &str = r#"emucap Tracking MCP stores experiment records under `.emucap/` so runs can be reproduced and compared. It does not control an emulator. Use Control MCP (`emucap-mcp`) for memory, execution, screenshots, and input; pass the required values between the two servers explicitly.
 
-[제어 MCP에서 받을 값]
-  • rom_sha1: 이 MCP는 ROM을 읽지 않는다. 제어 MCP `get_rom_info`가 반환한 공통 `rom_sha1` 값을 run_start/get_run/query_runs/log_finding에 그대로 넘긴다. `rom_sha1`이 없는 경우에만 `shasum -a1 <content>`를 쓴다.
-  • connection_ref(선택): 제어 MCP `status.emulator_identity.name`, 또는 `"port:" + status.listening_port`. run_start에 넘기면 같은 connection의 직전 미종료 run을 자동 마감(superseded)한다.
-  • regression_run/verify_determinism은 제어 MCP가 에뮬레이터를 실행해 결과만 반환한다. 그 결과를 log_gate/log_metric으로 기록한다. 프레임 경계 탐색 결과도 같은 방식으로 기록한다.
-  • write_memory/load_state/reset/입력처럼 상태를 바꾸는 호출은 자동 기록되지 않는다. 다시 재현할 수 있도록 log_intervention으로 기록한다.
+[Identity from Control MCP]
+- Pass `get_rom_info.rom_sha1` unchanged to `run_start` and ROM-scoped queries. This server does not read the ROM. Use `shasum -a1 <content>` only when a backend cannot provide `rom_sha1`.
+- `connection_ref` is optional. Use `status.emulator_identity.name`, or `"port:" + status.listening_port`. It lets `run_start` resume the same unfinished run or supersede an older run for that connection.
+- Record Control MCP analysis results with `log_gate` or `log_metric`.
+- Mutations such as `write_memory`, `load_state`, `reset`, and input are not recorded automatically. Call `log_intervention` when they matter to reproduction.
 
-[저장 위치] EMUCAP_TRACK_ROOT가 있으면 그 경로, 없으면 작업 중인 git 저장소의 `.emucap`, git 저장소가 아니면 현재 디렉터리의 `.emucap`을 쓴다. bootstrap은 실제 경로를 ledger_path로, 선택 이유를 ledger_path_source로 반환한다. 현재 디렉터리를 쓴 경우에는 ledger_path_warning도 반환하므로 EMUCAP_TRACK_ROOT를 지정하거나 git 저장소에서 실행하는 편이 안전하다. run.json은 이 서버만 쓰게 하고, 라이브 세션 중에는 `emucap track import`처럼 별도 프로세스가 쓰는 명령을 함께 실행하지 않는다. broker를 여러 세션에서 쓸 때는 세션별 EMUCAP_TRACK_ROOT를 나누는 것이 안전하다.
+[Storage and ownership]
+The ledger root is `EMUCAP_TRACK_ROOT`, otherwise the nearest Git repository's `.emucap`, otherwise the current directory's `.emucap`. `bootstrap` returns `ledger_path`, `ledger_path_source`, and a warning for the current-directory fallback. Keep a single writer for `run.json`: do not run a separate writer such as `emucap track import` against the same live ledger. Give concurrent broker sessions separate ledger roots.
 
-[run 수명]
-  run_start(rom_sha1 필수, connection_ref/goal/description/tags 선택): 새 run을 현재 기록 대상으로 지정하고 {run_id, rom_sha1, ledger_path}를 반환한다. 같은 connection_ref와 rom_sha1을 가진 미종료 run이 이미 있으면 새로 만들지 않고 이어 쓰며 resumed:true를 반환한다. rom_sha1이 다르면 같은 connection_ref의 이전 run을 superseded로 끝내고 새 run을 만든다.
-  run_resume(run_id): 지정한 running run을 현재 기록 대상으로 다시 선택하고 resumed:true를 반환한다. MCP 재연결 뒤 bootstrap의 running_runs에서 이어 쓸 run을 찾았을 때 사용한다. 이미 종료된 run이면 오류다.
-  log_metric/log_gate/log_artifact/set_reproduction/log_intervention은 현재 run이 있어야 한다. 없으면 run_start 또는 run_resume을 먼저 호출한다. log_finding은 현재 run이 있거나 rom_sha1을 직접 주면 기록할 수 있다.
-  run_finish(status=done|aborted|error 기본 done, run_id 선택): run_id가 있으면 현재 선택 여부와 상관없이 그 run을 종료한다. 생략하면 현재 run을 종료한다. 이어 쓸 run에는 run_finish를 쓰지 않는다. 더 이상 쓰지 않을 미종료 run만 종료한다.
+[Run lifecycle]
+- `run_start(rom_sha1, connection_ref?, goal?, description?, tags?)` selects a new active run. With the same `connection_ref` and ROM, it resumes an unfinished run and returns `resumed:true`. With a different ROM, it supersedes the previous unfinished run for that connection.
+- `run_resume(run_id)` reselects a stored running run after an MCP reconnect. It never creates a new run. A finished run cannot be resumed.
+- `log_metric`, `log_gate`, `log_artifact`, `set_reproduction`, and `log_intervention` require an active run. `log_finding` accepts either an active run or an explicit `rom_sha1`.
+- `run_finish(status=done|aborted|error, run_id?)` finishes the selected run or a run named by ID. Resume a run that will continue; finish only a run that will not.
 
-[기록 도구]
-  log_metric(key, value): 이름과 숫자 한 쌍을 기록한다.
-  log_gate(name, kind=machine|judgment, passed?/evidence_ref?/detail?/case_ref?): 검증 결과를 기록한다. passed를 생략하면 pending이다. 제어 MCP 분석 도구의 결과는 주로 여기에 기록한다.
-  log_artifact(kind, path): 이미 캡처된 파일을 등록하고 sha256을 계산한다. 새 캡처를 만들지는 않는다. 상대경로는 작업 중인 git 저장소에서 찾는다.
-  set_reproduction(base?, movie_ref?): 현재 run을 다시 실행하는 데 쓸 base와 movie_ref를 설정한다. repro_status는 자동으로 계산된다.
-  log_finding(claim, rom_sha1?/evidence_refs?/promoted?): 발견을 해당 ROM에 기록한다. promoted=true는 확정된 발견으로 표시한다.
-  log_intervention(op, args?/at_frame?/at_event?/frozen_context?): 현재 run에 상태 변경 이력을 기록한다.
+[Records]
+- `log_metric` stores a numeric observation.
+- `log_gate` stores machine or judgment evidence; omitted `passed` means pending.
+- `log_artifact` registers an existing file and computes its SHA-256. It does not capture a new artifact.
+- `set_reproduction` sets the base and movie reference; reproduction status is derived.
+- `log_finding` stores a ROM-scoped claim. `promoted:true` marks a confirmed finding.
+- `log_intervention` stores a state-changing operation and its context.
 
-[저장된 기록 읽기]
-  query_runs(rom_sha1?/goal?/status?): 필터로 run 목록(최근 우선). 손상 JSON은 skipped로 세고 죽지 않는다.
-  get_run(rom_sha1, run_id): 저장된 run.json 내용과 ledger_path를 반환한다. run_id는 전체에서 고유하지만 ROM별 디렉터리에서 찾으므로 rom_sha1도 필요하다.
-  compare_runs(run_id_a, run_id_b): 두 run의 수치 변화, log_gate 결과 변화, 재현성, 상태 변경, 파일 차이를 반환한다.
-  summarize_runs(goal?/tag?/rom_sha1?): 여러 run의 상태·재현성 분포, log_gate 결과 비율, 상태 변경 종류, run별 요약을 반환한다.
-  **성공 여부를 대신 결정하지 않는다. 저장된 결과를 보고 어떤 조건에서 성공했는지는 에이전트가 판단한다.**
+[Queries]
+- `query_runs` lists filtered runs, newest first. Corrupt JSON is counted as skipped instead of aborting the query.
+- `get_run` returns a stored `run.json` and its ledger path.
+- `compare_runs` compares metrics, gates, reproduction, interventions, and files.
+- `summarize_runs` aggregates status, reproduction, gates, interventions, and per-run summaries.
+The server reports stored evidence; it does not decide whether an experiment succeeded.
 
-[셸 CLI] emucap track ls|show|compare|summarize|reindex|import도 같은 `.emucap/` 기록을 읽는다.
+[Large results]
+Use `output_path` with `query_runs` or `summarize_runs` to write JSON to a file and receive a compact summary. Full memory dumps belong to Control MCP `dump_memory`; Tracking MCP has no memory-dump tool.
 
-[큰 결과] query_runs/summarize_runs에는 output_path를 줘 파일로 저장하고 요약과 경로만 받는다. 메모리 전체 덤프는 제어 MCP의 dump_memory를 쓴다. 이 추적 MCP에는 dump_memory가 없다."#;
+[CLI]
+`emucap track ls|show|compare|summarize|reindex|import` reads the same ledger."#;
 
 // ── 도구 구현 ────────────────────────────────────────────────────────────────
 
@@ -242,7 +254,7 @@ impl EmucapTrack {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(ar) = active else {
-            return track_err("활성 run 없음 — run_start 먼저");
+            return track_err("no active run; call run_start or run_resume first");
         };
         let root = emucap::track::store::root_from_env();
         let now = emucap::track::clock::now_rfc3339();
@@ -284,7 +296,7 @@ impl EmucapTrack {
         // 침묵 폐기 방지: resume는 기존 run 메타를 유지하므로, 이 호출이 넘긴 goal/description/tags는
         // 적용되지 않는다 — 응답에 명시해 "새 goal로 새 실험" 의도가 옛 run에 흡수되는 걸 가시화한다.
         if caller_supplied_meta {
-            resp["note"] = serde_json::json!("기존 run을 resume했다 — 이 호출의 goal/description/tags는 무시됐다(기존 run 메타 유지). 새 goal로 *새 실험*을 시작하려면 run_finish 후 run_start하라.");
+            resp["note"] = serde_json::json!("Resumed the existing run. This call's goal, description, and tags were ignored so the stored metadata remains unchanged. Finish it and call run_start to begin a new experiment with new metadata.");
         }
         *g = Some(ActiveRun {
             rom_sha1: binding.rom_sha1,
@@ -295,14 +307,14 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "추적 MCP의 첫 진입점. 이 서버는 에뮬레이터를 제어하지 않고 `.emucap/`에 실험 기록을 저장한다. ledger_path, 현재 선택한 run, 저장된 미종료 run, 사용할 수 있는 기록·검색 방법을 반환한다. rom_sha1은 제어 MCP(emucap-mcp)의 get_rom_info에서 읽어 run_start에 넘긴다"
+        description = "Start here. Returns the ledger path, active run, stored unfinished runs, and available record/query operations. This server stores `.emucap/` experiment records and never controls an emulator. Obtain rom_sha1 from Control MCP get_rom_info and pass it to run_start."
     )]
     async fn bootstrap(&self) -> CallToolResult {
         track_ok(self.make_bootstrap_value())
     }
 
     #[tool(
-        description = "실험 Run을 시작한다(메타 전용, 에뮬레이터 무통신). rom_sha1은 필수 — 제어 MCP의 get_rom_info에서 읽어 전달하라(이 MCP는 에뮬레이터를 모른다). connection_ref는 선택(어느 세션 run인지 표식). **resume**: connection_ref가 있고 디스크에 그 connection_ref + 같은 rom의 still-running run이 있으면 새 run을 만들지 않고 그 run을 active로 재바인딩한다(반환 resumed:true) — /mcp 재연결로 active가 끊겨도 같은 run을 이어써 파편화를 막는다. rom이 다르면 같은 connection_ref의 직전 미종료 run을 자동 마감하고 새 run을 만든다. 이후 log_*가 이 run에 기록된다."
+        description = "Start or resume an experiment run without contacting an emulator. rom_sha1 is required and must come from Control MCP get_rom_info. With connection_ref and a stored running run for the same ROM, rebind that run and return resumed:true. With a different ROM, supersede the previous unfinished run for that connection and create a new one. Subsequent log_* calls target the active run."
     )]
     async fn run_start(&self, Parameters(a): Parameters<TrackRunStartArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
@@ -362,7 +374,7 @@ impl EmucapTrack {
                             });
                         track_ok(v)
                     }
-                    None => track_err("내부 오류: start_run 응답에 run_id 없음"),
+                    None => track_err("internal error: start_run response has no run_id"),
                 }
             }
             Err(e) => track_err(e),
@@ -370,7 +382,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "특정 running Run을 in-memory active로 다시 바인딩한다(resume). /mcp 재연결 등으로 active 바인딩이 끊겼을 때, bootstrap의 running_runs에서 이 세션 run을 골라 run_id로 이어쓴다 — 새 run을 만들지 않아 파편화가 없다(반환 resumed:true). status가 running이 아니면(이미 종료) 에러. connection_ref가 있으면 run_start(같은 connection_ref)로도 같은 resume이 일어난다."
+        description = "Rebind a stored running run as the in-memory active run. Use its run_id from bootstrap.running_runs after an MCP reconnect. This returns resumed:true and does not create a new run. A finished run is rejected. run_start with the same connection_ref can perform the same resume automatically."
     )]
     async fn run_resume(&self, Parameters(a): Parameters<RunResumeArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
@@ -382,7 +394,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "활성 Run을 종료한다(status=done|aborted|error). run_id를 주면 활성 상태와 무관하게 그 run을 직접 종료한다(서버 재시작 등으로 고아화된 running run 복구용). run_start는 새 run 시작 시 같은 연결의 직전 미종료 run을 자동 마감하므로 보통은 명시 종료만 신경쓰면 된다."
+        description = "Finish a run with status done, aborted, or error. With run_id, finish that stored run even when it is not active; this supports orphan recovery after a restart. Without run_id, finish the active run. run_start already supersedes an older unfinished run for the same connection when necessary."
     )]
     async fn run_finish(&self, Parameters(a): Parameters<RunFinishArgs>) -> CallToolResult {
         let status =
@@ -413,7 +425,9 @@ impl EmucapTrack {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(ar) = active else {
-            return track_err("활성 run 없음 — run_start 먼저(또는 run_id로 특정 run 종료)");
+            return track_err(
+                "no active run; call run_start first or provide run_id to finish a stored run",
+            );
         };
         match emucap::track::mcp_ops::finish_active_run(
             &root,
@@ -430,7 +444,7 @@ impl EmucapTrack {
         }
     }
 
-    #[tool(description = "활성 Run에 정량 메트릭을 기록한다(메타 전용).")]
+    #[tool(description = "Record a numeric metric on the active run.")]
     async fn log_metric(&self, Parameters(a): Parameters<LogMetricArgs>) -> CallToolResult {
         self.with_active(|root, ar, gen, now| {
             emucap::track::mcp_ops::log_metric(
@@ -446,7 +460,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "현재 Run에 검증 결과를 기록한다(kind=machine|judgment, passed 생략=pending). 제어 MCP의 분석 결과는 주로 이 도구로 남긴다."
+        description = "Record verification evidence on the active run. kind must be machine or judgment; omit passed for a pending result. Use this for Control MCP analysis results."
     )]
     async fn log_gate(&self, Parameters(a): Parameters<LogGateArgs>) -> CallToolResult {
         // kind 검증을 active 검사보다 먼저(에러 우선순위 보존) — 로직은 mcp_ops::log_gate가 재검증·기록.
@@ -471,7 +485,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "이미 캡처된 파일을 활성 Run의 artifact로 등록한다(sha256 계산, 새 캡처 안 함)."
+        description = "Register an existing file as an artifact of the active run and compute its SHA-256. This tool does not capture a new artifact."
     )]
     async fn log_artifact(&self, Parameters(a): Parameters<LogArtifactArgs>) -> CallToolResult {
         let active = self
@@ -480,7 +494,7 @@ impl EmucapTrack {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let Some(ar) = active else {
-            return track_err("활성 run 없음 — run_start 먼저");
+            return track_err("no active run; call run_start or run_resume first");
         };
         let root = emucap::track::store::root_from_env();
         // 상대경로는 MCP 서버 cwd가 아니라 *작업 repo* 루트 기준으로 해소(최소놀람·재현성).
@@ -500,7 +514,9 @@ impl EmucapTrack {
         }
     }
 
-    #[tool(description = "활성 Run의 재현 base/movie를 설정한다(repro_status는 자동 도출).")]
+    #[tool(
+        description = "Set the active run's reproduction base and movie reference. reproduction status is derived automatically."
+    )]
     async fn set_reproduction(&self, Parameters(a): Parameters<SetReproArgs>) -> CallToolResult {
         self.with_active(|root, ar, _gen, _now| {
             emucap::track::mcp_ops::set_reproduction(
@@ -514,7 +530,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "현재 Run에 상태 변경을 기록한다(op=write_memory|load_state|reset|input_burst 등). 제어 MCP가 자동으로 남기지 않으므로 나중에 같은 실행을 재현하려면 에이전트가 직접 기록한다."
+        description = "Record a state-changing operation on the active run, such as write_memory, load_state, reset, or input_burst. Control MCP does not log mutations automatically, so record interventions needed for reproduction explicitly."
     )]
     async fn log_intervention(
         &self,
@@ -537,7 +553,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "발견을 ROM 스코프로 기록한다(promoted=true면 승격). rom_sha1 생략 시 활성 run의 것을 쓴다."
+        description = "Record a ROM-scoped finding. promoted:true marks it as confirmed. When rom_sha1 is omitted, use the active run's ROM identifier."
     )]
     async fn log_finding(&self, Parameters(a): Parameters<LogFindingArgs>) -> CallToolResult {
         let active = self
@@ -551,7 +567,7 @@ impl EmucapTrack {
             .or_else(|| active.as_ref().map(|r| r.rom_sha1.clone()))
         {
             Some(s) => s,
-            None => return track_err("rom_sha1 미지정 + 활성 run 없음"),
+            None => return track_err("rom_sha1 was omitted and there is no active run"),
         };
         let run_id = active.as_ref().map(|r| r.run_id.clone());
         let root = emucap::track::store::root_from_env();
@@ -571,7 +587,7 @@ impl EmucapTrack {
         }
     }
 
-    #[tool(description = "저장된 Run을 검색한다(rom_sha1/goal/status 필터).")]
+    #[tool(description = "Query stored runs using optional rom_sha1, goal, and status filters.")]
     async fn query_runs(&self, Parameters(a): Parameters<QueryRunsArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
         match emucap::track::mcp_ops::query_runs(
@@ -593,7 +609,7 @@ impl EmucapTrack {
         }
     }
 
-    #[tool(description = "저장된 Run의 상세 내용(run.json)을 반환한다.")]
+    #[tool(description = "Return the stored run.json record for a run.")]
     async fn get_run(&self, Parameters(a): Parameters<GetRunArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
         match emucap::track::mcp_ops::get_run(&root, &a.rom_sha1, &a.run_id) {
@@ -603,7 +619,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "두 run을 비교해 수치 변화, 검증 결과 변화, 재현 가능성, 상태 변경, 파일 차이를 반환한다. 에뮬레이터에는 요청을 보내지 않는다. run_id는 전체 기록에서 고유하다. 같은 이름의 gates/metrics가 여러 번 기록됐으면 마지막 값을 대표로 고르고 발생 횟수도 함께 반환한다."
+        description = "Compare two runs and return changes in metrics, gates, reproduction, interventions, and files without contacting an emulator. Run IDs are globally unique. For repeated gate or metric names, the latest value is representative and the occurrence count is included."
     )]
     async fn compare_runs(&self, Parameters(a): Parameters<CompareRunsArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
@@ -614,7 +630,7 @@ impl EmucapTrack {
     }
 
     #[tool(
-        description = "goal/tag/rom으로 묶은 run들을 요약한다: 상태와 재현 가능성 분포, 검증 항목별 통과·실패·미결 수, 상태 변경 종류, 수치 이름, run별 요약을 반환한다. 에뮬레이터에는 요청을 보내지 않고 성공 여부도 대신 판단하지 않는다. 손상된 run은 건너뛰고 skipped로 센다."
+        description = "Summarize runs filtered by goal, tag, or ROM: status and reproduction distributions, gate outcomes, intervention kinds, metric names, and per-run summaries. This does not contact an emulator or decide success. Corrupt runs are skipped and counted."
     )]
     async fn summarize_runs(&self, Parameters(a): Parameters<SummarizeRunsArgs>) -> CallToolResult {
         let root = emucap::track::store::root_from_env();
@@ -677,16 +693,16 @@ impl EmucapTrack {
             "active_run": active_json,
             "running_runs": running,
             "assembly": {
-                "note": "이 MCP는 에뮬레이터를 모른다. rom_sha1·connection_ref는 제어 MCP(emucap-mcp)에서 읽어 넘긴다.",
-                "rom_sha1": "제어 MCP `get_rom_info`의 균일 `rom_sha1` 필드로 구해 run_start에 넘겨라(없는 백엔드만 `shasum -a1 <content>`)",
-                "connection_ref": "제어 MCP status의 connection 이름 또는 \"port:N\"(선택; 같은 connection + 같은 rom의 still-running run은 run_start가 새 run 대신 resume한다)",
-                "analysis_verbs": "regression_run/verify_determinism은 제어 MCP가 결과를 반환만 한다 — 그 결과를 log_gate/log_metric으로 여기 기록하라",
-                "interventions": "write_memory/load_state/reset/입력은 제어 MCP가 자동 기록하지 않는다 — log_intervention으로 명시 기록하라"
+                "note": "This MCP has no emulator connection. Pass rom_sha1 and connection_ref from Control MCP (emucap-mcp).",
+                "rom_sha1": "Pass the normalized get_rom_info.rom_sha1 value to run_start. Use `shasum -a1 <content>` only for a backend that does not provide it.",
+                "connection_ref": "Optionally use the Control MCP status connection name or `port:N`. run_start resumes a stored running run for the same connection and ROM.",
+                "analysis_verbs": "Control MCP regression_run and verify_determinism return results only. Record relevant results here with log_gate or log_metric.",
+                "interventions": "Control MCP does not automatically record write_memory, load_state, reset, or input. Record relevant mutations with log_intervention."
             },
             "supported_queries": ["query_runs", "get_run", "compare_runs", "summarize_runs"],
-            "resume": "재연결로 active_run이 끊겼으면 running_runs에서 이 세션 run을 골라 run_resume(run_id=...)로 이어쓴다(또는 같은 connection_ref로 run_start하면 자동 resume). 새 run을 만들지 않아 파편화가 없다.",
-            "orphan_recovery": "정말 죽은 고아만 run_finish(run_id=...)로 종료한다(이어쓸 run은 resume, 버릴 run만 finish).",
-            "next_action": "active_run이 null이고 running_runs에 이 세션 run이 있으면 run_resume(run_id=...)로 이어쓴다. 없으면 run_start(rom_sha1=...)로 시작한다. 진짜 고아만 run_finish로 정리한다."
+            "resume": "After a reconnect, select this session's run from running_runs and call run_resume(run_id=...), or call run_start with the same connection_ref for automatic resume. No new run is created.",
+            "orphan_recovery": "Use run_finish(run_id=...) only for a genuinely abandoned run. Resume a run that will continue.",
+            "next_action": "If active_run is null and running_runs contains this session, call run_resume. Otherwise call run_start with rom_sha1. Finish only a genuinely abandoned run."
         });
         // ledger 경로 모호 케이스: cwd_fallback이면 위치가 서버 cwd에 의존하니 경고를 단다.
         if let Some(w) = root_source.warning() {

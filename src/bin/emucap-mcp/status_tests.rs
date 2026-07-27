@@ -132,13 +132,13 @@ fn composites_absent_without_deps_and_trace_note_present() {
         "screenshot",
     ]);
     assert!(has_method(&v, "tap") && has_method(&v, "hold_until"));
-    assert!(notes_contain(&v, "콜체인 역추적"), "trace 대체 note 누락");
-    // 토큰으로 구분 못 하는 명령단위 step·layer 노트는 도출하지 않는다(거짓 신호 방지).
-    assert!(!notes_contain(&v, "명령단위 step"), "거짓 step note 도출됨");
-    assert!(
-        !notes_contain(&v, "레이어 토글"),
-        "과발화 layer note 도출됨"
+    let notes = v["capability_notes"].as_array().unwrap();
+    assert_eq!(
+        notes.len(),
+        1,
+        "only the trace substitute should be derived"
     );
+    assert!(notes_contain(&v, "exec breakpoint"));
     // step 없으면 tap도 없다.
     let v2 = enriched(&["read_memory", "set_breakpoint"]);
     assert!(!has_method(&v2, "tap"));
@@ -186,8 +186,21 @@ fn mednafen_button_hints_expose_common_aliases() {
     assert_eq!(pce["aliases"]["start"], "run");
     assert_eq!(pce["aliases"]["a"], "i");
 
+    let pcfx = button_hint_for_system(Some("pc-fx")).unwrap();
+    assert_eq!(pcfx["system"], "pcfx");
+    assert_eq!(pcfx["aliases"]["start"], "run");
+    assert_eq!(pcfx["aliases"]["a"], "i");
+
     let md = button_hint_for_system(Some("md")).unwrap();
     assert_eq!(md["aliases"]["enter"], "start");
+
+    let ngp = button_hint_for_system(Some("ngpc")).unwrap();
+    assert_eq!(ngp["system"], "ngp");
+    assert_eq!(ngp["aliases"]["start"], "option");
+    assert_eq!(
+        ngp["buttons"],
+        serde_json::json!(["a", "b", "option", "up", "down", "left", "right"])
+    );
 }
 
 #[test]
@@ -255,6 +268,16 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
             .and_then(|v| v.as_str()),
         Some("MCP tool: launch")
     );
+    assert_eq!(
+        paths
+            .pointer("/adapters/openmsx/preferred_launcher")
+            .and_then(|v| v.as_str()),
+        Some("MCP tool: launch")
+    );
+    assert!(paths
+        .pointer("/adapters/openmsx/bridge_binary")
+        .and_then(|v| v.as_str())
+        .is_some_and(|path| path.contains("emucap-openmsx-bridge")));
     let mesen_platform_launch = paths
         .pointer("/adapters/mesen2/platform_launch")
         .and_then(|v| v.as_str())
@@ -386,6 +409,59 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
             system["adapter"] == "mupen64plus"
                 && system["content"] == serde_json::json!(["z64", "n64", "v64"])
         }));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems.iter().find(|system| system["system"] == "msx"))
+        .is_some_and(|system| {
+            system["adapter"] == "openmsx"
+                && system["content"] == serde_json::json!(["rom", "mx1", "mx2", "ri", "sg"])
+                && system.get("legacy_launcher").is_none()
+        }));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems.iter().find(|system| system["system"] == "wswan"))
+        .is_some_and(|system| {
+            system["adapter"] == "mednafen"
+                && system["content"] == serde_json::json!(["ws", "wsc", "wsr"])
+                && system["force_module"] == "wswan"
+        }));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems.iter().find(|system| system["system"] == "pcfx"))
+        .is_some_and(|system| {
+            system["adapter"] == "mednafen"
+                && system["content"] == serde_json::json!(["cue", "ccd", "toc", "m3u"])
+                && system["force_module"] == "pcfx"
+                && system["required_firmware"] == serde_json::json!(["pcfx.rom"])
+        }));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems.iter().find(|system| system["system"] == "ngp"))
+        .is_some_and(|system| {
+            system["adapter"] == "mednafen"
+                && system["content"] == serde_json::json!(["ngp", "ngpc", "ngc", "npc"])
+                && system["force_module"] == "ngp"
+        }));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems
+            .iter()
+            .find(|system| system["system"] == "neogeo_aes"))
+        .is_some_and(|system| {
+            system["adapter"] == "mame_neogeo"
+                && system["content"] == serde_json::json!(["zip"])
+                && system["required_firmware"] == serde_json::json!(["aes.zip"])
+        }));
+    assert!(supported_systems_value()
+        .as_array()
+        .and_then(|systems| systems
+            .iter()
+            .find(|system| system["system"] == "neogeo_cd"))
+        .is_some_and(|system| {
+            system["adapter"] == "mame_neogeo"
+                && system["content"] == serde_json::json!(["cue"])
+                && system["required_firmware"] == serde_json::json!(["neocdz.zip"])
+        }));
     assert!(
         supported_systems_value()
             .as_array()
@@ -393,6 +469,33 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
             .and_then(|system| system["legacy_launcher"].as_str())
             == Some("runtime_paths.adapters.mesen2.platform_launch")
     );
+}
+
+#[test]
+fn neogeo_aes_button_hint_describes_console_controls() {
+    let hint = button_hint_for_system(Some("neogeo_aes")).expect("AES input hint");
+    assert_eq!(hint["system"], "neogeo_aes");
+    assert!(hint["buttons"]
+        .as_array()
+        .is_some_and(|buttons| buttons.iter().any(|button| button == "select")));
+    assert!(!hint["buttons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|button| button == "coin"));
+}
+
+#[test]
+fn msx_button_hint_describes_keyboard_matrix_and_release() {
+    let hint = button_hint_for_system(Some("msx")).expect("MSX input hint");
+    assert_eq!(hint["system"], "msx");
+    assert!(hint["buttons"]
+        .as_array()
+        .is_some_and(|buttons| buttons.iter().any(|button| button == "space")));
+    assert_eq!(hint["aliases"]["fire1"], "space");
+    assert!(hint["notes"]
+        .as_str()
+        .is_some_and(|notes| notes.contains("set_input([])")));
 }
 
 struct NotConnectedLink {
@@ -451,10 +554,7 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
         Some("launch_plan")
     );
     assert!(value["start_here"].as_bool().unwrap());
-    assert!(value["do_not"]
-        .as_str()
-        .unwrap()
-        .contains("추측 실행하지 말라"));
+    assert!(value["do_not"].as_str().unwrap().contains("Do not infer"));
 }
 
 struct TimeoutLink {

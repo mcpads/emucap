@@ -901,6 +901,18 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         self.inner.session_token()
     }
 
+    fn stage_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.inner.stage_reclaim_token(token)
+    }
+
+    fn commit_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.inner.commit_staged_reclaim_token(token)
+    }
+
+    fn abort_staged_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
+        self.inner.abort_staged_reclaim_token(token)
+    }
+
     fn replace_reclaim_token(&mut self, token: &str) -> Result<bool, LinkError> {
         self.inner.replace_reclaim_token(token)
     }

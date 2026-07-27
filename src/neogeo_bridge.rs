@@ -1,8 +1,9 @@
-//! Neo Geo MVS/AES bridge for the repository-owned MAME Lua debugger plugin.
+//! Neo Geo MVS, AES, and CD bridge for the repository-owned MAME Lua debugger plugin.
 
 use std::fs::{self, File};
 use std::io::Read;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -12,7 +13,26 @@ use sha2::{Digest as Sha2Digest, Sha256};
 use crate::gdb_rsp::{GdbBridgeEnv, GdbError, GdbTransport};
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
-const METHODS: &[&str] = &[
+const MVS_METHODS: &[&str] = &[
+    "hello",
+    "status",
+    "get_rom_info",
+    "get_state",
+    "save_state",
+    "load_state",
+    "read_memory",
+    "write_memory",
+    "screenshot",
+    "set_input",
+    "press_buttons",
+    "pause",
+    "resume",
+    "step",
+    "step_instructions",
+    "run_frames",
+    "reset",
+];
+const CD_METHODS: &[&str] = &[
     "hello",
     "status",
     "get_rom_info",
@@ -29,7 +49,20 @@ const METHODS: &[&str] = &[
     "run_frames",
     "reset",
 ];
-const ACTIVE_EXCEPTIONS: &[&str] = &[
+const MVS_ACTIVE_EXCEPTIONS: &[&str] = &[
+    "neogeo.state-read.frozen-only",
+    "neogeo.state-save.frozen-only",
+    "neogeo.state-load.frozen-only",
+    "neogeo.memory-read.frozen-only",
+    "neogeo.memory-read.bounded",
+    "neogeo.memory-write.frozen-only",
+    "neogeo.input-hold.port-zero-only",
+    "neogeo.input-pulse.constraints",
+    "neogeo.execution-step.main-cpu-only",
+    "neogeo.execution-pause.machine-global",
+    "neogeo.execution-resume.machine-global",
+];
+const CD_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.state-read.frozen-only",
     "neogeo.memory-read.frozen-only",
     "neogeo.memory-read.bounded",
@@ -40,17 +73,85 @@ const ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.execution-pause.machine-global",
     "neogeo.execution-resume.machine-global",
 ];
-const RAM_BASE: u64 = 0x10_0000;
-const RAM_SIZE: u64 = 0x1_0000;
+const MVS_RAM_BASE: u64 = 0x10_0000;
+const MVS_RAM_SIZE: u64 = 0x1_0000;
+const CD_RAM_BASE: u64 = 0;
+const CD_RAM_SIZE: u64 = 0x20_0000;
 const MAX_READ: u64 = 0x4000;
 const MAX_INPUT_FRAMES: u64 = 120;
+const FRAME_OPERATION_STARTUP_MS: u64 = 5_000;
+const FRAME_OPERATION_BUDGET_MS: u64 = 500;
+const STATE_OPERATION_TIMEOUT: Duration = Duration::from_secs(65);
 const REG_NAMES: &[&str] = &[
     "d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "a0", "a1", "a2", "a3", "a4", "a5", "a6", "sp",
     "sr", "pc",
 ];
-const INPUT_BUTTONS: &[&str] = &[
+const MVS_INPUT_BUTTONS: &[&str] = &[
     "a", "b", "c", "d", "start", "coin", "service", "up", "down", "left", "right",
 ];
+const CD_INPUT_BUTTONS: &[&str] = &[
+    "a", "b", "c", "d", "start", "select", "up", "down", "left", "right",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NeoGeoProfile {
+    Mvs,
+    Aes,
+    Cd,
+}
+
+impl NeoGeoProfile {
+    fn parse(system: &str) -> BridgeResult<Self> {
+        match system {
+            "neogeo_mvs" => Ok(Self::Mvs),
+            "neogeo_aes" => Ok(Self::Aes),
+            "neogeo_cd" => Ok(Self::Cd),
+            _ => Err(BridgeError::BadParams(format!(
+                "unsupported Neo Geo system: {system}"
+            ))),
+        }
+    }
+
+    fn methods(self) -> &'static [&'static str] {
+        match self {
+            Self::Mvs | Self::Aes => MVS_METHODS,
+            Self::Cd => CD_METHODS,
+        }
+    }
+
+    fn active_exceptions(self) -> &'static [&'static str] {
+        match self {
+            Self::Mvs | Self::Aes => MVS_ACTIVE_EXCEPTIONS,
+            Self::Cd => CD_ACTIVE_EXCEPTIONS,
+        }
+    }
+
+    fn ram(self) -> (u64, u64) {
+        match self {
+            Self::Mvs | Self::Aes => (MVS_RAM_BASE, MVS_RAM_SIZE),
+            Self::Cd => (CD_RAM_BASE, CD_RAM_SIZE),
+        }
+    }
+
+    fn input_buttons(self) -> &'static [&'static str] {
+        match self {
+            Self::Mvs => MVS_INPUT_BUTTONS,
+            Self::Aes | Self::Cd => CD_INPUT_BUTTONS,
+        }
+    }
+
+    fn scope(self) -> &'static str {
+        match self {
+            Self::Mvs => "mvs",
+            Self::Aes => "aes",
+            Self::Cd => "cdz",
+        }
+    }
+
+    fn supports_state_files(self) -> bool {
+        matches!(self, Self::Mvs | Self::Aes)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -74,20 +175,18 @@ pub struct NeoGeoBridge<G> {
     gdb: G,
     env: GdbBridgeEnv,
     system: String,
+    profile: NeoGeoProfile,
     frozen: bool,
 }
 
 impl<G: GdbTransport> NeoGeoBridge<G> {
     pub fn new(gdb: G, env: GdbBridgeEnv, system: &str) -> BridgeResult<Self> {
-        if system != "neogeo_mvs" {
-            return Err(BridgeError::BadParams(format!(
-                "unsupported Neo Geo system: {system}"
-            )));
-        }
+        let profile = NeoGeoProfile::parse(system)?;
         Ok(Self {
             gdb,
             env,
             system: system.into(),
+            profile,
             frozen: false,
         })
     }
@@ -99,6 +198,8 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "status" => self.status(),
             "get_rom_info" => self.get_rom_info(),
             "get_state" => self.get_state(),
+            "save_state" if self.profile.supports_state_files() => self.save_state(&req.params),
+            "load_state" if self.profile.supports_state_files() => self.load_state(&req.params),
             "read_memory" => self.read_memory(&req.params),
             "write_memory" => self.write_memory(&req.params),
             "screenshot" => self.screenshot(),
@@ -136,25 +237,51 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     fn hello(&self) -> BridgeResult<Value> {
+        let methods = self.profile.methods();
+        let (_, ram_size) = self.profile.ram();
+        let input_buttons = self.profile.input_buttons();
+        let state_restore = match self.profile {
+            NeoGeoProfile::Mvs | NeoGeoProfile::Aes => json!({
+                "supported": true,
+                "format": "mame-native",
+                "save_completion": "pre-save notifier plus completed non-empty file",
+                "load_completion": "post-load notifier",
+                "execution_state": "frozen",
+                "screenshot_after_load": "step one frozen frame before judging the restored screen",
+            }),
+            NeoGeoProfile::Cd => json!({
+                "supported": false,
+                "reason": "MAME 0.288 does not mark the CDZ driver as supporting save states",
+            }),
+        };
         let mut value = json!({
             "protocol_version": PROTOCOL_VERSION,
             "system": self.system,
             "adapter": "mame-neogeo-rust-gdb",
             "backend": "lua-gdbstub",
             "debugger": true,
-            "methods": METHODS,
+            "methods": methods,
             "memory_types": ["ram"],
-            "region_sizes": {"ram": RAM_SIZE},
+            "region_sizes": {"ram": ram_size},
             "breakpoint_kinds": [],
-            "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
-            "input_buttons": {"system": self.system, "buttons": INPUT_BUTTONS},
+            "contracts": crate::contracts::advertisement_value(self.profile.active_exceptions()),
+            "input_buttons": {"system": self.system, "buttons": input_buttons},
             "capability_notes": {
-                "implemented_methods": METHODS,
+                "implemented_methods": methods,
                 "step_units": ["frames", "instructions"],
                 "step_cpus": ["m68000"],
                 "main_cpu": "m68000",
                 "secondary_cpu": "z80",
-                "initial_scope": "mvs",
+                "initial_scope": self.profile.scope(),
+                "state_restore": state_restore,
+            },
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+                "frame": {
+                    "max_count": max_sync_frame_count(),
+                    "estimated_ms_per_frame": FRAME_OPERATION_BUDGET_MS,
+                },
             },
         });
         let obj = value.as_object_mut().expect("hello object");
@@ -178,6 +305,9 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     fn status(&mut self) -> BridgeResult<Value> {
+        let methods = self.profile.methods();
+        let (_, ram_size) = self.profile.ram();
+        let input_buttons = self.profile.input_buttons();
         let frame = self.current_frame()?;
         let fields = self.input_fields()?;
         let input_override = self.input_override()?;
@@ -189,12 +319,20 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "debugger": true,
             "state": if self.frozen { "frozen" } else { "running" },
             "frame": frame,
-            "methods": METHODS,
+            "methods": methods,
             "memory_types": ["ram"],
-            "region_sizes": {"ram": RAM_SIZE},
+            "region_sizes": {"ram": ram_size},
             "breakpoint_kinds": [],
-            "input_buttons": {"system": self.system, "buttons": INPUT_BUTTONS, "available": fields},
+            "input_buttons": {"system": self.system, "buttons": input_buttons, "available": fields},
             "input_override": input_override,
+            "execution_limits": {
+                "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
+                "frame": {
+                    "max_count": max_sync_frame_count(),
+                    "estimated_ms_per_frame": FRAME_OPERATION_BUDGET_MS,
+                },
+            },
         }))
     }
 
@@ -208,29 +346,61 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 content.display()
             )));
         }
-        let mut file = File::open(content)?;
-        let mut hasher = Sha1::new();
-        let mut size = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        match self.profile {
+            NeoGeoProfile::Mvs | NeoGeoProfile::Aes => {
+                let mut file = File::open(content)?;
+                let mut hasher = Sha1::new();
+                let mut size = 0_u64;
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                    size = size
+                        .checked_add(read as u64)
+                        .ok_or_else(|| BridgeError::BadParams("content size overflow".into()))?;
+                }
+                Ok(json!({
+                    "system": self.system,
+                    "adapter": "mame-neogeo-rust-gdb",
+                    "name": content.file_name().and_then(|v| v.to_str()).unwrap_or(""),
+                    "path": content.canonicalize()?.display().to_string(),
+                    "sha1": format!("{:x}", hasher.finalize()),
+                    "size": size,
+                    "media_type": content.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase(),
+                }))
             }
-            hasher.update(&buffer[..read]);
-            size = size
-                .checked_add(read as u64)
-                .ok_or_else(|| BridgeError::BadParams("content size overflow".into()))?;
+            NeoGeoProfile::Cd => {
+                let identity = crate::cue::graph_identity(content)?;
+                let files = identity
+                    .files
+                    .iter()
+                    .map(|file| {
+                        json!({
+                            "declared_name": file.declared_name,
+                            "path": file.path.display().to_string(),
+                            "size": file.size,
+                            "sha1": file.sha1,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "system": self.system,
+                    "adapter": "mame-neogeo-rust-gdb",
+                    "name": content.file_name().and_then(|v| v.to_str()).unwrap_or(""),
+                    "path": content.canonicalize()?.display().to_string(),
+                    "sha1": identity.sha1,
+                    "size": identity.size,
+                    "media_type": "cue",
+                    "identity": {
+                        "kind": "cue_graph_v1",
+                        "files": files,
+                    },
+                }))
+            }
         }
-        Ok(json!({
-            "system": self.system,
-            "adapter": "mame-neogeo-rust-gdb",
-            "name": content.file_name().and_then(|v| v.to_str()).unwrap_or(""),
-            "path": content.canonicalize()?.display().to_string(),
-            "sha1": format!("{:x}", hasher.finalize()),
-            "size": size,
-            "media_type": content.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase(),
-        }))
     }
 
     fn get_state(&mut self) -> BridgeResult<Value> {
@@ -253,6 +423,69 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         Ok(json!({"M68K": regs, "frame": self.current_frame()?}))
     }
 
+    fn save_state(&mut self, params: &Value) -> BridgeResult<Value> {
+        self.require_frozen("save_state")?;
+        let requested = required_path(params, "path")?;
+        let path = absolute_path(&requested)?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let partial = state_partial_sibling(&path)?;
+        let _ = fs::remove_file(&partial);
+        let result = (|| {
+            self.state_lua_cmd("savesync", &partial)?;
+            let metadata = fs::metadata(&partial)?;
+            if metadata.len() == 0 {
+                return Err(BridgeError::Emulator(
+                    "MAME save completed with an empty state file".into(),
+                ));
+            }
+            // MAME writes into a unique sibling first. Publish that completed file through the
+            // crate's rollback-aware replacement path so replacing an existing state also works
+            // on Windows without deleting the prior state before the new file is ready.
+            crate::launch::copy_file_replace(&partial, &path)?;
+            let _ = fs::remove_file(&partial);
+            let data = fs::read(&path)?;
+            let mut hasher = Sha256::new();
+            Sha2Digest::update(&mut hasher, &data);
+            self.frozen = true;
+            Ok(json!({
+                "status": "completed",
+                "path": path.display().to_string(),
+                "format": "mame-native",
+                "bytes": data.len(),
+                "sha256": format!("{:x}", hasher.finalize()),
+                "state": "frozen",
+                "frame": self.current_frame()?,
+            }))
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+        result
+    }
+
+    fn load_state(&mut self, params: &Value) -> BridgeResult<Value> {
+        self.require_frozen("load_state")?;
+        let requested = required_path(params, "path")?;
+        let path = absolute_path(&requested)?;
+        if !path.is_file() || path.metadata()?.len() == 0 {
+            return Err(BridgeError::BadParams(format!(
+                "Neo Geo save state not found or empty: {}",
+                path.display()
+            )));
+        }
+        self.state_lua_cmd("loadsync", &path)?;
+        self.frozen = true;
+        Ok(json!({
+            "status": "completed",
+            "path": path.display().to_string(),
+            "format": "mame-native",
+            "state": "frozen",
+            "frame": self.current_frame()?,
+        }))
+    }
+
     fn read_memory(&mut self, params: &Value) -> BridgeResult<Value> {
         self.require_frozen("read_memory")?;
         let length = required_num(params, "length")?;
@@ -261,7 +494,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 "read length {length:#x} exceeds {MAX_READ:#x}"
             )));
         }
-        let address = region_address(params, length)?;
+        let address = region_address(self.profile, params, length)?;
         let raw = self.gdb.send(&format!("m{address:x},{length:x}"))?;
         let data = hex::decode(raw.trim())
             .map_err(|_| BridgeError::Emulator("invalid MAME memory response".into()))?;
@@ -285,7 +518,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             .ok_or_else(|| BridgeError::BadParams("missing required param: hex".into()))?;
         let data = hex::decode(raw)
             .map_err(|_| BridgeError::BadParams("hex must contain complete bytes".into()))?;
-        let address = region_address(params, data.len() as u64)?;
+        let address = region_address(self.profile, params, data.len() as u64)?;
         let response = self.gdb.send(&format!(
             "M{address:x},{:x}:{}",
             data.len(),
@@ -377,13 +610,39 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         if stop_on_done {
             self.require_frozen("frame step")?;
         }
+        let max_count = max_sync_frame_count();
+        if count > max_count {
+            return Err(BridgeError::BadParams(format!(
+                "Neo Geo frame count {count} exceeds the synchronous cap {max_count}; split the advance and verify each terminal response"
+            )));
+        }
         let before = self.current_frame()?;
         let command = if stop_on_done {
             "framestep"
         } else {
             "runframes"
         };
-        let response = self.lua_cmd(command, Some(&count.to_string()))?;
+        let previous_timeout = self.gdb.get_timeout()?;
+        let estimated_ms = FRAME_OPERATION_STARTUP_MS
+            .saturating_add(count.saturating_mul(FRAME_OPERATION_BUDGET_MS));
+        let timeout = Duration::from_millis(estimated_ms);
+        self.gdb.set_timeout(timeout)?;
+        let outcome = self.lua_cmd(command, Some(&count.to_string()));
+        let restore = self.gdb.set_timeout(previous_timeout);
+        let response = match (outcome, restore) {
+            (Ok(value), Ok(())) => value,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(cleanup)) => {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME {command} completed but failed to restore the GDB timeout: {cleanup}"
+                )))
+            }
+            (Err(primary), Err(cleanup)) => {
+                return Err(BridgeError::Emulator(format!(
+                    "{primary}; additionally failed to restore the GDB timeout: {cleanup}"
+                )))
+            }
+        };
         if response != "OK" {
             return Err(BridgeError::Emulator(format!(
                 "MAME {command} failed: {response}"
@@ -391,18 +650,16 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         }
         self.frozen = stop_on_done;
         let after = self.current_frame()?;
-        if after.saturating_sub(before) != count {
-            return Err(BridgeError::Emulator(format!(
-                "MAME frame step mismatch: requested {count}, observed {}",
-                after.saturating_sub(before)
-            )));
-        }
+        let frame_counter_delta = after.checked_sub(before);
         Ok(json!({
             "status": "completed",
             "unit": "frames",
             "count": count,
+            "frames_observed_min": count,
             "frame_before": before,
             "frame": after,
+            "frame_counter_delta": frame_counter_delta,
+            "frame_counter_continuous": frame_counter_delta.is_some(),
             "state": if stop_on_done { "frozen" } else { "running" },
         }))
     }
@@ -443,7 +700,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn set_input(&mut self, params: &Value) -> BridgeResult<Value> {
         require_port_zero(params)?;
-        let buttons = normalize_buttons(params.get("buttons"))?;
+        let buttons = normalize_buttons(self.profile, params.get("buttons"))?;
         self.lua_cmd("setinput", Some(&buttons.join(",")))?;
         Ok(
             json!({"buttons": buttons, "mode": if buttons.is_empty() { "native" } else { "persistent" }}),
@@ -452,7 +709,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn press_buttons(&mut self, params: &Value) -> BridgeResult<Value> {
         require_port_zero(params)?;
-        let buttons = normalize_buttons(params.get("buttons"))?;
+        let buttons = normalize_buttons(self.profile, params.get("buttons"))?;
         let frames = optional_num(params, "frames")?.unwrap_or(1).max(1);
         if frames > MAX_INPUT_FRAMES {
             return Err(BridgeError::BadParams(format!(
@@ -519,6 +776,39 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         }
     }
 
+    fn state_lua_cmd(&mut self, name: &str, path: &Path) -> BridgeResult<()> {
+        let path = path.to_str().ok_or_else(|| {
+            BridgeError::BadParams(format!(
+                "MAME state paths must be valid UTF-8: {}",
+                path.display()
+            ))
+        })?;
+        let previous_timeout = self.gdb.get_timeout()?;
+        self.gdb.set_timeout(STATE_OPERATION_TIMEOUT)?;
+        let outcome = self.lua_cmd(name, Some(path));
+        let restore = self.gdb.set_timeout(previous_timeout);
+        let response = match (outcome, restore) {
+            (Ok(value), Ok(())) => value,
+            (Err(primary), Ok(())) => return Err(primary),
+            (Ok(_), Err(cleanup)) => {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME {name} completed but failed to restore the GDB timeout: {cleanup}"
+                )))
+            }
+            (Err(primary), Err(cleanup)) => {
+                return Err(BridgeError::Emulator(format!(
+                    "{primary}; additionally failed to restore the GDB timeout: {cleanup}"
+                )))
+            }
+        };
+        if response != "OK" {
+            return Err(BridgeError::Emulator(format!(
+                "MAME {name} returned an unexpected response: {response}"
+            )));
+        }
+        Ok(())
+    }
+
     fn require_frozen(&self, operation: &str) -> BridgeResult<()> {
         if self.frozen {
             Ok(())
@@ -528,6 +818,50 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             )))
         }
     }
+}
+
+fn max_sync_frame_count() -> u64 {
+    let deadline_ms = crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64;
+    deadline_ms
+        .saturating_sub(FRAME_OPERATION_STARTUP_MS)
+        .checked_div(FRAME_OPERATION_BUDGET_MS)
+        .unwrap_or(0)
+        .min(crate::live::temporal::MAX_SYNC_ADVANCE_COUNT)
+}
+
+fn required_path(params: &Value, key: &str) -> BridgeResult<PathBuf> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| BridgeError::BadParams(format!("missing or invalid param: {key}")))
+}
+
+fn absolute_path(path: &Path) -> BridgeResult<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
+fn state_partial_sibling(path: &Path) -> BridgeResult<PathBuf> {
+    let parent = path.parent().ok_or_else(|| {
+        BridgeError::BadParams(format!(
+            "save path has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state");
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or_default();
+    Ok(parent.join(format!(".{name}.partial.{}.{nanos}", std::process::id())))
 }
 
 fn error_kind(error: &BridgeError) -> &'static str {
@@ -575,7 +909,7 @@ fn optional_num(params: &Value, key: &str) -> BridgeResult<Option<u64>> {
     }
 }
 
-fn region_address(params: &Value, length: u64) -> BridgeResult<u64> {
+fn region_address(profile: NeoGeoProfile, params: &Value, length: u64) -> BridgeResult<u64> {
     let memory_type = params
         .get("memory_type")
         .and_then(Value::as_str)
@@ -586,12 +920,13 @@ fn region_address(params: &Value, length: u64) -> BridgeResult<u64> {
         )));
     }
     let offset = required_num(params, "address")?;
-    if !matches!(offset.checked_add(length), Some(end) if end <= RAM_SIZE) {
+    let (ram_base, ram_size) = profile.ram();
+    if !matches!(offset.checked_add(length), Some(end) if end <= ram_size) {
         return Err(BridgeError::BadParams(format!(
-            "ram access out of range: offset {offset:#x}+{length:#x} exceeds {RAM_SIZE:#x}"
+            "ram access out of range: offset {offset:#x}+{length:#x} exceeds {ram_size:#x}"
         )));
     }
-    RAM_BASE
+    ram_base
         .checked_add(offset)
         .ok_or_else(|| BridgeError::BadParams("ram address overflow".into()))
 }
@@ -615,7 +950,7 @@ fn require_main_cpu(params: &Value) -> BridgeResult<()> {
     }
 }
 
-fn normalize_buttons(value: Option<&Value>) -> BridgeResult<Vec<String>> {
+fn normalize_buttons(profile: NeoGeoProfile, value: Option<&Value>) -> BridgeResult<Vec<String>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -630,7 +965,7 @@ fn normalize_buttons(value: Option<&Value>) -> BridgeResult<Vec<String>> {
                 .ok_or_else(|| BridgeError::BadParams("button names must be strings".into()))?
                 .trim()
                 .to_ascii_lowercase();
-            if INPUT_BUTTONS.contains(&key.as_str()) {
+            if profile.input_buttons().contains(&key.as_str()) {
                 Ok(key)
             } else {
                 Err(BridgeError::BadParams(format!(

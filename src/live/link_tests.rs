@@ -26,7 +26,7 @@ fn fake_link_can_return_error() {
 
 #[test]
 fn link_error_messages() {
-    assert!(format!("{}", LinkError::Busy).contains("다른 세션"));
+    assert!(format!("{}", LinkError::Busy).contains("another session"));
     assert!(format!(
         "{}",
         LinkError::NoSuchEmulator {

@@ -19,6 +19,7 @@ fn saturn_spec_has_module_and_content_and_headless() {
         Path::new("/tmp/m.log"),
         Some("ss"),
         false,
+        None,
         &opts("game.cue"),
     );
     assert_eq!(
@@ -36,6 +37,10 @@ fn saturn_spec_has_module_and_content_and_headless() {
     assert!(spec
         .env
         .contains(&("EMUCAP_PORT".to_string(), "47800".to_string())));
+    assert!(
+        !spec.env.iter().any(|(key, _)| key == "MEDNAFEN_HOME"),
+        "existing non-PC-FX firmware lookup must remain unchanged"
+    );
 }
 
 #[test]
@@ -45,6 +50,7 @@ fn md_spec_forces_six_button_pad() {
         Path::new("/tmp/m.log"),
         Some("md"),
         false,
+        None,
         &opts("game.md"),
     );
     assert_eq!(
@@ -73,7 +79,14 @@ fn name_and_token_are_passed_when_present() {
     let mut o = opts("g.cue");
     o.name = Some("saturn_session");
     o.session_token = Some("tok123");
-    let spec = mednafen_spec(Path::new("/b"), Path::new("/l"), Some("ss"), false, &o);
+    let spec = mednafen_spec(
+        Path::new("/b"),
+        Path::new("/l"),
+        Some("ss"),
+        false,
+        None,
+        &o,
+    );
     assert!(spec
         .env
         .contains(&("EMUCAP_NAME".to_string(), "saturn_session".to_string())));
@@ -89,6 +102,7 @@ fn pce_spec_enables_sound_only_when_requested() {
         Path::new("/tmp/m.log"),
         Some("pce"),
         true,
+        None,
         &opts("game.cue"),
     );
     assert_eq!(
@@ -100,6 +114,60 @@ fn pce_spec_enables_sound_only_when_requested() {
         ]
         .concat()
     );
+}
+
+#[test]
+fn ngp_spec_preserves_explicit_module_without_user_profile_override() {
+    let spec = mednafen_spec(
+        Path::new("/run/mednafen"),
+        Path::new("/tmp/m.log"),
+        Some("ngp"),
+        false,
+        None,
+        &opts("game.ngc"),
+    );
+    assert_eq!(
+        spec.args,
+        [
+            #[cfg(target_os = "macos")]
+            vec!["-video.driver", "softfb"],
+            vec!["-sound", "0", "-force_module", "ngp", "game.ngc"],
+        ]
+        .concat()
+    );
+    assert!(!spec.env.iter().any(|(key, _)| key == "MEDNAFEN_HOME"));
+}
+
+#[test]
+fn pcfx_spec_preserves_explicit_module_and_sound() {
+    let spec = mednafen_spec(
+        Path::new("/run/mednafen"),
+        Path::new("/tmp/m.log"),
+        Some("pcfx"),
+        true,
+        Some(Path::new("/firmware/pcfx.rom")),
+        &opts("game.cue"),
+    );
+    assert_eq!(
+        spec.args,
+        [
+            #[cfg(target_os = "macos")]
+            vec!["-video.driver", "softfb"],
+            vec![
+                "-sound",
+                "1",
+                "-pcfx.bios",
+                "/firmware/pcfx.rom",
+                "-force_module",
+                "pcfx",
+                "game.cue",
+            ],
+        ]
+        .concat()
+    );
+    assert!(spec
+        .env
+        .contains(&("MEDNAFEN_HOME".to_string(), "/tmp".to_string())));
 }
 
 #[test]

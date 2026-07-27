@@ -152,6 +152,18 @@ fn determinism_equal_hashes_is_reproducible() {
 }
 
 #[test]
+fn rom_identity_hash_comparison_is_case_insensitive() {
+    assert!(rom_hash_matches(
+        "08695F636F9FDF6E934E7AAE8B7BBBE4E67E100E",
+        "08695f636f9fdf6e934e7aae8b7bbbe4e67e100e"
+    ));
+    assert!(!rom_hash_matches(
+        "08695F636F9FDF6E934E7AAE8B7BBBE4E67E100E",
+        "18695f636f9fdf6e934e7aae8b7bbbe4e67e100e"
+    ));
+}
+
+#[test]
 fn determinism_differing_hashes_is_not_reproducible() {
     let (_t, dir, case) = det_input_case(None);
     let mut link = DetReplayLink::new(&[

@@ -17,7 +17,7 @@ pub struct SpecOpts<'a> {
     pub headless: bool,
 }
 
-/// Mednafen (Saturn / PSX / PCE / MD / WonderSwan). One binary handles every system; `module`
+/// Mednafen (Saturn / PSX / PCE / PC-FX / MD / WonderSwan / Neo Geo Pocket). One binary handles every system; `module`
 /// selects it. Mirrors adapters/mednafen/launch.sh: explicit `-sound 0|1`, a 6-button pad for MD
 /// so the raw input mask has a stable 2-byte buffer, `-force_module`, then the content path.
 pub fn mednafen_spec(
@@ -25,6 +25,7 @@ pub fn mednafen_spec(
     log_path: &Path,
     module: Option<&str>,
     sound: bool,
+    pcfx_bios: Option<&Path>,
     opts: &SpecOpts,
 ) -> LaunchSpec {
     let mut spec = LaunchSpec::new(binary, log_path);
@@ -37,8 +38,26 @@ pub fn mednafen_spec(
         spec = spec.args(["-video.driver", "softfb"]);
     }
     spec = spec.args(["-sound", if sound { "1" } else { "0" }]);
+    if module == Some("pcfx") {
+        // PC-FX has an explicit BIOS argument and needs no settings inherited from ~/.mednafen.
+        // Isolate it without changing the established firmware lookup of the other modules.
+        spec = spec.env(
+            "MEDNAFEN_HOME",
+            log_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     if module == Some("md") {
         spec = spec.args(["-md.input.auto", "0", "-md.input.port1", "gamepad6"]);
+    }
+    if let Some(path) = pcfx_bios {
+        spec = spec.args([
+            "-pcfx.bios".to_string(),
+            path.to_string_lossy().into_owned(),
+        ]);
     }
     if let Some(m) = module {
         spec = spec.args(["-force_module", m]);

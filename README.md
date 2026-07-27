@@ -1,18 +1,21 @@
 # emucap — emulator monitor + HITL adaptor
 
-> 한국어 안내: [README.ko.md](README.ko.md)
+> Korean guide: [README.ko.md](README.ko.md)
 
 MCP infrastructure for debugging retro-game patches. An AI agent reads and
 controls a running emulator's memory, state, and screen so it can analyze a
 problem a human described in plain language. A common Core plus per-emulator
 adapters supports several emulators — Mesen2 (SNES · Game Gear · Game Boy · GBC ·
 GBA · NES), a Mednafen fork
-(Saturn · PlayStation · PC Engine · Mega Drive/Genesis · WonderSwan/WSC), Flycast
+(Saturn · PlayStation · PC Engine · PC-FX · Mega Drive/Genesis · WonderSwan/WSC ·
+Neo Geo Pocket/Color), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
 (PlayStation 2), a Dolphin fork (GameCube · Wii), MAME (PC-98 and experimental Neo Geo
-MVS), and an experimental Mupen64Plus frontend (Nintendo 64).
+MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
+Stock openMSX 21.0 provides the first experimental MSX profile (C-BIOS MSX2+
+cartridges) through a separate Rust XML-control bridge.
 
-**v0.10.1 — beta.** This repository remains under active development; interfaces and
+**v0.11.0-alpha.1 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -64,18 +67,20 @@ cargo build --release \
   --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
   --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
   --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
-  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge
+  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
+  --bin emucap-openmsx-bridge
 ```
 
 Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap-track-mcp` (**Tracking MCP** — experiment ledger, emulator-less),
 `emucap` (case-bundle CLI), `emucap-broker` (multi-session broker),
 `emucap-mame-pc98-bridge` (PC-98 launch helper),
-`emucap-mame-neogeo-bridge` (Neo Geo MVS launch helper),
+`emucap-mame-neogeo-bridge` (Neo Geo MVS/AES/CD launch helper),
 `emucap-mupen64plus` (N64 frontend and adapter),
-`emucap-desmume-nds-bridge` (NDS launch helper), and
-`emucap-ppsspp-bridge` (PSP launch helper), and
-`emucap-pcsx2-bridge` (PS2 launch helper). All dependencies come from
+`emucap-desmume-nds-bridge` (NDS launch helper),
+`emucap-ppsspp-bridge` (PSP launch helper),
+`emucap-pcsx2-bridge` (PS2 launch helper), and
+`emucap-openmsx-bridge` (stock openMSX XML-control helper). All dependencies come from
 crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
 required** for a source build. The first build is slower while dependencies
 download; later builds are fast.
@@ -184,10 +189,15 @@ debugger halt to service requests without advancing the guest.
   halt service and safe savestate event.
   GBA needs a real BIOS (`gba_bios.bin`, not committed); SNES / Game Gear / GB /
   GBC / NES need none. → `adapters/mesen2/README.md`
-- **Mednafen (Saturn · PSX · PCE · MD · WonderSwan/WSC)** — build the fork with
+- **Mednafen (Saturn · PSX · PCE · PC-FX · MD · WonderSwan/WSC · Neo Geo Pocket/Color)** — build the fork with
   `adapters/mednafen/build.sh` (needs SDL: macOS `brew install sdl2`, Linux
-  `libsdl2-dev`). Its source archive and checksum are pinned. One binary handles all five systems. PSX and PCE-CD need BIOS
-  files (not committed to the repo). → `adapters/mednafen/README.md`
+  `libsdl2-dev`). Its source archive and checksum are pinned. One binary handles all seven system families.
+  PSX, PCE-CD, and PC-FX need BIOS files (not committed to the repo). PC-FX requires an explicit
+  version 1.00 BIOS and runs with an emucap-owned Mednafen profile. Neo Geo Pocket and
+  Pocket Color share the `ngp` module; base execution, save/load, screenshot, and input are
+  supported, but memory, breakpoints, disassembly, and instruction stepping are not advertised
+  because Mednafen exposes no debugger for that core.
+  → `adapters/mednafen/README.md`
 - **Flycast (Dreamcast)** — build with `adapters/flycast/build.sh`; it builds in an
   emucap-owned work tree, pins the commit and recursive submodule graph, and treats any
   `FLYCAST_SRC` checkout as a read-only Git object source.
@@ -216,17 +226,36 @@ debugger halt to service requests without advancing the guest.
   controller input injection. → `adapters/dolphin/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
   (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
-- **MAME (Neo Geo MVS, experimental)** — reuse the pinned MAME build and build
-  `emucap-mame-neogeo-bridge`. Launch requires a user-supplied `neogeo.zip` BIOS and
-  a game ROM set; `.zip` files are never auto-detected as Neo Geo. The current adapter
-  exposes MVS work RAM, 68000 state and stepping, frame control, screenshot, and port-0
-  input. Game-ROM and save-state validation is still pending. → `adapters/mame-neogeo/README.md`
+- **MAME (Neo Geo MVS/AES/CD, experimental)** — build the dedicated pinned MAME subset with
+  `adapters/mame-neogeo/build.sh`, then build `emucap-mame-neogeo-bridge`. Launch
+  requires an explicit system ID. MVS uses a user-supplied `neogeo.zip` plus a matching
+  game ROM set. AES uses `aes.zip` and a cartridge set whose ZIP stem names an
+  AES-compatible entry in MAME's pinned Neo Geo software list. CD uses an official
+  `neocdz.zip` BIOS plus a CUE entry file whose referenced tracks all exist; its content
+  identity covers the complete CUE graph. All three profiles expose bounded RAM, 68000
+  state and stepping, frame control, frozen-frame screenshots, and port-0 input. Native
+  save/load is advertised for MVS and AES; MAME 0.288 marks CDZ save states unsupported.
+  → `adapters/mame-neogeo/README.md`
 - **Mupen64Plus (Nintendo 64, experimental; Unix)** — run
   `adapters/mupen64plus/build.sh`, then build `emucap-mupen64plus`. Standard cartridge
   ROMs need no BIOS. The current pure-interpreter adapter supports isolated headless or
   visible launch, pause/resume, R4300 instruction stepping, CPU state, and bounded frozen
-  RDRAM access. Input, screenshots, save states, frame stepping, breakpoints, and RSP state
-  are not yet exposed. → `adapters/mupen64plus/README.md`
+  RDRAM access. Both modes expose port-0 input holds with explicit native-ownership release.
+  Visible launch also exposes exact rendered-frame stepping, bounded input pulses, current PNG
+  capture, and completion-checked native save/load. Headless launch remains instruction-only and
+  omits those rendered-frame operations. Breakpoints, reset, `run_frames`, and RSP state are not
+  yet exposed. → `adapters/mupen64plus/README.md`
+- **openMSX (MSX, experimental first profile)** — run
+  `adapters/openmsx/build.sh`, then build `emucap-openmsx-bridge`. The official
+  launcher accepts a pinned stock openMSX 21.0 sidecar and runs it with an
+  emucap-owned per-port `HOME`; it does not patch openMSX or read the user's
+  emulator profile. The current `msx` system is a `C-BIOS_MSX2+` cartridge
+  profile with Z80 state and instruction step, exact frame step, bounded CPU
+  memory/main RAM/VRAM access, frozen save/load, keyboard-matrix input, and
+  screenshots in `display: true`. Headless screenshots, disks, tapes,
+  real-machine firmware, joystick delivery, breakpoints, and turboR/R800 are
+  not exposed. Generic `.rom` files require `system=msx`.
+  → `adapters/openmsx/README.md`
 
 ## Learn more
 
@@ -237,5 +266,5 @@ debugger halt to service requests without advancing the guest.
 Binaries: `emucap` (case bundles: `finalize` / `inspect`), `emucap-mcp` (Control
 MCP — live emulator control, stdio), `emucap-track-mcp` (Tracking MCP —
 experiment ledger, emulator-less, stdio), `emucap-broker` (multi-session
-connection sharing), the N64 frontend, and the PC-98/Neo Geo/NDS/PSP/PS2 launch bridges
+connection sharing), the N64 frontend, and the PC-98/Neo Geo/NDS/PSP/PS2/MSX launch bridges
 listed in the build section.

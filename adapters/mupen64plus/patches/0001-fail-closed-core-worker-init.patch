@@ -1,0 +1,173 @@
+--- a/src/api/frontend.c
++++ b/src/api/frontend.c
+@@ -84,29 +84,48 @@ EXPORT m64p_error CALL CoreStartup(int APIVersion, const char *ConfigPath, const
+     plugin_connect(M64PLUGIN_INPUT, NULL);
+     plugin_connect(M64PLUGIN_CORE, NULL);
+
+-    savestates_init();
++    if (savestates_init() != 0)
++        return M64ERR_NO_MEMORY;
+
+     /* next, start up the configuration handling code by loading and parsing the config file */
+-    if (ConfigInit(ConfigPath, DataPath) != M64ERR_SUCCESS)
++    if (ConfigInit(ConfigPath, DataPath) != M64ERR_SUCCESS) {
++        ConfigShutdown();
++        savestates_deinit();
+         return M64ERR_INTERNAL;
++    }
+
+     /* set default configuration parameter values for Core */
+-    if (ConfigOpenSection("Core", &g_CoreConfig) != M64ERR_SUCCESS || g_CoreConfig == NULL)
++    if (ConfigOpenSection("Core", &g_CoreConfig) != M64ERR_SUCCESS || g_CoreConfig == NULL) {
++        ConfigShutdown();
++        savestates_deinit();
+         return M64ERR_INTERNAL;
++    }
+
+-    if (!main_set_core_defaults())
++    if (!main_set_core_defaults()) {
++        ConfigShutdown();
++        savestates_deinit();
+         return M64ERR_INTERNAL;
++    }
+
+     /* allocate base memory */
+     g_mem_base = init_mem_base();
+     if (g_mem_base == NULL) {
++        ConfigShutdown();
++        savestates_deinit();
+         return M64ERR_NO_MEMORY;
+     }
+
+     /* The ROM database contains MD5 hashes, goodnames, and some game-specific parameters */
+     romdatabase_open();
+
+-    workqueue_init();
++    if (workqueue_init() != 0) {
++        romdatabase_close();
++        release_mem_base(g_mem_base);
++        g_mem_base = NULL;
++        ConfigShutdown();
++        savestates_deinit();
++        return M64ERR_NO_MEMORY;
++    }
+
+     l_CoreInit = 1;
+     return M64ERR_SUCCESS;
+--- a/src/main/savestates.c
++++ b/src/main/savestates.c
+@@ -2199,17 +2199,19 @@ static int savestates_load_m64p(const char *filepath)
+     return ret;
+ }
+
+-void savestates_init(void)
++int savestates_init(void)
+ {
+     savestates_lock = SDL_CreateMutex();
+     if (!savestates_lock) {
+         DebugMessage(M64MSG_ERROR, "Could not create savestates list lock");
+-        return;
++        return -1;
+     }
++    return 0;
+ }
+
+ void savestates_deinit(void)
+ {
+     SDL_DestroyMutex(savestates_lock);
++    savestates_lock = NULL;
+     savestates_clear_job();
+ }
+--- a/src/main/savestates.h
++++ b/src/main/savestates.h
+@@ -42,7 +42,7 @@ extern char *savestatepath;
+
+ savestates_job savestates_get_job(void);
+ void savestates_set_job(savestates_job j, savestates_type t, const char *fn);
+-void savestates_init(void);
++int savestates_init(void);
+ void savestates_deinit(void);
+
+ int savestates_load(void);
+--- a/src/main/workqueue.c
++++ b/src/main/workqueue.c
+@@ -85,10 +85,8 @@ static int workqueue_thread_handler(void *data)
+
+     for (;;) {
+         work = workqueue_get_work(thread);
+-        if (work->func == workqueue_dismiss) {
+-            free(work);
++        if (work->func == workqueue_dismiss)
+             break;
+-        }
+
+         work->func(work);
+     }
+@@ -114,20 +112,24 @@ int workqueue_init(void)
+
+     SDL_LockMutex(workqueue_mgmt.lock);
+     for (i = 0; i < WORKQUEUE_THREADS; i++) {
+-        thread = malloc(sizeof(*thread));
++        thread = calloc(1, sizeof(*thread));
+         if (!thread) {
+             DebugMessage(M64MSG_ERROR, "Could not create workqueue thread management data");
+             SDL_UnlockMutex(workqueue_mgmt.lock);
++            SDL_DestroyMutex(workqueue_mgmt.lock);
++            workqueue_mgmt.lock = NULL;
+             return -1;
+         }
+
+-        memset(thread, 0, sizeof(*thread));
+-        list_add(&thread->list_mgmt, &workqueue_mgmt.thread_list);
+         INIT_LIST_HEAD(&thread->list);
++        INIT_LIST_HEAD(&thread->list_mgmt);
+         thread->work_avail = SDL_CreateCond();
+         if (!thread->work_avail) {
+             DebugMessage(M64MSG_ERROR, "Could not create workqueue thread work_avail condition");
++            free(thread);
+             SDL_UnlockMutex(workqueue_mgmt.lock);
++            SDL_DestroyMutex(workqueue_mgmt.lock);
++            workqueue_mgmt.lock = NULL;
+             return -1;
+         }
+
+@@ -138,9 +140,14 @@ int workqueue_init(void)
+ #endif
+         if (!thread->thread) {
+             DebugMessage(M64MSG_ERROR, "Could not create workqueue thread handler");
++            SDL_DestroyCond(thread->work_avail);
++            free(thread);
+             SDL_UnlockMutex(workqueue_mgmt.lock);
++            SDL_DestroyMutex(workqueue_mgmt.lock);
++            workqueue_mgmt.lock = NULL;
+             return -1;
+         }
++        list_add(&thread->list_mgmt, &workqueue_mgmt.thread_list);
+     }
+     SDL_UnlockMutex(workqueue_mgmt.lock);
+
+@@ -151,13 +158,12 @@ void workqueue_shutdown(void)
+ {
+     size_t i;
+     int status;
+-    struct work_struct *work;
++    struct work_struct dismiss_work[WORKQUEUE_THREADS];
+     struct workqueue_thread *thread, *safe;
+
+     for (i = 0; i < WORKQUEUE_THREADS; i++) {
+-        work = malloc(sizeof(*work));
+-        init_work(work, workqueue_dismiss);
+-        queue_work(work);
++        init_work(&dismiss_work[i], workqueue_dismiss);
++        queue_work(&dismiss_work[i]);
+     }
+
+     list_for_each_entry_safe_t(thread, safe, &workqueue_mgmt.thread_list, struct workqueue_thread, list_mgmt) {
+@@ -171,6 +177,7 @@ void workqueue_shutdown(void)
+         DebugMessage(M64MSG_WARNING, "Stopped workqueue with work still pending");
+
+     SDL_DestroyMutex(workqueue_mgmt.lock);
++    workqueue_mgmt.lock = NULL;
+ }
+
+ int queue_work(struct work_struct *work)

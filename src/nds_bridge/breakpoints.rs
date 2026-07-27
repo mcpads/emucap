@@ -19,25 +19,25 @@ impl<G: GdbTransport> NdsBridge<G> {
         if let (Some(s), Some(e)) = (optional_num(params, "start")?, optional_num(params, "end")?) {
             if e != s {
                 return Err(NdsBridgeError::Unsupported(
-                    "nds bridge: 범위 BP 미지원 — 단일 주소 exec만(start==end)".into(),
+                    "nds bridge: breakpoint ranges are unsupported; use a single exec address with start==end".into(),
                 ));
             }
         }
         for opt in ["pc_min", "pc_max", "value"] {
             if optional_num(params, opt)?.is_some() {
                 return Err(NdsBridgeError::Unsupported(format!(
-                    "nds bridge: {opt} 미지원 — 단일 주소 exec BP만(GDB Z0/Z1)"
+                    "nds bridge: {opt} is unsupported; only a single-address exec breakpoint is available through GDB Z0/Z1"
                 )));
             }
         }
         if params.get("pause_on_hit").and_then(Value::as_bool) == Some(false) {
             return Err(NdsBridgeError::Unsupported(
-                "nds bridge: pause_on_hit=false 미지원 — GDB BP는 항상 코어를 halt한다".into(),
+                "nds bridge: pause_on_hit=false is unsupported because a GDB breakpoint always halts the core".into(),
             ));
         }
         if params.get("auto_savestate").and_then(Value::as_bool) == Some(true) {
             return Err(NdsBridgeError::Unsupported(
-                "nds bridge: auto_savestate 미지원".into(),
+                "nds bridge: auto_savestate is unsupported".into(),
             ));
         }
         if params
@@ -46,7 +46,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             .is_some_and(|a| !a.is_empty())
         {
             return Err(NdsBridgeError::Unsupported(
-                "nds bridge: snapshot 미지원 — 히트 후 read_memory로 직접 캡처하라".into(),
+                "nds bridge: snapshot is unsupported; capture memory with read_memory after the hit".into(),
             ));
         }
         let hardware = params

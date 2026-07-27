@@ -399,8 +399,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             None => {
                 if params.get("frames").is_some() {
                     return Err(NdsBridgeError::Unsupported(
-                        "nds bridge: 프레임 step 미지원 — GDB-RSP엔 프레임 개념이 없다. 명령 단위 진행은 \
-                         step(unit=instructions)를 쓰라. DeSmuME fork도 frame-run primitive를 제공하지 않는다"
+                        "nds bridge: frame stepping is unsupported because GDB-RSP has no frame concept. Use step(unit=instructions). The DeSmuME fork does not expose a frame-run primitive."
                             .into(),
                     ));
                 }

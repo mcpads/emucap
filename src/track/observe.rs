@@ -92,14 +92,13 @@ pub fn observe_hash(
             // (어댑터가 잘라 응답하는 경우 방어. Mesen은 이제 over-cap을 아예 에러로 낸다).
             if r.get("truncated").and_then(serde_json::Value::as_bool) == Some(true) {
                 return Err(ObserveError::Decode(
-                    "read_memory 응답이 truncated=true — 부분 읽기는 검증에 못 쓴다(나눠 읽어라)"
+                    "read_memory returned truncated=true; a partial read cannot be used for verification, so split the read"
                         .into(),
                 ));
             }
-            let hex = r
-                .get("hex")
-                .and_then(|h| h.as_str())
-                .ok_or_else(|| ObserveError::Decode("read_memory 응답에 hex 없음".into()))?;
+            let hex = r.get("hex").and_then(|h| h.as_str()).ok_or_else(|| {
+                ObserveError::Decode("read_memory response has no hex field".into())
+            })?;
             let bytes = crate::analysis::bisect::hex_to_bytes(hex).map_err(ObserveError::Decode)?;
             Ok(ObserveOutcome {
                 kind_used: "memory".into(),
@@ -117,7 +116,9 @@ pub fn observe_hash(
             let b64 = r
                 .get("png_base64")
                 .and_then(|v| v.as_str())
-                .ok_or_else(|| ObserveError::Decode("screenshot 응답에 png_base64 없음".into()))?;
+                .ok_or_else(|| {
+                    ObserveError::Decode("screenshot response has no png_base64 field".into())
+                })?;
             use base64::Engine;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64.as_bytes())

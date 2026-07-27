@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{emu_home_dir, find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
 
-pub const REQUIRED_HOST_API: u32 = 1;
+pub const REQUIRED_HOST_API: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -15,6 +15,7 @@ pub struct BuildMetadata {
     pub core_commit: String,
     pub host_api: u32,
     pub bundle_sha256: String,
+    pub patchset_sha256: String,
     pub test_rom_sha256: String,
     pub debugger: bool,
 }
@@ -113,11 +114,14 @@ pub fn require_compatible_root(
     root: &Path,
     display: bool,
 ) -> io::Result<BuildMetadata> {
-    if !library_exists(root, "libmupen64plus") || !library_exists(root, "mupen64plus-rsp-hle") {
+    if !library_exists(root, "libmupen64plus")
+        || !library_exists(root, "mupen64plus-rsp-hle")
+        || !library_exists(root, "mupen64plus-input-sdl")
+    {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "Mupen64Plus core or RSP plugin is missing under {}",
+                "Mupen64Plus core, RSP, or input plugin is missing under {}",
                 root.display()
             ),
         ));
@@ -153,6 +157,7 @@ pub fn require_compatible_root(
         && metadata.host_api == expected_api
         && metadata.host_api == REQUIRED_HOST_API
         && metadata.bundle_sha256 == required_lock_value(&lock, "M64P_BUNDLE_SHA256")?
+        && metadata.patchset_sha256 == required_lock_value(&lock, "M64P_PATCHSET_SHA256")?
         && metadata.test_rom_sha256 == required_lock_value(&lock, "M64P_TEST_ROM_SHA256")?
         && metadata.debugger;
     if !matches_lock {

@@ -186,11 +186,11 @@ pub(crate) fn parse_observe_spec(
         "screenshot" => Ok(ObserveSpec::Screenshot),
         "state" => Ok(ObserveSpec::State),
         "memory" => {
-            let memory_type = memory_type.ok_or("observe=memory엔 memory_type 필요")?;
-            let address = address.ok_or("observe=memory엔 address 필요")?;
-            let length = length.ok_or("observe=memory엔 length 필요")?;
+            let memory_type = memory_type.ok_or("observe=memory requires memory_type")?;
+            let address = address.ok_or("observe=memory requires address")?;
+            let length = length.ok_or("observe=memory requires length")?;
             if length == 0 {
-                return Err("observe=memory length는 1 이상이어야".into());
+                return Err("observe=memory length must be at least 1".into());
             }
             Ok(ObserveSpec::Memory {
                 memory_type,
@@ -199,7 +199,7 @@ pub(crate) fn parse_observe_spec(
             })
         }
         other => Err(format!(
-            "알 수 없는 observe: {other} (auto|memory|screenshot|state)"
+            "unknown observe value: {other} (expected auto|memory|screenshot|state)"
         )),
     }
 }
@@ -236,7 +236,7 @@ pub(crate) fn verify_determinism_core(
                 .filter(|s| !s.is_empty())
                 .or_else(|| info.get("sha1").and_then(|s| s.as_str()))
                 .unwrap_or("");
-            if !h.is_empty() && h != "skipped:too_large" && h != case.rom.sha1 {
+            if !h.is_empty() && h != "skipped:too_large" && !rom_hash_matches(h, &case.rom.sha1) {
                 return DetResult {
                     outcome: DetOutcome::MeasurementInvalid("rom_mismatch".into()),
                     observe_kind: String::new(),
@@ -278,6 +278,10 @@ pub(crate) fn verify_determinism_core(
     }
 }
 
+fn rom_hash_matches(observed: &str, expected: &str) -> bool {
+    observed.eq_ignore_ascii_case(expected)
+}
+
 /// 한 케이스를 현재 link으로 재현·판정한다. savestate는 원자적 probe로, 읽기 검증은 evaluate가.
 pub(crate) fn run_one_case(
     link: &mut dyn EmulatorLink,
@@ -287,10 +291,16 @@ pub(crate) fn run_one_case(
     // 케이스 자체 검증: id == 디렉토리명
     let dir_name = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
     if dir_name != case.id {
-        return regression::Verdict::Invalid(format!("id({})≠디렉토리({})", case.id, dir_name));
+        return regression::Verdict::Invalid(format!(
+            "case id ({}) does not match directory name ({})",
+            case.id, dir_name
+        ));
     }
     if case.predicate.length == 0 || case.predicate.length > 8 {
-        return regression::Verdict::Invalid(format!("length 위반: {}", case.predicate.length));
+        return regression::Verdict::Invalid(format!(
+            "invalid predicate length: {}",
+            case.predicate.length
+        ));
     }
     if let Err(e) = ensure_capabilities_loaded(link) {
         return regression::Verdict::ReproError(format!("{e}"));
@@ -311,7 +321,7 @@ pub(crate) fn run_one_case(
                 .filter(|s| !s.is_empty())
                 .or_else(|| info.get("sha1").and_then(|s| s.as_str()))
                 .unwrap_or("");
-            if !h.is_empty() && h != "skipped:too_large" && h != case.rom.sha1 {
+            if !h.is_empty() && h != "skipped:too_large" && !rom_hash_matches(h, &case.rom.sha1) {
                 return regression::Verdict::RomMismatch;
             }
         }
@@ -465,7 +475,7 @@ fn validate_movie_frames(movie: &regression::Movie) -> Result<(), String> {
         // 프레임을 하나 더 소비해 회귀 판정이 틀린 시점에 일어난다 — 조용한 오류 대신 드러낸다.
         if w[1].frame <= w[0].frame {
             return Err(format!(
-                "무비 frame이 엄격 증가가 아님(중복·역행): {} 다음에 {}",
+                "movie frames are not strictly increasing: {} followed by {}",
                 w[0].frame, w[1].frame
             ));
         }
@@ -473,7 +483,7 @@ fn validate_movie_frames(movie: &regression::Movie) -> Result<(), String> {
     if let Some(last) = movie.frames.last() {
         if last.frame > MAX_REPLAY_FRAMES {
             return Err(format!(
-                "무비 최대 frame {}이 상한 {} 초과",
+                "movie maximum frame {} exceeds the limit {}",
                 last.frame, MAX_REPLAY_FRAMES
             ));
         }
@@ -625,6 +635,6 @@ fn read_target(link: &mut dyn EmulatorLink, p: &Predicate) -> Result<Vec<u8>, St
     let hex = r
         .get("hex")
         .and_then(|h| h.as_str())
-        .ok_or("read_memory 응답에 hex 없음")?;
+        .ok_or("read_memory response has no hex field")?;
     bisect::hex_to_bytes(hex)
 }

@@ -1,0 +1,21 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The emucap openMSX build recipe, documentation, and separate Rust control
+bridge are licensed GPL-2.0-or-later, the project default.
+
+The pinned openMSX 21.0 source is downloaded into the ignored work tree and
+retains its own copyright and license notices. Its README points to the GNU
+GPL version 2 text but does not give every default source file an unambiguous
+"only" or "or later" grant. The supported adapter therefore does not modify openMSX
+source. If a native patch is introduced later, its exact upstream file
+licenses must be reviewed before distribution.
+
+The openMSX source package includes C-BIOS machine ROMs under the BSD
+2-Clause license. Their original copyright, license, and disclaimer remain
+authoritative and must accompany any redistribution.
+
+This repository does not distribute openMSX source or binaries, C-BIOS
+binaries, proprietary MSX system ROMs, or game media. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

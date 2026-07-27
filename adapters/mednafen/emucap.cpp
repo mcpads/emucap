@@ -1,6 +1,7 @@
 // Mednafen 포크의 emucap 라이브 제어 소켓 클라이언트. emucap-mcp(서버)에 접속해 NDJSON
 // 프로토콜을 서비스한다 — Mesen의 emucap-core.lua에 대응하는 C++판. Rust 측(TcpLink·tools·
-// MCP)은 그대로 동작한다. 대상은 Saturn(ss), PSX(psx), PC Engine(pce), Mega Drive(md)이다.
+// MCP)은 그대로 동작한다. 대상은 Saturn(ss), PSX(psx), PC Engine(pce), PC-FX(pcfx),
+// Mega Drive(md), WonderSwan(wswan)이다.
 //
 // 빌드 통합: src/drivers/로 복사 + Makefile.am에 추가 + main.cpp 프레임 루프에서 호출.
 #include "main.h"            // CurGame, MDFNGI, Mednafen 타입, MDFNI_Reset
@@ -589,9 +590,10 @@ AddressSpaceType* find_aspace(const std::string& name) {
   return nullptr;
 }
 
-// 시스템 식별: 한 바이너리가 ss/psx/pce/md를 모두 처리하므로(모두 컴파일·링크됨), 시스템 특화
+// 시스템 식별: 한 바이너리가 ss/psx/pce/pcfx/md/wswan/ngp를 모두 처리하므로(모두 컴파일·링크됨), 시스템 특화
 // 코드(주소공간 매핑·버튼 테이블·엔디안)를 런타임에 분기한다. shortname은 MDFNGI 멤버이고
-// psx.cpp는 "psx", ss.cpp는 "ss", pce.cpp는 "pce", md/system.cpp는 "md"로 설정한다.
+// psx.cpp는 "psx", ss.cpp는 "ss", pce.cpp는 "pce", pcfx.cpp는 "pcfx",
+// md/system.cpp는 "md", wswan/main.cpp는 "wswan", ngp/neopop.cpp는 "ngp"로 설정한다.
 const char* system_shortname() {
   return (CurGame && CurGame->shortname) ? CurGame->shortname : "";
 }
@@ -605,6 +607,10 @@ bool is_pce() {
   return !strcmp(s, "pce") || !strcmp(s, "pce_fast");
 }
 
+bool is_pcfx() {
+  return !strcmp(system_shortname(), "pcfx");
+}
+
 bool is_ss() {
   return !strcmp(system_shortname(), "ss");
 }
@@ -615,6 +621,10 @@ bool is_md() {
 
 bool is_ws() {
   return !strcmp(system_shortname(), "wswan");
+}
+
+bool is_ngp() {
+  return !strcmp(system_shortname(), "ngp");
 }
 
 std::string hex_bytes(const uint8* data, size_t len) {
@@ -666,6 +676,7 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
   uint32 off;
   bool psx = is_psx();
   bool pce = is_pce();
+  bool pcfx = is_pcfx();
   bool md = is_md();
   bool ws = is_ws();
   if (psx) {
@@ -678,6 +689,10 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
     // cpu aspace는 현재 MPR 매핑을 반영한다. 값 조립은 65C02 계열 리틀엔디언.
     asname = bp.logical ? "cpu" : "physical";
     off = bp.logical ? (addr & 0xFFFF) : (addr & 0x1FFFFF);
+  } else if (pcfx) {
+    // PC-FX(V810): debugger read/write BP는 32비트 CPU physical 주소를 보고한다.
+    // V810은 little-endian이고 cpu aspace가 RAM/backup/BIOS 버스를 디코드한다.
+    asname = "cpu"; off = addr;
   } else if (md) {
     // Mega Drive/Genesis(68000): debugger read/write BP가 24비트 CPU physical 주소를 보고한다.
     // Work RAM은 0xFF0000~0xFFFFFF mirror이며, 다바이트 값은 68000 big-endian으로 조립한다.
@@ -702,8 +717,8 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
   unsigned n = len > 4 ? 4 : (len < 1 ? 1 : len);
   sp->GetAddressSpaceBytes(asname, off, n, buf);
   uint32 v = 0;
-  if (psx || pce || ws)
-    for (unsigned i = 0; i < n; i++) v |= (uint32)buf[i] << (i * 8);  // MIPS/HuC6280/V30MZ little-endian
+  if (psx || pce || pcfx || ws)
+    for (unsigned i = 0; i < n; i++) v |= (uint32)buf[i] << (i * 8);  // MIPS/HuC6280/V810/V30MZ little-endian
   else
     for (unsigned i = 0; i < n; i++) v = (v << 8) | buf[i];           // SH-2/68000 big-endian
   return v;
@@ -713,6 +728,9 @@ uint32 emucap_read_value_for_bp(const BP& bp, uint32 addr, unsigned len) {
 // 68000(BSR/JSR·RTS/RTR), SH-2(BSR/BSRF/JSR·RTS), MIPS(JAL/JALR·JR $ra), HuC6280(JSR·RTS).
 enum CallKind { CK_OTHER = 0, CK_CALL, CK_RETURN };
 CallKind classify_instr(uint32 pc) {
+  // V810 call/return classification is intentionally not implemented. PC-FX still uses the
+  // continuous CPU callback for trace and register watches, but does not advertise call_stack.
+  if (is_pcfx()) return CK_OTHER;
   const char* asname = "cpu";
   uint32 off = pc;
   if (is_pce()) {
@@ -996,7 +1014,6 @@ void handle_find_pattern(long id, const std::string& line) {
     reply_err(id, "bad_params", "hex는 비어 있지 않은 짝수 길이 hex 문자열이어야");
     return;
   }
-
   uint32 start = 0;
   if (!json_u32_arg(id, line, "start", start, false)) return;
   long length = -1, max_matches = 256, align = 1;
@@ -1080,6 +1097,11 @@ void handle_write_memory(long id, const std::string& line) {
   std::string hex = json_str(line, "hex");
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
+  if (is_pcfx() && (mt == "cpu" || mt == "bios" || mt.rfind("track", 0) == 0)) {
+    reply_err(id, "unsupported",
+              "PC-FX write_memory rejects cpu because it can mutate BIOS, and rejects bios/track views as protected or read-only");
+    return;
+  }
   if (is_md() && mt == "cpu") {
     reply_err(id, "unsupported", "Mednafen MD cpu address space write is a no-op; use memory_type=ram");
     return;
@@ -1231,8 +1253,9 @@ void resolve_sp_reg() {
   static const char* psx_names[] = {"SP", "sp", "R29", "r29", nullptr};
   static const char* pce_names[] = {"SP", "S", nullptr};
   static const char* ws_names[] = {"SP", nullptr};  // V30MZ 스택 포인터(debug.cpp V30MZ_Regs)
+  static const char* pcfx_names[] = {"SP", "PR3", nullptr};  // V810 PR3 is the stack pointer.
   const char** names = is_md() ? md_names : is_ss() ? ss_names : is_psx() ? psx_names
-                     : is_ws() ? ws_names : pce_names;
+                     : is_ws() ? ws_names : is_pcfx() ? pcfx_names : pce_names;
   uint32 v;
   for (int i = 0; names[i]; i++) {
     if (read_register_by_name(names[i], v)) {
@@ -1368,6 +1391,17 @@ const BtnOff g_pcebtn[] = {
   {nullptr, 0}
 };
 
+// PC-FX pad. gamepad.cpp's IDII declaration order is the raw little-endian input bit:
+// I..VI, SELECT, RUN, directions, mode1, padding, mode2.
+const BtnOff g_pcfxbtn[] = {
+  {"i", 0}, {"a", 0}, {"ii", 1}, {"b", 1},
+  {"iii", 2}, {"iv", 3}, {"v", 4}, {"vi", 5},
+  {"select", 6}, {"run", 7}, {"start", 7}, {"enter", 7}, {"return", 7},
+  {"up", 8}, {"right", 9}, {"down", 10}, {"left", 11},
+  {"mode1", 12}, {"mode2", 14},
+  {nullptr, 0}
+};
+
 // Mega Drive/Genesis pad. Mednafen MD IDII 선언 순서가 raw bit offset이다.
 // 기본 launcher는 md.input.port1=gamepad6으로 고정해 x/y/z/mode까지 2바이트 버퍼로 받는다.
 const BtnOff g_mdbtn[] = {
@@ -1395,12 +1429,23 @@ const BtnOff g_wsbtn[] = {
   {nullptr, 0}
 };
 
+// Neo Geo Pocket/Color built-in pad. ngp/neopop.cpp declares the raw one-byte input in this
+// order: directions, A, B, OPTION. Both monochrome and color cartridges use the same module.
+const BtnOff g_ngpbtn[] = {
+  {"up", 0}, {"down", 1}, {"left", 2}, {"right", 3},
+  {"a", 4}, {"b", 5},
+  {"option", 6}, {"start", 6}, {"enter", 6}, {"return", 6},
+  {nullptr, 0}
+};
+
 // 활성 시스템의 버튼 테이블(런타임 분기). buttons_to_mask/mask_to_buttons가 사용.
 const BtnOff* active_btntab() {
   if (is_psx()) return g_psxbtn;
   if (is_pce()) return g_pcebtn;
+  if (is_pcfx()) return g_pcfxbtn;
   if (is_md()) return g_mdbtn;
   if (is_ws()) return g_wsbtn;
+  if (is_ngp()) return g_ngpbtn;
   return g_satbtn;
 }
 
@@ -2124,6 +2169,10 @@ void handle_watch_register(long id, const std::string& line) {
 // call_stack(): 현재 shadow stack(call-site PC 체인, 바깥→안)을 [{pc,text}]로 반환한다. set_trace(true)
 // 선행 필요 — 추적 시작 이후의 call/return만 반영하며 스택 메모리 손상과 독립적이다.
 void handle_call_stack(long id) {
+  if (is_pcfx()) {
+    reply_err(id, "unsupported", "PC-FX V810 call_stack is not implemented; use set_trace/get_trace");
+    return;
+  }
   std::string out = "{\"call_stack\":[";
   for (size_t i = 0; i < g_callstack.size(); i++) {
     uint32 pc = g_callstack[i].pc;  // g_callstack[0]=가장 바깥, back()=가장 안
@@ -2205,7 +2254,8 @@ void handle(const std::string& line) {
           ",\"get_state\",\"read_memory\",\"find_pattern\",\"dump_memory\",\"write_memory\",\"probe\","
           "\"set_breakpoint\",\"clear_breakpoint\",\"clear_all_breakpoints\",\"list_breakpoints\","
           "\"poll_events\",\"disassemble\",\"step_instructions\","
-          "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\"";
+          "\"set_trace\",\"get_trace\",\"watch_register\"";
+      if (!is_pcfx()) methods += ",\"call_stack\"";
     }
     // Saturn 전용 VDP2 디코드 메서드. SS일 때만 advertise(다른 시스템엔 미advertise — 발견 표면 최소화).
     // PeekRawReg는 ss 코어 심볼이라 ss 외엔 의미 없음. has_debugger와 함께 조건을 확인한다.
@@ -2247,10 +2297,13 @@ void handle(const std::string& line) {
     add_exception("mednafen.input-hold.port-zero-only");
     add_exception("mednafen.input-pulse.port-zero-only");
     if (has_debugger) {
-      add_exception("mednafen.call-stack.best-effort");
+      if (!is_pcfx()) add_exception("mednafen.call-stack.best-effort");
       add_exception("mednafen.state.groups-absent");
       if (is_md()) {
         add_exception("mednafen.md.cpu-write-absent");
+      }
+      if (is_pcfx()) {
+        add_exception("mednafen.pcfx.protected-write-spaces");
       }
       if (is_ss()) {
         add_exception("mednafen.ss.physical-read-absent");
@@ -2258,6 +2311,8 @@ void handle(const std::string& line) {
       }
     } else if (is_pce()) {
       add_exception("mednafen.pce-fast.debugger-absent");
+    } else if (is_ngp()) {
+      add_exception("mednafen.ngp.debugger-absent");
     }
     std::string contracts =
         "{\"catalog\":\"emucap-feature-contracts/v3\",\"active_exceptions\":[" +
@@ -2559,6 +2614,43 @@ void handle(const std::string& line) {
           reply_err(id, "bad_params", "PCE 논리 read/write BP는 16비트(0x0000..0xFFFF); 물리는 memory_type=physical");
           return;
         }
+      }
+    } else if (is_pcfx()) {
+      // PC-FX V810 uses 32-bit physical addresses. Exec BP must be an aligned V810 instruction
+      // address. Read/write BP accepts raw CPU bus addresses, plus linear RAM/BIOS offset views.
+      if (type == BPOINT_PC) {
+        if (!mt.empty() && mt != "cpu") {
+          reply_err(id, "unsupported", "PC-FX exec BP uses memory_type=cpu and absolute V810 addresses");
+          return;
+        }
+        if ((start & 1) || (end & 1)) {
+          reply_err(id, "bad_params", "PC-FX V810 exec BP addresses must be 2-byte aligned");
+          return;
+        }
+      } else if (mt.empty() || mt == "cpu") {
+        logical = false;
+      } else if (mt == "ram") {
+        if (start > 0x1FFFFF || end > 0x1FFFFF) {
+          reply_err(id, "bad_params", "PC-FX ram BP offsets are 0x000000..0x1FFFFF");
+          return;
+        }
+        logical = false;  // RAM is linearly mapped at CPU bus 0x00000000.
+      } else if (mt == "bios") {
+        if (start > 0xFFFFF || end > 0xFFFFF) {
+          reply_err(id, "bad_params", "PC-FX bios BP offsets are 0x00000..0xFFFFF");
+          return;
+        }
+        start += 0xFFF00000u;
+        end += 0xFFF00000u;
+        logical = false;
+      } else if (mt == "backup" || mt == "exbackup") {
+        reply_err(id, "unsupported",
+                  "PC-FX backup BP views are interleaved on the CPU bus; use memory_type=cpu with an exact physical address");
+        return;
+      } else {
+        reply_err(id, "unsupported",
+                  "PC-FX read/write BP supports cpu, ram, and bios; CD track address spaces are read-only debugger views");
+        return;
       }
     } else if (is_md()) {
       if (type == BPOINT_READ || type == BPOINT_WRITE) {

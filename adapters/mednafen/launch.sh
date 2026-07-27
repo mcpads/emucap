@@ -14,12 +14,14 @@
 # 예:
 #   adapters/mednafen/launch.sh game.cue 47800
 #   adapters/mednafen/launch.sh pce_game.cue 47800 pce1 pce
+#   adapters/mednafen/launch.sh pcfx_game.cue 47800 pcfx1 pcfx
 #   adapters/mednafen/launch.sh md_game.md 47800 sonic md
 #
 # 환경변수:
 #   MEDNAFEN_BIN=/path/to/mednafen          기본: 플랫폼별 work/mednafen/src/mednafen(.exe), 없으면 PATH
-#   MEDNAFEN_FORCE_MODULE=pce|psx|ss|md     4번째 인자 없을 때 사용
+#   MEDNAFEN_FORCE_MODULE=pce|pcfx|psx|ss|md|wswan|ngp  4번째 인자 없을 때 사용
 #   MEDNAFEN_SOUND=0|1                      기본: 0
+#   EMUCAP_PCFX_BIOS=/absolute/pcfx.rom     PC-FX BIOS version 1.00
 #   EMUCAP_HEADLESS=1|0                     기본: 1(SDL_VIDEODRIVER=dummy)
 #   EMUCAP_LAUNCH_WAIT=<seconds>            기본: 20
 #   EMUCAP_POST_CONNECT_GRACE=<seconds>     기본: 3(연결 직후 사망/끊김 검출)
@@ -151,6 +153,40 @@ BIN="${MEDNAFEN_BIN:-$(resolve_default_mednafen)}"
 [ -f "$CONTENT" ] || { echo "ERROR: content 없음: $CONTENT" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "ERROR: Mednafen 바이너리 없음: $BIN (adapters/mednafen/build.sh 실행 필요)" >&2; exit 1; }
 
+PCFX_BIOS=""
+if [ "$MODULE" = "pcfx" ]; then
+  PCFX_BIOS="${EMUCAP_PCFX_BIOS:-$EMUCAP_DATA_ROOT/firmware/pcfx.rom}"
+  case "$PCFX_BIOS" in
+    /*) ;;
+    *)
+      echo "ERROR: EMUCAP_PCFX_BIOS는 절대 경로여야 한다: $PCFX_BIOS" >&2
+      exit 2
+      ;;
+  esac
+  [ -f "$PCFX_BIOS" ] || {
+    echo "ERROR: PC-FX BIOS 1.00 pcfx.rom 없음: $PCFX_BIOS" >&2
+    echo "  EMUCAP_PCFX_BIOS로 지정하거나 emucap firmware 디렉터리에 pcfx.rom을 두라." >&2
+    exit 2
+  }
+  PCFX_BIOS_SIZE="$(wc -c <"$PCFX_BIOS" | tr -d ' ')"
+  [ "$PCFX_BIOS_SIZE" = "1048576" ] || {
+    echo "ERROR: PC-FX BIOS 크기 불일치: expected=1048576 actual=$PCFX_BIOS_SIZE path=$PCFX_BIOS" >&2
+    exit 2
+  }
+  if command -v shasum >/dev/null 2>&1; then
+    PCFX_BIOS_SHA256="$(shasum -a 256 "$PCFX_BIOS" | awk '{print $1}')"
+  elif command -v sha256sum >/dev/null 2>&1; then
+    PCFX_BIOS_SHA256="$(sha256sum "$PCFX_BIOS" | awk '{print $1}')"
+  else
+    echo "ERROR: PC-FX BIOS 검증에 shasum 또는 sha256sum이 필요하다." >&2
+    exit 2
+  fi
+  [ "$PCFX_BIOS_SHA256" = "4b44ccf5d84cc83daa2e6a2bee00fdafa14eb58bdf5859e96d8861a891675417" ] || {
+    echo "ERROR: PC-FX BIOS는 지원하는 version 1.00 이미지가 아니다: sha256=$PCFX_BIOS_SHA256" >&2
+    exit 2
+  }
+fi
+
 tail_log() {
   echo "---- Mednafen log: $LOG ----" >&2
   if [ -s "$LOG" ]; then
@@ -224,6 +260,7 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
   echo "  session_token=${SESSION_TOKEN:+present}"
   echo "  token_file=$TOKEN_FILE"
   echo "  module=${MODULE:-<auto>}"
+  echo "  profile=$([ "$MODULE" = "pcfx" ] && printf '%s' "$RUN_DIR" || printf '%s' '<default Mednafen profile>')"
   echo "  bin=$BIN"
   echo "  wait=${WAIT}s"
   echo "  post_connect_grace=${POST_CONNECT_GRACE}s"
@@ -232,6 +269,10 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
 export EMUCAP_PORT="$PORT"
 export EMUCAP_CONTENT="$CONTENT"
 export MEDNAFEN_ALLOWMULTI="${MEDNAFEN_ALLOWMULTI:-1}"
+if [ "$MODULE" = "pcfx" ]; then
+  # PC-FX has an explicit BIOS argument, so it can use a fully isolated profile.
+  export MEDNAFEN_HOME="$RUN_DIR"
+fi
 if [ -n "$NAME" ]; then
   export EMUCAP_NAME="$NAME"
 fi
@@ -252,6 +293,9 @@ if [ "$MODULE" = "md" ]; then
   # Force a 6-button pad so the emucap raw input mask has a stable 2-byte buffer.
   # Games that only use 3-button inputs still see the low bits normally.
   ARGS+=(-md.input.auto 0 -md.input.port1 gamepad6)
+fi
+if [ -n "$PCFX_BIOS" ]; then
+  ARGS+=(-pcfx.bios "$PCFX_BIOS")
 fi
 if [ -n "$MODULE" ]; then
   ARGS+=(-force_module "$MODULE")

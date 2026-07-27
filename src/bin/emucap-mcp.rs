@@ -68,7 +68,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "emucap 작업의 첫 진입점 — 무엇을 켤지 모를 때 가장 먼저 호출한다. 에뮬레이터가 없어도 listener를 세우고 listening_port·runtime_paths·지원 시스템·물어볼 다음 질문을 반환한다."
+        description = "Start here for emucap work, especially when the content or system is unknown. Establishes a listener even without an emulator and returns listening_port, runtime_paths, supported systems, and the next question when user input is required."
     )]
     async fn bootstrap(&self) -> CallToolResult {
         let mut link = self.link();
@@ -79,7 +79,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "ROM/disc/disk를 어느 adapter로 띄울지 계획한다 — launcher 절대경로·argv·listening_port를 반환한다(미디어가 애매하면 추측 대신 물어볼 질문을 반환)."
+        description = "Plan which adapter should launch a ROM, disc, or disk. Returns the absolute launcher path, argv, and listening_port. For ambiguous media, returns a question instead of guessing."
     )]
     async fn launch_plan(&self, Parameters(a): Parameters<LaunchPlanArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -97,7 +97,7 @@ impl Emucap {
                         .unwrap_or(false)
                     {
                         obj.insert("warning".into(), serde_json::json!(
-                            "이 listening_port를 다른 에뮬레이터가 점유 중이다(bootstrap.occupant 참조). 이 plan의 launch를 그대로 실행하기 전에 bootstrap.recovery를 따라 점유를 해소하라."
+                            "Another emulator occupies this listening_port; inspect bootstrap.occupant and follow bootstrap.recovery before executing this launch plan."
                         ));
                     }
                     obj.insert("bootstrap".into(), bootstrap);
@@ -109,14 +109,14 @@ impl Emucap {
     }
 
     #[tool(
-        description = "resolved 어댑터로 에뮬레이터를 직접 띄운다(크로스플랫폼 Rust 런처) — 지원 에뮬레이터와 필요한 bridge를 detached spawn하고 pid를 반환한다. 몇 초 뒤 status로 connected를 확인하라."
+        description = "Launch an emulator with the resolved adapter. The cross-platform Rust launcher starts the supported emulator and any required bridge as detached processes, waits for adapter readiness, and returns process identity and launch outcome."
     )]
     async fn launch(&self, Parameters(a): Parameters<LaunchArgs>) -> CallToolResult {
         let mut link = self.link();
         output_result(ToolOutput::Json(make_launch(&mut *link, &a)))
     }
 
-    #[tool(description = "실행 중 게임의 메모리 범위를 읽는다")]
+    #[tool(description = "Read a byte range from the running game's memory.")]
     async fn read_memory(&self, Parameters(a): Parameters<ReadMemoryArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::read_memory(&mut *link, &a.memory_type, a.address.get(), a.length.get()) {
@@ -126,7 +126,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "세이브스테이트 로드→frame 진행→메모리 읽기를 한 어댑터 명령으로 수행한다(프레임 경계 탐색과 regression의 재생 경로). 진행 중 BP 히트 시 측정 무효라 {status:interrupted}로 닫는다."
+        description = "Load a savestate, advance by a frame count, and read memory as one adapter operation. This is the replay path for frame-boundary search and regression. A breakpoint hit invalidates the measurement and returns status:interrupted."
     )]
     async fn probe(&self, Parameters(a): Parameters<ProbeArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -144,7 +144,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "메모리 영역에서 hex 패턴을 어댑터 내부 스캔해 매칭 오프셋만 반환한다 — 런타임 문자열/버퍼/테이블 위치 특정(대용량을 read로 안 뜨고)."
+        description = "Scan a memory region inside the adapter for a hexadecimal pattern and return matching offsets. Use it to locate runtime strings, buffers, or tables without transferring the whole region through read_memory."
     )]
     async fn find_pattern(&self, Parameters(a): Parameters<FindPatternArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -170,7 +170,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "현재 화면을 캡처하고 PNG SHA-256·byte length와 backend가 제공하는 frame/state/freshness provenance를 함께 반환한다"
+        description = "Capture the current screen and return PNG data with SHA-256, byte length, and any frame, state, and freshness provenance supplied by the backend."
     )]
     async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -182,7 +182,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "에뮬레이터 상태 레지스터를 읽는다(groups로 필터, 생략 시 전체 — groups 미지원 백엔드는 무시하고 전체 반환)."
+        description = "Read emulator state registers. Filter with groups or omit them for all state. Backends without group filtering ignore the filter and return all available state."
     )]
     async fn get_state(&self, Parameters(a): Parameters<StateArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -193,7 +193,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Saturn VDP2 비디오 상태를 레이어별(NBG0~3·RBG·common)로 디코드해 반환한다. 반환 필드·공식·char base 보정은 어댑터 README 참조."
+        description = "Decode and return Saturn VDP2 video state by layer (NBG0-3, RBG, and common state). See the adapter README for returned fields, formulas, and character-base correction."
     )]
     async fn get_video_state(&self) -> CallToolResult {
         let mut link = self.link();
@@ -204,7 +204,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Saturn 화면좌표(NBG, x, y)를 그 셀의 char 데이터 주소로 푼다(스크롤→맵셀→PNT→charno→주소를 렌더러 공식으로 접는다). 중간값 동봉; 필드·공식·char-base 보정은 usage."
+        description = "Resolve a Saturn NBG screen coordinate to the cell's character-data address through scroll, map cell, pattern-name data, and character number. Returns intermediate values; see the adapter documentation for field formulas and character-base correction."
     )]
     async fn resolve_tile(&self, Parameters(a): Parameters<ResolveTileArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -215,7 +215,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "비디오 레이어 enable 마스크를 토글한다 — 텍스트 라우팅 판정·클린플레이트 캡처용(layers·mask 둘 다 생략하면 현재 상태 조회). ⚠ override라 지속되니 분석 후 layers에 전체 이름을 줘 반드시 복원하라."
+        description = "Set or query the video-layer enable mask for routing analysis and clean-plate capture. Omit both layers and mask to query. This is a persistent override; restore the complete layer set after analysis."
     )]
     async fn set_layer_enable(
         &self,
@@ -230,7 +230,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "실행 중 콘텐츠 신원을 읽는다 — name/path/size/media_type + 균일 `rom_sha1` 해시. 그 `rom_sha1`을 추적 MCP run_start에 그대로 넘긴다(없으면 `shasum -a1 <content>` 폴백)."
+        description = "Read the running content identity: name, path, size, media_type, and normalized rom_sha1. Pass rom_sha1 unchanged to Tracking MCP run_start. Use a local SHA-1 fallback only when the backend does not provide it."
     )]
     async fn get_rom_info(&self) -> CallToolResult {
         let mut link = self.link();
@@ -245,7 +245,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "떠 있는 에뮬레이터 연결 상태를 읽는다(미연결이면 listening_port·runtime_paths 반환). 새 작업이나 무엇을 켤지 모르면 status가 아니라 bootstrap을 먼저 호출한다."
+        description = "Read the current emulator connection state. When disconnected, returns listening_port and runtime_paths. For a new task or unknown content, call bootstrap before status."
     )]
     async fn status(&self) -> CallToolResult {
         let mut link = self.link();
@@ -295,15 +295,15 @@ impl Emucap {
                             "then_call": "status"
                         }
                     },
-                    "next_action": "연결 확인만이면 runtime_paths를 참고한다. 새 launch이고 content_path가 있으면 launch_plan(content_path, system?)을 호출한다. content_path/system을 모르면 사용자에게 question_to_user_if_content_unknown을 물어본다.",
+                    "next_action": "For connection inspection, use runtime_paths. For a new launch with known content_path, call launch_plan(content_path, system?). If content or system is unknown, ask question_to_user_if_content_unknown.",
                     "hint": port.map(|p| format!(
-                        "무엇을 켤지 모르면 status 응답만으로 추측 실행하지 말고 bootstrap() 또는 launch_plan(content_path, system?)을 먼저 호출하라. \
-                         launch 직전에 받은 이 포트({p})를 유지한 상태에서 launch(content_path, system?, name?) 도구를 호출하라. \
-                         launch_plan은 preferred_launcher.args와 legacy_fallback_*를 함께 준다. 기본은 MCP launch 도구이고, legacy script는 Rust launch가 해당 호스트에서 막힐 때만 쓴다. \
-                         이 status 호출이 listener를 세우고 background accept/hello를 준비하므로 생략하지 말 것. \
-                         launch 도구와 legacy launcher는 status.identity_guard.session_token_file.path의 포트 토큰을 전달해 이 MCP 세션 토큰을 맞춘다. \
-                         세션 토큰이 없거나 다른 오래된 에뮬레이터 연결은 handshake에서 hard fail 된다. \
-                         raw nohup 명령을 직접 조립하지 말고 launch 도구의 로그/결과를 확인하라. 광역 kill 금지."
+                        "When content is unknown, do not infer a launch from status alone. Call bootstrap() or launch_plan(content_path, system?) first. \
+                         Keep the current listener port ({p}) and call launch(content_path, system?, name?) immediately before execution. \
+                         launch_plan returns preferred_launcher.args and legacy_fallback_*; prefer the MCP launch tool and use a legacy script only when Rust launch is unavailable on this host. \
+                         This status call establishes the listener and prepares background accept and hello, so do not skip it. \
+                         The MCP launcher and legacy launcher pass the per-port token from status.identity_guard.session_token_file.path. \
+                         A missing token or a stale emulator from another session fails the handshake. \
+                         Do not assemble a raw nohup command. Inspect launcher logs and results, and never use a broad process kill."
                     )),
                 });
                 enrich_link_status(&mut v, port, token.as_deref(), None);
@@ -338,7 +338,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "마지막 정상 상태와 transport/adapter 실패 캡슐을 읽는다. 에뮬레이터에 요청하지 않으므로 연결이 끊긴 뒤에도 동작한다."
+        description = "Read the last known-good status and preserved transport or adapter failure capsule. This does not contact the emulator and remains available after disconnection."
     )]
     async fn get_failure_context(&self) -> CallToolResult {
         let mut link = self.link();
@@ -346,7 +346,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "fatal quarantine의 보존 상태를 해제하고 에뮬레이터의 기존 종료 경로를 계속한다. status.methods에 dismiss_failure가 있을 때만 사용한다."
+        description = "Dismiss a preserved fatal quarantine and continue the emulator's original termination path. Use only when status.methods includes dismiss_failure."
     )]
     async fn dismiss_failure(&self) -> CallToolResult {
         let mut link = self.link();
@@ -368,7 +368,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "메모리에 바이트를 쓴다. 짧은 값은 hex, raw binary 파일은 input_file(path, offset, length, sha256?)로 주며 둘 중 정확히 하나만 지정한다. 파일은 제어 MCP가 허용 범위 안에서 한 번 읽어 고정하고 SHA-256을 반환한다."
+        description = "Write bytes to emulator memory. Provide exactly one of hex for a short value or input_file(path, offset, length, sha256?) for a raw binary slice. Control MCP reads and fixes the bounded file slice once and returns its SHA-256."
     )]
     async fn write_memory(&self, Parameters(a): Parameters<WriteMemoryArgs>) -> CallToolResult {
         let generation = if a.input_file.is_some() {
@@ -394,7 +394,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "컨트롤러/키 입력을 누른 채 유지한다 — 빈 배열 set_input으로 해제할 때까지 지속(running·frozen 무관). 사용할 버튼은 status.input_buttons에서 확인한다."
+        description = "Hold controller or key input until released by set_input with an empty button array. Ownership persists in running and frozen states. Read valid button names from status.input_buttons."
     )]
     async fn set_input(&self, Parameters(a): Parameters<InputArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -405,7 +405,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "버튼/키를 frames만큼 실시간으로 눌렀다 뗀다(frozen이면 자동 resume). 버튼명은 status.input_buttons. frozen 유지 결정론 1칸/1회는 tap."
+        description = "Press buttons or keys for a real-time frame duration and then release them. Automatically resumes when frozen. Read names from status.input_buttons; use tap for deterministic frozen-state single actions."
     )]
     async fn press_buttons(&self, Parameters(a): Parameters<PressArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -416,7 +416,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "하단 터치스크린을 (x,y)에서 터치한다 — release=true면 뗀다, frames면 그만큼 눌렀다 자동으로 뗀다(탭), 둘 다 없으면 hold. 터치스크린이 있는 시스템에서 status.methods에 이 도구가 보일 때만 사용한다."
+        description = "Control a lower touchscreen at x,y. release:true releases touch; frames performs a timed tap and releases; omitting both holds touch. Use only when this method appears in status.methods."
     )]
     async fn touch(&self, Parameters(a): Parameters<TouchArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -427,7 +427,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "프레임 단위 정밀 탭 — frozen에서 auto-repeat 없이 1칸/1회 입력 후 뗀다(호출 후 frozen 유지). 버튼명은 status.input_buttons."
+        description = "Perform a frame-precise tap while frozen, then release input and remain frozen. Intended for one action below auto-repeat timing. Read button names from status.input_buttons."
     )]
     async fn tap(&self, Parameters(a): Parameters<TapArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -438,7 +438,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "버튼을 누른 채 frozen 진행하며 watch 메모리가 바뀌면 멈추고 뗀다 — 타일/커서 이동을 결정론적으로(입력 효과 피드백)."
+        description = "Advance while frozen with buttons held, stop when watched memory changes, and release input. Use for deterministic movement with memory feedback."
     )]
     async fn hold_until(&self, Parameters(a): Parameters<HoldUntilArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -456,7 +456,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "세이브스테이트를 파일로 저장한다")]
+    #[tool(description = "Save emulator state to a file.")]
     async fn save_state(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::save_state(&mut *l, &a.path) {
@@ -465,7 +465,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "파일에서 세이브스테이트를 로드한다")]
+    #[tool(description = "Load emulator state from a file.")]
     async fn load_state(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::load_state(&mut *l, &a.path) {
@@ -475,7 +475,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "N프레임 진행한다 — 항상 running으로 free-run이라 정밀 캡처엔 부적합(정확 N프레임은 pause→step). 진행 중 BP 히트 시 {status:interrupted}로 반환(poll_events로 드레인)."
+        description = "Advance for N frames in running free-run mode. This is not frame-exact capture; use pause then step for exact advancement. A breakpoint hit returns status:interrupted; drain its event with poll_events."
     )]
     async fn run_frames(&self, Parameters(a): Parameters<RunFramesArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -485,7 +485,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "다음 프레임 경계에서 일시정지(freeze)한다")]
+    #[tool(description = "Freeze at the next supported execution boundary.")]
     async fn pause(&self, Parameters(a): Parameters<CpuArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::pause(&mut *l, a.cpu.as_deref()) {
@@ -495,7 +495,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "일시정지 상태에서 지정한 단위만큼 진행 후 재정지한다. step(count=1, unit=\"frames\"|\"instructions\", cpu?)이며 기본 단위는 frames다. 제한이 있는 기기는 status.contracts.constraints의 execution.step.units에 허용 단위를 싣고, 이 제약이 없으면 두 단위를 지원한다."
+        description = "Advance a frozen emulator by count units and freeze again. unit is frames (default) or instructions, with optional cpu selection. Read allowed units from status.contracts.constraints execution.step.units; absence means both units are supported."
     )]
     async fn step(&self, Parameters(a): Parameters<StepArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -505,7 +505,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "정상 실행으로 복귀한다")]
+    #[tool(description = "Resume normal execution from a frozen state.")]
     async fn resume(&self, Parameters(a): Parameters<CpuArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::resume(&mut *l, a.cpu.as_deref()) {
@@ -515,7 +515,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "게임을 리셋한다(처음부터 재시작; 로드된 ROM 바이트는 그대로). reset 중 제어 연결을 다시 만드는 어댑터에서는 새 연결의 상태 확인까지 마친 뒤 반환한다."
+        description = "Reset the game while preserving loaded ROM bytes. Adapters that recreate the control connection during reset return only after the new connection is ready and verified."
     )]
     async fn reset(&self) -> CallToolResult {
         let mut l = self.link();
@@ -526,7 +526,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "메모리 접근·실행 또는 지원되는 장치 경계에 브레이크포인트를 건다(히트 시 freeze). kind·범위·pc/value 필터·snapshot 등 옵션은 인자 설명을 참조한다."
+        description = "Set a breakpoint on memory access, execution, or a supported device boundary and optionally freeze on hit. See argument schemas for kind, range, PC/value filters, and atomic snapshots."
     )]
     async fn set_breakpoint(&self, Parameters(a): Parameters<BreakpointArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -551,7 +551,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "address부터 count개 명령을 디코드한다(연결된 코어의 ISA) — BP 히트 PC 주변 명령 확인용."
+        description = "Decode count instructions from address using the connected core's ISA. Use it to inspect instructions around a breakpoint hit PC."
     )]
     async fn disassemble(&self, Parameters(a): Parameters<DisassembleArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -569,7 +569,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "register가 [min,max]를 벗어나는 명령에서 freeze한다(SP 폭주 등 derail 포착). 매 명령 검사라 hunting 전용 — 끝나면 clear."
+        description = "Watch a register and freeze on the instruction that moves it outside [min,max], for example a runaway stack pointer. This checks every instruction; use it for bounded hunting and clear it afterward."
     )]
     async fn watch_register(&self, Parameters(a): Parameters<WatchRegisterArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -586,7 +586,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "브레이크포인트를 해제한다")]
+    #[tool(description = "Remove one breakpoint by ID.")]
     async fn clear_breakpoint(&self, Parameters(a): Parameters<ClearBpArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::clear_breakpoint(&mut *l, a.id) {
@@ -595,7 +595,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "활성 브레이크포인트 목록을 반환한다(id·kind·범위).")]
+    #[tool(description = "List active breakpoints with their IDs, kinds, and ranges.")]
     async fn list_breakpoints(&self) -> CallToolResult {
         let mut l = self.link();
         match tools::list_breakpoints(&mut *l) {
@@ -604,7 +604,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "모든 브레이크포인트를 해제한다(정리용)")]
+    #[tool(description = "Remove all breakpoints during cleanup.")]
     async fn clear_all_breakpoints(&self) -> CallToolResult {
         let mut l = self.link();
         match tools::clear_all_breakpoints(&mut *l) {
@@ -613,7 +613,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "쌓인 이벤트(브레이크포인트 히트 등)를 드레인한다")]
+    #[tool(description = "Drain queued events such as breakpoint hits.")]
     async fn poll_events(&self, Parameters(a): Parameters<PollEventsArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::poll_events(&mut *l) {
@@ -630,7 +630,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "실행추적을 켜고/끈다 — 콜스택·트레이스 링버퍼 유지(크래시 추적용). 매 명령이라 hunting 전용, 끝나면 끈다."
+        description = "Enable or disable execution tracing and its call-stack and trace ring buffers. This observes every instruction; use it for bounded crash hunting and disable it afterward."
     )]
     async fn set_trace(&self, Parameters(a): Parameters<SetTraceArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -641,7 +641,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "최근 N개 실행 명령을 시간순으로 반환한다(`[{pc, op, bank?}]`; set_trace(true) 선행). `bank`은 pc가 페이징된 ROM 뱅크(Mesen GG/GB만). 없거나 null이면 뱅크 미확정(MBC1 mode-1 저역·비표준 매퍼 등). 카트가 태깅하는지는 `status.bank_tagging`."
+        description = "Return the N most recent executed instructions in chronological order as [{pc,op,bank?}]. Call set_trace(true) first. bank identifies a paged ROM bank when supported; missing or null means unresolved. Check status.bank_tagging."
     )]
     async fn get_trace(&self, Parameters(a): Parameters<GetTraceArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -659,7 +659,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "현재 콜스택(호출지 프레임 체인 `[{pc, bank}]`, 바깥→안)을 반환한다 — \"어떻게 여기 왔나\" 즉답(set_trace(true) 선행). `bank`은 pc가 페이징된 ROM 뱅크(Mesen GG/GB만). `bank`이 없거나 null이면 그 주소의 뱅크 미확정(SNES는 24비트 pc 안, 또는 MBC1 mode-1 저역·비표준 매퍼라 추정불가). 카트가 뱅크를 태깅하는지는 `status.bank_tagging`. `.pc`가 유일 보장 필드."
+        description = "Return the current outer-to-inner call-site chain as [{pc,bank?}]. Call set_trace(true) first. Only pc is guaranteed; bank is present when the backend can identify a paged ROM bank. Check status.bank_tagging."
     )]
     async fn call_stack(&self) -> CallToolResult {
         let mut l = self.link();
@@ -670,7 +670,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "게임이 리셋 핸들러를 실행하면 freeze한다 — 워치독 리셋·하드 크래시→리셋 자동 감지."
+        description = "Freeze when the game executes its reset handler, allowing automatic detection of watchdog resets or crash-to-reset paths."
     )]
     async fn break_on_reset(&self, Parameters(a): Parameters<BreakOnResetArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -681,7 +681,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "표준 메모리 리전을 .bin+regions.json+state.json으로 덤프한다(emucap diff 입력). 유효 리전은 status.memory_types."
+        description = "Dump standard memory regions as .bin files plus regions.json and state.json for emucap diff. Read valid regions from status.memory_types."
     )]
     async fn dump_memory(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -692,7 +692,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "회귀 스위트를 일괄 재생해 케이스별 PASS/FAIL·무효 버킷을 요약해 반환한다. 실험 기록에는 자동 저장하지 않으므로 결과를 남기려면 추적 MCP의 log_gate/log_metric을 사용한다."
+        description = "Replay a regression suite and summarize each case as pass, fail, or invalid. Results are not stored automatically; use Tracking MCP log_gate or log_metric to preserve them."
     )]
     async fn regression_run(&self, Parameters(a): Parameters<RegressionRunArgs>) -> CallToolResult {
         let suite = std::path::PathBuf::from(&a.suite_dir);
@@ -728,7 +728,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "케이스 재현 레시피를 N회 재생해 관측 해시 일치로 실행 절차의 재현성을 잰다(게임/엔진 결정론 아님). 실험 기록에는 자동 저장하지 않으므로 결과는 log_gate로 남긴다. observe와 한계는 인자 설명 및 usage 문서를 따른다."
+        description = "Replay a case recipe N times and compare observation hashes to measure reproducibility of this execution procedure, not determinism of the game or engine. Results are not stored automatically; preserve them with Tracking MCP log_gate."
     )]
     async fn verify_determinism(
         &self,
@@ -740,7 +740,7 @@ impl Emucap {
     fn verify_determinism_impl(&self, a: VerifyDeterminismArgs) -> CallToolResult {
         let replays = a.replays.unwrap_or(2);
         if !(2..=5).contains(&replays) {
-            return track_err("replays는 2~5");
+            return track_err("replays must be between 2 and 5");
         }
         let observe = match parse_observe_spec(
             a.observe.as_deref(),
@@ -778,7 +778,7 @@ impl Emucap {
             "replays": result.replays,
             "hashes": result.hashes,
             "case_id": case.id,
-            "note": "측정 범위: 이 harness 경로의 재현성(게임/엔진 결정론 아님; 시작-gap·동일 프로세스 엔트로피 한계). 결과 기록은 추적 MCP의 log_gate(name=determinism_replay, kind=machine, passed)로.",
+            "note": "Scope: reproducibility of this harness path, not game or engine determinism. Startup gaps and same-process entropy remain limitations. Record the result with Tracking MCP log_gate(name=determinism_replay, kind=machine, passed).",
         });
         CallToolResult::success(vec![Content::text(body.to_string())])
     }

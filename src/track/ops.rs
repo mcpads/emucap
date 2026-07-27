@@ -12,7 +12,7 @@ use crate::track::store::{self, TrackError};
 pub enum OpsError {
     #[error(transparent)]
     Track(#[from] TrackError),
-    #[error("run을 찾을 수 없음: {rom_sha1}/{run_id}")]
+    #[error("run not found: {rom_sha1}/{run_id}")]
     RunNotFound { rom_sha1: String, run_id: String },
 }
 
@@ -37,7 +37,7 @@ pub fn create_run(
     };
     if rom_sha1.is_empty() || !is_single_normal {
         return Err(OpsError::Track(TrackError::Invalid(format!(
-            "rom_sha1이 안전한 단일 경로 컴포넌트(sha1)가 아니다: {rom_sha1:?} — 실제 sha1을 넘겨라(예: shasum -a1 <content>)"
+            "rom_sha1 is not a safe single path component: {rom_sha1:?}. Pass an actual SHA-1, for example from `shasum -a1 <content>`."
         ))));
     }
     // rom.json이 없으면 생성(있으면 first_seen 보존). '없음'(NotFound)만 생성 트리거로 좁힌다 —

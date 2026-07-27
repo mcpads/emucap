@@ -1,6 +1,8 @@
 use super::media::{content_markers, ext_lower};
 use super::*;
 
+pub(super) use super::system::{adapter_for_system, normalize_system};
+
 pub(super) fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
     let dir = match adapter {
         "mesen2" => "adapters/mesen2",
@@ -8,6 +10,7 @@ pub(super) fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
         "mame_pc98" => "adapters/mame-pc98",
         "mame_neogeo" => "adapters/mame-neogeo",
         "mupen64plus" => "adapters/mupen64plus",
+        "openmsx" => "adapters/openmsx",
         "flycast" => "adapters/flycast",
         "desmume_nds" => "adapters/desmume-nds",
         "ppsspp" => "adapters/ppsspp",
@@ -306,6 +309,23 @@ pub(super) fn mame_binary_precondition(root: &Path) -> serde_json::Value {
     mame_binary_precondition_from(root, mame_launch::resolve_binary(root))
 }
 
+pub(super) fn mame_neogeo_binary_precondition(root: &Path) -> serde_json::Value {
+    let repo_work = root.join("adapters/mame-neogeo/work");
+    simple_binary_precondition(mame_neogeo_launch::resolve_binary(root), |path| {
+        if env_path_matches("EMUCAP_NEOGEO_MAME_BIN", path) {
+            "EMUCAP_NEOGEO_MAME_BIN"
+        } else if env_path_matches("MAME_BIN", path) {
+            "MAME_BIN"
+        } else if path.starts_with(&repo_work) {
+            "repo_build"
+        } else if path_matches_candidates(path, mame_launch::default_install_candidates()) {
+            "default_install"
+        } else {
+            "PATH"
+        }
+    })
+}
+
 /// DeSmuME/NDS needs two binaries — headless desmume-cli and the emucap NDS GDB bridge. Both must
 /// resolve for the launcher to run, so the precondition is available only when both are present and
 /// reports which one is missing otherwise.
@@ -470,6 +490,25 @@ pub(super) fn mupen64plus_precondition(root: &Path, display: bool) -> serde_json
     })
 }
 
+pub(super) fn openmsx_precondition(root: &Path) -> serde_json::Value {
+    let binary = openmsx_launch::resolve_binary(root);
+    let bridge = openmsx_launch::resolve_bridge(root);
+    let build = binary
+        .as_deref()
+        .map(|path| openmsx_launch::require_compatible_build(root, path));
+    serde_json::json!({
+        "available": binary.is_some()
+            && bridge.is_some()
+            && build.as_ref().is_some_and(Result::is_ok),
+        "path": binary.as_ref().map(|path| path.display().to_string()),
+        "bridge": bridge.as_ref().map(|path| path.display().to_string()),
+        "bridge_available": bridge.is_some(),
+        "host_build": build.as_ref().and_then(|result| result.as_ref().ok()),
+        "error": build.and_then(Result::err).map(|error| error.to_string()),
+        "source": "EMUCAP_OPENMSX_BIN / pinned repo build; EMUCAP_OPENMSX_BRIDGE_BIN / installed emucap-openmsx-bridge",
+    })
+}
+
 pub(super) fn adapter_binary_precondition_for(
     adapter: &str,
     root: &Path,
@@ -481,8 +520,9 @@ pub(super) fn adapter_binary_precondition_for(
         "flycast" => flycast_binary_precondition(),
         "dolphin" => dolphin_binary_precondition(root, display),
         "mame_pc98" => mame_binary_precondition(root),
-        "mame_neogeo" => mame_binary_precondition(root),
+        "mame_neogeo" => mame_neogeo_binary_precondition(root),
         "mupen64plus" => mupen64plus_precondition(root, display),
+        "openmsx" => openmsx_precondition(root),
         "desmume_nds" => desmume_nds_binary_precondition(root),
         "ppsspp" => ppsspp_binary_precondition(root),
         "pcsx2" => pcsx2_binary_precondition(root),
@@ -504,61 +544,67 @@ pub(super) fn build_required_precondition(
     }
     match adapter {
         "mesen2" => serde_json::json!(format!(
-            "{}로 pinned compatible Mesen을 먼저 빌드해야 함(MESEN_BIN override도 matching sidecar + runtime codeBreakIdle 필요)",
+            "Build the pinned compatible Mesen first with {}. A MESEN_BIN override also requires a matching sidecar and runtime codeBreakIdle support.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/mesen2/build.sh")
         )),
         "mednafen" => serde_json::json!(format!(
-            "{} 선행 빌드 또는 MEDNAFEN_BIN/default install/PATH의 Mednafen 바이너리 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            "Build Mednafen first with {}, or provide a binary through MEDNAFEN_BIN, the default install location, or PATH. Otherwise launch fails with binary-not-found.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
         )),
         "flycast" => serde_json::json!(format!(
-            "{} 선행 빌드 또는 FLYCAST_APP/default install/PATH의 Flycast 바이너리 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            "Build Flycast first with {}, or provide a binary through FLYCAST_APP, the default install location, or PATH. Otherwise launch fails with binary-not-found.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
         )),
         "mame_pc98" => serde_json::json!(format!(
-            "{} 선행 빌드 또는 MAME_BIN/default install/PATH의 MAME 바이너리 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            "Build MAME first with {}, or provide a binary through MAME_BIN, the default install location, or PATH. Otherwise launch fails with binary-not-found.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
         )),
         "mame_neogeo" => serde_json::json!(format!(
-            "{}로 pinned MAME을 빌드하고 emucap-mame-neogeo-bridge를 빌드해야 함",
+            "Build the pinned MAME with {} and build emucap-mame-neogeo-bridge.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/mame-neogeo/build.sh")
         )),
         "mupen64plus" => serde_json::json!(format!(
-            "{}로 pinned debugger-enabled Mupen64Plus bundle과 emucap-mupen64plus를 빌드해야 함",
+            "Build the pinned debugger-enabled Mupen64Plus bundle with {} and build emucap-mupen64plus.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/mupen64plus/build.sh")
         )),
+        "openmsx" => serde_json::json!(format!(
+            "Build pinned stock openMSX with {} and build emucap-openmsx-bridge with cargo build --release.",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/openmsx/build.sh")
+        )),
         "desmume_nds" => serde_json::json!(format!(
-            "{} 선행 빌드(desmume-cli) + emucap-desmume-nds-bridge(cargo build --release) 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            "Build desmume-cli with {} and build emucap-desmume-nds-bridge with cargo build --release. Otherwise launch fails with binary-not-found.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
         )),
         "ppsspp" => serde_json::json!(format!(
-            "{} 선행 빌드(PPSSPPHeadless) + emucap-ppsspp-bridge(cargo build --release) 필요 — 미충족이면 launcher가 binary-not-found로 실패",
+            "Build PPSSPPHeadless with {} and build emucap-ppsspp-bridge with cargo build --release. Otherwise launch fails with binary-not-found.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapter build.sh")
         )),
         "pcsx2" => serde_json::json!(format!(
-            "{}로 pinned compatible PCSX2 fork를 빌드하고 emucap-pcsx2-bridge를 빌드한 뒤 EMUCAP_PCSX2_BIOS를 설정해야 함",
+            "Build the pinned compatible PCSX2 fork with {}, build emucap-pcsx2-bridge, and set EMUCAP_PCSX2_BIOS.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/pcsx2/build.sh")
         )),
         "dolphin" => serde_json::json!(format!(
-            "{}로 pinned compatible Dolphin native fork를 먼저 빌드해야 함(override도 matching sidecar 필요)",
+            "Build the pinned compatible Dolphin native fork first with {}. An override also requires a matching sidecar.",
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/dolphin/build.sh")
@@ -611,7 +657,7 @@ pub(super) fn missing_adapter_binary_response(
         },
         "runtime_paths": paths,
         "repo_root": root.display().to_string(),
-        "next_action": "adapter binary precondition을 충족한 뒤 launch_plan(content_path, system)을 다시 호출하라",
+        "next_action": "Satisfy the adapter binary precondition, then call launch_plan(content_path, system) again.",
     })
 }
 
@@ -636,38 +682,8 @@ pub(super) fn missing_mame_bridge_response(
         },
         "runtime_paths": paths,
         "repo_root": root.display().to_string(),
-        "next_action": "PC-98 bridge precondition을 충족한 뒤 launch_plan(content_path, system)을 다시 호출하라",
+        "next_action": "Satisfy the PC-98 bridge precondition, then call launch_plan(content_path, system) again.",
     })
-}
-
-pub(super) fn normalize_system(system: &str) -> Option<&'static str> {
-    match system.trim().to_ascii_lowercase().as_str() {
-        "snes" | "super-famicom" | "super-nintendo" | "mesen" | "mesen2" => Some("snes"),
-        "gamegear" | "gg" | "game-gear" | "sms" | "mastersystem" | "master-system"
-        | "sega-mastersystem" => Some("gamegear"),
-        "gb" | "gameboy" | "game-boy" | "dmg" => Some("gb"),
-        "gbc" | "gbcolor" | "gameboycolor" | "game-boy-color" | "cgb" => Some("gbc"),
-        "gba" | "gameboyadvance" | "game-boy-advance" | "agb" => Some("gba"),
-        "nes" | "nintendo" | "famicom" | "fc" => Some("nes"),
-        "saturn" | "ss" | "sega-saturn" => Some("saturn"),
-        "psx" | "ps1" | "playstation" | "playstation1" => Some("psx"),
-        "pce" | "pcengine" | "pc-engine" | "pce-cd" | "pc-engine-cd" => Some("pce"),
-        "md" | "genesis" | "megadrive" | "mega-drive" | "sega-genesis" | "sega-megadrive" => {
-            Some("md")
-        }
-        "wswan" | "ws" | "wsc" | "wonderswan" | "wonderswan-color" | "wonderswancolor"
-        | "wonderswan_color" => Some("wswan"),
-        "pc98" | "pc-98" | "mame-pc98" | "pc9801" | "pc9821" => Some("pc98"),
-        "neogeo_mvs" | "neo-geo-mvs" | "neogeo-mvs" | "mvs" => Some("neogeo_mvs"),
-        "n64" | "nintendo64" | "nintendo-64" => Some("n64"),
-        "dc" | "dreamcast" | "flycast" | "sega-dreamcast" => Some("dc"),
-        "nds" | "ds" | "nintendo-ds" | "nintendods" | "desmume" => Some("nds"),
-        "psp" | "ppsspp" | "playstation-portable" => Some("psp"),
-        "ps2" | "pcsx2" | "playstation2" | "playstation-2" => Some("ps2"),
-        "gamecube" | "game-cube" | "gc" | "ngc" | "dolphin-gc" => Some("gamecube"),
-        "wii" | "nintendo-wii" | "dolphin-wii" => Some("wii"),
-        _ => None,
-    }
 }
 
 pub(super) fn infer_system(
@@ -688,7 +704,7 @@ pub(super) fn infer_system(
             "confidence": "none",
             "reason": format!("unsupported system={system:?}"),
             "needs_user_input": true,
-            "required_user_input": "지원 시스템 중 하나를 지정하라. Neo Geo MVS는 neogeo_mvs를 사용하고 generic neogeo는 사용하지 않는다."
+            "required_user_input": "Specify one supported system ID. Use neogeo_mvs for Neo Geo MVS, neogeo_aes for Neo Geo AES, or neogeo_cd for Neo Geo CD; generic neogeo is not accepted."
         });
     }
 
@@ -696,9 +712,9 @@ pub(super) fn infer_system(
         return serde_json::json!({
             "system": null,
             "confidence": "none",
-            "reason": "content_path가 없어 media 기반 추론을 할 수 없다",
+            "reason": "content_path is absent, so the system cannot be inferred from media",
             "needs_user_input": true,
-            "required_user_input": "실행할 ROM/disc/disk 경로와 supported_systems의 system id를 알려줘야 한다"
+            "required_user_input": "Provide the ROM, disc, or disk path and one system ID from supported_systems."
         });
     };
 
@@ -833,6 +849,13 @@ pub(super) fn infer_system(
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("mx1" | "mx2") => serde_json::json!({
+            "system": "msx",
+            "confidence": "extension",
+            "reason": "MSX cartridge ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("hdi" | "hdm" | "d88") => serde_json::json!({
             "system": "pc98",
             "confidence": "extension",
@@ -858,6 +881,13 @@ pub(super) fn infer_system(
             "system": "wswan",
             "confidence": "extension",
             "reason": "WonderSwan / WonderSwan Color ROM extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
+        Some("ngp" | "ngpc" | "ngc" | "npc") => serde_json::json!({
+            "system": "ngp",
+            "confidence": "extension",
+            "reason": "Neo Geo Pocket / Neo Geo Pocket Color ROM extension",
             "needs_user_input": false,
             "markers": markers,
         }),
@@ -902,8 +932,8 @@ pub(super) fn infer_system(
                 "confidence": "ambiguous_media",
                 "reason": "disc/binary image extension can map to multiple systems; do not guess without header evidence",
                 "needs_user_input": true,
-                "required_user_input": "이 image의 시스템을 명시적으로 지정하라",
-                "candidates": ["saturn", "psx", "ps2", "pce", "md", "psp", "dc", "gamecube", "wii"],
+                "required_user_input": "Specify the system for this image explicitly.",
+                "candidates": ["saturn", "psx", "ps2", "pce", "pcfx", "md", "psp", "dc", "gamecube", "wii"],
                 "markers": markers,
             })
         }
@@ -912,34 +942,9 @@ pub(super) fn infer_system(
             "confidence": "unknown_extension",
             "reason": format!("unsupported or unknown extension: {other:?}"),
             "needs_user_input": true,
-            "required_user_input": "content_path의 실제 시스템을 supported_systems의 system id 중 하나로 지정하라",
+            "required_user_input": "Specify the actual system for content_path using one system ID from supported_systems.",
             "markers": markers,
         }),
-    }
-}
-
-pub(super) fn adapter_for_system(system: &str) -> (&'static str, Option<&'static str>) {
-    match system {
-        "snes" => ("mesen2", None),
-        "gamegear" => ("mesen2", None),
-        "gb" => ("mesen2", None),
-        "gbc" => ("mesen2", None),
-        "gba" => ("mesen2", None),
-        "nes" => ("mesen2", None),
-        "saturn" => ("mednafen", Some("ss")),
-        "psx" => ("mednafen", Some("psx")),
-        "pce" => ("mednafen", Some("pce")),
-        "md" => ("mednafen", Some("md")),
-        "wswan" => ("mednafen", Some("wswan")),
-        "pc98" => ("mame_pc98", None),
-        "neogeo_mvs" => ("mame_neogeo", None),
-        "n64" => ("mupen64plus", None),
-        "dc" => ("flycast", None),
-        "nds" => ("desmume_nds", None),
-        "psp" => ("ppsspp", None),
-        "ps2" => ("pcsx2", None),
-        "gamecube" | "wii" => ("dolphin", None),
-        _ => ("", None),
     }
 }
 
@@ -958,7 +963,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "listening_port": port,
             "runtime_paths": paths,
             "supported_systems": supported_systems_value(),
-            "next_action": "사용자에게 required_user_input을 물은 뒤 launch_plan(content_path, system)을 다시 호출하라"
+            "next_action": "Ask the user for required_user_input, then call launch_plan(content_path, system) again."
         });
     };
     let Some(content_path) = args.content_path.as_deref() else {
@@ -969,7 +974,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "listening_port": port,
             "runtime_paths": paths,
             "supported_systems": supported_systems_value(),
-            "next_action": "실행할 content_path를 사용자에게 물은 뒤 launch_plan(content_path, system)을 다시 호출하라"
+            "next_action": "Ask the user for content_path, then call launch_plan(content_path, system) again."
         });
     };
     let Some(root) = find_repo_root() else {
@@ -1080,20 +1085,23 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     push_unavailable_precondition(&mut launch_blockers, bridge_label, &bridge);
     let ready_to_launch = launch_blockers.is_empty();
     let next_action = if ready_to_launch {
-        "preconditions(빌드·BIOS)를 먼저 확인하라 — ready_to_launch는 로컬 content와 adapter binary 확인까지 포함한다. 충족되면 preferred_launcher.args로 launch 도구를 호출한 뒤 status로 connected=true와 system을 확인하라(미연결이면 BIOS/romset/빌드 로그를 먼저 의심)"
+        "Check build and BIOS preconditions first. ready_to_launch includes local content and adapter-binary checks. When ready, call launch with preferred_launcher.args, then verify connected=true and system with status. If connection fails, inspect BIOS, ROM-set, and build logs first."
             .to_string()
     } else {
         format!(
-            "launch_blockers를 해결한 뒤 launch_plan(content_path, system)을 다시 호출하라: {}",
+            "Resolve launch_blockers, then call launch_plan(content_path, system) again: {}",
             launch_blockers.join("; ")
         )
     };
     let bios_required = match system {
-        "saturn" => serde_json::json!("~/.mednafen/firmware/ 에 Saturn BIOS(sega_101.bin JP / mpr-17933.bin US) — 없으면 부팅 실패"),
-        "psx" => serde_json::json!("~/.mednafen/firmware/ 에 PSX BIOS(scph5500.bin JP·scph5501.bin US·scph5502.bin EU)"),
-        "pce" => serde_json::json!("CD-ROM이면 ~/.mednafen/firmware/syscard3.pce (HuCard ROM은 불요)"),
-        "pc98" => serde_json::json!("MAME pc9801rs 머신 romset 필요 — 미제공 시 launch가 조용히 실패할 수 있다(build.sh가 배치)"),
-        "neogeo_mvs" => serde_json::json!("MAME neogeo.zip BIOS와 게임별 MVS .zip ROM set 필요. EMUCAP_NEOGEO_BIOS 또는 게임 set과 같은 디렉터리의 neogeo.zip을 사용한다."),
+        "saturn" => serde_json::json!("Saturn BIOS under ~/.mednafen/firmware/: sega_101.bin for JP or mpr-17933.bin for US. Boot fails when the required BIOS is absent."),
+        "psx" => serde_json::json!("PSX BIOS under ~/.mednafen/firmware/: scph5500.bin for JP, scph5501.bin for US, or scph5502.bin for EU."),
+        "pce" => serde_json::json!("CD-ROM content requires ~/.mednafen/firmware/syscard3.pce. HuCard ROMs do not."),
+        "pcfx" => serde_json::json!("Requires the PC-FX BIOS version 1.00. Set EMUCAP_PCFX_BIOS to an absolute pcfx.rom path or place it under the emucap-owned firmware directory."),
+        "pc98" => serde_json::json!("Requires the MAME pc9801rs machine ROM set. The build script installs it; launch may otherwise fail before connection."),
+        "neogeo_mvs" => serde_json::json!("Requires MAME neogeo.zip BIOS and a game-specific MVS .zip ROM set. Set EMUCAP_NEOGEO_BIOS or place neogeo.zip beside the game set."),
+        "neogeo_aes" => serde_json::json!("Requires MAME aes.zip and an AES-compatible cartridge .zip whose stem matches the pinned Neo Geo software list. Set EMUCAP_NEOGEO_AES_BIOS or place aes.zip beside the cartridge set."),
+        "neogeo_cd" => serde_json::json!("Requires MAME neocdz.zip and a CUE whose referenced files all exist. Set EMUCAP_NEOGEO_CD_BIOS or place neocdz.zip beside the CUE."),
         "n64" => serde_json::Value::Null,
         _ => serde_json::Value::Null, // snes·md·dc는 BIOS 불요(DC는 Flycast HLE 부팅)
     };
@@ -1144,7 +1152,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "headless_contract": if adapter == "mame_pc98" {
             "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It disables pc9801rs cbus:0 unless MAME_CBUS0 is explicitly set; do not run work/mame.raw or system mame directly."
         } else if adapter == "mame_neogeo" {
-            "Neo Geo MVS launch is headless by default and uses an emucap-owned MAME home. launch(display:true) opens a window without reading or changing the user's MAME configuration."
+            "Neo Geo MVS, AES, and CD launch headless by default and use profile-specific emucap-owned MAME homes. launch(display:true) opens a window without reading or changing the user's MAME configuration."
         } else if adapter == "mupen64plus" {
             "Nintendo 64 launch is headless by default and uses an emucap-owned Mupen64Plus configuration. launch(display:true) explicitly loads the pinned Rice video plugin."
         } else if adapter == "mednafen" {

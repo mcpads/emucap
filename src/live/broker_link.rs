@@ -202,7 +202,7 @@ impl BrokerLink {
                         mismatches += 1;
                         if mismatches > MAX_ID_MISMATCH {
                             return Err(LinkError::Protocol(format!(
-                                "broker id 불일치 {MAX_ID_MISMATCH}회 초과 — 스트림 desync"
+                                "more than {MAX_ID_MISMATCH} broker frames had a mismatched id; stream desynchronized"
                             )));
                         }
                         continue;
@@ -210,7 +210,9 @@ impl BrokerLink {
                     if !resp.ok {
                         return match resp.error {
                             Some(e) => Err(map_broker_error(line.trim(), &e.kind, e.message)),
-                            None => Err(LinkError::Protocol("ok=false인데 error 없음".into())),
+                            None => Err(LinkError::Protocol(
+                                "broker response returned ok=false without an error".into(),
+                            )),
                         };
                     }
                     let result = resp.result.unwrap_or(Value::Null);

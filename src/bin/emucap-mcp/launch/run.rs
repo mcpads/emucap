@@ -39,7 +39,7 @@ pub(crate) fn make_launch(
         .and_then(|v| v.as_u64())
         .and_then(|p| u16::try_from(p).ok())
     else {
-        return serde_json::json!({ "launched": false, "reason": "listening_port 미확정 — status를 먼저 호출하라" });
+        return serde_json::json!({ "launched": false, "reason": "listening_port is unknown; call status first" });
     };
     let token = link.session_token().map(str::to_string);
     let store = RuntimeStore::discover();
@@ -78,7 +78,7 @@ pub(crate) fn make_launch(
             "reason": "an emulator is already connected on this session's listening_port; not launching another (it would orphan the current one)",
             "connected_emulator": status.get("emulator_identity").cloned().unwrap_or(serde_json::Value::Null),
             "status": status,
-            "next_action": "교체하려면 기존 에뮬을 정리한 뒤 다시 launch하라(save_state 후 connected_emulator를 참조해 그 PID만 종료; 광역 kill 금지). 연결이 이미 죽었으면 status가 connected=false가 된 뒤 재시도하면 새 연결로 자동 채택된다.",
+            "next_action": "To replace it, preserve state if needed and terminate only the PID identified by connected_emulator, then launch again. Do not use a broad kill. If the connection is already dead, wait for status.connected=false and retry so the new connection can be adopted.",
         });
     }
 
@@ -87,7 +87,7 @@ pub(crate) fn make_launch(
             "launched": false,
             "reason": "content_path does not exist",
             "content_path": &a.content_path,
-            "next_action": "content_path를 확인한 뒤 launch_plan(content_path, system)을 다시 호출하라",
+            "next_action": "Verify content_path, then call launch_plan(content_path, system) again.",
         });
     }
 
@@ -95,7 +95,7 @@ pub(crate) fn make_launch(
     let Some(system) = inference.get("system").and_then(|v| v.as_str()) else {
         return serde_json::json!({
             "launched": false,
-            "reason": "시스템이 애매하다(CUE/CHD/BIN 등) — system을 지정해 다시 호출하라",
+            "reason": "The system is ambiguous for this media; specify system and call again.",
             "inference": inference,
         });
     };
@@ -143,7 +143,7 @@ pub(crate) fn make_launch(
                     "launched": false,
                     "reason": "current launch generation is still alive and may already be connected; reattach instead of launching a duplicate",
                     "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "status/bootstrap으로 같은 launch_id에 재부착하라. 의도적 교체만 replace=true로 다시 호출한다.",
+                    "next_action": "Reattach to the same launch_id through status or bootstrap. Use replace=true only for an intentional replacement.",
                 })
             }
             (ProcessState::Alive, Some(ProcessState::Unknown)) => {
@@ -151,7 +151,7 @@ pub(crate) fn make_launch(
                     "launched": false,
                     "reason": "current bridge process identity is unknown; refusing unsafe replacement",
                     "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "브리지 process identity를 확인하고 그 세대만 정리한 뒤 다시 launch하라.",
+                    "next_action": "Verify bridge process identity, clean up only that generation, then launch again.",
                 })
             }
             (ProcessState::Unknown, _) => {
@@ -159,7 +159,7 @@ pub(crate) fn make_launch(
                     "launched": false,
                     "reason": "current process liveness is unknown; refusing duplicate launch or unsafe replacement",
                     "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "프로세스 identity를 확인하고 명시적으로 정리한 뒤 다시 launch하라.",
+                    "next_action": "Verify process identity, clean it up explicitly, then launch again.",
                 })
             }
             (ProcessState::Exited, Some(ProcessState::Unknown)) => {
@@ -167,7 +167,7 @@ pub(crate) fn make_launch(
                     "launched": false,
                     "reason": "the emulator exited but bridge ownership is unknown; refusing unsafe cleanup",
                     "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "브리지 process identity를 확인하고 그 세대만 정리한 뒤 다시 launch하라.",
+                    "next_action": "Verify bridge process identity, clean up only that generation, then launch again.",
                 })
             }
             _ => {}
@@ -195,7 +195,7 @@ pub(crate) fn make_launch(
                     "launched": false,
                     "reason": "current launch generation is still alive and may already be connected; reattach instead of launching a duplicate",
                     "runtime_instance": current.public_value(),
-                    "next_action": "status/bootstrap으로 같은 launch_id에 재부착하라. 의도적 교체만 replace=true로 다시 호출한다.",
+                    "next_action": "Reattach to the same launch_id through status or bootstrap. Use replace=true only for an intentional replacement.",
                 })
             }
             ProcessState::Alive => {
@@ -205,7 +205,7 @@ pub(crate) fn make_launch(
                         "reason": "current generation is controlled by another or unverifiable lease; refusing replacement",
                         "lease": lease,
                         "runtime_instance": current.public_value_with_lease(&lease),
-                        "next_action": "현재 제어 임대가 반환되거나 같은 제어 세션임을 확인한 뒤 replace를 다시 요청하라.",
+                        "next_action": "Wait for the current control lease to be released, or verify that this is the same control session, before requesting replacement again.",
                     });
                 }
                 if let Err(e) = current.terminate_owned_processes() {
@@ -222,7 +222,7 @@ pub(crate) fn make_launch(
                     "launched": false,
                     "reason": "current process liveness is unknown; refusing duplicate launch or unsafe replacement",
                     "runtime_instance": current.public_value(),
-                    "next_action": "프로세스 identity를 확인하고 명시적으로 정리한 뒤 다시 launch하라.",
+                    "next_action": "Verify process identity, clean it up explicitly, then launch again.",
                 })
             }
             ProcessState::Exited => {
@@ -232,7 +232,7 @@ pub(crate) fn make_launch(
                         "reason": "the exited generation is controlled by another or unverifiable lease; refusing cleanup or replacement",
                         "lease": lease,
                         "runtime_instance": current.public_value_with_lease(&lease),
-                        "next_action": "제어 임대가 반환된 뒤 exact generation만 정리하거나 새 launch를 요청하라.",
+                        "next_action": "After the control lease is released, clean up only the exact generation or request a new launch.",
                     });
                 }
                 match current.bridge_process_state() {
@@ -251,7 +251,7 @@ pub(crate) fn make_launch(
                             "launched": false,
                             "reason": "the emulator exited but bridge ownership is unknown; refusing unsafe cleanup",
                             "runtime_instance": current.public_value_with_lease(&lease),
-                            "next_action": "브리지 process identity를 확인하고 그 세대만 정리한 뒤 다시 launch하라.",
+                            "next_action": "Verify bridge process identity, clean up only that generation, then launch again.",
                         })
                     }
                     Some(ProcessState::Exited) | None => {}
@@ -262,7 +262,7 @@ pub(crate) fn make_launch(
         return serde_json::json!({
             "launched": false,
             "reason": "connected legacy emulator has no runtime capsule; safe replacement ownership cannot be proven",
-            "next_action": "기존 에뮬레이터를 명시적으로 정리한 뒤 status가 connected=false인지 확인하고 다시 launch하라.",
+            "next_action": "Clean up the existing emulator explicitly, verify status.connected=false, then launch again.",
         });
     }
 
@@ -276,7 +276,7 @@ pub(crate) fn make_launch(
             })
         }
     };
-    let direct_reclaim = match link.replace_reclaim_token(prepared.reclaim_token()) {
+    let direct_reclaim = match link.stage_reclaim_token(prepared.reclaim_token()) {
         Ok(true) => Some(prepared.reclaim_token()),
         Ok(false) if token.is_none() => None,
         Ok(false) => {
@@ -306,15 +306,18 @@ pub(crate) fn make_launch(
         "mednafen" => launch_mednafen(port, direct_reclaim, runtime, module, a),
         "flycast" => launch_flycast(port, direct_reclaim, runtime, a),
         "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
-        "mame_neogeo" => launch_mame_neogeo(port, direct_reclaim, runtime, a),
+        "mame_neogeo" => {
+            super::mame_neogeo::launch_mame_neogeo(port, direct_reclaim, runtime, system, a)
+        }
         "mupen64plus" => launch_mupen64plus(port, direct_reclaim, runtime, a),
+        "openmsx" => super::openmsx::launch_openmsx(port, direct_reclaim, runtime, a),
         "desmume_nds" => launch_desmume_nds(port, direct_reclaim, runtime, a),
         "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
         "pcsx2" => launch_pcsx2(port, direct_reclaim, runtime, a),
         "dolphin" => launch_dolphin(port, direct_reclaim, runtime, system, a),
         _ => serde_json::json!({
             "launched": false,
-            "reason": format!("{system} 시스템은 Rust 런처 대상이 아니다"),
+            "reason": format!("system {system} is not supported by the Rust launcher"),
         }),
     };
     if !outcome
@@ -322,6 +325,7 @@ pub(crate) fn make_launch(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
+        record_token_cleanup_error(&mut outcome, abort_staged_reclaim(link, direct_reclaim));
         let _ = prepared.abort();
         return outcome;
     }
@@ -338,12 +342,15 @@ pub(crate) fn make_launch(
         if let Some(bridge_pid) = bridge_pid {
             let _ = emucap::launch::terminate_detached(bridge_pid);
         }
+        let token_cleanup_error = abort_staged_reclaim(link, direct_reclaim);
         let _ = prepared.abort();
-        return serde_json::json!({
+        let mut failure = serde_json::json!({
             "launched": false,
             "reason": "launcher returned success without an emulator PID",
             "launcher_outcome": outcome,
         });
+        record_token_cleanup_error(&mut failure, token_cleanup_error);
+        return failure;
     };
     let backend_endpoint = backend_endpoint_from_launch(&outcome);
     // 즉시 exec 실패·동적 로더 오류가 이전 current를 덮지 않게 짧은 process-readiness 창을 둔다.
@@ -366,14 +373,17 @@ pub(crate) fn make_launch(
             let _ = emucap::launch::terminate_detached(bridge_pid);
         }
         let _ = emucap::launch::terminate_detached(emulator_pid);
+        let token_cleanup_error = abort_staged_reclaim(link, direct_reclaim);
         let _ = prepared.abort();
-        return serde_json::json!({
+        let mut failure = serde_json::json!({
             "launched": false,
             "reason": "a launch process was not verifiably alive before the runtime generation became current",
             "emulator_process_state": emulator_state,
             "bridge_process_state": bridge_state,
             "launcher_outcome": outcome,
         });
+        record_token_cleanup_error(&mut failure, token_cleanup_error);
+        return failure;
     }
     let ready_status = match wait_for_adapter_ready(link, adapter_ready_timeout(adapter), || {
         let emulator_state = manifest.process_state();
@@ -391,23 +401,60 @@ pub(crate) fn make_launch(
         Ok(status) => status,
         Err(error) => {
             let _ = manifest.terminate_owned_processes();
+            let token_cleanup_error = abort_staged_reclaim(link, direct_reclaim);
             let _ = prepared.abort();
-            return serde_json::json!({
+            let mut failure = serde_json::json!({
                 "launched": false,
                 "reason": "adapter did not become ready",
                 "error": error,
                 "launcher_outcome": outcome,
             });
+            record_token_cleanup_error(&mut failure, token_cleanup_error);
+            return failure;
         }
     };
+    if let Some(reclaim_token) = direct_reclaim {
+        match link.commit_staged_reclaim_token(reclaim_token) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = manifest.terminate_owned_processes();
+                let token_cleanup_error = abort_staged_reclaim(link, direct_reclaim);
+                let _ = prepared.abort();
+                let mut failure = serde_json::json!({
+                    "launched": false,
+                    "reason": "direct link could not commit the ready launch token",
+                });
+                record_token_cleanup_error(&mut failure, token_cleanup_error);
+                return failure;
+            }
+            Err(error) => {
+                let _ = manifest.terminate_owned_processes();
+                let token_cleanup_error = abort_staged_reclaim(link, direct_reclaim);
+                let _ = prepared.abort();
+                let mut failure = serde_json::json!({
+                    "launched": false,
+                    "reason": "failed to commit the ready launch token",
+                    "error": error.to_string(),
+                });
+                record_token_cleanup_error(&mut failure, token_cleanup_error);
+                return failure;
+            }
+        }
+    }
     if let Err(e) = prepared.commit(&manifest) {
         let _ = manifest.terminate_owned_processes();
+        let token_cleanup_error = token
+            .as_deref()
+            .and_then(|old| link.replace_reclaim_token(old).err())
+            .map(|error| error.to_string());
         let _ = prepared.abort();
-        return serde_json::json!({
+        let mut failure = serde_json::json!({
             "launched": false,
             "reason": "failed to publish runtime current generation",
             "error": e.to_string(),
         });
+        record_token_cleanup_error(&mut failure, token_cleanup_error);
+        return failure;
     }
     if let Some(obj) = outcome.as_object_mut() {
         obj.insert("launch_id".into(), serde_json::json!(prepared.launch_id()));
@@ -423,17 +470,45 @@ pub(crate) fn make_launch(
         );
         obj.insert(
             "next_action".into(),
-            serde_json::json!("status로 methods, memory_types, state를 확인한 뒤 작업을 시작하라"),
+            serde_json::json!(
+                "Inspect methods, memory_types, and state with status before starting work."
+            ),
         );
     }
     outcome
 }
 
+fn abort_staged_reclaim(
+    link: &mut (dyn EmulatorLink + Send),
+    reclaim_token: Option<&str>,
+) -> Option<String> {
+    reclaim_token.and_then(|token| {
+        link.abort_staged_reclaim_token(token)
+            .err()
+            .map(|error| error.to_string())
+    })
+}
+
+fn record_token_cleanup_error(outcome: &mut serde_json::Value, error: Option<String>) {
+    let Some(error) = error else {
+        return;
+    };
+    if let Some(object) = outcome.as_object_mut() {
+        object.insert("token_cleanup_error".into(), serde_json::json!(error));
+        object.insert(
+            "next_safe_action".into(),
+            serde_json::json!(
+                "Inspect the listener token state before another launch; do not edit runtime files."
+            ),
+        );
+    }
+}
+
 pub(super) fn adapter_ready_timeout(adapter: &str) -> std::time::Duration {
     // Mesen starts an Avalonia window and then loads the command-line Lua script. On macOS a cold
     // display wake can make that path exceed the generic bridge budget even though the process is
-    // healthy. The fallback launcher already allows 20 seconds; the built-in path keeps a little
-    // more margin while continuing to poll liveness and failing with a bounded deadline.
+    // healthy. Both built-in and fallback paths use the same bounded 30-second budget; the
+    // built-in path additionally polls authenticated adapter readiness and process liveness.
     if adapter == "mesen2" {
         std::time::Duration::from_secs(30)
     } else {
@@ -504,10 +579,10 @@ pub(super) fn launch_mame(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let Some(binary) = emucap::launch::mame::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "MAME 바이너리 미발견 — adapters/mame-pc98/build.sh로 빌드하거나 MAME_BIN을 설정하라" });
+        return serde_json::json!({ "launched": false, "reason": "MAME binary was not found; build it with adapters/mame-pc98/build.sh or set MAME_BIN" });
     };
     let headless = pc98_headless(a);
     let log = adapter_log_path("mame-pc98", port, "mame-pc98.log");
@@ -538,68 +613,9 @@ pub(super) fn launch_mame(
             "binary": binary.display().to_string(),
             "log": log.display().to_string(),
             "note": "MAME + GDB bridge 2-process launch. If MAME spawn fails after bridge spawn, the Rust launcher terminates that bridge.",
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
-    }
-}
-
-/// Neo Geo MVS leg of `make_launch`: spawn isolated MAME and the dedicated 68000 bridge.
-pub(super) fn launch_mame_neogeo(
-    port: u16,
-    token: Option<&str>,
-    runtime: RuntimeEnv<'_>,
-    a: &LaunchArgs,
-) -> serde_json::Value {
-    let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root not found; set EMUCAP_REPO_ROOT" });
-    };
-    let content = Path::new(&a.content_path);
-    let Some(binary) = mame_neogeo_launch::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "MAME binary not found; run adapters/mame-neogeo/build.sh or set MAME_BIN" });
-    };
-    let Some(bridge) = mame_neogeo_launch::resolve_bridge(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "Neo Geo bridge binary not found; build emucap-mame-neogeo-bridge or set EMUCAP_NEOGEO_BRIDGE_BIN" });
-    };
-    let Some(bios) = mame_neogeo_launch::resolve_bios(content) else {
-        return serde_json::json!({
-            "launched": false,
-            "reason": "Neo Geo MVS BIOS neogeo.zip not found",
-            "next_action": "set EMUCAP_NEOGEO_BIOS to neogeo.zip or place it beside the game ROM set",
-        });
-    };
-    let log = adapter_log_path("mame-neogeo", port, "mame-neogeo.log");
-    let display = a.display.unwrap_or(false);
-    let launch = mame_neogeo_launch::Launch {
-        binary: &binary,
-        bridge: &bridge,
-        repo_root: &root,
-        content,
-        bios: &bios,
-        log_path: &log,
-        port,
-        name: a.name.as_deref(),
-        session_token: token,
-        runtime: Some(runtime),
-        display,
-    };
-    match mame_neogeo_launch::launch(&launch) {
-        Ok(launched) => serde_json::json!({
-            "launched": true,
-            "adapter": "mame_neogeo",
-            "pid": launched.mame_pid,
-            "mame_pid": launched.mame_pid,
-            "bridge_pid": launched.bridge_pid,
-            "display": display,
-            "driver": launched.driver,
-            "gdb_port": launched.gdb_port,
-            "port": port,
-            "binary": binary.display().to_string(),
-            "bios": bios.display().to_string(),
-            "log": log.display().to_string(),
-            "next_action": "adapter가 연결되면 launch가 반환한다",
-        }),
-        Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
 }
 
@@ -664,7 +680,7 @@ pub(super) fn launch_mupen64plus(
             "host_build": host_build,
             "log": log.display().to_string(),
             "isolation": "Mupen64Plus uses an emucap-owned per-port configuration and does not read or change the user's emulator settings.",
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
@@ -679,13 +695,13 @@ pub(super) fn launch_desmume_nds(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let Some(binary) = desmume_nds_launch::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "desmume-cli 바이너리 미발견 — adapters/desmume-nds/build.sh로 빌드하거나 EMUCAP_DESMUME_BIN을 설정하라" });
+        return serde_json::json!({ "launched": false, "reason": "desmume-cli binary was not found; build it with adapters/desmume-nds/build.sh or set EMUCAP_DESMUME_BIN" });
     };
     let Some(bridge) = desmume_nds_launch::resolve_bridge(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "NDS bridge 바이너리 미발견 — cargo build --release --bin emucap-desmume-nds-bridge 하거나 EMUCAP_NDS_BRIDGE_BIN을 설정하라" });
+        return serde_json::json!({ "launched": false, "reason": "NDS bridge binary was not found; build emucap-desmume-nds-bridge in release mode or set EMUCAP_NDS_BRIDGE_BIN" });
     };
     let log = adapter_log_path("desmume-nds", port, "desmume-nds.log");
     let display = a.display.unwrap_or(false);
@@ -715,7 +731,7 @@ pub(super) fn launch_desmume_nds(
             "bridge": bridge.display().to_string(),
             "log": log.display().to_string(),
             "note": "DeSmuME + NDS GDB bridge 2-process launch. If the bridge spawn fails after DeSmuME spawn, the Rust launcher terminates DeSmuME.",
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }
@@ -730,7 +746,7 @@ pub(super) fn launch_ppsspp(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let display = a.display.unwrap_or(false);
     // display=true (HITL) launches the PPSSPPSDL GUI build (a real window a human sees and plays);
@@ -738,17 +754,17 @@ pub(super) fn launch_ppsspp(
     // same debugger WebSocket, so the agent drives either identically.
     let binary = if display {
         let Some(gui) = ppsspp_launch::resolve_gui_binary(&root) else {
-            return serde_json::json!({ "launched": false, "reason": "PPSSPPSDL(GUI) 바이너리 미발견 — display=true는 adapters/ppsspp/build.sh(PPSSPPSDL 타깃)로 빌드하거나 EMUCAP_PPSSPP_GUI_BIN을 설정해야 한다" });
+            return serde_json::json!({ "launched": false, "reason": "PPSSPPSDL GUI binary was not found; for display=true, build the PPSSPPSDL target with adapters/ppsspp/build.sh or set EMUCAP_PPSSPP_GUI_BIN" });
         };
         gui
     } else {
         let Some(headless) = ppsspp_launch::resolve_binary(&root) else {
-            return serde_json::json!({ "launched": false, "reason": "PPSSPPHeadless 바이너리 미발견 — adapters/ppsspp/build.sh로 빌드하거나 EMUCAP_PPSSPP_BIN을 설정하라" });
+            return serde_json::json!({ "launched": false, "reason": "PPSSPPHeadless binary was not found; build it with adapters/ppsspp/build.sh or set EMUCAP_PPSSPP_BIN" });
         };
         headless
     };
     let Some(bridge) = ppsspp_launch::resolve_bridge(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "PSP bridge 바이너리 미발견 — cargo build --release --bin emucap-ppsspp-bridge 하거나 EMUCAP_PSP_BRIDGE_BIN을 설정하라" });
+        return serde_json::json!({ "launched": false, "reason": "PSP bridge binary was not found; build emucap-ppsspp-bridge in release mode or set EMUCAP_PSP_BRIDGE_BIN" });
     };
     let log = adapter_log_path("ppsspp", port, "ppsspp.log");
     let spec = ppsspp_launch::Launch {
@@ -776,11 +792,11 @@ pub(super) fn launch_ppsspp(
             "bridge": bridge.display().to_string(),
             "log": log.display().to_string(),
             "note": if display {
-                "PPSSPP(GUI) + PSP debugger-WebSocket bridge 2-process launch. HITL 창이 열린다(사람이 보고 PPSSPP 자체 키/게임패드 매핑으로 플레이). GUI는 startBreak 없이 부팅되어 게임이 바로 돈다. macOS는 caffeinate로 디스플레이를 깨워둔다."
+                "Two-process launch with PPSSPP GUI and the PSP debugger WebSocket bridge. Opens a HITL window for human play through PPSSPP's native input mappings. The GUI boots without startBreak so the game runs immediately. On macOS, caffeinate keeps the display awake."
             } else {
-                "PPSSPP + PSP debugger-WebSocket bridge 2-process launch. PPSSPPHeadless는 --timeout 없이 뜬다(지정하면 WS 활동과 무관하게 강제 종료됨). If the bridge spawn fails after PPSSPP spawn, the Rust launcher terminates PPSSPP."
+                "Two-process launch with PPSSPPHeadless and the PSP debugger WebSocket bridge. PPSSPPHeadless runs without --timeout because that option terminates independently of WebSocket activity. If bridge spawn fails after PPSSPP starts, the Rust launcher terminates PPSSPP."
             },
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }
@@ -795,7 +811,7 @@ pub(super) fn launch_pcsx2(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let Some(binary) = pcsx2_launch::resolve_binary(&root) else {
         return serde_json::json!({
@@ -864,7 +880,7 @@ pub(super) fn launch_pcsx2(
             "bios": bios.display().to_string(),
             "log": log.display().to_string(),
             "isolation": "PCSX2 uses an emucap-owned per-port data root; the selected BIOS is referenced in place.",
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
@@ -879,7 +895,7 @@ pub(super) fn launch_flycast(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(binary) = emucap::launch::flycast::resolve_binary() else {
-        return serde_json::json!({ "launched": false, "reason": "Flycast 바이너리 미발견 — adapters/flycast/build.sh로 빌드하거나 FLYCAST_APP을 실행파일 또는 macOS Flycast.app 경로로 설정하라" });
+        return serde_json::json!({ "launched": false, "reason": "Flycast binary was not found; build it with adapters/flycast/build.sh or set FLYCAST_APP to an executable or macOS Flycast.app path" });
     };
     let log = adapter_log_path("flycast", port, "flycast.log");
     let spec = emucap::launch::flycast::Launch {
@@ -901,7 +917,7 @@ pub(super) fn launch_flycast(
             "port": port,
             "binary": binary.display().to_string(),
             "log": log.display().to_string(),
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }
@@ -917,7 +933,7 @@ pub(super) fn launch_dolphin(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let display = a.display.unwrap_or(false);
     let Some(binary) = dolphin_launch::resolve_binary(&root, display) else {
@@ -967,7 +983,7 @@ pub(super) fn launch_dolphin(
             "log": log.display().to_string(),
             "emucap_home": emucap::launch::emu_home_dir("dolphin", port).display().to_string(),
             "isolation": "Dolphin runs from an emucap-owned portable copy with a per-port --user directory.",
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(error) => serde_json::json!({ "launched": false, "error": error.to_string() }),
     }
@@ -982,13 +998,13 @@ pub(super) fn launch_mesen(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let Some(binary) = emucap::launch::mesen::resolve_binary(&root) else {
         return serde_json::json!({
             "launched": false,
             "kind": "mesen-patch-required",
-            "reason": "compatible Mesen 바이너리 미발견 — adapters/mesen2/build.sh(Windows: build.ps1)를 실행하라"
+            "reason": "compatible Mesen binary was not found; run adapters/mesen2/build.sh or build.ps1 on Windows"
         });
     };
     let host_build = match emucap::launch::mesen::require_compatible_build(&root, &binary) {
@@ -1033,7 +1049,7 @@ pub(super) fn launch_mesen(
             "log": log.display().to_string(),
             "emucap_home": emucap::launch::emu_home_dir("mesen2", port).display().to_string(),
             "isolation": "Mesen runs from an emucap-owned portable copy; user settings.json is not edited.",
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }
@@ -1049,10 +1065,10 @@ pub(super) fn launch_mednafen(
     a: &LaunchArgs,
 ) -> serde_json::Value {
     let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repo root 미발견 — EMUCAP_REPO_ROOT를 설정하라" });
+        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
     };
     let Some((binary, explicit)) = emucap::launch::mednafen::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "Mednafen 바이너리 미발견 — adapters/mednafen/build.sh로 빌드하거나 MEDNAFEN_BIN을 설정하라" });
+        return serde_json::json!({ "launched": false, "reason": "Mednafen binary was not found; build it with adapters/mednafen/build.sh or set MEDNAFEN_BIN" });
     };
     let log = adapter_log_path("mednafen", port, "mednafen.log");
     let sound = a.sound.unwrap_or(false);
@@ -1081,7 +1097,7 @@ pub(super) fn launch_mednafen(
             "port": port,
             "binary": binary.display().to_string(),
             "log": log.display().to_string(),
-            "next_action": "adapter가 연결되면 launch가 반환한다",
+            "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
     }
@@ -1104,9 +1120,9 @@ pub(crate) fn occupied_graceful(
         .map(emucap::live::tcp::session_token_is_own)
         .unwrap_or(false);
     let recovery = if stale_own {
-        "이 포트의 에뮬레이터는 *이 세션 소유*인데 토큰이 어긋났다(토큰파일 유실/스윕 추정). 재연결로는 안 고쳐진다 — 필요하면 save_state 후 launch 도구로 같은 포트에 재기동하면 새 토큰파일을 읽어 매칭된다."
+        "The emulator on this port belongs to this session, but its token no longer matches, likely because the token file was lost or swept. Reconnection cannot repair this. Preserve state if needed, then relaunch on the same port so the new token file is adopted."
     } else {
-        "이 포트를 다른 세션의 에뮬레이터가 점유 중이다(occupant 참조). 같은 세션의 stale 연결이면 /mcp 재연결 시 토큰이 재사용돼 자동 reclaim된다. 무관한 orphan이면 occupant.content/system을 확인해 그 PID만 종료(pgrep -f <content> → kill; 광역 kill 금지) 후 재시도하거나, 이 세션 에뮬을 다른 포트로 띄운다."
+        "An emulator from another session occupies this port; inspect occupant. A stale connection from the same session is reclaimed automatically when MCP reconnects with the same token. For an unrelated orphan, verify occupant.content and system, terminate only that PID, and retry, or launch this session on another port. Do not use a broad kill."
     };
     let mut v = serde_json::json!({
         "connected": false,

@@ -176,11 +176,16 @@ unless `EMUCAP_LOG` overrides the log path.
 **macOS / Linux fallback** — use `launch.sh` only when the MCP `launch` tool is unavailable:
 
 ```bash
-REPO=/path/to/emu-monitor-hitl-adaptor
+REPO=/path/to/emucap
 "$REPO/adapters/mesen2/launch.sh" "/path/to/game.sfc" <listening_port> [name] [system]
-# launch.sh prints "연결됨" (connected) and returns only after it confirms the TCP
+# launch.sh returns only after it confirms the TCP connection
 # connection (ESTABLISHED + post-connect grace) — no separate sleep is needed.
 ```
+
+The fallback confirms transport stability, not the authenticated adapter contract. Call MCP
+`status` after it returns and verify `connected`, content identity, and `runtime_binding` before
+issuing control operations. The built-in MCP launcher performs that authenticated readiness check
+before returning.
 
 `launch.sh` checks `MESEN_BIN`, then the local build, then ordinary install/PATH candidates. Any
 candidate without matching build metadata is rejected as `mesen-patch-required`.
@@ -204,26 +209,29 @@ powershell -ExecutionPolicy Bypass -File "<repo>\adapters\mesen2\launch.ps1" "C:
 - If `launch.sh` reports "no MCP listener", do not relaunch the emulator — call `status`
   again first. A log that looks like a shutdown right after renderer/video init may just
   be the launcher timeout cleaning up with SIGTERM.
-- If no new Mesen window appears on macOS, or launch.sh fails right after "연결됨",
+- If no new Mesen window appears on macOS, or launch.sh fails immediately after confirming the connection,
   first suspect a blocked macOS dialog or display-sleep renderer failure. The fallback launcher defaults
   to direct execution of the portable copy and uses `caffeinate` when available. If it still recurs,
   check the Mesen window/dialog directly and relaunch.
 - To let a human freeze a transient moment (a sprite popup, etc.) on the spot, press the
   **freeze hotkey `Home`** in the Mesen window (change with `EMUCAP_FREEZE_KEY`; the same
   key toggles resume) — it is a codeBreak freeze, so emucap freezes indefinitely while
-  keeping responses alive (`status.reason="hotkey"`). ⚠ **Do not use Mesen's GUI Pause** —
-  it drops the connection to 'not connected' and does not recover until you resume from the GUI.
+  keeping responses alive (`status.reason="hotkey"`). The compatible host also supports Mesen's
+  regular GUI Pause. The adapter adopts it as `frozen` (`status.reason="host_halt"`), continues
+  serving supported requests, and reports `running` after a GUI Resume. A Pause already active
+  when the command-line script attaches is handled through the same native idle service.
 - Environment variables: `MESEN_BIN` (compatible executable or macOS app bundle; the adjacent
   build sidecar is required), `EMUCAP_MESEN_SRC` (build-only read-only clone origin),
   `EMUCAP_MESEN_WORK` (build-only owned work root), `EMUCAP_EMU_HOME` (portable copy root),
-  `EMUCAP_LAUNCH_WAIT` (seconds to wait for connection, default 20),
+  `EMUCAP_LAUNCH_WAIT` (seconds to wait for connection, default 30),
   `EMUCAP_POST_CONNECT_GRACE` (grace seconds after connection, default 2), `EMUCAP_LOG`
   (log path), `EMUCAP_DEADMAN_MS` (operator opt-in idle auto-resume; default 0 = disabled),
   `EMUCAP_RECONNECT_GIVEUP_MS` (operator opt-in auto-resume after MCP disconnect; default 0 =
   wait indefinitely). `status.freeze_policy` reports `mode=native_halt_service`, service interval,
-  zero instruction drift, whether the current halt is savestate-safe, and the effective release
-  timers. Each Lua callback remains subject to Mesen's script timeout; the native wait loop invokes
-  subsequent bounded callbacks without advancing guest time.
+  zero instruction drift after halt adoption, host-pause adoption, whether the current halt is
+  savestate-safe, and the effective release timers. Each Lua callback remains subject to Mesen's
+  script timeout; the native wait loop invokes subsequent bounded callbacks without advancing
+  guest time.
 - `EMUCAP_PREARM` pre-arms a DMA write BP right after cold boot (form `dma` | `dma:<dest>` |
   `dma:<dest>:<vmin>-<vmax>`). When an agent round-trip cannot catch a DMA write that
   vanishes in an instant during boot (e.g. initialization before the attract), arm it ahead

@@ -23,7 +23,7 @@ MAME
   Upstream: https://github.com/mamedev/mame
   License:  GPL-2.0-or-later as a whole (majority of files BSD-3-Clause)
   Used by:  adapters/mame-pc98 and adapters/mame-neogeo
-            (patches + Lua plugin + GDB bridges; PC-98 and Neo Geo MVS)
+            (patches + Lua plugin + GDB bridges; PC-98 and Neo Geo MVS/AES/CD)
   Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
 
 MesenCE
@@ -79,6 +79,18 @@ Mupen64Plus
   Distribution: emucap ships the frontend source and build recipe, not emulator
                 binaries or game media. The upstream GPL test ROM remains in the
                 ignored local build tree.
+
+openMSX
+  Upstream: https://github.com/openMSX/openMSX
+  Pinned source: 21.0
+  License: GNU GPL version 2; the supported path uses an unmodified upstream build
+           plus a pinned upstream SDL2 compatibility backport. Native patching is
+           not part of the supported path.
+  Used by: adapters/openmsx and emucap-openmsx-bridge (source-build recipe and
+           external XML control; C-BIOS MSX2+ cartridge profile)
+  Bundled C-BIOS machine ROMs are BSD 2-Clause and retain their upstream notices.
+  Distribution: emucap ships the build recipe, not emulator binaries, proprietary
+                system ROMs, or game media.
 
 Upstream license determinations were made from each project's source-file SPDX
 headers and README, not from the bare COPYING boilerplate.

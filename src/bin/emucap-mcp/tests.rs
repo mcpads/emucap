@@ -13,6 +13,15 @@ fn body_text(r: &CallToolResult) -> String {
         .join("")
 }
 
+fn contains_hangul(text: &str) -> bool {
+    text.chars().any(|c| {
+        matches!(
+            c,
+            '\u{1100}'..='\u{11ff}' | '\u{3130}'..='\u{318f}' | '\u{ac00}'..='\u{d7af}'
+        )
+    })
+}
+
 #[test]
 fn server_info_identifies_the_control_binary() {
     let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
@@ -23,6 +32,19 @@ fn server_info_identifies_the_control_binary() {
     assert_eq!(info.server_info.name, "emucap-mcp");
     assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
     assert_eq!(info.instructions.as_deref(), Some(SERVER_INSTRUCTIONS));
+}
+
+#[test]
+fn control_mcp_consumer_metadata_is_english() {
+    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
+        "127.0.0.1:0",
+        Duration::from_millis(50),
+    )));
+    let server = Emucap::new(shared);
+    let instructions = server.get_info().instructions.unwrap_or_default();
+    let tools = serde_json::to_string(&server.tool_router.list_all()).unwrap();
+    assert!(!contains_hangul(&instructions), "{instructions}");
+    assert!(!contains_hangul(&tools), "{tools}");
 }
 
 #[test]
