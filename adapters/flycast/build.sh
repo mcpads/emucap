@@ -324,6 +324,10 @@ fi
 inject_check 'core/emucap.cpp' "$SRC/CMakeLists.txt"
 inject_check 'core/emucap_failure.cpp' "$SRC/CMakeLists.txt"
 inject_check 'core/emucap_native_failure.cpp' "$SRC/CMakeLists.txt"
+perl -0777 -pi -e 's{\z}{\nif(WIN32)\n  # emucap: private Windows failure ACL\n  target_link_libraries(flycast PRIVATE advapi32)\nendif()\n} unless m{emucap: private Windows failure ACL}' \
+  "$SRC/CMakeLists.txt"
+inject_check 'emucap: private Windows failure ACL' "$SRC/CMakeLists.txt"
+inject_check 'target_link_libraries(flycast PRIVATE advapi32)' "$SRC/CMakeLists.txt"
 echo "→ CMakeLists.txt target_sources에 emucap + failure serializers 추가"
 
 # 3b. macOS 필수 빌드 픽스(클린 upstream엔 없음 — 텍스처 디버그 mods와 무관한 빌드 자체 픽스).

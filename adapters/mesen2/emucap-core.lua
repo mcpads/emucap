@@ -27,6 +27,7 @@ local socket = require("socket.core")
 local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
 local Dump = require("emucap_dump")
+local Deferred = require("emucap_deferred")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -80,6 +81,7 @@ local INSTR_CHUNK = 20000      -- 명령 step 청크(≤1s 안에서 keepalive)
 local TX_CAP = tonumber(os.getenv("EMUCAP_TX_CAP") or "") or (8 * 1024 * 1024)
 if TX_CAP < 1024 then TX_CAP = 1024 end
 local conn = nil
+local session_epoch = 0       -- response IDs are scoped to one accepted frontend connection
 local rx_buf = ""
 local tx = Tx.new(TX_CAP)
 local frame = 0
@@ -303,6 +305,7 @@ local function connect()
   local c = socket.tcp()
   c:settimeout(0)
   c:connect(HOST, PORT)
+  session_epoch = session_epoch + 1
   conn = c
   rx_buf = ""
   Tx.reset(tx)
@@ -677,33 +680,41 @@ local function read_target(pr)
 end
 
 -- ── 지연 명령 (run_frames / press_buttons / probe): 프레임마다 진행, 끝나면 응답 ──
+local function apply_deferred_effect(effect)
+  Deferred.apply(effect, {
+    release_input = function() input_hold = nil end,
+    working = function(value)
+      send_line(string.format(
+        '{"id":%d,"ok":true,"result":{"status":"working"}}',
+        value.id))
+    end,
+    terminal = function(value)
+      if value.operation_kind == "probe" and value.status == "completed" then
+        reply_ok(value.id, { hex = read_target(value.probe), frame = value.frame })
+        return
+      end
+      local result = { status = value.status, frame = value.frame }
+      if value.reason then result.reason = value.reason end
+      if value.breakpoint_id then result.breakpoint_id = value.breakpoint_id end
+      reply_ok(value.id, result)
+    end,
+  })
+end
+
 local function tick_deferred()
-  deferred.remaining = deferred.remaining - 1
-  deferred.age = deferred.age + 1
-  if deferred.remaining <= 0 then
-    if deferred.kind == "press" then input_hold = nil end   -- 버튼 해제
-    if deferred.kind == "probe" then
-      reply_ok(deferred.id, { hex = read_target(deferred.probe), frame = frame })
-    else
-      reply_ok(deferred.id, { status = "completed", frame = frame })
-    end
-    deferred = nil
-  elseif deferred.age % KEEPALIVE_FRAMES == 0 and not Tx.pending(tx) then
-    send_line(string.format('{"id":%d,"ok":true,"result":{"status":"working"}}', deferred.id))
-  end
+  local effect
+  deferred, effect = Deferred.tick(deferred, frame, KEEPALIVE_FRAMES)
+  if effect and effect.kind == "working" and Tx.pending(tx) then return end
+  apply_deferred_effect(effect)
 end
 
 -- 백스톱: freeze(브레이크포인트 등)가 진행 중 지연 명령(press/run_frames/probe)을 가로채면
 -- frozen 동안 tick_deferred가 안 돌아 응답이 막힌다. freeze 진입 시 여기서 마무리해 클라이언트
 -- 타임아웃을 막는다. press면 버튼을 뗀다.
 local function flush_deferred(status, reason, bp_id)
-  if not deferred then return end
-  if deferred.kind == "press" then input_hold = nil end
-  local r = { status = status, frame = frame }
-  if reason then r.reason = reason end
-  if bp_id then r.breakpoint_id = bp_id end
-  reply_ok(deferred.id, r)
-  deferred = nil
+  local effect
+  deferred, effect = Deferred.interrupt(deferred, status, reason, bp_id, frame)
+  apply_deferred_effect(effect)
 end
 
 -- full-range exec 콜백(save/load/probe·watch_register·set_trace)의 상한. 대부분 24비트(0xFFFFFF)면 CPU 실행
@@ -729,7 +740,8 @@ local function on_io_exec()
     if op.probe.frame <= 0 then
       reply_ok(op.id, { hex = read_target(op.probe), frame = frame })
     else
-      deferred = { id = op.id, kind = "probe", remaining = op.probe.frame, age = 0, probe = op.probe }
+      deferred = Deferred.start(
+        session_epoch, op.id, "probe", op.probe.frame, op.probe)
     end
     return
   end
@@ -819,7 +831,7 @@ local function frozen_state_io(method, id, p)
     reply_ok(id, { hex = read_target(probe), frame = frame })
     return nil
   end
-  deferred = { id = id, kind = "probe", remaining = probe.frame, age = 0, probe = probe }
+  deferred = Deferred.start(session_epoch, id, "probe", probe.frame, probe)
   return "resume"
 end
 
@@ -829,8 +841,9 @@ end
 -- only request-scoped work and release a transient press hold.
 abort_inflight = function()
   local cancelled = deferred ~= nil or pending_step_id ~= nil or pending_io ~= nil
-  if deferred and deferred.kind == "press" then input_hold = nil end
-  deferred = nil
+  local deferred_effect
+  deferred, deferred_effect = Deferred.cancel(deferred)
+  apply_deferred_effect(deferred_effect)
   pending_step_id = nil
   step_remaining = 0
   if pending_io and pending_io.ref then
@@ -1657,7 +1670,7 @@ local function dispatch(line)
   if method == "run_frames" then
     local frames, err = bounded_sync_count(p.n, 1, false)
     if not frames then reply_err(id, "bad_params", err); return end
-    deferred = { id = id, kind = "run", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "run", frames)
     return
   end
   if method == "press_buttons" then
@@ -1666,7 +1679,7 @@ local function dispatch(line)
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = { id = id, kind = "press", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "press", frames)
     return
   end
   if method == "save_state" then arm_io("save", id, p.path); return end
@@ -1702,7 +1715,7 @@ local function handle_in_freeze(line)
     -- free-run으로 one-shot watch/BP를 조기 소진시키는 레이스라 제거됨 — Mednafen과 동일 원자 resume 규약).
     local frames, err = bounded_sync_count(p.n, 1, false)
     if not frames then reply_err(id, "bad_params", err); return nil end
-    deferred = { id = id, kind = "run", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "run", frames)
     return "resume"
   elseif method == "press_buttons" then
     local frames, frame_err = bounded_sync_count(p.frames, 1, false)
@@ -1710,7 +1723,7 @@ local function handle_in_freeze(line)
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return nil end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = { id = id, kind = "press", remaining = frames, age = 0 }
+    deferred = Deferred.start(session_epoch, id, "press", frames)
     return "resume"
   elseif method == "save_state" or method == "load_state" or method == "probe" then
     return frozen_state_io(method, id, p)

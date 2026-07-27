@@ -295,7 +295,7 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    & git -C $here diff --quiet HEAD -- emucap-core.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null
+    & git -C $here diff --quiet HEAD -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null
     if ($LASTEXITCODE -ne 0) {
       $buildHash = "$buildHash-dirty"
     }

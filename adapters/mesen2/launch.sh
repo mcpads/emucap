@@ -92,7 +92,8 @@ EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo u
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   git -C "$HERE" diff --quiet HEAD -- \
-    emucap-core.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua "$(basename "$LUA")" 2>/dev/null \
+    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua \
+    "$(basename "$LUA")" 2>/dev/null \
     || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
 else
   EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"

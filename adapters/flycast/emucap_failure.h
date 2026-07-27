@@ -50,3 +50,12 @@ bool emucap_write_failure_atomic(
 	const std::string& path,
 	const std::string& json,
 	std::string* error = nullptr);
+
+#ifdef _WIN32
+/// Windows launch paths originate in the wide environment. This overload avoids narrowing a
+/// Unicode generation path through the active ANSI code page.
+bool emucap_write_failure_atomic_wide(
+	const std::wstring& path,
+	const std::string& json,
+	std::string* error = nullptr);
+#endif
