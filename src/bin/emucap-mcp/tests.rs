@@ -48,6 +48,25 @@ fn control_mcp_consumer_metadata_is_english() {
 }
 
 #[test]
+fn stop_is_exposed_as_a_host_lifecycle_tool_with_required_generation_identity() {
+    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
+        "127.0.0.1:0",
+        Duration::from_millis(50),
+    )));
+    let tools = Emucap::new(shared).tool_router.list_all();
+    let stop = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "stop")
+        .expect("stop tool");
+    let schema = serde_json::to_value(&stop.input_schema).unwrap();
+    assert_eq!(schema["required"], serde_json::json!(["launch_id"]));
+    assert!(stop
+        .description
+        .as_deref()
+        .is_some_and(|description| description.contains("process-start identities")));
+}
+
+#[test]
 fn broker_probe_detects_a_listening_session_port() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     assert!(broker_session_accepting(

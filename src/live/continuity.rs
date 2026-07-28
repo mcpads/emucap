@@ -12,7 +12,7 @@ use serde_json::Value;
 use super::link::{Capabilities, EmulatorIdentity, EmulatorLink, LinkError};
 use super::runtime::{
     capture_process, control_session_key, process_state, CurrentManifest, LeaseRecord, LeaseState,
-    LeaseView, ProcessIdentity, ProcessState, RuntimeStore,
+    LeaseView, ProcessIdentity, ProcessState, RuntimeStore, TerminationRecord,
 };
 
 const LINK_SCHEMA_VERSION: u32 = 1;
@@ -122,6 +122,8 @@ pub struct ContinuitySnapshot {
     pub last_failure: Option<FailureObservation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub termination: Option<TerminationRecord>,
     /// Kept out of the `continuity` JSON; status surfaces it under `runtime_instance.lease`.
     #[serde(skip)]
     pub lease: LeaseView,
@@ -146,6 +148,7 @@ impl Default for ContinuitySnapshot {
             },
             last_failure: None,
             runtime_diagnostics: Vec::new(),
+            termination: None,
             lease: LeaseView::unknown(),
         }
     }
@@ -267,6 +270,7 @@ pub struct ObservedLink<L> {
     live_record: Option<LinkRecord>,
     runtime_binding: RuntimeBinding,
     adapter_failure: Option<Value>,
+    termination: Option<TerminationRecord>,
     runtime_diagnostics: Vec<RuntimeDiagnostic>,
     snapshot: ContinuitySnapshot,
 }
@@ -291,6 +295,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             live_record: None,
             runtime_binding: RuntimeBinding::default(),
             adapter_failure: None,
+            termination: None,
             runtime_diagnostics: Vec::new(),
             snapshot: ContinuitySnapshot::default(),
         };
@@ -309,6 +314,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
     fn refresh_runtime(&mut self) {
         self.runtime_diagnostics.clear();
         self.adapter_failure = None;
+        self.termination = None;
         let Some(port) = self.inner.endpoint_port() else {
             self.runtime_binding = runtime_binding(
                 None,
@@ -360,6 +366,20 @@ impl<L: EmulatorLink> ObservedLink<L> {
                     self.runtime_diagnostics.push(runtime_diagnostic(
                         "adapter_failure",
                         self.store.adapter_failure_path(port, &current.launch_id),
+                        &error,
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+        self.termination = match self.current.as_ref() {
+            Some(current) => match self.store.read_termination(port, &current.launch_id) {
+                Ok(termination) => termination,
+                Err(error) => {
+                    self.runtime_diagnostics.push(runtime_diagnostic(
+                        "termination",
+                        self.store.termination_path(port, &current.launch_id),
                         &error,
                     ));
                     None
@@ -474,6 +494,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             evidence,
             last_failure: active_record.and_then(|r| r.last_failure.clone()),
             runtime_diagnostics: self.runtime_diagnostics.clone(),
+            termination: current_bound.then(|| self.termination.clone()).flatten(),
             lease,
         };
     }

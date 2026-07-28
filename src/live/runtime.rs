@@ -9,6 +9,11 @@ use std::process::Command;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod termination;
+pub use termination::{
+    GenerationTermination, ProcessTermination, TerminationRecord, TerminationState,
+};
+
 const SCHEMA_VERSION: u32 = 1;
 pub const MAX_CAPSULE_FILE_BYTES: u64 = 128 * 1024;
 
@@ -147,6 +152,11 @@ impl RuntimeStore {
     pub fn adapter_failure_path(&self, port: u16, launch_id: &str) -> PathBuf {
         self.generation_dir(port, launch_id)
             .join("adapter-failure.json")
+    }
+
+    pub fn termination_path(&self, port: u16, launch_id: &str) -> PathBuf {
+        self.generation_dir(port, launch_id)
+            .join("termination.json")
     }
 
     pub fn compatibility_token_path(&self, port: u16) -> PathBuf {
@@ -507,38 +517,6 @@ impl CurrentManifest {
             "lease": lease,
             "next_safe_action": next_safe_action(emulator_state, bridge_state, lease.state),
         })
-    }
-
-    pub fn terminate_owned_processes(&self) -> io::Result<()> {
-        if self.process_state() == ProcessState::Unknown {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "emulator process identity is unknown",
-            ));
-        }
-        if let Some(bridge) = self.bridge.as_ref() {
-            match process_state(bridge) {
-                ProcessState::Alive => crate::launch::terminate_detached(bridge.pid)?,
-                ProcessState::Exited => {}
-                ProcessState::Unknown => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "bridge process identity is unknown",
-                    ))
-                }
-            }
-        }
-        match self.process_state() {
-            ProcessState::Alive => crate::launch::terminate_detached(self.emulator.pid)?,
-            ProcessState::Exited => {}
-            ProcessState::Unknown => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "emulator process identity became unknown before termination",
-                ))
-            }
-        }
-        Ok(())
     }
 }
 

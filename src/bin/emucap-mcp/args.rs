@@ -515,6 +515,14 @@ pub(crate) struct LaunchArgs {
     pub(crate) replace: bool,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct StopArgs {
+    /// Exact current launch generation to terminate. Read it from
+    /// `status.runtime_instance.launch_id`; a stale or different generation is
+    /// rejected without signalling any process.
+    pub(crate) launch_id: String,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub(crate) struct VerifyDeterminismArgs {
     /// Regression case directory containing case.json and movie or savestate

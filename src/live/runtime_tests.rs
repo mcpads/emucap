@@ -218,6 +218,7 @@ fn owned_cleanup_terminates_a_live_bridge_after_the_emulator_exits() {
         .spawn()
         .unwrap();
     let bridge_identity = capture_process(bridge.id());
+    let bridge_waiter = std::thread::spawn(move || bridge.wait().unwrap());
     let current = CurrentManifest {
         schema_version: SCHEMA_VERSION,
         launch_id: "launch-cleanup-test".into(),
@@ -235,8 +236,90 @@ fn owned_cleanup_terminates_a_live_bridge_after_the_emulator_exits() {
     assert_eq!(current.process_state(), ProcessState::Exited);
     assert_eq!(current.bridge_process_state(), Some(ProcessState::Alive));
     current.terminate_owned_processes().unwrap();
-    bridge.wait().unwrap();
+    bridge_waiter.join().unwrap();
     assert_eq!(current.bridge_process_state(), Some(ProcessState::Exited));
+}
+
+#[cfg(unix)]
+#[test]
+fn owned_cleanup_attempts_bridge_after_emulator_termination_failure() {
+    let mut emulator = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let emulator_pid = emulator.id();
+    let emulator_waiter = std::thread::spawn(move || emulator.wait().unwrap());
+    let mut bridge = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let bridge_pid = bridge.id();
+    let bridge_waiter = std::thread::spawn(move || bridge.wait().unwrap());
+    let current = CurrentManifest {
+        schema_version: SCHEMA_VERSION,
+        launch_id: "launch-partial-cleanup-test".into(),
+        port: 47811,
+        adapter: "mame-pc98".into(),
+        system: "pc98".into(),
+        content: "/games/test.hdi".into(),
+        build: None,
+        emulator: capture_process(emulator_pid),
+        bridge: Some(capture_process(bridge_pid)),
+        backend_endpoint: Some("127.0.0.1:48811".into()),
+        created_at_unix_ms: 1,
+    };
+    let mut attempted = Vec::new();
+    let report = current
+        .terminate_owned_processes_with(|process| {
+            attempted.push(process.pid);
+            if process.pid == emulator_pid {
+                Err(io::Error::other("injected emulator termination failure"))
+            } else {
+                crate::launch::terminate_detached(process.pid)
+            }
+        })
+        .unwrap();
+
+    assert_eq!(attempted, [emulator_pid, bridge_pid]);
+    assert!(!report.completed);
+    assert_eq!(report.emulator.after, ProcessState::Alive);
+    assert_eq!(report.bridge.as_ref().unwrap().after, ProcessState::Exited);
+    bridge_waiter.join().unwrap();
+    crate::launch::terminate_detached(emulator_pid).unwrap();
+    emulator_waiter.join().unwrap();
+}
+
+#[test]
+fn completed_termination_record_requires_verified_exited_processes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(47812).unwrap();
+    let current = manifest(&prepared);
+    prepared.commit(&current).unwrap();
+    let requested = TerminationRecord::requested(47812, current.launch_id.clone(), None);
+    store.write_current_termination(&requested).unwrap();
+    assert_eq!(
+        store
+            .read_termination(47812, &current.launch_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TerminationState::Requested
+    );
+
+    let lying = requested.finish(GenerationTermination {
+        completed: true,
+        emulator: ProcessTermination {
+            pid: current.emulator.pid,
+            before: ProcessState::Alive,
+            after: ProcessState::Exited,
+            method: Some(crate::launch::TerminationMethod::Term),
+            error: None,
+        },
+        bridge: None,
+    });
+    let error = store.write_current_termination(&lying).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
 #[cfg(target_os = "macos")]

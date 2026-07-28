@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.11.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.11.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -140,6 +140,12 @@ timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종�
 살아 있는 소유 generation에는 재부착하고, 의도적으로 교체할 때만 identity가 검증되는
 `launch(..., replace: true)`를 쓴다. Flycast fatal quarantine에서는 먼저 보존 문맥을 읽고,
 `status.methods`가 광고할 때만 `dismiss_failure`를 호출한다.
+
+managed emulator를 종료할 때는 `status.runtime_instance.launch_id`를 읽고
+`stop(launch_id=...)`을 호출한다. 제어 MCP가 current generation, 제어 lease,
+process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 종료까지 기다린다.
+실패 증거는 보존하며, stale generation이나 broker 소유·unmanaged process는 추측해서
+종료하지 않는다.
 
 ## 에뮬레이터별 어댑터 (필요할 때 에이전트가 설치)
 

@@ -24,6 +24,8 @@ mod regression;
 mod result;
 #[path = "emucap-mcp/status.rs"]
 mod status;
+#[path = "emucap-mcp/stop.rs"]
+mod stop;
 
 #[cfg(test)]
 #[path = "emucap-mcp/tests.rs"]
@@ -41,6 +43,7 @@ use crate::status::{
     enrich_breakpoint_kinds, enrich_link_status, enrich_status_value, make_bootstrap_value,
     normalize_rom_sha1,
 };
+use crate::stop::make_stop;
 
 type SharedLink = Arc<Mutex<dyn EmulatorLink + Send>>;
 
@@ -114,6 +117,14 @@ impl Emucap {
     async fn launch(&self, Parameters(a): Parameters<LaunchArgs>) -> CallToolResult {
         let mut link = self.link();
         output_result(ToolOutput::Json(make_launch(&mut *link, &a)))
+    }
+
+    #[tool(
+        description = "Terminate one exact managed launch generation and all of its owned helper processes. Requires status.runtime_instance.launch_id, verifies the current generation, control lease, and process-start identities, preserves failure evidence, and never terminates by executable name. This ends the emulator process; use pause to freeze guest execution."
+    )]
+    async fn stop(&self, Parameters(a): Parameters<StopArgs>) -> CallToolResult {
+        let mut link = self.link();
+        output_result(ToolOutput::Json(make_stop(&mut *link, &a)))
     }
 
     #[tool(description = "Read a byte range from the running game's memory.")]

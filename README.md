@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.11.0 — beta.** This repository remains under active development; interfaces and
+**v0.11.1 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -174,6 +174,12 @@ emulator exited. Inspect `status.continuity.runtime_binding`,
 use `launch(..., replace: true)` only for an intentional, identity-verified
 replacement. On a Flycast fatal quarantine, read the preserved context first and
 call `dismiss_failure` only when `status.methods` advertises it.
+
+To end a managed emulator, read `status.runtime_instance.launch_id` and call
+`stop(launch_id=...)`. The Control MCP verifies the current generation, control
+lease, and process-start identities, then waits for the emulator and its recorded
+bridge to exit. It preserves failure evidence and refuses stale, broker-owned, or
+unmanaged processes instead of asking the agent to kill by process name.
 
 ## Per-emulator adapters (the agent installs when needed)
 

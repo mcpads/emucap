@@ -57,7 +57,7 @@ function Get-EmulatorConnectionPids([int]$LocalPort) {
   foreach ($conn in @(Get-LocalTcpConnections $LocalPort | Where-Object { $_.State -eq "Established" })) {
     try {
       $proc = Get-Process -Id $conn.OwningProcess -ErrorAction Stop
-      if ($proc.ProcessName -match '^(Mesen|mednafen|Flycast|pcsx-redux|mame)$') {
+      if ($proc.ProcessName -match '^(Mesen|mednafen|Flycast|mame)$') {
         $pids += $proc.Id
       }
     } catch {

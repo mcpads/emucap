@@ -89,6 +89,9 @@ std::string s_handler_error;
 constexpr uint64_t MAX_SYNC_ADVANCE_COUNT = 15;
 constexpr uint64_t MAX_MEMORY_READ_BYTES = 16 * 1024 * 1024;
 constexpr uint64_t MAX_MEMORY_WRITE_BYTES = 16 * 1024;
+constexpr auto SYNC_RESPONSE_BUDGET = std::chrono::seconds(4);
+constexpr auto FRAME_STEP_WORK_BUDGET = std::chrono::seconds(3);
+constexpr auto STEP_WAIT_SLICE = std::chrono::seconds(1);
 
 std::mutex s_frame_step_mutex;
 std::condition_variable s_frame_step_cv;
@@ -350,6 +353,9 @@ void AddExecutionLimits(picojson::object& result)
   picojson::object limits;
   limits["max_sync_advance_count"] =
       picojson::value(static_cast<double>(MAX_SYNC_ADVANCE_COUNT));
+  limits["max_sync_operation_ms"] =
+      picojson::value(static_cast<double>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(SYNC_RESPONSE_BUDGET).count()));
   result["execution_limits"] = picojson::value(limits);
 }
 
@@ -656,11 +662,22 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
   power_pc.SetMode(PowerPC::CoreMode::Interpreter);
   bool completed_all = true;
   bool can_restore_mode = true;
+  const auto operation_deadline = std::chrono::steady_clock::now() + SYNC_RESPONSE_BUDGET;
   for (uint64_t i = 0; i < count; ++i)
   {
+    const auto remaining = operation_deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero())
+    {
+      completed_all = false;
+      break;
+    }
     Common::Event completed;
     cpu.StepOpcode(&completed);
-    if (!completed.WaitFor(std::chrono::seconds(1)))
+    const auto wait_budget =
+        std::max(std::chrono::milliseconds(1),
+                 std::min(std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
+                          std::chrono::duration_cast<std::chrono::milliseconds>(STEP_WAIT_SLICE)));
+    if (!completed.WaitFor(wait_budget))
     {
       can_restore_mode = cpu.CancelStepOpcode(&completed);
       completed_all = false;
@@ -670,7 +687,7 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
   if (can_restore_mode)
     power_pc.SetMode(old_mode);
   if (!completed_all)
-    return Fail("instruction step did not complete within 1 second");
+    return Fail("timeout", "instruction step did not complete within the operation deadline");
   picojson::object r;
   r["status"] = picojson::value(std::string("completed"));
   r["count"] = picojson::value(static_cast<double>(count));
@@ -707,10 +724,12 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
       Core::CancelFrameStep(host_system);
       cancelled->Set();
     });
-    return cancelled->WaitFor(std::chrono::seconds(1));
+    return cancelled->WaitFor(STEP_WAIT_SLICE);
   };
 
-  const auto operation_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+  // Leave one cleanup slice and one second of transport margin inside the MCP's five-second idle
+  // timeout. A terminal adapter error must arrive before the front side can mistake it for silence.
+  const auto operation_deadline = std::chrono::steady_clock::now() + FRAME_STEP_WORK_BUDGET;
   uint64_t completed = 0;
   for (; completed < count; ++completed)
   {
@@ -733,7 +752,7 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
     if (dispatch_remaining <= std::chrono::steady_clock::duration::zero() ||
         !start->dispatched.WaitFor(
             std::min(std::chrono::duration_cast<std::chrono::milliseconds>(dispatch_remaining),
-                     std::chrono::milliseconds(1000))))
+                     std::chrono::duration_cast<std::chrono::milliseconds>(STEP_WAIT_SLICE))))
     {
       start->cancelled.store(true);
       if (!cancel_frame_step())
@@ -748,7 +767,7 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
 
     std::unique_lock<std::mutex> lock(s_frame_step_mutex);
     const auto completion_deadline =
-        std::min(operation_deadline, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+        std::min(operation_deadline, std::chrono::steady_clock::now() + STEP_WAIT_SLICE * 2);
     const bool signaled = s_frame_step_cv.wait_until(lock, completion_deadline, [&] {
       return s_frame_step_completions != completion_before ||
              s_breakpoint_interruptions != interruption_before || s_stop.load();

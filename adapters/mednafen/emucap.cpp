@@ -32,6 +32,7 @@ extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 
 #include <exception>
 #include <atomic>
+#include <chrono>
 #include <stdexcept>
 
 #ifdef _WIN32
@@ -153,6 +154,7 @@ std::string g_tx;
 size_t g_tx_pos = 0;
 static const size_t TX_CAP = 8 * 1024 * 1024;
 static const long MAX_SYNC_ADVANCE = 5000;
+static const uint64_t PROGRESS_INTERVAL_MS = 1000;
 uint64_t g_frame = 0;
 long g_test_adapter_exception_id = -1;
 bool g_internal_failure_active = false;
@@ -162,9 +164,8 @@ char g_internal_failure_reason[512]{};
 // 지연 명령(run_frames): N프레임 진행 후 응답. 진행 중엔 새 명령을 받지 않고 keepalive를 보낸다.
 long g_def_id = -1;
 long g_def_remaining = 0;
-long g_def_age = 0;
+uint64_t g_def_progress_ms = 0;
 bool g_def_is_press = false;        // 현재 g_def가 press_buttons면 완료 시 입력 해제
-const long KEEPALIVE_FRAMES = 120;  // Rust 링크 타임아웃(5s) 안에서 데드라인 리셋
 
 // 입력 주입: non-empty set_input은 다음 set_input까지 유지하고 press_buttons는 완료·중단 때
 // 네이티브 입력권을 반환한다. mask와 소유 flag를 한 atomic snapshot으로 읽어 release/apply 경합을 막는다.
@@ -198,6 +199,7 @@ uint64_t g_layer_enable_mask = ~0ULL;
 bool g_frozen = false;
 long g_step_id = -1;
 long g_step_remaining = 0;
+uint64_t g_step_progress_ms = 0;
 
 // 명령 단위 step(step_instructions): continuous CPU 콜백을 무장해 g_insn_remaining개 CPU 명령을
 // 진행한 뒤 emucap_cpu_cb 안에서 재정지한다(기존 BP freeze 경로 freeze_spin_until_resume 재사용 —
@@ -205,6 +207,7 @@ long g_step_remaining = 0;
 // (resume에서만 해제 비용을 치르게 — continuous DebugMode는 매 명령 cb라 도구 비활성 시 즉시 해제).
 long g_insn_step_id = -1;
 long g_insn_remaining = 0;
+uint64_t g_insn_progress_ms = 0;
 bool g_insn_armed = false;
 // 실행추적(set_trace/get_trace): continuous cb가 매 명령 PC를 원형버퍼에 기록한다 — 크래시 직전 실행
 // 경로("어떻게 여기 왔나") 역추적용. step_instructions와 같은 continuous 콜백을 공유한다(arch 독립 — PC만).
@@ -257,6 +260,7 @@ bool g_insn_skip_first = false;
 // 별도 load+run_frames 호출 사이의 자유 실행 누수를 없애 bisect를 결정론적으로 만든다.
 long g_probe_id = -1;
 long g_probe_remaining = 0;
+uint64_t g_probe_progress_ms = 0;
 std::string g_probe_mt;
 uint32 g_probe_addr = 0;
 long g_probe_len = 0;
@@ -267,6 +271,11 @@ int emucap_port() {
   return (port > 0 && port < 65536) ? port : 47800;
 }
 
+uint64_t monotonic_millis() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
 void rearm_breakpoints();
 
 void cancel_session_requests() {
@@ -275,17 +284,20 @@ void cancel_session_requests() {
   if (g_def_is_press) g_input_override.release();
   g_def_id = -1;
   g_def_remaining = 0;
-  g_def_age = 0;
+  g_def_progress_ms = 0;
   g_def_is_press = false;
   g_probe_id = -1;
   g_probe_remaining = 0;
+  g_probe_progress_ms = 0;
   g_probe_mt.clear();
   g_probe_addr = 0;
   g_probe_len = 0;
   g_step_id = -1;
   g_step_remaining = 0;
+  g_step_progress_ms = 0;
   g_insn_step_id = -1;
   g_insn_remaining = 0;
+  g_insn_progress_ms = 0;
   g_insn_skip_first = false;
   g_test_adapter_exception_id = -1;
   if (g_insn_armed) rearm_breakpoints();
@@ -926,21 +938,25 @@ void flush_deferred_on_freeze(uint32 pc) {
     reply_ok(g_def_id, buf);
     g_def_id = -1;
     g_def_remaining = 0;
+    g_def_progress_ms = 0;
   }
   if (g_probe_id >= 0) {            // probe 중 BP 끼면 결정론 측정 무효 → interrupted로 닫는다(hang 대신)
     reply_ok(g_probe_id, buf);
     g_probe_id = -1;
     g_probe_remaining = 0;
+    g_probe_progress_ms = 0;
   }
   if (g_step_id >= 0) {             // step(frames)/tap 진행 중 BP → step 중단·interrupted → freeze 발효(균일)
     reply_ok(g_step_id, buf);
     g_step_id = -1;
     g_step_remaining = 0;
+    g_step_progress_ms = 0;
   }
   if (g_insn_step_id >= 0) {        // step_instructions 진행 중 BP → 중단·interrupted → freeze 발효(균일)
     reply_ok(g_insn_step_id, buf);
     g_insn_step_id = -1;
     g_insn_remaining = 0;
+    g_insn_progress_ms = 0;
   }
 }
 
@@ -2539,7 +2555,7 @@ void handle(const std::string& line) {
     g_frozen = false;
     g_def_id = id;             // 지연: N프레임 후 emucap_service가 완료 응답(여기선 응답 안 함)
     g_def_remaining = n;
-    g_def_age = 0;
+    g_def_progress_ms = monotonic_millis();
     g_def_is_press = false;
   } else if (method == "set_input") {
     long port = 0;
@@ -2575,7 +2591,7 @@ void handle(const std::string& line) {
     g_frozen = false;          // run_frames와 동일: 어댑터에서 직접 resume(재freeze 레이스로 g_def가 freeze_spin에 갇히는 timeout 방지)
     g_def_id = id;             // 지연: N프레임 누른 뒤 완료 응답 + 입력 해제(emucap_service)
     g_def_remaining = frames;
-    g_def_age = 0;
+    g_def_progress_ms = monotonic_millis();
     g_def_is_press = true;
   } else if (method == "pause") {
     g_frozen = true;           // 다음 프레임부터 emucap_service가 스핀
@@ -2586,9 +2602,11 @@ void handle(const std::string& line) {
     g_frozen = false;
     g_step_remaining = 0;
     g_step_id = -1;
+    g_step_progress_ms = 0;
     // 명령단위 step 진행/정지 중이었으면 continuous 콜백을 해제해 fast path로 복귀(perf — 매 명령 cb).
     g_insn_remaining = 0;
     g_insn_step_id = -1;
+    g_insn_progress_ms = 0;
     g_insn_skip_first = false;
     if (g_insn_armed) rearm_breakpoints();   // continuous 해제(BP만 있으면 BP 모드로, 없으면 콜백 해제)
     reply_ok(id, "{\"state\":\"running\"}");
@@ -2615,6 +2633,7 @@ void handle(const std::string& line) {
       if (!normalize_sync_advance(id, count, false)) return;
       g_insn_remaining = count;
       g_insn_step_id = id;               // 완료 응답은 cb가 count 명령 실행 후(지연)
+      g_insn_progress_ms = monotonic_millis();
       // cold(콜백 밖) 진입이면 첫 continuous cb를 흡수해 진입명령을 공짜 실행(BP 진입과 동형) → 정확히 N.
       // cb 안 진입(BP 히트/명령단위 연쇄)이면 진입명령이 이미 공짜 실행되므로 skip 안 함.
       g_insn_skip_first = !g_frozen_via_cb;
@@ -2631,6 +2650,7 @@ void handle(const std::string& line) {
     // 프레임 중 BP가 히트해 cb 안에서 park하면 freeze_spin이 true로(park 위치가 권위).
     g_step_id = id;            // 완료 응답은 emucap_service가 frames 경과 후
     g_step_remaining = frames;
+    g_step_progress_ms = monotonic_millis();
   } else if (method == "probe") {
     // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
     // 중에는 거부한다 — Mesen 어댑터와 동일하게 freeze 상태머신과 섞이지 않게 한다.
@@ -2654,6 +2674,7 @@ void handle(const std::string& line) {
     } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
     g_probe_id = id;                   // 진행·읽기·응답은 emucap_service가(그 사이 새 명령 차단)
     g_probe_remaining = frames;
+    g_probe_progress_ms = monotonic_millis();
     g_probe_mt = probe_mt;
     g_probe_addr = probe_addr;
     g_probe_len = probe_len;
@@ -3276,7 +3297,12 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
           reply_ok(g_insn_step_id, buf);     // 프레임 step과 동일 응답 형태(지연 완료)
           g_insn_step_id = -1;
         }
+        g_insn_progress_ms = 0;
         freeze_spin_until_resume();           // BP 히트와 동일 경로로 이 명령 직전에 정지
+      } else if (g_insn_step_id >= 0 && g_tx.empty()
+                 && emucap_progress_due(
+                     g_insn_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS)) {
+        reply_ok(g_insn_step_id, "{\"status\":\"working\"}");
       }
     }
     return;
@@ -3533,9 +3559,9 @@ void emucap_service(uint64_t frame) {
   }
   // 지연 명령(run_frames) 진행 중이면 그것만 진행한다(새 명령은 안 받음 — 에이전트 대기 중).
   if (g_def_id >= 0) {
-    if (!g_tx.empty()) flush_tx_once();
+    if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return;
+    if (g_def_id < 0) return;
     g_def_remaining--;
-    g_def_age++;
     if (g_def_remaining <= 0) {
       if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
       char buf[96];
@@ -3543,17 +3569,23 @@ void emucap_service(uint64_t frame) {
                (unsigned long long)g_frame);
       reply_ok(g_def_id, buf);
       g_def_id = -1;
-    } else if (g_def_age % KEEPALIVE_FRAMES == 0 && g_tx.empty()) {
+      g_def_progress_ms = 0;
+    } else if (g_tx.empty()
+               && emucap_progress_due(
+                   g_def_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS)) {
       reply_ok(g_def_id, "{\"status\":\"working\"}");  // keepalive(Rust가 working은 건너뜀)
     }
     return;
   }
   // 원자적 probe 진행 중: N프레임 진행(다른 명령 차단) 후 타깃 읽고 응답.
   if (g_probe_id >= 0) {
-    if (!g_tx.empty()) flush_tx_once();
+    if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return;
+    if (g_probe_id < 0) return;
     if (g_probe_remaining > 0) {
       g_probe_remaining--;
-      if (g_probe_remaining > 0 && g_probe_remaining % KEEPALIVE_FRAMES == 0 && g_tx.empty())
+      if (g_probe_remaining > 0 && g_tx.empty()
+          && emucap_progress_due(
+              g_probe_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS))
         reply_ok(g_probe_id, "{\"status\":\"working\"}");  // 긴 진행도 타임아웃 안 나게
       return;  // 프레임 진행만(serve_socket_once 미호출 → 네트워크 갭 없음 → 결정론)
     }
@@ -3564,11 +3596,13 @@ void emucap_service(uint64_t frame) {
       reply_ok(g_probe_id, "{\"hex\":\"" + hex + "\"}");
     }
     g_probe_id = -1;
+    g_probe_progress_ms = 0;
     return;
   }
   // step(N) 진행: 매 프레임 1씩 줄이고, 0에서 완료 응답 후 frozen 유지(다음 호출이 스핀).
   if (g_step_remaining > 0) {
-    if (!g_tx.empty()) flush_tx_once();
+    if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return;
+    if (g_step_id < 0) return;
     g_step_remaining--;
     if (g_step_remaining == 0 && g_step_id >= 0) {
       char buf[96];
@@ -3576,6 +3610,11 @@ void emucap_service(uint64_t frame) {
                (unsigned long long)g_frame);
       reply_ok(g_step_id, buf);
       g_step_id = -1;
+      g_step_progress_ms = 0;
+    } else if (g_step_id >= 0 && g_tx.empty()
+               && emucap_progress_due(
+                   g_step_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS)) {
+      reply_ok(g_step_id, "{\"status\":\"working\"}");
     }
     return;  // 반환해 프레임 1개 진행
   }

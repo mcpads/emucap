@@ -488,7 +488,7 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 
   INUSE="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED 2>/dev/null \
-            | awk 'NR > 1 && $1 ~ /(Mesen|mednafen|Flycast|pcsx-redux)/ { print $2 }' \
+            | awk 'NR > 1 && $1 ~ /(Mesen|mednafen|Flycast)/ { print $2 }' \
             | sort -u \
             | tr '\n' ' ' || true)"
   if [ -n "$INUSE" ]; then
