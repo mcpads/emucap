@@ -293,30 +293,87 @@ pub(crate) fn process_alive(pid: u32) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationMethod {
+    AlreadyExited,
+    Term,
+    Kill,
+    Taskkill,
+}
+
 /// Terminate a PID that the caller has already proven it owns. Runtime callers normally validate
 /// process start identity first; launch rollback may call this immediately for a PID it just spawned.
-pub fn terminate_detached(pid: u32) -> std::io::Result<()> {
+/// Success means the PID no longer names a live process, not merely that a signal was accepted.
+pub fn terminate_detached(pid: u32) -> std::io::Result<TerminationMethod> {
+    terminate_detached_checked(pid, || process_alive(pid))
+}
+
+/// Terminate a PID while rechecking that it still identifies the caller-owned process before every
+/// signal. The predicate must return false after the recorded process exits or its PID is reused.
+pub(crate) fn terminate_detached_checked<F>(
+    pid: u32,
+    mut target_is_alive: F,
+) -> std::io::Result<TerminationMethod>
+where
+    F: FnMut() -> bool,
+{
     #[cfg(unix)]
     {
+        if !target_is_alive() {
+            return Ok(TerminationMethod::AlreadyExited);
+        }
         // SIGTERM 먼저, 안 죽으면 SIGKILL. desmume-cli는 SIGTERM을 무시하므로
         // (adapters/desmume-nds/README.md) SIGTERM만 보내는 종료 처리는 실패한 launch에서 프로세스를
         // orphan으로 남긴다. 종료를 잠깐 폴링한 뒤 살아있으면 SIGKILL로 강제한다(shell launcher의 kill_ours와
         // 동일 규약). Windows는 taskkill /F가 이미 강제 종료.
         let p = pid as libc::pid_t;
-        unsafe { libc::kill(p, libc::SIGTERM) };
+        if unsafe { libc::kill(p, libc::SIGTERM) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(TerminationMethod::AlreadyExited);
+            }
+            return Err(error);
+        }
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(100));
-            // kill(pid, 0): 존재하면 0, 없으면(ESRCH) -1. spawn_detached의 wait 스레드가 reap하므로
-            // 프로세스가 죽으면 곧 사라진다.
-            if unsafe { libc::kill(p, 0) } != 0 {
-                return Ok(());
+            if !target_is_alive() {
+                return Ok(TerminationMethod::Term);
             }
         }
-        unsafe { libc::kill(p, libc::SIGKILL) };
-        Ok(())
+        // The PID may have been reused after SIGTERM. Revalidate the recorded identity immediately
+        // before escalation so SIGKILL can never target the replacement process.
+        if !target_is_alive() {
+            return Ok(TerminationMethod::Term);
+        }
+        if unsafe { libc::kill(p, libc::SIGKILL) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(TerminationMethod::Term);
+            }
+            return Err(error);
+        }
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !target_is_alive() {
+                return Ok(TerminationMethod::Kill);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("pid {pid} remained alive after SIGKILL"),
+        ))
     }
     #[cfg(windows)]
     {
+        if !target_is_alive() {
+            return Ok(TerminationMethod::AlreadyExited);
+        }
+        // Recheck immediately before the single taskkill operation. Unlike the Unix path, there is
+        // no later escalation signal.
+        if !target_is_alive() {
+            return Ok(TerminationMethod::AlreadyExited);
+        }
         let pid_s = pid.to_string();
         let status = Command::new("taskkill")
             .args(["/PID", &pid_s, "/T", "/F"])
@@ -324,13 +381,21 @@ pub fn terminate_detached(pid: u32) -> std::io::Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(std::io::Error::other(format!(
+        if !status.success() {
+            return Err(std::io::Error::other(format!(
                 "taskkill failed for pid {pid}"
-            )))
+            )));
         }
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !target_is_alive() {
+                return Ok(TerminationMethod::Taskkill);
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("pid {pid} remained alive after taskkill"),
+        ))
     }
 }
 

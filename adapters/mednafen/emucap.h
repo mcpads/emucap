@@ -3,6 +3,23 @@
 #ifndef EMUCAP_H
 #define EMUCAP_H
 #include <cstdint>
+
+// Return true once per elapsed interval. The caller supplies a monotonic clock so the transition
+// stays deterministic in the native unit test and uses steady_clock in production.
+inline bool emucap_progress_due(
+    std::uint64_t& last_progress_ms,
+    std::uint64_t now_ms,
+    std::uint64_t interval_ms) {
+  if (interval_ms == 0) return false;
+  if (now_ms < last_progress_ms) {
+    last_progress_ms = now_ms;
+    return false;
+  }
+  if (now_ms - last_progress_ms < interval_ms) return false;
+  last_progress_ms = now_ms;
+  return true;
+}
+
 void emucap_service(uint64_t frame);
 // 입력 주입: 주입 입력이 있으면 포트0 버퍼를 덮어쓴다. namespace Mednafen 안(mednafen.cpp)과
 // 밖(드라이버) 양쪽에서 호출하므로 extern "C"로 linkage를 고정한다(C++ mangling 불일치 방지).

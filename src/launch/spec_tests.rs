@@ -253,8 +253,8 @@ fn mesen_spec_passes_rom_lua_and_cli_config_overrides() {
     assert_eq!(&spec.args[0], "game.sfc");
     assert_eq!(&spec.args[1], "/a/emucap-snes.lua");
     // Required settings are applied via CLI config override, not by editing the user's
-    // settings.json (so the user's key mappings/controller are inherited untouched), and
-    // --donotSaveSettings keeps the overrides out of the user's saved config.
+    // settings.json. The portable template supplies Mesen's built-in native mappings, and
+    // --donotSaveSettings keeps the isolated runtime profile unchanged.
     let has = |a: &str| spec.args.iter().any(|x| x == a);
     assert!(has("--debug.scriptWindow.allowIoOsAccess=true"));
     assert!(has("--debug.scriptWindow.allowNetworkAccess=true"));

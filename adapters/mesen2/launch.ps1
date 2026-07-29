@@ -57,7 +57,7 @@ function Get-EmulatorConnectionPids([int]$LocalPort) {
   foreach ($conn in @(Get-LocalTcpConnections $LocalPort | Where-Object { $_.State -eq "Established" })) {
     try {
       $proc = Get-Process -Id $conn.OwningProcess -ErrorAction Stop
-      if ($proc.ProcessName -match '^(Mesen|mednafen|Flycast|pcsx-redux|mame)$') {
+      if ($proc.ProcessName -match '^(Mesen|mednafen|Flycast|mame)$') {
         $pids += $proc.Id
       }
     } catch {
@@ -240,20 +240,11 @@ if ($portableFull.Equals($sourceDir, [System.StringComparison]::OrdinalIgnoreCas
 Replace-PortableDirectory $sourceDir $portableDir
 
 $settings = Join-Path $portableDir "settings.json"
-@'
-{
-  "Debug": {
-    "ScriptWindow": {
-      "AllowIoOsAccess": true,
-      "AllowNetworkAccess": true,
-      "ScriptTimeout": 60
-    }
-  },
-  "Preferences": {
-    "SingleInstance": false
-  }
+$settingsTemplate = Join-Path $here "portable-settings.json"
+if (-not (Test-Path -LiteralPath $settingsTemplate -PathType Leaf)) {
+  throw "portable Mesen settings template is missing: $settingsTemplate"
 }
-'@ | Set-Content $settings -Encoding UTF8
+Copy-Item -LiteralPath $settingsTemplate -Destination $settings -Force
 
 $isGba = ((Split-Path -Leaf $lua) -eq "emucap-gba.lua") -or ([System.IO.Path]::GetExtension($Rom) -ieq ".gba")
 if ($isGba) {

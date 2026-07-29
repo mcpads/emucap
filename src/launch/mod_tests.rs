@@ -299,6 +299,7 @@ fn terminate_detached_escalates_to_sigkill_when_sigterm_ignored() {
         .args(["-c", &script])
         .spawn()
         .expect("spawn SIGTERM-ignoring test process");
+    let pid = child.id();
     for _ in 0..200 {
         if ready.exists() {
             break;
@@ -306,11 +307,46 @@ fn terminate_detached_escalates_to_sigkill_when_sigterm_ignored() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(ready.exists(), "test process never signalled ready");
-    terminate_detached(child.id()).expect("terminate");
-    let status = child.wait().expect("wait");
-    assert_eq!(
-        status.signal(),
-        Some(9),
-        "a SIGTERM-ignoring process must be escalated to SIGKILL"
+    let waiter = std::thread::spawn(move || child.wait().expect("wait"));
+    let method = terminate_detached(pid).expect("terminate");
+    let status = waiter.join().unwrap();
+    assert_eq!(method, TerminationMethod::Kill);
+    assert_eq!(status.signal(), Some(9));
+}
+
+#[cfg(unix)]
+#[test]
+fn terminate_detached_does_not_escalate_after_target_identity_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let script = format!("trap '' TERM; : > '{}'; exec sleep 30", ready.display());
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", &script])
+        .spawn()
+        .expect("spawn SIGTERM-ignoring test process");
+    let pid = child.id();
+    for _ in 0..200 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "test process never signalled ready");
+
+    let identity_checks = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_checks = identity_checks.clone();
+    let method = terminate_detached_checked(pid, move || {
+        observed_checks.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2
+    })
+    .expect("identity change should stop escalation");
+
+    assert_eq!(method, TerminationMethod::Term);
+    assert!(
+        process_alive(pid),
+        "the helper sent SIGKILL after the predicate stopped identifying the target"
     );
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    child.wait().unwrap();
 }

@@ -2,6 +2,26 @@
 
 Actively developed beta software — interfaces may still change.
 
+## 0.11.2
+
+### Fixed
+- Mesen portable sessions initialize the pinned host's built-in controller and keyboard mappings instead of starting with an unmapped isolated profile. The shared template is applied by the MCP and both fallback launchers without reading or modifying the user's normal Mesen settings.
+
+## 0.11.1
+
+### Added
+- Added `stop(launch_id)` for identity-verified shutdown of a managed emulator generation. It rejects stale, foreign, broker-owned, unmanaged, or unverifiable processes without signalling them and preserves termination evidence.
+
+### Changed
+- Long synchronous operations now distinguish nonterminal progress from completion and retain a separate overall deadline, preventing progress responses from extending work indefinitely.
+
+### Fixed
+- Mednafen frame and instruction stepping, frame runs, timed input, and probes report monotonic progress before the frontend idle timeout. A maximum-size 5,000-frame Mega Drive step now completes without dropping the connection and returns to a frozen state.
+- Dolphin frame and instruction stepping use bounded internal operation deadlines so a stalled native wait returns a terminal error before the frontend can mistake it for a disconnected adapter.
+
+### Removed
+- Removed the unused, unregistered PCSX-Redux runtime draft and its build and launch scripts. PlayStation support continues through the Mednafen adapter.
+
 ## 0.11.0
 
 ### Added

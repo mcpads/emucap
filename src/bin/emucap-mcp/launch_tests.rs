@@ -1605,6 +1605,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
         .spawn()
         .unwrap();
     let orphan_bridge_pid = orphan_bridge.id();
+    let orphan_bridge_reaper = std::thread::spawn(move || orphan_bridge.wait());
     let old_manifest = old.manifest(ManifestSpec {
         adapter: "mame_pc98".into(),
         system: "pc98".into(),
@@ -1635,7 +1636,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
         },
     );
     assert_eq!(outcome["launched"], true, "{outcome}");
-    orphan_bridge.wait().unwrap();
+    orphan_bridge_reaper.join().unwrap().unwrap();
     assert_eq!(
         old_manifest.bridge_process_state(),
         Some(ProcessState::Exited)

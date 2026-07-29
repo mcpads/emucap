@@ -1,0 +1,14 @@
+{
+  "ConfigUpgrade": 1,
+  "DefaultKeyMappings": "Xbox, ArrowKeys",
+  "Debug": {
+    "ScriptWindow": {
+      "AllowIoOsAccess": true,
+      "AllowNetworkAccess": true,
+      "ScriptTimeout": 60
+    }
+  },
+  "Preferences": {
+    "SingleInstance": false
+  }
+}

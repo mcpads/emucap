@@ -946,11 +946,19 @@ pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLi
             .ok()
             .flatten()
     });
-    enrich_runtime_instance(
-        object,
-        &continuity,
-        refreshed_current.map(|current| current.public_value_with_lease(&continuity.lease)),
-    );
+    let current = refreshed_current.map(|current| {
+        let mut value = current.public_value_with_lease(&continuity.lease);
+        if let (Some(runtime), Some(termination)) =
+            (value.as_object_mut(), continuity.termination.as_ref())
+        {
+            runtime.insert(
+                "termination".into(),
+                serde_json::to_value(termination).unwrap_or_else(|_| serde_json::json!({})),
+            );
+        }
+        value
+    });
+    enrich_runtime_instance(object, &continuity, current);
 }
 
 fn enrich_runtime_instance(
@@ -1075,6 +1083,6 @@ fn owned_instance_json(emu_dir: &str, port: u16) -> serde_json::Value {
         "run_dir": run_dir.display().to_string(),
         "pids": pids,
         "pidfiles": pidfiles,
-        "cleanup": "To stop this instance, terminate only the PIDs listed here and recorded in the per-port pidfiles. On Unix use `kill <pid>`; on Windows use `taskkill /PID <pid> /F`. Never use name- or path-based broad termination such as pkill, killall, or taskkill /IM because another session may use the same binary.",
+        "cleanup": "For a managed runtime, use stop(status.runtime_instance.launch_id). These pidfiles are diagnostic fallback data and do not replace launch-generation, lease, and process-start identity verification. Never use name- or path-based broad termination such as pkill, killall, or taskkill /IM.",
     })
 }

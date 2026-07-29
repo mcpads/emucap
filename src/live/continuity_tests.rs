@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::*;
 use crate::live::link::EmulatorIdentity;
+use crate::live::runtime::TerminationState;
 
 enum Outcome {
     Ok(Value),
@@ -78,6 +79,21 @@ fn current(store: &RuntimeStore, port: u16) -> CurrentManifest {
     });
     prepared.commit(&manifest).unwrap();
     manifest
+}
+
+#[test]
+fn continuity_surfaces_durable_requested_stop_without_erasing_other_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47819);
+    let requested = TerminationRecord::requested(47819, current.launch_id.clone(), None);
+    store.write_current_termination(&requested).unwrap();
+    let inner = SequenceLink::new(47819, &current.launch_id, []);
+    let link = ObservedLink::with_store(inner, store);
+
+    let termination = link.continuity().termination.unwrap();
+    assert_eq!(termination.launch_id, current.launch_id);
+    assert_eq!(termination.state, TerminationState::Requested);
 }
 
 #[test]

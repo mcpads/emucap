@@ -93,7 +93,7 @@ PIDFILE="$RUN_DIR/flycast.pid"
 if command -v lsof >/dev/null 2>&1; then
   LISTENER="$(lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 { print $1 ":" $2 }' | sort -u | tr '\n' ' ' || true)"
   [ -z "$LISTENER" ] && { echo "ERROR: 포트 ${PORT}에 MCP listener가 없음 — 먼저 emucap status로 listening_port를 받아라."; exit 3; }
-  INUSE="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED 2>/dev/null | grep -iE 'Flycast|Mesen|mednafen|pcsx-redux|mame' | awk '{print $2}' | sort -u || true)"
+  INUSE="$(lsof -nP -iTCP:"$PORT" -sTCP:ESTABLISHED 2>/dev/null | grep -iE 'Flycast|Mesen|mednafen|mame' | awk '{print $2}' | sort -u || true)"
   [ -n "$INUSE" ] && { echo "ERROR: 포트 ${PORT}에 이미 에뮬레이터(PID $(echo "$INUSE" | tr '\n' ' '))가 연결됨 — 거부."; exit 3; }
 fi
 # 고아만 정리(우리 PIDFILE)
