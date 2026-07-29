@@ -250,7 +250,7 @@ fn portable_plain_binary_refuses_symlinked_parent_inside_emucap_home() {
 }
 
 #[test]
-fn portable_app_bundle_copies_bundle_and_keeps_source_settings() {
+fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
     let src = tempfile::tempdir().unwrap();
     let emu_home = tempfile::tempdir().unwrap();
     let app = src.path().join("Mesen.app");
@@ -312,14 +312,15 @@ fn portable_app_bundle_copies_bundle_and_keeps_source_settings() {
         assert!(source_plist.contains("<string>ca.mesen</string>"));
         assert!(!source_plist.contains("ca.mesen.emucap"));
     }
-    // app bundle copy는 source .app의 settings.json을 그대로 옮길 뿐, 우리가 키를 주입하지
-    // 않는다(필수값은 CLI override). source에 있던 값은 유지되고 우리 키는 없다.
+    ensure_portable_settings(&portable).unwrap();
+
+    // The source app remains read-only input, while the emucap-owned copy gets the deterministic
+    // isolated profile needed for native host input.
     let v = read(&portable.settings);
-    assert_eq!(v["Video"]["Scale"], json!(4));
-    assert!(
-        v.get("Debug").is_none(),
-        "settings.json에 우리 키를 주입하지 않는다"
-    );
+    assert!(v.get("Video").is_none());
+    assert_eq!(v["ConfigUpgrade"], 1);
+    assert_eq!(v["DefaultKeyMappings"], "Xbox, ArrowKeys");
+    assert_eq!(read(&source_settings), json!({"Video": {"Scale": 4}}));
 }
 
 /// Run `f` with `EMUCAP_EMU_HOME` and `EMUCAP_GBA_BIOS` set as given (both restored after),
@@ -379,6 +380,14 @@ fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
     assert_eq!(settings["Debug"]["ScriptWindow"]["ScriptTimeout"], 60);
     assert_eq!(settings["Preferences"]["SingleInstance"], false);
     assert_eq!(
+        settings["ConfigUpgrade"], 1,
+        "Mesen must run its pinned FirstRun input initializer"
+    );
+    assert_eq!(
+        settings["DefaultKeyMappings"], "Xbox, ArrowKeys",
+        "the isolated profile must provide native host input mappings"
+    );
+    assert_eq!(
         portable.settings.parent(),
         portable.binary.parent(),
         "settings and Firmware must resolve from the same portable data directory"
@@ -386,7 +395,7 @@ fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
 }
 
 #[test]
-fn portable_setup_preserves_existing_settings() {
+fn portable_setup_replaces_build_settings_with_isolated_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let lua = dir.path().join("emucap-gba.lua");
     let log = dir.path().join("launch.log");
@@ -396,7 +405,10 @@ fn portable_setup_preserves_existing_settings() {
 
     ensure_portable_settings(&portable).unwrap();
 
-    assert_eq!(read(&portable.settings), json!({"Video": {"Scale": 4}}));
+    let settings = read(&portable.settings);
+    assert!(settings.get("Video").is_none());
+    assert_eq!(settings["ConfigUpgrade"], 1);
+    assert_eq!(settings["DefaultKeyMappings"], "Xbox, ArrowKeys");
 }
 
 #[test]
@@ -413,6 +425,7 @@ fn non_gba_also_gets_the_portable_settings_marker() {
         read(&portable.settings)["Preferences"]["SingleInstance"],
         false
     );
+    assert_eq!(read(&portable.settings)["ConfigUpgrade"], 1);
 }
 
 #[cfg(unix)]

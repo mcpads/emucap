@@ -251,21 +251,16 @@ find_app_bundle() {
 
 write_portable_settings() {
   local settings="$1"
-  mkdir -p "$(dirname "$settings")"
-  cat > "$settings" <<'JSON'
-{
-  "Debug": {
-    "ScriptWindow": {
-      "AllowIoOsAccess": true,
-      "AllowNetworkAccess": true,
-      "ScriptTimeout": 60
-    }
-  },
-  "Preferences": {
-    "SingleInstance": false
+  local template="$HERE/portable-settings.json"
+  local tmp="${settings}.tmp.$$"
+  [ -f "$template" ] || {
+    echo "ERROR: portable Mesen settings template is missing: $template" >&2
+    return 1
   }
-}
-JSON
+  mkdir -p "$(dirname "$settings")"
+  rm -f "$tmp"
+  cp "$template" "$tmp"
+  mv -f "$tmp" "$settings"
 }
 
 is_gba_launch() {

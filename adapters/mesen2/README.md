@@ -68,8 +68,9 @@ after a crash, new launches are blocked until it is dismissed.
 Recommended path: call the MCP `launch` tool. It verifies the pinned compatible host, copies its
 complete app bundle (macOS) or publish directory into an emucap-owned portable directory, applies
 required options without modifying the user's default settings, and keeps native input available.
-Every system gets a minimal portable `settings.json`; GBA also stages its BIOS into that same
-portable home.
+Every system gets a minimal portable `settings.json` that asks Mesen to initialize its built-in
+Xbox and keyboard mappings in memory; it does not copy or modify the user's custom mappings. GBA
+also stages its BIOS into that same portable home.
 The legacy `adapters/mesen2/launch.sh <ROM> <EMUCAP_PORT> [EMUCAP_NAME] [SYSTEM]` helper follows the
 same portable copy rule and remains a fallback when the MCP tool is unavailable. `launch_plan`
 includes the normalized system in this fallback command. Direct use may omit `SYSTEM` for known ROM
@@ -167,11 +168,12 @@ launch a `.gba` file with `system: "gba"`; for NES, launch a `.nes` file with `s
 
 The launcher uses an emucap-owned portable Mesen copy under `EMUCAP_EMU_HOME` or the OS default emucap
 data root. Every system gets a local `settings.json` portable-home marker so Mesen cannot fall back to
-the user's ordinary configuration or native library. The Rust MCP launcher applies required options
-on the command line; fallback launchers use the same isolation rule. On macOS each portable app also
-gets a port-specific bundle identifier, keeping its LaunchServices and saved-state namespace separate
-from the user's Mesen and other emucap ports. Pidfiles and logs stay under the per-port directory
-unless `EMUCAP_LOG` overrides the log path.
+the user's ordinary configuration or native library. The shared portable template triggers Mesen's
+built-in input defaults on every launch, while `--donotSaveSettings` keeps that initialization
+ephemeral. The Rust MCP launcher applies required options on the command line; fallback launchers use
+the same isolation rule. On macOS each portable app also gets a port-specific bundle identifier,
+keeping its LaunchServices and saved-state namespace separate from the user's Mesen and other emucap
+ports. Pidfiles and logs stay under the per-port directory unless `EMUCAP_LOG` overrides the log path.
 
 **macOS / Linux fallback** — use `launch.sh` only when the MCP `launch` tool is unavailable:
 

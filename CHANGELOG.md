@@ -11,6 +11,7 @@ Actively developed beta software — interfaces may still change.
 - Long synchronous operations now distinguish nonterminal progress from completion and retain a separate overall deadline, preventing progress responses from extending work indefinitely.
 
 ### Fixed
+- Mesen portable sessions initialize the pinned host's built-in controller and keyboard mappings instead of starting with an unmapped isolated profile. The shared template is applied by the MCP and both fallback launchers without reading or modifying the user's normal Mesen settings.
 - Mednafen frame and instruction stepping, frame runs, timed input, and probes report monotonic progress before the frontend idle timeout. A maximum-size 5,000-frame Mega Drive step now completes without dropping the connection and returns to a frozen state.
 - Dolphin frame and instruction stepping use bounded internal operation deadlines so a stalled native wait returns a terminal error before the frontend can mistake it for a disconnected adapter.
 

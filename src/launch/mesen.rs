@@ -5,8 +5,9 @@
 //! so starting an emucap instance doesn't take over the user's other open ROM, and a controller
 //! connected on the game port (emu.setInput reaches no device otherwise). A minimal settings.json
 //! keeps every launch in the copied portable home instead of loading the user's config or native
-//! libraries. Required values are also passed as CLI overrides with `--donotSaveSettings`; neither
-//! path modifies the user's file.
+//! libraries, and asks Mesen to initialize its built-in native input mappings in memory. Required
+//! values are also passed as CLI overrides with `--donotSaveSettings`; neither path modifies the
+//! user's file.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -368,7 +369,7 @@ pub fn prepare_portable_binary(
     }
 
     // launch() installs the per-port portable marker after validating this
-    // copied runtime, preserving any regular settings file bundled with it.
+    // copied runtime, replacing any settings file bundled with the build.
     Ok(PreparedPortable {
         binary,
         settings,
@@ -414,19 +415,10 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     Ok(pid)
 }
 
-const PORTABLE_SETTINGS: &str = r#"{
-  "Debug": {
-    "ScriptWindow": {
-      "AllowIoOsAccess": true,
-      "AllowNetworkAccess": true,
-      "ScriptTimeout": 60
-    }
-  },
-  "Preferences": {
-    "SingleInstance": false
-  }
-}
-"#;
+const PORTABLE_SETTINGS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/adapters/mesen2/portable-settings.json"
+));
 
 fn is_gba_launch(l: &Launch) -> bool {
     l.lua.file_name().and_then(|name| name.to_str()) == Some("emucap-gba.lua")
@@ -437,8 +429,10 @@ fn is_gba_launch(l: &Launch) -> bool {
 }
 
 /// A settings.json beside the executable is Mesen's portable-data marker. It keeps configuration and
-/// native-library lookup in the per-port copy; for GBA it also makes the staged Firmware directory
-/// the lookup path. An existing regular file copied from the source app is preserved verbatim.
+/// native-library lookup in the per-port copy, and the shared template requests Mesen's built-in
+/// native input defaults. For GBA it also makes the staged Firmware directory the lookup path.
+/// Settings copied from the build are replaced so build-machine state cannot affect an isolated
+/// launch.
 fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> {
     if super::has_symlink_component_under(&portable.home, &portable.settings) {
         return Err(std::io::Error::new(
@@ -449,10 +443,7 @@ fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> 
             ),
         ));
     }
-    if portable.settings.is_file() {
-        return Ok(());
-    }
-    if portable.settings.exists() {
+    if portable.settings.exists() && !portable.settings.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             format!(
@@ -468,6 +459,12 @@ fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> 
     if let Err(err) = std::fs::write(&tmp, PORTABLE_SETTINGS.as_bytes()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
+    }
+    if portable.settings.is_file() {
+        if let Err(err) = std::fs::remove_file(&portable.settings) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
     }
     super::rename_file_tmp(&tmp, &portable.settings)
 }

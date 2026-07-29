@@ -147,12 +147,11 @@ pub fn mesen_spec(binary: &Path, log_path: &Path, lua: &Path, opts: &SpecOpts) -
         .arg(opts.content)
         .arg(lua.to_string_lossy().into_owned())
         // Apply the emucap-required settings via CLI config override instead of editing the
-        // user's settings.json. This inherits the user's own key mappings / controller (so a
-        // human can drive the GUI) while enabling the Lua socket, and --donotSaveSettings keeps
-        // these overrides out of the saved config. Cross-platform: CommandLineHelper parses these
-        // identically on macOS/Linux/Windows. ScriptWindow lives under Debug; SingleInstance under
-        // Preferences. snes.port1.type is forced so emucap set_input always reaches a controller,
-        // even on a fresh profile where the user hasn't attached one yet.
+        // user's settings.json. The portable settings template initializes Mesen's built-in
+        // native mappings so a human can drive the GUI; --donotSaveSettings keeps the isolated
+        // runtime profile unchanged. Cross-platform: CommandLineHelper parses these identically
+        // on macOS/Linux/Windows. ScriptWindow lives under Debug; SingleInstance under Preferences.
+        // snes.port1.type is forced so emucap set_input always reaches a controller.
         .args([
             "--debug.scriptWindow.allowIoOsAccess=true",
             "--debug.scriptWindow.allowNetworkAccess=true",
