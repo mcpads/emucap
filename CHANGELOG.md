@@ -2,6 +2,21 @@
 
 Actively developed beta software — interfaces may still change.
 
+## 0.12.0-alpha.1
+
+### Added
+- Added MCP 2026-07-28 discovery and request-per-message compatibility to both stdio servers while preserving the legacy `initialize` lifecycle. Real-process wire tests cover modern discovery, tool listing and invocation, legacy fallback, and fail-loud unsupported-version recovery.
+- Added public one-hour cache hints for binary-static server discovery and tool schemas. Runtime adapter capabilities remain uncached and are reported only by `status`.
+
+### Changed
+- Updated the Rust MCP SDK to rmcp 3.0.1; moved the hashing, Base64, SQLite, ULID, ZIP, and WebSocket crates to their current stable major releases; refreshed the remaining compatible dependencies; and declared Rust 1.88 as the minimum supported compiler.
+- Separated MCP protocol lifecycle from emulator generations, control leases, and tracking runs in the architecture and runtime lifecycle contracts. Shared transports remain blocked until mutation requests carry explicit application context and lease identity.
+- Moved the DeSmuME, PPSSPP, and MAME source pins into adapter-local lock files. DeSmuME and PPSSPP now verify their ordered patch-stack digests, and MAME verifies its pinned source archive on both `shasum` and `sha256sum` hosts.
+
+### Fixed
+- Build guards now validate the current file-based Mesen portable settings template instead of searching for the removed inline heredoc, and derive the Mednafen corrupt-cache fixture filename from the pinned version.
+- SQLite indexing now converts intervention sequence and frame counters to its signed integer domain explicitly and rejects out-of-range values instead of relying on an implicit unsigned conversion.
+
 ## 0.11.2
 
 ### Fixed

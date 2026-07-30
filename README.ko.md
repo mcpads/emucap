@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.11.2 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.12.0-alpha.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -39,7 +39,7 @@ override를 우선한다.
 
 ### 1. 사전 요건 (에이전트가 확인 후 없으면 설치)
 
-- **Rust** — `command -v cargo` 로 확인. 없으면:
+- **Rust 1.88 이상** — `command -v cargo`와 `rustc --version`으로 확인. 없으면:
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
 - **C 컴파일러** (SQLite 번들 빌드용) — macOS: `xcode-select -p || xcode-select --install`.
   Linux: `cc --version || sudo apt-get install -y build-essential`. Windows: MSVC C++ build tools를

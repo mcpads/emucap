@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.11.2 — beta.** This repository remains under active development; interfaces and
+**v0.12.0-alpha.1 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -51,7 +51,7 @@ use the equivalents (and see the Platforms note above).
 
 ### 1. Prerequisites (the agent checks, and installs if missing)
 
-- **Rust** — check with `command -v cargo`. If missing:
+- **Rust 1.88 or newer** — check with `command -v cargo` and `rustc --version`. If missing:
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
 - **C compiler** (to build the bundled SQLite) — macOS: `xcode-select -p || xcode-select --install`.
   Linux: `cc --version || sudo apt-get install -y build-essential`. Windows: install the MSVC C++
