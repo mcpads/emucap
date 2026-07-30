@@ -18,6 +18,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
+. "$HERE/upstream.lock"
 PATCH="$HERE/patches/0001-headless-cli.patch"
 PATCH2="$HERE/patches/0002-emucap-hooks.patch"
 PATCH3="$HERE/patches/0003-emucap-state-disasm.patch"
@@ -48,17 +49,34 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 [ -f "$PATCH9" ] || { echo "ERROR: emucap gdb SIGPIPE patch not found: $PATCH9" >&2; exit 1; }
 [ -f "$PATCH10" ] || { echo "ERROR: emucap shared-scheduler state patch not found: $PATCH10" >&2; exit 1; }
 
+if command -v shasum >/dev/null 2>&1; then
+  ACTUAL_PATCHSET_SHA256="$(
+    for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10"; do
+      cat "$patch"
+    done | shasum -a 256 | awk '{print $1}'
+  )"
+elif command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_PATCHSET_SHA256="$(
+    for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10"; do
+      cat "$patch"
+    done | sha256sum | awk '{print $1}'
+  )"
+else
+  echo "ERROR: shasum or sha256sum is required" >&2
+  exit 1
+fi
+[ "$ACTUAL_PATCHSET_SHA256" = "$DESMUME_PATCHSET_SHA256" ] || {
+  echo "ERROR: DeSmuME patch stack does not match upstream.lock" >&2
+  exit 1
+}
+
 for tool in meson ninja git; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: missing build tool: $tool (macOS: brew install $tool)" >&2; exit 1; }
 done
 
 emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "DeSmuME"
-
-# DeSmuME upstream is pinned to a known-good revision — the patch stack (0001-0010) is written
-# against exactly this tree. Cloning a moving HEAD would silently build an untested revision, and any
-# upstream edit near the patch hunks would break fresh installs with no repo change. Bump this
-# deliberately (and re-verify the patch stack) when moving to a newer DeSmuME.
-DESMUME_COMMIT="a7570473c0c0d3271bf652f534ab8fd584c6dfae"
 
 # 1. Work-tree source: prefer a read-only EMUCAP_DESMUME_SRC copy, else clone the pinned upstream.
 if [ ! -d "$SRC/.git" ]; then
@@ -70,9 +88,9 @@ if [ ! -d "$SRC/.git" ]; then
     src_rev="$(git -C "$SRC" rev-parse HEAD)"
     [ "$src_rev" = "$DESMUME_COMMIT" ] || echo "WARNING: EMUCAP_DESMUME_SRC HEAD $src_rev != supported $DESMUME_COMMIT — the patch stack may not apply cleanly." >&2
   else
-    echo "→ cloning DeSmuME upstream (pinned $DESMUME_COMMIT): TASEmulators/desmume"
+    echo "→ cloning DeSmuME upstream (pinned $DESMUME_COMMIT)"
     git init -q "$SRC"
-    git -C "$SRC" fetch -q --depth 1 https://github.com/TASEmulators/desmume.git "$DESMUME_COMMIT"
+    git -C "$SRC" fetch -q --depth 1 "$DESMUME_REPO" "$DESMUME_COMMIT"
     git -C "$SRC" checkout -q FETCH_HEAD
     got="$(git -C "$SRC" rev-parse HEAD)"
     [ "$got" = "$DESMUME_COMMIT" ] || { echo "ERROR: DeSmuME revision mismatch: got $got expected $DESMUME_COMMIT" >&2; exit 1; }

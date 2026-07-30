@@ -1,0 +1,4 @@
+MAME_LOCK_VERSION=0.288
+MAME_LOCK_TAG=mame0288
+MAME_LOCK_URL=https://github.com/mamedev/mame/archive/refs/tags/mame0288.tar.gz
+MAME_LOCK_SHA256=244d916eb3fb8bcd71f2ac51ae71ab6af8cf99869ea7b85d7efc7339ea56c563

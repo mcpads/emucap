@@ -3,13 +3,31 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
+. "$HERE/upstream.lock"
 WORK_INPUT="${EMUCAP_PPSSPP_WORK:-$HERE/work}"
 [ ! -L "$WORK_INPUT" ] || { echo "ERROR: PPSSPP work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
 mkdir -p "$WORK_INPUT"
 WORK="$(cd "$WORK_INPUT" && pwd -P)"
 emucap_acquire_build_lock "${EMUCAP_BUILD_LOCK:-$WORK/.build.lock}" "PPSSPP"
-PPSSPP_COMMIT="${EMUCAP_PPSSPP_COMMIT:-56c694d88bbf82270e8b472fe63abd60f3f8e0a9}"
-REPO="https://github.com/hrydgard/ppsspp.git"
+PPSSPP_COMMIT="${EMUCAP_PPSSPP_COMMIT:-$PPSSPP_COMMIT}"
+if command -v shasum >/dev/null 2>&1; then
+  ACTUAL_PATCHSET_SHA256="$(
+    for patch in "$HERE"/patches/*.patch; do cat "$patch"; done |
+      shasum -a 256 | awk '{print $1}'
+  )"
+elif command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_PATCHSET_SHA256="$(
+    for patch in "$HERE"/patches/*.patch; do cat "$patch"; done |
+      sha256sum | awk '{print $1}'
+  )"
+else
+  echo "ERROR: shasum or sha256sum is required" >&2
+  exit 1
+fi
+[ "$ACTUAL_PATCHSET_SHA256" = "$PPSSPP_PATCHSET_SHA256" ] || {
+  echo "ERROR: PPSSPP patch stack does not match upstream.lock" >&2
+  exit 1
+}
 # macOS: force Apple clang (homebrew LLVM breaks libc++).
 if [ "$(uname)" = "Darwin" ]; then export CC=/usr/bin/clang CXX=/usr/bin/clang++; fi
 # emucap ALWAYS builds inside its own work tree ($WORK/ppsspp), never in a caller-supplied checkout.
@@ -17,7 +35,7 @@ if [ "$(uname)" = "Darwin" ]; then export CC=/usr/bin/clang CXX=/usr/bin/clang++
 # the initial clone skips the network. The pinned checkout, the emucap patch stack, and the build all
 # happen only in $SRC — the supplied checkout is never patched or built in.
 SRC="$WORK/ppsspp"
-ORIGIN="${EMUCAP_PPSSPP_SRC:-$REPO}"
+ORIGIN="${EMUCAP_PPSSPP_SRC:-$PPSSPP_REPO}"
 if [ ! -d "$SRC/.git" ]; then git clone --recurse-submodules "$ORIGIN" "$SRC"; fi
 git -C "$SRC" fetch --recurse-submodules origin
 git -C "$SRC" checkout "$PPSSPP_COMMIT"
