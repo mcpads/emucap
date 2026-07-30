@@ -191,7 +191,7 @@ MESEN_BIN="${MESEN_BIN:-$(resolve_default_mesen || true)}"
 case "$MESEN_BIN" in
   *.app) MESEN_BIN="$MESEN_BIN/Contents/MacOS/Mesen" ;;
 esac
-OLD="$(cat "$PIDFILE" 2>/dev/null || true)"
+OLD="$(head -n 1 "$PIDFILE" 2>/dev/null | tr -d '\r\n' || true)"
 TOKEN_FILE="$(emucap_session_token_file "$PORT")"
 SESSION_TOKEN="${EMUCAP_SESSION_TOKEN:-}"
 if [ -z "$SESSION_TOKEN" ] && [ -r "$TOKEN_FILE" ]; then
@@ -463,6 +463,29 @@ kill_ours() {
   kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
 }
 
+refuse_live_portable_pid() {
+  local pid="$1" command_line portable_root="$RUN_DIR"
+  case "$pid" in
+    ''|*[!0-9]*) return 0 ;;
+  esac
+  kill -0 "$pid" 2>/dev/null || return 0
+  if [ -d "$RUN_DIR" ]; then
+    portable_root="$(cd "$RUN_DIR" && pwd -P)"
+  fi
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  case "$command_line" in
+    "$portable_root/"*)
+      echo "ERROR: the previous per-port Mesen PID $pid is still alive; refusing replacement." >&2
+      echo "  End its exact managed generation with MCP stop before launching another one." >&2
+      return 1
+      ;;
+    *)
+      # A reused or foreign PID is not ours. Never signal it; the new launch may coexist with it.
+      return 0
+      ;;
+  esac
+}
+
 # 안전장치 0 (status 선행 강제): 이 포트에 MCP listener가 없으면 status를 안 불렀거나 stale 포트를
 #   넘긴 것이다. 이 상태에서 GUI를 띄우면 연결 대기 후 launcher가 죽여 "비디오 초기화 직후 종료"처럼 보이므로
 #   에뮬레이터를 아예 띄우지 않는다.
@@ -495,12 +518,10 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
-# 안전장치 2 (고아만 정리): 위에서 '연결된 에뮬레이터 없음'을 확인했으니, 우리 PIDFILE의 OLD가 살아 있고
-#   Mesen.app이면 = emucap-mcp는 죽었는데 떠 있는 고아 창(우리 이전 실행의 잔해)일 뿐이다. 그것만 정리한다.
-#   연결돼 일하는 인스턴스는 위 안전장치 1이 이미 거부했으므로 여기서 타 세션을 죽일 일은 없다.
-if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null && ps -p "$OLD" -o command= 2>/dev/null | grep -q 'Mesen.app'; then
-  kill_ours "$OLD"
-fi
+# A legacy launch has no generation/process-start identity strong enough to terminate an earlier
+# process safely. Refuse an exact per-port portable process and ignore a reused/foreign PID; never
+# turn a stale pidfile into a signal against the user's ordinary Mesen.
+refuse_live_portable_pid "$OLD" || exit 3
 
 SOURCE_MESEN_BIN="$MESEN_BIN"
 MESEN_APP_BUNDLE=""

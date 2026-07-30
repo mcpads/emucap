@@ -323,6 +323,61 @@ fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
     assert_eq!(read(&source_settings), json!({"Video": {"Scale": 4}}));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn portable_ports_get_distinct_bundle_identities_without_touching_source_profile() {
+    let src = tempfile::tempdir().unwrap();
+    let emu_home = tempfile::tempdir().unwrap();
+    let app = src.path().join("Mesen.app");
+    let source_bin = app.join("Contents/MacOS/Mesen");
+    let source_info = app.join("Contents/Info.plist");
+    let source_settings = app.join("Contents/MacOS/settings.json");
+    std::fs::create_dir_all(source_bin.parent().unwrap()).unwrap();
+    std::fs::write(&source_bin, "fake app mesen").unwrap();
+    std::fs::write(
+        &source_info,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>ca.mesen</string>
+</dict></plist>
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &source_settings,
+        br#"{"Preferences":{"SingleInstance":true}}"#,
+    )
+    .unwrap();
+
+    let (first, second) = with_emu_home(emu_home.path(), || {
+        (
+            prepare_portable_binary(&source_bin, 47921).unwrap(),
+            prepare_portable_binary(&source_bin, 47922).unwrap(),
+        )
+    });
+
+    let first_info =
+        std::fs::read_to_string(first.home.join("Mesen.app/Contents/Info.plist")).unwrap();
+    let second_info =
+        std::fs::read_to_string(second.home.join("Mesen.app/Contents/Info.plist")).unwrap();
+    assert!(first_info.contains("ca.mesen.emucap.p47921"));
+    assert!(second_info.contains("ca.mesen.emucap.p47922"));
+    assert_eq!(
+        std::fs::read_to_string(&source_info).unwrap(),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>ca.mesen</string>
+</dict></plist>
+"#
+    );
+    assert_eq!(
+        read(&source_settings),
+        json!({"Preferences": {"SingleInstance": true}})
+    );
+}
+
 /// Run `f` with `EMUCAP_EMU_HOME` and `EMUCAP_GBA_BIOS` set as given (both restored after),
 /// under the shared env lock so it does not race other env-touching tests.
 fn with_gba_env<T>(emu_home: &Path, gba_bios: Option<&Path>, f: impl FnOnce() -> T) -> T {

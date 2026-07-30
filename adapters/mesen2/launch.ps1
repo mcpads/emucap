@@ -229,10 +229,30 @@ if ($busy.Count -gt 0) {
   throw "Port $Port already has an emulator connection (PID: $($busy -join ', ')); do not relaunch on a stale port"
 }
 
+$portableFull = [System.IO.Path]::GetFullPath($portableDir)
+if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
+  $oldPidText = (Get-Content -LiteralPath $pidFile -TotalCount 1).Trim()
+  $oldPid = 0
+  if ([int]::TryParse($oldPidText, [ref]$oldPid)) {
+    $oldProcess = Get-Process -Id $oldPid -ErrorAction SilentlyContinue
+    if ($oldProcess) {
+      $oldPath = $null
+      try { $oldPath = $oldProcess.Path } catch {}
+      if (-not $oldPath) {
+        throw "Previous pidfile process $oldPid is alive but its executable identity is unverifiable; refusing replacement"
+      }
+      $oldFull = [System.IO.Path]::GetFullPath($oldPath)
+      if ($oldFull.StartsWith($portableFull + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Previous per-port Mesen PID $oldPid is still alive; end its exact managed generation with MCP stop before relaunch"
+      }
+      # A reused or foreign PID is not ours. Never signal it; the new portable Mesen may coexist.
+    }
+  }
+}
+
 New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
 $mesen = Join-Path $portableDir (Split-Path -Leaf $sourceMesen)
 $sourceDir = (Resolve-Path -LiteralPath (Split-Path -Parent $sourceMesen)).Path
-$portableFull = [System.IO.Path]::GetFullPath($portableDir)
 if ($portableFull.Equals($sourceDir, [System.StringComparison]::OrdinalIgnoreCase) -or
     $portableFull.StartsWith($sourceDir + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw "portable destination must not be inside source publish directory: $portableFull"

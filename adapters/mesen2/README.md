@@ -191,6 +191,9 @@ before returning.
 
 `launch.sh` checks `MESEN_BIN`, then the local build, then ordinary install/PATH candidates. Any
 candidate without matching build metadata is rejected as `mesen-patch-required`.
+Fallback launchers never terminate a PID recovered only from an old pidfile. A live process whose
+executable belongs to the same per-port portable directory makes replacement fail closed; a
+reused or foreign PID is left untouched. End an existing managed generation with MCP `stop`.
 
 **Windows fallback** — use **`launch.ps1`** only when the MCP `launch` tool is unavailable. It copies
 the complete compatible publish directory into `%LOCALAPPDATA%\emucap\mesen2\<port>\portable` and
