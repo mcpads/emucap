@@ -630,10 +630,10 @@ void handle_read_memory(long id, const std::string& line) {
 	long addr = 0, len = 0;
 	json_num(line, "address", addr);   // region 내 0-based 오프셋
 	json_num(line, "length", len);
-	if (len <= 0 || len > 0x100000) { reply_err(id, "bad_params", "length 범위(1..0x100000)"); return; }
+	if (len <= 0 || len > 0x100000) { reply_err(id, "bad_params", "length must be in 1..0x100000"); return; }
 	if (addr < 0 || (uint64_t)addr + (uint64_t)len > (uint64_t)r->size) {
 		char m[128];
-		snprintf(m, sizeof(m), "address+length가 %s region 범위(size=0x%X)를 초과", r->mt, (unsigned)r->size);
+		snprintf(m, sizeof(m), "address+length exceeds %s region size 0x%X", r->mt, (unsigned)r->size);
 		reply_err(id, "bad_params", m); return;
 	}
 	std::string hex;
@@ -652,11 +652,11 @@ void handle_write_memory(long id, const std::string& line) {
 	long addr = 0;
 	json_num(line, "address", addr);   // region 내 0-based 오프셋
 	std::string hex = json_str(line, "hex");
-	if (hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex는 짝수 길이 hex 문자열이어야"); return; }
+	if (hex.empty() || hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string"); return; }
 	uint64_t nbytes = hex.size() / 2;
 	if (addr < 0 || (uint64_t)addr + nbytes > (uint64_t)r->size) {
 		char m[128];
-		snprintf(m, sizeof(m), "address+hex 길이가 %s region 범위(size=0x%X)를 초과", r->mt, (unsigned)r->size);
+		snprintf(m, sizeof(m), "address+hex length exceeds %s region size 0x%X", r->mt, (unsigned)r->size);
 		reply_err(id, "bad_params", m); return;
 	}
 	long n = 0;
@@ -692,7 +692,7 @@ void handle_get_state(long id) {
 // 프레임 경계라 상태 일관(dc_serialize/emu.loadstate 안전).
 void handle_save_state(long id, const std::string& line) {
 	std::string path = json_str(line, "path");
-	if (path.empty()) { reply_err(id, "bad_params", "path 필요"); return; }
+	if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
 	try {
 		Serializer sizer;            // 1패스: 크기 산출
 		dc_serialize(sizer);
@@ -701,25 +701,25 @@ void handle_save_state(long id, const std::string& line) {
 		Serializer ser(buf.data(), sz);
 		dc_serialize(ser);           // 2패스: 실제 직렬화
 		FILE* f = fopen(path.c_str(), "wb");
-		if (!f) { reply_err(id, "io_error", "파일 열기 실패"); return; }
+		if (!f) { reply_err(id, "io_error", "failed to open file"); return; }
 		size_t w = fwrite(buf.data(), 1, sz, f);
 		fclose(f);
-		if (w != sz) { reply_err(id, "io_error", "쓰기 실패"); return; }
+		if (w != sz) { reply_err(id, "io_error", "failed to write file"); return; }
 	} catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
 	reply_ok(id, "{\"status\":\"completed\"}");
 }
 void handle_load_state(long id, const std::string& line) {
 	std::string path = json_str(line, "path");
-	if (path.empty()) { reply_err(id, "bad_params", "path 필요"); return; }
+	if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
 	try {
 		FILE* f = fopen(path.c_str(), "rb");
-		if (!f) { reply_err(id, "io_error", "파일 열기 실패"); return; }
+		if (!f) { reply_err(id, "io_error", "failed to open file"); return; }
 		fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-		if (sz <= 0) { fclose(f); reply_err(id, "io_error", "빈/잘못된 파일"); return; }
+		if (sz <= 0) { fclose(f); reply_err(id, "io_error", "file is empty or invalid"); return; }
 		std::vector<u8> buf((size_t)sz);
 		size_t r = fread(buf.data(), 1, (size_t)sz, f);
 		fclose(f);
-		if ((long)r != sz) { reply_err(id, "io_error", "읽기 실패"); return; }
+		if ((long)r != sz) { reply_err(id, "io_error", "failed to read file"); return; }
 		Deserializer deser(buf.data(), (size_t)sz);
 		emu.loadstate(deser);
 	} catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
@@ -749,7 +749,7 @@ void handle_set_breakpoint(long id, const std::string& line) {
 	// exec(PC) BP만 지원. read/write 워치포인트는 메모리 접근 훅이 필요 → 미지원(거부).
 	std::string kind = json_str(line, "kind");
 	if (!kind.empty() && kind != "exec" && kind != "pc") {
-		reply_err(id, "unsupported", "이 어댑터는 exec BP만 지원(read/write 워치포인트는 GDB-브리지)");
+		reply_err(id, "unsupported", "this adapter supports exec breakpoints only; read/write watchpoints require the GDB bridge");
 		return;
 	}
 	long start = 0;
@@ -811,12 +811,12 @@ void handle_find_pattern(long id, const std::string& line) {
 	bool has_length = json_num(line, "length", length);
 	json_num(line, "max_matches", max_matches);
 	json_num(line, "align", align);
-	if (hex.empty() || hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex는 짝수 길이 hex 문자열"); return; }
+	if (hex.empty() || hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string"); return; }
 	if (align < 1) align = 1;
 	if (max_matches < 1) max_matches = 256;
 	if (start < 0 || (uint64_t)start >= (uint64_t)r->size) {
 		char m[128];
-		snprintf(m, sizeof(m), "start가 %s region 범위(size=0x%X)를 초과", r->mt, (unsigned)r->size);
+		snprintf(m, sizeof(m), "start exceeds %s region size 0x%X", r->mt, (unsigned)r->size);
 		reply_err(id, "bad_params", m); return;
 	}
 	// length 미지정/<=0 → region의 남은 끝까지. 어댑터-내부 스캔이라 16MB도 ms 수준이므로 한 호출
@@ -988,11 +988,11 @@ void handle_get_trace(long id, const std::string& line) {
 // (SP 폭주 등 derail 포착). register 이름은 get_state의 "cpu.r15"/"r15"/"sp"/"pc" 등. 매 명령 검사라 hunting 전용.
 void handle_watch_register(long id, const std::string& line) {
 	std::string reg = json_str(line, "register");
-	if (reg.empty()) { reply_err(id, "bad_params", "register 필요"); return; }
+	if (reg.empty()) { reply_err(id, "bad_params", "register is required"); return; }
 	uint32_t probe;
 	if (!emucap_read_reg(reg, probe)) {
 		std::string m = "register '" + reg +
-		                "'를 찾을 수 없다 — 유효 이름은 get_state로 확인(cpu.r0..cpu.r15/pc/pr/sr/gbr/vbr/sp 등)";
+		                "' was not found; read valid names from get_state (cpu.r0..cpu.r15, pc, pr, sr, gbr, vbr, sp)";
 		reply_err(id, "bad_params", m.c_str());
 		return;
 	}
@@ -1183,7 +1183,7 @@ void handle(const std::string& line) {
 			// (조용히 프레임 진행하면 1명령씩 좁히려던 호출이 수천 명령을 건너뛴다).
 			std::string unit = json_str(line, "unit");
 			if (unit == "instructions") {
-				reply_err(id, "unsupported", "이 어댑터는 명령 단위 step 미지원 — step(frames)을 쓰라");
+				reply_err(id, "unsupported", "instruction stepping is unavailable; use step(unit=frames)");
 				return;
 			}
 			long frames = 1;
@@ -1193,7 +1193,7 @@ void handle(const std::string& line) {
 			g_step_id = id;        // 완료 응답은 emucap_service가 frames 경과 후
 			g_step_remaining = frames;
 		} else if (method == "step_instructions") {
-			reply_err(id, "unsupported", "이 어댑터는 명령 단위 step 미지원(vblank-프레임 freeze) — step(frames)/run_frames를 쓰라");
+			reply_err(id, "unsupported", "instruction stepping is unavailable with the vblank frame-freeze model; use frame step or run_frames");
 		} else if (method == "reset") {
 			emu.requestReset();
 			reply_ok(id, "{\"reset\":true}");
@@ -1213,15 +1213,15 @@ void handle(const std::string& line) {
 				std::lock_guard<std::mutex> lk(g_fb_mtx);
 				raw = g_fb_raw; w = g_fb_w; h = g_fb_h; fresh = g_fb_fresh;
 			}
-			if (raw.empty() || w <= 0 || h <= 0) { reply_err(id, "no_frame", "렌더된 프레임 없음(게임 미시작?)"); return; }
+			if (raw.empty() || w <= 0 || h <= 0) { reply_err(id, "no_frame", "no rendered frame is available"); return; }
 			if (!fresh) {
 				reply_err(id, "bad_state",
-					"load_state 이후 새 렌더 프레임이 아직 없음; step(1) 또는 resume 후 다시 캡처");
+					"no fresh rendered frame exists after load_state; advance one frame or resume before capture");
 				return;
 			}
 			std::vector<u8> png;
 			emucap_encode_png(raw.data(), w, h, png);
-			if (png.empty()) { reply_err(id, "io_error", "PNG 인코딩 실패"); return; }
+			if (png.empty()) { reply_err(id, "io_error", "PNG encoding failed"); return; }
 			reply_ok(id, std::string("{\"png_base64\":\"") + base64_encode(png.data(), png.size())
 				+ "\",\"freshness\":\"current\",\"frame\":" + std::to_string(g_frame) + "}");
 		} else if (method == "set_breakpoint") {
@@ -1256,7 +1256,7 @@ void handle(const std::string& line) {
 	} catch (const std::exception& e) {
 		reply_err(id, "internal_error", e.what());
 	} catch (...) {
-		reply_err(id, "internal_error", "알 수 없는 예외");
+		reply_err(id, "internal_error", "unknown exception");
 	}
 }
 

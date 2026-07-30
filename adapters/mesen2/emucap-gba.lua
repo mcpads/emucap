@@ -12,6 +12,7 @@ SYS = {
   system_label = "Game Boy Advance",
   cpu_type = "gba",             -- emu.cpuType.gba (ARM7TDMI)
   default_memtype = "gbaMemory", -- emu.memType.gbaMemory (ARM CPU 버스, 32비트 주소공간)
+  address_space_size = 0x10000000,
   -- Mesen GbaController setInput 키(소문자): a/b/l/r/start/select + 방향키(X/Y 없음).
   buttons = {
     a = true, b = true, l = true, r = true,
@@ -442,6 +443,6 @@ if not dir or dir == "" then
   local src = debug.getinfo(1, "S").source
   if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
 end
-assert(dir and dir ~= "", "emucap-gba: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
+assert(dir and dir ~= "", "emucap-gba: EMUCAP_ADAPTER_DIR is unset and the script path could not be derived; use launch or load this script from a file")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

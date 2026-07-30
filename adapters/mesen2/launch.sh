@@ -76,8 +76,8 @@ resolve_mesen_lua() {
   esac
 }
 
-# Explicit override wins. Otherwise the MCP fallback passes SYSTEM; direct legacy use falls back to
-# unambiguous ROM extensions. Unknown media must not silently select the SNES entry.
+# Explicit override wins. Otherwise a caller may pass SYSTEM; direct use falls back to unambiguous
+# ROM extensions. Unknown media must not silently select the SNES entry.
 if [ -n "${EMUCAP_MESEN_LUA:-}" ]; then
   LUA="$EMUCAP_MESEN_LUA"
 elif ! LUA="$(resolve_mesen_lua "$SYSTEM")"; then
@@ -91,10 +91,11 @@ export EMUCAP_ADAPTER_DIR="$HERE"
 EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
-  git -C "$HERE" diff --quiet HEAD -- \
-    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua \
-    "$(basename "$LUA")" 2>/dev/null \
-    || EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+  if [ -n "$(git -C "$HERE" status --porcelain -- \
+    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_memory.lua emucap_tx.lua emucap_state_io.lua \
+    "$(basename "$LUA")" 2>/dev/null)" ]; then
+    EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
+  fi
 else
   EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
 fi

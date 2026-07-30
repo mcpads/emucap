@@ -1103,11 +1103,11 @@ void handle_find_pattern(long id, const std::string& line) {
   // read_memory와 동일하게 거부한다(silent-wrong 검색 결과 방지).
   if (reject_ss_physical_read(id, mt)) return;
   AddressSpaceType* sp = find_aspace(mt);
-  if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
+  if (!sp) { reply_err(id, "bad_params", "unknown memory_type"); return; }
 
   std::vector<uint8> pat;
   if (!decode_hex_bytes(pat_hex, pat)) {
-    reply_err(id, "bad_params", "hex는 비어 있지 않은 짝수 길이 hex 문자열이어야");
+    reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string");
     return;
   }
   uint32 start = 0;
@@ -1120,14 +1120,14 @@ void handle_find_pattern(long id, const std::string& line) {
   if (max_matches > 4096) max_matches = 4096;
   if (align < 1) align = 1;
   if ((uint64)start >= sp->size) {
-    reply_err(id, "bad_params", "start 범위 초과");
+    reply_err(id, "bad_params", "start is outside the memory region");
     return;
   }
 
   uint64 available = sp->size - (uint64)start;
   uint64 requested = has_length ? (uint64)(length < 0 ? -1 : length) : available;
   if (has_length && length < 0) {
-    reply_err(id, "bad_params", "length 범위 초과");
+    reply_err(id, "bad_params", "length exceeds the memory region");
     return;
   }
   if (requested > available) requested = available;
@@ -1180,7 +1180,7 @@ void handle_read_memory(long id, const std::string& line) {
   if (reject_ss_physical_read(id, mt)) return;
   std::string hex;
   if (!read_aspace_hex(mt, addr, len, hex)) {
-    reply_err(id, "bad_params", "알 수 없는 memory_type 또는 address/length 범위 초과");
+    reply_err(id, "bad_params", "unknown memory_type or address/length exceeds the region");
     return;
   }
   reply_ok(id, "{\"hex\":\"" + hex + "\"}");
@@ -1192,7 +1192,7 @@ void handle_write_memory(long id, const std::string& line) {
   if (!json_u32_arg(id, line, "address", addr, true)) return;
   std::string hex = json_str(line, "hex");
   AddressSpaceType* sp = find_aspace(mt);
-  if (!sp) { reply_err(id, "bad_params", "알 수 없는 memory_type"); return; }
+  if (!sp) { reply_err(id, "bad_params", "unknown memory_type"); return; }
   if (is_pcfx() && (mt == "cpu" || mt == "bios" || mt.rfind("track", 0) == 0)) {
     reply_err(id, "unsupported",
               "PC-FX write_memory rejects cpu because it can mutate BIOS, and rejects bios/track views as protected or read-only");
@@ -1215,15 +1215,15 @@ void handle_write_memory(long id, const std::string& line) {
     return;
   }
   // 홀수 길이 hex는 마지막 nibble을 조용히 버리는 오류를 낸다 — Mesen 어댑터와 동일하게 거부한다.
-  if (hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex는 짝수 길이 hex 문자열이어야"); return; }
+  if (hex.size() % 2 != 0) { reply_err(id, "bad_params", "hex must be an even-length hexadecimal string"); return; }
   std::vector<uint8> bytes;
   if (!decode_hex_bytes(hex, bytes)) {
-    reply_err(id, "bad_params", "hex는 비어 있지 않은 짝수 길이 hex 문자열이어야");
+    reply_err(id, "bad_params", "hex must be a non-empty even-length hexadecimal string");
     return;
   }
   uint64 end = (uint64)addr + (uint64)bytes.size();
   if (end > 0x100000000ULL || (sp->size && end > sp->size)) {
-    reply_err(id, "bad_params", "address/hex 길이가 memory_type 범위를 초과");
+    reply_err(id, "bad_params", "address+hex length exceeds the memory region");
     return;
   }
   if (!bytes.empty())
@@ -1263,12 +1263,12 @@ bool mkdir_p(const std::string& path) {
 // 오프셋 기준이라 0(read_memory(memory_type=name, address=offset)와 같은 주소계).
 void handle_dump_memory(long id, const std::string& line) {
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->AddressSpaces) {
-    reply_err(id, "unsupported", "dump_memory: 디버거/주소공간 없음");
+    reply_err(id, "unsupported", "dump_memory requires debugger address spaces");
     return;
   }
   std::string dir = json_str(line, "path");
-  if (dir.empty()) { reply_err(id, "bad_params", "path 필요"); return; }
-  if (!mkdir_p(dir)) { reply_err(id, "io_error", "디렉터리 생성 실패"); return; }
+  if (dir.empty()) { reply_err(id, "bad_params", "path is required"); return; }
+  if (!mkdir_p(dir)) { reply_err(id, "io_error", "failed to create directory"); return; }
 
   static uint8 buf[0x10000];   // 64KB 청크(거대 length로 인한 과대 할당·스택 부담 회피)
   std::string metas;           // regions.json 항목(실제로 쓴 space만)
@@ -1384,7 +1384,7 @@ void handle_get_state(long id, const std::string& line) {
     return;
   }
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->RegGroups) {
-    reply_err(id, "no_debugger", "디버거 미초기화");
+    reply_err(id, "no_debugger", "debugger is not initialized");
     return;
   }
   std::string out = "{\"state\":{";
@@ -1411,7 +1411,7 @@ void handle_get_state(long id, const std::string& line) {
 
 void handle_save_state(long id, const std::string& line) {
   std::string path = json_str(line, "path");
-  if (path.empty()) { reply_err(id, "bad_params", "path 필요"); return; }
+  if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
   try {
     FileStream fs(path, FileStream::MODE_WRITE);
     MDFNSS_SaveSM(&fs);
@@ -1422,7 +1422,7 @@ void handle_save_state(long id, const std::string& line) {
 
 void handle_load_state(long id, const std::string& line) {
   std::string path = json_str(line, "path");
-  if (path.empty()) { reply_err(id, "bad_params", "path 필요"); return; }
+  if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
   try {
     FileStream fs(path, FileStream::MODE_READ);
     MDFNSS_LoadSM(&fs);
@@ -1697,7 +1697,7 @@ void decode_nbg_layout(int n, NbgLayout& L) {
 // {decoded, raw, reg_offset}를 동봉해 소비자가 raw로 자가검증한다. 게임별 보정상수
 // (폰트 char base 등)는 넣지 않는다 — HW 디코드만(보정은 에이전트 RE 몫).
 void handle_get_video_state(long id) {
-  if (!is_ss()) { reply_err(id, "unsupported", "get_video_state는 Saturn(ss) 전용"); return; }
+  if (!is_ss()) { reply_err(id, "unsupported", "get_video_state is available only for Saturn"); return; }
   // reg(a) := VDP2::PeekRawReg(a). PeekRawReg가 (a>>1)&0xFF로 인덱싱하니 바이트 오프셋 a 전달.
   auto reg = [](uint32 a) -> unsigned { return (unsigned)MDFN_IEN_SS::VDP2::PeekRawReg(a); };
   // {decoded, raw, reg_offset} — decoded는 이미 완성된 JSON 값(숫자/true/false/"문자열").
@@ -1869,13 +1869,13 @@ void handle_get_video_state(long id) {
 // 반환에 중간값(nt_addr·raw PND·charno·cellbytes·palno·flip)을 동봉해 소비자가 자가검증·합성한다.
 // 게임 폰트 char-base 보정상수는 넣지 않는다(HW 디코드만 — 보정은 에이전트 RE 몫).
 void handle_resolve_tile(long id, const std::string& line) {
-  if (!is_ss()) { reply_err(id, "unsupported", "resolve_tile는 Saturn(ss) 전용"); return; }
+  if (!is_ss()) { reply_err(id, "unsupported", "resolve_tile is available only for Saturn"); return; }
   long nbg = -1, sx = -1, sy = -1;
   json_num(line, "nbg", nbg);
   json_num(line, "x", sx);
   json_num(line, "y", sy);
-  if (nbg < 0 || nbg > 3) { reply_err(id, "bad_params", "nbg는 0..3(NBG0..3 — 회전배경 RBG는 범위 밖)"); return; }
-  if (sx < 0 || sy < 0)   { reply_err(id, "bad_params", "x,y는 음수 불가"); return; }
+  if (nbg < 0 || nbg > 3) { reply_err(id, "bad_params", "nbg must be 0..3 (NBG0..3; rotating RBG layers are excluded)"); return; }
+  if (sx < 0 || sy < 0)   { reply_err(id, "bad_params", "x and y must be non-negative"); return; }
   int n = (int)nbg;
 
   NbgLayout L;
@@ -1900,7 +1900,7 @@ void handle_resolve_tile(long id, const std::string& line) {
 
   // PNT 엔트리 읽기(vdp2vram, big-endian: PeekVRAM=ne16_rbo_be). nt_addr*2 = byte 주소.
   AddressSpaceType* sp = find_aspace("vdp2vram");
-  if (!sp) { reply_err(id, "unsupported", "vdp2vram AddressSpace 없음(디버거 강등?)"); return; }
+  if (!sp) { reply_err(id, "unsupported", "vdp2vram address space is unavailable"); return; }
   auto rdword = [&](uint32 word_idx) -> unsigned {
     uint8 b[2];
     uint32 byte_addr = (word_idx & 0x3FFFF) << 1;
@@ -1997,7 +1997,7 @@ void handle_resolve_tile(long id, const std::string& line) {
 // {layer_names, mask, enabled:[이름]}. 마스크는 디버그 override라 바꿀 때까지 유지(지속성 안내는 tool에).
 void handle_set_layer_enable(long id, const std::string& line) {
   if (!MDFNGameInfo || !MDFNGameInfo->LayerNames) {
-    reply_err(id, "unsupported", "이 시스템은 레이어 토글 미지원");
+    reply_err(id, "unsupported", "layer toggling is unavailable for this system");
     return;
   }
   // LayerNames는 null-구분 문자열 목록이며 빈 문자열(이중 null)로 끝난다(드라이버 gfxdebugger.cpp 동형).
@@ -2020,7 +2020,7 @@ void handle_set_layer_enable(long id, const std::string& line) {
     size_t lb = line.find('[', b);
     size_t rb = (lb == std::string::npos) ? std::string::npos : line.find(']', lb);
     if (lb == std::string::npos || rb == std::string::npos) {
-      reply_err(id, "bad_params", "layers는 문자열 배열이어야 한다");
+      reply_err(id, "bad_params", "layers must be an array of strings");
       return;
     }
     std::string arr = line.substr(lb + 1, rb - lb - 1);
@@ -2042,7 +2042,7 @@ void handle_set_layer_enable(long id, const std::string& line) {
         }
       }
       if (bit < 0) {
-        reply_err(id, "bad_params", ("알 수 없는 layer 이름: " + want).c_str());
+        reply_err(id, "bad_params", ("unknown layer name: " + want).c_str());
         return;
       }
       mask |= (1ULL << bit);
@@ -2112,12 +2112,12 @@ void handle_set_layer_enable(long id, const std::string& line) {
 // EMUCAP_CONTENT 미설정 → unsupported, MDFNGameInfo null(게임 미로드) → bad_state 에러.
 void handle_get_rom_info(long id) {
   if (!MDFNGameInfo) {
-    reply_err(id, "bad_state", "MDFNGameInfo 미초기화 — 게임 미로드");
+    reply_err(id, "bad_state", "MDFNGameInfo is not initialized; no game is loaded");
     return;
   }
   const char* content = getenv("EMUCAP_CONTENT");
   if (!content || !content[0]) {
-    reply_err(id, "unsupported", "EMUCAP_CONTENT 미설정 — 콘텐츠 신원 불가");
+    reply_err(id, "unsupported", "EMUCAP_CONTENT is unset; content identity is unavailable");
     return;
   }
   std::string path(content);
@@ -2182,7 +2182,7 @@ void handle_get_rom_info(long id) {
 // 매 명령이라 느림 — 끝나면 끈다). Debugger 필요(SetCPUCallback).
 void handle_set_trace(long id, const std::string& line) {
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->SetCPUCallback) {
-    reply_err(id, "no_debugger", "디버거 미초기화(set_trace 불가)");
+    reply_err(id, "no_debugger", "debugger is not initialized; set_trace is unavailable");
     return;
   }
   bool enabled = false;
@@ -2234,18 +2234,18 @@ void handle_get_trace(long id, const std::string& line) {
 void handle_watch_register(long id, const std::string& line) {
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->RegGroups ||
       !CurGame->Debugger->SetCPUCallback) {
-    reply_err(id, "no_debugger", "디버거 미초기화(watch_register 불가)");
+    reply_err(id, "no_debugger", "debugger is not initialized; watch_register is unavailable");
     return;
   }
   std::string reg = json_str(line, "register");
   if (reg.empty()) {
-    reply_err(id, "bad_params", "register 필요");
+    reply_err(id, "bad_params", "register is required");
     return;
   }
   uint32 probe;
   if (!read_register_by_name(reg, probe)) {
     std::string m =
-        "register '" + reg + "'를 찾을 수 없다 — 유효 이름은 get_state로 확인(name 또는 group.name)";
+        "register '" + reg + "' was not found; read valid names from get_state (name or group.name)";
     reply_err(id, "bad_params", m.c_str());
     return;
   }
@@ -2313,7 +2313,7 @@ uint32 read_reset_entry() {
 void handle_break_on_reset(long id, const std::string& line) {
   if (!is_md() && !is_pce()) {
     reply_err(id, "unsupported",
-              "break_on_reset는 카트리지(MD/PCE) 전용 — 디스크는 exec BP를 BIOS 엔트리에");
+              "break_on_reset is available only for cartridge systems; use an exec breakpoint at the BIOS entry for disc systems");
     return;
   }
   bool enabled = false;
@@ -2618,11 +2618,11 @@ void handle(const std::string& line) {
     if (unit == "instructions") {
       // frozen(pause/step/BP) 전제 — 정지 지점에서 N명령씩 좁힌다(프레임 step과 달리 running 진입 금지).
       if (!g_frozen) {
-        reply_err(id, "not_frozen", "step_instructions는 frozen(pause/step/BP)에서만 — pause 후 사용");
+        reply_err(id, "not_frozen", "instruction step requires frozen state; call pause first");
         return;
       }
       if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->SetCPUCallback) {
-        reply_err(id, "no_debugger", "이 코어는 CPU 콜백(명령 단위 step) 미지원");
+        reply_err(id, "no_debugger", "this core does not expose the CPU callback required for instruction step");
         return;
       }
       long count = 1;
@@ -2654,7 +2654,7 @@ void handle(const std::string& line) {
   } else if (method == "probe") {
     // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
     // 중에는 거부한다 — Mesen 어댑터와 동일하게 freeze 상태머신과 섞이지 않게 한다.
-    if (g_frozen) { reply_err(id, "frozen", "frozen 중에는 probe 불가 — resume 후 사용"); return; }
+    if (g_frozen) { reply_err(id, "frozen", "probe requires running state; call resume first"); return; }
     std::string probe_mt = json_str(line, "memory_type");
     // Saturn "physical"은 미구현(read=0)이라 타깃 읽기가 조용히 all-zeros를 줘 거짓 probe 결과를 낸다 —
     // read_memory와 동일하게 거부한다(상태-파괴적 savestate 로드/프레임 진행 전에).
@@ -2688,7 +2688,7 @@ void handle(const std::string& line) {
     // exec/read/write만 지원한다. nmi/irq/dma 등은 이 디버거에 없다 — 조용히 exec로 처리(silent-wrong,
     // "보이는데 안 됨")하지 않고 supported를 동반해 거부한다.
     if (kind != "exec" && kind != "read" && kind != "write") {
-      std::string m = "kind '" + kind + "'는 미지원 — supported: exec, read, write";
+      std::string m = "unsupported breakpoint kind '" + kind + "'; supported: exec, read, write";
       reply_err(id, "unsupported", m.c_str());
       return;
     }
@@ -2725,12 +2725,12 @@ void handle(const std::string& line) {
       if (type == BPOINT_PC) {
         if (start > 0xFFFF || end > 0xFFFF) {
           reply_err(id, "bad_params",
-                    "PCE exec BP는 16비트 논리 주소(0x0000..0xFFFF, MPR 뱅킹) — 물리/뱅크 주소가 아니다");
+                    "PCE exec breakpoints use 16-bit logical addresses (0x0000..0xFFFF with MPR banking), not physical or bank addresses");
           return;
         }
       } else if ((type == BPOINT_READ || type == BPOINT_WRITE) && mt == "physical") {
         if (start > 0x1FFFFF || end > 0x1FFFFF) {
-          reply_err(id, "bad_params", "PCE physical BP는 21비트(0x000000..0x1FFFFF)");
+          reply_err(id, "bad_params", "PCE physical breakpoints use 21-bit addresses (0x000000..0x1FFFFF)");
           return;
         }
         logical = false;
@@ -2745,7 +2745,7 @@ void handle(const std::string& line) {
       } else if (type == BPOINT_READ || type == BPOINT_WRITE) {
         // 기본 logical(cpu, 16비트) read/write BP: 범위 밖은 GetLastLogicalReadAddr(16비트)와 안 맞아 미발화.
         if (start > 0xFFFF || end > 0xFFFF) {
-          reply_err(id, "bad_params", "PCE 논리 read/write BP는 16비트(0x0000..0xFFFF); 물리는 memory_type=physical");
+          reply_err(id, "bad_params", "PCE logical read/write breakpoints use 16-bit addresses; use memory_type=physical for physical addresses");
           return;
         }
       }
@@ -2808,31 +2808,31 @@ void handle(const std::string& line) {
       if (type == BPOINT_READ || type == BPOINT_WRITE) {
         if (mt == "ram") {
           if (start > 0xFFFF || end > 0xFFFF) {
-            reply_err(id, "bad_params", "MD ram BP 범위는 0x0000..0xFFFF");
+            reply_err(id, "bad_params", "MD ram breakpoint range is 0x0000..0xFFFF");
             return;
           }
           start = 0xFF0000u | (start & 0xFFFFu);
           end = 0xFF0000u | (end & 0xFFFFu);
         } else if (mt == "zram") {
           if (start > 0x1FFF || end > 0x1FFF) {
-            reply_err(id, "bad_params", "MD zram BP 범위는 0x0000..0x1FFF");
+            reply_err(id, "bad_params", "MD zram breakpoint range is 0x0000..0x1FFF");
             return;
           }
           start = 0xA00000u | (start & 0x1FFFu);
           end = 0xA00000u | (end & 0x1FFFu);
         } else if (mt == "vram" || mt == "cram" || mt == "vsram" || mt == "vdpreg") {
           if (type != BPOINT_WRITE) {
-            reply_err(id, "unsupported", "MD VDP read BP는 아직 미지원 — write BP만 지원");
+            reply_err(id, "unsupported", "MD VDP read breakpoints are unavailable; only write breakpoints are supported");
             return;
           }
           uint32 max_addr = mt == "vram" ? 0xFFFFu : mt == "vdpreg" ? 0x1Fu : 0x7Fu;
           if (start > max_addr || end > max_addr) {
-            reply_err(id, "bad_params", "MD VDP BP 범위 초과");
+            reply_err(id, "bad_params", "MD VDP breakpoint range exceeded");
             return;
           }
           adapter_bp = true;  // VDP writes are port/DMA-side effects, not CPU address-space writes.
         } else if (mt != "cpu") {
-          reply_err(id, "unsupported", "MD read/write BP는 cpu/ram/zram 및 vram/cram/vsram/vdpreg write를 지원한다");
+          reply_err(id, "unsupported", "MD read/write breakpoints support cpu, ram, zram, and writes to vram, cram, vsram, or vdpreg");
           return;
         }
       }
@@ -2855,7 +2855,7 @@ void handle(const std::string& line) {
           for (const auto& r : kSSBusRegions) {
             if (mt == r.mt) {
               if (start >= r.size || end >= r.size) {
-                reply_err(id, "bad_params", "SS RAM-region BP offset가 region 크기를 초과");
+                reply_err(id, "bad_params", "Saturn RAM-region breakpoint offset exceeds the region size");
                 return;
               }
               start = r.base + start;
@@ -2868,9 +2868,8 @@ void handle(const std::string& line) {
           if (!matched) {
             // 변환 불가 memory_type은 수락-후-미발화 대신 명확히 거부한다.
             reply_err(id, "unsupported",
-                      "SS read/write BP는 physical(raw 버스주소) 및 workraml/workramh/scspram/vdp1vram/"
-                      "vdp2vram/cram만 지원 — backup/vdp1fb0/vdp1fb1/scspmprog/scsptemp/scspmems/dspprog는 "
-                      "SH-2 외부버스 선형주소가 없어 BP 미지원(physical+버스주소로 걸어라)");
+                      "Saturn read/write breakpoints support physical raw bus addresses and workraml, workramh, scspram, "
+                      "vdp1vram, vdp2vram, or cram. Other auxiliary regions lack a linear SH-2 external-bus address.");
             return;
           }
         }
@@ -2882,8 +2881,8 @@ void handle(const std::string& line) {
       if (type == BPOINT_PC) {
         if (start > 0xFFFF || end > 0xFFFF) {
           reply_err(id, "bad_params",
-                    "WonderSwan exec BP는 16비트 논리 IP(0x0000..0xFFFF) 기준 — (CS<<4)+IP 선형주소가 아니라 "
-                    "IP offset을 줘라(get_state의 V30MZ.IP가 BP 주소, V30MZ.CS는 세그먼트). read/write BP만 20비트 physical.");
+                    "WonderSwan exec breakpoints use the 16-bit logical IP offset from V30MZ.IP, not the linear (CS<<4)+IP address; "
+                    "only read/write breakpoints use 20-bit physical addresses.");
           return;
         }
       } else {
@@ -2893,19 +2892,19 @@ void handle(const std::string& line) {
         // 걸어 엉뚱한 주소를 관측한다(DS:off가 아니라 physical:off; 값-조건 read도 physical로 읽어 필터도 틀어짐).
         if (mt.empty() || mt == "physical") {
           if (start > 0xFFFFF || end > 0xFFFFF) {
-            reply_err(id, "bad_params", "WonderSwan physical BP는 20비트(0x00000..0xFFFFF)");
+            reply_err(id, "bad_params", "WonderSwan physical breakpoints use 20-bit addresses (0x00000..0xFFFFF)");
             return;
           }
         } else if (mt == "ram") {
           // ram(0x0000-0xFFFF 내부RAM)은 physical 0x0-0xFFFF에 매핑 — 그 위 offset은 physical 뱅크1로 새므로 bound한다.
           if (start > 0xFFFF || end > 0xFFFF) {
-            reply_err(id, "bad_params", "WonderSwan ram BP는 16비트 내부 RAM(0x0000..0xFFFF) — 그 위는 physical로 걸어라");
+            reply_err(id, "bad_params", "WonderSwan ram breakpoints use 16-bit internal RAM offsets; use physical above 0xFFFF");
             return;
           }
         } else {
           reply_err(id, "bad_params",
-                    "WonderSwan read/write BP memory_type은 physical(20비트)/ram(16비트)만 — cs/ss/ds/es 세그먼트뷰는 "
-                    "read_memory용이고 BP엔 세그먼트가 안 적용된다. (seg<<4)+off를 physical로 줘라");
+                    "WonderSwan read/write breakpoint memory_type must be physical (20-bit) or ram (16-bit). "
+                    "Segment views are read-only address-space views; pass (segment<<4)+offset as physical.");
           return;
         }
       }
@@ -2927,8 +2926,8 @@ void handle(const std::string& line) {
       // physical에서 value_len 바이트 읽어 정확하므로 write만 거부한다(연속 byte-write 누적은 후속 과제).
       if (is_ws() && type == BPOINT_WRITE && val_len > 1) {
         reply_err(id, "unsupported",
-                  "WonderSwan write BP는 값-조건 value_len>1 미지원 — V30MZ가 워드를 per-byte로 써 훅이 1바이트만 "
-                  "주입한다. value_len=1로 걸거나 read BP를 써라(read는 다바이트 지원)");
+                  "WonderSwan write breakpoint value filters support value_len=1 only because V30MZ writes words per byte. "
+                  "Use value_len=1 or a read breakpoint for multi-byte matching.");
         return;
       }
       // write BP의 value 필터는 *쓰는 값*과 비교한다 — CPU 메모리 write는 MD/PCE/PSX/SS 전부 어댑터가
@@ -2942,8 +2941,8 @@ void handle(const std::string& line) {
       // write+value는 전 시스템 동작). aux/VDP write 경로 값 주입은 후속 과제다.
       if (has_value && (type == BPOINT_AUX_READ || type == BPOINT_AUX_WRITE)) {
         reply_err(id, "unsupported",
-                  "값-조건 BP는 보조(VDP/비디오 메모리) 주소공간에 아직 미지원 — 쓰는 값 주입이 CPU "
-                  "경로만 구현됨. value 없이 걸거나 CPU 메모리 주소로 걸어라");
+                  "Value-filtered breakpoints are unavailable in auxiliary VDP/video address spaces because accessed-value "
+                  "capture is implemented only on CPU paths. Omit value or use a CPU memory address.");
         return;
       }
       // 좁은 한계: SS on-chip 레지스터 대상 RMW만 CheatMemRead fastmap 밖이라 부정확 — work RAM 대상은
@@ -2961,7 +2960,7 @@ void handle(const std::string& line) {
     if (!validate_snapshot_specs(id, line, snapshots)) return;
 
     if (!adapter_bp && (!CurGame || !CurGame->Debugger || !CurGame->Debugger->AddBreakPoint)) {
-      reply_err(id, "no_debugger", "디버거 미초기화");
+      reply_err(id, "no_debugger", "debugger is not initialized");
     } else {
       long bid = g_bp_next_id++;
       BP b{};
@@ -3068,7 +3067,7 @@ void handle(const std::string& line) {
     if (count < 1) count = 1;
     if (count > 256) count = 256;
     if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->Disassemble) {
-      reply_err(id, "no_debugger", "디스어셈블러 미초기화(--enable-debugger 필요)");
+      reply_err(id, "no_debugger", "disassembler is not initialized; --enable-debugger is required");
     } else {
       uint32 A = addr;
       std::string out = "[";
@@ -3164,7 +3163,7 @@ void handle(const std::string& line) {
     reply_ok(id, "{\"reset\":true}");
   } else if (method == "screenshot") {
     if (!g_last_surface) {
-      reply_err(id, "no_frame", "아직 렌더된 프레임 없음");
+      reply_err(id, "no_frame", "no rendered frame is available yet");
     } else {
       try {
         // 인스턴스별 유니크 경로 — 다중 인스턴스(MEDNAFEN_ALLOWMULTI)가 같은 파일을
@@ -3189,7 +3188,7 @@ void handle(const std::string& line) {
   } catch (const std::exception& e) {
     reply_err(id, "internal_error", e.what());
   } catch (...) {
-    reply_err(id, "internal_error", "알 수 없는 예외");
+    reply_err(id, "internal_error", "unknown exception");
   }
 }
 
@@ -3591,7 +3590,7 @@ void emucap_service(uint64_t frame) {
     }
     std::string hex;
     if (!read_aspace_hex(g_probe_mt, g_probe_addr, g_probe_len, hex)) {
-      reply_err(g_probe_id, "bad_params", "알 수 없는 memory_type 또는 address/length 범위 초과");
+      reply_err(g_probe_id, "bad_params", "unknown memory_type or address/length exceeds the region");
     } else {
       reply_ok(g_probe_id, "{\"hex\":\"" + hex + "\"}");
     }

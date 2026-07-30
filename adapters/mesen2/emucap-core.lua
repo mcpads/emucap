@@ -1,10 +1,10 @@
 -- 이 파일은 제네릭 코어다. 시스템별 엔트리 스크립트(emucap-snes.lua/emucap-sms.lua)가 전역 SYS를
 -- 설정한 뒤 dofile(이 파일)한다. SYS는 buttons/aliases/system/system_label/cpu_type/default_memtype/
 -- reset_vector/bank_mirror/dump_regions/region_sizes를 담는다.
-assert(SYS and SYS.buttons and SYS.cpu_type and SYS.default_memtype,
-  "emucap-core: 전역 SYS config가 없다 — 엔트리 스크립트에서 SYS를 설정하고 dofile 하라")
+assert(SYS and SYS.buttons and SYS.cpu_type and SYS.default_memtype and SYS.address_space_size,
+  "emucap-core: global SYS config is missing; set SYS in the entry script before loading the core")
 assert(SYS.snapshot_regs,
-  "emucap-core: SYS.snapshot_regs가 없다 — 엔트리가 snapshot_regs를 설정해야 한다")
+  "emucap-core: SYS.snapshot_regs is missing; the entry script must provide it")
 -- disassemble/op_is_call/op_is_return은 optional이다. Lua ISA 디코더와 SP기반 콜스택 모델이 맞는
 -- 시스템(SNES=65816·GG=Z80·GB=SM83)만 제공한다. ARM(GBA)처럼 디코더가 크고 콜스택이 LR기반이라 코어의
 -- SP모델과 안 맞는 ISA는 이 셋을 비우면 disassemble·call_stack을 미지원으로 광고·거부한다.
@@ -28,10 +28,11 @@ local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
 local Dump = require("emucap_dump")
 local Deferred = require("emucap_deferred")
+local Memory = require("emucap_memory")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
-  "emucap-core: safe native halt event가 없는 Mesen host는 live control 미지원 — adapters/mesen2/build.sh로 호환 host를 빌드하라")
+  "emucap-core: this Mesen host lacks safe native-halt events; build the compatible host with adapters/mesen2/build.sh")
 
 local HOST = "127.0.0.1"
 -- 포트: 교차-ROM 2-인스턴스를 위해 EMUCAP_PORT로 덮어쓸 수 있다(없으면 47800).
@@ -315,7 +316,7 @@ local function send_line(s)
   if not conn then return end
   local ok, err = Tx.enqueue(tx, s)
   if ok then return end
-  emu.log("[emucap] TX " .. tostring(err) .. " — 연결 폐기")
+  emu.log("[emucap] TX " .. tostring(err) .. "; dropping the connection")
   disconnect()
 end
 
@@ -323,7 +324,7 @@ local function flush_tx()
   if not conn or not Tx.pending(tx) then return "idle" end
   local status, err = Tx.flush(tx, conn)
   if status == "error" then
-    emu.log("[emucap] TX 오류(" .. tostring(err) .. ") — 재연결")
+    emu.log("[emucap] TX error (" .. tostring(err) .. "); reconnecting")
     disconnect()
   elseif status == "complete" and reset_after_reply then
     -- Some Mesen systems power cycle by recreating the debugger and Lua context. Send the terminal
@@ -360,7 +361,7 @@ local function freeze_key_down()
   local ok, pressed = pcall(emu.isKeyPressed, FREEZE_KEY)
   if not ok then
     freeze_key_ok = false
-    emu.log("[emucap] freeze 핫키 '" .. tostring(FREEZE_KEY) .. "' 무효 — 비활성(EMUCAP_FREEZE_KEY로 변경)")
+    emu.log("[emucap] invalid freeze key '" .. tostring(FREEZE_KEY) .. "'; disabled (set EMUCAP_FREEZE_KEY to change it)")
     return false
   end
   return pressed and true or false
@@ -493,14 +494,11 @@ function handlers.hello()
       patchset_sha256 = MESEN_PATCHSET_SHA256 or "unknown",
     }
   end
-  -- memory_types: read_memory가 받는 memory_type = emu.memType의 키 전체. 정적 추측이 아니라 Mesen
-  -- API의 실제 메모리 타입을 런타임 열거해 advertise한다(능력 발견). MCP가
-  -- status.memory_types로 표면화. emu.memType이 없으면 생략(graceful — MCP가 빈 목록 처리).
+  -- Advertise only memory types that belong to the active system and have a known finite range.
+  -- Mesen's global enum also contains names for inactive cores, so enumerating it directly would
+  -- make status.memory_types claim regions that this game cannot use.
   if emu and emu.memType then
-    local mtypes = {}
-    for k, _ in pairs(emu.memType) do mtypes[#mtypes + 1] = k end
-    table.sort(mtypes)
-    result.memory_types = mtypes
+    result.memory_types = Memory.catalog(emu, SYS)
   end
   local name = os.getenv("EMUCAP_NAME")
   if name then result.name = name end
@@ -514,36 +512,37 @@ function handlers.hello()
 end
 
 function handlers.read_memory(p)
-  local mt = emu.memType[p.memory_type] or p.memory_type
   local length = p.length or 0
-  if length < 0 then length = 0 end
   -- 워치독 안전 상한: 멀티MB 읽기는 emu 스레드를 초단위 블록해 소켓을 굶긴다(find_pattern SCAN_CAP과 동형).
   -- 넘치면 조용히 자르지 않고 에러로 거부한다 — truncated+ok로 부분 데이터를 성공처럼 돌려주면 검증
   -- consumer(observe/regression)가 hex만 읽어 prefix만 해시/비교해 거짓 pass/fail을 낼 수 있다.
   -- 큰 영역은 dump_memory를 쓰거나 READ_CAP 이하로 나눠 읽는다.
   if length > READ_CAP then
     return false, "bad_params",
-      string.format("read_memory length %d가 상한 %d 초과 — dump_memory를 쓰거나 나눠 읽어라", length, READ_CAP)
+      string.format("read_memory length %d exceeds limit %d; use dump_memory or split the read", length, READ_CAP)
   end
+  local region, kind, message = Memory.range(emu, SYS, p.memory_type, p.address, length)
+  if not region then return false, kind, message end
   local out = {}
   for i = 0, length - 1 do
-    out[#out + 1] = string.format("%02x", emu.read(p.address + i, mt, false))
+    out[#out + 1] = string.format("%02x", emu.read(p.address + i, region.memory_type, false))
   end
   return true, { hex = table.concat(out) }
 end
 
 function handlers.write_memory(p)
-  local mt = emu.memType[p.memory_type] or p.memory_type
   local hex = p.hex
   -- 홀수 길이 hex는 마지막 single nibble을 한 바이트로 써넣는 조용한 오류를 낸다 — 거부한다.
-  if type(hex) ~= "string" or #hex % 2 ~= 0 then
-    return false, "bad_params", "hex는 짝수 길이 hex 문자열이어야"
+  if type(hex) ~= "string" or #hex < 2 or #hex % 2 ~= 0 then
+    return false, "bad_params", "hex must be an even-length hexadecimal string"
   end
   local n = 0
+  local region, kind, message = Memory.range(emu, SYS, p.memory_type, p.address, #hex / 2)
+  if not region then return false, kind, message end
   for i = 1, #hex, 2 do
     local byte = tonumber(hex:sub(i, i + 1), 16)
-    if not byte then return false, "bad_params", "hex 디코드 실패" end
-    emu.write(p.address + n, byte, mt)
+    if not byte then return false, "bad_params", "hex decode failed" end
+    emu.write(p.address + n, byte, region.memory_type)
     n = n + 1
   end
   return true, { written = n }
@@ -671,10 +670,9 @@ end
 
 -- 타깃 메모리를 hex로 읽는다(probe 완료 시 사용).
 local function read_target(pr)
-  local mt = emu.memType[pr.mem] or pr.mem
   local out = {}
   for i = 0, (pr.len - 1) do
-    out[#out + 1] = string.format("%02x", emu.read(pr.addr + i, mt, false))
+    out[#out + 1] = string.format("%02x", emu.read(pr.addr + i, pr.mt, false))
   end
   return table.concat(out)
 end
@@ -757,7 +755,7 @@ local function on_io_exec()
 end
 
 local function arm_io(kind, id, path)
-  if not path then reply_err(id, "bad_params", "path 필요"); return end
+  if not path then reply_err(id, "bad_params", "path is required"); return end
   pending_io = { kind = kind, id = id, path = path }
   pending_io.ref = emu.addMemoryCallback(on_io_exec, emu.callbackType.exec, IO_LO, IO_HI, CPU)
 end
@@ -765,12 +763,18 @@ end
 -- probe: 베이스 복귀 → frame프레임 전진 → 타깃 읽기, 한 명령에서 원자적으로(결정론적).
 -- 의미 키: state(베이스 세이브스테이트), frame(프레임), memory_type/address/length(타깃).
 local function arm_probe(id, p)
-  if not p.state then reply_err(id, "bad_params", "state 필요"); return end
+  if not p.state then reply_err(id, "bad_params", "state is required"); return end
   local frames, err = bounded_sync_count(p.frame, 0, true)
   if not frames then reply_err(id, "bad_params", err); return end
+  local region, kind, message = Memory.range(
+    emu, SYS, p.memory_type, p.address or 0, p.length or 1)
+  if not region then reply_err(id, kind, message); return end
   pending_io = {
     kind = "probe", id = id, path = p.state,
-    probe = { frame = frames, mem = p.memory_type, addr = p.address or 0, len = p.length or 1 },
+    probe = {
+      frame = frames, mem = p.memory_type, mt = region.memory_type,
+      addr = p.address or 0, len = p.length or 1,
+    },
   }
   pending_io.ref = emu.addMemoryCallback(on_io_exec, emu.callbackType.exec, IO_LO, IO_HI, CPU)
 end
@@ -787,7 +791,7 @@ local function frozen_state_io(method, id, p)
 
   local path = method == "probe" and p.state or p.path
   if not path then
-    reply_err(id, "bad_params", method == "probe" and "state 필요" or "path 필요")
+    reply_err(id, "bad_params", method == "probe" and "state is required" or "path is required")
     return nil
   end
 
@@ -795,9 +799,13 @@ local function frozen_state_io(method, id, p)
   if method == "probe" then
     local frames, err = bounded_sync_count(p.frame, 0, true)
     if not frames then reply_err(id, "bad_params", err); return nil end
+    local region, range_kind, range_message = Memory.range(
+      emu, SYS, p.memory_type, p.address or 0, p.length or 1)
+    if not region then reply_err(id, range_kind, range_message); return nil end
     probe = {
       frame = frames,
       mem = p.memory_type,
+      mt = region.memory_type,
       addr = p.address or 0,
       len = p.length or 1,
     }
@@ -851,7 +859,7 @@ abort_inflight = function()
   end
   pending_io = nil
   reset_after_reply = false
-  if cancelled then pcall(emu.log, "[emucap] 연결 종료 — 미완성 요청을 취소하고 재접속 대기") end
+  if cancelled then pcall(emu.log, "[emucap] connection closed; cancelled unfinished requests and waiting to reconnect") end
 end
 
 -- ── 브레이크포인트 ───────────────────────────────────────────
@@ -873,29 +881,22 @@ end
 
 local function parse_snapshot_specs(raw)
   if raw == nil then return nil end
-  if type(raw) ~= "table" then return nil, "snapshot은 memory_type:address:length 문자열 배열이어야 한다" end
+  if type(raw) ~= "table" then return nil, "snapshot must be an array of memory_type:address:length strings" end
   local specs = {}
   for _, raw_spec in ipairs(raw) do
     local mt_name, addr_text, len_text = tostring(raw_spec):match("^%s*([^:]+):([^:]+):([^:]+)%s*$")
-    if not mt_name then return nil, "잘못된 snapshot 스펙: " .. tostring(raw_spec) end
-    local mt = emu.memType[mt_name]
-    if mt == nil then return nil, "지원하지 않는 snapshot memory_type: " .. mt_name end
+    if not mt_name then return nil, "invalid snapshot specification: " .. tostring(raw_spec) end
     local addr, len = snum(addr_text), snum(len_text)
-    if addr == nil or addr < 0 or addr ~= math.floor(addr) then
-      return nil, "snapshot address는 0 이상의 정수여야 한다: " .. addr_text
-    end
-    if len == nil or len < 1 or len ~= math.floor(len) then
-      return nil, "snapshot length는 1 이상의 정수여야 한다: " .. len_text
-    end
+    if addr == nil then return nil, "invalid snapshot address: " .. addr_text end
+    if len == nil or len < 1 then return nil, "invalid snapshot length: " .. len_text end
     if len > READ_CAP then
-      return nil, string.format("snapshot length %d가 상한 %d 초과", len, READ_CAP)
+      return nil, string.format("snapshot length %d exceeds limit %d", len, READ_CAP)
     end
-    local region_size = SYS.region_sizes and SYS.region_sizes[mt_name]
-    if region_size and (addr >= region_size or len > region_size - addr) then
-      return nil, string.format("snapshot %s 범위 0x%X+0x%X가 영역 크기 0x%X 초과",
-        mt_name, addr, len, region_size)
-    end
-    specs[#specs + 1] = { mt = mt, mt_name = mt_name, addr = addr, len = len }
+    local region, _, range_message = Memory.range(emu, SYS, mt_name, addr, len)
+    if not region then return nil, range_message end
+    specs[#specs + 1] = {
+      mt = region.memory_type, mt_name = mt_name, addr = addr, len = len,
+    }
   end
   return specs
 end
@@ -1151,8 +1152,8 @@ function handlers.set_breakpoint(p)
   -- breakpoint 히트 시점과 원자적이지 않다.
   if p.auto_savestate then
     return false, "unsupported",
-      "auto_savestate는 BP 히트에서 미지원 — createSavestate는 exec 콜백 전용이라 read/write/이벤트/codeBreak 콜백에선 실패한다. "
-      .. "히트 순간 원자 캡처는 snapshot= 스펙을 써라. 실행 중 save_state는 히트 시점과 원자적이지 않다."
+      "auto_savestate is unavailable on breakpoint hits because createSavestate is valid only in an exec callback. "
+      .. "Use snapshot specs for atomic hit-time capture; save_state while running is not atomic with the hit."
   end
   local id = next_bp_id; next_bp_id = next_bp_id + 1
   if p.kind == "snes_obj_eval_start" or p.kind == "snes_obj_handoff" then
@@ -1164,7 +1165,7 @@ function handlers.set_breakpoint(p)
         or start_scanline < 0 or end_scanline < start_scanline
         or start_scanline ~= math.floor(start_scanline) or end_scanline ~= math.floor(end_scanline)
         or end_scanline > 0xFFFF then
-      return false, "bad_params", "SNES OBJ event start/end는 0..65535 범위의 오름차순 scanline이어야 한다"
+      return false, "bad_params", "SNES OBJ event start/end must be ascending integer scanlines in 0..65535"
     end
     local snapshot_specs, snapshot_error = parse_snapshot_specs(p.snapshot)
     if snapshot_error then return false, "bad_params", snapshot_error end
@@ -1292,18 +1293,27 @@ function handlers.set_breakpoint(p)
   end
   local cbtype = emu.callbackType[p.kind]
   if not cbtype then
-    return false, "bad_params", "지원하지 않는 breakpoint kind: " .. tostring(p.kind)
+    return false, "bad_params", "unsupported breakpoint kind: " .. tostring(p.kind)
   end
+  local bp_start, bp_end = p.start or 0, p["end"] or p.start or 0
+  if bp_end < bp_start then
+    return false, "bad_params", "breakpoint end must be greater than or equal to start"
+  end
+  local has_value = (p.value ~= nil) and (p.kind ~= "exec")
+  local value_len = math.max(1, math.min(4, p.value_len or 1))
+  local value_tail = has_value and value_len - 1 or 0
+  local bp_region, range_kind, range_message = Memory.range(
+    emu, SYS, p.memory_type, bp_start, bp_end - bp_start + 1 + value_tail)
+  if not bp_region then return false, range_kind, range_message end
   -- 값-조건: read/write BP에서 접근 값이 (value & value_mask)와 같을 때만 발화.
   -- exec BP엔 접근 값 개념이 없어 무시. value 미지정이면 종전대로 모든 접근에 발화.
-  local has_value = (p.value ~= nil) and (p.kind ~= "exec")
   local bp = {
     id = id, kind = p.kind, memory_type = p.memory_type,
     pause_on_hit = p.pause_on_hit,
-    start = p.start or 0, end_ = p["end"] or p.start or 0,
+    start = bp_start, end_ = bp_end,
     cbtype = cbtype, pc_min = p.pc_min, pc_max = p.pc_max,   -- pc 조건(선택)
     has_value = has_value, value = p.value or 0,
-    value_mask = p.value_mask or 0xFFFFFFFF, value_len = math.max(1, math.min(4, p.value_len or 1)),
+    value_mask = p.value_mask or 0xFFFFFFFF, value_len = value_len,
   }
   -- 잘못된 BP 주소 등록 방지: read/write BP는 CPU-버스 주소로 콜백을 단다 — addMemoryCallback은 memory_type을
   -- 콜백 등록에 쓰지 않는다. 그래서 RAM memory_type의 상대 offset을 주면(예 GG smsWorkRam:0x0B) 버스 0x000B(ROM)에
@@ -1319,10 +1329,10 @@ function handlers.set_breakpoint(p)
       -- 그 밖 offset은 안정된 버스주소가 없다(gbVideoRam:0x2000 → base+off=0xA000=카트RAM에 오발화). base+offset을
       -- 조용히 걸면 무관 메모리에 걸리므로, bp_bus_window 지정 시 window 밖 offset은 명확히 거부한다(read_memory는 여전히 offset으로 됨).
       local window = SYS.bp_bus_window and SYS.bp_bus_window[bp.memory_type]
-      if window and bp.end_ >= window then
+      if window and bp.end_ + value_tail >= window then
         return false, "bad_params", string.format(
-          "%s BP offset 0x%X가 CPU-버스 window(0x%X) 밖 — 뱅크된 영역은 뱅크당 고정 버스주소만 있어 그 밖 offset은 "
-            .. "안정된 BP 주소가 없다. window 안 offset이나 CPU-버스 memory_type으로 걸어라",
+          "%s BP offset 0x%X is outside its CPU-bus window (0x%X); banked regions have no stable BP address outside that window. "
+            .. "Use an offset within the window or a CPU-bus memory type.",
           bp.memory_type, bp.end_, window)
       end
       bp.start = bp.start + base; bp.end_ = bp.end_ + base; bp.bus_translated = true
@@ -1340,7 +1350,7 @@ function handlers.set_breakpoint(p)
     local disp = SYS.non_bus_write_memtypes[bp.memory_type]
     if disp == "vram_recon" then
       if p.kind ~= "write" then
-        return false, "unsupported", bp.memory_type .. " read BP 재구성 미구현(write만) — status.methods 참조"
+        return false, "unsupported", bp.memory_type .. " read BP reconstruction is unavailable; only write reconstruction is implemented"
       end
       local budget = math.max(1, p.max_instructions or VRAM_RECON_BUDGET)
       setup_vram_recon_bp(bp, budget)
@@ -1348,7 +1358,7 @@ function handlers.set_breakpoint(p)
       return true, { id = id, mechanism = "vdp_write_reconstruction", max_instructions = budget }
     elseif disp then
       return false, "unsupported", bp.memory_type
-        .. "은 CPU 버스에 없어(VDP/PPU 등 비-CPU-버스 메모리 — 포트 write로만 접근) memory " .. p.kind .. " BP로 못 잡는다 — 재구성 미지원. status.methods 참조"
+        .. " is not on the CPU bus and cannot be observed by a memory " .. p.kind .. " breakpoint; reconstruction is unavailable"
     end
   end
   local function on_access(addr, value)
@@ -1393,7 +1403,7 @@ end
 
 function handlers.clear_breakpoint(p)
   local bp = breakpoints[p.id]
-  if not bp then return false, "not_found", "그런 breakpoint 없음" end
+  if not bp then return false, "not_found", "breakpoint not found" end
   if bp.is_event then emu.removeEventCallback(bp.ref, bp.evtype)
   elseif bp.is_dma then
     for _, d in ipairs(bp.dma_refs) do emu.removeMemoryCallback(d.ref, bp.cbtype, d.reg, d.reg, CPU) end
@@ -1587,32 +1597,33 @@ local SCAN_CAP = 0x20000   -- 1초 워치독 안전: 한 호출 최대 128KB 스
 -- 의미 키: memory_type, hex(찾을 바이트열, 짝수 길이), start(오프셋, 기본 0), length(검색 길이; 미지정 시
 -- 영역 끝까지), max_matches(상한, 기본 256), align(이 배수 오프셋만, 기본 1 — 테이블 엔트리 검색).
 function handlers.find_pattern(p)
-  local mt = emu.memType[p.memory_type] or p.memory_type
   local hex = p.hex
   if type(hex) ~= "string" or #hex < 2 or #hex % 2 ~= 0 then
-    return false, "bad_params", "hex는 짝수 길이(≥1바이트) hex 문자열"
+    return false, "bad_params", "hex must contain at least one byte and have even length"
   end
   local pat = {}
   for i = 1, #hex, 2 do
     local b = tonumber(hex:sub(i, i + 1), 16)
-    if not b then return false, "bad_params", "hex 디코드 실패" end
+    if not b then return false, "bad_params", "hex decode failed" end
     pat[#pat + 1] = string.char(b)
   end
   pat = table.concat(pat)
   local start = p.start or 0
-  if start < 0 then start = 0 end
   local len = p.length
   if not len then
     local rs = REGION_SIZE[p.memory_type]
     if rs then len = rs - start
-    else return false, "bad_params", "length 필요(알 수 없는 memory_type은 검색 길이를 명시)" end
+    else return false, "bad_params", "length is required for an unknown memory_type" end
   end
-  if len < 0 then len = 0 end
+  local region, kind, message = Memory.range(emu, SYS, p.memory_type, start, len)
+  if not region then return false, kind, message end
   local truncated_scan = false
   if len > SCAN_CAP then len = SCAN_CAP; truncated_scan = true end   -- 워치독 안전 상한
   -- 영역을 바이너리 문자열로 1회 적재
   local buf = {}
-  for i = 0, len - 1 do buf[i + 1] = string.char(emu.read(start + i, mt, false)) end
+  for i = 0, len - 1 do
+    buf[i + 1] = string.char(emu.read(start + i, region.memory_type, false))
+  end
   buf = table.concat(buf)
   local align = (p.align and p.align >= 1) and p.align or 1
   local max_matches = p.max_matches or 256
@@ -1663,7 +1674,7 @@ local function dispatch(line)
     return
   end
   if method == "step" or method == "resume" then
-    reply_err(id, "not_paused", "step/resume는 frozen에서만 가능")
+    reply_err(id, "not_paused", "step and resume require frozen state")
     return
   end
   -- 지연 명령(즉시 응답 안 함; 프레임 경과/exec 후 응답)
@@ -1925,9 +1936,9 @@ end, emu.eventType.startFrame)
 CPU = emu.cpuType[SYS.cpu_type]   -- 브레이크포인트/세이브스테이트 exec 콜백용
 
 if emu.getScriptDataFolder() == "" then
-  emu.displayMessage("emucap", "I/O 접근 꺼짐 — Script Settings에서 켜야 함")
+  emu.displayMessage("emucap", "I/O access is disabled; enable it in Script Settings")
 end
-emu.log("emucap-core(능동) 로드됨: " .. HOST .. ":" .. PORT)
+emu.log("emucap-core active control loaded: " .. HOST .. ":" .. PORT)
 
 -- 콜드부팅 1회성 DMA 포착(EMUCAP_PREARM): soft reset로는 재현 안 되는 전원ON 1회 DMA(예: OBJ 폰트
 -- 로드)는 BP를 부팅 '전'에 무장해야 잡힌다. 이 환경변수가 있으면 스크립트 로드(=ROM 부팅 직전)에 dma
@@ -1945,9 +1956,9 @@ do
       pause_on_hit = false,
     })
     if pok and ok == true then
-      emu.log("[emucap] pre-arm dma 캡처 활성(bp " .. tostring(info.id) .. "): " .. prearm)
+      emu.log("[emucap] pre-armed DMA capture (bp " .. tostring(info.id) .. "): " .. prearm)
     else
-      emu.log("[emucap] pre-arm dma 실패: " .. prearm .. " (" .. tostring(info) .. ")")
+      emu.log("[emucap] failed to pre-arm DMA capture: " .. prearm .. " (" .. tostring(info) .. ")")
     end
   end
 end

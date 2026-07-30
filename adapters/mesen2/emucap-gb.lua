@@ -7,6 +7,7 @@ SYS = {
   system_label = "Game Boy",
   cpu_type = "gameboy",              -- emu.cpuType.gameboy (GB/GBC 공통, SM83)
   default_memtype = "gameboyMemory", -- emu.memType.gameboyMemory (SM83 CPU 버스 $0000-$FFFF)
+  address_space_size = 0x10000,
   -- Mesen GameboyController setInput 키(소문자): a/b/start/select + 방향키.
   buttons = {
     a = true, b = true, start = true, select = true,
@@ -263,6 +264,6 @@ if not dir or dir == "" then
   local src = debug.getinfo(1, "S").source
   if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
 end
-assert(dir and dir ~= "", "emucap-gb: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
+assert(dir and dir ~= "", "emucap-gb: EMUCAP_ADAPTER_DIR is unset and the script path could not be derived; use launch or load this script from a file")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

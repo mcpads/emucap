@@ -47,7 +47,7 @@ $lua = if ($env:EMUCAP_MESEN_LUA) {
 
 function Get-LocalTcpConnections([int]$LocalPort) {
   if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) {
-    throw "Get-NetTCPConnection is unavailable; use the MCP launch tool or run this fallback on Windows with the NetTCPIP module"
+    throw "Get-NetTCPConnection is unavailable; use the MCP launch tool or run this script on Windows with the NetTCPIP module"
   }
   @(Get-NetTCPConnection -LocalPort $LocalPort -ErrorAction SilentlyContinue)
 }
@@ -286,8 +286,8 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    & git -C $here diff --quiet HEAD -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null
-    if ($LASTEXITCODE -ne 0) {
+    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_memory.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $dirtyFiles.Count -gt 0) {
       $buildHash = "$buildHash-dirty"
     }
   }

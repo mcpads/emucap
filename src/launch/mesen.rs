@@ -386,8 +386,27 @@ pub struct Launch<'a> {
     pub log_path: &'a Path,
     pub port: u16,
     pub name: Option<&'a str>,
+    pub build: Option<&'a str>,
     pub session_token: Option<&'a str>,
     pub runtime: Option<super::RuntimeEnv<'a>>,
+}
+
+fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> super::LaunchSpec {
+    let opts = crate::launch::spec::SpecOpts {
+        content: l.content,
+        port: l.port,
+        name: l.name,
+        session_token: l.session_token,
+        runtime: l.runtime,
+        headless: false,
+    };
+    let mut spec = crate::launch::spec::mesen_spec(binary, l.log_path, l.lua, &opts)
+        .env("EMUCAP_MESEN_UPSTREAM_COMMIT", &host_build.commit)
+        .env("EMUCAP_MESEN_PATCHSET_SHA256", &host_build.patchset_sha256);
+    if let Some(build) = l.build {
+        spec = spec.env("EMUCAP_BUILD_HASH", build);
+    }
+    spec
 }
 
 /// Prepare an emucap-owned portable Mesen copy and launch it detached with the ROM + adapter Lua and
@@ -397,17 +416,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let portable = prepare_portable_binary(l.binary, l.port)?;
     ensure_portable_settings(&portable)?;
     provision_gba_bios(l, &portable)?;
-    let opts = crate::launch::spec::SpecOpts {
-        content: l.content,
-        port: l.port,
-        name: l.name,
-        session_token: l.session_token,
-        runtime: l.runtime,
-        headless: false, // Mesen renders a GUI window; there is no headless mode.
-    };
-    let spec = crate::launch::spec::mesen_spec(&portable.binary, l.log_path, l.lua, &opts)
-        .env("EMUCAP_MESEN_UPSTREAM_COMMIT", &host_build.commit)
-        .env("EMUCAP_MESEN_PATCHSET_SHA256", &host_build.patchset_sha256);
+    let spec = launch_spec(l, &portable.binary, &host_build);
     crate::launch::wake_display_before_gui_launch();
     let pid = crate::launch::spawn_detached(&spec)?;
     // Keep the macOS display awake for the HITL window and reap the helper (no-op off macOS).

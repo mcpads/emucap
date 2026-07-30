@@ -356,6 +356,7 @@ fn gba_provision_inputs<'a>(
         log_path: log,
         port: 47800,
         name: None,
+        build: Some("test-build"),
         session_token: None,
         runtime: None,
     };
@@ -559,4 +560,43 @@ fn provision_skips_non_gba_lua_entry() {
     l.content = "/unused/rom.sfc";
     // No BIOS anywhere, but a non-GBA entry must not attempt provisioning.
     with_gba_env(dir.path(), None, || provision_gba_bios(&l, &portable)).unwrap();
+}
+
+#[test]
+fn launch_spec_propagates_server_and_host_build_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("Mesen");
+    let lua = dir.path().join("emucap-snes.lua");
+    let log = dir.path().join("mesen.log");
+    let launch = Launch {
+        binary: &binary,
+        content: "/tmp/game.sfc",
+        lua: &lua,
+        log_path: &log,
+        port: 47800,
+        name: Some("test"),
+        build: Some("server-build"),
+        session_token: Some("token"),
+        runtime: None,
+    };
+    let host_build = BuildMetadata {
+        upstream: "https://example.invalid/Mesen.git".into(),
+        tag: "test".into(),
+        commit: "a".repeat(40),
+        host_api: REQUIRED_HOST_API,
+        patchset_sha256: "b".repeat(64),
+    };
+
+    let spec = launch_spec(&launch, &binary, &host_build);
+    assert!(spec
+        .env
+        .contains(&("EMUCAP_BUILD_HASH".into(), "server-build".into())));
+    assert!(spec.env.contains(&(
+        "EMUCAP_MESEN_UPSTREAM_COMMIT".into(),
+        host_build.commit.clone()
+    )));
+    assert!(spec.env.contains(&(
+        "EMUCAP_MESEN_PATCHSET_SHA256".into(),
+        host_build.patchset_sha256.clone()
+    )));
 }

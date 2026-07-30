@@ -111,7 +111,7 @@ local function dump_bundle()
     INTERVAL, DEPTH, table.concat(slices_json, ","))
   write_file(dir .. "/_raw.json", raw)
 
-  emu.displayMessage("emucap", "캡처됨 → " .. dir)
+  emu.displayMessage("emucap", "Captured: " .. dir)
   emu.drawString(8, 8, "EMUCAP CAPTURED", 0xFFFFFF, 0x000000, 0, 120)
 end
 
@@ -135,7 +135,7 @@ local function on_exec_sample()
 
   if not logged_first then
     logged_first = true
-    emu.log("emucap: 첫 샘플 저장 (state " .. #state .. " bytes)")
+    emu.log("emucap: saved the first sample (state " .. #state .. " bytes)")
   end
 end
 
@@ -160,11 +160,11 @@ end, emu.eventType.startFrame)
 -- I/O 접근이 꺼져 있으면 트리거가 발화해도 파일을 못 쓴다. 로드 시 미리 경고한다.
 -- (getScriptDataFolder는 I/O 접근이 꺼져 있으면 빈 문자열을 반환한다.)
 if emu.getScriptDataFolder() == "" then
-  emu.displayMessage("emucap", "I/O 접근 꺼짐 — Script Settings에서 켜야 캡처 저장됨")
-  emu.log("emucap 경고: I/O 접근이 꺼져 있어 캡처를 저장할 수 없습니다.")
+  emu.displayMessage("emucap", "I/O access is disabled; enable it in Script Settings")
+  emu.log("emucap warning: captures cannot be saved while I/O access is disabled.")
   emu.log("  Script -> Settings -> Script Window -> Restrictions ->")
-  emu.log("  'Allow access to I/O and OS functions' 를 켜고 스크립트를 다시 로드하세요.")
+  emu.log("  Enable 'Allow access to I/O and OS functions' and reload the script.")
 end
 
-emu.log("emucap: ROM 경로 = " .. detect_rom_path())
-emu.log("emucap 어댑터 로드됨: " .. #TRIGGER_KEYS .. "키 조합으로 회고 덤프")
+emu.log("emucap: ROM path = " .. detect_rom_path())
+emu.log("emucap adapter loaded: retrospective dump uses a " .. #TRIGGER_KEYS .. "-key chord")
