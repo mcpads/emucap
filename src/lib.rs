@@ -6,6 +6,7 @@ pub mod gdb_rsp;
 pub mod launch;
 pub mod live;
 pub mod mcp_result;
+pub mod mcp_stdio;
 #[cfg(unix)]
 pub mod n64_adapter;
 pub mod nds_bridge;
@@ -21,3 +22,7 @@ pub mod track;
 
 #[cfg(test)]
 pub(crate) mod test_env;
+
+#[cfg(test)]
+#[path = "mcp_stdio_tests.rs"]
+mod mcp_stdio_tests;

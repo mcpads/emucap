@@ -709,3 +709,34 @@ fn unsupported_modern_version_is_rejected_without_terminating_server() {
     let supported = server.request(modern_request(2, "server/discover", json!({})));
     assert_eq!(supported["result"]["resultType"], "complete");
 }
+
+#[test]
+fn malformed_first_modern_request_is_rejected_without_terminating_servers() {
+    let control_envs = [("EMUCAP_PORT", free_port().to_string())];
+    let mut control = McpProcess::spawn(env!("CARGO_BIN_EXE_emucap-mcp"), &control_envs);
+    let malformed = control.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "server/discover",
+        "params": {}
+    }));
+    assert_eq!(malformed["error"]["code"], -32600);
+    let discover = control.request(modern_request(2, "server/discover", json!({})));
+    assert_eq!(discover["result"]["resultType"], "complete");
+
+    let root = tempfile::tempdir().expect("temporary tracking root");
+    let track_envs = [(
+        "EMUCAP_TRACK_ROOT",
+        root.path().to_string_lossy().into_owned(),
+    )];
+    let mut track = McpProcess::spawn(env!("CARGO_BIN_EXE_emucap-track-mcp"), &track_envs);
+    let malformed = track.request(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "server/discover",
+        "params": {}
+    }));
+    assert_eq!(malformed["error"]["code"], -32600);
+    let discover = track.request(modern_request(2, "server/discover", json!({})));
+    assert_eq!(discover["result"]["resultType"], "complete");
+}

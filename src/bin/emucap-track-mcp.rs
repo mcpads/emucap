@@ -774,7 +774,7 @@ impl ServerHandler for EmucapTrack {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = EmucapTrack::new();
-    let service = server.serve(rmcp::transport::stdio()).await?;
+    let service = server.serve(emucap::mcp_stdio::bounded_stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
