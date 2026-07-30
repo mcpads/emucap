@@ -975,7 +975,7 @@ pub fn screenshot(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64.as_bytes())
         .map_err(|e| LinkError::Protocol(format!("failed to decode base64 screenshot: {e}")))?;
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let sha256 = hex::encode(Sha256::digest(&bytes));
     if let Some(reported) = result.get("sha256").and_then(Value::as_str) {
         if reported != sha256 {
             return Err(LinkError::Protocol(format!(

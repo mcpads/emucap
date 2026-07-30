@@ -134,6 +134,11 @@ emulator. Unfinished request IDs and transient presses are canceled and transien
 released; execution state, breakpoints, and explicit `set_input` holds remain. A timeout alone is not
 proof that Mednafen exited, so reconnect and query `status` before launching another process.
 
+A completed or breakpoint-interrupted `press_buttons` pulse releases its override before the
+terminal response. `set_input([])` explicitly returns port 0 to native input; `resume` does not
+release an explicit persistent hold. The maintained macOS display-mode gate verifies physical
+input before and after both release paths.
+
 ```
 # Saturn
 ./launch.sh "/path/to/saturn.cue" 47800

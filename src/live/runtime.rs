@@ -236,11 +236,14 @@ impl RuntimeStore {
 
     pub fn prepare(&self, port: u16) -> io::Result<PreparedGeneration> {
         let expected_current_launch_id = self.read_current(port)?.map(|current| current.launch_id);
-        let launch_id = format!("launch-{}", ulid::Ulid::new().to_string().to_lowercase());
+        let launch_id = format!(
+            "launch-{}",
+            ulid::Ulid::generate().to_string().to_lowercase()
+        );
         let reclaim_token = format!(
             "reclaim-{}{}",
-            ulid::Ulid::new().to_string().to_lowercase(),
-            ulid::Ulid::new().to_string().to_lowercase()
+            ulid::Ulid::generate().to_string().to_lowercase(),
+            ulid::Ulid::generate().to_string().to_lowercase()
         );
         let generation = self.generation_dir(port, &launch_id);
         self.create_managed_dir(&generation)?;
@@ -805,7 +808,7 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
         path.file_name()
             .and_then(|v| v.to_str())
             .unwrap_or("capsule"),
-        ulid::Ulid::new().to_string().to_lowercase()
+        ulid::Ulid::generate().to_string().to_lowercase()
     ));
     let result = (|| {
         let mut options = OpenOptions::new();

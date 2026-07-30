@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.11.2 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.12.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -39,7 +39,7 @@ override를 우선한다.
 
 ### 1. 사전 요건 (에이전트가 확인 후 없으면 설치)
 
-- **Rust** — `command -v cargo` 로 확인. 없으면:
+- **Rust 1.88 이상** — `command -v cargo`와 `rustc --version`으로 확인. 없으면:
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
 - **C 컴파일러** (SQLite 번들 빌드용) — macOS: `xcode-select -p || xcode-select --install`.
   Linux: `cc --version || sudo apt-get install -y build-essential`. Windows: MSVC C++ build tools를
@@ -74,7 +74,9 @@ SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필�
 emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전트가 둘을 조립한다(§3계층).
 
 - **제어 MCP**(`emucap-mcp`) — 에뮬레이터 조작 엔진. 메모리·상태·화면을 읽고, 입력·세이브스테이트·
-  브레이크포인트를 제어하고, 분석 verb(`regression_run`/`verify_determinism`)로 결과를 *반환*한다.
+  브레이크포인트를 제어하고, 선택적 분석 verb(`regression_run`/`verify_determinism`)로 결과를
+  *반환*한다. 이 schema가 필요할 때만 `analysis(operation="describe")`를 호출하고, 같은
+  `analysis` 도구로 선택한 operation을 실행한다.
 - **추적 MCP**(`emucap-track-mcp`) — 실험 원장(`.emucap/`). run을 시작(`run_start`)·기록(`log_*`)·
   질의(`query_runs`/`compare_runs`/`summarize_runs`)한다. **에뮬레이터를 모른다**(emulator-less). 제어
   MCP에 *얹혀* 실험을 남기는 add-on이라, 켜지 않아도 제어 MCP는 그대로 동작한다.
@@ -114,11 +116,12 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
 
 두 MCP는 서로를 호출하지 않는다 — **에이전트가 조립한다**:
 
-- **rom_sha1 전달**: 제어 MCP의 `get_rom_info`(`.sha1`)로 ROM 식별자를 읽어 추적 MCP의
+- **rom_sha1 전달**: 제어 MCP의 `get_rom_info`(`.rom_sha1`)로 ROM 식별자를 읽어 추적 MCP의
   `run_start(rom_sha1=…)`에 넘긴다(어댑터가 `get_rom_info` 미지원이면 `shasum -a1 <content>`).
   `connection_ref`(제어 MCP `status`의 연결 이름 또는 `"port:N"`)를 함께 넘기면 같은 연결의 직전
   미종료 run이 자동 마감된다.
-- **분석 verb는 반환만**: `regression_run`/`verify_determinism`은 제어 MCP가 에뮬을 구동해
+- **분석 verb는 반환만**: 필요할 때 `analysis(operation="describe")`를 호출하고 같은 도구로
+  선택한 `regression_run`/`verify_determinism` operation을 실행한다. 제어 MCP가 에뮬을 구동해
   결과를 *반환*할 뿐 원장에 쓰지 않는다. 남기려면 그 결과를 추적 MCP의 `log_gate`(예:
   `determinism_replay`의 `kind=machine` 판정)·`log_metric`으로 기록한다.
 - **프레임 경계 탐색은 `probe`를 조립**: 같은 베이스 상태에서 원자적 `probe`를 반복 호출해 프레임
@@ -129,10 +132,16 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
 ### 4. 첫 동작 (에이전트가 bootstrap으로 시작)
 
 모든 emucap 작업은 `bootstrap`으로 시작한다. 에이전트에게 "emucap `bootstrap`을 호출해줘"라고
-하면, `bootstrap`이 `listening_port`·`runtime_paths`(각 어댑터의 build 경로와 legacy fallback launcher)·
-지원 시스템·그리고 무엇을 켤지 물어볼 질문을 돌려준다. 이후 `launch_plan(content_path, system?)`이
-MCP `launch` 도구 인자를 돌려주고, 에이전트가 `launch`를 호출한 뒤 몇 초 뒤 `status`를 확인한다.
-즉 **어댑터 설치 경로와 fallback도 bootstrap이 알려주므로**, 에이전트가 로컬을 헤맬 필요가 없다.
+하면, 기본 응답이 `listening_port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을
+간결하게 돌려준다. 전체 routing catalog는 `bootstrap(include=["systems"])`, build/runtime 경로는
+`bootstrap(include=["installation"])`으로 명시적으로 요청한다. 이후
+`launch_plan(content_path, system?)`이 검증된 MCP `launch` 도구 인자를 돌려준다.
+에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
+identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
+
+연결된 첫 full `status`는 `capability_revision`을 반환한다. 반복 확인에서는 이를
+`known_capability_revision`으로 보내면 capability catalog가 바뀌지 않았을 때 그 묶음만 생략하고,
+현재 execution·continuity·generation·ownership 상태는 계속 반환한다.
 
 timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종료의 증거가 아니다.
 재실행하기 전에 `status.continuity.runtime_binding`·`status.runtime_instance` 또는

@@ -100,6 +100,60 @@ fn intervention_rows_indexed() {
 }
 
 #[test]
+fn intervention_sequence_outside_sqlite_integer_range_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let mut r = run("01A", "sha_a", "g1");
+    r.interventions.push(Intervention {
+        id: "iv1".into(),
+        seq: u64::MAX,
+        at_frame: None,
+        at_event: None,
+        frozen_context: true,
+        op: "write_memory".into(),
+        args: serde_json::json!({}),
+        created_at: "t".into(),
+    });
+    store::save_run(root, &r).unwrap();
+    let conn = index::open_index(&root.join("index.sqlite")).unwrap();
+
+    assert!(matches!(
+        index::reindex(root, &conn),
+        Err(index::IndexError::IntegerOutOfRange {
+            field: "seq",
+            value: u64::MAX
+        })
+    ));
+}
+
+#[test]
+fn intervention_frame_outside_sqlite_integer_range_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let mut r = run("01A", "sha_a", "g1");
+    r.interventions.push(Intervention {
+        id: "iv1".into(),
+        seq: 0,
+        at_frame: Some(u64::MAX),
+        at_event: None,
+        frozen_context: true,
+        op: "write_memory".into(),
+        args: serde_json::json!({}),
+        created_at: "t".into(),
+    });
+    store::save_run(root, &r).unwrap();
+    let conn = index::open_index(&root.join("index.sqlite")).unwrap();
+
+    assert!(matches!(
+        index::reindex(root, &conn),
+        Err(index::IndexError::IntegerOutOfRange {
+            field: "at_frame",
+            value: u64::MAX
+        })
+    ));
+}
+
+#[test]
 fn reindex_strict_errors_on_corrupt_run() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();

@@ -2,6 +2,60 @@
 
 Actively developed beta software — interfaces may still change.
 
+## Unreleased
+
+## 0.12.0
+
+### Changed
+- Consolidated Control and Tracking tool responses on one structured-result path. JSON tools now
+  expose machine-readable structured content, all argument objects reject unknown fields, and an
+  explicit `launched: false` or `stopped: false` is also an MCP tool error without losing its
+  diagnostic payload.
+- Reduced discovery duplication: compact `bootstrap` returns system IDs and a catalog revision,
+  while full system and installation detail is opt-in; `launch_plan` no longer repeats the system
+  catalog. Full `status` returns a capability revision so repeated checks can omit an unchanged
+  catalog while preserving current execution, continuity, generation, and ownership state.
+  Executable legacy-launch aliases and command templates are no longer advertised.
+- Replaced the platform-heavy Control server instructions with common lifecycle, timing, memory,
+  input-ownership, breakpoint-evidence, and reproduction rules. Adapter-specific exceptions remain
+  runtime-negotiated.
+- Consolidated live regression and reproducibility analysis behind one static `analysis` tool.
+  `operation="describe"` returns the detailed operation schemas only when requested; execution
+  stays in the current Control session and preserves verdict, generation, and cleanup contracts.
+- Mesen advertises only memory regions belonging to the active system, derives each live boundary
+  from the host-reported memory size, and applies one finite-range validator to memory access,
+  search, probe, breakpoint ranges, and hit-time snapshots.
+
+### Fixed
+- Mesen launch identity now distinguishes the emucap server build from the pinned host build, and
+  direct launcher dirty detection includes untracked production Lua modules.
+- Mesen fallback launchers refuse to replace a live process from the same managed portable
+  directory and never signal a foreign or PID-reused process based only on a stale pidfile.
+- Mesen, Mednafen, and Flycast reject empty memory writes before mutation; Mesen also rejects
+  cross-region access before calling the host.
+- Control and Tracking reject malformed, metadata-free, or oversized initial stdio messages
+  without terminating the MCP process, and accept a subsequent valid discovery or initialization.
+- Identity-mismatch errors no longer include raw expected or received session tokens.
+
+### Removed
+- Removed the direct `regression_run` and `verify_determinism` MCP tool routes. Their operations
+  remain available through `analysis`.
+
+## 0.12.0-alpha.1
+
+### Added
+- Added MCP 2026-07-28 discovery and request-per-message compatibility to both stdio servers while preserving the legacy `initialize` lifecycle. Real-process wire tests cover modern discovery, tool listing and invocation, legacy fallback, and fail-loud unsupported-version recovery.
+- Added public one-hour cache hints for binary-static server discovery and tool schemas. Runtime adapter capabilities remain uncached and are reported only by `status`.
+
+### Changed
+- Updated the Rust MCP SDK to rmcp 3.0.1; moved the hashing, Base64, SQLite, ULID, ZIP, and WebSocket crates to their current stable major releases; refreshed the remaining compatible dependencies; and declared Rust 1.88 as the minimum supported compiler.
+- Separated MCP protocol lifecycle from emulator generations, control leases, and tracking runs in the architecture and runtime lifecycle contracts. Shared transports remain blocked until mutation requests carry explicit application context and lease identity.
+- Moved the DeSmuME, PPSSPP, and MAME source pins into adapter-local lock files. DeSmuME and PPSSPP now verify their ordered patch-stack digests, and MAME verifies its pinned source archive on both `shasum` and `sha256sum` hosts.
+
+### Fixed
+- Build guards now validate the current file-based Mesen portable settings template instead of searching for the removed inline heredoc, and derive the Mednafen corrupt-cache fixture filename from the pinned version.
+- SQLite indexing now converts intervention sequence and frame counters to its signed integer domain explicitly and rejects out-of-range values instead of relying on an implicit unsigned conversion.
+
 ## 0.11.2
 
 ### Fixed

@@ -7,6 +7,7 @@ SYS = {
   system_label = "Nintendo Entertainment System",
   cpu_type = "nes",              -- emu.cpuType.nes (NES/Famicom 공통, 6502/2A03)
   default_memtype = "nesMemory", -- emu.memType.nesMemory (6502 CPU 버스 $0000-$FFFF)
+  address_space_size = 0x10000,
   -- Mesen NesController setInput 키(소문자): a/b/start/select + 방향키. 표준 NES 패드는 X/Y/L/R 없음.
   buttons = {
     a = true, b = true, start = true, select = true,
@@ -49,7 +50,8 @@ SYS = {
   region_sizes = {
     nesInternalRam = 0x800, nesWorkRam = 0x2000, nesSaveRam = 0x2000,
     nesPrgRom = 0x80000, nesChrRom = 0x40000, nesChrRam = 0x2000,
-    nesNametableRam = 0x800, nesPaletteRam = 0x20, nesSpriteRam = 0x100,
+    nesPpuMemory = 0x4000, nesNametableRam = 0x800, nesPaletteRam = 0x20,
+    nesSpriteRam = 0x100, nesSecondarySpriteRam = 0x20,
   },
 }
 
@@ -203,6 +205,6 @@ if not dir or dir == "" then
   local src = debug.getinfo(1, "S").source
   if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
 end
-assert(dir and dir ~= "", "emucap-nes: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
+assert(dir and dir ~= "", "emucap-nes: EMUCAP_ADAPTER_DIR is unset and the script path could not be derived; use launch or load this script from a file")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

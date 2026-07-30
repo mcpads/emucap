@@ -1,62 +1,47 @@
 # emucap
 
-Emulator **capture** infrastructure for debugging retro-game patches (emucap = emulator capture).
-"Capture" here is not a narrow snapshot but a *broad surface for capturing a running emulator's
-observable and reachable state* — memory, registers, screen, VDP, events; reach (writes, input,
-breakpoints, freeze-step, save-states); case bundles; and an experiment ledger. It helps an AI analyze
-a problem a human described, and supports several emulators through a common Core plus adapters.
+emucap gives agents a common observation and control surface over supported emulators. Installation,
+supported platforms, prerequisites, and adapter-specific build instructions are in `README.md` and
+`adapters/*/README.md`.
 
-Install and build → `README.md` (agent-driven install: prerequisites, Core build, MCP registration,
-bootstrap handoff). Per-emulator adapters → each `adapters/*/README.md`.
+## MCP entrypoints
 
-## Binaries
+Register both servers:
 
-emucap is split into **two MCP servers — a Control MCP and a Tracking MCP**. Register both; the agent
-composes them (they do not call each other).
+- `emucap-mcp` controls a live emulator.
+- `emucap-track-mcp` stores experiment records and is the sole `.emucap/` writer.
 
-- `emucap` — case-bundle CLI (`finalize`/`inspect`) + tracking-ledger CLI
-  (`track ls|show|compare|summarize|reindex|import`).
-- `emucap-mcp` — the **Control MCP**. Reads and controls a running emulator (stdio): memory, state,
-  screen, input, breakpoints, save-states, atomic frame-boundary probes, plus analysis verbs
-  (`regression_run`/`verify_determinism`, which only *return* results — they do not write to the
-  ledger). Port `EMUCAP_PORT` (default 47800).
-- `emucap-track-mcp` — the **Tracking MCP**. An emulator-less server (stdio) that is the single writer
-  of the experiment ledger (`.emucap/`): `run_start`/`run_finish`/`log_metric`/`log_gate`/
-  `log_finding`/`log_artifact`/`set_reproduction`/`log_intervention`/`query_runs`/`get_run`/
-  `compare_runs`/`summarize_runs` (+ `bootstrap`). Ledger location `EMUCAP_TRACK_ROOT` (default
-  `.emucap` at the working repo's git root).
-- `emucap-broker` — multi-session connection sharing (for the Control MCP).
-- `emucap-mame-pc98-bridge` — PC-98 launch helper used by the Rust MAME launcher.
-- `emucap-mame-neogeo-bridge` — Neo Geo MVS/AES/CD launch and debugger bridge for MAME.
-- `emucap-mupen64plus` — N64 adapter host for the debugger-enabled Mupen64Plus fork.
-- `emucap-desmume-nds-bridge` — NDS launch helper used by the Rust DeSmuME launcher.
-- `emucap-ppsspp-bridge` — PSP launch helper used by the Rust PPSSPP launcher.
-- `emucap-pcsx2-bridge` — PS2 launch helper used by the Rust PCSX2 launcher.
-- `emucap-openmsx-bridge` — MSX launch and XML-control bridge for stock openMSX.
+Start each new Control task with compact `bootstrap()`. Use `include=["systems"]` for the full
+routing catalog or `include=["installation"]` for build/runtime paths. With known content, call
+`launch_plan`, then the managed `launch`, and verify a fresh `status`.
 
-## MCP operating notes
+Pass `get_rom_info.rom_sha1` unchanged to Tracking `run_start`. Record relevant writes, loads,
+resets, and input with `log_intervention`; record analysis evidence with `log_gate` or `log_metric`.
+Control-side analysis tools do not write the ledger.
 
-Start every emucap task with the MCP `bootstrap`. **Each MCP has its own `bootstrap`** — the Control
-MCP's returns `listening_port`, `runtime_paths`, supported systems, and questions to ask (emulator
-entry); the Tracking MCP's returns `ledger_path`, the active run, and orphaned running runs (ledger
-entry). Do not hunt for an emucap directory locally or guess a launch from the `status` command
-template alone.
+## Runtime safety
 
-Tracking tools (run/log/query) live **only on the Tracking MCP** — do not call them from the Control
-MCP. Read `rom_sha1` from the Control MCP's `get_rom_info` and pass it to the Tracking MCP's
-`run_start`; record analysis-verb results with `log_gate` and state-changing interventions with
-`log_intervention`.
+The full live `status` is the capability authority. Use only advertised methods, memory regions,
+breakpoint domains, inputs, and contract limits. A later status may pass
+`known_capability_revision`; an `unchanged` response omits the cached catalog but retains live
+execution and continuity state.
 
-Treat transport, execution, and evidence as separate states. A timeout or disconnected socket does
-not prove that the emulator exited: inspect `status.continuity.runtime_binding`,
-`status.runtime_instance` or `status.stale_runtime_instance`, and `get_failure_context` before
-launching again. A `mismatched` or `unmanaged` live adapter can provide observations, but an older
-runtime record is not evidence that the current process is owned. Do not edit runtime files; use
-`launch(..., replace: true)` only for an intentional identity-verified replacement. Flycast can
-hold an exact fatal snapshot in read-only quarantine; inspect it first, then call `dismiss_failure`
-only when the connected adapter advertises that method.
+Treat connection, guest execution, process state, lease ownership, runtime binding, and preserved
+failure evidence as separate facts. A timeout or disconnected socket does not prove emulator exit.
+Inspect continuity, `runtime_instance` or `stale_runtime_instance`, and `get_failure_context` before
+replacement.
 
-If tool discovery lacks the Control MCP's `bootstrap`/`launch_plan`, or `status` has no
-`runtime_paths` (or the Tracking MCP's `run_start` is missing), the running release is stale. Rebuild
-with `cargo build --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge --bin emucap-openmsx-bridge`
-and restart both MCPs.
+Never edit runtime ownership files, build detached launch commands, or terminate by executable
+name. Use `replace:true` only for intentional replacement. End a managed generation with
+`stop(status.runtime_instance.launch_id)`; it verifies generation, lease, PID, and process-start
+identity and fails closed on uncertainty.
+
+Wait for each dependent MCP call to finish before issuing the next one. Network request order does
+not prove write/read, load/inspect, or pause/step order. Read adapter contracts before composing
+time-sensitive primitives.
+
+## Build and reconnect
+
+Use release binaries for registered MCP servers. After changing MCP instructions, schemas, tools,
+or runtime responses, rebuild the affected release binaries and reconnect both servers. A debug
+build does not update a running release process.

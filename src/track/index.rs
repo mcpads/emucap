@@ -12,6 +12,8 @@ pub enum IndexError {
     Track(#[from] TrackError),
     #[error("serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("intervention {field} exceeds SQLite INTEGER range: {value}")]
+    IntegerOutOfRange { field: &'static str, value: u64 },
 }
 
 const SCHEMA: &str = "
@@ -164,10 +166,23 @@ fn reindex_from(
             )?;
         }
         for iv in &run.interventions {
+            let seq = i64::try_from(iv.seq).map_err(|_| IndexError::IntegerOutOfRange {
+                field: "seq",
+                value: iv.seq,
+            })?;
+            let at_frame = iv
+                .at_frame
+                .map(|value| {
+                    i64::try_from(value).map_err(|_| IndexError::IntegerOutOfRange {
+                        field: "at_frame",
+                        value,
+                    })
+                })
+                .transpose()?;
             tx.execute(
                 "INSERT INTO intervention (id,run_id,seq,at_frame,at_event,frozen_context,op,args,created_at)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                rusqlite::params![iv.id, run.id, iv.seq, iv.at_frame, iv.at_event,
+                rusqlite::params![iv.id, run.id, seq, at_frame, iv.at_event,
                     iv.frozen_context as i64, iv.op, iv.args.to_string(), iv.created_at],
             )?;
         }

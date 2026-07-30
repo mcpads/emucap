@@ -471,7 +471,7 @@ impl Mupen64PlusHost {
             "adapter": "mupen64plus-native",
             "name": self.rom_path.file_name().and_then(|v| v.to_str()).unwrap_or(""),
             "path": self.rom_path.canonicalize()?.display().to_string(),
-            "sha1": format!("{:x}", hasher.finalize()),
+            "sha1": hex::encode(hasher.finalize()),
             "size": size,
             "media_type": self.rom_path.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase()
         }))

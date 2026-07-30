@@ -6,6 +6,7 @@ SYS = {
   system_label = "Game Gear",
   cpu_type = "sms",               -- emu.cpuType.sms (SMS/GG 공통)
   default_memtype = "smsMemory",  -- emu.memType.smsMemory (Z80 버스)
+  address_space_size = 0x10000,
   -- MesenCE SmsController의 setInput 키(소스 확정): up/down/left/right + one(버튼1=B)·two(버튼2=A)·
   -- pause(=Game Gear Start / SMS Pause 버튼).
   buttons = {
@@ -349,6 +350,6 @@ if not dir or dir == "" then
   local src = debug.getinfo(1, "S").source
   if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
 end
-assert(dir and dir ~= "", "emucap-sms: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
+assert(dir and dir ~= "", "emucap-sms: EMUCAP_ADAPTER_DIR is unset and the script path could not be derived; use launch or load this script from a file")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

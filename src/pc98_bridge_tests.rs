@@ -1420,7 +1420,7 @@ fn screenshot_returns_png_base64_from_lua_snapshot() {
     );
     assert_eq!(
         result["sha256"],
-        format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\nfake"))
+        hex::encode(Sha256::digest(b"\x89PNG\r\n\x1a\nfake"))
     );
     assert_eq!(result["byte_len"], 12);
     assert_eq!(result["state"], "frozen");

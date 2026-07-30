@@ -126,7 +126,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             }
             let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
             let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
-            let sha256 = format!("{:x}", Sha256::digest(&png));
+            let sha256 = hex::encode(Sha256::digest(&png));
             Ok(json!({
                 "png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
                 "sha256": sha256,

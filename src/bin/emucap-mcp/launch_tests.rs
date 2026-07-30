@@ -1,6 +1,6 @@
 use super::*;
 #[cfg(unix)]
-use emucap::live::continuity::ContinuitySnapshot;
+use emucap::live::continuity::{ContinuitySnapshot, RuntimeBinding, RuntimeBindingState};
 use emucap::live::link::{Capabilities, LinkError};
 #[cfg(unix)]
 use emucap::live::runtime::LeaseView;
@@ -8,6 +8,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(unix)]
+fn test_runtime_binding(port: u16) -> RuntimeBinding {
+    let current_launch_id = emucap::live::runtime::RuntimeStore::discover()
+        .read_current(port)
+        .ok()
+        .flatten()
+        .map(|current| current.launch_id);
+    RuntimeBinding {
+        state: if current_launch_id.is_some() {
+            RuntimeBindingState::Bound
+        } else {
+            RuntimeBindingState::Unobserved
+        },
+        current_launch_id: current_launch_id.clone(),
+        live_launch_id: current_launch_id,
+        reason: "test link follows the current runtime generation".into(),
+    }
+}
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
@@ -96,14 +115,6 @@ fn write_dolphin_sidecar(binary: &Path) {
         serde_json::to_vec(&sidecar).unwrap(),
     )
     .unwrap();
-}
-
-fn path_ends_with_parts(path: &str, parts: &[&str]) -> bool {
-    let mut suffix = PathBuf::new();
-    for part in parts {
-        suffix.push(part);
-    }
-    Path::new(path).ends_with(suffix)
 }
 
 #[test]
@@ -278,32 +289,7 @@ fn app_bundle_env_preconditions_report_env_source() {
 }
 
 #[test]
-fn legacy_fallback_availability_follows_host_script_type() {
-    let temporary = tempfile::tempdir().unwrap();
-    let sh = temporary.path().join("launch.sh");
-    let ps1 = temporary.path().join("launch.ps1");
-    std::fs::write(&sh, "#!/bin/sh\n").unwrap();
-    std::fs::write(&ps1, "exit 0\n").unwrap();
-
-    assert_eq!(native_legacy_script(&sh), !cfg!(windows));
-    assert_eq!(native_legacy_script(&ps1), cfg!(windows));
-    assert!(!native_legacy_script(&temporary.path().join(
-        if cfg!(windows) {
-            "missing.ps1"
-        } else {
-            "missing.sh"
-        }
-    )));
-
-    let non_native = if cfg!(windows) { &sh } else { &ps1 };
-    let details = legacy_fallback_details(non_native, &["launch".into()]);
-    assert_eq!(details["available_on_this_host"], false);
-    assert_eq!(details["launcher"], serde_json::Value::Null);
-    assert_eq!(details["argv"], serde_json::Value::Null);
-}
-
-#[test]
-fn launch_plan_for_ps2_has_no_nonexistent_legacy_fallback() {
+fn launch_plan_exposes_only_the_mcp_launcher() {
     let plan = make_launch_plan(
         Some(47805),
         &LaunchPlanArgs {
@@ -313,11 +299,11 @@ fn launch_plan_for_ps2_has_no_nonexistent_legacy_fallback() {
     );
     assert_eq!(plan["adapter"], "pcsx2");
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
-    assert_eq!(plan["legacy_fallback"]["available_on_this_host"], false);
-    assert_eq!(plan["legacy_fallback"]["launcher"], serde_json::Value::Null);
-    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
-    assert_eq!(plan["legacy_fallback_argv"], serde_json::Value::Null);
-    assert_eq!(plan["legacy_fallback_command"], serde_json::Value::Null);
+    assert!(plan.get("legacy_fallback").is_none());
+    assert!(plan.get("legacy_fallback_launcher").is_none());
+    assert!(plan.get("legacy_fallback_argv").is_none());
+    assert!(plan.get("legacy_fallback_command").is_none());
+    assert!(plan.get("runtime_paths").is_none());
 }
 
 #[test]
@@ -748,6 +734,77 @@ fn normalize_system_accepts_nes_aliases() {
 }
 
 #[test]
+fn launch_plan_without_content_requests_only_the_content_path() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: None,
+            system: None,
+        },
+    );
+
+    assert_eq!(plan["ready_to_launch"], false);
+    assert_eq!(plan["next_action"]["kind"], "resolve_input");
+    assert_eq!(
+        plan["next_action"]["required_input"],
+        serde_json::json!(["content_path"])
+    );
+    assert_eq!(
+        plan["next_action"]["then_call"]["arguments_from"],
+        serde_json::json!(["content_path", "system?"])
+    );
+}
+
+#[test]
+fn launch_plan_with_ambiguous_media_preserves_content_and_requests_system() {
+    let content_path = "/tmp/game.cue";
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some(content_path.into()),
+            system: None,
+        },
+    );
+
+    assert_eq!(plan["ready_to_launch"], false);
+    assert_eq!(plan["next_action"]["kind"], "resolve_input");
+    assert_eq!(
+        plan["next_action"]["required_input"],
+        serde_json::json!(["system"])
+    );
+    assert_eq!(
+        plan["next_action"]["then_call"]["arguments"]["content_path"],
+        content_path
+    );
+    assert_eq!(
+        plan["next_action"]["then_call"]["arguments_from"],
+        serde_json::json!(["system"])
+    );
+}
+
+#[test]
+fn launch_plan_with_explicit_system_and_no_content_preserves_system() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: None,
+            system: Some("nes".into()),
+        },
+    );
+
+    assert_eq!(plan["ready_to_launch"], false);
+    assert_eq!(plan["next_action"]["kind"], "resolve_input");
+    assert_eq!(
+        plan["next_action"]["required_input"],
+        serde_json::json!(["content_path"])
+    );
+    assert_eq!(
+        plan["next_action"]["then_call"]["arguments"]["system"],
+        "nes"
+    );
+}
+
+#[test]
 fn launch_plan_for_nes_uses_mesen2_and_nes_entry() {
     // NES routes to emucap-nes.lua (6502/2A03) on the mesen2 adapter with no force_module.
     // Extension inference needs no binary/header evidence.
@@ -792,12 +849,6 @@ fn launch_plan_for_gameboy_family_uses_mesen2_and_gb_entry() {
             expected_button_system(expected),
             ".{ext}"
         );
-        let fallback_argv = plan["legacy_fallback_argv"].as_array().unwrap();
-        assert_eq!(
-            fallback_argv.last().and_then(|value| value.as_str()),
-            Some(expected),
-            ".{ext} fallback must pass the normalized system explicitly"
-        );
         assert_eq!(
             plan["environment_defaults"]["EMUCAP_MESEN_LUA"]["default"],
             serde_json::Value::Null,
@@ -828,21 +879,6 @@ fn launch_plan_for_md_uses_mednafen_force_module() {
     assert_eq!(plan["force_module"], "md");
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "md");
-    assert!(plan["legacy_fallback_launcher"]
-        .as_str()
-        .is_some_and(|p| path_ends_with_parts(p, &["adapters", "mednafen", "launch.sh"])));
-    assert!(plan["legacy_fallback_command"]
-        .as_str()
-        .unwrap()
-        .contains("md_session"));
-    assert!(plan["legacy_fallback_command"]
-        .as_str()
-        .unwrap()
-        .ends_with(" md"));
-    assert_eq!(
-        plan["legacy_fallback"]["available_on_this_host"],
-        serde_json::json!(!cfg!(windows))
-    );
     assert_eq!(plan["button_hint"]["system"], "md");
 }
 
@@ -876,6 +912,15 @@ fn launch_plan_blocks_missing_content_even_with_binary() {
     assert_eq!(plan["ok"], true);
     assert_eq!(plan["content_exists"], false);
     assert_eq!(plan["ready_to_launch"], false);
+    assert_eq!(plan["next_action"]["kind"], "resolve_preconditions");
+    assert_eq!(
+        plan["next_action"]["blockers"], plan["launch_blockers"],
+        "the agent action must preserve the exact blockers it has to resolve"
+    );
+    assert_eq!(
+        plan["next_action"]["then_call"]["arguments"]["content_path"],
+        missing.display().to_string()
+    );
     assert!(plan["launch_blockers"]
         .as_array()
         .unwrap()
@@ -919,6 +964,119 @@ fn launch_plan_ready_when_content_and_binary_exist() {
     );
     assert_eq!(plan["ready_to_launch"], true);
     assert!(plan["launch_blockers"].as_array().unwrap().is_empty());
+    assert_eq!(plan["next_action"]["kind"], "call_tool");
+    assert_eq!(plan["next_action"]["tool"], "status");
+    assert_eq!(
+        plan["next_action"]["require"]["path"],
+        "/task_entry/accepts_new_content"
+    );
+    assert_eq!(plan["next_action"]["require"]["equals"], true);
+    assert_eq!(plan["next_action"]["then_call"]["tool"], "launch");
+    assert_eq!(
+        plan["next_action"]["then_call"]["arguments_from"],
+        "/preferred_launcher/args"
+    );
+    assert_eq!(plan["next_action"]["after_call"]["tool"], "status");
+}
+
+#[test]
+fn launch_plan_task_entry_blocker_overrides_local_readiness_and_preserves_replan_input() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let fake_mesen = tmp
+        .path()
+        .join(if cfg!(windows) { "Mesen.exe" } else { "Mesen" });
+    let rom = tmp.path().join("game.sfc");
+    std::fs::write(&fake_mesen, b"fake").unwrap();
+    make_executable(&fake_mesen);
+    write_mesen_sidecar(&fake_mesen);
+    std::fs::write(&rom, b"fake snes rom").unwrap();
+    let old = std::env::var_os("MESEN_BIN");
+    std::env::set_var("MESEN_BIN", &fake_mesen);
+    let args = LaunchPlanArgs {
+        content_path: Some(rom.display().to_string()),
+        system: None,
+    };
+    let mut plan = make_launch_plan(Some(47804), &args);
+    match old {
+        Some(value) => std::env::set_var("MESEN_BIN", value),
+        None => std::env::remove_var("MESEN_BIN"),
+    }
+    assert_eq!(plan["ready_to_launch"], true);
+
+    apply_task_entry_transition(
+        &mut plan,
+        &args,
+        &serde_json::json!({
+            "entry": {
+                "state": "transition_blocked",
+                "reason": "lease_unknown",
+                "primary_action": {
+                    "kind": "call_tool",
+                    "tool": "status",
+                    "arguments": {}
+                }
+            }
+        }),
+    );
+
+    assert_eq!(plan["local_preconditions_ready"], true);
+    assert_eq!(plan["ready_to_launch"], false);
+    assert_eq!(plan["transition"]["state"], "transition_blocked");
+    assert_eq!(plan["transition"]["reason"], "lease_unknown");
+    assert_eq!(plan["next_action"]["kind"], "call_tool");
+    assert_eq!(plan["next_action"]["tool"], "status");
+    assert_eq!(plan["transition"]["then_call"]["tool"], "launch_plan");
+    assert_eq!(
+        plan["transition"]["then_call"]["arguments"]["content_path"],
+        rom.display().to_string()
+    );
+    assert!(
+        plan["transition"]["then_call"]["arguments"]
+            .get("system")
+            .is_none(),
+        "an unresolved optional system must not become a required or guessed argument"
+    );
+}
+
+#[test]
+fn launch_plan_preserved_failure_action_overrides_local_planning() {
+    let args = LaunchPlanArgs {
+        content_path: Some("/tmp/game.sfc".into()),
+        system: Some("snes".into()),
+    };
+    let mut plan = serde_json::json!({
+        "ready_to_launch": true,
+        "next_action": {
+            "kind": "call_tool",
+            "tool": "status"
+        }
+    });
+    apply_task_entry_transition(
+        &mut plan,
+        &args,
+        &serde_json::json!({
+            "entry": {
+                "state": "inspect_failure",
+                "reason": "preserved_failure",
+                "primary_action": {
+                    "kind": "call_tool",
+                    "tool": "get_failure_context",
+                    "arguments": {}
+                }
+            }
+        }),
+    );
+
+    assert_eq!(plan["ready_to_launch"], false);
+    assert_eq!(plan["next_action"]["tool"], "get_failure_context");
+    assert_eq!(
+        plan["transition"]["then_call"]["arguments"],
+        serde_json::json!({
+            "content_path": "/tmp/game.sfc",
+            "system": "snes"
+        })
+    );
 }
 
 #[test]
@@ -958,17 +1116,6 @@ fn launch_plan_for_pc98_uses_repo_launcher_and_headless_contract() {
     assert_eq!(plan["adapter"], "mame_pc98");
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "pc98");
-    assert!(plan["legacy_fallback_launcher"]
-        .as_str()
-        .is_some_and(|p| path_ends_with_parts(p, &["adapters", "mame-pc98", "launch.sh"])));
-    assert!(plan["legacy_fallback_command"]
-        .as_str()
-        .unwrap()
-        .contains("pc9801rs"));
-    assert_eq!(
-        plan["legacy_fallback"]["available_on_this_host"],
-        serde_json::json!(!cfg!(windows))
-    );
     assert_eq!(plan["environment_defaults"]["MAME_CBUS0"]["default"], "");
     assert!(plan["headless_contract"]
         .as_str()
@@ -997,7 +1144,6 @@ fn launch_plan_for_neogeo_mvs_uses_dedicated_adapter_without_zip_inference() {
     assert_eq!(plan["system"], "neogeo_mvs");
     assert_eq!(plan["adapter"], "mame_neogeo");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "neogeo_mvs");
-    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
     assert!(plan["preconditions"]["bios_required"]
         .as_str()
         .unwrap()
@@ -1024,7 +1170,6 @@ fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
         plan["preconditions"]["bios_required"],
         serde_json::Value::Null
     );
-    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
     assert!(plan["headless_contract"]
         .as_str()
         .unwrap()
@@ -1032,7 +1177,7 @@ fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
 }
 
 #[test]
-fn launch_plan_for_msx_uses_stock_openmsx_bridge_without_legacy_fallback() {
+fn launch_plan_for_msx_uses_stock_openmsx_bridge() {
     let plan = make_launch_plan(
         Some(47804),
         &LaunchPlanArgs {
@@ -1044,7 +1189,6 @@ fn launch_plan_for_msx_uses_stock_openmsx_bridge_without_legacy_fallback() {
     assert_eq!(plan["system"], "msx");
     assert_eq!(plan["adapter"], "openmsx");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "msx");
-    assert_eq!(plan["legacy_fallback_launcher"], serde_json::Value::Null);
     assert_eq!(
         plan["preconditions"]["bios_required"],
         serde_json::Value::Null
@@ -1106,17 +1250,6 @@ fn launch_plan_for_nds_uses_desmume_adapter_and_mcp_launcher() {
     assert_eq!(plan["force_module"], serde_json::Value::Null);
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "nds");
-    assert!(plan["legacy_fallback_launcher"]
-        .as_str()
-        .is_some_and(|p| path_ends_with_parts(p, &["adapters", "desmume-nds", "launch.sh"])));
-    assert!(plan["legacy_fallback_command"]
-        .as_str()
-        .unwrap()
-        .contains("nds_session"));
-    assert_eq!(
-        plan["legacy_fallback"]["available_on_this_host"],
-        serde_json::json!(!cfg!(windows))
-    );
     assert_eq!(plan["button_hint"]["system"], "nds");
 }
 
@@ -1175,17 +1308,6 @@ fn launch_plan_for_psp_uses_ppsspp_adapter_and_mcp_launcher() {
     assert_eq!(plan["force_module"], serde_json::Value::Null);
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "psp");
-    assert!(plan["legacy_fallback_launcher"]
-        .as_str()
-        .is_some_and(|p| path_ends_with_parts(p, &["adapters", "ppsspp", "launch.sh"])));
-    assert!(plan["legacy_fallback_command"]
-        .as_str()
-        .unwrap()
-        .contains("psp_session"));
-    assert_eq!(
-        plan["legacy_fallback"]["available_on_this_host"],
-        serde_json::json!(!cfg!(windows))
-    );
 }
 
 #[test]
@@ -1236,7 +1358,7 @@ fn occupied_graceful_returns_diagnostic_not_error() {
         ..Default::default()
     };
     let v = occupied_graceful(&occupant, Some(47801), None);
-    // 진입점 계약: 에러가 아니라 connected=false + port + runtime_paths + 점유 진단
+    // Entry-point contract: diagnostic JSON, not an ownership-changing error.
     assert_eq!(v["connected"], serde_json::json!(false));
     assert_eq!(v["occupied_by_foreign"], serde_json::json!(true));
     assert_eq!(v["stale_own_token"], serde_json::json!(false));
@@ -1246,10 +1368,7 @@ fn occupied_graceful_returns_diagnostic_not_error() {
         v["occupant"]["content"],
         serde_json::json!("/x/game_poc.md")
     );
-    assert!(
-        v.get("runtime_paths").is_some(),
-        "graceful 응답은 runtime_paths를 포함해야"
-    );
+    assert!(v.get("runtime_paths").is_none());
     assert!(v.get("recovery").is_some(), "복구 절차 안내가 있어야");
     // 비밀 누출 없음: occupant에 session_token 미포함
     assert!(
@@ -1465,10 +1584,12 @@ impl EmulatorLink for RuntimeLaunchLink {
 
     fn continuity(&self) -> ContinuitySnapshot {
         ContinuitySnapshot {
+            runtime_binding: test_runtime_binding(self.port),
             lease: LeaseView {
                 state: self.lease_state,
                 holder_pid: Some(std::process::id()),
             },
+            lease_record_present: true,
             ..ContinuitySnapshot::default()
         }
     }
@@ -1560,10 +1681,12 @@ impl EmulatorLink for ConnectedRuntimeLaunchLink {
 
     fn continuity(&self) -> ContinuitySnapshot {
         ContinuitySnapshot {
+            runtime_binding: test_runtime_binding(self.port),
             lease: LeaseView {
                 state: self.lease_state,
                 holder_pid: Some(std::process::id()),
             },
+            lease_record_present: true,
             ..ContinuitySnapshot::default()
         }
     }

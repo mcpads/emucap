@@ -5,6 +5,7 @@ SYS = {
   system_label = "SNES",
   cpu_type = "snes",              -- emu.cpuType.snes
   default_memtype = "snesMemory", -- emu.memType.snesMemory
+  address_space_size = 0x1000000,
   -- Mesen emu.setInput은 소문자 키만 인식한다.
   buttons = {
     a = true, b = true, x = true, y = true, l = true, r = true,
@@ -224,6 +225,6 @@ if not dir or dir == "" then
   local src = debug.getinfo(1, "S").source
   if src and src:sub(1, 1) == "@" then dir = src:sub(2):match("^(.*)[/\\][^/\\]+$") end
 end
-assert(dir and dir ~= "", "emucap-snes: EMUCAP_ADAPTER_DIR 미설정 + 스크립트 경로 도출 실패 — launch로 띄우거나 파일에서 로드하라")
+assert(dir and dir ~= "", "emucap-snes: EMUCAP_ADAPTER_DIR is unset and the script path could not be derived; use launch or load this script from a file")
 package.path = dir .. "/?.lua;" .. package.path
 require("emucap-core")

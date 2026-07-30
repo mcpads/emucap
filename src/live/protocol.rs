@@ -46,7 +46,7 @@ pub struct ProtocolError {
 }
 
 pub fn to_line(req: &Request) -> String {
-    let mut s = serde_json::to_string(req).expect("요청 직렬화");
+    let mut s = serde_json::to_string(req).expect("serialize request");
     s.push('\n');
     s
 }

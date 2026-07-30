@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.11.2 — beta.** This repository remains under active development; interfaces and
+**v0.12.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -51,7 +51,7 @@ use the equivalents (and see the Platforms note above).
 
 ### 1. Prerequisites (the agent checks, and installs if missing)
 
-- **Rust** — check with `command -v cargo`. If missing:
+- **Rust 1.88 or newer** — check with `command -v cargo` and `rustc --version`. If missing:
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
 - **C compiler** (to build the bundled SQLite) — macOS: `xcode-select -p || xcode-select --install`.
   Linux: `cc --version || sudo apt-get install -y build-essential`. Windows: install the MSVC C++
@@ -92,7 +92,9 @@ them (see §2b).
 
 - **Control MCP** (`emucap-mcp`) — the emulator-driving engine. Reads memory,
   state, and screen; controls input, save-states, and breakpoints; and returns
-  results from analysis verbs (`regression_run` / `verify_determinism`).
+  results from optional analysis verbs (`regression_run` /
+  `verify_determinism`). Call `analysis(operation="describe")` only when those
+  operation schemas are needed, then use the same `analysis` tool to execute one.
 - **Tracking MCP** (`emucap-track-mcp`) — the experiment ledger (`.emucap/`).
   Starts (`run_start`), records (`log_*`), and queries (`query_runs` /
   `compare_runs` / `summarize_runs`) runs. It **knows nothing about emulators**
@@ -142,13 +144,14 @@ MLflow, ① Control MCP is TensorFlow):
 The two MCPs never call each other — **the agent composes them**:
 
 - **Pass rom_sha1**: read the ROM identifier via the Control MCP's `get_rom_info`
-  (`.sha1`) and pass it to the Tracking MCP's `run_start(rom_sha1=…)` (if an
+  (`.rom_sha1`) and pass it to the Tracking MCP's `run_start(rom_sha1=…)` (if an
   adapter lacks `get_rom_info`, fall back to `shasum -a1 <content>`). Passing
   `connection_ref` (the Control MCP `status` connection name, or `"port:N"`)
   auto-finalizes the previous unfinished run on that connection.
-- **Analysis verbs only return**: `regression_run` / `verify_determinism` have
-  the Control MCP drive the emulator and *return* a
-  result without writing to the ledger. To record it, log the result via the
+- **Analysis verbs only return**: call `analysis(operation="describe")` when
+  `regression_run` / `verify_determinism` are needed, then execute the selected
+  operation through that same tool. Analysis drives the emulator and *returns*
+  a result without writing to the ledger. To record it, log the result via the
   Tracking MCP's `log_gate` / `log_metric`.
 - **Frame-boundary search composes `probe`**: binary-search the frame range with
   repeated atomic `probe` calls. Each call restores the same base state,
@@ -160,12 +163,19 @@ The two MCPs never call each other — **the agent composes them**:
 ### 4. First run (the agent starts with bootstrap)
 
 Every emucap task starts with `bootstrap`. Ask the agent to "call emucap
-`bootstrap`", and it returns `listening_port`, `runtime_paths` (each adapter's
-absolute build paths and legacy fallback launchers), the supported systems, and
-questions about what to bring up. Then `launch_plan(content_path, system?)`
-returns the preferred MCP `launch` tool arguments. The agent calls `launch` and
-checks `status` a few seconds later. Because **bootstrap also reveals the adapter
-install paths and fallbacks**, the agent never has to hunt around the filesystem.
+`bootstrap`", and its compact response returns `listening_port`, system IDs, a
+catalog revision, and questions about what to bring up. The full routing catalog
+is available through `bootstrap(include=["systems"])`; build and runtime paths
+through `bootstrap(include=["installation"])`. Then
+`launch_plan(content_path, system?)` returns the validated MCP `launch` tool
+arguments. The agent calls `launch`, which waits for adapter readiness, and
+verifies the resulting live and runtime identities with `status`. Launcher
+scripts are developer entry points, not an alternative managed lifecycle.
+
+A full connected `status` returns `capability_revision`. Pass it back as
+`known_capability_revision` on repeated checks to omit an unchanged capability
+catalog while retaining current execution, continuity, generation, and
+ownership state.
 
 A timeout or `connected: false` reports transport state, not proof that the
 emulator exited. Inspect `status.continuity.runtime_binding`,

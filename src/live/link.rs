@@ -26,7 +26,7 @@ pub enum LinkError {
     Protocol(String),
     #[error("emulator error [{kind}]: {message}")]
     Emulator { kind: String, message: String },
-    #[error("emulator identity mismatch — expected session_token {expected}, got {actual:?}; identity={identity:?}")]
+    #[error("emulator identity mismatch; the connected adapter did not present this control session's token")]
     IdentityMismatch {
         expected: String,
         actual: Option<String>,

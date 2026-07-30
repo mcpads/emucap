@@ -1,8 +1,88 @@
 use super::*;
 
-use crate::args::{Num, VerifyDeterminismArgs, WriteMemoryArgs, WriteMemoryFileArgs};
-use crate::regression::tests::{det_input_case, DetReplayLink};
-use emucap::live::link::FakeLink;
+use crate::args::{Num, StatusArgs, VerifyDeterminismArgs, WriteMemoryArgs, WriteMemoryFileArgs};
+use emucap::analysis::bisect::{CmpOp, Predicate};
+use emucap::analysis::regression;
+use emucap::live::link::{Capabilities, EmulatorIdentity, FakeLink};
+
+struct DetReplayLink {
+    caps: Capabilities,
+    obs_queue: std::collections::VecDeque<&'static str>,
+}
+
+impl DetReplayLink {
+    fn new(methods: &[&str]) -> Self {
+        Self {
+            caps: Capabilities {
+                protocol_version: 1,
+                methods: methods.iter().map(|method| (*method).to_string()).collect(),
+                memory_types: vec![],
+                breakpoint_kinds: vec![],
+                contracts: emucap::contracts::ContractAdvertisement::Unreported,
+                identity: EmulatorIdentity::default(),
+            },
+            obs_queue: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn obs(mut self, hexes: &[&'static str]) -> Self {
+        self.obs_queue = hexes.iter().copied().collect();
+        self
+    }
+}
+
+impl EmulatorLink for DetReplayLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        match method {
+            "reset" | "pause" | "set_input" | "step" | "clear_all_breakpoints" | "resume" => {
+                Ok(serde_json::json!({}))
+            }
+            "read_memory" => Ok(serde_json::json!({
+                "hex": self.obs_queue.pop_front().unwrap_or("00")
+            })),
+            other => Err(LinkError::Protocol(format!("unexpected: {other}"))),
+        }
+    }
+}
+
+fn det_input_case() -> (tempfile::TempDir, std::path::PathBuf) {
+    let temporary = tempfile::tempdir().unwrap();
+    let directory = temporary.path().join("c");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("inputs.movie"), "0:enter\n").unwrap();
+    let case = regression::Case {
+        format_version: regression::CASE_FORMAT_VERSION,
+        id: "c".into(),
+        description: "det".into(),
+        rom: regression::RomRef {
+            sha1: "unused".into(),
+            path_hint: "x".into(),
+        },
+        repro: regression::Repro::InputReplay {
+            start: "reset".into(),
+            movie: "inputs.movie".into(),
+            anchor: None,
+        },
+        predicate: Predicate {
+            memory_type: "w".into(),
+            address: 0,
+            length: 2,
+            op: CmpOp::Eq,
+            value: 0,
+        },
+        expect: regression::Expect::Absent,
+    };
+    regression::save_case(&directory, &case).unwrap();
+    (temporary, directory)
+}
 
 /// CallToolResult의 텍스트 본문을 추출한다(검증용).
 fn body_text(r: &CallToolResult) -> String {
@@ -47,6 +127,80 @@ fn control_mcp_consumer_metadata_is_english() {
     assert!(!contains_hangul(&tools), "{tools}");
 }
 
+#[tokio::test]
+async fn analysis_dispatcher_is_the_only_analysis_tool_surface() {
+    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
+        "127.0.0.1:0",
+        Duration::from_millis(50),
+    )));
+    let server = Emucap::new(shared);
+
+    let initial: Vec<_> = server
+        .visible_tools()
+        .into_iter()
+        .map(|tool| tool.name.into_owned())
+        .collect();
+    assert!(initial.iter().any(|name| name == "analysis"));
+    for name in ["regression_run", "verify_determinism"] {
+        assert!(!initial.iter().any(|visible| visible == name));
+        assert!(server.get_tool(name).is_none());
+    }
+
+    let description = server
+        .analysis(Parameters(AnalysisArgs {
+            operation: AnalysisOperation::Describe,
+            arguments: None,
+        }))
+        .await
+        .structured_content
+        .expect("analysis description");
+    assert_eq!(description["surface"], "analysis");
+    assert!(description["operations"]["regression_run"]["arguments_schema"].is_object());
+    assert!(description["operations"]["verify_determinism"]["arguments_schema"].is_object());
+    assert_eq!(description["next_action"]["tool"], "analysis");
+}
+
+#[tokio::test]
+async fn repeated_status_keeps_live_state_and_omits_unchanged_capabilities() {
+    let shared: SharedLink = Arc::new(Mutex::new(FakeLink::ok(serde_json::json!({
+        "connected": true,
+        "execution": {"state": "frozen"},
+        "execution_limits": {"frame": {"max_count": 60}}
+    }))));
+    let server = Emucap::new(shared);
+
+    let first = server
+        .status(Parameters(StatusArgs {
+            known_capability_revision: None,
+        }))
+        .await;
+    let first = first.structured_content.expect("full status JSON");
+    let revision = first["capability_revision"]
+        .as_str()
+        .expect("capability revision")
+        .to_string();
+    assert_eq!(first["capability_snapshot"], "full");
+    assert!(first["methods"].is_array());
+
+    let repeated = server
+        .status(Parameters(StatusArgs {
+            known_capability_revision: Some(revision.clone()),
+        }))
+        .await;
+    let repeated = repeated.structured_content.expect("compact status JSON");
+    assert_eq!(repeated["capability_revision"], revision);
+    assert_eq!(repeated["capability_snapshot"], "unchanged");
+    assert_eq!(repeated["execution"]["state"], "frozen");
+    assert!(repeated.get("continuity").is_some());
+    assert!(repeated.get("methods").is_none());
+    assert!(
+        serde_json::to_vec(&repeated)
+            .expect("serialize compact connected status")
+            .len()
+            <= 4 * 1024
+    );
+}
+
 #[test]
 fn stop_is_exposed_as_a_host_lifecycle_tool_with_required_generation_identity() {
     let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
@@ -83,7 +237,7 @@ fn broker_helper_child_is_waited_by_reaper_thread() {
 
 #[test]
 fn image_output_publishes_screenshot_provenance() {
-    let result = output_result(ToolOutput::Image {
+    let result = tool_output_result(ToolOutput::Image {
         png_base64: "QUJD".into(),
         saved_path: Some("/tmp/shot.png".into()),
         provenance: serde_json::json!({
@@ -94,13 +248,18 @@ fn image_output_publishes_screenshot_provenance() {
             "state": "frozen",
         }),
     });
-    let text = body_text(&result);
-    assert!(text.contains("saved: /tmp/shot.png"));
-    assert!(text.contains("provenance:"));
-    assert!(text.contains("\"sha256\":\"abc\""));
-    assert!(text.contains("\"frame_before\":42"));
-    assert!(text.contains("\"frame_after\":42"));
-    assert!(text.contains("\"state\":\"frozen\""));
+    assert!(result
+        .content
+        .first()
+        .and_then(|block| block.as_image())
+        .is_some());
+    let metadata = result.structured_content.as_ref().unwrap();
+    assert_eq!(metadata["saved_path"], "/tmp/shot.png");
+    assert_eq!(metadata["provenance"]["sha256"], "abc");
+    assert_eq!(metadata["provenance"]["frame_before"], 42);
+    assert_eq!(metadata["provenance"]["frame_after"], 42);
+    assert_eq!(metadata["provenance"]["state"], "frozen");
+    assert_eq!(body_text(&result), metadata.to_string());
 }
 
 // 한 도구가 lock을 쥔 채 panic해 뮤텍스가 poisoned돼도, link() 헬퍼가 복구해 서버가
@@ -142,7 +301,7 @@ fn verify_determinism_returns_result_without_ledger() {
         .obs(&["aa", "aa"]),
     ));
     let srv = Emucap::new(link);
-    let (_t, dir, _case) = det_input_case(None);
+    let (_t, dir) = det_input_case();
     let args = VerifyDeterminismArgs {
         case_dir: dir.to_string_lossy().to_string(),
         observe: Some("memory".into()),
@@ -166,7 +325,7 @@ fn verify_determinism_returns_result_without_ledger() {
 fn verify_determinism_rejects_replays_below_two() {
     let link: SharedLink = Arc::new(Mutex::new(DetReplayLink::new(&["reset"])));
     let srv = Emucap::new(link);
-    let (_t, dir, _case) = det_input_case(None);
+    let (_t, dir) = det_input_case();
     let args = VerifyDeterminismArgs {
         case_dir: dir.to_string_lossy().to_string(),
         observe: None,

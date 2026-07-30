@@ -29,10 +29,10 @@ end
 
 function Dump.write(params, regions, api, open_file)
   if type(params) ~= "table" or type(params.path) ~= "string" or params.path == "" then
-    return false, "bad_params", "path 필요"
+    return false, "bad_params", "path is required"
   end
   if type(regions) ~= "table" then
-    return false, "internal_error", "dump region 목록이 없음"
+    return false, "internal_error", "dump region list is missing"
   end
 
   api = api or emu
@@ -41,7 +41,7 @@ function Dump.write(params, regions, api, open_file)
   for _, region in ipairs(regions) do
     local memory_type = api.memType[region.mt]
     if memory_type == nil then
-      return false, "internal_error", "알 수 없는 dump memory type: " .. tostring(region.mt)
+      return false, "internal_error", "unknown dump memory type: " .. tostring(region.mt)
     end
 
     local buffer = {}

@@ -191,13 +191,7 @@ fn make_stop_with_store(
         });
     }
 
-    let mut runtime_instance = current.public_value_with_lease(&lease);
-    if let Some(runtime) = runtime_instance.as_object_mut() {
-        runtime.insert(
-            "termination".into(),
-            serde_json::to_value(&finished).unwrap_or_else(|_| serde_json::json!({})),
-        );
-    }
+    let runtime_instance = current.public_value_with_lease(&lease);
     serde_json::json!({
         "stopped": finished.state == TerminationState::Completed,
         "launch_id": args.launch_id,

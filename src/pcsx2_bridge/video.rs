@@ -53,7 +53,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
                     "PCSX2 screenshot file was not a PNG".into(),
                 ));
             }
-            let sha256 = format!("{:x}", Sha256::digest(&png));
+            let sha256 = hex::encode(Sha256::digest(&png));
             Ok(json!({
                 "png_base64": base64::engine::general_purpose::STANDARD.encode(&png),
                 "format": "png",

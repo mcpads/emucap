@@ -10,10 +10,15 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
-VER="${MAME_VER:-0.288}"
-TAG="${MAME_TAG:-mame0288}"
-URL="${MAME_URL:-https://github.com/mamedev/mame/archive/refs/tags/${TAG}.tar.gz}"
-SHA256="${MAME_SHA256:-244d916eb3fb8bcd71f2ac51ae71ab6af8cf99869ea7b85d7efc7339ea56c563}"
+. "$HERE/upstream.lock"
+VER="${MAME_VER:-$MAME_LOCK_VERSION}"
+TAG="${MAME_TAG:-$MAME_LOCK_TAG}"
+if [ -n "${MAME_URL:-}" ] || [ -n "${MAME_TAG:-}" ]; then
+  URL="${MAME_URL:-https://github.com/mamedev/mame/archive/refs/tags/${TAG}.tar.gz}"
+else
+  URL="$MAME_LOCK_URL"
+fi
+SHA256="${MAME_SHA256:-$MAME_LOCK_SHA256}"
 DEFAULT_WORK="$HERE/work"
 WORK_INPUT="${MAME_WORK:-$DEFAULT_WORK}"
 CUSTOM_WORK=0
@@ -85,8 +90,19 @@ if [ ! -f "$TARBALL" ]; then
 fi
 
 if command -v shasum >/dev/null 2>&1; then
-  printf '%s  %s\n' "$SHA256" "$TARBALL" | shasum -a 256 -c -
+  ACTUAL_SHA256="$(shasum -a 256 "$TARBALL" | awk '{print $1}')"
+elif command -v sha256sum >/dev/null 2>&1; then
+  ACTUAL_SHA256="$(sha256sum "$TARBALL" | awk '{print $1}')"
+else
+  echo "ERROR: shasum or sha256sum is required" >&2
+  exit 1
 fi
+[ "$ACTUAL_SHA256" = "$SHA256" ] || {
+  echo "ERROR: MAME source archive checksum mismatch" >&2
+  echo "  expected=$SHA256" >&2
+  echo "  actual=$ACTUAL_SHA256" >&2
+  exit 1
+}
 
 echo "-> Extracting fresh source"
 safe_rm_rf_under_work "$SRC"

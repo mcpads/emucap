@@ -570,7 +570,7 @@
       "surface": "public",
       "methods": ["regression_run"],
       "temporal_classes": ["T5"],
-      "disposition": "retain",
+      "disposition": "consolidate",
       "expectations": ["ANALYSIS.PROVENANCE.1"]
     },
     {
@@ -578,7 +578,7 @@
       "surface": "public",
       "methods": ["verify_determinism"],
       "temporal_classes": ["T5"],
-      "disposition": "retain",
+      "disposition": "consolidate",
       "expectations": ["ANALYSIS.PROVENANCE.1"]
     }
   ]
