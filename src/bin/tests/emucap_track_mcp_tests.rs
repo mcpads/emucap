@@ -209,7 +209,7 @@ async fn bootstrap_reports_ledger_active_and_orphans() {
     )
     .unwrap();
     let s = EmucapTrack::new();
-    let r = s.bootstrap().await;
+    let r = s.bootstrap(Parameters(EmptyArgs::default())).await;
     let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
     assert_eq!(v["server"], "emucap-track-mcp");
     assert_eq!(v["emulator_less"], true);
@@ -381,7 +381,7 @@ async fn bootstrap_reports_ledger_path_source() {
     // temp_env는 EMUCAP_TRACK_ROOT를 설정하므로 source=env, 경고 없음
     let (_dir, _g) = temp_env();
     let s = EmucapTrack::new();
-    let r = s.bootstrap().await;
+    let r = s.bootstrap(Parameters(EmptyArgs::default())).await;
     let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
     assert_eq!(v["ledger_path_source"], "env");
     assert!(v.get("ledger_path_warning").is_none());

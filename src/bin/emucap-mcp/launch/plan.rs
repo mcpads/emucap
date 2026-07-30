@@ -1,32 +1,10 @@
+use super::actions::{
+    blocked_launch_action, missing_content_action, ready_launch_action, unresolved_system_action,
+};
 use super::media::{content_markers, ext_lower};
 use super::*;
 
 pub(super) use super::system::{adapter_for_system, normalize_system};
-
-pub(super) fn adapter_script_launcher(root: &Path, adapter: &str) -> PathBuf {
-    let dir = match adapter {
-        "mesen2" => "adapters/mesen2",
-        "mednafen" => "adapters/mednafen",
-        "mame_pc98" => "adapters/mame-pc98",
-        "mame_neogeo" => "adapters/mame-neogeo",
-        "mupen64plus" => "adapters/mupen64plus",
-        "openmsx" => "adapters/openmsx",
-        "flycast" => "adapters/flycast",
-        "desmume_nds" => "adapters/desmume-nds",
-        "ppsspp" => "adapters/ppsspp",
-        "pcsx2" => "adapters/pcsx2",
-        "dolphin" => {
-            return root.join("adapters/dolphin/launch-native.ps1");
-        }
-        _ => return root.join("adapters"),
-    };
-    let ps1 = root.join(dir).join("launch.ps1");
-    if cfg!(windows) && ps1.exists() {
-        ps1
-    } else {
-        root.join(dir).join("launch.sh")
-    }
-}
 
 pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
@@ -44,56 +22,6 @@ pub(super) fn path_matches_candidates(path: &Path, candidates: Vec<PathBuf>) -> 
     candidates
         .iter()
         .any(|candidate| same_path(path, candidate))
-}
-
-pub(super) fn native_legacy_script(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str());
-    path.is_file()
-        && if cfg!(windows) {
-            ext.is_some_and(|e| e.eq_ignore_ascii_case("ps1"))
-        } else {
-            ext == Some("sh")
-        }
-}
-
-pub(super) fn legacy_command(argv: &[String]) -> String {
-    argv.iter()
-        .map(|s| {
-            if s.contains(' ') {
-                format!("{s:?}")
-            } else {
-                s.clone()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-pub(super) fn legacy_fallback_details(launcher: &Path, argv: &[String]) -> serde_json::Value {
-    let available = native_legacy_script(launcher);
-    serde_json::json!({
-        "available_on_this_host": available,
-        "launcher": if available {
-            serde_json::json!(launcher.display().to_string())
-        } else {
-            serde_json::Value::Null
-        },
-        "argv": if available {
-            serde_json::json!(argv)
-        } else {
-            serde_json::Value::Null
-        },
-        "command": if available {
-            serde_json::json!(legacy_command(argv))
-        } else {
-            serde_json::Value::Null
-        },
-        "reason": if available {
-            "native script for this host"
-        } else {
-            "no native legacy script for this host; use preferred_launcher"
-        },
-    })
 }
 
 pub(super) fn mednafen_binary_precondition_from(
@@ -655,7 +583,6 @@ pub(super) fn missing_adapter_binary_response(
             "adapter_binary": adapter_binary,
             "build_required": build_required,
         },
-        "runtime_paths": paths,
         "repo_root": root.display().to_string(),
         "next_action": "Satisfy the adapter binary precondition, then call launch_plan(content_path, system) again.",
     })
@@ -680,7 +607,6 @@ pub(super) fn missing_mame_bridge_response(
             "bridge": bridge,
             "build_required": build_required,
         },
-        "runtime_paths": paths,
         "repo_root": root.display().to_string(),
         "next_action": "Satisfy the PC-98 bridge precondition, then call launch_plan(content_path, system) again.",
     })
@@ -714,7 +640,7 @@ pub(super) fn infer_system(
             "confidence": "none",
             "reason": "content_path is absent, so the system cannot be inferred from media",
             "needs_user_input": true,
-            "required_user_input": "Provide the ROM, disc, or disk path and one system ID from supported_systems."
+            "required_user_input": "Provide the ROM, disc, or disk path."
         });
     };
 
@@ -956,14 +882,15 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     let inference = infer_system(args.content_path.as_deref(), args.system.as_deref());
     let paths = runtime_paths(port);
     let Some(system) = inference.get("system").and_then(|v| v.as_str()) else {
+        let next_action = unresolved_system_action(args, &inference);
         return serde_json::json!({
             "ok": false,
             "ready_to_launch": false,
             "inference": inference,
             "listening_port": port,
-            "runtime_paths": paths,
-            "supported_systems": supported_systems_value(),
-            "next_action": "Ask the user for required_user_input, then call launch_plan(content_path, system) again."
+            "supported_system_ids": supported_system_ids_value(),
+            "system_catalog_revision": system_catalog_revision(),
+            "next_action": next_action
         });
     };
     let Some(content_path) = args.content_path.as_deref() else {
@@ -972,9 +899,9 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "ready_to_launch": false,
             "inference": inference,
             "listening_port": port,
-            "runtime_paths": paths,
-            "supported_systems": supported_systems_value(),
-            "next_action": "Ask the user for content_path, then call launch_plan(content_path, system) again."
+            "supported_system_ids": supported_system_ids_value(),
+            "system_catalog_revision": system_catalog_revision(),
+            "next_action": missing_content_action(system)
         });
     };
     let Some(root) = find_repo_root() else {
@@ -983,8 +910,11 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "ready_to_launch": false,
             "inference": inference,
             "listening_port": port,
-            "runtime_paths": paths,
-            "error": "repo root not found; set EMUCAP_REPO_ROOT"
+            "error": "repo root not found; set EMUCAP_REPO_ROOT",
+            "next_action": {
+                "kind": "resolve_preconditions",
+                "blockers": ["repo root not found; set EMUCAP_REPO_ROOT and restart the MCP server"]
+            }
         });
     };
     let Some(p) = port else {
@@ -992,8 +922,12 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "ok": false,
             "ready_to_launch": false,
             "inference": inference,
-            "runtime_paths": paths,
-            "error": "listening_port unavailable; call bootstrap/status again"
+            "error": "listening_port unavailable",
+            "next_action": {
+                "kind": "call_tool",
+                "tool": "bootstrap",
+                "arguments": {}
+            }
         });
     };
 
@@ -1006,33 +940,6 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     if adapter == "mednafen" {
         preferred_launcher_args["sound"] = serde_json::json!(false);
     }
-    let fallback_launcher = adapter_script_launcher(&root, adapter);
-    let legacy_available = native_legacy_script(&fallback_launcher);
-    let is_ps1 = fallback_launcher.extension().and_then(|e| e.to_str()) == Some("ps1");
-    let mut argv: Vec<String> = if is_ps1 {
-        vec![
-            "powershell".into(),
-            "-ExecutionPolicy".into(),
-            "Bypass".into(),
-            "-File".into(),
-        ]
-    } else {
-        Vec::new()
-    };
-    argv.push(fallback_launcher.display().to_string());
-    argv.push(content_path.to_string());
-    argv.push(p.to_string());
-    argv.push(format!("{system}_session"));
-    if adapter == "mesen2" {
-        argv.push(system.to_string());
-    } else if adapter == "mednafen" {
-        if let Some(module) = force_module {
-            argv.push(module.to_string());
-        }
-    } else if adapter == "mame_pc98" {
-        argv.push("pc9801rs".to_string());
-    }
-
     let environment_defaults = if adapter == "mame_pc98" {
         serde_json::json!({
             "MAME_CBUS0": {
@@ -1054,7 +961,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "EMUCAP_MESEN_LUA": {
                 "default": null,
                 "applies_when": "explicitly set",
-                "reason": "optional per-system Lua entry override; otherwise the fallback launcher uses its SYSTEM argument or an unambiguous ROM extension"
+                "reason": "optional per-system Lua entry override; otherwise the launcher uses the normalized system"
             }
         })
     } else {
@@ -1085,13 +992,9 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     push_unavailable_precondition(&mut launch_blockers, bridge_label, &bridge);
     let ready_to_launch = launch_blockers.is_empty();
     let next_action = if ready_to_launch {
-        "Check build and BIOS preconditions first. ready_to_launch includes local content and adapter-binary checks. When ready, call launch with preferred_launcher.args, then verify connected=true and system with status. If connection fails, inspect BIOS, ROM-set, and build logs first."
-            .to_string()
+        ready_launch_action()
     } else {
-        format!(
-            "Resolve launch_blockers, then call launch_plan(content_path, system) again: {}",
-            launch_blockers.join("; ")
-        )
+        blocked_launch_action(content_path, system, &launch_blockers)
     };
     let bios_required = match system {
         "saturn" => serde_json::json!("Saturn BIOS under ~/.mednafen/firmware/: sega_101.bin for JP or mpr-17933.bin for US. Boot fails when the required BIOS is absent."),
@@ -1130,25 +1033,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "args": preferred_launcher_args,
             "reason": "cross-platform Rust launch path; uses emucap-owned config/data roots"
         },
-        "legacy_fallback_launcher": if legacy_available {
-            serde_json::json!(fallback_launcher.display().to_string())
-        } else {
-            serde_json::Value::Null
-        },
-        "legacy_fallback_argv": if legacy_available {
-            serde_json::json!(argv)
-        } else {
-            serde_json::Value::Null
-        },
-        "legacy_fallback": legacy_fallback_details(&fallback_launcher, &argv),
         "environment_defaults": environment_defaults,
-        "legacy_fallback_command": if legacy_available {
-            serde_json::json!(legacy_command(&argv))
-        } else {
-            serde_json::Value::Null
-        },
         "inference": inference,
-        "runtime_paths": paths,
         "button_hint": button_hint_for_system(Some(system)),
         "headless_contract": if adapter == "mame_pc98" {
             "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It disables pc9801rs cbus:0 unless MAME_CBUS0 is explicitly set; do not run work/mame.raw or system mame directly."

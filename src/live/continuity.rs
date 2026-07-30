@@ -127,6 +127,9 @@ pub struct ContinuitySnapshot {
     /// Kept out of the `continuity` JSON; status surfaces it under `runtime_instance.lease`.
     #[serde(skip)]
     pub lease: LeaseView,
+    /// Distinguishes a missing lease record from a present record whose holder is unverifiable.
+    #[serde(skip)]
+    pub lease_record_present: bool,
 }
 
 impl Default for ContinuitySnapshot {
@@ -150,6 +153,7 @@ impl Default for ContinuitySnapshot {
             runtime_diagnostics: Vec::new(),
             termination: None,
             lease: LeaseView::unknown(),
+            lease_record_present: false,
         }
     }
 }
@@ -496,6 +500,9 @@ impl<L: EmulatorLink> ObservedLink<L> {
             runtime_diagnostics: self.runtime_diagnostics.clone(),
             termination: current_bound.then(|| self.termination.clone()).flatten(),
             lease,
+            lease_record_present: active_record
+                .and_then(|record| record.lease.as_ref())
+                .is_some(),
         };
     }
 
@@ -1052,7 +1059,7 @@ fn adapter_failure_execution(failure: &Value) -> ExecutionState {
     }
 }
 
-fn lease_view(lease: &LeaseRecord, holder: &ProcessIdentity) -> LeaseView {
+pub(super) fn lease_view(lease: &LeaseRecord, holder: &ProcessIdentity) -> LeaseView {
     let state = if &lease.holder == holder {
         LeaseState::Held
     } else {

@@ -8,17 +8,23 @@ use emucap::launch::{
 };
 use emucap::live::link::{EmulatorIdentity, EmulatorLink};
 use emucap::live::runtime::{LeaseState, ManifestSpec, ProcessState, RuntimeStore};
+use emucap::live::task_entry::{
+    admit_generation_transition, observe_runtime, EntryReason, ListenerState, TransitionAdmission,
+    TransitionIntent,
+};
 
 use crate::args::{LaunchArgs, LaunchPlanArgs};
 use crate::status::{
-    button_hint_for_system, enrich_link_status, find_repo_root, make_bootstrap_value,
-    runtime_paths, supported_systems_value, BUILD_HASH,
+    button_hint_for_system, enrich_link_status, find_repo_root, observe_control_state,
+    runtime_paths, supported_system_ids_value, system_catalog_revision, BUILD_HASH,
 };
 
 #[cfg(test)]
 #[path = "launch_tests.rs"]
 mod tests;
 
+#[path = "launch/actions.rs"]
+mod actions;
 #[path = "launch/mame_neogeo.rs"]
 mod mame_neogeo;
 #[path = "launch/media.rs"]
@@ -32,6 +38,7 @@ mod run;
 #[path = "launch/system.rs"]
 mod system;
 
+pub(crate) use actions::apply_task_entry_transition;
 pub(crate) use plan::make_launch_plan;
 pub(crate) use run::{make_launch, occupied_graceful};
 

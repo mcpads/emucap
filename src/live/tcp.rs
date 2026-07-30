@@ -414,9 +414,9 @@ impl TcpLink {
     pub fn local_addr(&self) -> SocketAddr {
         self.listener
             .as_ref()
-            .expect("바인드된 리스너")
+            .expect("bound listener")
             .local_addr()
-            .expect("로컬 주소")
+            .expect("local address")
     }
 
     /// 테스트 관측용 — 현재 활성 연결 보유 여부(쓰기 타임아웃 poison 후 conn이 버려졌는지 검증).
@@ -698,7 +698,7 @@ impl TcpLink {
         // connect 직후를 한 박자 놓치는 레이스 흡수). 연결이 없으면 ~20ms 후 NotConnected.
         let stream = {
             let mut accepted = None;
-            let listener = self.listener.as_ref().expect("위에서 바인드됨");
+            let listener = self.listener.as_ref().expect("listener bound above");
             for attempt in 0..10 {
                 match listener.accept() {
                     Ok((s, _)) => {

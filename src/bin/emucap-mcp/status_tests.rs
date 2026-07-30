@@ -38,14 +38,6 @@ fn notes_contain(v: &serde_json::Value, sub: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn path_ends_with(value: &str, parts: &[&str]) -> bool {
-    let mut suffix = std::path::PathBuf::new();
-    for part in parts {
-        suffix.push(part);
-    }
-    std::path::Path::new(value).ends_with(suffix)
-}
-
 #[test]
 fn composites_appear_when_deps_met() {
     let v = enriched(&[
@@ -248,160 +240,33 @@ fn adapter_provided_dict_capability_notes_preserved() {
 }
 
 #[test]
-fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
+fn runtime_paths_exposes_build_and_runtime_locations_without_launcher_aliases() {
     let paths = runtime_paths(Some(47803));
     let root = paths
         .get("repo_root")
         .and_then(|v| v.as_str())
         .expect("repo_root");
-    assert!(
-        repo_path(
-            std::path::Path::new(root),
-            &["adapters", "mame-pc98", "launch.sh"]
-        )
-        .is_file(),
-        "repo_root must point at this repository"
-    );
-    assert_eq!(
-        paths
-            .pointer("/adapters/mame_pc98/preferred_launcher")
-            .and_then(|v| v.as_str()),
-        Some("MCP tool: launch")
-    );
-    assert_eq!(
-        paths
-            .pointer("/adapters/openmsx/preferred_launcher")
-            .and_then(|v| v.as_str()),
-        Some("MCP tool: launch")
-    );
+    assert!(std::path::Path::new(root).join("Cargo.toml").is_file());
     assert!(paths
         .pointer("/adapters/openmsx/bridge_binary")
         .and_then(|v| v.as_str())
         .is_some_and(|path| path.contains("emucap-openmsx-bridge")));
-    let mesen_platform_launch = paths
-        .pointer("/adapters/mesen2/platform_launch")
-        .and_then(|v| v.as_str())
-        .expect("mesen2 platform_launch");
-    let mesen_template = paths
-        .pointer("/command_templates/legacy_mesen2")
-        .and_then(|v| v.as_str())
-        .expect("mesen2 legacy template");
-    assert!(mesen_template.contains("[system]"));
-    if cfg!(windows) {
-        assert!(path_ends_with(
-            mesen_platform_launch,
-            &["adapters", "mesen2", "launch.ps1"]
-        ));
-        assert!(mesen_template.contains("powershell -ExecutionPolicy Bypass -File"));
-        assert!(mesen_template.contains("launch.ps1"));
-        assert_eq!(
-            paths
-                .pointer("/legacy_fallbacks/mesen2/available_on_this_host")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    } else {
-        assert!(path_ends_with(
-            mesen_platform_launch,
-            &["adapters", "mesen2", "launch.sh"]
-        ));
-        assert!(mesen_template.contains("mesen2/launch.sh"));
-        assert_eq!(
-            paths
-                .pointer("/legacy_fallbacks/mesen2/available_on_this_host")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-    assert_eq!(
-        paths
-            .pointer("/adapters/mame_pc98/launch")
-            .and_then(|v| v.as_str()),
-        Some(
-            repo_path(
-                std::path::Path::new(root),
-                &["adapters", "mame-pc98", "launch.sh"]
-            )
-            .to_str()
-            .unwrap()
-        )
-    );
-    assert_eq!(
-        paths
-            .pointer("/adapters/mame_pc98/work_source_dir")
-            .and_then(|v| v.as_str()),
-        Some(
-            repo_path(
-                std::path::Path::new(root),
-                &["adapters", "mame-pc98", "work", "mame-src"]
-            )
-            .to_str()
-            .unwrap()
-        )
-    );
-    assert_eq!(
-        paths
-            .pointer("/adapters/mame_pc98/work_wrapper")
-            .and_then(|v| v.as_str()),
-        Some(
-            repo_path(
-                std::path::Path::new(root),
-                &["adapters", "mame-pc98", "work", "mame"]
-            )
-            .to_str()
-            .unwrap()
-        )
-    );
-    let mame_template = paths.pointer("/command_templates/legacy_mame_pc98");
-    if cfg!(windows) {
-        assert_eq!(mame_template, Some(&serde_json::Value::Null));
-        assert_eq!(
-            paths
-                .pointer("/legacy_fallbacks/mame_pc98/available_on_this_host")
-                .and_then(|v| v.as_bool()),
-            Some(false)
-        );
-    } else {
-        assert!(
-            mame_template
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains("47803")
-                    && s.contains("mame-pc98")
-                    && s.contains("launch.sh")),
-            "legacy command template should include the current listening port and launcher"
-        );
-        assert_eq!(
-            paths
-                .pointer("/legacy_fallbacks/mame_pc98/available_on_this_host")
-                .and_then(|v| v.as_bool()),
-            Some(true)
-        );
-    }
-    assert_eq!(
-        paths
-            .pointer("/command_templates/preferred")
-            .and_then(|v| v.as_str()),
-        Some("launch(content_path, system?, name?)")
-    );
+    assert!(paths.pointer("/adapters/mesen2/build").is_some());
+    assert!(paths.pointer("/runtime_capsule/current").is_some());
+    assert!(paths.pointer("/command_templates").is_none());
+    assert!(paths.pointer("/legacy_fallbacks").is_none());
+    assert!(paths.pointer("/adapters/mesen2/launch").is_none());
     assert!(paths.pointer("/adapters/pcsx2/launch").is_none());
-    assert_eq!(
-        paths.pointer("/command_templates/legacy_pcsx2"),
-        Some(&serde_json::Value::Null)
-    );
-    assert_eq!(
-        paths
-            .pointer("/legacy_fallbacks/pcsx2/available_on_this_host")
-            .and_then(|v| v.as_bool()),
-        Some(false)
-    );
-    assert_eq!(
-        paths.pointer("/legacy_fallbacks/pcsx2/launcher"),
-        Some(&serde_json::Value::Null)
-    );
-    assert!(supported_systems_value()
+}
+
+#[test]
+fn supported_system_catalog_keeps_platform_routing_without_launcher_paths() {
+    let systems = supported_systems_value();
+    assert!(systems
         .as_array()
-        .and_then(|systems| systems.iter().find(|system| system["system"] == "ps2"))
-        .is_some_and(|system| system.get("legacy_launcher").is_none()));
+        .is_some_and(|systems| systems.iter().all(|system| {
+            system.get("launcher").is_none() && system.get("legacy_launcher").is_none()
+        })));
     assert!(supported_systems_value()
         .as_array()
         .and_then(|systems| systems.iter().find(|system| system["system"] == "n64"))
@@ -415,7 +280,6 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
         .is_some_and(|system| {
             system["adapter"] == "openmsx"
                 && system["content"] == serde_json::json!(["rom", "mx1", "mx2", "ri", "sg"])
-                && system.get("legacy_launcher").is_none()
         }));
     assert!(supported_systems_value()
         .as_array()
@@ -462,13 +326,6 @@ fn runtime_paths_exposes_preferred_launch_tool_and_repo_fallbacks() {
                 && system["content"] == serde_json::json!(["cue"])
                 && system["required_firmware"] == serde_json::json!(["neocdz.zip"])
         }));
-    assert!(
-        supported_systems_value()
-            .as_array()
-            .and_then(|systems| systems.iter().find(|system| system["system"] == "snes"))
-            .and_then(|system| system["legacy_launcher"].as_str())
-            == Some("runtime_paths.adapters.mesen2.platform_launch")
-    );
 }
 
 #[test]
@@ -540,25 +397,118 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
             identity: EmulatorIdentity::default(),
         },
     };
-    let value = make_bootstrap_value(&mut link).unwrap();
-    assert_eq!(value["first_tool"], "bootstrap");
-    assert_eq!(value["listening_port"], 47855);
+    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    assert_eq!(value["listener"]["state"], "bound");
+    assert_eq!(value["listener"]["port"], 47855);
+    assert_eq!(value["adapter_connection"]["state"], "disconnected");
+    assert_eq!(value["entry"]["state"], "ready_for_content");
+    assert_eq!(value["entry"]["reason"], "ready_no_history");
+    assert_eq!(value["entry"]["primary_action"]["kind"], "resolve_input");
     assert_eq!(
-        value["question_to_user_if_content_unknown"],
+        value["entry"]["primary_action"]["question_if_missing"],
         unknown_content_question()
     );
     assert_eq!(
-        value["required_user_input_if_content_unknown"],
-        required_unknown_content_input()
+        value["entry"]["primary_action"]["required_input"],
+        serde_json::json!(["content_path"])
     );
     assert_eq!(
         value
-            .pointer("/workflow/unknown_content/then_call")
+            .pointer("/entry/primary_action/then_call/tool")
             .and_then(|v| v.as_str()),
         Some("launch_plan")
     );
-    assert!(value["start_here"].as_bool().unwrap());
-    assert!(value["do_not"].as_str().unwrap().contains("Do not infer"));
+    assert!(value["supported_system_ids"].is_array());
+    assert!(value["system_catalog_revision"]
+        .as_str()
+        .is_some_and(|revision| revision.starts_with("sha256:")));
+    assert!(value.get("supported_systems").is_none());
+    assert!(value.get("runtime_paths").is_none());
+    assert!(value.get("status").is_none());
+    assert!(value.get("workflow").is_none());
+    assert!(value.get("do_not").is_none());
+    assert!(value.get("ok").is_none());
+}
+
+#[test]
+fn bootstrap_details_are_explicit_opt_in_sections() {
+    let mut link = NotConnectedLink {
+        caps: emucap::live::link::Capabilities::empty(),
+    };
+
+    let compact = make_bootstrap_value(&mut link, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, true, true).unwrap();
+
+    assert!(value["supported_systems"].is_array());
+    assert!(value["runtime_paths"].is_object());
+    assert_eq!(value["entry"], compact["entry"]);
+}
+
+#[test]
+fn matching_capability_revision_omits_only_the_capability_snapshot() {
+    let mut full = serde_json::json!({
+        "connected": true,
+        "execution": {"state": "frozen"},
+        "continuity": {"transport": {"state": "connected"}},
+        "emulator_identity": {"system": "snes", "adapter": "mesen2", "launch_id": "launch-a"},
+        "methods": ["status", "read_memory"],
+        "memory_types": ["workram"],
+        "breakpoint_kinds": [{"kind": "exec"}],
+        "input_buttons": {"buttons": ["a"]},
+        "contracts": {"state": "validated"},
+        "capability_notes": ["test"],
+        "execution_limits": {"frame": {"max_count": 60}}
+    });
+    let revision = apply_capability_revision(&mut full, None);
+    assert_eq!(full["capability_snapshot"], "full");
+    assert!(full.get("methods").is_some());
+
+    let mut unchanged = serde_json::json!({
+        "connected": true,
+        "execution": {"state": "running"},
+        "continuity": {"transport": {"state": "connected"}},
+        "emulator_identity": {"system": "snes", "adapter": "mesen2", "launch_id": "launch-a"},
+        "methods": ["status", "read_memory"],
+        "memory_types": ["workram"],
+        "breakpoint_kinds": [{"kind": "exec"}],
+        "input_buttons": {"buttons": ["a"]},
+        "contracts": {"state": "validated"},
+        "capability_notes": ["test"],
+        "execution_limits": {"frame": {"max_count": 60}}
+    });
+    apply_capability_revision(&mut unchanged, Some(&revision));
+
+    assert_eq!(unchanged["capability_snapshot"], "unchanged");
+    assert_eq!(unchanged["execution"]["state"], "running");
+    assert!(unchanged.get("continuity").is_some());
+    for field in CAPABILITY_FIELDS {
+        assert!(
+            unchanged.get(*field).is_none(),
+            "{field} should be omitted when unchanged"
+        );
+    }
+}
+
+#[test]
+fn capability_revision_changes_with_catalog_or_generation() {
+    let base = serde_json::json!({
+        "emulator_identity": {"system": "snes", "adapter": "mesen2", "launch_id": "launch-a"},
+        "methods": ["status"],
+        "memory_types": ["workram"]
+    });
+    let mut changed_catalog = base.clone();
+    changed_catalog["methods"] = serde_json::json!(["status", "read_memory"]);
+    let mut changed_generation = base.clone();
+    changed_generation["emulator_identity"]["launch_id"] = serde_json::json!("launch-b");
+
+    assert_ne!(
+        capability_revision(&base),
+        capability_revision(&changed_catalog)
+    );
+    assert_ne!(
+        capability_revision(&base),
+        capability_revision(&changed_generation)
+    );
 }
 
 struct TimeoutLink {
@@ -589,15 +539,31 @@ fn bootstrap_is_total_when_status_times_out() {
         caps: emucap::live::link::Capabilities::empty(),
     };
 
-    let value = make_bootstrap_value(&mut link).unwrap();
-
-    assert_eq!(value["status"]["request_succeeded"], false);
-    assert_eq!(value["status"]["error_kind"], "request_timeout");
+    let observation = observe_control_state(&mut link).unwrap();
+    assert_eq!(observation.status["request_succeeded"], false);
+    assert_eq!(observation.status["error_kind"], "request_timeout");
+    assert_eq!(observation.runtime.listener, ListenerState::Bound);
     assert_eq!(
-        value["status"]["continuity"]["transport"]["state"],
-        "disconnected"
+        observation.runtime.transport,
+        emucap::live::continuity::TransportState::Stalled
     );
-    assert_eq!(value["listening_port"], 47856);
+    assert_eq!(
+        observation.disposition.state,
+        emucap::live::task_entry::EntryState::TransitionBlocked
+    );
+    assert_eq!(
+        observation.disposition.reason,
+        emucap::live::task_entry::EntryReason::TransportUncertain
+    );
+
+    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    assert_eq!(value["listener"]["port"], 47856);
+    assert_eq!(value["adapter_connection"]["state"], "stalled");
+    assert_eq!(value["entry"]["state"], "transition_blocked");
+    assert_eq!(value["entry"]["reason"], "transport_uncertain");
+    assert_eq!(value["entry"]["primary_action"]["tool"], "status");
+    assert!(value.get("status").is_none());
+    assert!(value.get("error").is_none());
 }
 
 #[test]
@@ -668,20 +634,13 @@ fn bootstrap_returns_diagnostic_json_when_runtime_capsule_is_corrupt() {
         caps: emucap::live::link::Capabilities::empty(),
     };
 
-    let value = make_bootstrap_value(&mut link).unwrap();
+    let value = make_bootstrap_value(&mut link, false, false).unwrap();
 
-    assert_eq!(
-        value["status"]["continuity"]["runtime_diagnostics"][0]["artifact"],
-        "current"
-    );
-    assert_eq!(
-        value["status"]["continuity"]["runtime_diagnostics"][0]["kind"],
-        "invalid"
-    );
-    assert!(value["status"]["next_safe_action"]
-        .as_str()
-        .unwrap()
-        .contains("do not replace"));
+    assert_eq!(value["entry"]["state"], "repair_runtime_metadata");
+    assert_eq!(value["entry"]["reason"], "runtime_metadata_invalid");
+    assert_eq!(value["entry"]["primary_action"]["tool"], "status");
+    assert!(value.get("status").is_none());
+    assert!(!value.to_string().contains("/runtime/47857/current.json"));
 }
 
 #[test]

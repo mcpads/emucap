@@ -8,10 +8,9 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use emucap::mcp_result::{error_result, json_result};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{
-    CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerInfo,
-};
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -37,7 +36,12 @@ struct ActiveRun {
 
 // ── 도구 Args ────────────────────────────────────────────────────────────────
 
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct EmptyArgs {}
+
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct TrackRunStartArgs {
     /// Required opaque ROM identifier from Control MCP `get_rom_info.rom_sha1`.
     /// This server does not inspect the emulator or infer the value.
@@ -56,6 +60,7 @@ struct TrackRunStartArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RunResumeArgs {
     /// Globally unique run ID to rebind. Only a stored run with status=running
     /// can be resumed; start a new run after a finished run.
@@ -63,6 +68,7 @@ struct RunResumeArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct RunFinishArgs {
     /// done|aborted|error (default: done).
     #[serde(default)]
@@ -74,12 +80,14 @@ struct RunFinishArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogMetricArgs {
     key: String,
     value: f64,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogGateArgs {
     name: String,
     /// machine | judgment.
@@ -91,6 +99,7 @@ struct LogGateArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogArtifactArgs {
     kind: String,
     /// Path to an existing captured file. Relative paths are resolved from the
@@ -99,12 +108,14 @@ struct LogArtifactArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SetReproArgs {
     base: Option<String>,
     movie_ref: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogFindingArgs {
     /// ROM identifier. When omitted, use the active run's rom_sha1. The call
     /// fails if neither is available.
@@ -117,6 +128,7 @@ struct LogFindingArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct LogInterventionArgs {
     /// Free-form intervention label such as write_memory, load_state, reset, or
     /// input_burst. Control MCP mutations are not logged automatically.
@@ -137,6 +149,7 @@ struct LogInterventionArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct QueryRunsArgs {
     rom_sha1: Option<String>,
     goal: Option<String>,
@@ -148,12 +161,14 @@ struct QueryRunsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct GetRunArgs {
     rom_sha1: String,
     run_id: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct CompareRunsArgs {
     /// Baseline run ID (A).
     run_id_a: String,
@@ -162,6 +177,7 @@ struct CompareRunsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct SummarizeRunsArgs {
     /// Exact goal filter. Omit for no goal restriction.
     #[serde(default)]
@@ -182,13 +198,11 @@ struct SummarizeRunsArgs {
 
 /// 추적 도구 공통: ok json
 fn track_ok(v: serde_json::Value) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(v.to_string())])
+    json_result(v)
 }
 /// 추적 도구 공통: 에러 텍스트
 fn track_err(msg: impl std::fmt::Display) -> CallToolResult {
-    let mut r = CallToolResult::success(vec![Content::text(format!("{msg}"))]);
-    r.is_error = Some(true);
-    r
+    error_result("tracking_error", msg)
 }
 
 /// Self-contained guidance shown to every Tracking MCP consumer.
@@ -313,7 +327,7 @@ impl EmucapTrack {
     #[tool(
         description = "Start here. Returns the ledger path, active run, stored unfinished runs, and available record/query operations. This server stores `.emucap/` experiment records and never controls an emulator. Obtain rom_sha1 from Control MCP get_rom_info and pass it to run_start."
     )]
-    async fn bootstrap(&self) -> CallToolResult {
+    async fn bootstrap(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         track_ok(self.make_bootstrap_value())
     }
 
@@ -700,7 +714,7 @@ impl EmucapTrack {
                 "note": "This MCP has no emulator connection. Pass rom_sha1 and connection_ref from Control MCP (emucap-mcp).",
                 "rom_sha1": "Pass the normalized get_rom_info.rom_sha1 value to run_start. Use `shasum -a1 <content>` only for a backend that does not provide it.",
                 "connection_ref": "Optionally use the Control MCP status connection name or `port:N`. run_start resumes a stored running run for the same connection and ROM.",
-                "analysis_verbs": "Control MCP regression_run and verify_determinism return results only. Record relevant results here with log_gate or log_metric.",
+                "analysis_verbs": "Control MCP analysis operations regression_run and verify_determinism return results only. Record relevant results here with log_gate or log_metric.",
                 "interventions": "Control MCP does not automatically record write_memory, load_state, reset, or input. Record relevant mutations with log_intervention."
             },
             "supported_queries": ["query_runs", "get_run", "compare_runs", "summarize_runs"],

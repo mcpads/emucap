@@ -1,6 +1,93 @@
 use super::plan::*;
 use super::*;
 
+fn transition_rejection(
+    reason: EntryReason,
+    status: serde_json::Value,
+    current: Option<&emucap::live::runtime::CurrentManifest>,
+) -> serde_json::Value {
+    let (message, next_action) = match reason {
+        EntryReason::RuntimeMetadataInvalid => (
+            "runtime current capsule is unreadable; refusing to guess ownership",
+            "Inspect status.runtime_diagnostics and repair or isolate the exact runtime metadata before launching.",
+        ),
+        EntryReason::ListenerBlocked | EntryReason::RuntimeCandidateAmbiguity => (
+            "listening_port is already occupied or has ambiguous runtime candidates; refusing launch",
+            "Inspect status and resolve the exact listener or runtime candidate without editing session files.",
+        ),
+        EntryReason::ListenerUnavailable => (
+            "listening_port is unavailable; refusing launch",
+            "Call bootstrap or status again to establish a listener.",
+        ),
+        EntryReason::FailurePreserved => (
+            "the current generation is preserving failure evidence; refusing replacement",
+            "Call get_failure_context before dismissing or replacing the failed generation.",
+        ),
+        EntryReason::TransportUncertain => (
+            "adapter control status is stalled or malformed; refusing to infer disconnection",
+            "Call status again or stop the exact managed generation before starting another launch.",
+        ),
+        EntryReason::LiveManagedGeneration => (
+            "an emulator is already connected or the current launch generation is still alive",
+            "Inspect status and reattach. Use replace=true only for an intentional replacement.",
+        ),
+        EntryReason::LiveUnmanagedGeneration => (
+            "an emulator is already connected but legacy or unmanaged ownership cannot be proven",
+            "Inspect status and stop the existing emulator through its verified owner before launching.",
+        ),
+        EntryReason::LeaseOccupied => (
+            "the current generation lease is held by another live controller",
+            "Wait for the current controller to release the lease.",
+        ),
+        EntryReason::LeaseUnknown => (
+            "the current generation lease holder is unverifiable",
+            "Inspect status and restore verifiable ownership; do not edit lease or link files.",
+        ),
+        EntryReason::BridgeExited => (
+            "the current emulator is alive but its required bridge exited",
+            "Inspect status and use replace=true only if terminating the exact managed generation is intended.",
+        ),
+        EntryReason::BridgeIdentityUnknown => (
+            "current bridge process identity is unknown; refusing unsafe transition",
+            "Verify bridge process identity and act only on the exact managed generation.",
+        ),
+        EntryReason::ProcessIdentityUnknown => (
+            "current process liveness is unknown; refusing unsafe transition",
+            "Verify process-start identity before retrying launch or replacement.",
+        ),
+        EntryReason::TransportReattach => (
+            "the current launch generation should be reattached instead of duplicated",
+            "Call status to reattach to the same generation.",
+        ),
+        EntryReason::ReadyNoHistory
+        | EntryReason::TerminalHistory
+        | EntryReason::OwnedHelperCleanupPending => (
+            "generation transition was rejected after its readiness classification changed",
+            "Call status and retry against the current generation.",
+        ),
+    };
+    let mut value = serde_json::json!({
+        "launched": false,
+        "reason": message,
+        "entry_reason": reason,
+        "status": status,
+        "next_action": next_action,
+    });
+    if let Some(current) = current {
+        value["runtime_instance"] = current.public_value();
+    }
+    if matches!(
+        reason,
+        EntryReason::LiveManagedGeneration | EntryReason::LiveUnmanagedGeneration
+    ) {
+        value["connected_emulator"] = value["status"]
+            .get("emulator_identity")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+    }
+    value
+}
+
 /// Actually launch an emulator (the `launch` tool): ensure the listener, capture this session's port +
 /// token, pick the adapter from the system/extension, and dispatch to that adapter's Rust orchestrator.
 /// Returns a JSON outcome. A system without a Rust orchestrator yet points back at launch_plan, so no
@@ -9,37 +96,22 @@ pub(crate) fn make_launch(
     link: &mut (dyn EmulatorLink + Send),
     a: &LaunchArgs,
 ) -> serde_json::Value {
-    let bootstrap = match make_bootstrap_value(link) {
-        Ok(b) => b,
+    let control = match observe_control_state(link) {
+        Ok(observation) => observation,
         Err(e) => return serde_json::json!({ "launched": false, "error": e.to_string() }),
     };
-    let status = bootstrap
-        .get("status")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}));
-    let port_occupied = status
-        .get("occupied_by_foreign")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-        || status
-            .get("stale_own_token")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-    if port_occupied {
-        return serde_json::json!({
-            "launched": false,
-            "reason": "listening_port is already occupied; not launching another emulator on the same port",
-            "status": status,
-            "bootstrap": bootstrap,
-            "next_action": status.get("recovery").cloned().unwrap_or_else(|| serde_json::json!("call status/bootstrap and resolve the occupied port before launch")),
-        });
+    let status = control.status;
+    let intent = if a.replace {
+        TransitionIntent::Replace
+    } else {
+        TransitionIntent::Launch
+    };
+    let initial_admission = admit_generation_transition(&control.runtime, intent);
+    if let TransitionAdmission::Rejected(reason) = initial_admission {
+        return transition_rejection(reason, status, None);
     }
-    let Some(port) = bootstrap
-        .get("listening_port")
-        .and_then(|v| v.as_u64())
-        .and_then(|p| u16::try_from(p).ok())
-    else {
-        return serde_json::json!({ "launched": false, "reason": "listening_port is unknown; call status first" });
+    let Some(port) = link.endpoint_port() else {
+        return transition_rejection(EntryReason::ListenerUnavailable, status, None);
     };
     let token = link.session_token().map(str::to_string);
     let store = RuntimeStore::discover();
@@ -54,33 +126,6 @@ pub(crate) fn make_launch(
             })
         }
     };
-
-    // A front connection normally means the current generation must be preserved. The only
-    // launch-time exception is a capsule proving that the emulator exited while its exact bridge
-    // remains alive: that bridge is an owned orphan, not a live emulator session, and is cleaned
-    // below after the new launch has passed its non-mutating preflight.
-    let already_connected = status
-        .get("connected")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let observed_lease = link.continuity().lease;
-    let observed_cleanup_authorized = matches!(
-        observed_lease.state,
-        LeaseState::Held | LeaseState::Available
-    );
-    let exact_owned_bridge_orphan = previous.as_ref().is_some_and(|current| {
-        current.process_state() == ProcessState::Exited
-            && current.bridge_process_state() == Some(ProcessState::Alive)
-    }) && observed_cleanup_authorized;
-    if already_connected && !a.replace && !exact_owned_bridge_orphan {
-        return serde_json::json!({
-            "launched": false,
-            "reason": "an emulator is already connected on this session's listening_port; not launching another (it would orphan the current one)",
-            "connected_emulator": status.get("emulator_identity").cloned().unwrap_or(serde_json::Value::Null),
-            "status": status,
-            "next_action": "To replace it, preserve state if needed and terminate only the PID identified by connected_emulator, then launch again. Do not use a broad kill. If the connection is already dead, wait for status.connected=false and retry so the new connection can be adopted.",
-        });
-    }
 
     if !Path::new(&a.content_path).exists() {
         return serde_json::json!({
@@ -136,45 +181,11 @@ pub(crate) fn make_launch(
             }
         }
     }
-    if let Some(current) = previous.as_ref() {
-        match (current.process_state(), current.bridge_process_state()) {
-            (ProcessState::Alive, _) if !a.replace => {
-                return serde_json::json!({
-                    "launched": false,
-                    "reason": "current launch generation is still alive and may already be connected; reattach instead of launching a duplicate",
-                    "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "Reattach to the same launch_id through status or bootstrap. Use replace=true only for an intentional replacement.",
-                })
-            }
-            (ProcessState::Alive, Some(ProcessState::Unknown)) => {
-                return serde_json::json!({
-                    "launched": false,
-                    "reason": "current bridge process identity is unknown; refusing unsafe replacement",
-                    "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "Verify bridge process identity, clean up only that generation, then launch again.",
-                })
-            }
-            (ProcessState::Unknown, _) => {
-                return serde_json::json!({
-                    "launched": false,
-                    "reason": "current process liveness is unknown; refusing duplicate launch or unsafe replacement",
-                    "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "Verify process identity, clean it up explicitly, then launch again.",
-                })
-            }
-            (ProcessState::Exited, Some(ProcessState::Unknown)) => {
-                return serde_json::json!({
-                    "launched": false,
-                    "reason": "the emulator exited but bridge ownership is unknown; refusing unsafe cleanup",
-                    "runtime_instance": current.public_value_with_lease(&observed_lease),
-                    "next_action": "Verify bridge process identity, clean up only that generation, then launch again.",
-                })
-            }
-            _ => {}
-        }
-    }
-    let lease = if let Some(current) = previous.as_ref() {
-        match link.acquire_control_lease(&current.launch_id) {
+    if initial_admission == TransitionAdmission::AcquireLease {
+        let Some(current) = previous.as_ref() else {
+            return transition_rejection(EntryReason::ProcessIdentityUnknown, status, None);
+        };
+        let lease = match link.acquire_control_lease(&current.launch_id) {
             Ok(lease) => lease,
             Err(error) => {
                 return serde_json::json!({
@@ -183,87 +194,114 @@ pub(crate) fn make_launch(
                     "error": error.to_string(),
                 })
             }
+        };
+        if lease.state != LeaseState::Held {
+            let reason = if lease.state == LeaseState::Occupied {
+                EntryReason::LeaseOccupied
+            } else {
+                EntryReason::LeaseUnknown
+            };
+            return transition_rejection(reason, status, Some(current));
         }
-    } else {
-        observed_lease
+    }
+
+    let refreshed = match store.read_current(port) {
+        Ok(current) => current,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "runtime current capsule became unreadable before generation transition",
+                "error": error.to_string(),
+            })
+        }
     };
-    let cleanup_authorized = lease.state == LeaseState::Held;
-    if let Some(current) = previous.as_ref() {
-        match current.process_state() {
-            ProcessState::Alive if !a.replace => {
-                return serde_json::json!({
-                    "launched": false,
-                    "reason": "current launch generation is still alive and may already be connected; reattach instead of launching a duplicate",
-                    "runtime_instance": current.public_value(),
-                    "next_action": "Reattach to the same launch_id through status or bootstrap. Use replace=true only for an intentional replacement.",
-                })
+    let expected_launch_id = previous.as_ref().map(|current| current.launch_id.as_str());
+    let refreshed_launch_id = refreshed.as_ref().map(|current| current.launch_id.as_str());
+    if expected_launch_id != refreshed_launch_id {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "runtime current generation changed before launch transition; no process was signalled",
+            "expected_launch_id": expected_launch_id,
+            "current_launch_id": refreshed_launch_id,
+        });
+    }
+    let adapter_connected = status
+        .get("connected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let refreshed_observation = observe_runtime(link, ListenerState::Bound, adapter_connected);
+    if let TransitionAdmission::Rejected(reason) =
+        admit_generation_transition(&refreshed_observation, intent)
+    {
+        return transition_rejection(reason, status, refreshed.as_ref());
+    }
+    if refreshed.is_some()
+        && admit_generation_transition(&refreshed_observation, intent)
+            == TransitionAdmission::AcquireLease
+    {
+        return transition_rejection(EntryReason::LeaseUnknown, status, refreshed.as_ref());
+    }
+
+    let before_signal = match store.read_current(port) {
+        Ok(current) => current,
+        Err(error) => {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "runtime current capsule became unreadable immediately before process transition",
+                "error": error.to_string(),
+            })
+        }
+    };
+    let before_signal_launch_id = before_signal
+        .as_ref()
+        .map(|current| current.launch_id.as_str());
+    if expected_launch_id != before_signal_launch_id {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "runtime current generation changed immediately before process transition; no process was signalled",
+            "expected_launch_id": expected_launch_id,
+            "current_launch_id": before_signal_launch_id,
+        });
+    }
+
+    if let Some(current) = before_signal.as_ref() {
+        match (current.process_state(), current.bridge_process_state()) {
+            (ProcessState::Unknown, _) => {
+                return transition_rejection(
+                    EntryReason::ProcessIdentityUnknown,
+                    status,
+                    Some(current),
+                );
             }
-            ProcessState::Alive => {
-                if !cleanup_authorized {
-                    return serde_json::json!({
-                        "launched": false,
-                        "reason": "current generation is controlled by another or unverifiable lease; refusing replacement",
-                        "lease": lease,
-                        "runtime_instance": current.public_value_with_lease(&lease),
-                        "next_action": "Wait for the current control lease to be released, or verify that this is the same control session, before requesting replacement again.",
-                    });
-                }
-                if let Err(e) = current.terminate_owned_processes() {
+            (_, Some(ProcessState::Unknown)) => {
+                return transition_rejection(
+                    EntryReason::BridgeIdentityUnknown,
+                    status,
+                    Some(current),
+                );
+            }
+            (ProcessState::Alive, _) => {
+                if let Err(error) = current.terminate_owned_processes() {
                     return serde_json::json!({
                         "launched": false,
                         "reason": "verified current generation could not be terminated for replacement",
-                        "error": e.to_string(),
+                        "error": error.to_string(),
                         "runtime_instance": current.public_value(),
                     });
                 }
             }
-            ProcessState::Unknown => {
-                return serde_json::json!({
-                    "launched": false,
-                    "reason": "current process liveness is unknown; refusing duplicate launch or unsafe replacement",
-                    "runtime_instance": current.public_value(),
-                    "next_action": "Verify process identity, clean it up explicitly, then launch again.",
-                })
-            }
-            ProcessState::Exited => {
-                if !cleanup_authorized {
+            (ProcessState::Exited, Some(ProcessState::Alive)) => {
+                if let Err(error) = current.terminate_owned_processes() {
                     return serde_json::json!({
                         "launched": false,
-                        "reason": "the exited generation is controlled by another or unverifiable lease; refusing cleanup or replacement",
-                        "lease": lease,
-                        "runtime_instance": current.public_value_with_lease(&lease),
-                        "next_action": "After the control lease is released, clean up only the exact generation or request a new launch.",
+                        "reason": "the emulator exited but its verified bridge could not be cleaned up",
+                        "error": error.to_string(),
+                        "runtime_instance": current.public_value(),
                     });
                 }
-                match current.bridge_process_state() {
-                    Some(ProcessState::Alive) => {
-                        if let Err(e) = current.terminate_owned_processes() {
-                            return serde_json::json!({
-                                "launched": false,
-                                "reason": "the emulator exited but its verified bridge could not be cleaned up",
-                                "error": e.to_string(),
-                                "runtime_instance": current.public_value(),
-                            });
-                        }
-                    }
-                    Some(ProcessState::Unknown) => {
-                        return serde_json::json!({
-                            "launched": false,
-                            "reason": "the emulator exited but bridge ownership is unknown; refusing unsafe cleanup",
-                            "runtime_instance": current.public_value_with_lease(&lease),
-                            "next_action": "Verify bridge process identity, clean up only that generation, then launch again.",
-                        })
-                    }
-                    Some(ProcessState::Exited) | None => {}
-                }
             }
+            (ProcessState::Exited, Some(ProcessState::Exited) | None) => {}
         }
-    } else if already_connected {
-        return serde_json::json!({
-            "launched": false,
-            "reason": "connected legacy emulator has no runtime capsule; safe replacement ownership cannot be proven",
-            "next_action": "Clean up the existing emulator explicitly, verify status.connected=false, then launch again.",
-        });
     }
 
     let prepared = match store.prepare(port) {
@@ -662,8 +700,8 @@ pub(super) fn launch_mupen64plus(
         log_path: &log,
         port,
         name: a.name.as_deref(),
-        session_token: token,
         build: Some(BUILD_HASH),
+        session_token: token,
         runtime: Some(runtime),
         display,
     };
@@ -1035,6 +1073,7 @@ pub(super) fn launch_mesen(
         log_path: &log,
         port,
         name: a.name.as_deref(),
+        build: Some(BUILD_HASH),
         session_token: token,
         runtime: Some(runtime),
     };
@@ -1103,9 +1142,8 @@ pub(super) fn launch_mednafen(
     }
 }
 
-/// 진입점이 IdentityMismatch(포트를 다른 세션 에뮬이 점유)일 때 하드에러 대신 줄 graceful 응답.
-/// 계약: 미연결처럼 connected=false + listening_port + runtime_paths를 주고, 점유자 진단·복구절차를 더한다.
-/// 그래야 새 세션이 잠기지 않고 자기 에뮬을 올바른 포트로 띄우거나 orphan을 정리할 수 있다.
+/// IdentityMismatch is a recoverable listener state, so report it without discarding diagnostics.
+/// The response stays disconnected, preserves the listening port, and describes the occupant.
 pub(crate) fn occupied_graceful(
     occupant: &EmulatorIdentity,
     port: Option<u16>,

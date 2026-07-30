@@ -5,6 +5,7 @@ pub mod cue;
 pub mod gdb_rsp;
 pub mod launch;
 pub mod live;
+pub mod mcp_result;
 #[cfg(unix)]
 pub mod n64_adapter;
 pub mod nds_bridge;

@@ -1,8 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use emucap::live::link::{EmulatorIdentity, EmulatorLink, LinkError};
+use emucap::live::task_entry::{
+    classify_entry, observe_runtime, EntryDisposition, EntryReason, EntryState, ListenerState,
+    RuntimeObservation,
+};
 use emucap::live::tcp;
 use emucap::live::tools::{self, ToolOutput};
+use sha2::{Digest, Sha256};
 
 use crate::launch::occupied_graceful;
 
@@ -351,71 +357,6 @@ fn abs_path_json(root: &Path, parts: &[&str]) -> serde_json::Value {
     repo_path(root, parts).display().to_string().into()
 }
 
-fn mesen_platform_launcher(root: &Path) -> PathBuf {
-    let ps1 = repo_path(root, &["adapters", "mesen2", "launch.ps1"]);
-    if cfg!(windows) && ps1.is_file() {
-        ps1
-    } else {
-        repo_path(root, &["adapters", "mesen2", "launch.sh"])
-    }
-}
-
-fn powershell_quote(path: &Path) -> String {
-    format!("'{}'", path.display().to_string().replace('\'', "''"))
-}
-
-fn legacy_mesen_command(root: &Path, port: u16) -> String {
-    let launcher = mesen_platform_launcher(root);
-    if launcher.extension().and_then(|e| e.to_str()) == Some("ps1") {
-        format!(
-            "powershell -ExecutionPolicy Bypass -File {} <ROM> {port} [name] [system]",
-            powershell_quote(&launcher)
-        )
-    } else {
-        format!("{} <ROM> {port} [name] [system]", launcher.display())
-    }
-}
-
-fn native_legacy_script(path: &Path) -> bool {
-    let ext = path.extension().and_then(|e| e.to_str());
-    path.is_file()
-        && if cfg!(windows) {
-            ext.is_some_and(|e| e.eq_ignore_ascii_case("ps1"))
-        } else {
-            ext == Some("sh")
-        }
-}
-
-fn legacy_command_template(launcher: &Path, command: String) -> serde_json::Value {
-    if native_legacy_script(launcher) {
-        serde_json::json!(command)
-    } else {
-        serde_json::Value::Null
-    }
-}
-
-fn legacy_fallback_entry(launcher: &Path, command: String) -> serde_json::Value {
-    let available = native_legacy_script(launcher);
-    serde_json::json!({
-        "available_on_this_host": available,
-        "launcher": if available {
-            serde_json::json!(launcher.display().to_string())
-        } else {
-            serde_json::Value::Null
-        },
-        "command_template": if available {
-            serde_json::json!(command)
-        } else {
-            serde_json::Value::Null
-        },
-        "reason": if available {
-            "native script for this host"
-        } else {
-            "no native legacy script for this host; use command_templates.preferred"
-        },
-    })
-}
-
 pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
     let runtime_store = emucap::live::runtime::RuntimeStore::discover();
     let capsule_paths = serde_json::json!({
@@ -431,14 +372,6 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
         });
     };
     let token_file = port.map(tcp::session_token_path);
-    let mesen_launcher = mesen_platform_launcher(&root);
-    let mednafen_launcher = repo_path(&root, &["adapters", "mednafen", "launch.sh"]);
-    let mame_launcher = repo_path(&root, &["adapters", "mame-pc98", "launch.sh"]);
-    let flycast_launcher = repo_path(&root, &["adapters", "flycast", "launch.sh"]);
-    let desmume_launcher = repo_path(&root, &["adapters", "desmume-nds", "launch.sh"]);
-    let ppsspp_launcher = repo_path(&root, &["adapters", "ppsspp", "launch.sh"]);
-    let pcsx2_launcher = repo_path(&root, &["adapters", "pcsx2", "launch.sh"]);
-    let dolphin_launcher = repo_path(&root, &["adapters", "dolphin", "launch-native.ps1"]);
     serde_json::json!({
         "repo_root": root.display().to_string(),
         "repo_root_env": "EMUCAP_REPO_ROOT",
@@ -446,127 +379,70 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
         "runtime_capsule": capsule_paths,
         "adapters": {
             "mesen2": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "mesen2", if cfg!(windows) { "build.ps1" } else { "build.sh" }]),
-                "launch": abs_path_json(&root, &["adapters", "mesen2", "launch.sh"]),
-                "windows_script": abs_path_json(&root, &["adapters", "mesen2", "launch.ps1"]),
-                "platform_launch": mesen_launcher.display().to_string(),
-                "lua": abs_path_json(&root, &["adapters", "mesen2", "emucap-core.lua"]),
             },
             "mednafen": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "mednafen", "build.sh"]),
-                "launch": abs_path_json(&root, &["adapters", "mednafen", "launch.sh"]),
-                "work_dir": abs_path_json(&root, &["adapters", "mednafen", "work"]),
             },
             "mame_pc98": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "mame-pc98", "build.sh"]),
-                "launch": abs_path_json(&root, &["adapters", "mame-pc98", "launch.sh"]),
-                "headless_wrapper": abs_path_json(&root, &["adapters", "mame-pc98", "mame-headless.sh"]),
-                "work_source_dir": abs_path_json(&root, &["adapters", "mame-pc98", "work", "mame-src"]),
-                "work_wrapper": abs_path_json(&root, &["adapters", "mame-pc98", "work", "mame"]),
-                "work_raw_binary": abs_path_json(&root, &["adapters", "mame-pc98", "work", "mame.raw"]),
             },
             "mame_neogeo": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "mame-neogeo", "build.sh"]),
                 "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
             },
             "mupen64plus": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "mupen64plus", "build.sh"]),
                 "adapter_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mupen64plus.exe" } else { "emucap-mupen64plus" }]),
-                "plugin_root": emucap::launch::mupen64plus::default_root(&root).display().to_string(),
             },
             "openmsx": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "openmsx", "build.sh"]),
                 "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-openmsx-bridge.exe" } else { "emucap-openmsx-bridge" }]),
-                "work_dir": abs_path_json(&root, &["adapters", "openmsx", "work"]),
             },
             "flycast": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "flycast", "build.sh"]),
-                "launch": abs_path_json(&root, &["adapters", "flycast", "launch.sh"]),
             },
             "desmume_nds": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "desmume-nds", "build.sh"]),
-                "launch": abs_path_json(&root, &["adapters", "desmume-nds", "launch.sh"]),
             },
             "ppsspp": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "ppsspp", "build.sh"]),
-                "launch": abs_path_json(&root, &["adapters", "ppsspp", "launch.sh"]),
             },
             "pcsx2": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "pcsx2", "build.sh"]),
                 "bios_env": "EMUCAP_PCSX2_BIOS",
             },
             "dolphin": {
-                "preferred_launcher": "MCP tool: launch",
                 "build": abs_path_json(&root, &["adapters", "dolphin", if cfg!(windows) { "build.ps1" } else { "build.sh" }]),
-                "windows_script": abs_path_json(&root, &["adapters", "dolphin", "launch-native.ps1"]),
             }
-        },
-        "command_templates": port.map(|p| serde_json::json!({
-            "preferred": "launch(content_path, system?, name?)",
-            "legacy_mesen2": legacy_command_template(&mesen_launcher, legacy_mesen_command(&root, p)),
-            "legacy_mednafen": legacy_command_template(&mednafen_launcher, format!("{} <disc_or_rom> {p} [name] [force_module]", mednafen_launcher.display())),
-            "legacy_mame_pc98": legacy_command_template(&mame_launcher, format!("{} <disk.hdi|disk.hdm|disk.d88> {p} [name] [machine]", mame_launcher.display())),
-            "legacy_flycast": legacy_command_template(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
-            "legacy_desmume_nds": legacy_command_template(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
-            "legacy_ppsspp": legacy_command_template(&ppsspp_launcher, format!("{} <game.iso|game.cso|game.pbp> {p} [name]", ppsspp_launcher.display())),
-            "legacy_pcsx2": legacy_command_template(&pcsx2_launcher, format!("{} <game.iso> {p} [name]", pcsx2_launcher.display())),
-            "legacy_dolphin": legacy_command_template(&dolphin_launcher, format!("powershell -ExecutionPolicy Bypass -File {} <game.gcm|game.iso|game.wbfs> {p} [name]", dolphin_launcher.display())),
-        })),
-        "legacy_fallbacks": port.map(|p| serde_json::json!({
-            "mesen2": legacy_fallback_entry(&mesen_launcher, legacy_mesen_command(&root, p)),
-            "mednafen": legacy_fallback_entry(&mednafen_launcher, format!("{} <disc_or_rom> {p} [name] [force_module]", mednafen_launcher.display())),
-            "mame_pc98": legacy_fallback_entry(&mame_launcher, format!("{} <disk.hdi|disk.hdm|disk.d88> {p} [name] [machine]", mame_launcher.display())),
-            "flycast": legacy_fallback_entry(&flycast_launcher, format!("{} <disc.gdi|disc.cdi|disc.chd|disc.cue> {p}", flycast_launcher.display())),
-            "desmume_nds": legacy_fallback_entry(&desmume_launcher, format!("{} <rom.nds> {p} [name]", desmume_launcher.display())),
-            "ppsspp": legacy_fallback_entry(&ppsspp_launcher, format!("{} <game.iso|game.cso|game.pbp> {p} [name]", ppsspp_launcher.display())),
-            "pcsx2": legacy_fallback_entry(&pcsx2_launcher, format!("{} <game.iso> {p} [name]", pcsx2_launcher.display())),
-            "dolphin": legacy_fallback_entry(&dolphin_launcher, format!("powershell -ExecutionPolicy Bypass -File {} <game.gcm|game.iso|game.wbfs> {p} [name]", dolphin_launcher.display())),
-        })),
+        }
     })
 }
 
-pub(crate) fn supported_systems_value() -> serde_json::Value {
+fn build_supported_systems_value() -> serde_json::Value {
     serde_json::json!([
         {
             "system": "snes",
             "adapter": "mesen2",
             "content": ["sfc", "smc"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
         },
         {
             "system": "gamegear",
             "aliases": ["gg", "game-gear", "sms", "master-system"],
             "adapter": "mesen2",
             "content": ["gg", "sms"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
         },
         {
             "system": "gb",
             "aliases": ["gameboy", "game-boy", "dmg"],
             "adapter": "mesen2",
             "content": ["gb"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch"
         },
         {
             "system": "gbc",
             "aliases": ["gbcolor", "gameboycolor", "game-boy-color", "cgb"],
             "adapter": "mesen2",
             "content": ["gbc"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
             "notes": "GB and GBC share the emucap-gb.lua entry (Mesen gameboy console / SM83 CPU)."
         },
         {
@@ -574,8 +450,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["gameboyadvance", "game-boy-advance", "agb"],
             "adapter": "mesen2",
             "content": ["gba"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
             "notes": "ARM7: disassemble/call_stack are unsupported; memory/state/BP/save/input/screenshot are supported."
         },
         {
@@ -583,8 +457,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["famicom", "fc", "nintendo"],
             "adapter": "mesen2",
             "content": ["nes"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mesen2.platform_launch",
             "notes": "6502/2A03: disassemble/call_stack/break_on_reset supported; memory/state/BP/save/input/screenshot supported."
         },
         {
@@ -592,7 +464,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["nintendo64", "nintendo-64"],
             "adapter": "mupen64plus",
             "content": ["z64", "n64", "v64"],
-            "launcher": "MCP tool: launch",
             "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded run_frames and input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
         },
         {
@@ -600,7 +471,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["msx2+", "msx2plus", "openmsx"],
             "adapter": "openmsx",
             "content": ["rom", "mx1", "mx2", "ri", "sg"],
-            "launcher": "MCP tool: launch",
             "notes": "Pinned openMSX 21.0 C-BIOS MSX2+ cartridge profile. It exposes Z80 exec/read/write breakpoints with atomic evidence and disassembly in addition to frame/instruction control, memory, state, input, and visible frozen screenshots. Generic .rom files require system=msx."
         },
         {
@@ -608,7 +478,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": [],
             "adapter": "openmsx",
             "content": ["rom", "mx1", "mx2", "ri", "sg", "cas", "tsx", "wav"],
-            "launcher": "MCP tool: launch",
             "notes": "Pinned Philips VG 8020 real-firmware profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute firmware directory. Cartridge and cassette media are admitted; disk is not."
         },
         {
@@ -616,7 +485,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": [],
             "adapter": "openmsx",
             "content": ["rom", "mx1", "mx2", "ri", "sg", "dsk", "cas", "tsx", "wav"],
-            "launcher": "MCP tool: launch",
             "notes": "Pinned Philips NMS 8250 real-firmware profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute firmware directory. Mutable media is mounted from an isolated working copy."
         },
         {
@@ -624,7 +492,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": [],
             "adapter": "openmsx",
             "content": ["rom", "mx1", "mx2", "ri", "sg", "dsk", "cas", "tsx", "wav"],
-            "launcher": "MCP tool: launch",
             "notes": "Pinned Panasonic FS-A1WSX real-firmware profile. It is not the legacy msx2+ alias. Set EMUCAP_OPENMSX_FIRMWARE to an absolute firmware directory."
         },
         {
@@ -632,24 +499,18 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["ss"],
             "adapter": "mednafen",
             "content": ["cue", "chd"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch"
         },
         {
             "system": "psx",
             "aliases": ["ps1", "playstation"],
             "adapter": "mednafen",
             "content": ["cue", "bin", "chd", "iso"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch"
         },
         {
             "system": "pce",
             "aliases": ["pcengine", "pc-engine", "pce-cd"],
             "adapter": "mednafen",
             "content": ["cue", "pce", "chd"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
             "force_module": "pce"
         },
         {
@@ -657,8 +518,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["pc-fx"],
             "adapter": "mednafen",
             "content": ["cue", "ccd", "toc", "m3u"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
             "force_module": "pcfx",
             "required_firmware": ["pcfx.rom"],
             "notes": "Disc formats are ambiguous; pass system=pcfx explicitly. V810 call_stack is a best-effort trace-derived shadow stack."
@@ -668,8 +527,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["genesis", "megadrive", "mega-drive"],
             "adapter": "mednafen",
             "content": ["md", "gen", "smd", "bin"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
             "force_module": "md",
             "notes": ".bin is only inferred as MD when a Mega Drive/Genesis header is present; otherwise pass system=md explicitly"
         },
@@ -678,8 +535,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["ws", "wsc", "wonderswan", "wonderswan-color", "wonderswancolor", "wonderswan_color"],
             "adapter": "mednafen",
             "content": ["ws", "wsc", "wsr"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
             "force_module": "wswan",
             "notes": "WonderSwan and WonderSwan Color share the Mednafen wswan module."
         },
@@ -688,8 +543,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["ngpc", "neo-geo-pocket", "neo-geo-pocket-color", "neogeo-pocket", "neogeo-pocket-color"],
             "adapter": "mednafen",
             "content": ["ngp", "ngpc", "ngc", "npc"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mednafen.launch",
             "force_module": "ngp",
             "notes": "Neo Geo Pocket and Pocket Color share the patched Mednafen ngp module. Its TLCS-900/H profile exposes side-effect-free RAM/ROM/BIOS views, RAM writes, exact instruction step, safe disassembly, and exec-only breakpoints. Sound-Z80 state, read/write breakpoints, trace, and call-stack classification are not exposed."
         },
@@ -698,15 +551,12 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["pc-98", "mame-pc98"],
             "adapter": "mame_pc98",
             "content": ["hdi", "hdm", "d88"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.mame_pc98.launch"
         },
         {
             "system": "neogeo_mvs",
             "aliases": ["neo-geo-mvs", "neogeo-mvs", "mvs"],
             "adapter": "mame_neogeo",
             "content": ["zip"],
-            "launcher": "MCP tool: launch",
             "required_firmware": ["neogeo.zip"],
             "notes": ".zip is not auto-inferred; pass system=neogeo_mvs explicitly. AES, CD, Pocket/Color, and Hyper Neo Geo 64 are separate targets and are not accepted as aliases."
         },
@@ -715,7 +565,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["neo-geo-aes", "neogeo-aes", "aes"],
             "adapter": "mame_neogeo",
             "content": ["zip"],
-            "launcher": "MCP tool: launch",
             "required_firmware": ["aes.zip"],
             "notes": ".zip is not auto-inferred; pass system=neogeo_aes explicitly. The ZIP stem must name an AES-compatible entry in the pinned MAME Neo Geo software list."
         },
@@ -724,7 +573,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["neo-geo-cd", "neogeo-cd", "ngcd"],
             "adapter": "mame_neogeo",
             "content": ["cue"],
-            "launcher": "MCP tool: launch",
             "required_firmware": ["neocdz.zip"],
             "notes": "CUE is ambiguous; pass system=neogeo_cd explicitly. The content identity covers the CUE and every referenced file. Native save/load is not advertised."
         },
@@ -733,24 +581,18 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["dreamcast", "flycast"],
             "adapter": "flycast",
             "content": ["gdi", "cdi", "chd", "cue"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.flycast.launch"
         },
         {
             "system": "nds",
             "aliases": ["ds", "nintendo-ds", "desmume"],
             "adapter": "desmume_nds",
             "content": ["nds"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.desmume_nds.launch"
         },
         {
             "system": "psp",
             "aliases": ["ppsspp", "playstation-portable"],
             "adapter": "ppsspp",
             "content": ["iso", "cso", "pbp"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.ppsspp.launch",
             "notes": ".iso is shared with Saturn/PSX/PCE/MD/Dreamcast — a PSP GAME ISO9660 header disambiguates automatically; otherwise pass system=psp explicitly."
         },
         {
@@ -758,7 +600,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["pcsx2", "playstation2", "playstation-2"],
             "adapter": "pcsx2",
             "content": ["iso"],
-            "launcher": "MCP tool: launch",
             "required_environment": ["EMUCAP_PCSX2_BIOS"],
             "notes": "An ISO9660 SYSTEM.CNF BOOT2 entry is inferred automatically. The pinned PCSX2 fork and Rust bridge are required."
         },
@@ -767,8 +608,6 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["gc", "ngc", "game-cube"],
             "adapter": "dolphin",
             "content": ["gcm", "iso", "rvz", "gcz"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.dolphin.windows_script",
             "notes": ".gcm and the GameCube disc magic are inferred automatically; shared container extensions require system=gamecube."
         },
         {
@@ -776,74 +615,192 @@ pub(crate) fn supported_systems_value() -> serde_json::Value {
             "aliases": ["nintendo-wii"],
             "adapter": "dolphin",
             "content": ["wbfs", "iso", "rvz", "wia", "gcz"],
-            "launcher": "MCP tool: launch",
-            "legacy_launcher": "runtime_paths.adapters.dolphin.windows_script",
             "notes": ".wbfs and the Wii disc magic are inferred automatically; shared container extensions require system=wii."
         }
     ])
 }
 
-pub(crate) fn supported_system_names() -> String {
-    supported_systems_value()
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|system| system["system"].as_str())
-        .collect::<Vec<_>>()
-        .join("/")
+fn supported_systems_catalog() -> &'static serde_json::Value {
+    static CATALOG: OnceLock<serde_json::Value> = OnceLock::new();
+    CATALOG.get_or_init(build_supported_systems_value)
 }
 
-pub(crate) fn unknown_content_question() -> String {
-    format!(
-        "Which ROM, disc, or disk path should be launched, and for which system ({})?",
-        supported_system_names()
-    )
+pub(crate) fn supported_systems_value() -> serde_json::Value {
+    supported_systems_catalog().clone()
 }
 
-pub(crate) fn required_unknown_content_input() -> String {
-    format!(
-        "Ask for content_path and a system ({}) before calling launch_plan(content_path, system).",
-        supported_system_names()
-    )
+pub(crate) fn supported_system_ids_value() -> serde_json::Value {
+    static IDS: OnceLock<serde_json::Value> = OnceLock::new();
+    IDS.get_or_init(|| {
+        serde_json::Value::Array(
+            supported_systems_catalog()
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|system| system["system"].as_str())
+                .map(|system| serde_json::json!(system))
+                .collect(),
+        )
+    })
+    .clone()
 }
 
-pub(crate) fn make_bootstrap_value(
-    link: &mut dyn EmulatorLink,
-) -> Result<serde_json::Value, LinkError> {
-    let status = tools::status(link);
+fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonical_json).collect())
+        }
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let mut canonical = serde_json::Map::new();
+            for key in keys {
+                canonical.insert(key.clone(), canonical_json(&values[key]));
+            }
+            serde_json::Value::Object(canonical)
+        }
+        scalar => scalar.clone(),
+    }
+}
+
+fn json_revision(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(&canonical_json(value))
+        .expect("serializing a serde_json::Value cannot fail");
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+pub(crate) fn system_catalog_revision() -> String {
+    static REVISION: OnceLock<String> = OnceLock::new();
+    REVISION
+        .get_or_init(|| json_revision(supported_systems_catalog()))
+        .clone()
+}
+
+pub(crate) fn unknown_content_question() -> &'static str {
+    "Which ROM, disc, or disk path should be used?"
+}
+
+const CAPABILITY_FIELDS: &[&str] = &[
+    "methods",
+    "memory_types",
+    "breakpoint_kinds",
+    "input_buttons",
+    "contracts",
+    "capability_notes",
+    "execution_limits",
+    "freeze_policy",
+    "bank_tagging",
+];
+
+fn capability_revision(value: &serde_json::Value) -> String {
+    let mut snapshot = serde_json::Map::new();
+    snapshot.insert("schema".into(), serde_json::json!(1));
+    for field in CAPABILITY_FIELDS {
+        if let Some(field_value) = value.get(field) {
+            snapshot.insert((*field).into(), field_value.clone());
+        }
+    }
+    for field in [
+        "server_build",
+        "emulator_build",
+        "emulator_identity",
+        "protocol_version",
+    ] {
+        if let Some(field_value) = value.get(field) {
+            snapshot.insert(field.into(), field_value.clone());
+        }
+    }
+    json_revision(&serde_json::Value::Object(snapshot))
+}
+
+fn remove_capability_fields(value: &mut serde_json::Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in CAPABILITY_FIELDS {
+        object.remove(*field);
+    }
+}
+
+pub(crate) fn apply_capability_revision(
+    value: &mut serde_json::Value,
+    known_revision: Option<&str>,
+) -> String {
+    let revision = capability_revision(value);
+    let unchanged = known_revision == Some(revision.as_str());
+    if unchanged {
+        remove_capability_fields(value);
+    }
+    value["capability_revision"] = serde_json::json!(revision);
+    value["capability_snapshot"] = serde_json::json!(if unchanged { "unchanged" } else { "full" });
+    revision
+}
+
+pub(crate) fn enrich_connected_status(value: &mut serde_json::Value, link: &dyn EmulatorLink) {
     let port = link.endpoint_port();
     let token = link.session_token().map(str::to_string);
     let identity = link.capabilities().identity.clone();
+    let methods = link.capabilities().methods.clone();
+    let memory_types = link.capabilities().memory_types.clone();
+    let breakpoint_kinds = link.capabilities().breakpoint_kinds.clone();
     let contracts = link.capabilities().contracts.clone();
+    enrich_status_value(value, &methods, &memory_types, identity.system.as_deref());
+    enrich_breakpoint_kinds(value, &breakpoint_kinds);
+    enrich_contract_status(value, &identity, &contracts);
+    enrich_link_status(value, port, token.as_deref(), Some(&identity));
+    enrich_continuity(value, link);
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("protocol_version")
+            .or_insert_with(|| serde_json::json!(link.capabilities().protocol_version));
+    }
+    value["request_succeeded"] = serde_json::json!(true);
+}
 
-    let mut status_value = match status {
+pub(crate) struct ControlObservation {
+    pub(crate) status: serde_json::Value,
+    pub(crate) runtime: RuntimeObservation,
+    pub(crate) disposition: EntryDisposition,
+}
+
+pub(crate) fn observe_control_state(
+    link: &mut dyn EmulatorLink,
+) -> Result<ControlObservation, LinkError> {
+    let port = link.endpoint_port();
+    let token = link.session_token().map(str::to_string);
+    let (mut status, listener, adapter_connected, observation_uncertain) = match tools::status(link)
+    {
         Ok(ToolOutput::Json(mut v)) => {
-            let methods = link.capabilities().methods.clone();
-            let memory_types = link.capabilities().memory_types.clone();
-            let breakpoint_kinds = link.capabilities().breakpoint_kinds.clone();
-            enrich_status_value(&mut v, &methods, &memory_types, identity.system.as_deref());
-            enrich_breakpoint_kinds(&mut v, &breakpoint_kinds);
-            enrich_contract_status(&mut v, &identity, &contracts);
-            enrich_link_status(&mut v, port, token.as_deref(), Some(&identity));
-            enrich_continuity(&mut v, link);
-            v["request_succeeded"] = serde_json::json!(true);
-            v
+            enrich_connected_status(&mut v, link);
+            (v, ListenerState::Bound, true, false)
         }
-        Ok(_) => serde_json::json!({"connected": true}),
+        Ok(_) => {
+            let mut v = serde_json::json!({"connected": true});
+            enrich_continuity(&mut v, link);
+            (v, ListenerState::Bound, true, false)
+        }
         Err(LinkError::NotConnected) => {
             let mut v = serde_json::json!({
                 "connected": false,
                 "listening_port": port,
+                "request_succeeded": false,
             });
             enrich_link_status(&mut v, port, token.as_deref(), None);
             enrich_continuity(&mut v, link);
-            v["request_succeeded"] = serde_json::json!(false);
-            v
+            let listener = if port.is_some() {
+                ListenerState::Bound
+            } else {
+                ListenerState::Unavailable
+            };
+            (v, listener, false, false)
         }
         Err(LinkError::IdentityMismatch { identity, .. }) => {
-            occupied_graceful(&identity, port, token.as_deref())
+            let mut v = occupied_graceful(&identity, port, token.as_deref());
+            enrich_continuity(&mut v, link);
+            (v, ListenerState::Blocked, false, false)
         }
         Err(e) if is_observation_failure(&e) => {
+            let observation_uncertain = matches!(e, LinkError::Timeout | LinkError::Protocol(_));
             let mut v = serde_json::json!({
                 "connected": false,
                 "request_succeeded": false,
@@ -853,53 +810,105 @@ pub(crate) fn make_bootstrap_value(
             });
             enrich_link_status(&mut v, port, token.as_deref(), None);
             enrich_continuity(&mut v, link);
-            v
+            let listener = if matches!(e, LinkError::PortBusy { .. }) {
+                ListenerState::Blocked
+            } else if port.is_some() {
+                ListenerState::Bound
+            } else {
+                ListenerState::Unavailable
+            };
+            (v, listener, false, observation_uncertain)
         }
         Err(e) => return Err(e),
     };
-
-    // Also covers the identity-mismatch branch, whose graceful response is assembled separately.
-    enrich_continuity(&mut status_value, link);
-
-    if let Some(obj) = status_value.as_object_mut() {
-        obj.entry("listening_port")
-            .or_insert_with(|| port.map_or(serde_json::Value::Null, |p| serde_json::json!(p)));
+    let mut runtime = observe_runtime(link, listener, adapter_connected);
+    if observation_uncertain {
+        runtime.control_observation_uncertain = true;
+        runtime.transport = emucap::live::continuity::TransportState::Stalled;
     }
+    let disposition = classify_entry(&runtime);
+    if let Some(object) = status.as_object_mut() {
+        object.insert(
+            "task_entry".into(),
+            serde_json::json!({
+                "state": disposition.state,
+                "reason": disposition.reason,
+                "accepts_new_content": disposition.accepts_new_content(),
+            }),
+        );
+    }
+    Ok(ControlObservation {
+        status,
+        runtime,
+        disposition,
+    })
+}
 
-    let unknown_content_question = unknown_content_question();
-
-    Ok(serde_json::json!({
-        "ok": true,
-        "start_here": true,
-        "first_tool": "bootstrap",
-        "connected": status_value
-            .get("connected")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        "listening_port": port,
-        "status": status_value,
-        "runtime_paths": runtime_paths(port),
-        "supported_systems": supported_systems_value(),
-        "required_user_input_if_content_unknown": required_unknown_content_input(),
-        "question_to_user_if_content_unknown": unknown_content_question.clone(),
-        "workflow": {
-            "unknown_content": {
-                "ask_user": unknown_content_question,
-                "then_call": "launch_plan",
-                "required_args": ["content_path", "system"]
-            },
-            "known_content": {
-                "then_call": "launch_plan",
-                "required_args": ["content_path"],
-                "optional_args": ["system"]
-            },
-            "already_running": {
-                "then_call": "status"
+fn primary_action(disposition: EntryDisposition) -> serde_json::Value {
+    match disposition.state {
+        EntryState::ReadyForContent => serde_json::json!({
+            "kind": "resolve_input",
+            "required_input": ["content_path"],
+            "question_if_missing": unknown_content_question(),
+            "then_call": {
+                "tool": "launch_plan",
+                "arguments_from": ["content_path", "system?"]
             }
+        }),
+        EntryState::InspectFailure => serde_json::json!({
+            "kind": "call_tool",
+            "tool": "get_failure_context",
+            "arguments": {}
+        }),
+        EntryState::RepairRuntimeMetadata
+        | EntryState::InspectExisting
+        | EntryState::ReattachExisting
+        | EntryState::TransitionBlocked => serde_json::json!({
+            "kind": "call_tool",
+            "tool": "status",
+            "arguments": {}
+        }),
+    }
+}
+
+pub(crate) fn make_bootstrap_value(
+    link: &mut dyn EmulatorLink,
+    include_systems: bool,
+    include_installation: bool,
+) -> Result<serde_json::Value, LinkError> {
+    let observation = observe_control_state(link)?;
+    let port = link.endpoint_port();
+    let mut result = serde_json::json!({
+        "listener": {
+            "state": observation.runtime.listener,
+            "port": port,
         },
-        "next_action": "When content_path is known, call launch_plan(content_path, system?). Otherwise ask question_to_user_if_content_unknown verbatim.",
-        "do_not": "Do not infer and execute a runtime_paths command_template when content_path or system is unknown."
-    }))
+        "server_build": BUILD_HASH,
+        "adapter_connection": {
+            "state": observation.runtime.transport,
+        },
+        "entry": {
+            "state": observation.disposition.state,
+            "reason": observation.disposition.reason,
+            "primary_action": primary_action(observation.disposition),
+        },
+        "supported_system_ids": supported_system_ids_value(),
+        "system_catalog_revision": system_catalog_revision(),
+        "optional_details": {
+            "systems": "bootstrap(include=[\"systems\"])",
+            "installation": "bootstrap(include=[\"installation\"])"
+        }
+    });
+    if observation.disposition.reason == EntryReason::TerminalHistory {
+        result["terminal_history_available"] = serde_json::json!(true);
+    }
+    if include_systems {
+        result["supported_systems"] = supported_systems_value();
+    }
+    if include_installation {
+        result["runtime_paths"] = runtime_paths(port);
+    }
+    Ok(result)
 }
 
 pub(crate) fn is_observation_failure(error: &LinkError) -> bool {
@@ -1016,10 +1025,9 @@ pub(crate) fn enrich_link_status(
             "session_token_present": session_token.is_some(),
             "session_token_file": token_file_status(port),
             "mismatch_policy": "hard_fail_on_handshake",
-            "launcher_contract": "Use the MCP launch tool with status.listening_port; legacy adapters/* launchers remain fallback paths and read the token file automatically.",
+            "launcher_contract": "Use the MCP launch tool with status.listening_port. It passes the per-port session token automatically.",
         }),
     );
-    obj.insert("runtime_paths".into(), runtime_paths(port));
     if let Some(port) = port {
         if let Ok(Some(current)) =
             emucap::live::runtime::RuntimeStore::discover().read_current(port)

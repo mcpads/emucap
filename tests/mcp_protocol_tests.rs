@@ -1,10 +1,14 @@
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use emucap::analysis::bisect::{CmpOp, Predicate};
+use emucap::analysis::regression;
+use emucap::live::runtime::{ManifestSpec, RuntimeStore};
 use serde_json::{json, Value};
 
 const MODERN_VERSION: &str = "2026-07-28";
@@ -87,6 +91,103 @@ fn free_port() -> u16 {
         .port()
 }
 
+fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>) {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let observed_calls = calls.clone();
+    let handle = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match TcpStream::connect(("127.0.0.1", port)) {
+                Ok(stream) => break stream,
+                Err(error) if Instant::now() < deadline => {
+                    let _ = error;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("connect fake analysis adapter: {error}"),
+            }
+        };
+        let mut writer = stream.try_clone().expect("clone fake adapter stream");
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        while reader.read_line(&mut line).expect("read control request") != 0 {
+            let request: Value = serde_json::from_str(line.trim()).expect("control request JSON");
+            line.clear();
+            let method = request["method"].as_str().expect("control method");
+            observed_calls.lock().unwrap().push(method.to_string());
+            let result = match method {
+                "hello" => {
+                    let token = request["params"]["session_token"]
+                        .as_str()
+                        .expect("session token");
+                    json!({
+                        "protocol_version": 1,
+                        "methods": [
+                            "status", "reset", "pause", "set_input", "step",
+                            "read_memory", "clear_all_breakpoints", "resume"
+                        ],
+                        "memory_types": ["w"],
+                        "breakpoint_kinds": [],
+                        "system": "test",
+                        "adapter": "analysis-wire-test",
+                        "build": "analysis-wire-test",
+                        "launch_id": "launch-analysis-wire-test",
+                        "session_token": token,
+                        "contracts": {
+                            "catalog": emucap::contracts::CATALOG_ID,
+                            "active_exceptions": []
+                        }
+                    })
+                }
+                "status" => json!({
+                    "connected": true,
+                    "execution": {"state": "frozen"}
+                }),
+                "read_memory" => json!({"hex": "aa"}),
+                _ => json!({}),
+            };
+            let response = json!({
+                "id": request["id"],
+                "ok": true,
+                "result": result
+            });
+            writeln!(writer, "{response}").expect("write control response");
+            writer.flush().expect("flush control response");
+        }
+    });
+    (handle, calls)
+}
+
+fn make_analysis_case() -> (tempfile::TempDir, std::path::PathBuf) {
+    let temporary = tempfile::tempdir().expect("temporary analysis case");
+    let directory = temporary.path().join("wire_case");
+    std::fs::create_dir_all(&directory).expect("create analysis case");
+    std::fs::write(directory.join("inputs.movie"), "0:enter\n").expect("write movie");
+    let case = regression::Case {
+        format_version: regression::CASE_FORMAT_VERSION,
+        id: "wire_case".into(),
+        description: "wire analysis case".into(),
+        rom: regression::RomRef {
+            sha1: "unused".into(),
+            path_hint: "wire.rom".into(),
+        },
+        repro: regression::Repro::InputReplay {
+            start: "reset".into(),
+            movie: "inputs.movie".into(),
+            anchor: None,
+        },
+        predicate: Predicate {
+            memory_type: "w".into(),
+            address: 0,
+            length: 1,
+            op: CmpOp::Eq,
+            value: 0,
+        },
+        expect: regression::Expect::Absent,
+    };
+    regression::save_case(&directory, &case).expect("save analysis case");
+    (temporary, directory)
+}
+
 fn modern_meta(version: &str) -> Value {
     json!({
         "io.modelcontextprotocol/protocolVersion": version,
@@ -109,6 +210,11 @@ fn modern_request(id: u64, method: &str, params: Value) -> Value {
     })
 }
 
+fn control_binary() -> String {
+    std::env::var("EMUCAP_RELEASE_BIN")
+        .unwrap_or_else(|_| env!("CARGO_BIN_EXE_emucap-mcp").to_string())
+}
+
 fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String)]) {
     let mut server = McpProcess::spawn(binary, envs);
     let discover = server.request(modern_request(1, "server/discover", json!({})));
@@ -123,20 +229,46 @@ fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String
     );
     assert_eq!(result["ttlMs"], STATIC_MCP_METADATA_TTL_MS);
     assert_eq!(result["cacheScope"], "public");
+    if expected_name == "emucap-mcp" {
+        assert!(result["capabilities"]["tools"]["listChanged"].is_null());
+        assert!(
+            result["instructions"]
+                .as_str()
+                .is_some_and(|instructions| instructions.len() <= 4 * 1024),
+            "Control Server Instructions must stay within the always-loaded byte budget"
+        );
+    }
 
     let list = server.request(modern_request(2, "tools/list", json!({})));
     let result = &list["result"];
     assert_eq!(result["resultType"], "complete");
     assert_eq!(result["ttlMs"], STATIC_MCP_METADATA_TTL_MS);
     assert_eq!(result["cacheScope"], "public");
-    let names: Vec<&str> = result["tools"]
-        .as_array()
-        .expect("tool list")
+    let tools = result["tools"].as_array().expect("tool list");
+    let names: Vec<&str> = tools
         .iter()
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
     assert!(names.contains(&"bootstrap"));
     assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool["inputSchema"]["additionalProperties"] == false),
+        "every tool must reject undeclared arguments"
+    );
+    if expected_name == "emucap-mcp" {
+        assert!(names.contains(&"analysis"));
+        assert!(!names.contains(&"regression_run"));
+        assert!(!names.contains(&"verify_determinism"));
+        assert!(
+            serde_json::to_vec(result)
+                .expect("serialize tools/list result")
+                .len()
+                <= 36 * 1024,
+            "Control tools/list must stay within the discovery byte budget"
+        );
+    }
 
     let call = server.request(modern_request(
         3,
@@ -147,6 +279,163 @@ fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String
     assert!(call["result"]["content"]
         .as_array()
         .is_some_and(|content| !content.is_empty()));
+    assert!(call["result"]["structuredContent"].is_object());
+
+    if expected_name == "emucap-mcp" {
+        let bootstrap = &call["result"]["structuredContent"];
+        assert!(bootstrap["listener"].is_object());
+        assert!(bootstrap["listener"]["state"].is_string());
+        assert!(bootstrap["listener"]["port"].is_number());
+        assert!(bootstrap["adapter_connection"]["state"].is_string());
+        assert!(bootstrap["entry"]["state"].is_string());
+        assert!(bootstrap["entry"]["reason"].is_string());
+        assert!(bootstrap["entry"]["primary_action"].is_object());
+        assert!(bootstrap["supported_system_ids"].is_array());
+        assert!(bootstrap["system_catalog_revision"].is_string());
+        assert!(bootstrap.get("supported_systems").is_none());
+        assert!(bootstrap.get("runtime_paths").is_none());
+        assert!(bootstrap.get("status").is_none());
+        assert!(bootstrap.get("workflow").is_none());
+        assert!(bootstrap.get("do_not").is_none());
+        assert!(bootstrap.get("ok").is_none());
+        if let Ok(expected_build) = std::env::var("EMUCAP_EXPECT_SERVER_BUILD") {
+            assert_eq!(
+                bootstrap["server_build"], expected_build,
+                "release-wire evaluation must use the committed build requested by the runner"
+            );
+        }
+        assert!(
+            serde_json::to_vec(bootstrap)
+                .expect("serialize compact bootstrap")
+                .len()
+                <= 4 * 1024,
+            "default bootstrap must stay compact"
+        );
+
+        let detailed = server.request(modern_request(
+            10,
+            "tools/call",
+            json!({
+                "name": "bootstrap",
+                "arguments": {"include": ["systems", "installation"]}
+            }),
+        ));
+        let detailed = &detailed["result"]["structuredContent"];
+        assert!(detailed["supported_systems"].is_array());
+        assert!(detailed["runtime_paths"].is_object());
+        assert_eq!(detailed["entry"], bootstrap["entry"]);
+        assert_eq!(detailed["listener"], bootstrap["listener"]);
+        assert!(
+            serde_json::to_vec(detailed)
+                .expect("serialize detailed bootstrap")
+                .len()
+                <= 16 * 1024,
+            "opt-in bootstrap details must remain bounded"
+        );
+    }
+
+    let invalid = server.request(modern_request(
+        4,
+        "tools/call",
+        json!({"name": "bootstrap", "arguments": {"bogus": true}}),
+    ));
+    assert_eq!(invalid["result"]["resultType"], "complete");
+    assert_eq!(invalid["result"]["isError"], true);
+
+    let after_invalid = server.request(modern_request(
+        5,
+        "tools/call",
+        json!({"name": "bootstrap", "arguments": {}}),
+    ));
+    assert_eq!(after_invalid["result"]["resultType"], "complete");
+    assert_ne!(after_invalid["result"]["isError"], true);
+
+    if expected_name == "emucap-mcp" {
+        let launch_failure = server.request(modern_request(
+            6,
+            "tools/call",
+            json!({
+                "name": "launch",
+                "arguments": {
+                    "content_path": "/definitely/missing/emucap-test.sfc",
+                    "system": "snes"
+                }
+            }),
+        ));
+        assert_eq!(launch_failure["result"]["resultType"], "complete");
+        assert_eq!(launch_failure["result"]["isError"], true);
+        assert_eq!(
+            launch_failure["result"]["structuredContent"]["launched"],
+            false
+        );
+
+        let stop_failure = server.request(modern_request(
+            7,
+            "tools/call",
+            json!({
+                "name": "stop",
+                "arguments": {"launch_id": "launch-does-not-exist"}
+            }),
+        ));
+        assert_eq!(stop_failure["result"]["resultType"], "complete");
+        assert_eq!(stop_failure["result"]["isError"], true);
+        assert_eq!(
+            stop_failure["result"]["structuredContent"]["stopped"],
+            false
+        );
+
+        let status = server.request(modern_request(
+            8,
+            "tools/call",
+            json!({"name": "status", "arguments": {}}),
+        ));
+        assert!(status["result"]["structuredContent"]
+            .get("runtime_paths")
+            .is_none());
+        assert_eq!(
+            status["result"]["structuredContent"]["task_entry"]["state"],
+            call["result"]["structuredContent"]["entry"]["state"]
+        );
+        assert_eq!(
+            status["result"]["structuredContent"]["task_entry"]["reason"],
+            call["result"]["structuredContent"]["entry"]["reason"]
+        );
+
+        let plan = server.request(modern_request(
+            9,
+            "tools/call",
+            json!({"name": "launch_plan", "arguments": {}}),
+        ));
+        let plan_body = &plan["result"]["structuredContent"];
+        assert!(plan_body.get("bootstrap").is_none());
+        assert!(plan_body.get("runtime_paths").is_none());
+        assert_eq!(plan_body["next_action"]["kind"], "resolve_input");
+        assert_eq!(
+            plan_body["next_action"]["required_input"],
+            serde_json::json!(["content_path"])
+        );
+        assert_eq!(plan_body["next_action"]["then_call"]["tool"], "launch_plan");
+        assert_eq!(
+            plan_body["next_action"]["then_call"]["arguments_from"],
+            serde_json::json!(["content_path", "system?"])
+        );
+        assert!(
+            serde_json::to_vec(plan_body)
+                .expect("serialize launch plan")
+                .len()
+                <= 2 * 1024,
+            "content-free launch_plan must stay compact"
+        );
+        assert!(plan_body.get("supported_systems").is_none());
+        assert!(plan_body["supported_system_ids"].is_array());
+        assert!(
+            serde_json::to_vec(&status["result"]["structuredContent"])
+                .expect("serialize disconnected status")
+                .len()
+                <= 4 * 1024,
+            "disconnected status must stay within its response byte budget"
+        );
+    }
 }
 
 fn assert_legacy_server(binary: &str, envs: &[(&str, String)]) {
@@ -185,11 +474,207 @@ fn assert_legacy_server(binary: &str, envs: &[(&str, String)]) {
 }
 
 #[test]
+fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() {
+    let port = free_port();
+    let envs = [("EMUCAP_PORT", port.to_string())];
+    let binary = control_binary();
+    let mut server = McpProcess::spawn(&binary, &envs);
+
+    let discover = server.request(modern_request(1, "server/discover", json!({})));
+    assert!(discover["result"]["capabilities"]["tools"]["listChanged"].is_null());
+
+    let initial = server.request(modern_request(2, "tools/list", json!({})));
+    let initial_size = serde_json::to_vec(&initial["result"])
+        .expect("serialize initial Control tools/list")
+        .len();
+    assert!(
+        initial_size < 31_887,
+        "static analysis dispatcher must reduce default discovery below the prior full-schema baseline; got {initial_size} bytes"
+    );
+    let initial_names: Vec<&str> = initial["result"]["tools"]
+        .as_array()
+        .expect("initial tool list")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect();
+    assert!(initial_names.contains(&"analysis"));
+    assert!(!initial_names.contains(&"regression_run"));
+    assert!(!initial_names.contains(&"verify_determinism"));
+    assert_eq!(initial["result"]["ttlMs"], STATIC_MCP_METADATA_TTL_MS);
+    assert_eq!(initial["result"]["cacheScope"], "public");
+
+    let described = server.request(modern_request(
+        3,
+        "tools/call",
+        json!({
+            "name": "analysis",
+            "arguments": {"operation": "describe"}
+        }),
+    ));
+    assert_eq!(
+        described["result"]["structuredContent"]["surface"],
+        "analysis"
+    );
+    assert!(
+        described["result"]["structuredContent"]["operations"]["regression_run"]
+            ["arguments_schema"]
+            .is_object()
+    );
+    assert!(
+        described["result"]["structuredContent"]["operations"]["verify_determinism"]
+            ["arguments_schema"]
+            .is_object()
+    );
+
+    let removed_route = server.request(modern_request(
+        4,
+        "tools/call",
+        json!({
+            "name": "verify_determinism",
+            "arguments": {
+                "case_dir": "/must/not/be/read",
+                "replays": 1
+            }
+        }),
+    ));
+    assert!(removed_route["error"]["message"]
+        .as_str()
+        .is_some_and(|text| text.contains("not found")));
+
+    let invalid = server.request(modern_request(
+        6,
+        "tools/call",
+        json!({
+            "name": "analysis",
+            "arguments": {
+                "operation": "verify_determinism",
+                "arguments": {"bogus": true}
+            }
+        }),
+    ));
+    assert_eq!(invalid["result"]["isError"], true);
+    assert!(invalid["result"]["content"][0]["text"]
+        .as_str()
+        .is_some_and(|text| text.contains("invalid verify_determinism arguments")));
+
+    let (_temporary, case_dir) = make_analysis_case();
+    let (adapter, calls) = spawn_analysis_adapter(port);
+    let verdict = server.request(modern_request(
+        7,
+        "tools/call",
+        json!({
+            "name": "analysis",
+            "arguments": {
+                "operation": "verify_determinism",
+                "arguments": {
+                    "case_dir": case_dir,
+                    "observe": "memory",
+                    "memory_type": "w",
+                    "address": 0,
+                    "length": 1,
+                    "replays": 2
+                }
+            }
+        }),
+    ));
+    assert_ne!(verdict["result"]["isError"], true);
+    assert_eq!(
+        verdict["result"]["structuredContent"]["outcome"],
+        "reproducible"
+    );
+    assert_eq!(verdict["result"]["structuredContent"]["passed"], true);
+    assert_eq!(
+        verdict["result"]["structuredContent"]["hashes"]
+            .as_array()
+            .expect("observation hashes")
+            .len(),
+        2
+    );
+
+    drop(server);
+    adapter.join().expect("join fake analysis adapter");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.last().map(String::as_str), Some("resume"));
+    assert_eq!(
+        calls
+            .windows(3)
+            .filter(|window| { window == &["set_input", "clear_all_breakpoints", "pause"] })
+            .count(),
+        2,
+        "each replay must use the shared terminal cleanup path"
+    );
+}
+
+#[test]
 fn control_mcp_supports_modern_and_legacy_lifecycles() {
     let port = free_port().to_string();
     let envs = [("EMUCAP_PORT", port.clone())];
-    assert_modern_server(env!("CARGO_BIN_EXE_emucap-mcp"), "emucap-mcp", &envs);
-    assert_legacy_server(env!("CARGO_BIN_EXE_emucap-mcp"), &envs);
+    let binary = control_binary();
+    assert_modern_server(&binary, "emucap-mcp", &envs);
+    assert_legacy_server(&binary, &envs);
+}
+
+#[test]
+fn bootstrap_redacts_terminal_content_until_status_is_requested() {
+    let root = tempfile::tempdir().expect("temporary emulator home");
+    let port = free_port();
+    let store = RuntimeStore::new(root.path().join("sessions"));
+    let prepared = store.prepare(port).expect("prepare terminal generation");
+    let secret_content = root.path().join("private/previous-game.sfc");
+    let mut exited_process = Command::new("/usr/bin/true")
+        .spawn()
+        .expect("spawn short-lived process");
+    let exited_pid = exited_process.id();
+    exited_process.wait().expect("wait for short-lived process");
+    let manifest = prepared.manifest(ManifestSpec {
+        adapter: "mesen2".into(),
+        system: "snes".into(),
+        content: secret_content.to_string_lossy().into_owned(),
+        emulator_pid: exited_pid,
+        bridge_pid: None,
+        backend_endpoint: None,
+        build: Some("test-build".into()),
+    });
+    prepared
+        .commit(&manifest)
+        .expect("commit terminal generation");
+
+    let envs = [
+        ("EMUCAP_PORT", port.to_string()),
+        (
+            "EMUCAP_EMU_HOME",
+            root.path().to_string_lossy().into_owned(),
+        ),
+    ];
+    let mut server = McpProcess::spawn(env!("CARGO_BIN_EXE_emucap-mcp"), &envs);
+    let bootstrap = server.request(modern_request(
+        1,
+        "tools/call",
+        json!({"name": "bootstrap", "arguments": {}}),
+    ));
+    let body = &bootstrap["result"]["structuredContent"];
+    assert_eq!(body["entry"]["state"], "ready_for_content");
+    assert_eq!(body["entry"]["reason"], "terminal_history");
+    assert_eq!(body["terminal_history_available"], true);
+    assert!(
+        !body
+            .to_string()
+            .contains(secret_content.to_string_lossy().as_ref()),
+        "default bootstrap must not expose a prior content path"
+    );
+
+    let status = server.request(modern_request(
+        2,
+        "tools/call",
+        json!({"name": "status", "arguments": {}}),
+    ));
+    let status = &status["result"]["structuredContent"];
+    assert_eq!(status["task_entry"]["state"], body["entry"]["state"]);
+    assert_eq!(status["task_entry"]["reason"], body["entry"]["reason"]);
+    assert_eq!(
+        status["runtime_instance"]["content"],
+        secret_content.to_string_lossy().as_ref()
+    );
 }
 
 #[test]

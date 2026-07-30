@@ -1,10 +1,11 @@
+//! Contract tests for the live regression and determinism executor.
 use super::*;
-use emucap::track::observe::ObserveSpec;
+use crate::track::observe::ObserveSpec;
 
 /// 결정론 재현 판정 구동기 테스트용 목. read_memory/screenshot 응답을 큐에서 순서대로
 /// 돌려줘 "재생마다 다른 관측치"를 흉내낼 수 있다. probe도 큐로.
 pub(crate) struct DetReplayLink {
-    caps: emucap::live::link::Capabilities,
+    caps: crate::live::link::Capabilities,
     obs_queue: std::collections::VecDeque<&'static str>, // read_memory hex
     probe_queue: std::collections::VecDeque<&'static str>,
     poll_events: std::collections::VecDeque<serde_json::Value>,
@@ -15,13 +16,13 @@ pub(crate) struct DetReplayLink {
 impl DetReplayLink {
     pub(crate) fn new(methods: &[&str]) -> Self {
         Self {
-            caps: emucap::live::link::Capabilities {
+            caps: crate::live::link::Capabilities {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
                 breakpoint_kinds: vec![],
-                contracts: emucap::contracts::ContractAdvertisement::Unreported,
-                identity: emucap::live::link::EmulatorIdentity::default(),
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
+                identity: crate::live::link::EmulatorIdentity::default(),
             },
             obs_queue: std::collections::VecDeque::new(),
             probe_queue: std::collections::VecDeque::new(),
@@ -45,7 +46,7 @@ impl DetReplayLink {
     }
 }
 impl EmulatorLink for DetReplayLink {
-    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+    fn capabilities(&self) -> &crate::live::link::Capabilities {
         &self.caps
     }
     fn call(
@@ -346,7 +347,7 @@ fn default_session_port_does_not_wrap() {
 
 #[test]
 fn validate_movie_frames_rejects_absurd_and_nonmonotonic() {
-    use emucap::analysis::regression::{Movie, MovieFrame};
+    use crate::analysis::regression::{Movie, MovieFrame};
     let absurd = Movie {
         frames: vec![MovieFrame {
             frame: 5_000_000,
@@ -406,21 +407,21 @@ fn validate_movie_frames_rejects_absurd_and_nonmonotonic() {
 }
 
 struct LazyNoProbe {
-    caps: emucap::live::link::Capabilities,
+    caps: crate::live::link::Capabilities,
     calls: Vec<String>,
 }
 
 impl LazyNoProbe {
     fn new() -> Self {
         Self {
-            caps: emucap::live::link::Capabilities::empty(),
+            caps: crate::live::link::Capabilities::empty(),
             calls: Vec::new(),
         }
     }
 }
 
 impl EmulatorLink for LazyNoProbe {
-    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+    fn capabilities(&self) -> &crate::live::link::Capabilities {
         &self.caps
     }
 
@@ -472,26 +473,28 @@ fn savestate_regression_without_probe_is_unsupported_after_capability_load() {
 }
 
 struct Pc98InputReplayLink {
-    caps: emucap::live::link::Capabilities,
+    caps: crate::live::link::Capabilities,
     calls: Vec<String>,
     read_hex: &'static str,
     state_restore: Option<serde_json::Value>,
     poll_events: Vec<serde_json::Value>,
     fail_call: Option<usize>,
+    generation_change_call: Option<usize>,
 }
 
 impl Pc98InputReplayLink {
     fn new(methods: &[&str], read_hex: &'static str) -> Self {
         Self {
-            caps: emucap::live::link::Capabilities {
+            caps: crate::live::link::Capabilities {
                 protocol_version: 1,
                 methods: methods.iter().map(|m| (*m).to_string()).collect(),
                 memory_types: vec![],
                 breakpoint_kinds: vec![],
-                contracts: emucap::contracts::ContractAdvertisement::Unreported,
-                identity: emucap::live::link::EmulatorIdentity {
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
+                identity: crate::live::link::EmulatorIdentity {
                     system: Some("pc98".into()),
                     adapter: Some("mame-pc98-gdb".into()),
+                    launch_id: Some("launch-a".into()),
                     ..Default::default()
                 },
             },
@@ -500,6 +503,7 @@ impl Pc98InputReplayLink {
             state_restore: None,
             poll_events: Vec::new(),
             fail_call: None,
+            generation_change_call: None,
         }
     }
 
@@ -517,10 +521,15 @@ impl Pc98InputReplayLink {
         self.fail_call = Some(call);
         self
     }
+
+    fn with_generation_change_on(mut self, call: usize) -> Self {
+        self.generation_change_call = Some(call);
+        self
+    }
 }
 
 impl EmulatorLink for Pc98InputReplayLink {
-    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+    fn capabilities(&self) -> &crate::live::link::Capabilities {
         &self.caps
     }
 
@@ -532,6 +541,9 @@ impl EmulatorLink for Pc98InputReplayLink {
         self.calls.push(method.to_string());
         if self.fail_call == Some(self.calls.len()) {
             return Err(LinkError::Timeout);
+        }
+        if self.generation_change_call == Some(self.calls.len()) {
+            self.caps.identity.launch_id = Some("launch-b".into());
         }
         match method {
             "reset"
@@ -847,6 +859,34 @@ fn input_replay_cleanup_failure_is_fail_loud_and_attempts_remaining_cleanup() {
     assert_eq!(
         &link.calls[link.calls.len() - 3..],
         &["set_input", "clear_all_breakpoints", "pause"]
+    );
+}
+
+#[test]
+fn input_replay_generation_change_rejects_cleanup_against_the_new_generation() {
+    let (_tmp, case_dir, case) = input_replay_case();
+    let mut link = Pc98InputReplayLink::new(
+        &[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+        ],
+        "01",
+    )
+    .with_generation_change_on(4);
+
+    let verdict = run_one_case(&mut link, &case_dir, &case);
+    assert!(
+        matches!(verdict, regression::Verdict::ReproError(ref error) if error.contains("launch generation changed")),
+        "a generation change must invalidate the replay: {verdict:?}"
+    );
+    assert_eq!(
+        link.calls.last().map(String::as_str),
+        Some("read_memory"),
+        "cleanup must not mutate the replacement generation"
     );
 }
 

@@ -5,6 +5,7 @@ pub mod link;
 pub mod protocol;
 pub mod reconnect;
 pub mod runtime;
+pub mod task_entry;
 pub mod tcp;
 pub mod temporal;
 pub mod tools;
@@ -17,6 +18,8 @@ mod broker_tests;
 mod link_tests;
 #[cfg(test)]
 mod protocol_tests;
+#[cfg(test)]
+mod task_entry_tests;
 #[cfg(test)]
 mod tcp_tests;
 #[cfg(test)]

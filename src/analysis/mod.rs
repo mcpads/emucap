@@ -1,6 +1,7 @@
 pub mod bisect;
 pub mod diff;
 pub mod dump;
+pub mod live_regression;
 pub mod regression;
 pub mod state_diff;
 

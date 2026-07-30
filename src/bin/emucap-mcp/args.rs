@@ -68,7 +68,45 @@ impl JsonSchema for Num {
 #[path = "args_tests.rs"]
 mod tests;
 
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EmptyArgs {}
+
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BootstrapDetail {
+    /// Include the full system routing catalog. The default response contains
+    /// only system identifiers and a catalog revision.
+    Systems,
+    /// Include build and runtime installation paths.
+    Installation,
+}
+
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BootstrapArgs {
+    /// Optional detail sections. Omit for the compact task-entry response.
+    #[serde(default)]
+    pub(crate) include: Vec<BootstrapDetail>,
+}
+
+impl BootstrapArgs {
+    pub(crate) fn includes(&self, detail: BootstrapDetail) -> bool {
+        self.include.contains(&detail)
+    }
+}
+
+#[derive(Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StatusArgs {
+    /// Revision returned by a previous full status. When it still matches, the
+    /// response omits the unchanged capability catalog but retains live state.
+    #[serde(default)]
+    pub(crate) known_capability_revision: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadMemoryArgs {
     /// Memory-type identifier. Read valid names from `status.memory_types`; see
     /// the corresponding adapter README for system-specific meanings.
@@ -80,6 +118,7 @@ pub(crate) struct ReadMemoryArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ProbeArgs {
     /// Base savestate path. The adapter loads it, advances by `frame`, and reads
     /// the target memory.
@@ -97,6 +136,7 @@ pub(crate) struct ProbeArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct DisassembleArgs {
     /// Start address for disassembly. Check `status.methods` and the adapter
     /// README for CPU, ISA, and support details. Returns [{addr,text,bytes}].
@@ -113,6 +153,7 @@ fn default_disas_count() -> u64 {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WriteMemoryFileArgs {
     /// Absolute path to a raw binary file read by Control MCP, not the adapter.
     pub(crate) path: String,
@@ -129,6 +170,7 @@ pub(crate) struct WriteMemoryFileArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WriteMemoryArgs {
     pub(crate) memory_type: String,
     /// Start address within the selected memory type.
@@ -142,6 +184,7 @@ pub(crate) struct WriteMemoryArgs {
     pub(crate) input_file: Option<WriteMemoryFileArgs>,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FindPatternArgs {
     /// Memory type to search, using the same identifier as read_memory. Prefer a
     /// linear region such as work RAM, VRAM, CRAM, or text RAM.
@@ -170,12 +213,14 @@ fn default_max_matches() -> u64 {
     256
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InputArgs {
     #[serde(default)]
     pub(crate) port: u64,
     pub(crate) buttons: Vec<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PressArgs {
     #[serde(default)]
     pub(crate) port: u64,
@@ -187,6 +232,7 @@ pub(crate) struct PressArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TouchArgs {
     #[serde(default)]
     pub(crate) port: u64,
@@ -209,6 +255,7 @@ fn two() -> u64 {
     2
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TapArgs {
     #[serde(default)]
     pub(crate) port: u64,
@@ -223,6 +270,7 @@ pub(crate) struct TapArgs {
     pub(crate) after_frames: u64,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct HoldUntilArgs {
     #[serde(default)]
     pub(crate) port: u64,
@@ -241,6 +289,7 @@ fn three_hundred() -> u64 {
     300
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PathArgs {
     pub(crate) path: String,
 }
@@ -280,6 +329,7 @@ fn deser_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RunFramesArgs {
     #[serde(deserialize_with = "deser_frame_count")]
     pub(crate) n: u64,
@@ -288,6 +338,7 @@ fn one() -> u64 {
     1
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StepArgs {
     /// Number of units to advance. The legacy input name `frames` is accepted
     /// for compatibility.
@@ -308,6 +359,7 @@ pub(crate) struct StepArgs {
 }
 /// CPU selection for pause and resume.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CpuArgs {
     /// Target CPU for a multi-core backend. NDS accepts `arm9` (default), `arm7`,
     /// and `both` for resume. Single-core backends ignore this field.
@@ -315,6 +367,7 @@ pub(crate) struct CpuArgs {
     pub(crate) cpu: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BreakpointArgs {
     /// Breakpoint kind. Read allowed values and their address units,
     /// memory_type use, and snapshot support from `status.breakpoint_kinds`.
@@ -359,6 +412,7 @@ pub(crate) struct BreakpointArgs {
     pub(crate) snapshot: Vec<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct WatchRegisterArgs {
     /// Register to watch, using a get_state `cpu.*` name such as sp, pc, k, a, x,
     /// y, ps, d, or dbr. Default: sp.
@@ -390,11 +444,13 @@ fn default_true() -> bool {
     true
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SetTraceArgs {
     /// Enable or disable execution tracing.
     pub(crate) enabled: bool,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct GetTraceArgs {
     /// Number of recent instructions to return. Maximum: 256.
     #[serde(default = "two_fifty_six")]
@@ -407,22 +463,26 @@ fn two_fifty_six() -> u64 {
     256
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PollEventsArgs {
     /// Write JSON results to this path and return a summary. Omit for inline results.
     #[serde(default)]
     pub(crate) output_path: Option<String>,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct BreakOnResetArgs {
     /// Enable or disable reset-handler detection.
     pub(crate) enabled: bool,
 }
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ClearBpArgs {
     pub(crate) id: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ScreenshotArgs {
     /// Also save the PNG to this path when specified.
     #[serde(default)]
@@ -430,6 +490,7 @@ pub(crate) struct ScreenshotArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StateArgs {
     /// State groups to return, such as cpu, ppu, dmaController, spc,
     /// internalRegisters, or memoryManager. Omit for all groups.
@@ -442,6 +503,7 @@ pub(crate) struct StateArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResolveTileArgs {
     /// NBG layer number from 0 through 3. Rotational RBG layers are unsupported.
     pub(crate) nbg: u32,
@@ -452,6 +514,7 @@ pub(crate) struct ResolveTileArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SetLayerEnableArgs {
     /// Case-insensitive layer names to enable; all omitted layers are disabled.
     /// Read names from the response's `layer_names`, or query by omitting both
@@ -465,24 +528,47 @@ pub(crate) struct SetLayerEnableArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RegressionRunArgs {
     /// Regression suite directory containing case subdirectories.
     pub(crate) suite_dir: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AnalysisOperation {
+    Describe,
+    RegressionRun,
+    VerifyDeterminism,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AnalysisArgs {
+    /// Use describe first to load the operation-specific schemas, then select
+    /// regression_run or verify_determinism.
+    pub(crate) operation: AnalysisOperation,
+    /// Operation-specific arguments returned by operation=describe. Omit for
+    /// describe.
+    #[serde(default)]
+    pub(crate) arguments: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaunchPlanArgs {
     /// ROM, disc, or disk path to launch. Omit when unknown and use the returned
-    /// supported_systems and required_user_input fields.
+    /// system identifiers and required_user_input fields.
     #[serde(default)]
     pub(crate) content_path: Option<String>,
     /// Explicit system identifier. Provide it for ambiguous media such as CUE,
-    /// CHD, or BIN. Use bootstrap.supported_systems for accepted values.
+    /// CHD, or BIN. Use bootstrap(include=["systems"]) for the full catalog.
     #[serde(default)]
     pub(crate) system: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LaunchArgs {
     /// Required ROM, disc, or disk path. launch performs execution, not planning.
     pub(crate) content_path: String,
@@ -516,6 +602,7 @@ pub(crate) struct LaunchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct StopArgs {
     /// Exact current launch generation to terminate. Read it from
     /// `status.runtime_instance.launch_id`; a stale or different generation is
@@ -524,6 +611,7 @@ pub(crate) struct StopArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct VerifyDeterminismArgs {
     /// Regression case directory containing case.json and movie or savestate
     /// data. Uses reproduction and ROM fields; ignores the predicate.
