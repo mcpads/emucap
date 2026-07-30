@@ -138,7 +138,7 @@ impl Mupen64PlusHost {
         let remove_result = fs::remove_file(path);
         let (width, height) = png_dimensions(&data)?;
         remove_result?;
-        let sha256 = format!("{:x}", Sha256::digest(&data));
+        let sha256 = hex::encode(Sha256::digest(&data));
         Ok(json!({
             "png_base64": base64::engine::general_purpose::STANDARD.encode(&data),
             "sha256": sha256,
@@ -195,7 +195,7 @@ impl Mupen64PlusHost {
                 "path": path.display().to_string(),
                 "format": "mupen64plus-native",
                 "bytes": data.len(),
-                "sha256": format!("{:x}", Sha256::digest(&data)),
+                "sha256": hex::encode(Sha256::digest(&data)),
                 "state": "frozen",
                 "frame_before": frame_before,
                 "frame": stepped["frame"],

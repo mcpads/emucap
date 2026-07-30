@@ -66,7 +66,7 @@ impl<G: GdbTransport> Bridge<G> {
             hasher.update(&data);
             Ok(json!({
                 "png_base64": base64::engine::general_purpose::STANDARD.encode(&data),
-                "sha256": format!("{:x}", hasher.finalize()),
+                "sha256": hex::encode(hasher.finalize()),
                 "byte_len": data.len(),
                 "state": state,
                 "frame_before": frame_before,

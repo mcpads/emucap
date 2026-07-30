@@ -164,12 +164,12 @@ pub fn graph_identity(cue: &Path) -> io::Result<CueGraphIdentity> {
             declared_name: input.declared_name,
             path: canonical,
             size,
-            sha1: format!("{:x}", file_hasher.finalize()),
+            sha1: hex::encode(file_hasher.finalize()),
         });
     }
 
     Ok(CueGraphIdentity {
-        sha1: format!("{:x}", graph_hasher.finalize()),
+        sha1: hex::encode(graph_hasher.finalize()),
         size: total_size,
         files,
     })

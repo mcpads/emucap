@@ -435,7 +435,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                     "adapter": "mame-neogeo-rust-gdb",
                     "name": content.file_name().and_then(|v| v.to_str()).unwrap_or(""),
                     "path": content.canonicalize()?.display().to_string(),
-                    "sha1": format!("{:x}", hasher.finalize()),
+                    "sha1": hex::encode(hasher.finalize()),
                     "size": size,
                     "media_type": content.extension().and_then(|v| v.to_str()).unwrap_or("").to_ascii_lowercase(),
                 }))
@@ -522,7 +522,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 "path": path.display().to_string(),
                 "format": "mame-native",
                 "bytes": data.len(),
-                "sha256": format!("{:x}", hasher.finalize()),
+                "sha256": hex::encode(hasher.finalize()),
                 "state": "frozen",
                 "frame": self.current_frame()?,
             }))
@@ -783,7 +783,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             Sha2Digest::update(&mut hasher, &data);
             Ok(json!({
                 "png_base64": base64::engine::general_purpose::STANDARD.encode(&data),
-                "sha256": format!("{:x}", hasher.finalize()),
+                "sha256": hex::encode(hasher.finalize()),
                 "byte_len": data.len(),
                 "frame_before": frame_before,
                 "frame_after": frame_after,

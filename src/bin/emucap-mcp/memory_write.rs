@@ -149,7 +149,7 @@ fn normalize_sha256(value: &str) -> Result<String, LinkError> {
 }
 
 fn prepared(bytes: Vec<u8>, source_kind: &'static str) -> PreparedWrite {
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let sha256 = hex::encode(Sha256::digest(&bytes));
     PreparedWrite {
         bytes,
         source_kind,

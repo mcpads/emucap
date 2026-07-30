@@ -1,6 +1,6 @@
 use emucap::live::link::LinkError;
 use emucap::live::tools::ToolOutput;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock as Content};
 
 /// 분석 verb의 문자열 에러를 CallToolResult로(verify_determinism의 인자 검증용).
 pub(crate) fn track_err(msg: impl std::fmt::Display) -> CallToolResult {

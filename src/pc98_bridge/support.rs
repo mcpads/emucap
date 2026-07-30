@@ -866,7 +866,7 @@ pub(super) fn sha1_file(path: &Path) -> std::io::Result<String> {
         }
         h.update(&buf[..n]);
     }
-    Ok(format!("{:x}", h.finalize()))
+    Ok(hex::encode(h.finalize()))
 }
 
 pub(super) fn absolute_display(path: &Path) -> String {

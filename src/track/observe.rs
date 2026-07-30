@@ -49,7 +49,7 @@ impl std::fmt::Display for ObserveError {
 pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
-    format!("{:x}", h.finalize())
+    hex::encode(h.finalize())
 }
 
 fn has(link: &dyn EmulatorLink, m: &str) -> bool {

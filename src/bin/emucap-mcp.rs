@@ -7,7 +7,9 @@ use emucap::live::link::{EmulatorLink, LinkError};
 use emucap::live::tcp;
 use emucap::live::tools::{self, ToolOutput};
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerInfo,
+};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 #[path = "emucap-mcp/args.rs"]
@@ -44,6 +46,8 @@ use crate::status::{
     normalize_rom_sha1,
 };
 use crate::stop::make_stop;
+
+const STATIC_MCP_METADATA_TTL_MS: u64 = 3_600_000;
 
 type SharedLink = Arc<Mutex<dyn EmulatorLink + Send>>;
 
@@ -801,6 +805,30 @@ impl ServerHandler for Emucap {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("emucap-mcp", env!("CARGO_PKG_VERSION")))
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn discover(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, rmcp::ErrorData> {
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(STATIC_MCP_METADATA_TTL_MS)
+        .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        Ok(
+            rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all())
+                .with_ttl_ms(STATIC_MCP_METADATA_TTL_MS)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
+        )
     }
 }
 

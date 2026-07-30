@@ -201,7 +201,7 @@ fn firmware_inventory_uses_content_identity_and_canonical_staging_name() {
     let source = temp.path().join("nested/arbitrary-name.bin");
     std::fs::create_dir_all(source.parent().unwrap()).unwrap();
     std::fs::write(&source, b"firmware-fixture").unwrap();
-    let sha1 = format!("{:x}", Sha1::digest(b"firmware-fixture"));
+    let sha1 = hex::encode(Sha1::digest(b"firmware-fixture"));
     let requirement = FirmwareRequirement {
         canonical_name: "canonical.rom",
         accepted_sha1: vec![sha1.clone()],
@@ -223,8 +223,8 @@ fn firmware_inventory_rejects_two_different_accepted_images() {
     let requirement = FirmwareRequirement {
         canonical_name: "machine.rom",
         accepted_sha1: vec![
-            format!("{:x}", Sha1::digest(b"one")),
-            format!("{:x}", Sha1::digest(b"two")),
+            hex::encode(Sha1::digest(b"one")),
+            hex::encode(Sha1::digest(b"two")),
         ],
     };
     let error = resolve_firmware_inventory(temp.path(), &[requirement]).unwrap_err();

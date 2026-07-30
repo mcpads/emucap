@@ -221,7 +221,7 @@ pub fn log_artifact(
         }
         hasher.update(&buf[..n]);
     }
-    let sha256 = format!("{:x}", hasher.finalize());
+    let sha256 = hex::encode(hasher.finalize());
 
     let run_dir = store::run_dir(root, rom_sha1, run_id);
     // 저장 경로 우선순위: run_dir 상대 > repo(track root의 부모=git root) 상대 > 절대(repo 밖만).

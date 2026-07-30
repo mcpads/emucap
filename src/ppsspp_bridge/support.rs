@@ -245,7 +245,7 @@ pub(super) fn sha1_file(path: &Path) -> std::io::Result<String> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(hex::encode(hasher.finalize()))
 }
 
 pub(super) fn absolute_display(path: &Path) -> String {

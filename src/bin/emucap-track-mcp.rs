@@ -9,10 +9,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
-use rmcp::model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock as Content, Implementation, ServerCapabilities, ServerInfo,
+};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use schemars::JsonSchema;
 use serde::Deserialize;
+
+const STATIC_MCP_METADATA_TTL_MS: u64 = 3_600_000;
 
 /// 추적 서버 상태 — link 없음(emulator-less). active_run만 in-memory로 들고, 원장 쓰기는
 /// 모두 이 한 프로세스 안에서 직렬화된다(run.json RMW 동시성이 한 프로세스에 갇힘).
@@ -726,6 +730,30 @@ impl ServerHandler for EmucapTrack {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(SERVER_INSTRUCTIONS)
+    }
+
+    async fn discover(
+        &self,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::DiscoverResult, rmcp::ErrorData> {
+        Ok(rmcp::model::DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(STATIC_MCP_METADATA_TTL_MS)
+        .with_cache_scope(rmcp::model::CacheScope::Public))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        Ok(
+            rmcp::model::ListToolsResult::with_all_items(self.tool_router.list_all())
+                .with_ttl_ms(STATIC_MCP_METADATA_TTL_MS)
+                .with_cache_scope(rmcp::model::CacheScope::Public),
+        )
     }
 }
 

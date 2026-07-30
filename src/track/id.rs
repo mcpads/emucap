@@ -7,6 +7,6 @@ pub struct UlidGen;
 
 impl IdGen for UlidGen {
     fn new_id(&self) -> String {
-        ulid::Ulid::new().to_string()
+        ulid::Ulid::generate().to_string()
     }
 }

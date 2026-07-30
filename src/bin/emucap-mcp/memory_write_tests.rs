@@ -53,7 +53,7 @@ async fn file_slice_is_snapshotted_and_expected_hash_is_checked() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("payload.bin");
     std::fs::write(&path, [0, 1, 2, 3, 4]).unwrap();
-    let expected = format!("{:x}", Sha256::digest([1, 2, 3]));
+    let expected = hex::encode(Sha256::digest([1, 2, 3]));
     let input = args(
         None,
         Some(file_args(&path, 1, 3, Some(expected.to_uppercase()))),

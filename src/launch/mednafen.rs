@@ -53,7 +53,7 @@ pub fn resolve_pcfx_bios() -> std::io::Result<PathBuf> {
             ),
         ));
     }
-    let actual = format!("{:x}", Sha256::digest(&bytes));
+    let actual = hex::encode(Sha256::digest(&bytes));
     if actual != PCFX_BIOS_SHA256 {
         return Err(Error::new(
             ErrorKind::InvalidData,
