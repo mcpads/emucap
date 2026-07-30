@@ -2,6 +2,39 @@
 
 Actively developed beta software — interfaces may still change.
 
+## Unreleased
+
+### Changed
+- Consolidated Control and Tracking tool responses on one structured-result path. JSON tools now
+  expose machine-readable structured content, all argument objects reject unknown fields, and an
+  explicit `launched: false` or `stopped: false` is also an MCP tool error without losing its
+  diagnostic payload.
+- Reduced discovery duplication: compact `bootstrap` returns system IDs and a catalog revision,
+  while full system and installation detail is opt-in; `launch_plan` no longer repeats the system
+  catalog. Full `status` returns a capability revision so repeated checks can omit an unchanged
+  catalog while preserving current execution, continuity, generation, and ownership state.
+  Executable legacy-launch aliases and command templates are no longer advertised.
+- Replaced the platform-heavy Control server instructions with common lifecycle, timing, memory,
+  input-ownership, breakpoint-evidence, and reproduction rules. Adapter-specific exceptions remain
+  runtime-negotiated.
+- Consolidated live regression and reproducibility analysis behind one static `analysis` tool.
+  `operation="describe"` returns the detailed operation schemas only when requested; execution
+  stays in the current Control session and preserves verdict, generation, and cleanup contracts.
+- Mesen advertises only memory regions belonging to the active system, derives each live boundary
+  from the host-reported memory size, and applies one finite-range validator to memory access,
+  search, probe, breakpoint ranges, and hit-time snapshots.
+
+### Fixed
+- Mesen launch identity now distinguishes the emucap server build from the pinned host build, and
+  direct launcher dirty detection includes untracked production Lua modules.
+- Mesen, Mednafen, and Flycast reject empty memory writes before mutation; Mesen also rejects
+  cross-region access before calling the host.
+- Identity-mismatch errors no longer include raw expected or received session tokens.
+
+### Removed
+- Removed the direct `regression_run` and `verify_determinism` MCP tool routes. Their operations
+  remain available through `analysis`.
+
 ## 0.12.0-alpha.1
 
 ### Added
