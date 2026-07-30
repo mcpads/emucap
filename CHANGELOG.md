@@ -4,7 +4,7 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
-## 0.12.0-rc.1
+## 0.12.0
 
 ### Changed
 - Consolidated Control and Tracking tool responses on one structured-result path. JSON tools now
