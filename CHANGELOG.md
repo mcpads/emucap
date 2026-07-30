@@ -4,6 +4,8 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.12.0-rc.1
+
 ### Changed
 - Consolidated Control and Tracking tool responses on one structured-result path. JSON tools now
   expose machine-readable structured content, all argument objects reject unknown fields, and an
@@ -27,8 +29,12 @@ Actively developed beta software — interfaces may still change.
 ### Fixed
 - Mesen launch identity now distinguishes the emucap server build from the pinned host build, and
   direct launcher dirty detection includes untracked production Lua modules.
+- Mesen fallback launchers refuse to replace a live process from the same managed portable
+  directory and never signal a foreign or PID-reused process based only on a stale pidfile.
 - Mesen, Mednafen, and Flycast reject empty memory writes before mutation; Mesen also rejects
   cross-region access before calling the host.
+- Control and Tracking reject malformed, metadata-free, or oversized initial stdio messages
+  without terminating the MCP process, and accept a subsequent valid discovery or initialization.
 - Identity-mismatch errors no longer include raw expected or received session tokens.
 
 ### Removed
