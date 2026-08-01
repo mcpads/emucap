@@ -4,6 +4,13 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.12.1
+
+### Fixed
+- A malformed, unreadable, or oversized `adapter-failure.json` now degrades exact crash evidence
+  without blocking a new emulator generation when the ownership, process, and lease records still
+  prove that the transition is safe. Corrupt ownership metadata remains fail-closed.
+
 ## 0.12.0
 
 ### Changed

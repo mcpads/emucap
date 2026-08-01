@@ -434,6 +434,7 @@ fn corrupt_current_manifest_is_reported_as_runtime_diagnostic() {
     assert_eq!(diagnostic.artifact, "current");
     assert_eq!(diagnostic.kind, "invalid");
     assert_eq!(diagnostic.path, path.display().to_string());
+    assert!(diagnostic.blocks_generation_transition);
     assert!(link.failure_context()["adapter_failure"].is_null());
 }
 
@@ -477,12 +478,33 @@ fn oversized_adapter_failure_is_diagnostic_not_exact_evidence() {
     assert_ne!(snapshot.execution.state, ExecutionState::Crashed);
     assert_eq!(snapshot.runtime_diagnostics[0].artifact, "adapter_failure");
     assert_eq!(snapshot.runtime_diagnostics[0].kind, "oversized");
+    assert!(!snapshot.runtime_diagnostics[0].blocks_generation_transition);
     let context = link.failure_context();
     assert!(context["adapter_failure"].is_null());
     assert_eq!(
         context["continuity"]["runtime_diagnostics"][0]["path"],
         path.display().to_string()
     );
+}
+
+#[test]
+fn malformed_adapter_failure_is_nonblocking_degraded_evidence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47835);
+    let path = store.adapter_failure_path(47835, &current.launch_id);
+    std::fs::write(&path, b"{not-json").unwrap();
+    let inner = SequenceLink::new(47835, &current.launch_id, []);
+    let mut link = ObservedLink::with_store(inner, store);
+
+    let snapshot = link.continuity();
+    assert_ne!(snapshot.evidence.state, EvidenceState::Exact);
+    assert_ne!(snapshot.execution.state, ExecutionState::Crashed);
+    assert_eq!(snapshot.runtime_diagnostics.len(), 1);
+    assert_eq!(snapshot.runtime_diagnostics[0].artifact, "adapter_failure");
+    assert_eq!(snapshot.runtime_diagnostics[0].kind, "invalid");
+    assert!(!snapshot.runtime_diagnostics[0].blocks_generation_transition);
+    assert!(link.failure_context()["adapter_failure"].is_null());
 }
 
 #[test]

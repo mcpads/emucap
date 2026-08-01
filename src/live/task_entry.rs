@@ -86,7 +86,10 @@ pub fn observe_runtime(
         adapter_connected,
         control_observation_uncertain: false,
         failure_context_available: continuity.evidence.failure_context_available,
-        runtime_metadata_valid: continuity.runtime_diagnostics.is_empty(),
+        runtime_metadata_valid: !continuity
+            .runtime_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.blocks_generation_transition),
         runtime_candidate_count: link.runtime_candidates().len(),
         lease: EntryLeaseState::Absent,
         current: None,
