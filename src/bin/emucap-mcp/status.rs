@@ -930,7 +930,11 @@ pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLi
         "continuity".into(),
         serde_json::to_value(&continuity).unwrap_or_else(|_| serde_json::json!({})),
     );
-    if !continuity.runtime_diagnostics.is_empty() {
+    if continuity
+        .runtime_diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.blocks_generation_transition)
+    {
         object.insert(
             "next_safe_action".into(),
             serde_json::json!(

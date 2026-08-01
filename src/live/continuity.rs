@@ -110,6 +110,14 @@ pub struct RuntimeDiagnostic {
     pub path: String,
     pub kind: String,
     pub reason: String,
+    /// False only for an evidence artifact whose bytes are never used to establish process,
+    /// generation, or lease ownership. Older serialized diagnostics default to fail-closed.
+    #[serde(default = "runtime_diagnostic_blocks_transition_by_default")]
+    pub blocks_generation_transition: bool,
+}
+
+const fn runtime_diagnostic_blocks_transition_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -893,6 +901,10 @@ fn runtime_diagnostic(
         path: path.display().to_string(),
         kind: kind.into(),
         reason,
+        // adapter-failure.json is bounded failure evidence, not an ownership capsule. Losing it
+        // degrades crash proof but must not strand an otherwise verifiable exited generation.
+        // Unknown future artifacts remain blocking by default.
+        blocks_generation_transition: artifact != "adapter_failure",
     }
 }
 

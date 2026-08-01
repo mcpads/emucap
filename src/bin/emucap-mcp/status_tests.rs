@@ -595,6 +595,8 @@ fn mismatched_live_identity_demotes_the_old_runtime_capsule() {
 
 struct DiagnosticLink {
     caps: emucap::live::link::Capabilities,
+    artifact: &'static str,
+    blocks_generation_transition: bool,
 }
 
 impl EmulatorLink for DiagnosticLink {
@@ -619,10 +621,11 @@ impl EmulatorLink for DiagnosticLink {
         continuity
             .runtime_diagnostics
             .push(emucap::live::continuity::RuntimeDiagnostic {
-                artifact: "current".into(),
+                artifact: self.artifact.into(),
                 path: "/runtime/47857/current.json".into(),
                 kind: "invalid".into(),
                 reason: "invalid JSON".into(),
+                blocks_generation_transition: self.blocks_generation_transition,
             });
         continuity
     }
@@ -632,6 +635,8 @@ impl EmulatorLink for DiagnosticLink {
 fn bootstrap_returns_diagnostic_json_when_runtime_capsule_is_corrupt() {
     let mut link = DiagnosticLink {
         caps: emucap::live::link::Capabilities::empty(),
+        artifact: "current",
+        blocks_generation_transition: true,
     };
 
     let value = make_bootstrap_value(&mut link, false, false).unwrap();
@@ -641,6 +646,25 @@ fn bootstrap_returns_diagnostic_json_when_runtime_capsule_is_corrupt() {
     assert_eq!(value["entry"]["primary_action"]["tool"], "status");
     assert!(value.get("status").is_none());
     assert!(!value.to_string().contains("/runtime/47857/current.json"));
+}
+
+#[test]
+fn bootstrap_does_not_block_on_corrupt_adapter_failure_evidence() {
+    let mut link = DiagnosticLink {
+        caps: emucap::live::link::Capabilities::empty(),
+        artifact: "adapter_failure",
+        blocks_generation_transition: false,
+    };
+
+    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+
+    assert_eq!(value["entry"]["state"], "ready_for_content");
+    assert_eq!(value["entry"]["reason"], "ready_no_history");
+    assert_eq!(value["entry"]["primary_action"]["kind"], "resolve_input");
+    assert_eq!(
+        value["entry"]["primary_action"]["then_call"]["tool"],
+        "launch_plan"
+    );
 }
 
 #[test]
