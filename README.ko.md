@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.12.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.13.0-rc.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -74,9 +74,16 @@ SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필�
 emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전트가 둘을 조립한다(§3계층).
 
 - **제어 MCP**(`emucap-mcp`) — 에뮬레이터 조작 엔진. 메모리·상태·화면을 읽고, 입력·세이브스테이트·
-  브레이크포인트를 제어하고, 선택적 분석 verb(`regression_run`/`verify_determinism`)로 결과를
-  *반환*한다. 이 schema가 필요할 때만 `analysis(operation="describe")`를 호출하고, 같은
-  `analysis` 도구로 선택한 operation을 실행한다.
+  브레이크포인트를 제어하고 선택적 분석 결과를 *반환*한다. 정적 도구 목록은 간결한 기본
+  리모컨이다. 지속·기기별 입력은 `input_control(operation="describe")`, 복합·기기별 디버거 기능은
+  `debug(operation="describe")`, 재현성 분석은 `analysis(operation="describe")`로 연다. 각 서랍은
+  현재 runtime의 operation과 schema만 반환하며 실행도 같은 도구가 맡는다. 메모리 쓰기·disassembly·
+  breakpoint·event polling은 디버거 기본 기능이라 direct tool로 유지한다. 실행 중 매체 교체도 direct이며
+  frozen 상태와 `status.media_devices`의 device ID를 요구한다. 정확한 guest-time 전진은 frozen으로
+  돌아오는 `step`을 사용한다. 어댑터의 free-running frame wait는 호환용 wire 동작으로만 남고 MCP
+  에이전트에게는 노출하지 않는다.
+  정확한 bounded 버튼 입력은 입력권을 반환하고 frozen으로 끝나는 direct `tap`을 쓴다. Guest가 계속
+  실행되는 실시간 pulse는 runtime이 지원할 때만 입력 서랍의 `pulse_while_running`으로 명시적으로 연다.
 - **추적 MCP**(`emucap-track-mcp`) — 실험 원장(`.emucap/`). run을 시작(`run_start`)·기록(`log_*`)·
   질의(`query_runs`/`compare_runs`/`summarize_runs`)한다. **에뮬레이터를 모른다**(emulator-less). 제어
   MCP에 *얹혀* 실험을 남기는 add-on이라, 켜지 않아도 제어 MCP는 그대로 동작한다.
@@ -124,31 +131,57 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
   선택한 `regression_run`/`verify_determinism` operation을 실행한다. 제어 MCP가 에뮬을 구동해
   결과를 *반환*할 뿐 원장에 쓰지 않는다. 남기려면 그 결과를 추적 MCP의 `log_gate`(예:
   `determinism_replay`의 `kind=machine` 판정)·`log_metric`으로 기록한다.
-- **프레임 경계 탐색은 `probe`를 조립**: 같은 베이스 상태에서 원자적 `probe`를 반복 호출해 프레임
+- **프레임 경계 탐색은 debug `probe` operation을 조립**: 같은 베이스 상태에서 원자적 probe를 반복해 프레임
   범위를 이분한다. 각 호출이 상태 복원·진행·판정을 한 번에 수행하므로 호출 사이 지연은 결과를 바꾸지 않는다.
-- **개입은 명시 기록**: `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동
+- **개입은 명시 기록**: debug `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동
   기록하지 않으므로, 재현 충실도(repro_status)를 위해 추적 MCP의 `log_intervention`으로 직접 남긴다.
 
 ### 4. 첫 동작 (에이전트가 bootstrap으로 시작)
 
 모든 emucap 작업은 `bootstrap`으로 시작한다. 에이전트에게 "emucap `bootstrap`을 호출해줘"라고
-하면, 기본 응답이 `listening_port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을
+하면, 기본 응답이 `listener.port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을
 간결하게 돌려준다. 전체 routing catalog는 `bootstrap(include=["systems"])`, build/runtime 경로는
 `bootstrap(include=["installation"])`으로 명시적으로 요청한다. 이후
 `launch_plan(content_path, system?)`이 검증된 MCP `launch` 도구 인자를 돌려준다.
 에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
 identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
 
+`listener.base_port`는 direct mode에서 빈 포트를 찾기 시작하는 값일 뿐이며 다른 살아 있는 MCP 세션이
+이미 사용 중일 수 있다. Launcher는 실제로 할당된 `listener.port` 또는 full `status`의
+`listening_port`만 사용한다. Emulator generation을 `stop`해도 그 세션의 MCP listener는 닫히지 않으며,
+MCP 세션이 끝날 때 반환된다.
+
 연결된 첫 full `status`는 `capability_revision`을 반환한다. 반복 확인에서는 이를
 `known_capability_revision`으로 보내면 capability catalog가 바뀌지 않았을 때 그 묶음만 생략하고,
 현재 execution·continuity·generation·ownership 상태는 계속 반환한다.
+
+전체 status에 `recording_capability`가 있을 때는 debug `record_window` operation이 에이전트·네트워크 지연을 guest
+time에 섞지 않고 유한한 guest-frame 구간을 소유할 수 있다. 현재 workspace 안의 기존 absolute
+`output_root`와 frame 수를 주면 emulator를 frozen으로 되돌리고 검증된 bundle path와 manifest hash를
+반환한다. event class와 limit의 권위는 live capability다. 지원하지 않는 adapter는 hook을 설치하거나
+guest를 진행하지 않고 거부한다. 선택적 origin·입력 무비·event stop도 그 exact capability가 광고할
+때만 쓸 수 있으며, 생략하면 기존 next-frame bounded 동작을 유지한다.
+`recording_capability.warmup`이 있으면 `warmup_frames`로 저비용 transaction event는 계속 기록하면서
+observation-only hook의 활성화를 정확한 guest frame 경계까지 미룰 수 있다. 입력 무비는 두 구간을 한
+요청 안에서 모두 포함한다.
+선택한 event가 `startable`이면 `start_on`으로 첫 occurrence에 observation 시작을 맞출 수 있다.
+`initial_snapshots`는 capability가 광고한 callback-safe memory type과 상한을 추가로 요구하며, Core가
+별도 인증 binary sink로 받아 manifest의 exact anchor event와 member hash를 묶는다. 선택적 terminal snapshot은
+`recording_capability.terminal_snapshots`의 상한과 `status.memory_regions`의 정확한 유한 영역이 모두
+있을 때만 쓸 수 있다. Core가 arming 전에 모든 범위를 검증하고 terminal frame이 frozen인 동안만
+읽어 hash가 있는 bundle member로 게시한다. 이 필드를 생략하면 추가 memory read가 없다.
+`recording_capability.terminal_state`가 광고한 profile 하나를 선택하면 같은 frozen 종점의 producer
+정의 상태를 canonical JSON member 하나로 보존할 수 있다. 소비자 schema는 emucap에 들어오지 않는다.
+Control MCP가 재시작되어도
+`status.recording_capture`가 bounded
+active/terminal capsule을 이어 보여주며 event bytes와 private staging path는 status에 넣지 않는다.
 
 timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종료의 증거가 아니다.
 재실행하기 전에 `status.continuity.runtime_binding`·`status.runtime_instance` 또는
 `status.stale_runtime_instance`·`get_failure_context`를 확인한다.
 살아 있는 소유 generation에는 재부착하고, 의도적으로 교체할 때만 identity가 검증되는
 `launch(..., replace: true)`를 쓴다. Flycast fatal quarantine에서는 먼저 보존 문맥을 읽고,
-`status.methods`가 광고할 때만 `dismiss_failure`를 호출한다.
+`status.methods`가 광고할 때만 debug `dismiss_failure` operation을 호출한다.
 
 managed emulator를 종료할 때는 `status.runtime_instance.launch_id`를 읽고
 `stop(launch_id=...)`을 호출한다. 제어 MCP가 current generation, 제어 lease,
@@ -217,7 +250,7 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   callback barrier를 이용한 정확한 rendered-frame 스텝, 제한된 입력 pulse, 현재 PNG 캡처,
   완료를 확인하는 native save/load도 제공한다. 두 모드는 모두 동기식 reset, R4300
   exec/read/write breakpoint와 hit-time 증거, event polling, disassemble을 제공한다.
-  `run_frames`는 창 실행에서만 제공하고 headless는 rendered-frame 기능을 노출하지 않는다.
+  headless는 rendered-frame 기능을 노출하지 않는다.
   RSP 상태는 이 profile의 범위가 아니다.
   → `adapters/mupen64plus/README.md`
 - **openMSX MSX 카트리지 profile (실험적)** — `adapters/openmsx/build.sh`를 실행하고

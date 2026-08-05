@@ -4,6 +4,35 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.13.0-rc.0
+
+### Added
+- Added opt-in bounded recording through the capability-scoped debug surface. A recording owns its
+  guest-frame interval, returns frozen, and atomically publishes a validated, hashed evidence
+  bundle. Negotiated extensions cover reset-origin capture, dense input movies, typed event
+  classes, event stops, event-aligned initial memory, terminal memory, and producer-defined
+  terminal state without changing the default request.
+- Added capability-scoped input and debugger drawers while retaining memory access, disassembly,
+  breakpoints, event polling, exact `step`, and live media replacement as direct basic controls.
+
+### Fixed
+- Mesen now tracks the current halt cause separately from recording boundary eligibility. A frame
+  `step` after `record_window` reports `reason: step` and preserves the new exact frame boundary,
+  while mid-frame and interrupted halts cannot inherit recording eligibility.
+- Mesen event-aligned captures keep internal occurrence bookkeeping out of the public observation
+  anchor, so strict terminal validation can publish the matching initial snapshot and event stream.
+- Direct sessions report the listener port actually selected by the operating system, and recording
+  terminal state is reconciled after reconnect or cancellation without treating progress as completion.
+
+### Changed
+- Recording event classes use generic producer contracts with exact per-class accounting; Mesen
+  installs requested SNES observation hooks only for the active bounded window, and Mednafen keeps
+  unsupported profiles unchanged.
+- Removed free-running frame waits from the MCP agent surface; the remaining `step` advances exact
+  frame or instruction units and ends frozen, while the adapter wire operation remains for compatibility.
+- Extended opt-in recording with capability-bounded warmup intervals and one producer-defined,
+  hashed terminal state member. Existing recording requests retain their prior behavior and layout.
+
 ## 0.12.1
 
 ### Fixed
