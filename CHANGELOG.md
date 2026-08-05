@@ -4,7 +4,7 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
-## 0.13.0-rc.1
+## 0.13.0
 
 ### Added
 - Added opt-in bounded recording through the capability-scoped debug surface. A recording owns its
