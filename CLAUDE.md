@@ -26,8 +26,8 @@ breakpoint domains, inputs, and contract limits. A later status may pass
 `known_capability_revision`; an `unchanged` response omits the cached catalog but retains live
 execution and continuity state.
 
-The static Control tool list is a basic remote. Memory writes, disassembly, breakpoints, event
-polling, and live media changes are direct tools. Call `input_control(operation="describe")` for
+The static Control tool list is a basic remote. Memory writes, disassembly, call stacks,
+breakpoints, event polling, and live media changes are direct tools. Call `input_control(operation="describe")` for
 persistent or device-specific input, `debug(operation="describe")` for composite or device-specific
 debugger operations, and `analysis(operation="describe")` for optional analysis. Execute a returned
 operation through the same drawer with its capability revision.

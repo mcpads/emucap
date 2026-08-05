@@ -690,8 +690,14 @@ pub fn disassemble(
     link: &mut dyn EmulatorLink,
     address: u64,
     count: u64,
+    cpu: Option<&str>,
+    mode: Option<&str>,
 ) -> Result<ToolOutput, LinkError> {
-    let params = json!({ "address": address, "count": count });
+    let mut params = json!({ "address": address, "count": count });
+    with_cpu(&mut params, cpu);
+    if let (Some(mode), Some(params)) = (mode, params.as_object_mut()) {
+        params.insert("mode".into(), json!(mode));
+    }
     Ok(ToolOutput::Json(link.call("disassemble", params)?))
 }
 
@@ -760,9 +766,12 @@ pub fn get_trace(link: &mut dyn EmulatorLink, count: u64) -> Result<ToolOutput, 
     ))
 }
 
-/// 현재 콜스택(JSR/JSL 호출지 체인, 바깥→안)을 반환한다. set_trace(true)가 선행돼야 함.
-pub fn call_stack(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(link.call("call_stack", json!({}))?))
+/// 현재 콜스택을 backend가 광고한 authority로 반환한다. 일부 backend는 실행 추적에서 호출 체인을
+/// 재구성하고, 다른 backend는 정지 시점의 프레임 포인터나 네이티브 unwinder를 사용한다.
+pub fn call_stack(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({});
+    with_cpu(&mut params, cpu);
+    Ok(ToolOutput::Json(link.call("call_stack", params)?))
 }
 
 /// break_on_reset: 게임이 리셋 핸들러($00:FFFC 벡터)를 실행하면 freeze(워치독 리셋·하드 크래시→리셋

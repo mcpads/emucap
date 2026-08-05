@@ -686,7 +686,6 @@
       "id": "debug.call-stack",
       "surface": "public",
       "methods": ["call_stack"],
-      "route": "debug",
       "temporal_classes": ["T4"],
       "disposition": "retain",
       "expectations": ["TRACE.AUTHORITY.1"]

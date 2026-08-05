@@ -288,6 +288,7 @@ fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
         "change_media",
         "write_memory",
         "disassemble",
+        "call_stack",
         "set_breakpoint",
         "clear_breakpoint",
         "list_breakpoints",
@@ -404,6 +405,47 @@ async fn step_keeps_the_existing_exact_frozen_wire_contract() {
 }
 
 #[tokio::test]
+async fn debugger_cpu_and_mode_selection_reaches_the_adapter_wire() {
+    let concrete = Arc::new(Mutex::new(StepWireLink::new()));
+    let shared: SharedLink = concrete.clone();
+    let server = Emucap::new(shared);
+
+    let result = server
+        .disassemble(Parameters(DisassembleArgs {
+            address: Num(0x0200_0000),
+            count: 4,
+            output_path: None,
+            cpu: Some("arm7".into()),
+            mode: Some("thumb".into()),
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true));
+    {
+        let link = concrete.lock().unwrap();
+        assert_eq!(link.last_method.as_deref(), Some("disassemble"));
+        assert_eq!(
+            link.last_params,
+            Some(serde_json::json!({
+                "address": 0x0200_0000,
+                "count": 4,
+                "cpu": "arm7",
+                "mode": "thumb"
+            }))
+        );
+    }
+
+    let result = server
+        .call_stack(Parameters(CallStackArgs {
+            cpu: Some("arm7".into()),
+        }))
+        .await;
+    assert_ne!(result.is_error, Some(true));
+    let link = concrete.lock().unwrap();
+    assert_eq!(link.last_method.as_deref(), Some("call_stack"));
+    assert_eq!(link.last_params, Some(serde_json::json!({"cpu": "arm7"})));
+}
+
+#[tokio::test]
 async fn named_touch_operations_preserve_the_single_wire_contract() {
     let concrete = Arc::new(Mutex::new(InputWireLink::new()));
     let shared: SharedLink = concrete.clone();
@@ -509,6 +551,30 @@ fn stop_is_exposed_as_a_host_lifecycle_tool_with_required_generation_identity() 
     assert_eq!(schema["required"], serde_json::json!(["launch_id"]));
     assert_eq!(schema["additionalProperties"], false);
     assert_eq!(schema["properties"]["launch_id"]["type"], "string");
+}
+
+#[test]
+fn debugger_tools_expose_optional_cpu_and_instruction_mode_routing() {
+    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
+        "127.0.0.1:0",
+        Duration::from_millis(50),
+    )));
+    let tools = Emucap::new(shared).tool_router.list_all();
+
+    let disassemble = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "disassemble")
+        .expect("disassemble tool");
+    let schema = serde_json::to_value(&disassemble.input_schema).unwrap();
+    assert!(schema["properties"]["cpu"].is_object());
+    assert!(schema["properties"]["mode"].is_object());
+
+    let call_stack = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "call_stack")
+        .expect("call_stack tool");
+    let schema = serde_json::to_value(&call_stack.input_schema).unwrap();
+    assert!(schema["properties"]["cpu"].is_object());
 }
 
 #[test]

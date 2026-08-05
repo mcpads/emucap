@@ -249,9 +249,26 @@ pub(crate) struct DisassembleArgs {
     /// Write JSON results to this path and return a summary. Omit for inline results.
     #[serde(default)]
     pub(crate) output_path: Option<String>,
+    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
+    /// Omit for the backend's default core.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
+    /// Instruction-set mode when the backend supports an override, for example
+    /// NDS `arm`, `thumb`, or `auto`. Omit for automatic selection.
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
 }
 fn default_disas_count() -> u64 {
     8
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CallStackArgs {
+    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
+    /// Omit for the backend's default core.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

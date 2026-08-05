@@ -614,7 +614,13 @@ impl Emucap {
     #[tool(description = "Decode instructions from an advertised address domain.")]
     async fn disassemble(&self, Parameters(a): Parameters<DisassembleArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::disassemble(&mut *l, a.address.get(), a.count) {
+        match tools::disassemble(
+            &mut *l,
+            a.address.get(),
+            a.count,
+            a.cpu.as_deref(),
+            a.mode.as_deref(),
+        ) {
             Ok(ToolOutput::Json(v)) => match a.output_path.as_deref() {
                 Some(p) => match emucap::offload::offload_result(&v, std::path::Path::new(p)) {
                     Ok(s) => tool_output_result(ToolOutput::Json(s)),
@@ -708,9 +714,10 @@ impl Emucap {
         }
     }
 
-    async fn call_stack(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
+    #[tool(description = "Read the current call chain at its advertised authority level.")]
+    async fn call_stack(&self, Parameters(a): Parameters<CallStackArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::call_stack(&mut *l) {
+        match tools::call_stack(&mut *l, a.cpu.as_deref()) {
             Ok(o) => tool_output_result(o),
             Err(e) => link_error_result(e),
         }

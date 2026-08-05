@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.13.0-rc.0 — beta.** This repository remains under active development; interfaces and
+**v0.13.0-rc.1 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -98,7 +98,7 @@ them (see §2b).
   `debug(operation="describe")`, and reproducibility analysis with
   `analysis(operation="describe")`. Each drawer returns only the current
   runtime's operations and schemas; execute through that same tool. Core
-  debugger primitives—memory write, disassembly, breakpoints, and event
+  debugger primitives—memory write, disassembly, call stacks, breakpoints, and event
   polling—remain direct tools. Live media changes are also direct and require a
   frozen guest plus a device ID from `status.media_devices`. Exact guest-time
   advance uses `step`, which returns the guest frozen; adapter free-running frame waits are
@@ -167,7 +167,7 @@ The two MCPs never call each other — **the agent composes them**:
 - **Frame-boundary search composes the debug `probe` operation**: binary-search
   the frame range with repeated atomic probes. Each call restores the same base state,
   advances, and reads the predicate without an externally visible gap.
-- **Interventions are logged explicitly**: state changes like debug `write_memory` /
+- **Interventions are logged explicitly**: state changes like `write_memory` /
   `load_state` / `reset` / input are not recorded automatically, so log them via
   the Tracking MCP's `log_intervention` to preserve reproduction fidelity.
 

@@ -26,7 +26,6 @@ const OPERATIONS: &[&str] = &[
     "watch_register",
     "set_trace",
     "get_trace",
-    "call_stack",
     "break_on_reset",
 ];
 
@@ -131,12 +130,6 @@ pub(crate) fn describe(status: &Value) -> Value {
         status,
         "get_trace",
         "Read a bounded recent execution trace.",
-    );
-    add::<EmptyArgs>(
-        &mut operations,
-        status,
-        "call_stack",
-        "Read the current call chain at its advertised authority level.",
     );
     add::<BreakOnResetArgs>(
         &mut operations,
@@ -266,10 +259,6 @@ pub(crate) async fn execute(
         },
         "get_trace" => match analysis_surface::parse_arguments(&operation, arguments.arguments) {
             Ok(values) => server.get_trace(Parameters(values)).await,
-            Err(error) => invalid_request_result(error),
-        },
-        "call_stack" => match analysis_surface::parse_arguments(&operation, arguments.arguments) {
-            Ok(values) => server.call_stack(Parameters(values)).await,
             Err(error) => invalid_request_result(error),
         },
         "break_on_reset" => {

@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.13.0-rc.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.13.0-rc.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -78,7 +78,7 @@ emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전
   리모컨이다. 지속·기기별 입력은 `input_control(operation="describe")`, 복합·기기별 디버거 기능은
   `debug(operation="describe")`, 재현성 분석은 `analysis(operation="describe")`로 연다. 각 서랍은
   현재 runtime의 operation과 schema만 반환하며 실행도 같은 도구가 맡는다. 메모리 쓰기·disassembly·
-  breakpoint·event polling은 디버거 기본 기능이라 direct tool로 유지한다. 실행 중 매체 교체도 direct이며
+  call stack·breakpoint·event polling은 디버거 기본 기능이라 direct tool로 유지한다. 실행 중 매체 교체도 direct이며
   frozen 상태와 `status.media_devices`의 device ID를 요구한다. 정확한 guest-time 전진은 frozen으로
   돌아오는 `step`을 사용한다. 어댑터의 free-running frame wait는 호환용 wire 동작으로만 남고 MCP
   에이전트에게는 노출하지 않는다.
@@ -133,7 +133,7 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
   `determinism_replay`의 `kind=machine` 판정)·`log_metric`으로 기록한다.
 - **프레임 경계 탐색은 debug `probe` operation을 조립**: 같은 베이스 상태에서 원자적 probe를 반복해 프레임
   범위를 이분한다. 각 호출이 상태 복원·진행·판정을 한 번에 수행하므로 호출 사이 지연은 결과를 바꾸지 않는다.
-- **개입은 명시 기록**: debug `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동
+- **개입은 명시 기록**: `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동
   기록하지 않으므로, 재현 충실도(repro_status)를 위해 추적 MCP의 `log_intervention`으로 직접 남긴다.
 
 ### 4. 첫 동작 (에이전트가 bootstrap으로 시작)
