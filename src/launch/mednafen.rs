@@ -4,14 +4,80 @@
 //! rebuilding the shared work tree doesn't disturb a running instance (the copy is a separate inode).
 
 use super::spec::{mednafen_spec, SpecOpts};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 
 pub const PCFX_BIOS_SHA256: &str =
     "4b44ccf5d84cc83daa2e6a2bee00fdafa14eb58bdf5859e96d8861a891675417";
 const PCFX_BIOS_SIZE: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuildMetadata {
+    pub upstream: String,
+    pub upstream_revision: String,
+    pub patchset_sha256: String,
+    pub binary_sha256: String,
+}
+
+fn metadata_path(binary: &Path) -> PathBuf {
+    let mut value = binary.as_os_str().to_os_string();
+    value.push(".emucap-build.json");
+    PathBuf::from(value)
+}
+
+pub fn read_build_metadata(binary: &Path) -> std::io::Result<Option<BuildMetadata>> {
+    let path = metadata_path(binary);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let metadata: BuildMetadata = serde_json::from_slice(&bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("invalid Mednafen build sidecar {}: {error}", path.display()),
+        )
+    })?;
+    let digest =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if metadata.upstream.is_empty()
+        || metadata.upstream_revision.is_empty()
+        || !digest(&metadata.patchset_sha256)
+        || !digest(&metadata.binary_sha256)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Mednafen build sidecar identity is incomplete",
+        ));
+    }
+    let mut file = File::open(binary)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual = hex::encode(hasher.finalize());
+    if !metadata.binary_sha256.eq_ignore_ascii_case(&actual) {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "Mednafen build sidecar binary_sha256 does not match {}",
+                binary.display()
+            ),
+        ));
+    }
+    Ok(Some(metadata))
+}
 
 fn default_pcfx_bios_source() -> PathBuf {
     super::emu_home_base().join("firmware/pcfx.rom")
@@ -172,6 +238,7 @@ fn copy_run_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// BIOS path so the launch never edits or depends on Mednafen's user profile. Other systems retain
 /// Mednafen's normal firmware lookup. Returns the child pid.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
+    let build_metadata = read_build_metadata(l.binary)?;
     let run_binary = if l.explicit_binary {
         l.binary.to_path_buf()
     } else {
@@ -194,7 +261,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
     } else {
         None
     };
-    let spec = mednafen_spec(
+    let mut spec = mednafen_spec(
         &run_binary,
         l.log_path,
         l.module,
@@ -202,6 +269,16 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
         pcfx_bios.as_deref(),
         &opts,
     );
+    if let Some(metadata) = build_metadata {
+        spec = spec
+            .env("EMUCAP_MEDNAFEN_BINARY_SHA256", metadata.binary_sha256)
+            .env("EMUCAP_MEDNAFEN_UPSTREAM", metadata.upstream)
+            .env(
+                "EMUCAP_MEDNAFEN_UPSTREAM_REVISION",
+                metadata.upstream_revision,
+            )
+            .env("EMUCAP_MEDNAFEN_PATCHSET_SHA256", metadata.patchset_sha256);
+    }
     super::spawn_detached(&spec)
 }
 

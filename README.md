@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.12.1 — beta.** This repository remains under active development; interfaces and
+**v0.13.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -92,9 +92,20 @@ them (see §2b).
 
 - **Control MCP** (`emucap-mcp`) — the emulator-driving engine. Reads memory,
   state, and screen; controls input, save-states, and breakpoints; and returns
-  results from optional analysis verbs (`regression_run` /
-  `verify_determinism`). Call `analysis(operation="describe")` only when those
-  operation schemas are needed, then use the same `analysis` tool to execute one.
+  results from optional analysis operations. Its static tool list is a compact
+  basic remote. Open persistent/device input with
+  `input_control(operation="describe")`, composite or device-specific debugger operations with
+  `debug(operation="describe")`, and reproducibility analysis with
+  `analysis(operation="describe")`. Each drawer returns only the current
+  runtime's operations and schemas; execute through that same tool. Core
+  debugger primitives—memory write, disassembly, call stacks, breakpoints, and event
+  polling—remain direct tools. Live media changes are also direct and require a
+  frozen guest plus a device ID from `status.media_devices`. Exact guest-time
+  advance uses `step`, which returns the guest frozen; adapter free-running frame waits are
+  compatibility wire operations and are not exposed to MCP agents.
+  Exact bounded button input uses direct `tap`, which releases input and returns frozen. A
+  real-time pulse that leaves the guest running is available only as the explicitly named
+  `pulse_while_running` operation in the input drawer when the runtime supports it.
 - **Tracking MCP** (`emucap-track-mcp`) — the experiment ledger (`.emucap/`).
   Starts (`run_start`), records (`log_*`), and queries (`query_runs` /
   `compare_runs` / `summarize_runs`) runs. It **knows nothing about emulators**
@@ -153,8 +164,8 @@ The two MCPs never call each other — **the agent composes them**:
   operation through that same tool. Analysis drives the emulator and *returns*
   a result without writing to the ledger. To record it, log the result via the
   Tracking MCP's `log_gate` / `log_metric`.
-- **Frame-boundary search composes `probe`**: binary-search the frame range with
-  repeated atomic `probe` calls. Each call restores the same base state,
+- **Frame-boundary search composes the debug `probe` operation**: binary-search
+  the frame range with repeated atomic probes. Each call restores the same base state,
   advances, and reads the predicate without an externally visible gap.
 - **Interventions are logged explicitly**: state changes like `write_memory` /
   `load_state` / `reset` / input are not recorded automatically, so log them via
@@ -163,7 +174,7 @@ The two MCPs never call each other — **the agent composes them**:
 ### 4. First run (the agent starts with bootstrap)
 
 Every emucap task starts with `bootstrap`. Ask the agent to "call emucap
-`bootstrap`", and its compact response returns `listening_port`, system IDs, a
+`bootstrap`", and its compact response returns `listener.port`, system IDs, a
 catalog revision, and questions about what to bring up. The full routing catalog
 is available through `bootstrap(include=["systems"])`; build and runtime paths
 through `bootstrap(include=["installation"])`. Then
@@ -172,10 +183,45 @@ arguments. The agent calls `launch`, which waits for adapter readiness, and
 verifies the resulting live and runtime identities with `status`. Launcher
 scripts are developer entry points, not an alternative managed lifecycle.
 
+`listener.base_port` is only where direct-mode port search begins. It may already
+belong to another live MCP session. Launchers use the assigned `listener.port`
+or full-status `listening_port`. Stopping an emulator generation does not close
+its owning MCP listener; that listener is released when the MCP session exits.
+
 A full connected `status` returns `capability_revision`. Pass it back as
 `known_capability_revision` on repeated checks to omit an unchanged capability
 catalog while retaining current execution, continuity, generation, and
 ownership state.
+
+When that full status includes `recording_capability`, the debug `record_window`
+operation can own a
+finite guest-frame interval without making agent or network latency part of guest
+time. Give it an existing absolute `output_root` in the current workspace and a
+frame count; it returns with the emulator frozen plus a validated bundle path and
+manifest hash. The live capability is the authority for event classes and limits.
+Optional origin, input movie, and event-stop arguments are valid only when that exact capability
+advertises them; omitting them retains the bounded next-frame behavior.
+When `recording_capability.warmup` exists, `warmup_frames` keeps cheap transaction classes active
+while delaying observation-only hooks until the exact guest boundary; the input movie covers both
+intervals in one request.
+When a selected event is marked `startable`, optional `start_on` can align the observation interval
+to its first occurrence. `initial_snapshots` additionally require the capability's callback-safe
+memory type and bounds; Core receives them through a separate authenticated binary sink and binds
+their hashes to the exact anchor event in the manifest.
+Optional terminal snapshots additionally require bounds in `recording_capability.terminal_snapshots`
+and an exact finite entry in `status.memory_regions`. Core validates every range before arming,
+reads it only after the terminal frame is frozen, and publishes it as a hashed bundle member.
+Omitting the field performs no extra memory read.
+An advertised `recording_capability.terminal_state` profile may likewise be selected to preserve
+one producer-defined, canonical JSON state member at the same frozen terminal boundary. Consumers
+project that representation on their side; their schemas are not part of emucap.
+Longer windows are explicit and capability-bounded. A short request keeps the established failure
+deadline, while Core derives proportionally more host cleanup time for a longer requested window;
+host time never changes the movie's guest-frame schedule.
+Unsupported adapters reject the call without installing hooks or advancing the
+guest. `status.recording_capture` retains a bounded active or terminal capsule
+across a Control MCP restart; event bytes and private staging paths stay out of
+status.
 
 A timeout or `connected: false` reports transport state, not proof that the
 emulator exited. Inspect `status.continuity.runtime_binding`,
@@ -183,7 +229,7 @@ emulator exited. Inspect `status.continuity.runtime_binding`,
 `get_failure_context` before relaunching. Reattach to a live owned generation;
 use `launch(..., replace: true)` only for an intentional, identity-verified
 replacement. On a Flycast fatal quarantine, read the preserved context first and
-call `dismiss_failure` only when `status.methods` advertises it.
+call debug operation `dismiss_failure` only when `status.methods` advertises it.
 
 To end a managed emulator, read `status.runtime_instance.launch_id` and call
 `stop(launch_id=...)`. The Control MCP verifies the current generation, control
@@ -262,7 +308,7 @@ debugger halt to service requests without advancing the guest.
   RDRAM access. Both modes expose port-0 input holds with explicit native-ownership release.
   Both modes also expose synchronous reset, R4300 exec/read/write breakpoints with hit-time
   evidence, event polling, and disassembly. Visible launch additionally exposes exact
-  rendered-frame stepping, bounded `run_frames` and input pulses, current PNG capture, and
+  exact rendered-frame advance, bounded input pulses, current PNG capture, and
   completion-checked native save/load. Headless launch remains instruction-only and omits those
   rendered-frame operations. RSP state remains outside this profile.
   → `adapters/mupen64plus/README.md`

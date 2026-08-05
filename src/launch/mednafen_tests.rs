@@ -66,6 +66,50 @@ fn run_copy_preserves_source_binary_name() {
 }
 
 #[test]
+fn build_sidecar_binds_the_exact_mednafen_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join(default_binary_name());
+    std::fs::write(&binary, b"maintained mednafen").unwrap();
+    let binary_sha256 = hex::encode(Sha256::digest(b"maintained mednafen"));
+    let metadata = BuildMetadata {
+        upstream: "https://example.invalid/mednafen.tar.xz".into(),
+        upstream_revision: "1.2.3@sha256:archive".into(),
+        patchset_sha256: "a".repeat(64),
+        binary_sha256,
+    };
+    std::fs::write(
+        metadata_path(&binary),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(read_build_metadata(&binary).unwrap(), Some(metadata));
+}
+
+#[test]
+fn build_sidecar_rejects_a_replaced_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join(default_binary_name());
+    std::fs::write(&binary, b"first").unwrap();
+    let metadata = BuildMetadata {
+        upstream: "https://example.invalid/mednafen.tar.xz".into(),
+        upstream_revision: "1.2.3@sha256:archive".into(),
+        patchset_sha256: "a".repeat(64),
+        binary_sha256: hex::encode(Sha256::digest(b"first")),
+    };
+    std::fs::write(
+        metadata_path(&binary),
+        serde_json::to_vec(&metadata).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&binary, b"replacement").unwrap();
+
+    let error = read_build_metadata(&binary).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidData);
+    assert!(error.to_string().contains("binary_sha256 does not match"));
+}
+
+#[test]
 fn pcfx_bios_resolution_rejects_wrong_hash_after_size_check() {
     let _lock = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_PCFX_BIOS", "EMUCAP_EMU_HOME"]);

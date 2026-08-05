@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use emucap::bundle::manifest::Manifest;
-use emucap::bundle::summary::{render_json, render_table, summarize};
+use emucap::bundle::manifest::parse_manifest;
+use emucap::bundle::summary::{render_bundle_json, render_bundle_table, summarize_bundle};
 
 pub fn run(dir: &Path, json: bool) -> anyhow::Result<()> {
     let manifest_path = dir.join("manifest.json");
@@ -13,12 +13,12 @@ pub fn run(dir: &Path, json: bool) -> anyhow::Result<()> {
             manifest_path.display()
         )
     })?;
-    let manifest: Manifest = serde_json::from_str(&text).context("manifest.json 파싱 실패")?;
-    let summary = summarize(&manifest);
+    let manifest = parse_manifest(&text).context("failed to parse manifest.json")?;
+    let summary = summarize_bundle(&manifest);
     if json {
-        println!("{}", render_json(&summary));
+        println!("{}", render_bundle_json(&summary));
     } else {
-        print!("{}", render_table(&summary));
+        print!("{}", render_bundle_table(&summary));
     }
     Ok(())
 }

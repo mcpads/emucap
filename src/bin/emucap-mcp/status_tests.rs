@@ -42,6 +42,7 @@ fn notes_contain(v: &serde_json::Value, sub: &str) -> bool {
 fn composites_appear_when_deps_met() {
     let v = enriched(&[
         "set_input",
+        "press_buttons",
         "step",
         "pause",
         "read_memory",
@@ -51,11 +52,38 @@ fn composites_appear_when_deps_met() {
         "step_instructions",
         "set_trace",
     ]);
-    for c in ["tap", "hold_until", "regression_run", "verify_determinism"] {
+    for c in [
+        "tap",
+        "pulse_while_running",
+        "hold_until",
+        "regression_run",
+        "verify_determinism",
+    ] {
         assert!(has_method(&v, c), "composite {c} missing");
     }
+    assert!(
+        !has_method(&v, "press_buttons"),
+        "wire pulse must not compete with the exact public tap"
+    );
     // 의존 충족된 풀셋엔 substitute note가 없다.
     assert!(v.get("capability_notes").is_none());
+}
+
+#[test]
+fn real_time_button_pulse_is_named_by_its_execution_effect() {
+    let value = enriched(&["press_buttons"]);
+    assert!(has_method(&value, "pulse_while_running"));
+    assert!(!has_method(&value, "press_buttons"));
+    assert!(!has_method(&value, "tap"));
+}
+
+#[test]
+fn touch_modes_are_named_by_ownership_and_terminal_execution_state() {
+    let value = enriched(&["touch"]);
+    for method in ["hold_touch", "release_touch", "pulse_touch_while_running"] {
+        assert!(has_method(&value, method), "missing {method}");
+    }
+    assert!(!has_method(&value, "touch"));
 }
 
 #[test]
@@ -84,10 +112,14 @@ fn synchronous_advance_exposes_host_admission_bounds() {
         value.pointer("/contracts/constraints/execution.step.max_count"),
         Some(&serde_json::json!(crate::args::MAX_SYNC_ADVANCE_COUNT))
     );
-    assert_eq!(
-        value.pointer("/contracts/constraints/execution.run_frames.max_frames"),
-        Some(&serde_json::json!(crate::args::MAX_SYNC_ADVANCE_COUNT))
-    );
+    assert!(value
+        .pointer("/contracts/constraints/execution.run_frames.max_frames")
+        .is_none());
+    assert!(!value["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|method| method == "run_frames" || method == "wait_for_running_frames"));
 }
 
 #[test]
@@ -106,10 +138,463 @@ fn synchronous_advance_uses_smaller_adapter_frame_limit() {
         value.pointer("/contracts/constraints/execution.step.max_count"),
         Some(&serde_json::json!(5_000))
     );
+    assert!(value
+        .pointer("/contracts/constraints/execution.run_frames.max_frames")
+        .is_none());
+}
+
+#[test]
+fn recording_status_projects_only_the_negotiated_generic_capability() {
+    use emucap::bundle::recording_manifest::RecordingLimits;
+    use emucap::live::recording_capability::{
+        RecordingCapability, RecordingCapabilityOrigin, RecordingCapabilityUnit,
+        RecordingEventCapability,
+    };
+
+    let capability = RecordingCapability {
+        revision: emucap::live::recording_capability::INITIAL_RECORDING_CAPABILITY_REVISION.into(),
+        origins: vec![RecordingCapabilityOrigin::NextFrameBoundary],
+        units: vec![RecordingCapabilityUnit::Frames],
+        default_event_classes: vec!["frame_boundary".into()],
+        event_classes: vec![RecordingEventCapability {
+            id: "frame_boundary".into(),
+            contract_sha256: "498fcd52f2fa2327e0af9e9730b4314f0854a6047f57dcde16961b8a4ecb80cd"
+                .into(),
+            clock_domains: vec!["frame".into()],
+            exact: true,
+            stoppable: false,
+            startable: false,
+        }],
+        event_order: None,
+        class_accounting: false,
+        input_movie: None,
+        initial_snapshots: None,
+        terminal_snapshots: None,
+        terminal_state: None,
+        warmup: None,
+        limits: RecordingLimits {
+            max_frames: 300,
+            max_events: 100_000,
+            max_bytes: 64 * 1024 * 1024,
+            max_line_bytes: 64 * 1024,
+            max_host_ms: 30_000,
+            progress_interval_ms: 250,
+        },
+    };
+    let mut value = serde_json::json!({"connected": true});
+    enrich_recording_capability(&mut value, Some(&capability));
     assert_eq!(
-        value.pointer("/contracts/constraints/execution.run_frames.max_frames"),
-        Some(&serde_json::json!(49))
+        value.pointer("/recording_capability/origins/0"),
+        Some(&serde_json::json!("next_frame_boundary"))
     );
+    assert_eq!(
+        value.pointer("/recording_capability/limits/max_frames"),
+        Some(&serde_json::json!(300))
+    );
+    let encoded = serde_json::to_string(&value).unwrap().to_ascii_lowercase();
+    assert!(!encoded.contains("mesen"));
+    assert!(!encoded.contains("snes"));
+
+    let mut absent = serde_json::json!({"connected": true});
+    enrich_recording_capability(&mut absent, None);
+    assert!(absent.get("recording_capability").is_none());
+}
+
+struct RecordingStatusLink {
+    caps: emucap::live::link::Capabilities,
+    port: Option<u16>,
+    binding: emucap::live::continuity::RuntimeBindingState,
+}
+
+impl EmulatorLink for RecordingStatusLink {
+    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        Err(LinkError::NotConnected)
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        self.port
+    }
+
+    fn continuity(&self) -> emucap::live::continuity::ContinuitySnapshot {
+        let mut continuity = emucap::live::continuity::ContinuitySnapshot::default();
+        continuity.runtime_binding.state = self.binding;
+        continuity
+    }
+}
+
+#[test]
+fn connected_status_exposes_recording_only_for_a_bound_direct_generation() {
+    use emucap::bundle::recording_manifest::RecordingLimits;
+    use emucap::live::recording_capability::{
+        RecordingCapability, RecordingCapabilityOrigin, RecordingCapabilityUnit,
+        RecordingEventCapability,
+    };
+
+    let capability = RecordingCapability {
+        revision: emucap::live::recording_capability::INITIAL_RECORDING_CAPABILITY_REVISION.into(),
+        origins: vec![RecordingCapabilityOrigin::NextFrameBoundary],
+        units: vec![RecordingCapabilityUnit::Frames],
+        default_event_classes: vec!["frame_boundary".into()],
+        event_classes: vec![RecordingEventCapability {
+            id: "frame_boundary".into(),
+            contract_sha256: "498fcd52f2fa2327e0af9e9730b4314f0854a6047f57dcde16961b8a4ecb80cd"
+                .into(),
+            clock_domains: vec!["frame".into()],
+            exact: true,
+            stoppable: false,
+            startable: false,
+        }],
+        event_order: None,
+        class_accounting: false,
+        input_movie: None,
+        initial_snapshots: None,
+        terminal_snapshots: None,
+        terminal_state: None,
+        warmup: None,
+        limits: RecordingLimits {
+            max_frames: 300,
+            max_events: 100_000,
+            max_bytes: 64 * 1024 * 1024,
+            max_line_bytes: 64 * 1024,
+            max_host_ms: 30_000,
+            progress_interval_ms: 250,
+        },
+    };
+    let caps = emucap::live::link::Capabilities {
+        protocol_version: 1,
+        methods: vec!["status".into(), "record_window".into()],
+        memory_types: vec![],
+        memory_regions: vec![],
+        breakpoint_kinds: vec![],
+        contracts: emucap::contracts::ContractAdvertisement::Unreported,
+        recording: Some(capability),
+        identity: EmulatorIdentity::default(),
+    };
+
+    for (port, binding, exposed) in [
+        (
+            Some(47800),
+            emucap::live::continuity::RuntimeBindingState::Bound,
+            true,
+        ),
+        (
+            None,
+            emucap::live::continuity::RuntimeBindingState::Bound,
+            false,
+        ),
+        (
+            Some(47800),
+            emucap::live::continuity::RuntimeBindingState::Unmanaged,
+            false,
+        ),
+    ] {
+        let link = RecordingStatusLink {
+            caps: caps.clone(),
+            port,
+            binding,
+        };
+        let mut value = serde_json::json!({"connected": true});
+        enrich_connected_status(&mut value, &link);
+        assert_eq!(
+            value.get("recording_capability").is_some(),
+            exposed,
+            "port={port:?} binding={binding:?}"
+        );
+    }
+}
+
+#[test]
+fn recording_capture_status_is_bounded_and_omits_private_staging_paths() {
+    use emucap::live::capture_capsule::{
+        CaptureCapsule, CaptureLeaseIdentity, CaptureState, FilesystemIdentity,
+    };
+
+    let mut capsule = CaptureCapsule {
+        schema_version: 1,
+        capture_id: "capture-test".into(),
+        launch_id: "launch-test".into(),
+        request_digest_sha256: "11".repeat(32),
+        capability_revision: "22".repeat(32),
+        output_root: "/private/evidence".into(),
+        destination_path: "/private/evidence/capture-test".into(),
+        staging_path: "/private/evidence/.capture-test.staging-secret".into(),
+        output_root_identity: FilesystemIdentity {
+            canonical_path: "/private/evidence".into(),
+            device: Some(1),
+            inode: Some(2),
+        },
+        staging_identity: FilesystemIdentity {
+            canonical_path: "/private/evidence/.capture-test.staging-secret".into(),
+            device: Some(1),
+            inode: Some(3),
+        },
+        lease: CaptureLeaseIdentity::current(),
+        state: CaptureState::Recording,
+        progress: None,
+        terminal: None,
+        created_at_unix_ms: 1,
+        updated_at_unix_ms: 2,
+    };
+
+    let projection = recording_capture_projection(&capsule);
+    assert_eq!(projection["state"], serde_json::json!("recording"));
+    assert_eq!(projection["capture_id"], serde_json::json!("capture-test"));
+    let encoded = serde_json::to_string(&projection).unwrap();
+    assert!(!encoded.contains("staging"));
+    assert!(!encoded.contains("/private/evidence"));
+    assert!(encoded.len() < 1024);
+
+    capsule.state = CaptureState::PublicationFailed;
+    capsule.terminal = Some(emucap::live::capture_capsule::CaptureTerminalSummary {
+        operation_outcome: emucap::bundle::recording_manifest::OperationOutcome::Failed,
+        execution_outcome: emucap::bundle::recording_manifest::ExecutionOutcome::AdapterError,
+        integrity: emucap::bundle::recording_manifest::Integrity::Unverifiable,
+        publication: emucap::bundle::recording_manifest::PublicationOutcome::Failed,
+        final_execution_state: emucap::bundle::recording_manifest::FinalExecutionState::Frozen,
+        final_frame: 3,
+        counters: emucap::bundle::recording_manifest::RecordingCounters {
+            frames: 2,
+            events: 2,
+            bytes: 256,
+            dropped: 0,
+        },
+        cleanup: emucap::bundle::recording_manifest::CleanupFacts {
+            hooks: emucap::bundle::recording_manifest::CleanupState::Released,
+            transient_input: emucap::bundle::recording_manifest::CleanupState::NotAcquired,
+            sink: emucap::bundle::recording_manifest::CleanupState::Released,
+        },
+        stop_event: None,
+        bundle_path: Some(format!("/evidence/{}", "x".repeat(5000))),
+        manifest_sha256: Some("11".repeat(32)),
+        reason: Some("failure ".repeat(1000)),
+    });
+    let terminal_projection = recording_capture_projection(&capsule);
+    let encoded = serde_json::to_string(&terminal_projection).unwrap();
+    assert!(encoded.len() < 2048);
+    assert_eq!(
+        terminal_projection.pointer("/terminal/bundle_path_omitted"),
+        Some(&serde_json::json!(true))
+    );
+    assert!(terminal_projection["terminal"]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.ends_with("...") && reason.len() <= 515));
+}
+
+#[cfg(unix)]
+struct ReconnectingRecordingLink {
+    caps: emucap::live::link::Capabilities,
+    store: emucap::live::runtime::RuntimeStore,
+    port: u16,
+    launch_id: String,
+    capture_id: String,
+}
+
+#[cfg(unix)]
+impl EmulatorLink for ReconnectingRecordingLink {
+    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        assert_eq!(method, "status");
+        Ok(serde_json::json!({
+            "connected": true,
+            "recording": {
+                "last": {
+                    "capture_id": self.capture_id,
+                    "operation_outcome": "failed",
+                    "execution_outcome": "adapter_error",
+                    "integrity": "unverifiable",
+                    "final_execution_state": "frozen",
+                    "final_frame": 42,
+                    "counters": {"frames": 2, "events": 2, "bytes": 256, "dropped": 0},
+                    "cleanup": {
+                        "hooks": "released",
+                        "transient_input": "not_acquired",
+                        "sink": "released"
+                    },
+                    "reason": "connection_closed"
+                }
+            }
+        }))
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(self.port)
+    }
+
+    fn acquire_control_lease(
+        &mut self,
+        expected_launch_id: &str,
+    ) -> Result<emucap::live::runtime::LeaseView, LinkError> {
+        assert_eq!(expected_launch_id, self.launch_id);
+        let current = emucap::live::capture_capsule::CaptureLeaseIdentity::current();
+        let current_for_record = current.clone();
+        self.store
+            .update_link_json(
+                self.port,
+                &self.launch_id,
+                move |record: Option<emucap::live::continuity::LinkRecord>| {
+                    let mut record = record.expect("test link record");
+                    record.lease = Some(emucap::live::runtime::LeaseRecord {
+                        control_session_key: current_for_record.control_session_key,
+                        holder: current_for_record.holder,
+                        acquired_at_unix_ms: 2,
+                        refreshed_at_unix_ms: 2,
+                    });
+                    Ok(record)
+                },
+            )
+            .unwrap();
+        Ok(emucap::live::runtime::LeaseView {
+            state: emucap::live::runtime::LeaseState::Held,
+            holder_pid: Some(current.holder.pid),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn connected_status_reconciles_an_abandoned_exact_generation_capture() {
+    use emucap::live::capture_capsule::{
+        CaptureCapsuleRepository, CaptureLeaseIdentity, CapturePreparation, CaptureState,
+    };
+    use emucap::live::continuity::{LinkRecord, TransportState};
+    use emucap::live::runtime::{capture_process, LeaseRecord, ManifestSpec, RuntimeStore};
+
+    let temp = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let port = 47800;
+    let prepared = store.prepare(port).unwrap();
+    let launch_id = prepared.launch_id().to_string();
+    prepared
+        .commit(&prepared.manifest(ManifestSpec {
+            adapter: "synthetic-recording".into(),
+            system: "test".into(),
+            content: "/content/test.rom".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: Some("test-build".into()),
+        }))
+        .unwrap();
+
+    let mut former = std::process::Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let former_lease = CaptureLeaseIdentity {
+        control_session_key: Some("former-controller".into()),
+        holder: capture_process(former.id()),
+    };
+    former.wait().unwrap();
+    let record = LinkRecord {
+        schema_version: 1,
+        launch_id: launch_id.clone(),
+        lease: Some(LeaseRecord {
+            control_session_key: former_lease.control_session_key.clone(),
+            holder: former_lease.holder.clone(),
+            acquired_at_unix_ms: 1,
+            refreshed_at_unix_ms: 1,
+        }),
+        last_identity: None,
+        last_response_unix_ms: None,
+        last_method: None,
+        last_status: None,
+        transport_state: TransportState::Disconnected,
+        consecutive_timeouts: 0,
+        last_failure: None,
+        truncated: false,
+        updated_at_unix_ms: 1,
+    };
+    store
+        .update_link_json(port, &launch_id, move |_| Ok(record))
+        .unwrap();
+
+    let capture_id = "capture-reconnect";
+    let staging_path = output.path().join(format!(".{capture_id}.staging-test"));
+    std::fs::create_dir(&staging_path).unwrap();
+    let repository = CaptureCapsuleRepository::new(store.clone(), port, &launch_id);
+    repository
+        .create(CapturePreparation {
+            capture_id: capture_id.into(),
+            request_digest_sha256: "11".repeat(32),
+            capability_revision: "22".repeat(32),
+            output_root: output.path().to_path_buf(),
+            destination_path: output.path().join(capture_id),
+            staging_path: staging_path.clone(),
+            lease: former_lease,
+        })
+        .unwrap();
+    repository
+        .transition(
+            capture_id,
+            CaptureState::Prepared,
+            CaptureState::Arming,
+            None,
+        )
+        .unwrap();
+    repository
+        .transition(capture_id, CaptureState::Arming, CaptureState::Armed, None)
+        .unwrap();
+    repository
+        .transition(
+            capture_id,
+            CaptureState::Armed,
+            CaptureState::Recording,
+            None,
+        )
+        .unwrap();
+
+    let caps = emucap::live::link::Capabilities {
+        protocol_version: 1,
+        methods: vec!["status".into()],
+        memory_types: vec![],
+        memory_regions: vec![],
+        breakpoint_kinds: vec![],
+        contracts: emucap::contracts::ContractAdvertisement::Unreported,
+        recording: None,
+        identity: EmulatorIdentity {
+            launch_id: Some(launch_id.clone()),
+            ..EmulatorIdentity::default()
+        },
+    };
+    let mut link = ReconnectingRecordingLink {
+        caps,
+        store: store.clone(),
+        port,
+        launch_id: launch_id.clone(),
+        capture_id: capture_id.into(),
+    };
+
+    assert!(reconcile_connected_recording_with_store(&mut link, store).unwrap());
+    let recovered = repository.read().unwrap().unwrap();
+    assert_eq!(recovered.state, CaptureState::PublicationFailed);
+    let terminal = recovered.terminal.unwrap();
+    assert!(terminal
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("abandoned staging"));
+    assert!(!staging_path.exists());
+    assert!(std::fs::read_dir(output.path()).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with(".capture-reconnect.invalid-")));
 }
 
 #[test]
@@ -385,6 +870,65 @@ impl EmulatorLink for NotConnectedLink {
     }
 }
 
+struct LazySelectedPortLink {
+    caps: emucap::live::link::Capabilities,
+    bound: bool,
+}
+
+impl EmulatorLink for LazySelectedPortLink {
+    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        self.bound = true;
+        Err(LinkError::NotConnected)
+    }
+
+    fn base_port(&self) -> Option<u16> {
+        Some(47800)
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        self.bound.then_some(47801)
+    }
+
+    fn session_token(&self) -> Option<&str> {
+        Some("selected-port-token")
+    }
+}
+
+#[test]
+fn status_reports_the_port_selected_during_lazy_binding() {
+    let mut link = LazySelectedPortLink {
+        caps: emucap::live::link::Capabilities::empty(),
+        bound: false,
+    };
+
+    let observation = observe_control_state(&mut link).unwrap();
+
+    assert_eq!(observation.status["base_port"], 47800);
+    assert_eq!(observation.status["listening_port"], 47801);
+    assert_eq!(observation.runtime.listener, ListenerState::Bound);
+}
+
+#[test]
+fn bootstrap_distinguishes_the_search_base_from_the_selected_listener() {
+    let mut link = LazySelectedPortLink {
+        caps: emucap::live::link::Capabilities::empty(),
+        bound: false,
+    };
+
+    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+
+    assert_eq!(value["listener"]["base_port"], 47800);
+    assert_eq!(value["listener"]["port"], 47801);
+}
+
 #[test]
 fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
     let mut link = NotConnectedLink {
@@ -392,8 +936,10 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
             protocol_version: 1,
             methods: vec![],
             memory_types: vec![],
+            memory_regions: vec![],
             breakpoint_kinds: vec![],
             contracts: emucap::contracts::ContractAdvertisement::Unreported,
+            recording: None,
             identity: EmulatorIdentity::default(),
         },
     };
@@ -924,6 +1470,30 @@ fn enrich_status_value_no_memory_types_when_empty() {
     let mut v = serde_json::json!({"connected": true});
     enrich_status_value(&mut v, &["status".to_string()], &[], None);
     assert!(v.get("memory_types").is_none());
+}
+
+#[test]
+fn enrich_memory_regions_exposes_only_exact_advertised_regions() {
+    use emucap::live::link::MemoryRegion;
+
+    let regions = vec![MemoryRegion {
+        memory_type: "workram".into(),
+        size: 0x20_000,
+    }];
+    let mut connected = serde_json::json!({"connected": true});
+    enrich_memory_regions(&mut connected, &regions);
+    assert_eq!(
+        connected["memory_regions"],
+        serde_json::json!([{"memory_type": "workram", "size": 0x20_000}])
+    );
+
+    let mut disconnected = serde_json::json!({"connected": false});
+    enrich_memory_regions(&mut disconnected, &regions);
+    assert!(disconnected.get("memory_regions").is_none());
+
+    let mut legacy = serde_json::json!({"connected": true});
+    enrich_memory_regions(&mut legacy, &[]);
+    assert!(legacy.get("memory_regions").is_none());
 }
 
 #[test]

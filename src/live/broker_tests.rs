@@ -77,11 +77,13 @@ fn fake_mesen_emu(
                 "ok": true,
                 "result": {
                     "protocol_version": 1,
-                    "methods": ["status"],
+                    "methods": ["status", "record_window", "abort_recording"],
                     "name": name,
                     "adapter": "mesen2-live",
                     "mesen_host_api": 1,
                     "host_features": host_features,
+                    "memory_types": ["workram"],
+                    "memory_regions": [{"memory_type": "workram", "size": 131072}],
                     "breakpoint_kinds": [{
                         "kind": "device_boundary",
                         "range_unit": "scanline",
@@ -91,6 +93,26 @@ fn fake_mesen_emu(
                     "host_build": {
                         "upstream_commit": "0123456789abcdef0123456789abcdef01234567",
                         "patchset_sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+                    },
+                    "recording": {
+                        "revision": super::recording_capability::INITIAL_RECORDING_CAPABILITY_REVISION,
+                        "origins": ["next_frame_boundary"],
+                        "units": ["frames"],
+                        "default_event_classes": ["frame_boundary"],
+                        "event_classes": [{
+                            "id": "frame_boundary",
+                            "contract_sha256": "498fcd52f2fa2327e0af9e9730b4314f0854a6047f57dcde16961b8a4ecb80cd",
+                            "clock_domains": ["frame"],
+                            "exact": true
+                        }],
+                        "limits": {
+                            "max_frames": 300,
+                            "max_events": 100000,
+                            "max_bytes": 67108864,
+                            "max_line_bytes": 65536,
+                            "max_host_ms": 30000,
+                            "progress_interval_ms": 250
+                        }
                     }
                 }
             })
@@ -224,6 +246,10 @@ fn broker_forwards_mesen_native_halt_identity() {
         serde_json::json!(["code_break_idle", "native_halt_service"])
     );
     assert_eq!(
+        result["memory_regions"],
+        serde_json::json!([{"memory_type": "workram", "size": 131072}])
+    );
+    assert_eq!(
         result["breakpoint_kinds"],
         serde_json::json!([{
             "kind": "device_boundary",
@@ -235,6 +261,10 @@ fn broker_forwards_mesen_native_halt_identity() {
     assert_eq!(
         result["host_build"]["upstream_commit"],
         "0123456789abcdef0123456789abcdef01234567"
+    );
+    assert_eq!(
+        result["recording"]["default_event_classes"],
+        serde_json::json!(["frame_boundary"])
     );
     emulator.join().unwrap();
 }

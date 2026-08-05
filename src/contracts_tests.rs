@@ -10,6 +10,52 @@ fn embedded_contract_sources_validate() {
 }
 
 #[test]
+fn multi_operation_public_feature_can_expose_each_method_directly() {
+    let mut catalog = catalog().clone();
+    let feature = catalog
+        .features
+        .iter_mut()
+        .find(|feature| feature.id == "debug.breakpoint")
+        .unwrap();
+    feature.route = None;
+
+    let errors = validate_sources(&catalog, registry());
+    assert!(errors.is_empty(), "{errors:#?}");
+}
+
+#[test]
+fn internal_wire_features_cannot_leak_into_an_mcp_route() {
+    let mut catalog = catalog().clone();
+    let feature = catalog
+        .features
+        .iter_mut()
+        .find(|feature| feature.id == "transport.hello")
+        .unwrap();
+    feature.route = Some("debug".into());
+
+    let errors = validate_sources(&catalog, registry());
+    assert!(errors
+        .iter()
+        .any(|error| error == "non-public feature transport.hello cannot declare an MCP route"));
+}
+
+#[test]
+fn public_features_can_use_only_declared_role_drawers() {
+    let mut catalog = catalog().clone();
+    let feature = catalog
+        .features
+        .iter_mut()
+        .find(|feature| feature.id == "memory.write")
+        .unwrap();
+    feature.route = Some("platform_extras".into());
+
+    let errors = validate_sources(&catalog, registry());
+    assert!(errors
+        .iter()
+        .any(|error| error == "unknown public route platform_extras for memory.write"));
+}
+
+#[test]
 fn every_method_has_exactly_one_feature_owner() {
     let mut owners = BTreeMap::new();
     for feature in &catalog().features {
@@ -52,6 +98,19 @@ fn known_scoped_advertisement_validates() {
 }
 
 #[test]
+fn public_step_and_compatibility_execution_methods_have_contract_owners() {
+    let value = advertisement_value(&[]);
+    let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+    let methods = ["step", "run_frames", "step_instructions"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let status = validate_advertisement(&ad, Some("adapter"), Some("system"), &methods);
+    assert_eq!(status.state, "validated", "{:?}", status.errors);
+}
+
+#[test]
 fn dolphin_native_advertisement_exposes_its_composition_limits() {
     let value = advertisement_value(&[
         "dolphin.breakpoint.exact-exec-only",
@@ -65,7 +124,6 @@ fn dolphin_native_advertisement_exposes_its_composition_limits() {
     let methods = [
         "status",
         "step",
-        "step_instructions",
         "set_breakpoint",
         "set_input",
         "save_state",

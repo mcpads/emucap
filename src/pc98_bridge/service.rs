@@ -1,7 +1,8 @@
 use super::*;
 
 impl<G: GdbTransport> Bridge<G> {
-    pub(super) fn hello(&self) -> BridgeResult<Value> {
+    pub(super) fn hello(&mut self) -> BridgeResult<Value> {
+        let media = self.media_status()?;
         let mut result = json!({
             "protocol_version": PROTOCOL_VERSION,
             "system": "pc98",
@@ -10,6 +11,7 @@ impl<G: GdbTransport> Bridge<G> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": memory_type_names(),
+            "media_devices": media.devices,
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
                 {"kind":"read", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
@@ -63,6 +65,7 @@ impl<G: GdbTransport> Bridge<G> {
 
     pub(super) fn status(&mut self) -> BridgeResult<Value> {
         self.drain_stop()?;
+        let media = self.media_status()?;
         let mut input_buttons = input_buttons_json();
         let available = self.refresh_input_fields();
         if let Some(obj) = input_buttons.as_object_mut() {
@@ -78,6 +81,8 @@ impl<G: GdbTransport> Bridge<G> {
             "frame": self.current_frame(),
             "state": if self.frozen { "frozen" } else { "running" },
             "memory_types": memory_type_names(),
+            "media_devices": media.devices,
+            "mounted_media": media.mounted,
             "contracts": crate::contracts::advertisement_value(&[
                 "pc98.call-stack.best-effort",
                 "pc98.input-hold.port-zero-only",

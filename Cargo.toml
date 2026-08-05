@@ -1,6 +1,6 @@
 [package]
 name = "emucap"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["mcpads"]
@@ -66,8 +66,8 @@ sha1 = "0.11"
 sha2 = "0.11"
 hex = "0.4"
 base64 = "0.23"
-rmcp = { version = "3.0.1", features = ["server", "transport-io", "macros"] }
-tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+rmcp = { version = "3.1.0", features = ["server", "transport-io", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-std", "time", "sync"] }
 schemars = "1.2.1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 ulid = "3"

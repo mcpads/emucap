@@ -33,6 +33,8 @@ mod media;
 mod openmsx;
 #[path = "launch/plan.rs"]
 mod plan;
+#[path = "launch/recording.rs"]
+mod recording;
 #[path = "launch/run.rs"]
 mod run;
 #[path = "launch/system.rs"]

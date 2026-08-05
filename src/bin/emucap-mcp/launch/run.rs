@@ -205,6 +205,14 @@ pub(crate) fn make_launch(
         }
     }
 
+    if let Some(current) = previous.as_ref() {
+        if let Some(rejection) =
+            super::recording::reconcile_previous_capture(link, &store, port, current)
+        {
+            return rejection;
+        }
+    }
+
     let refreshed = match store.read_current(port) {
         Ok(current) => current,
         Err(error) => {
@@ -1110,6 +1118,9 @@ pub(super) fn launch_mednafen(
         return serde_json::json!({ "launched": false, "reason": "Mednafen binary was not found; build it with adapters/mednafen/build.sh or set MEDNAFEN_BIN" });
     };
     let log = adapter_log_path("mednafen", port, "mednafen.log");
+    let host_build = emucap::launch::mednafen::read_build_metadata(&binary)
+        .ok()
+        .flatten();
     let sound = a.sound.unwrap_or(false);
     let display = a.display.unwrap_or(false);
     let spec = emucap::launch::mednafen::Launch {
@@ -1135,6 +1146,7 @@ pub(super) fn launch_mednafen(
             "pid": pid,
             "port": port,
             "binary": binary.display().to_string(),
+            "host_build": host_build,
             "log": log.display().to_string(),
             "next_action": "launch returns after the adapter connects",
         }),

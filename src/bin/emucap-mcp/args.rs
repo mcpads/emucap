@@ -105,6 +105,108 @@ pub(crate) struct StatusArgs {
     pub(crate) known_capability_revision: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowLimitsArgs {
+    /// Narrow the advertised event-record limit.
+    #[serde(default)]
+    pub(crate) max_events: Option<u64>,
+    /// Narrow the advertised event-byte limit.
+    #[serde(default)]
+    pub(crate) max_bytes: Option<u64>,
+    /// Narrow the advertised adapter deadline; publication follows guest closure.
+    #[serde(default)]
+    pub(crate) max_host_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordWindowOriginArgs {
+    NextFrameBoundary,
+    ResetRelease,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowStopArgs {
+    /// Selected stoppable event class.
+    pub(crate) event_class: String,
+    /// Positive occurrence within the frame bound.
+    pub(crate) occurrence: u64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowStartArgs {
+    /// Selected exact event class that begins observation at its first occurrence.
+    pub(crate) event_class: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowArgs {
+    /// Existing absolute directory; Core creates one capture child.
+    pub(crate) output_root: String,
+    /// Guest frames to capture; returns frozen.
+    pub(crate) frames: u64,
+    /// Guest frames before selected observation-only classes are armed.
+    #[serde(default)]
+    pub(crate) warmup_frames: u64,
+    /// Advertised event-class IDs; omit for defaults.
+    #[serde(default)]
+    pub(crate) event_classes: Vec<String>,
+    /// Advertised origin; omit for next_frame_boundary.
+    #[serde(default)]
+    pub(crate) origin: Option<RecordWindowOriginArgs>,
+    /// Absolute dense movie path; check live capability.
+    #[serde(default)]
+    pub(crate) input_path: Option<String>,
+    /// Selected stoppable event occurrence.
+    #[serde(default)]
+    pub(crate) stop_on: Option<RecordWindowStopArgs>,
+    /// Begin observation at the first occurrence of this selected startable event.
+    #[serde(default)]
+    pub(crate) start_on: Option<RecordWindowStartArgs>,
+    /// Callback-safe memory ranges captured at the exact event-aligned start.
+    #[serde(default)]
+    pub(crate) initial_snapshots: Vec<RecordWindowInitialSnapshotArgs>,
+    /// Bounded frozen-terminal reads from `status.memory_regions`.
+    #[serde(default)]
+    pub(crate) terminal_snapshots: Vec<RecordWindowTerminalSnapshotArgs>,
+    /// Advertised frozen-terminal state profile to preserve as one hashed JSON member.
+    #[serde(default)]
+    pub(crate) terminal_state_profile: Option<String>,
+    /// Optional narrower advertised limits.
+    #[serde(default)]
+    pub(crate) limits: Option<RecordWindowLimitsArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowTerminalSnapshotArgs {
+    /// Safe bundle member label.
+    pub(crate) label: String,
+    /// Live memory type.
+    pub(crate) memory_type: String,
+    /// Region-relative offset.
+    pub(crate) address: Num,
+    /// Byte length.
+    pub(crate) length: Num,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowInitialSnapshotArgs {
+    /// Safe bundle member label.
+    pub(crate) label: String,
+    /// Callback-safe memory type advertised by the recording capability.
+    pub(crate) memory_type: String,
+    /// Region-relative offset.
+    pub(crate) address: Num,
+    /// Byte length.
+    pub(crate) length: Num,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadMemoryArgs {
@@ -147,9 +249,26 @@ pub(crate) struct DisassembleArgs {
     /// Write JSON results to this path and return a summary. Omit for inline results.
     #[serde(default)]
     pub(crate) output_path: Option<String>,
+    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
+    /// Omit for the backend's default core.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
+    /// Instruction-set mode when the backend supports an override, for example
+    /// NDS `arm`, `thumb`, or `auto`. Omit for automatic selection.
+    #[serde(default)]
+    pub(crate) mode: Option<String>,
 }
 fn default_disas_count() -> u64 {
     8
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CallStackArgs {
+    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
+    /// Omit for the backend's default core.
+    #[serde(default)]
+    pub(crate) cpu: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -251,6 +370,39 @@ pub(crate) struct TouchArgs {
     pub(crate) release: bool,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HoldTouchArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+    /// Lower touchscreen X coordinate (0-255).
+    pub(crate) x: u64,
+    /// Lower touchscreen Y coordinate (0-191).
+    pub(crate) y: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReleaseTouchArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PulseTouchArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+    /// Lower touchscreen X coordinate (0-255).
+    pub(crate) x: u64,
+    /// Lower touchscreen Y coordinate (0-191).
+    pub(crate) y: u64,
+    /// Frames for which to hold the touch before releasing it. This operation
+    /// leaves guest execution running.
+    #[serde(deserialize_with = "deser_input_frames")]
+    pub(crate) frames: u64,
+}
+
 fn two() -> u64 {
     2
 }
@@ -294,6 +446,22 @@ pub(crate) struct PathArgs {
     pub(crate) path: String,
 }
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ChangeMediaArgs {
+    /// Device identifier from status.media_devices, for example `flop1`.
+    pub(crate) device: String,
+    /// Absolute path to an existing media image. Mutually exclusive with eject=true.
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+    /// Eject the current image. Mutually exclusive with path.
+    #[serde(default)]
+    pub(crate) eject: bool,
+    /// Optional SHA-1 precondition checked by the adapter immediately before mounting.
+    #[serde(default)]
+    pub(crate) expected_sha1: Option<String>,
+}
+
 /// Common bound for one synchronous frame or instruction advance. At 60 fps, 5,000 frames take
 /// about 83 seconds, leaving cleanup time before the 300-second deferred deadline. Bridges that
 /// step one instruction at a time also receive a finite work bound. Callers split longer travel
@@ -328,12 +496,6 @@ fn deser_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::
     Ok(n)
 }
 
-#[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RunFramesArgs {
-    #[serde(deserialize_with = "deser_frame_count")]
-    pub(crate) n: u64,
-}
 fn one() -> u64 {
     1
 }
@@ -356,6 +518,19 @@ pub(crate) struct StepArgs {
     /// Omit for the default core. Single-core backends ignore this field.
     #[serde(default)]
     pub(crate) cpu: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RoutedOperationArgs {
+    /// Call `describe` first, then use one operation returned by that response.
+    pub(crate) operation: String,
+    /// Exact object matching the selected operation's returned schema.
+    #[serde(default)]
+    pub(crate) arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Capability revision returned by this drawer's describe response.
+    #[serde(default)]
+    pub(crate) known_capability_revision: Option<String>,
 }
 /// CPU selection for pause and resume.
 #[derive(Deserialize, JsonSchema)]
@@ -384,10 +559,8 @@ pub(crate) struct BreakpointArgs {
     pub(crate) pause_on_hit: bool,
     #[serde(default)]
     pub(crate) auto_savestate: bool,
-    /// Optional lower PC filter for read, write, or exec breakpoints. Break only
-    /// when the causing instruction PC is within [pc_min, pc_max]. PC semantics
-    /// match get_state `cpu.pc`. For kind=dma this field is the lower VRAM-address
-    /// filter. Supply pc_max with it.
+    /// Inclusive causing-PC lower bound; supply pc_max too. For dma, this filters
+    /// the VRAM-address range.
     #[serde(default)]
     pub(crate) pc_min: Option<Num>,
     /// Upper PC filter supplied with pc_min. For kind=dma, upper VRAM address.
@@ -404,10 +577,8 @@ pub(crate) struct BreakpointArgs {
     /// Compared value width in bytes, from 1 to 4. Default: 1.
     #[serde(default)]
     pub(crate) value_len: Option<Num>,
-    /// Memory slices to capture atomically at the hit, each formatted as
-    /// "memory_type:address:length", for example "snesWorkRam:0x68:3". The event
-    /// preserves hit-time snapshot and register data without post-freeze drift.
-    /// Check support in `status.breakpoint_kinds`.
+    /// Hit-time atomic memory slices as "memory_type:address:length". Check
+    /// support in status.breakpoint_kinds.
     #[serde(default)]
     pub(crate) snapshot: Vec<String>,
 }
@@ -583,10 +754,8 @@ pub(crate) struct LaunchArgs {
     /// Optional connection name exposed as `status.emulator_identity.name`.
     #[serde(default)]
     pub(crate) name: Option<String>,
-    /// Show a native HITL window for human viewing and input while an agent uses
-    /// the debugger. Supported adapters select their graphical frontend; macOS
-    /// keeps the display awake while the window lives. Default: false (headless).
-    /// Adapters without HITL display support ignore this field.
+    /// Show an isolated native HITL window when supported. Default: false;
+    /// unsupported adapters ignore this field.
     #[serde(default)]
     pub(crate) display: Option<bool>,
     /// Enable audio output independently of display. Currently supported by

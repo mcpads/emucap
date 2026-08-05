@@ -9,7 +9,7 @@ use super::continuity::{
     lease_view, ExecutionState, LinkRecord, RuntimeBindingState, TransportState,
 };
 use super::link::EmulatorLink;
-use super::runtime::{capture_process, LeaseState, ProcessState, RuntimeStore};
+use super::runtime::{capture_process, LeaseState, ProcessState, RuntimeStore, TerminationState};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +43,7 @@ pub struct RuntimeObservation {
     pub runtime_binding: RuntimeBindingState,
     pub adapter_connected: bool,
     pub control_observation_uncertain: bool,
+    pub termination_completed: bool,
     pub failure_context_available: bool,
     pub runtime_metadata_valid: bool,
     pub runtime_candidate_count: usize,
@@ -59,6 +60,7 @@ impl RuntimeObservation {
             runtime_binding: RuntimeBindingState::Unobserved,
             adapter_connected: false,
             control_observation_uncertain: false,
+            termination_completed: false,
             failure_context_available: false,
             runtime_metadata_valid: true,
             runtime_candidate_count: 0,
@@ -85,6 +87,7 @@ pub fn observe_runtime(
         runtime_binding: continuity.runtime_binding.state,
         adapter_connected,
         control_observation_uncertain: false,
+        termination_completed: false,
         failure_context_available: continuity.evidence.failure_context_available,
         runtime_metadata_valid: !continuity
             .runtime_diagnostics
@@ -112,6 +115,15 @@ pub fn observe_runtime(
         emulator: current.process_state(),
         bridge: current.bridge_process_state(),
     });
+    observation.termination_completed = match store.read_termination(port, &current.launch_id) {
+        Ok(termination) => termination
+            .as_ref()
+            .is_some_and(|termination| termination.state == TerminationState::Completed),
+        Err(_) => {
+            observation.runtime_metadata_valid = false;
+            return observation;
+        }
+    };
     let record = match store.read_link_json::<LinkRecord>(port, &current.launch_id) {
         Ok(record) => record.filter(|record| record.launch_id == current.launch_id),
         Err(_) => {
@@ -207,6 +219,16 @@ fn lease_blocker(lease: EntryLeaseState) -> Option<EntryReason> {
     }
 }
 
+fn completed_terminal_generation(observation: &RuntimeObservation) -> bool {
+    observation.termination_completed
+        && observation.current.is_some_and(|current| {
+            current.emulator == ProcessState::Exited
+                && current
+                    .bridge
+                    .is_none_or(|bridge| bridge == ProcessState::Exited)
+        })
+}
+
 pub fn classify_entry(observation: &RuntimeObservation) -> EntryDisposition {
     if !observation.runtime_metadata_valid {
         return EntryDisposition::new(
@@ -225,7 +247,7 @@ pub fn classify_entry(observation: &RuntimeObservation) -> EntryDisposition {
     if observation.execution == ExecutionState::Crashed && observation.failure_context_available {
         return EntryDisposition::new(EntryState::InspectFailure, EntryReason::FailurePreserved);
     }
-    if observation.control_observation_uncertain {
+    if observation.control_observation_uncertain && !completed_terminal_generation(observation) {
         return blocked(EntryReason::TransportUncertain);
     }
     if observation.adapter_connected && observation.runtime_binding != RuntimeBindingState::Bound {

@@ -23,8 +23,10 @@ lock_value() {
 VER="$(lock_value MEDNAFEN_VERSION)"
 URL="$(lock_value MEDNAFEN_URL)"
 MEDNAFEN_SHA256="$(lock_value MEDNAFEN_SHA256)"
+MEDNAFEN_PATCHSET_SHA256="$(lock_value MEDNAFEN_PATCHSET_SHA256)"
 [ -n "$VER" ] && [ -n "$URL" ] &&
-  printf '%s' "$MEDNAFEN_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
+  printf '%s' "$MEDNAFEN_SHA256" | grep -Eq '^[0-9a-f]{64}$' &&
+  printf '%s' "$MEDNAFEN_PATCHSET_SHA256" | grep -Eq '^[0-9a-f]{64}$' || {
   echo "ERROR: invalid Mednafen upstream lock: $LOCK_FILE" >&2
   exit 1
 }
@@ -133,6 +135,7 @@ tar xf "$TARBALL" -C "$SRC" --strip-components=1
 
 # 3. emucap 소켓 클라이언트
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
+  "$HERE/emucap_recording.cpp" "$HERE/emucap_recording.h" \
   "$HERE/emucap_ngp.h" \
   "$HERE/emucap_json_num.h" "$SRC/src/drivers/"
 cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
@@ -144,11 +147,36 @@ cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
   emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+  emucap_recording.cpp emucap_recording.h \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
-printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/src/drivers/emucap_build.h"
+PATCHSET_SHA256="$({
+  for path in \
+    build.sh emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+    emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
+    emucap_recording.cpp emucap_recording.h; do
+    printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
+  done
+  for path in \
+    ../_common/emucap_native_failure.cpp \
+    ../_common/emucap_native_failure.h; do
+    printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
+  done
+} | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print $1}')"
+[ "$PATCHSET_SHA256" = "$MEDNAFEN_PATCHSET_SHA256" ] || {
+  echo "ERROR: Mednafen patch inputs do not match upstream.lock" >&2
+  echo "  expected=$MEDNAFEN_PATCHSET_SHA256" >&2
+  echo "  actual=$PATCHSET_SHA256" >&2
+  exit 1
+}
+{
+  printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH"
+  printf '#define EMUCAP_MEDNAFEN_UPSTREAM "%s"\n' "$URL"
+  printf '#define EMUCAP_MEDNAFEN_UPSTREAM_REVISION "%s@sha256:%s"\n' "$VER" "$MEDNAFEN_SHA256"
+  printf '#define EMUCAP_MEDNAFEN_PATCHSET_SHA256 "%s"\n' "$PATCHSET_SHA256"
+} > "$SRC/src/drivers/emucap_build.h"
 "$HERE/../_common/test-native-failure.sh"
 
 # 헬퍼: perl 주입 후 마커(고정 문자열)가 들어갔는지 검증. fresh 빌드가 조용히 깨지는 것을 막는다.
@@ -589,7 +617,7 @@ esac
 ./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-ngp --enable-debugger >/dev/null
 
 # 6. emucap sources를 빌드에 추가(automake 불필요 — 생성된 Makefile의 OBJECTS에 추가, 일반 .cpp.o 규칙이 컴파일)
-perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) emucap_native_failure.\$(OBJEXT) /' \
+perl -0777 -pi -e 's/(am_libmdfnsdl_a_OBJECTS = main\.\$\(OBJEXT\) )/${1}emucap.\$(OBJEXT) emucap_recording.\$(OBJEXT) emucap_native_failure.\$(OBJEXT) /' \
   src/drivers/Makefile
 # Upstream ships the TLCS disassembler sources but does not build them. Keep each source as a
 # separate object because their file-local decoder names intentionally overlap.
@@ -600,6 +628,15 @@ inject_check 'ngp/TLCS-900h/TLCS900h_disassemble.$(OBJEXT)' src/Makefile "ngp di
 # 7. 빌드
 echo "→ make"
 make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW*|MSYS*|CYGWIN*) BUILT_BINARY="$SRC/src/mednafen.exe" ;;
+  *) BUILT_BINARY="$SRC/src/mednafen" ;;
+esac
+BINARY_SHA256="$(sha256_path "$BUILT_BINARY")"
+printf '{\n  "upstream": "%s",\n  "upstream_revision": "%s@sha256:%s",\n  "patchset_sha256": "%s",\n  "binary_sha256": "%s"\n}\n' \
+  "$URL" "$VER" "$MEDNAFEN_SHA256" "$PATCHSET_SHA256" "$BINARY_SHA256" \
+  > "${BUILT_BINARY}.emucap-build.json"
 
 echo ""
 echo "✓ 빌드 완료: $SRC/src/mednafen (ss + psx + pce + pcfx + md + wswan + ngp)"

@@ -12,12 +12,18 @@ fn main() {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
-    // dirty: 커밋 안 된 변경이 있으면 -dirty 접미(재빌드 근거 있음을 표시). best-effort.
+    // dirty: tracked edits, staged changes, and untracked production files all invalidate a
+    // release/runtime-proof identity. `git diff` alone misses untracked source modules.
     let dirty = Command::new("git")
-        .args(["diff", "--quiet", "--ignore-submodules", "HEAD"])
-        .status()
-        .map(|s| !s.success())
-        .unwrap_or(false);
+        .args([
+            "status",
+            "--porcelain",
+            "--untracked-files=normal",
+            "--ignore-submodules",
+        ])
+        .output()
+        .map(|output| !output.status.success() || !output.stdout.is_empty())
+        .unwrap_or(true);
     let build = if dirty { format!("{hash}-dirty") } else { hash };
     // OUT_DIR에 hash 파일을 쓰고 소스에서 include_str!로 읽는다 — env!(cargo:rustc-env)는 build-script env
     // 변경을 소스 재컴파일에 반영 못 하는 함정이 있어 갱신된 hash가 바이너리에 안 실렸다. include_str!은 cargo가

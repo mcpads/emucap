@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::bisect::Predicate;
+pub use crate::input_movie::{parse_movie, Movie, MovieFrame};
 
 /// 케이스를 잡은 빌드 식별.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -164,45 +165,6 @@ pub fn evaluate(read: &[u8], predicate: &Predicate, expect: Expect) -> Verdict {
         (Expect::Present, true) => Verdict::Pass,
         (Expect::Present, false) => Verdict::Fail,
     }
-}
-
-/// 한 프레임의 눌린 버튼 전체 집합(델타 아님).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MovieFrame {
-    pub frame: u64,
-    pub buttons: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Movie {
-    pub frames: Vec<MovieFrame>,
-}
-
-/// `<frame>:<btn>,<btn>` 줄들을 파싱한다. 각 줄 = 그 프레임의 전체 눌림셋. 빈 줄 무시,
-/// 프레임 순 정렬. 버튼명은 소문자 트림. 명시 안 된 프레임은 입력 없음(러너가 그렇게 적용).
-pub fn parse_movie(text: &str) -> Result<Movie, String> {
-    let mut frames = Vec::new();
-    for (i, raw) in text.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let (f, btns) = line
-            .split_once(':')
-            .ok_or_else(|| format!("{}행: ':' 없음", i + 1))?;
-        let frame: u64 = f
-            .trim()
-            .parse()
-            .map_err(|_| format!("{}행: 프레임 숫자 아님: {f}", i + 1))?;
-        let buttons = btns
-            .split(',')
-            .map(|b| b.trim().to_lowercase())
-            .filter(|b| !b.is_empty())
-            .collect();
-        frames.push(MovieFrame { frame, buttons });
-    }
-    frames.sort_by_key(|f| f.frame);
-    Ok(Movie { frames })
 }
 
 /// dir/case.json에 케이스를 직렬화한다.

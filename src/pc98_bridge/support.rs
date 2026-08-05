@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn error_kind(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::BadParams(_) => "bad_params",
+        BridgeError::BadState(_) => "bad_state",
         BridgeError::UnknownMethod(_) => "unknown_method",
         BridgeError::Emulator(_) | BridgeError::Gdb(GdbError::Emulator(_)) => "emulator_error",
         BridgeError::Io(_)

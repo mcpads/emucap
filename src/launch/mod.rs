@@ -269,7 +269,10 @@ pub(crate) fn wake_display_before_gui_launch() {
 pub(crate) fn process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        pid > 0 && unsafe { libc::kill(pid, 0) == 0 }
     }
     #[cfg(windows)]
     {
@@ -320,6 +323,18 @@ where
 {
     #[cfg(unix)]
     {
+        let p = libc::pid_t::try_from(pid).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("pid {pid} is outside the platform process-id range"),
+            )
+        })?;
+        if p <= 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("pid {pid} is not a signalable process id"),
+            ));
+        }
         if !target_is_alive() {
             return Ok(TerminationMethod::AlreadyExited);
         }
@@ -327,7 +342,6 @@ where
         // (adapters/desmume-nds/README.md) SIGTERM만 보내는 종료 처리는 실패한 launch에서 프로세스를
         // orphan으로 남긴다. 종료를 잠깐 폴링한 뒤 살아있으면 SIGKILL로 강제한다(shell launcher의 kill_ours와
         // 동일 규약). Windows는 taskkill /F가 이미 강제 종료.
-        let p = pid as libc::pid_t;
         if unsafe { libc::kill(p, libc::SIGTERM) } != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {

@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::link::{Capabilities, EmulatorIdentity, EmulatorLink, LinkError};
+use super::link::{
+    AbortRequest, Capabilities, EmulatorIdentity, EmulatorLink, LinkError, ProgressCallControl,
+    ProgressObserver, WorkingProgress,
+};
 use super::protocol::{
     parse_response, read_ndjson_frame, result_status, to_line, Request, PROTOCOL_VERSION,
     STATUS_WORKING,
@@ -72,8 +75,10 @@ pub fn connect(
             protocol_version: PROTOCOL_VERSION,
             methods: vec![],
             memory_types: vec![],
+            memory_regions: vec![],
             breakpoint_kinds: vec![],
             contracts: crate::contracts::ContractAdvertisement::Unreported,
+            recording: None,
             identity: EmulatorIdentity::default(),
         },
         next_id: 1,
@@ -97,7 +102,7 @@ pub fn connect(
                 .collect()
         })
         .unwrap_or_default();
-    let memory_types = res
+    let memory_types: Vec<String> = res
         .get("memory_types")
         .and_then(|m| m.as_array())
         .map(|a| {
@@ -106,6 +111,8 @@ pub fn connect(
                 .collect()
         })
         .unwrap_or_default();
+    let memory_regions =
+        super::link::memory_regions_from_hello(res.get("memory_regions"), &memory_types)?;
     let breakpoint_kinds = res
         .get("breakpoint_kinds")
         .and_then(Value::as_array)
@@ -117,12 +124,21 @@ pub fn connect(
                 .collect()
         })
         .unwrap_or_default();
+    let registry = crate::event_contracts::EventContractRegistry::builtin()
+        .map_err(|error| LinkError::Protocol(error.to_string()))?;
+    let recording = super::recording_capability::RecordingCapability::from_hello(
+        res.get("recording"),
+        &registry,
+    )
+    .map_err(|error| LinkError::Protocol(error.to_string()))?;
     link.caps = Capabilities {
         protocol_version: PROTOCOL_VERSION,
         methods,
         memory_types,
+        memory_regions,
         breakpoint_kinds,
         contracts: crate::contracts::advertisement_from_hello(&res),
+        recording,
         identity: EmulatorIdentity::from_hello(&res),
     };
     link.start_heartbeat();
@@ -168,12 +184,37 @@ impl BrokerLink {
     }
 
     fn raw_call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        self.raw_call_inner(method, params, None, None)
+    }
+
+    fn send_abort(&mut self, abort: &AbortRequest) -> Result<(), LinkError> {
+        let id = self.next_id;
+        self.next_id = self.next_id.saturating_add(1);
+        let request = Request::new(id, &abort.method, abort.params.clone());
+        let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        writer
+            .write_all(to_line(&request).as_bytes())
+            .map_err(|_| LinkError::NotConnected)
+    }
+
+    fn close_session(&self) {
+        let writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = writer.shutdown(std::net::Shutdown::Both);
+    }
+
+    fn raw_call_inner(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut observer: Option<&mut ProgressObserver<'_>>,
+        control: Option<&ProgressCallControl>,
+    ) -> Result<Value, LinkError> {
         // id 불일치 프레임을 무제한 버리면, 악성·버그 피어가 매칭 안 되는 프레임을 스트림하는 것만으로
         // raw_call을 영구 wedge시킨다(이 호출은 outer SharedLink mutex를 쥐고 있어 MCP 전체가 정지).
         // TcpLink(MAX_ID_MISMATCH)와 동일하게 상한을 둔다.
         const MAX_ID_MISMATCH: u32 = 256;
         let id = self.next_id;
-        self.next_id += 1;
+        self.next_id = self.next_id.saturating_add(1);
         let req = Request::new(id, method, params);
         {
             let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
@@ -184,10 +225,21 @@ impl BrokerLink {
         // deferred(working) 응답이 끝없이 와도 매 성공 read가 consecutive_timeouts를 리셋해 3-timeout
         // 가드가 못 끊는다 — 총 벽시계 데드라인으로 유한하게 끊는다. 초과면 NotConnected로 poison해
         // LazyBrokerLink가 inner를 버리고 재attach하게 한다(SharedLink mutex 무한 wedge 방지).
-        let deadline = Instant::now() + self.deferred_deadline;
+        let call_deadline = control
+            .and_then(|control| control.max_host_ms)
+            .map(Duration::from_millis)
+            .unwrap_or(self.deferred_deadline)
+            .min(self.deferred_deadline);
+        let deadline = Instant::now() + call_deadline;
+        let mut abort_sent = false;
         loop {
             if Instant::now() > deadline {
-                return Err(LinkError::NotConnected);
+                self.close_session();
+                return if control.is_some_and(|control| control.cancellation.is_cancelled()) {
+                    Err(LinkError::Cancelled)
+                } else {
+                    Err(LinkError::NotConnected)
+                };
             }
             // 영속 버퍼로 읽어 timeout 경계의 부분 frame을 보존한다. protocol cap 초과나 불완전 EOF는
             // 이 BrokerLink를 폐기할 수 있는 연결 오류로 반환한다.
@@ -217,6 +269,40 @@ impl BrokerLink {
                     }
                     let result = resp.result.unwrap_or(Value::Null);
                     if result_status(&result) == STATUS_WORKING {
+                        if let Some(observer) = observer.as_deref_mut() {
+                            let progress = match WorkingProgress::parse(result) {
+                                Ok(progress) => progress,
+                                Err(error) => {
+                                    if let Some(abort) =
+                                        control.and_then(|control| control.abort.as_ref())
+                                    {
+                                        let _ = self.send_abort(abort);
+                                    }
+                                    self.close_session();
+                                    return Err(error);
+                                }
+                            };
+                            if let Err(error) = observer(&progress) {
+                                if let Some(abort) =
+                                    control.and_then(|control| control.abort.as_ref())
+                                {
+                                    let _ = self.send_abort(abort);
+                                }
+                                self.close_session();
+                                return Err(error);
+                            }
+                        }
+                        if !abort_sent
+                            && control.is_some_and(|control| control.cancellation.is_cancelled())
+                        {
+                            let Some(abort) = control.and_then(|control| control.abort.as_ref())
+                            else {
+                                self.close_session();
+                                return Err(LinkError::Cancelled);
+                            };
+                            self.send_abort(abort)?;
+                            abort_sent = true;
+                        }
                         // keepalive — 다음 줄을 더 읽는다
                         continue;
                     }
@@ -226,6 +312,17 @@ impl BrokerLink {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
+                    if !abort_sent
+                        && control.is_some_and(|control| control.cancellation.is_cancelled())
+                    {
+                        let Some(abort) = control.and_then(|control| control.abort.as_ref()) else {
+                            self.close_session();
+                            return Err(LinkError::Cancelled);
+                        };
+                        self.send_abort(abort)?;
+                        abort_sent = true;
+                        continue;
+                    }
                     // 단발 타임아웃은 비치명(느린 op일 수 있음). 부분 수신 줄은 pending에 보존된다.
                     // 연속 임계치면 hung broker로 보고 NotConnected를 올려 LazyBrokerLink가 재attach하게
                     // 한다 — 안 그러면 행된 broker에 영구 Timeout으로 wedge된다(M3 self-heal).
@@ -289,6 +386,19 @@ impl EmulatorLink for BrokerLink {
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
         self.raw_call(method, params)
     }
+
+    fn call_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        observer: &mut ProgressObserver<'_>,
+        control: &ProgressCallControl,
+    ) -> Result<Value, LinkError> {
+        if control.cancellation.is_cancelled() {
+            return Err(LinkError::Cancelled);
+        }
+        self.raw_call_inner(method, params, Some(observer), Some(control))
+    }
 }
 
 /// 지연 BrokerLink — 첫 call 시에 connect+attach를 시도한다. 실패 시 직접 모드로 폴백하지
@@ -331,8 +441,10 @@ impl EmulatorLink for LazyBrokerLink {
                     protocol_version: PROTOCOL_VERSION,
                     methods: vec![],
                     memory_types: vec![],
+                    memory_regions: vec![],
                     breakpoint_kinds: vec![],
                     contracts: crate::contracts::ContractAdvertisement::Unreported,
+                    recording: None,
                     identity: EmulatorIdentity::default(),
                 })
             })
@@ -346,6 +458,28 @@ impl EmulatorLink for LazyBrokerLink {
         if matches!(
             result,
             Err(LinkError::NotConnected | LinkError::Protocol(_))
+        ) {
+            self.inner = None;
+        }
+        result
+    }
+
+    fn call_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        observer: &mut ProgressObserver<'_>,
+        control: &ProgressCallControl,
+    ) -> Result<Value, LinkError> {
+        if control.cancellation.is_cancelled() {
+            return Err(LinkError::Cancelled);
+        }
+        let result =
+            self.ensure_connected()?
+                .raw_call_inner(method, params, Some(observer), Some(control));
+        if matches!(
+            result,
+            Err(LinkError::NotConnected | LinkError::Protocol(_) | LinkError::Cancelled)
         ) {
             self.inner = None;
         }

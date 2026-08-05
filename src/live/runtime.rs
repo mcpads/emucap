@@ -159,6 +159,37 @@ impl RuntimeStore {
             .join("termination.json")
     }
 
+    pub fn capture_path(&self, port: u16, launch_id: &str) -> PathBuf {
+        self.generation_dir(port, launch_id).join("capture.json")
+    }
+
+    pub fn generation_capture_blocker(
+        &self,
+        port: u16,
+        launch_id: &str,
+    ) -> io::Result<Option<String>> {
+        let capture: Option<super::capture_capsule::CaptureCapsule> =
+            self.read_capture_json(port, launch_id)?;
+        let Some(capture) = capture else {
+            return Ok(None);
+        };
+        let Some(reason) = capture.generation_mutation_blocker() else {
+            return Ok(None);
+        };
+        // Unverifiable callback cleanup blocks every further mutation while the exact generation
+        // may still execute. Once every generation-owned process is provably gone, those hooks and
+        // input overrides cannot survive, so replacement is safe without rewriting historical
+        // terminal evidence into a cleanup claim it did not observe.
+        let generation_terminated = self.read_current(port)?.is_some_and(|current| {
+            current.launch_id == launch_id
+                && current.process_state() == ProcessState::Exited
+                && current
+                    .bridge_process_state()
+                    .is_none_or(|state| state == ProcessState::Exited)
+        });
+        Ok((!generation_terminated).then_some(reason))
+    }
+
     pub fn compatibility_token_path(&self, port: u16) -> PathBuf {
         self.root
             .join("compatibility")
@@ -319,6 +350,36 @@ impl RuntimeStore {
         result
     }
 
+    pub fn read_capture_json<T: DeserializeOwned>(
+        &self,
+        port: u16,
+        launch_id: &str,
+    ) -> io::Result<Option<T>> {
+        validate_launch_id(launch_id)?;
+        read_json_if_exists(&self.capture_path(port, launch_id))
+    }
+
+    pub fn update_capture_json<T, F>(&self, port: u16, launch_id: &str, update: F) -> io::Result<T>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce(Option<T>) -> io::Result<T>,
+    {
+        validate_launch_id(launch_id)?;
+        let generation = self.generation_dir(port, launch_id);
+        self.create_managed_dir(&generation)?;
+        let lock_path = generation.join(".capture.lock");
+        let lock = open_private_lock(&lock_path)?;
+        lock_with_deadline(&lock, std::time::Duration::from_millis(250))?;
+        let result = (|| {
+            let current = read_json_if_exists(&self.capture_path(port, launch_id))?;
+            let next = update(current)?;
+            write_atomic_json(&self.capture_path(port, launch_id), &next)?;
+            Ok(next)
+        })();
+        let _ = fs2::FileExt::unlock(&lock);
+        result
+    }
+
     pub fn read_adapter_failure(
         &self,
         port: u16,
@@ -463,6 +524,19 @@ impl PreparedGeneration {
                     io::ErrorKind::WouldBlock,
                     "runtime current generation changed after launch preparation",
                 ));
+            }
+            if let Some(previous_launch_id) = self.expected_current_launch_id.as_deref() {
+                if let Some(reason) = self
+                    .store
+                    .generation_capture_blocker(self.port, previous_launch_id)?
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        format!(
+                            "runtime generation is blocked by recording capture safety: {reason}"
+                        ),
+                    ));
+                }
             }
             write_atomic_json(&self.store.current_path(self.port), manifest)?;
             let _ = self

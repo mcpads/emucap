@@ -26,8 +26,10 @@ impl SequenceLink {
                 protocol_version: 1,
                 methods: vec!["status".into()],
                 memory_types: vec![],
+                memory_regions: vec![],
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
+                recording: None,
                 identity: EmulatorIdentity {
                     launch_id: Some(launch_id.into()),
                     ..Default::default()
@@ -170,7 +172,7 @@ fn live_identity_mismatch_never_overwrites_the_current_capsule() {
     inner.caps.identity = EmulatorIdentity {
         system: Some("snes".into()),
         adapter: Some("mesen2-live".into()),
-        content: Some("/anachron.sfc".into()),
+        content: Some("/fixture.sfc".into()),
         launch_id: None,
         ..Default::default()
     };
@@ -650,4 +652,79 @@ fn lease_acquisition_is_bound_to_the_expected_current_generation() {
         second_record.and_then(|record| record.lease).is_none(),
         "the newer generation's lease must remain untouched"
     );
+}
+
+#[test]
+fn unresolved_recording_cleanup_blocks_mutation_without_calling_the_adapter() {
+    use crate::bundle::recording_manifest::{
+        CleanupFacts, CleanupState, ExecutionOutcome, FinalExecutionState, Integrity,
+        OperationOutcome, PublicationOutcome, RecordingCounters,
+    };
+    use crate::live::capture_capsule::{
+        CaptureCapsuleRepository, CaptureLeaseIdentity, CapturePreparation, CaptureState,
+        CaptureTerminalSummary,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47831);
+    let inner = SequenceLink::new(
+        47831,
+        &current.launch_id,
+        [Outcome::Ok(serde_json::json!({"unexpected": true}))],
+    );
+    let mut link = ObservedLink::with_store(inner, store.clone());
+    link.acquire_control_lease(&current.launch_id).unwrap();
+
+    let output = tempfile::tempdir().unwrap();
+    let staging = output.path().join(".capture-quarantine.staging-test");
+    std::fs::create_dir(&staging).unwrap();
+    let repository = CaptureCapsuleRepository::new(store, 47831, &current.launch_id);
+    repository
+        .create(CapturePreparation {
+            capture_id: "capture-quarantine".into(),
+            request_digest_sha256: "11".repeat(32),
+            capability_revision: "22".repeat(32),
+            output_root: output.path().to_path_buf(),
+            destination_path: output.path().join("capture-quarantine"),
+            staging_path: staging,
+            lease: CaptureLeaseIdentity::current(),
+        })
+        .unwrap();
+    repository
+        .transition(
+            "capture-quarantine",
+            CaptureState::Prepared,
+            CaptureState::PublicationFailed,
+            Some(CaptureTerminalSummary {
+                operation_outcome: OperationOutcome::Failed,
+                execution_outcome: ExecutionOutcome::AdapterError,
+                integrity: Integrity::Unverifiable,
+                publication: PublicationOutcome::Failed,
+                final_execution_state: FinalExecutionState::Unknown,
+                final_frame: 0,
+                counters: RecordingCounters {
+                    frames: 0,
+                    events: 0,
+                    bytes: 0,
+                    dropped: 0,
+                },
+                cleanup: CleanupFacts {
+                    hooks: CleanupState::Unverifiable,
+                    transient_input: CleanupState::Unverifiable,
+                    sink: CleanupState::Released,
+                },
+                stop_event: None,
+                bundle_path: None,
+                manifest_sha256: None,
+                reason: Some("connection closed before cleanup was observed".into()),
+            }),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        link.call("write_memory", serde_json::json!({})),
+        Err(LinkError::Emulator { kind, .. }) if kind == "recording_quarantined"
+    ));
+    assert_eq!(link.inner.outcomes.len(), 1, "inner mutation must not run");
 }

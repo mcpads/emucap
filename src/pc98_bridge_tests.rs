@@ -108,6 +108,21 @@ fn i386_regs_hex(values: &[(&str, u32)]) -> String {
     hex::encode(out)
 }
 
+fn media_descriptor(id: &str, path: Option<&str>) -> String {
+    format!(
+        "{}|{}|0|0|{}|{}|{}",
+        hex::encode(id),
+        hex::encode("floppy"),
+        if path.is_some() { "1" } else { "0" },
+        if path.is_some() { "1" } else { "0" },
+        hex::encode(path.unwrap_or("")),
+    )
+}
+
+fn media_status(id: &str, path: Option<&str>) -> String {
+    format!("MEDIA:{}", media_descriptor(id, path))
+}
+
 struct StateSaveGdb {
     regs_hex: String,
     save_items_dir: Option<PathBuf>,
@@ -286,7 +301,16 @@ fn hello_advertises_only_implemented_rust_methods() {
         build: Some("abc123".into()),
         ..Default::default()
     };
-    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), env);
+    let mut bridge = Bridge::new(
+        FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (
+                "qEmucap,mediastatus".into(),
+                media_status("flop1", Some("/tmp/disk1.hdm")),
+            ),
+        ]),
+        env,
+    );
     let response = bridge.handle_request(Request::new(1, "hello", json!({})));
     let result = response.result.unwrap();
     assert_eq!(result["adapter"], "mame-pc98-rust-gdb");
@@ -393,10 +417,183 @@ fn hello_advertises_only_implemented_rust_methods() {
         .unwrap()
         .iter()
         .any(|m| m == "probe"));
+    assert!(result["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m == "change_media"));
+    assert_eq!(result["media_devices"][0]["id"], "flop1");
+    assert_eq!(result["media_devices"][0]["supports_runtime_change"], true);
     assert_eq!(
         result["memory_types"],
         json!(["cpu", "gvram_b", "gvram_g", "gvram_i", "gvram_r", "physical", "ram", "tvram"])
     );
+}
+
+#[test]
+fn change_media_mounts_an_existing_image_while_frozen_and_returns_readback() {
+    let temporary = tempfile::tempdir().unwrap();
+    let previous = temporary.path().join("disk1.hdm");
+    let requested = temporary.path().join("disk2.hdm");
+    std::fs::write(&previous, b"old disk").unwrap();
+    std::fs::write(&requested, b"new disk").unwrap();
+    let previous = previous.canonicalize().unwrap();
+    let requested = requested.canonicalize().unwrap();
+    let spec = format!(
+        "{}|mount|{}",
+        hex::encode("flop1"),
+        hex::encode(requested.to_str().unwrap())
+    );
+    let mut bridge = Bridge::new(
+        FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (
+                "qEmucap,mediastatus".into(),
+                media_status("flop1", previous.to_str()),
+            ),
+            (
+                format!("qEmucap,mediachange,{}", hex::encode(spec)),
+                format!("MEDIAOK|{}", media_descriptor("flop1", requested.to_str())),
+            ),
+        ]),
+        GdbBridgeEnv::default(),
+    );
+    let response = bridge.handle_request(Request::new(
+        40,
+        "change_media",
+        json!({
+            "device": "flop1",
+            "path": requested,
+            "expected_sha1": sha1_file(&requested).unwrap(),
+        }),
+    ));
+    assert!(response.ok, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(result["previous"]["path"], previous.to_str().unwrap());
+    assert_eq!(result["current"]["path"], requested.to_str().unwrap());
+    assert_eq!(result["media"]["sha1"], sha1_file(&requested).unwrap());
+}
+
+#[test]
+fn change_media_rejects_running_and_invalid_requests_before_backend_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let requested = temporary.path().join("disk2.hdm");
+    std::fs::write(&requested, b"new disk").unwrap();
+
+    let mut bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
+    bridge.frozen = false;
+    let running = bridge.handle_request(Request::new(
+        41,
+        "change_media",
+        json!({"device":"flop1", "path": requested}),
+    ));
+    assert!(!running.ok);
+    assert_eq!(running.error.unwrap().kind, "bad_state");
+    assert_eq!(bridge.gdb.calls, ["?"]);
+
+    bridge.frozen = true;
+    for params in [
+        json!({"device":"flop1", "path":"relative.hdm"}),
+        json!({"device":"flop1", "eject":true, "path":"/tmp/disk.hdm"}),
+        json!({"device":"flop1"}),
+    ] {
+        let response = bridge.handle_request(Request::new(42, "change_media", params));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert_eq!(bridge.gdb.calls, ["?"]);
+    }
+
+    let mismatch = bridge.handle_request(Request::new(
+        42,
+        "change_media",
+        json!({
+            "device":"flop1",
+            "path": requested,
+            "expected_sha1": "0000000000000000000000000000000000000000"
+        }),
+    ));
+    assert!(!mismatch.ok);
+    assert_eq!(mismatch.error.unwrap().kind, "bad_params");
+    assert_eq!(bridge.gdb.calls, ["?"]);
+}
+
+#[test]
+fn change_media_failure_reports_rollback_and_current_slot() {
+    let temporary = tempfile::tempdir().unwrap();
+    let previous = temporary.path().join("disk1.hdm");
+    let requested = temporary.path().join("disk2.hdm");
+    std::fs::write(&previous, b"old disk").unwrap();
+    std::fs::write(&requested, b"new disk").unwrap();
+    let previous = previous.canonicalize().unwrap();
+    let requested = requested.canonicalize().unwrap();
+    let spec = format!(
+        "{}|mount|{}",
+        hex::encode("flop1"),
+        hex::encode(requested.to_str().unwrap())
+    );
+    let mut bridge = Bridge::new(
+        FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (
+                "qEmucap,mediastatus".into(),
+                media_status("flop1", previous.to_str()),
+            ),
+            (
+                format!("qEmucap,mediachange,{}", hex::encode(spec)),
+                format!(
+                    "MEDIAERR|{}|restored|{}",
+                    hex::encode("unsupported image"),
+                    media_descriptor("flop1", previous.to_str())
+                ),
+            ),
+        ]),
+        GdbBridgeEnv::default(),
+    );
+    let response = bridge.handle_request(Request::new(
+        43,
+        "change_media",
+        json!({"device":"flop1", "path": requested}),
+    ));
+    assert!(!response.ok);
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, "emulator_error");
+    assert!(error.message.contains("rollback=restored"));
+    assert!(error.message.contains(previous.to_str().unwrap()));
+}
+
+#[test]
+fn change_media_ejects_the_requested_slot_and_stays_frozen() {
+    let temporary = tempfile::tempdir().unwrap();
+    let previous = temporary.path().join("disk1.hdm");
+    std::fs::write(&previous, b"old disk").unwrap();
+    let previous = previous.canonicalize().unwrap();
+    let spec = format!("{}|eject|", hex::encode("flop1"));
+    let mut bridge = Bridge::new(
+        FakeGdb::from_pairs(vec![
+            ("?".into(), "S05".into()),
+            (
+                "qEmucap,mediastatus".into(),
+                media_status("flop1", previous.to_str()),
+            ),
+            (
+                format!("qEmucap,mediachange,{}", hex::encode(spec)),
+                format!("MEDIAOK|{}", media_descriptor("flop1", None)),
+            ),
+        ]),
+        GdbBridgeEnv::default(),
+    );
+    let response = bridge.handle_request(Request::new(
+        44,
+        "change_media",
+        json!({"device":"flop1", "eject":true}),
+    ));
+    assert!(response.ok, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["action"], "eject");
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(result["current"]["mounted"], false);
 }
 
 #[test]
@@ -811,6 +1008,7 @@ fn input_rejects_nonzero_port_and_oversized_pulse_before_mutation() {
 fn status_reports_plugin_input_ownership() {
     let fake = FakeGdb::with(&[
         ("?", "S05"),
+        ("qEmucap,mediastatus", "MEDIA:"),
         ("qEmucap,inputfields", "enter"),
         ("qEmucap,inputstatus", "-1"),
         ("qEmucap,frame", "42"),
@@ -1067,6 +1265,7 @@ fn trace_methods_manage_lua_trace_file_and_parse_rows() {
 fn status_drains_nonblocking_stop_when_running() {
     let fake = FakeGdb::with(&[
         ("?", ""),
+        ("qEmucap,mediastatus", "MEDIA:"),
         ("qEmucap,inputfields", "enter,esc,space,a,b"),
         ("qEmucap,inputstatus", "0"),
         ("qEmucap,frame", "12"),

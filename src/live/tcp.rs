@@ -7,11 +7,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use super::link::{Capabilities, EmulatorLink, LinkError};
+use super::link::{
+    AbortRequest, Capabilities, EmulatorLink, LinkError, ProgressCallControl, ProgressObserver,
+    WorkingProgress,
+};
 use super::protocol::{parse_response, read_ndjson_frame, to_line, Request, PROTOCOL_VERSION};
+
+mod call;
 
 pub struct TcpLink {
     addr: String,
+    base_port: u16,
     listener: Option<TcpListener>,
     timeout: Duration,
     conn: Option<Conn>,
@@ -60,6 +66,7 @@ fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLin
     let session_token = new_session_token();
     TcpLink {
         addr: addr.to_string(),
+        base_port: split_addr(addr).1,
         listener,
         timeout,
         conn: None,
@@ -271,7 +278,8 @@ pub fn bind(addr: &str, timeout: Duration) -> std::io::Result<TcpLink> {
     listener.set_nonblocking(true)?;
     let local = listener.local_addr()?;
     let port = local.port();
-    let link = fresh(&local.to_string(), Some(listener), timeout);
+    let mut link = fresh(addr, Some(listener), timeout);
+    link.addr = local.to_string();
     write_session_token(port, &link.session_token)?;
     Ok(link)
 }
@@ -345,7 +353,7 @@ fn handshake_stream(
                 .collect()
         })
         .unwrap_or_default();
-    let memory_types = caps_val
+    let memory_types: Vec<String> = caps_val
         .get("memory_types")
         .and_then(|v| v.as_array())
         .map(|a| {
@@ -354,6 +362,8 @@ fn handshake_stream(
                 .collect()
         })
         .unwrap_or_default();
+    let memory_regions =
+        super::link::memory_regions_from_hello(caps_val.get("memory_regions"), &memory_types)?;
     let breakpoint_kinds = caps_val
         .get("breakpoint_kinds")
         .and_then(Value::as_array)
@@ -371,6 +381,13 @@ fn handshake_stream(
         )));
     }
     let identity = super::link::EmulatorIdentity::from_hello(&caps_val);
+    let registry = crate::event_contracts::EventContractRegistry::builtin()
+        .map_err(|error| LinkError::Protocol(error.to_string()))?;
+    let recording = super::recording_capability::RecordingCapability::from_hello(
+        caps_val.get("recording"),
+        &registry,
+    )
+    .map_err(|error| LinkError::Protocol(error.to_string()))?;
     if identity.adapter.as_deref() == Some("mesen2-live") && !identity.has_mesen_native_halt() {
         return Err(LinkError::Protocol(
             "mesen-patch-required: Mesen hello lacks code_break_idle/native_halt_service"
@@ -397,8 +414,10 @@ fn handshake_stream(
             protocol_version,
             methods,
             memory_types,
+            memory_regions,
             breakpoint_kinds,
             contracts: crate::contracts::advertisement_from_hello(&caps_val),
+            recording,
             identity,
         },
     ))
@@ -434,7 +453,12 @@ impl TcpLink {
     /// 연결을 붙들면 영영 wedge되어 세션 재시작을 강요하므로, 모든 끊김 신호(쓰기 실패·읽기
     /// EOF·읽기 에러·hello 실패·타임아웃)에서 한곳을 거쳐 비운다.
     fn drop_conn(&mut self) {
-        self.conn = None;
+        if let Some(conn) = self.conn.take() {
+            // Explicitly poison both directions before dropping duplicated descriptors. Deadline
+            // guards and buffered reader/writer clones must not keep a failed protocol stream
+            // half-open or let a flooding peer continue writing after Core fenced the request.
+            let _ = conn.reader.get_ref().shutdown(std::net::Shutdown::Both);
+        }
         self.caps = Capabilities::empty();
     }
 
@@ -474,6 +498,7 @@ impl TcpLink {
             Some(Ok((conn, caps, token))) if token == self.expected_session_token() => {
                 self.conn = Some(conn);
                 self.caps = caps;
+                self.runtime_candidates.clear();
                 self.preaccept = None;
                 Ok(true)
             }
@@ -547,6 +572,7 @@ impl TcpLink {
         if let Ok((conn, caps)) = handshake_stream(stream, self.timeout, Some(&expected)) {
             self.conn = Some(conn);
             self.caps = caps;
+            self.runtime_candidates.clear();
             self.consecutive_timeouts = 0;
         }
         // handshake 실패면 stream은 handshake_stream이 소비·폐기 — 기존 conn 그대로.
@@ -733,122 +759,11 @@ impl TcpLink {
         };
         self.conn = Some(conn);
         self.caps = caps;
+        self.runtime_candidates.clear();
         // 새 클라이언트를 갓 채택했으니 이전 죽은 conn에서 누적된 타임아웃 카운트를 지운다(try_adopt_
         // pending_client와 동일). 안 그러면 stale 카운트가 신규 conn 첫 타임아웃에 그대로 이어져 조기 드롭.
         self.consecutive_timeouts = 0;
         Ok(())
-    }
-
-    /// 연결이 있다고 가정하고 요청을 보낸 뒤, 최종 응답까지 기다린다.
-    /// `status:"working"` keepalive 프레임은 건너뛴다(지연 명령 진행 중).
-    fn raw_call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
-        let id = self.next_id;
-        self.next_id += 1;
-        let req = Request::new(id, method, params);
-
-        {
-            let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
-            if let Err(e) = conn.writer.write_all(to_line(&req).as_bytes()) {
-                // 쓰기 실패는 타임아웃이든 broken pipe든 conn을 버린다. 쓰기 타임아웃은 요청 라인의 일부만
-                // 전송됐을 수 있어(대용량 params), 같은 conn에 다음 요청을 이어붙이면 상대 NDJSON 프레이밍이
-                // 오염된다 — 부분 송신은 복구 불가다. 읽기 타임아웃은 conn.pending으로 부분 수신을 보존해
-                // 유지하지만, 송신은 그럴 수 없으므로 버려서 다음 호출이 새 클라이언트를 재수락하게 한다
-                // (부분 프레임에 새 요청이 이어붙지 못하게).
-                self.drop_conn();
-                if is_timeout(&e) {
-                    return Err(LinkError::Timeout);
-                }
-                return Err(io_to_link(e));
-            }
-        }
-
-        // deferred(working keepalive) 명령의 전체 벽시계 데드라인. working은 id가 일치해 매 Ok read가
-        // consecutive_timeouts를 리셋하므로 3-timeout 가드가 못 끊는다 — 이 상한으로 총 대기를 유한하게.
-        let deadline = std::time::Instant::now() + self.deferred_deadline;
-
-        // id 불일치(늦은 응답·desync) 프레임은 버리고 계속 읽되, 한도를 둔다 — 끝없이
-        // 오면 raw_call이 무한 점유되므로 desync로 간주해 빠르게 실패한다. working
-        // keepalive는 id가 일치하므로 이 카운터에 잡히지 않는다(긴 명령은 영향 없음).
-        const MAX_ID_MISMATCH: u32 = 256;
-        let mut mismatch = 0u32;
-        loop {
-            // deferred 데드라인 초과 = working이 끝없이 오거나 id 불일치가 오래 이어짐. 진짜 완료가 안
-            // 오는 것으로 보고 드롭+Timeout(무한 점유 금지). 개별 read 타임아웃은 아래 arm이 처리한다.
-            if std::time::Instant::now() >= deadline {
-                self.consecutive_timeouts = 0;
-                self.drop_conn();
-                return Err(LinkError::Timeout);
-            }
-            // 영속 버퍼(conn.pending)로 읽는다 — 타임아웃이 frame 중간에 걸려도 이미 읽은 바이트가
-            // 보존된다. protocol cap 초과나 불완전 EOF는 연결을 폐기한다.
-            let read_result = {
-                let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
-                read_ndjson_frame(&mut conn.reader, &mut conn.pending)
-            };
-            match read_result {
-                Ok(None) => {
-                    self.drop_conn();
-                    return Err(LinkError::NotConnected);
-                }
-                Ok(Some(line)) => {
-                    self.consecutive_timeouts = 0; // 응답 수신 = 어댑터 살아있음 → 타임아웃 카운터 리셋
-                    let resp = match parse_response(line.trim()) {
-                        Ok(response) => response,
-                        Err(error) => {
-                            self.drop_conn();
-                            return Err(LinkError::Protocol(error.to_string()));
-                        }
-                    };
-                    if resp.id != id {
-                        mismatch += 1;
-                        if mismatch > MAX_ID_MISMATCH {
-                            self.drop_conn();
-                            return Err(LinkError::Protocol(
-                                "too many frames with a mismatched id; stream desynchronized"
-                                    .into(),
-                            ));
-                        }
-                        // 이전에 타임아웃된 명령의 늦은 응답 등 — id가 안 맞으면 버리고 계속.
-                        // (안 버리면 응답이 한 칸씩 밀려 스트림이 desync된다.)
-                        continue;
-                    }
-                    if !resp.ok {
-                        return if let Some(err) = resp.error {
-                            Err(LinkError::Emulator {
-                                kind: err.kind,
-                                message: err.message,
-                            })
-                        } else {
-                            Err(LinkError::Protocol(
-                                "response returned ok=false without an error".into(),
-                            ))
-                        };
-                    }
-                    let result = resp.result.unwrap_or(Value::Null);
-                    if super::protocol::result_status(&result) == super::protocol::STATUS_WORKING {
-                        continue; // keepalive — 다음 줄을 더 읽는다
-                    }
-                    return Ok(result);
-                }
-                Err(ref e) if is_timeout(e) => {
-                    // 요청 타임아웃은 단발이면 연결을 끊지 '않는다'. 느리지만 살아있는 어댑터(큰 VRAM/OAM
-                    // read, NMI 빈번 장면, frozen 캡처 등)를 죽이면 공들인 게임 상태가 날아간다. 부분 수신한
-                    // 줄은 conn.pending에 남아 다음 호출이 이어 읽으므로 스트림 desync도 없다(늦은 응답은
-                    // id 불일치로 버려진다). 단, 연속 임계치면 진짜 행으로 보고 드롭해 재수락을 유도한다
-                    // (안 그러면 죽은 어댑터에 영영 wedge). 진짜 죽음은 쓰기 실패·EOF로도 감지된다.
-                    self.consecutive_timeouts += 1;
-                    if self.consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
-                        self.consecutive_timeouts = 0;
-                        self.drop_conn();
-                    }
-                    return Err(LinkError::Timeout);
-                }
-                Err(e) => {
-                    self.drop_conn();
-                    return Err(io_to_link(e));
-                }
-            }
-        }
     }
 
     /// deferred 데드라인을 짧게 바꿔 테스트에서 working 플러드 컷오프를 빠르게 검증한다(프로덕션 미포함).
@@ -868,6 +783,20 @@ impl EmulatorLink for TcpLink {
         self.raw_call(method, params)
     }
 
+    fn call_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        observer: &mut ProgressObserver<'_>,
+        control: &ProgressCallControl,
+    ) -> Result<Value, LinkError> {
+        if control.cancellation.is_cancelled() {
+            return Err(LinkError::Cancelled);
+        }
+        self.ensure_connected()?;
+        self.raw_call_inner(method, params, Some(observer), Some(control))
+    }
+
     fn supports_session_reconnect(&self) -> bool {
         true
     }
@@ -876,9 +805,15 @@ impl EmulatorLink for TcpLink {
         self.drop_conn();
     }
 
+    fn base_port(&self) -> Option<u16> {
+        Some(self.base_port)
+    }
+
     fn endpoint_port(&self) -> Option<u16> {
-        // self.addr는 자동 선택 후 잡은 포트를 반영한다(미바인드면 기준 포트).
-        Some(split_addr(&self.addr).1)
+        self.listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map(|address| address.port())
     }
 
     fn session_token(&self) -> Option<&str> {
@@ -969,9 +904,7 @@ pub(crate) fn select_runtime_generation(
     store: &super::runtime::RuntimeStore,
     base: u16,
 ) -> Result<RuntimeSelection, LinkError> {
-    let Some(control_key) = super::runtime::control_session_key() else {
-        return Ok(RuntimeSelection::None);
-    };
+    let control_key = super::runtime::control_session_key();
     let holder = super::runtime::capture_process(std::process::id());
     let mut preferred = Vec::new();
     let mut reclaimable = Vec::new();
@@ -1008,7 +941,13 @@ pub(crate) fn select_runtime_generation(
                 }
             }
         };
-        let same_control = lease.control_session_key.as_deref() == Some(control_key.as_str());
+        // An absent stable control-session key cannot establish same-session preference.  It does
+        // not, however, erase the independently verified fact that the exact previous holder has
+        // exited.  A sole available generation can be reclaimed with its private capability; live
+        // and unverifiable holders remain ineligible below.
+        let same_control = control_key.as_ref().is_some_and(|control_key| {
+            lease.control_session_key.as_deref() == Some(control_key.as_str())
+        });
         let token = store
             .read_auth(port, &current.launch_id)
             .map_err(io_to_link)?;

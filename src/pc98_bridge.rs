@@ -31,6 +31,7 @@ const METHODS: &[&str] = &[
     "find_pattern",
     "dump_memory",
     "get_rom_info",
+    "change_media",
     "write_memory",
     "get_state",
     "save_state",
@@ -214,6 +215,8 @@ struct Breakpoint {
 pub enum BridgeError {
     #[error("{0}")]
     BadParams(String),
+    #[error("{0}")]
+    BadState(String),
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("{0}")]
@@ -267,6 +270,7 @@ impl<G: GdbTransport> Bridge<G> {
             "find_pattern" => self.find_pattern(&req.params),
             "dump_memory" => self.dump_memory(&req.params),
             "get_rom_info" => self.get_rom_info(),
+            "change_media" => self.change_media(&req.params),
             "write_memory" => self.write_memory(&req.params),
             "get_state" => self.get_state(),
             "save_state" => self.save_state(&req.params),
@@ -322,6 +326,7 @@ mod breakpoints;
 mod debug_runtime;
 mod execution;
 mod machine;
+mod media;
 mod service;
 mod support;
 use support::*;

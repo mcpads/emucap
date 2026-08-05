@@ -13,6 +13,15 @@ local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
 local HAS_SNES_PPU_OBJ_EVENTS = SYS.system == "snes"
   and emu.eventType.snesPpuObjEvaluationStart ~= nil
   and emu.eventType.snesPpuObjScanlineHandoff ~= nil
+local HAS_SNES_DEEP_EVENTS = SYS.system == "snes"
+  and type(emu.getSnesObservationEvent) == "function"
+  and emu.eventType.snesInstructionExecution ~= nil
+  and emu.eventType.snesContentRead ~= nil
+  and emu.eventType.snesTransferEnable ~= nil
+  and emu.eventType.snesTransferAccess ~= nil
+  and emu.eventType.snesDevicePortWrite ~= nil
+  and emu.eventType.snesInterruptDelivery ~= nil
+  and emu.eventType.snesPpuObjConsumptionRead ~= nil
 
 -- emucap Mesen2 라이브 클라이언트 (능동 제어)
 -- 필요 옵션: "Allow network access" + "Allow access to I/O and OS functions".
@@ -28,7 +37,9 @@ local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
 local Dump = require("emucap_dump")
 local Deferred = require("emucap_deferred")
+local FreezeState = require("emucap_freeze_state")
 local Memory = require("emucap_memory")
+local Recording = require("emucap_recording")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -41,11 +52,25 @@ local PROTOCOL_VERSION = 1
 local MESEN_HOST_API = 2
 local MESEN_UPSTREAM_COMMIT = os.getenv("EMUCAP_MESEN_UPSTREAM_COMMIT")
 local MESEN_PATCHSET_SHA256 = os.getenv("EMUCAP_MESEN_PATCHSET_SHA256")
+local MESEN_BINARY_SHA256 = os.getenv("EMUCAP_MESEN_BINARY_SHA256")
+local function exact_hex(value, length)
+  return type(value) == "string" and #value == length and not value:find("[^0-9a-fA-F]")
+end
+-- Recording evidence names the exact host revision, patch stack, and produced binary. Legacy or
+-- manually launched hosts retain every pre-existing method but do not advertise this capability.
+local RECORDING_SUPPORTED = SYS.system == "snes"
+  and exact_hex(MESEN_UPSTREAM_COMMIT, 40)
+  and exact_hex(MESEN_PATCHSET_SHA256, 64)
+  and exact_hex(MESEN_BINARY_SHA256, 64)
 -- 데드맨은 operator opt-in이다. pause/BP 성공 뒤 agent 왕복 지연만으로 실행을 재개하면 frozen
 -- persistence 계약을 깨므로 기본은 0(비활성). 양수를 명시한 launch만 그 비활동 시간 뒤 자동 resume한다.
 -- hotkey freeze는 값과 무관하게 항상 데드맨 면제.
 local MAX_FREEZE_MS = tonumber(os.getenv("EMUCAP_DEADMAN_MS") or "") or 0
 local HALT_SERVICE_INTERVAL_MS = 10  -- native SleepUntilResume의 idle callback 최소 대기 간격
+-- A zero-timeout recording socket turns normal producer/consumer scheduling jitter into a false
+-- sink failure. Permit one short bounded drain interval while staying well below Mesen's one-second
+-- Lua callback watchdog; an actual stalled sink still fail-stops the capture.
+local RECORDING_SINK_WRITE_TIMEOUT_SECONDS = 0.1
 local function wall_ms() return socket.gettime() * 1000 end
 -- freeze 중 연결끊김(서버 재시작//mcp 재연결) 시 freeze를 유지한 채 재접속을 시도해 장면을 보존한다.
 -- transport loss만으로 guest 실행을 바꾸지 않는 것이 기본이다. 양수를 명시한 launch만 그 시간 뒤
@@ -65,7 +90,9 @@ local prev_freeze_key = false  -- 라이징 에지 검출(running→freeze, froz
 
 local STATE = "running"       -- "running" | "frozen"
 local freeze_start_ms = nil   -- 마지막 명령 이후 경과 측정(데드맨). frozen 진입/명령 수신 시 갱신.
-local freeze_reason = "paused"
+-- The current halt cause and its temporal eligibility are independent. A later step must replace
+-- a recording halt's reason, while a completed frame step remains a proven recording boundary.
+local freeze_state = FreezeState.halt("paused", false)
 -- true only while the patched host services a main-CPU instruction-boundary halt. Frame/PPU steps,
 -- read/write breakpoints, and other mid-instruction halts use the ordinary idle event and keep this
 -- false, so savestate calls fail loudly instead of serializing an unsafe core state.
@@ -91,6 +118,10 @@ local frame = 0
 local KEEPALIVE_FRAMES = 30
 local deferred = nil           -- run_frames/press_buttons 진행 상태 { id, kind, remaining, age }
 local pending_io = nil         -- save_state/load_state 진행 상태 { id, kind, path, ref }
+local recording = nil          -- bounded, generation-bound host-sink recording transaction
+local recording_reset = nil    -- validated/sink-bound request waiting for the native reset callback
+local recording_last = nil     -- bounded terminal status only; event bytes stay in the Core bundle
+local recording_hook_refs = {} -- request-owned semantic callbacks; empty on the ordinary path
 local abort_inflight = nil     -- disconnect 시 새 세션에 옛 response id를 흘리지 않도록 지연 작업 폐기
 local resume_from_freeze = nil -- reset reply flush에서도 frozen ownership을 반환할 수 있게 forward declaration
 local reset_after_reply = false -- reset terminal response를 모두 보낸 뒤 host reset을 실행
@@ -386,18 +417,22 @@ local BUTTON_ALIASES = SYS.aliases
 local function buttons_to_table(buttons)
   local t = {}
   local unknown = {}
+  local duplicate = {}
   for _, b in ipairs(buttons or {}) do
     local raw = tostring(b)
     local lb = raw:lower()              -- "A" → "a" 정규화
     lb = BUTTON_ALIASES[lb] or lb
     if VALID_BUTTONS[lb] then
-      t[lb] = true
+      if t[lb] then duplicate[#duplicate + 1] = raw else t[lb] = true end
     else
       unknown[#unknown + 1] = raw
     end
   end
   if #unknown > 0 then
     return nil, "unknown " .. SYS.system_label .. " button(s): " .. table.concat(unknown, ", ")
+  end
+  if #duplicate > 0 then
+    return nil, "duplicate " .. SYS.system_label .. " button(s): " .. table.concat(duplicate, ", ")
   end
   return t
 end
@@ -435,6 +470,10 @@ local function bounded_sync_count(value, default_value, allow_zero)
 end
 
 function handlers.hello()
+  local memory_regions = nil
+  if emu and emu.memType then
+    memory_regions = Memory.regions(emu, SYS)
+  end
   -- disassemble/call_stack은 ISA 구현(SYS.disassemble·op_is_call/op_is_return)이 있을 때만 advertise한다.
   -- GBA처럼 미제공이면 methods에서 빠져 status.methods에 안 뜨고, 호출 시 handler가 unsupported로 거부한다.
   local method_list = { "read_memory", "screenshot", "get_state", "get_rom_info", "status",
@@ -445,6 +484,9 @@ function handlers.hello()
                 "break_on_reset", "dump_memory", "find_pattern", "probe", "reset" }
   if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
   if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
+  if RECORDING_SUPPORTED then
+    method_list[#method_list + 1] = "record_window"
+  end
   local host_features = {
     "code_break_idle",
     "native_halt_service",
@@ -452,6 +494,7 @@ function handlers.hello()
     "paused_start_service",
   }
   if HAS_SNES_PPU_OBJ_EVENTS then host_features[#host_features + 1] = "snes_ppu_obj_events" end
+  if HAS_SNES_DEEP_EVENTS then host_features[#host_features + 1] = "snes_deep_observation_events" end
   local breakpoint_kinds = {
     { kind = "exec", range_unit = "address", range_mode = "inclusive", memory_type_used = true, snapshot = true },
     { kind = "read", range_unit = "address", range_mode = "inclusive", memory_type_used = true, snapshot = true },
@@ -480,6 +523,11 @@ function handlers.hello()
     breakpoint_kinds = breakpoint_kinds,
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
+  if RECORDING_SUPPORTED then
+    result.recording = Recording.capability(
+      as_array, HAS_SNES_PPU_OBJ_EVENTS, memory_regions ~= nil and #memory_regions > 0,
+      HAS_SNES_DEEP_EVENTS, SYS.system == "snes")
+  end
   local active_exceptions = { "mesen.execution.instruction-step-absent" }
   if HAS_CALLSTACK then
     active_exceptions[#active_exceptions + 1] = "mesen.call-stack.best-effort"
@@ -488,17 +536,25 @@ function handlers.hello()
     catalog = "emucap-feature-contracts/v3",
     active_exceptions = active_exceptions,
   }
-  if MESEN_UPSTREAM_COMMIT then
+  if MESEN_UPSTREAM_COMMIT and MESEN_BINARY_SHA256 then
     result.host_build = {
+      upstream = "https://github.com/nesdev-org/MesenCE.git",
+      commit = MESEN_UPSTREAM_COMMIT,
       upstream_commit = MESEN_UPSTREAM_COMMIT,
       patchset_sha256 = MESEN_PATCHSET_SHA256 or "unknown",
+      binary_sha256 = MESEN_BINARY_SHA256,
+      host_api = MESEN_HOST_API,
     }
   end
   -- Advertise only memory types that belong to the active system and have a known finite range.
   -- Mesen's global enum also contains names for inactive cores, so enumerating it directly would
   -- make status.memory_types claim regions that this game cannot use.
-  if emu and emu.memType then
-    result.memory_types = Memory.catalog(emu, SYS)
+  if memory_regions then
+    result.memory_regions = memory_regions
+    result.memory_types = as_array({})
+    for _, region in ipairs(memory_regions) do
+      result.memory_types[#result.memory_types + 1] = region.memory_type
+    end
   end
   local name = os.getenv("EMUCAP_NAME")
   if name then result.name = name end
@@ -610,7 +666,7 @@ function handlers.status()
     state = STATE,
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
-  if STATE == "frozen" then r.reason = freeze_reason end   -- "hotkey"면 사용자가 로컬 핫키로 얼림
+  if STATE == "frozen" then r.reason = freeze_state.reason end
   local held_buttons = {}
   if input_hold then
     for name, pressed in pairs(input_hold.tbl) do
@@ -638,11 +694,31 @@ function handlers.status()
     idle_auto_resume_ms = MAX_FREEZE_MS,
     disconnect_auto_resume_ms = RECONNECT_GIVEUP_MS,
   }
-  if MESEN_UPSTREAM_COMMIT then
+  if MESEN_UPSTREAM_COMMIT and MESEN_BINARY_SHA256 then
     r.host_build = {
+      upstream = "https://github.com/nesdev-org/MesenCE.git",
+      commit = MESEN_UPSTREAM_COMMIT,
       upstream_commit = MESEN_UPSTREAM_COMMIT,
       patchset_sha256 = MESEN_PATCHSET_SHA256 or "unknown",
+      binary_sha256 = MESEN_BINARY_SHA256,
       host_api = MESEN_HOST_API,
+    }
+  end
+  if RECORDING_SUPPORTED then
+    r.recording = {
+      capability_revision = Recording.revision(),
+      active = recording ~= nil or recording_reset ~= nil,
+      phase = recording_reset and "arming_reset"
+        or (recording and (recording.advanced_frames < recording.warmup_frames and "warming"
+          or (recording.start_on and not recording.observation_started and "aligning"
+            or "recording")) or nil),
+      capture_id = recording and recording.capture_id
+        or (recording_reset and recording_reset.params.capture_id or nil),
+      frame = recording and recording.last_frame or nil,
+      frames = recording and recording.advanced_frames or nil,
+      events = recording and recording.events or nil,
+      bytes = recording and recording.complete_bytes or nil,
+      last = recording_last,
     }
   end
   -- 핫키 진단(Home "가끔 안 됨" 분간): freeze_key=키명, armed=무장여부, down=지금 눌림 감지중.
@@ -666,6 +742,21 @@ end
 function handlers.reset()
   reset_after_reply = true
   return true, { reset = true, reconnect = true }
+end
+
+function handlers.abort_recording(p)
+  if not RECORDING_SUPPORTED then
+    return false, "unsupported", "record_window is not supported for " .. SYS.system
+  end
+  if recording and p.capture_id ~= recording.capture_id then
+    return false, "bad_state", "capture_id does not match the active recording"
+  end
+  return true, {
+    status = "completed",
+    capture_id = p.capture_id,
+    aborted = false,
+    terminal = recording == nil,
+  }
 end
 
 -- 타깃 메모리를 hex로 읽는다(probe 완료 시 사용).
@@ -843,12 +934,424 @@ local function frozen_state_io(method, id, p)
   return "resume"
 end
 
+-- Recording event bytes use a dedicated authenticated loopback socket, so neither poll_events nor
+-- the control response queue becomes archival storage. Core owns the listener, physical byte
+-- ceiling, validation, and publication; the adapter never receives an output path.
+local function open_recording_sink(p)
+  local sink_params = type(p.sink) == "table" and p.sink or {}
+  local endpoint = sink_params.endpoint
+  local token = sink_params.token
+  local port = type(endpoint) == "string" and endpoint:match("^127%.0%.0%.1:(%d+)$") or nil
+  port = tonumber(port)
+  if not port or port < 1 or port > 65535 then
+    return nil, "sink.endpoint must be an authenticated 127.0.0.1 TCP endpoint"
+  end
+  if type(token) ~= "string" or #token < 16 or #token > 128 or token:find("[^%w%._~%-]") then
+    return nil, "sink.token must contain 16..128 URL-safe characters"
+  end
+
+  local sock = socket.tcp()
+  sock:settimeout(0.1)
+  local connected, connect_err = sock:connect(HOST, port)
+  if not connected then
+    pcall(function() sock:close() end)
+    return nil, "sink connect failed: " .. tostring(connect_err)
+  end
+  local auth = jvalue({ token = token, capture_id = p.capture_id }) .. "\n"
+  local last, send_err, partial = sock:send(auth)
+  if last ~= #auth then
+    pcall(function() sock:close() end)
+    return nil, "sink authentication write failed: " .. tostring(send_err or partial or "partial write")
+  end
+  sock:settimeout(RECORDING_SINK_WRITE_TIMEOUT_SECONDS)
+
+  local closed = false
+  return {
+    write = function(line) return sock:send(line) end,
+    close = function()
+      if closed then return true end
+      closed = true
+      local ok, err = sock:close()
+      if ok == nil or ok == false then return nil, err end
+      return true
+    end,
+  }
+end
+
+local function open_recording_member_sink(p)
+  if type(p.initial_snapshots) ~= "table" or #p.initial_snapshots == 0 then return nil end
+  local sink_params = type(p.member_sink) == "table" and p.member_sink or {}
+  local endpoint = sink_params.endpoint
+  local token = sink_params.token
+  local port = type(endpoint) == "string" and endpoint:match("^127%.0%.0%.1:(%d+)$") or nil
+  port = tonumber(port)
+  if not port or port < 1 or port > 65535 then
+    return nil, "member_sink.endpoint must be an authenticated 127.0.0.1 TCP endpoint"
+  end
+  if type(token) ~= "string" or #token < 16 or #token > 128 or token:find("[^%w%._~%-]") then
+    return nil, "member_sink.token must contain 16..128 URL-safe characters"
+  end
+  local sock = socket.tcp()
+  sock:settimeout(0.1)
+  local connected, connect_err = sock:connect(HOST, port)
+  if not connected then
+    pcall(function() sock:close() end)
+    return nil, "member sink connect failed: " .. tostring(connect_err)
+  end
+  local auth = jvalue({ token = token, capture_id = p.capture_id }) .. "\n"
+  local last, send_err, partial = sock:send(auth)
+  if last ~= #auth then
+    pcall(function() sock:close() end)
+    return nil, "member sink authentication write failed: "
+      .. tostring(send_err or partial or "partial write")
+  end
+  sock:settimeout(RECORDING_SINK_WRITE_TIMEOUT_SECONDS)
+  local closed = false
+  return {
+    write = function(bytes)
+      local offset = 1
+      while offset <= #bytes do
+        local sent, err, partial_sent = sock:send(bytes, offset)
+        if sent then
+          offset = sent + 1
+        elseif partial_sent and partial_sent >= offset then
+          offset = partial_sent + 1
+        else
+          return nil, err or "partial write", partial_sent
+        end
+      end
+      return #bytes
+    end,
+    close = function()
+      if closed then return true end
+      closed = true
+      local ok, err = sock:close()
+      if ok == nil or ok == false then return nil, err end
+      return true
+    end,
+  }
+end
+
+local function capture_initial_snapshots(state)
+  local sink = state and state.member_sink
+  if not sink then return nil, "member sink is unavailable" end
+  for _, request in ipairs(state.initial_snapshots or {}) do
+    local region, _, range_error = Memory.range(
+      emu, SYS, request.memory_type, request.address, request.length)
+    if not region then return nil, range_error end
+    local header = jvalue({ label = request.label, bytes = request.length }) .. "\n"
+    local sent, write_error = sink.write(header)
+    if sent ~= #header then return nil, write_error or "member header write failed" end
+    local chunk_size = 4096
+    for base = 0, request.length - 1, chunk_size do
+      local count = math.min(chunk_size, request.length - base)
+      local bytes = {}
+      for offset = 0, count - 1 do
+        bytes[offset + 1] = string.char(emu.read(
+          request.address + base + offset, region.memory_type, false))
+      end
+      local chunk = table.concat(bytes)
+      sent, write_error = sink.write(chunk)
+      if sent ~= #chunk then return nil, write_error or "member body write failed" end
+    end
+  end
+  return true
+end
+
+local function remember_recording_terminal(finished, result)
+  recording_last = {
+    capture_id = finished.capture_id,
+    operation_outcome = result.operation_outcome,
+    execution_outcome = result.execution_outcome,
+    integrity = result.integrity,
+    final_execution_state = result.final_execution_state,
+    final_frame = result.final_frame,
+    counters = {
+      frames = result.frames,
+      events = result.events,
+      bytes = result.bytes,
+      dropped = result.dropped,
+    },
+    cleanup = result.cleanup,
+    stop_event = result.stop_event,
+    observation_start = result.observation_start,
+    event_classes = result.event_classes,
+    reason = result.reason,
+  }
+end
+
+local function install_recording_input(state, port)
+  if type(state) ~= "table" or port ~= 0 then return nil, "invalid recording input state" end
+  input_hold = { port = port, tbl = state }
+  return true
+end
+
+local function release_recording_input()
+  input_hold = nil
+  return true
+end
+
+local function apply_recording_effect(effect, frame_boundary_proven)
+  if not (recording and effect) then return nil end
+  if effect.kind == "working" then
+    if not Tx.pending(tx) then reply_ok(recording.request_id, Recording.progress(recording)) end
+    return nil
+  end
+  if effect.kind ~= "terminal" then return nil end
+
+  local finished = recording
+  local result = Recording.result(finished, wall_ms())
+  recording = nil
+  remember_recording_terminal(finished, result)
+  STATE = "frozen"
+  freeze_state = FreezeState.halt("record_window", frame_boundary_proven)
+  freeze_start_ms = wall_ms()
+  freeze_disc_ms = nil
+  freeze_snapshot = nil
+  -- This only enqueues the terminal line. Every caller invokes breakExecution before the next TX
+  -- flush, and the native halt idle callback performs that flush after CodeBreak linearizes frozen.
+  reply_ok(finished.request_id, result)
+  return "freeze"
+end
+
+local function release_recording_hooks()
+  local ok, errors, retained = true, {}, {}
+  for _, hook in ipairs(recording_hook_refs) do
+    local removed, err = pcall(emu.removeEventCallback, hook.ref, hook.event_type)
+    if not removed then
+      ok = false
+      errors[#errors + 1] = tostring(err)
+      retained[#retained + 1] = hook
+    end
+  end
+  recording_hook_refs = retained
+  if not ok then return nil, table.concat(errors, "; ") end
+  return true
+end
+
+local function semantic_obj_payload()
+  local state = emu.getState()
+  local regs = SYS.snapshot_regs(state)
+  local pc, bank = state["cpu.pc"], state["cpu.k"]
+  regs.pc = type(pc) == "number" and type(bank) == "number"
+    and pc + bank * 0x10000 or nil
+  return {
+    cpu = regs,
+    ppu = {
+      scanline = state["ppu.scanline"],
+      dot = state["ppu.cycle"],
+      hclock = state["ppu.hClock"],
+    },
+    forced_blank = state["ppu.forcedBlank"],
+  }
+end
+
+local function deep_payload(event_id, event)
+  if event_id == "snes_cpu_instruction" then
+    return { pc = event.pc, opcode = event.opcode, a = event.a, x = event.x, y = event.y,
+      sp = event.sp, d = event.d, dbr = event.dbr, k = event.k, ps = event.ps,
+      emulation = event.emulation, cpu_cycle = event.cpuCycle }
+  elseif event_id == "snes_content_read" then
+    return { bus_address = event.address, content_offset = event.contentOffset,
+      value = event.value, operation = event.operation, pc = event.pc, cpu_cycle = event.cpuCycle }
+  elseif event_id == "snes_transfer_enable" then
+    return { written_mask = event.value, channel = event.channel, hdma = event.hdma,
+      direction_to_bus_a = event.directionToBusA, source = event.source,
+      destination = event.destination, size = event.transferSize, mode = event.transferMode,
+      fixed = event.fixedTransfer, decrement = event.decrement, pc = event.pc,
+      table_address = event.tableAddress, hdma_bank = event.hdmaBank,
+      hdma_indirect = event.hdmaIndirect, cpu_cycle = event.cpuCycle }
+  elseif event_id == "snes_transfer_access" then
+    return { bus_address = event.address, value = event.value, operation = event.operation,
+      channel = event.channel, hdma = event.hdma }
+  elseif event_id == "snes_device_port_write" then
+    return { port = event.address, value = event.value, operation = event.operation,
+      transfer_active = event.transferActive, channel = event.channel, hdma = event.hdma,
+      pc = event.pc, cpu_cycle = event.cpuCycle }
+  elseif event_id == "snes_interrupt_delivery" then
+    return { nmi = event.nmi, interrupted_pc = event.address, handler_pc = event.destination,
+      pc = event.pc, a = event.a, x = event.x, y = event.y, sp = event.sp, d = event.d,
+      dbr = event.dbr, k = event.k, ps = event.ps, emulation = event.emulation,
+      cpu_cycle = event.cpuCycle }
+  elseif event_id == "snes_ppu_obj_consumption_read" then
+    return { memory_kind = event.memoryKind, address = event.address, value = event.value,
+      scanline = event.scanline, dot = event.dot, hclock = event.hClock }
+  end
+  return nil
+end
+
+local function install_recording_semantic_hooks(state)
+  local candidates = {
+    { id = "snes_ppu_obj_evaluation_start", event_type = emu.eventType.snesPpuObjEvaluationStart,
+      payload = semantic_obj_payload },
+    { id = "snes_ppu_obj_handoff", event_type = emu.eventType.snesPpuObjScanlineHandoff,
+      payload = semantic_obj_payload },
+    { id = "snes_cpu_instruction", event_type = emu.eventType.snesInstructionExecution, deep = true },
+    { id = "snes_content_read", event_type = emu.eventType.snesContentRead, deep = true },
+    { id = "snes_transfer_enable", event_type = emu.eventType.snesTransferEnable, deep = true },
+    { id = "snes_transfer_access", event_type = emu.eventType.snesTransferAccess, deep = true },
+    { id = "snes_device_port_write", event_type = emu.eventType.snesDevicePortWrite, deep = true },
+    { id = "snes_interrupt_delivery", event_type = emu.eventType.snesInterruptDelivery, deep = true },
+    { id = "snes_ppu_obj_consumption_read", event_type = emu.eventType.snesPpuObjConsumptionRead,
+      deep = true },
+  }
+  local requested = false
+  for _, candidate in ipairs(candidates) do
+    if state.selected[candidate.id] then
+      local event_id = candidate.id
+      local event_type = candidate.event_type
+      local is_deep = candidate.deep == true
+      local payload_factory = candidate.payload
+      requested = true
+      if (is_deep and not HAS_SNES_DEEP_EVENTS)
+          or (not is_deep and not HAS_SNES_PPU_OBJ_EVENTS) or event_type == nil then
+        release_recording_hooks()
+        return nil, "selected semantic event requires the maintained SNES observation callbacks"
+      end
+      local ok, ref = pcall(emu.addEventCallback, function()
+        if recording ~= state or not state.active then return end
+        local effect
+        local event = is_deep and emu.getSnesObservationEvent() or nil
+        -- Event envelopes use the adapter's recording-frame coordinate. Native observation
+        -- callbacks also expose Mesen's process-global frame counter, but that counter can start
+        -- before this script and therefore cannot be mixed with frame_boundary/f_start. Device
+        -- time remains available through the native master clock and phase payload.
+        local event_frame = frame
+        local tick = event and event.masterClock or emu.getMasterClock()
+        local payload = payload_factory and payload_factory() or deep_payload(event_id, event)
+        state, effect = Recording.semantic_event(state, event_id, event_frame, tick, payload)
+        recording = state
+        if effect and apply_recording_effect(effect, false) == "freeze" then emu.breakExecution() end
+      end, event_type)
+      if not ok or ref == nil then
+        release_recording_hooks()
+        return nil, "semantic event hook installation failed: " .. tostring(ref)
+      end
+      recording_hook_refs[#recording_hook_refs + 1] = { ref = ref, event_type = event_type }
+    end
+  end
+  return Recording.attach_hooks(state, requested)
+end
+
+local function resolve_recording_effect(effect, frame_boundary_proven)
+  if not (recording and effect and effect.kind == "arm_observation") then
+    return apply_recording_effect(effect, frame_boundary_proven)
+  end
+  local hooks_ok, hooks_error = install_recording_semantic_hooks(recording)
+  if not hooks_ok then
+    recording, effect = Recording.cancel(recording, frame, hooks_error)
+  else
+    effect = { kind = "working" }
+  end
+  return apply_recording_effect(effect, frame_boundary_proven)
+end
+
+local function recording_conflict()
+  if recording or recording_reset or deferred or pending_step_id or pending_io or input_hold then
+    return "a conflicting temporal operation or input override is active"
+  end
+  if #recording_hook_refs > 0 then
+    return "a prior recording hook could not be verified as removed"
+  end
+  if next(breakpoints) ~= nil or trace_on or reset_bp then
+    return "persistent breakpoints, reset watch, and instruction trace must be cleared before recording"
+  end
+  return nil
+end
+
+local function start_recording(id, p)
+  if not RECORDING_SUPPORTED then
+    reply_err(id, "unsupported", "record_window is not supported for " .. SYS.system)
+    return nil
+  end
+  local conflict = recording_conflict()
+  if conflict then reply_err(id, "busy", conflict); return nil end
+
+  local callback_start = wall_ms()
+  local launch_id = os.getenv("EMUCAP_LAUNCH_ID")
+  local validated, kind, message = Recording.validate(p, launch_id, frame, callback_start)
+  if not validated then reply_err(id, kind, message); return nil end
+  local prepared
+  prepared, kind, message = Recording.prepare(
+    p, launch_id, frame, callback_start, buttons_to_table, validated)
+  if not prepared then reply_err(id, kind, message); return nil end
+  local sink, sink_err = open_recording_sink(p)
+  if not sink then reply_err(id, "sink_unavailable", sink_err); return nil end
+  local member_sink, member_sink_err = open_recording_member_sink(p)
+  if member_sink_err then
+    pcall(sink.close)
+    reply_err(id, "sink_unavailable", member_sink_err)
+    return nil
+  end
+
+  if p.origin == "reset_release" then
+    recording_reset = {
+      params = p,
+      request_id = id,
+      launch_id = launch_id,
+      started_ms = callback_start,
+      sink = sink,
+      member_sink = member_sink,
+      prepared = prepared,
+      cancelled = false,
+    }
+    -- Mesen processes this queued action after the current frame. Its native Reset event runs after
+    -- the console reset and before any post-reset guest tick; that callback completes the arm.
+    local queued, reset_error = pcall(emu.reset)
+    if not queued then
+      recording_reset = nil
+      pcall(sink.close)
+      if member_sink then pcall(member_sink.close) end
+      reply_err(id, "emulator_error", "reset queue failed: " .. tostring(reset_error))
+      return nil
+    end
+    return "started"
+  end
+
+  local state, effect
+  state, effect, kind, message = Recording.start(
+    p, id, launch_id, frame, callback_start, sink, buttons_to_table,
+    install_recording_input, release_recording_input, prepared, release_recording_hooks,
+    member_sink, capture_initial_snapshots, wall_ms)
+  if not state then
+    pcall(sink.close)
+    if member_sink then pcall(member_sink.close) end
+    reply_err(id, kind, message)
+    return nil
+  end
+  recording = state
+  local action = resolve_recording_effect(effect, true)
+  return action or "started"
+end
+
+local function handle_recording_control(line)
+  local id, method, p = parse_request(line)
+  id = id or 0
+  if method ~= "abort_recording" then
+    reply_err(id, "busy", "record_window owns guest progress until its terminal response")
+    return nil
+  end
+  if p.capture_id ~= recording.capture_id or p.launch_id ~= recording.launch_id then
+    reply_err(id, "bad_state", "abort identity does not match the active recording")
+    return nil
+  end
+
+  local finished_id = recording.request_id
+  local effect
+  recording, effect = Recording.cancel(recording, frame, "request_cancelled")
+  reply_ok(id, { status = "completed", capture_id = p.capture_id, aborted = true })
+  -- apply_recording_effect replies to the original request id after the abort acknowledgement.
+  if recording then recording.request_id = finished_id end
+  return apply_recording_effect(effect, true)
+end
+
 -- A TCP session is also the response-id namespace. Once it is gone, an unfinished response cannot
 -- be delivered on the next session: doing so puts an old id ahead of the new hello and can keep the
 -- replacement MCP from ever completing its handshake. Preserve emulator/freeze state, but cancel
 -- only request-scoped work and release a transient press hold.
 abort_inflight = function()
   local cancelled = deferred ~= nil or pending_step_id ~= nil or pending_io ~= nil
+    or recording ~= nil or recording_reset ~= nil
   local deferred_effect
   deferred, deferred_effect = Deferred.cancel(deferred)
   apply_deferred_effect(deferred_effect)
@@ -858,6 +1361,25 @@ abort_inflight = function()
     pcall(emu.removeMemoryCallback, pending_io.ref, emu.callbackType.exec, IO_LO, IO_HI, CPU)
   end
   pending_io = nil
+  if recording then
+    local finished = recording
+    local effect
+    finished, effect = Recording.cancel(finished, frame, "connection_closed")
+    local result = Recording.result(finished, wall_ms())
+    recording = nil
+    remember_recording_terminal(finished, result)
+    STATE = "frozen"
+    freeze_state = FreezeState.halt("record_window", false)
+    freeze_start_ms = wall_ms()
+    freeze_disc_ms = freeze_start_ms
+    freeze_snapshot = nil
+    emu.breakExecution()
+  end
+  if recording_reset then
+    -- The system reset is already queued and has no safe public unqueue operation. Preserve the
+    -- exact request until the native reset callback, then close it before the first post-reset tick.
+    recording_reset.cancelled = true
+  end
   reset_after_reply = false
   if cancelled then pcall(emu.log, "[emucap] connection closed; cancelled unfinished requests and waiting to reconnect") end
 end
@@ -967,7 +1489,7 @@ local function record_hit(bp, addr, value)
   end
   if bp.pause_on_hit and STATE ~= "frozen" then
     flush_deferred("interrupted", "breakpoint", bp.id)   -- 진행 중 지연 명령 마무리
-    STATE = "frozen"; freeze_reason = "breakpoint"
+    STATE = "frozen"; freeze_state = FreezeState.halt("breakpoint", false)
     emu.breakExecution()
   end
 end
@@ -984,7 +1506,7 @@ local function record_reg_hit(bp, pc, v)
   end
   if bp.pause_on_hit and STATE ~= "frozen" then
     flush_deferred("interrupted", "register_break", bp.id)
-    STATE = "frozen"; freeze_reason = "register_break"
+    STATE = "frozen"; freeze_state = FreezeState.halt("register_break", false)
     emu.breakExecution()
   end
 end
@@ -1209,7 +1731,7 @@ function handlers.set_breakpoint(p)
       events[#events + 1] = event
       if bp.pause_on_hit and STATE ~= "frozen" then
         flush_deferred("interrupted", bp.kind, id)
-        STATE = "frozen"; freeze_reason = bp.kind; emu.breakExecution()
+        STATE = "frozen"; freeze_state = FreezeState.halt(bp.kind, false); emu.breakExecution()
       end
     end, event_type)
     breakpoints[id] = bp
@@ -1230,7 +1752,8 @@ function handlers.set_breakpoint(p)
           address = 0, value = 0, pc = full_pc(st), bank = bank_for_pc(st), frame = frame }
       else dropped = dropped + 1 end
       if bp.pause_on_hit and STATE ~= "frozen" then
-        flush_deferred("interrupted", p.kind, id); STATE = "frozen"; freeze_reason = p.kind; emu.breakExecution()
+        flush_deferred("interrupted", p.kind, id)
+        STATE = "frozen"; freeze_state = FreezeState.halt(p.kind, false); emu.breakExecution()
       end
     end, evtype)
     breakpoints[id] = bp
@@ -1282,7 +1805,8 @@ function handlers.set_breakpoint(p)
           channels = as_array(chans), pc = full_pc(st), bank = bank_for_pc(st), frame = frame }
       else dropped = dropped + 1 end
       if bp.pause_on_hit and STATE ~= "frozen" then
-        flush_deferred("interrupted", "dma", id); STATE = "frozen"; freeze_reason = "dma"; emu.breakExecution()
+        flush_deferred("interrupted", "dma", id)
+        STATE = "frozen"; freeze_state = FreezeState.halt("dma", false); emu.breakExecution()
       end
     end
     for _, reg in ipairs(regs) do
@@ -1471,7 +1995,7 @@ function handlers.break_on_reset(p)
       else dropped = dropped + 1 end
       if STATE ~= "frozen" then
         flush_deferred("interrupted", "crash", 0)
-        STATE = "frozen"; freeze_reason = "crash"; emu.breakExecution()
+        STATE = "frozen"; freeze_state = FreezeState.halt("crash", false); emu.breakExecution()
       end
     end, emu.callbackType.exec, handler, handler, CPU)
     return true, { watching = true, handler = handler }
@@ -1667,8 +2191,11 @@ end
 local function dispatch(line)
   local id, method, p = parse_request(line)
   id = id or 0
+  if method == "record_window" then
+    return start_recording(id, p)
+  end
   if method == "pause" then
-    STATE = "frozen"; freeze_reason = "paused"
+    STATE = "frozen"; freeze_state = FreezeState.halt("paused", false)
     reply_ok(id, { state = "frozen" })
     emu.breakExecution()   -- 실제 freeze는 codeBreak에서
     return
@@ -1708,7 +2235,14 @@ end
 local function handle_in_freeze(line)
   local id, method, p = parse_request(line)
   id = id or 0
-  if method == "resume" then
+  if method == "record_window" then
+    if not FreezeState.can_start_recording(freeze_state) then
+      reply_err(id, "unsafe_halt", "the current frozen position is not a proven frame boundary")
+    else
+      local action = start_recording(id, p)
+      if action == "started" then return "resume" end
+    end
+  elseif method == "resume" then
     reply_ok(id, { state = "running" })
     return "resume"
   elseif method == "step" then
@@ -1717,6 +2251,7 @@ local function handle_in_freeze(line)
     step_unit = (p.unit == "instructions") and "instructions" or "frames"
     step_remaining = count
     pending_step_id = id   -- 완료 응답은 청크들이 끝난 뒤
+    freeze_state = FreezeState.halt("step", false)
     return "step"
   elseif method == "pause" then
     reply_ok(id, { state = "frozen" })   -- 멱등
@@ -1781,7 +2316,7 @@ end
 local function adopt_host_halt(reason)
   if STATE == "frozen" then return end
   STATE = "frozen"
-  freeze_reason = reason
+  freeze_state = FreezeState.halt(reason, false)
   freeze_start_ms = wall_ms()
   freeze_disc_ms = nil
   freeze_snapshot = nil
@@ -1809,6 +2344,7 @@ local function service_frozen_once()
   if pending_step_id then
     if Tx.pending(tx) then return end
     if step_remaining <= 0 then
+      freeze_state = FreezeState.after_step(step_unit)
       reply_ok(pending_step_id, { status = "completed", frame = frame })
       pending_step_id = nil
     else
@@ -1853,7 +2389,8 @@ local function service_frozen_once()
       last_reconnect_ms = now
       connect()
     end
-  elseif freeze_reason ~= "hotkey" and MAX_FREEZE_MS > 0 and now - freeze_start_ms >= MAX_FREEZE_MS then
+  elseif freeze_state.reason ~= "hotkey" and MAX_FREEZE_MS > 0
+      and now - freeze_start_ms >= MAX_FREEZE_MS then
     -- operator opt-in deadman. hotkey freeze와 기본값(0)은 명시적 release까지 영속한다.
     resume_from_freeze()
   end
@@ -1882,9 +2419,47 @@ emu.addEventCallback(function()
   halt_savestate_safe = false
 end, emu.eventType.codeBreakIdleSavestate)
 
+-- Emulator::Reset emits this after the console, input devices, and master clock are reset and before
+-- returning to the emulation loop. The reset-origin transaction was fully validated, movie-decoded,
+-- and sink-bound before emu.reset() was queued, so this callback performs only the boundary arm.
+emu.addEventCallback(function()
+  if not recording_reset then return end
+  local pending = recording_reset
+  recording_reset = nil
+
+  -- A reset release is a new adapter frame boundary even though Mesen's regular StartFrame callback
+  -- is emitted only when this new frame completes and the PPU wraps back to scanline zero.
+  frame = frame + 1
+  local state, effect, kind, message = Recording.start(
+    pending.params, pending.request_id, pending.launch_id, frame, pending.started_ms,
+    pending.sink, buttons_to_table, install_recording_input, release_recording_input,
+    pending.prepared, release_recording_hooks, pending.member_sink,
+    capture_initial_snapshots, wall_ms)
+  if not state then
+    pcall(pending.sink.close)
+    if pending.member_sink then pcall(pending.member_sink.close) end
+    reply_err(pending.request_id, kind or "adapter_error", message or "reset recording arm failed")
+    STATE = "frozen"
+    freeze_state = FreezeState.halt("record_window", true)
+    emu.breakExecution()
+    return
+  end
+
+  recording = state
+  if pending.cancelled then
+    recording, effect = Recording.cancel(recording, frame, "connection_closed")
+  end
+  if resolve_recording_effect(effect, true) == "freeze" then emu.breakExecution() end
+end, emu.eventType.reset)
+
 -- 입력 적용: ROM이 읽기 직전인 inputPolled에서 주입한 입력을 덮어쓴다.
 emu.addEventCallback(function()
-  apply_input()
+  local ok, err = apply_input()
+  if not ok and recording then
+    local effect
+    recording, effect = Recording.fail_input(recording, frame, err)
+    if apply_recording_effect(effect, false) == "freeze" then emu.breakExecution() end
+  end
 end, emu.eventType.inputPolled)
 
 -- RUNNING 프레임 루프
@@ -1901,12 +2476,29 @@ emu.addEventCallback(function()
     freeze_start_ms = nil
     freeze_disc_ms = nil
     freeze_snapshot = nil
-    freeze_reason = "paused"
+    freeze_state = FreezeState.halt("paused", false)
     if #events < EVENT_CAP then
       events[#events + 1] = { type = "user_resume", reason = "host", frame = frame }
     else
       dropped = dropped + 1
     end
+  end
+  -- A recording transaction completes the prior interval before deciding whether to stop, apply
+  -- the next full input state, and publish the next frame boundary.
+  -- Control traffic is limited to an identity-bound abort until the original request terminates.
+  if recording then
+    local effect
+    recording, effect = Recording.tick(recording, frame, wall_ms())
+    if resolve_recording_effect(effect, true) == "freeze" then
+      emu.breakExecution()
+      return
+    end
+    local control = poll_line()
+    if not recording then return end
+    if control and handle_recording_control(control) == "freeze" then
+      emu.breakExecution()
+    end
+    return
   end
   -- The local freeze hotkey remains an explicit adapter-owned alternative to Mesen's regular Pause.
   -- Deferred operations already own their execution interval, so do not let a host key interrupt one.
@@ -1920,7 +2512,7 @@ emu.addEventCallback(function()
       if #events < EVENT_CAP then
         events[#events + 1] = { type = "user_freeze", reason = "hotkey", frame = frame, pc = full_pc(emu.getState()) }
       else dropped = dropped + 1 end
-      STATE = "frozen"; freeze_reason = "hotkey"
+      STATE = "frozen"; freeze_state = FreezeState.halt("hotkey", false)
       pcall(emu.drawString, 8, 8, "emucap FROZEN (hotkey)", 0xFFFFFF, 0x000000, 0, 180)
       emu.breakExecution()
       return
@@ -1930,7 +2522,9 @@ emu.addEventCallback(function()
   -- 지연 명령(run_frames/press_buttons) 진행 중이면 그것만 진행(에이전트는 대기 중).
   if deferred then tick_deferred(); return end
   local line = poll_line()
-  if line then dispatch(line) end
+  if line and dispatch(line) == "freeze" then
+    emu.breakExecution()
+  end
 end, emu.eventType.startFrame)
 
 CPU = emu.cpuType[SYS.cpu_type]   -- 브레이크포인트/세이브스테이트 exec 콜백용

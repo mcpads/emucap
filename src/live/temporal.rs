@@ -8,7 +8,8 @@ pub const MAX_SYNC_ADVANCE_COUNT: u64 = 5_000;
 /// Backend-side deadline for bridges that execute an advance as repeated GDB/WebSocket requests.
 /// It stays below the outer link's 300-second deferred deadline, leaving time for terminal cleanup
 /// and the final response.
-pub const MAX_SYNC_OPERATION_TIME: Duration = Duration::from_secs(250);
+pub const MAX_SYNC_OPERATION_MS: u64 = 250_000;
+pub const MAX_SYNC_OPERATION_TIME: Duration = Duration::from_millis(MAX_SYNC_OPERATION_MS);
 
 /// Monotonic wall-clock boundary shared by adapter-owned synchronous work.
 ///

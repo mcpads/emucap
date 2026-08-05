@@ -387,11 +387,13 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
             "content",
             "launch_id",
             "memory_types",
+            "memory_regions",
             "breakpoint_kinds",
             "contracts",
             "host_features",
             "mesen_host_api",
             "host_build",
+            "recording",
         ] {
             if let Some(v) = obj.get(key) {
                 result.insert(key.into(), v.clone());

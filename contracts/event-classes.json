@@ -1,0 +1,227 @@
+{
+  "registry": "emucap-event-classes/v1",
+  "classes": [
+    {
+      "id": "frame_boundary",
+      "revision": 1,
+      "contract": "frame_boundary/v1;clock=frame:strict;frame=tick;payload=empty-object",
+      "contract_sha256": "498fcd52f2fa2327e0af9e9730b4314f0854a6047f57dcde16961b8a4ecb80cd",
+      "clock_domain": "frame",
+      "clock_order": "strict",
+      "frame_relation": "tick",
+      "payload_kind": "empty_object",
+      "payload_fields": []
+    },
+    {
+      "id": "frame_completed",
+      "revision": 1,
+      "contract": "frame_completed/v1;clock=frame:strict;frame=previous_tick;payload=empty-object;point=post-interval-pre-next-input",
+      "contract_sha256": "a335a785a0c109cc7edc6ecab27ff429e386c2ad2eb34769cac4f9cc47378b91",
+      "clock_domain": "frame",
+      "clock_order": "strict",
+      "frame_relation": "previous_tick",
+      "payload_kind": "empty_object",
+      "payload_fields": []
+    },
+    {
+      "id": "snes_ppu_obj_evaluation_start",
+      "revision": 1,
+      "contract": "snes_ppu_obj_evaluation_start/v1;clock=snes_master:nondecreasing;frame=independent;payload=cpu.pc:u24,cpu.a:u16,cpu.x:u16,cpu.y:u16,cpu.sp:u16,cpu.d:u16,cpu.dbr:u8,cpu.k:u8,cpu.ps:u8,ppu.scanline:u16,ppu.dot:u16,ppu.hclock:u32,forced_blank:bool",
+      "contract_sha256": "0d32bfc67347b3169fd77f9d30beb9c325c64db30f0081c628ba85646ebd763b",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "cpu.pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "cpu.a", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.x", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.y", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.sp", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.d", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.dbr", "type": "u64", "min": 0, "max": 255 },
+        { "path": "cpu.k", "type": "u64", "min": 0, "max": 255 },
+        { "path": "cpu.ps", "type": "u64", "min": 0, "max": 255 },
+        { "path": "ppu.scanline", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "ppu.dot", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "ppu.hclock", "type": "u64", "min": 0, "max": 4294967295 },
+        { "path": "forced_blank", "type": "bool" }
+      ]
+    },
+    {
+      "id": "snes_ppu_obj_handoff",
+      "revision": 1,
+      "contract": "snes_ppu_obj_handoff/v1;clock=snes_master:nondecreasing;frame=independent;payload=cpu.pc:u24,cpu.a:u16,cpu.x:u16,cpu.y:u16,cpu.sp:u16,cpu.d:u16,cpu.dbr:u8,cpu.k:u8,cpu.ps:u8,ppu.scanline:u16,ppu.dot:u16,ppu.hclock:u32,forced_blank:bool",
+      "contract_sha256": "ad23c438ee6400f5f9cab84d877f490abe24670769e50efd2bf67d932d329bbc",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "cpu.pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "cpu.a", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.x", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.y", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.sp", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.d", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "cpu.dbr", "type": "u64", "min": 0, "max": 255 },
+        { "path": "cpu.k", "type": "u64", "min": 0, "max": 255 },
+        { "path": "cpu.ps", "type": "u64", "min": 0, "max": 255 },
+        { "path": "ppu.scanline", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "ppu.dot", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "ppu.hclock", "type": "u64", "min": 0, "max": 4294967295 },
+        { "path": "forced_blank", "type": "bool" }
+      ]
+    },
+    {
+      "id": "snes_cpu_instruction",
+      "revision": 1,
+      "contract": "snes_cpu_instruction/v1;clock=snes_master:nondecreasing;frame=independent;phase=pre-execution-after-debug-opcode-peek;payload=pc:u24,opcode:u8,a:u16,x:u16,y:u16,sp:u16,d:u16,dbr:u8,k:u8,ps:u8,emulation:bool,cpu_cycle:u53",
+      "contract_sha256": "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f2ae73ac4ba81c55af0",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "opcode", "type": "u64", "min": 0, "max": 255 },
+        { "path": "a", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "x", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "y", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "sp", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "d", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "dbr", "type": "u64", "min": 0, "max": 255 },
+        { "path": "k", "type": "u64", "min": 0, "max": 255 },
+        { "path": "ps", "type": "u64", "min": 0, "max": 255 },
+        { "path": "emulation", "type": "bool" },
+        { "path": "cpu_cycle", "type": "u64", "min": 0, "max": 9007199254740991 }
+      ]
+    },
+    {
+      "id": "snes_content_read",
+      "revision": 1,
+      "contract": "snes_content_read/v1;clock=snes_master:nondecreasing;frame=independent;coverage=resolved-snes-prg-rom-all-operation-types;payload=bus_address:u24,content_offset:u32,value:u8,operation:u8,pc:u24,cpu_cycle:u53",
+      "contract_sha256": "233b0c2291c335a96afcdcb2b0caa6ca8e21c9c79458c8441531a3dccee4c883",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "bus_address", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "content_offset", "type": "u64", "min": 0, "max": 4294967295 },
+        { "path": "value", "type": "u64", "min": 0, "max": 255 },
+        { "path": "operation", "type": "u64", "min": 0, "max": 9 },
+        { "path": "pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "cpu_cycle", "type": "u64", "min": 0, "max": 9007199254740991 }
+      ]
+    },
+    {
+      "id": "snes_transfer_enable",
+      "revision": 1,
+      "contract": "snes_transfer_enable/v1;clock=snes_master:nondecreasing;frame=independent;phase=enable-write-before-controller-service;coverage=all-eight-channel-descriptors-per-write;payload=written_mask:u8,channel:u3,hdma:bool,direction_to_bus_a:bool,source:u24,destination:u16,size:u17,mode:u3,fixed:bool,decrement:bool,pc:u24,table_address:u16,hdma_bank:u8,hdma_indirect:bool,cpu_cycle:u53",
+      "contract_sha256": "90678005dc54a82c200e9aef01404ca10430ee3a5a32916777cc484650bcdcc7",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "written_mask", "type": "u64", "min": 0, "max": 255 },
+        { "path": "channel", "type": "u64", "min": 0, "max": 7 },
+        { "path": "hdma", "type": "bool" },
+        { "path": "direction_to_bus_a", "type": "bool" },
+        { "path": "source", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "destination", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "size", "type": "u64", "min": 0, "max": 65536 },
+        { "path": "mode", "type": "u64", "min": 0, "max": 7 },
+        { "path": "fixed", "type": "bool" },
+        { "path": "decrement", "type": "bool" },
+        { "path": "pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "table_address", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "hdma_bank", "type": "u64", "min": 0, "max": 255 },
+        { "path": "hdma_indirect", "type": "bool" },
+        { "path": "cpu_cycle", "type": "u64", "min": 0, "max": 9007199254740991 }
+      ]
+    },
+    {
+      "id": "snes_transfer_access",
+      "revision": 1,
+      "contract": "snes_transfer_access/v1;clock=snes_master:nondecreasing;frame=independent;coverage=manual-dma-and-hdma-byte-bus-access;payload=bus_address:u24,value:u8,operation:u8,channel:u3,hdma:bool",
+      "contract_sha256": "735c6cdf3c8cbddde4b754dc6eea6700888bb03e9cd3c77eda750c5f8a372e60",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "bus_address", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "value", "type": "u64", "min": 0, "max": 255 },
+        { "path": "operation", "type": "u64", "min": 0, "max": 9 },
+        { "path": "channel", "type": "u64", "min": 0, "max": 7 },
+        { "path": "hdma", "type": "bool" }
+      ]
+    },
+    {
+      "id": "snes_device_port_write",
+      "revision": 1,
+      "contract": "snes_device_port_write/v1;clock=snes_master:nondecreasing;frame=independent;coverage=snes-register-handler;payload=port:u24,value:u8,operation:u8,transfer_active:bool,channel:u3,hdma:bool,pc:u24,cpu_cycle:u53",
+      "contract_sha256": "36ffca829da2ceb7f4b76f2d38b12331eade10014dd07ecd61f21403be8e4ca5",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "port", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "value", "type": "u64", "min": 0, "max": 255 },
+        { "path": "operation", "type": "u64", "min": 0, "max": 9 },
+        { "path": "transfer_active", "type": "bool" },
+        { "path": "channel", "type": "u64", "min": 0, "max": 7 },
+        { "path": "hdma", "type": "bool" },
+        { "path": "pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "cpu_cycle", "type": "u64", "min": 0, "max": 9007199254740991 }
+      ]
+    },
+    {
+      "id": "snes_interrupt_delivery",
+      "revision": 1,
+      "contract": "snes_interrupt_delivery/v1;clock=snes_master:nondecreasing;frame=independent;phase=debugger-delivery-before-callstack-update;payload=nmi:bool,interrupted_pc:u24,handler_pc:u24,pc:u24,a:u16,x:u16,y:u16,sp:u16,d:u16,dbr:u8,k:u8,ps:u8,emulation:bool,cpu_cycle:u53",
+      "contract_sha256": "c00494d891e76c380bd782d897c5f5ab4b59d918d49c3a64d78d9d4255c11e38",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "nmi", "type": "bool" },
+        { "path": "interrupted_pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "handler_pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "pc", "type": "u64", "min": 0, "max": 16777215 },
+        { "path": "a", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "x", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "y", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "sp", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "d", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "dbr", "type": "u64", "min": 0, "max": 255 },
+        { "path": "k", "type": "u64", "min": 0, "max": 255 },
+        { "path": "ps", "type": "u64", "min": 0, "max": 255 },
+        { "path": "emulation", "type": "bool" },
+        { "path": "cpu_cycle", "type": "u64", "min": 0, "max": 9007199254740991 }
+      ]
+    },
+    {
+      "id": "snes_ppu_obj_consumption_read",
+      "revision": 1,
+      "contract": "snes_ppu_obj_consumption_read/v1;clock=snes_master:nondecreasing;frame=independent;coverage=actual-oam-and-obj-tile-vram-reads;payload=memory_kind:u1,address:u16,value:u8,scanline:u16,dot:u16,hclock:u16",
+      "contract_sha256": "570c5e6c3bf493c0b2e93a59d467fb7300c400993115a08789b8836ad536adc8",
+      "clock_domain": "snes_master",
+      "clock_order": "nondecreasing",
+      "frame_relation": "independent",
+      "payload_kind": "object",
+      "payload_fields": [
+        { "path": "memory_kind", "type": "u64", "min": 0, "max": 1 },
+        { "path": "address", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "value", "type": "u64", "min": 0, "max": 255 },
+        { "path": "scanline", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "dot", "type": "u64", "min": 0, "max": 65535 },
+        { "path": "hclock", "type": "u64", "min": 0, "max": 65535 }
+      ]
+    }
+  ]
+}

@@ -92,7 +92,8 @@ EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo u
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   if [ -n "$(git -C "$HERE" status --porcelain -- \
-    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_memory.lua emucap_tx.lua emucap_state_io.lua \
+    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_memory.lua \
+    emucap_tx.lua emucap_state_io.lua emucap_recording.lua \
     "$(basename "$LUA")" 2>/dev/null)" ]; then
     EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"
   fi
@@ -215,21 +216,32 @@ json_string() {
 json_number() {
   sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$MESEN_METADATA" | head -1
 }
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  else
+    sha256sum "$1" | awk '{print tolower($1)}'
+  fi
+}
 lock_value() { sed -n "s/^$1=//p" "$HERE/upstream.lock"; }
 MESEN_UPSTREAM_COMMIT="$(json_string commit)"
 MESEN_PATCHSET_SHA256="$(json_string patchset_sha256)"
+MESEN_BINARY_SHA256="$(json_string binary_sha256)"
 MESEN_HOST_API="$(json_number host_api)"
 if [ "$MESEN_UPSTREAM_COMMIT" != "$(lock_value MESEN_COMMIT)" ] ||
    [ "$MESEN_HOST_API" != "$(lock_value MESEN_HOST_API)" ] ||
    [ "$MESEN_PATCHSET_SHA256" != "$(lock_value MESEN_PATCHSET_SHA256)" ] ||
    [ "$(json_string upstream)" != "$(lock_value MESEN_REPO)" ] ||
    [ "$(json_string tag)" != "$(lock_value MESEN_TAG)" ] ||
-   ! printf '%s' "$MESEN_PATCHSET_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+   ! printf '%s' "$MESEN_PATCHSET_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$' ||
+   ! printf '%s' "$MESEN_BINARY_SHA256" | grep -Eq '^[0-9a-fA-F]{64}$' ||
+   [ "$(sha256_file "$MESEN_BIN")" != "$(printf '%s' "$MESEN_BINARY_SHA256" | tr '[:upper:]' '[:lower:]')" ]; then
   echo "ERROR: mesen-patch-required — sidecar가 upstream.lock과 맞지 않음: $MESEN_METADATA" >&2
   exit 1
 fi
 export EMUCAP_MESEN_UPSTREAM_COMMIT="$MESEN_UPSTREAM_COMMIT"
 export EMUCAP_MESEN_PATCHSET_SHA256="$MESEN_PATCHSET_SHA256"
+export EMUCAP_MESEN_BINARY_SHA256="$MESEN_BINARY_SHA256"
 MESEN_CLI_ARGS=(
   --debug.scriptWindow.allowIoOsAccess=true
   --debug.scriptWindow.allowNetworkAccess=true
@@ -599,7 +611,7 @@ if [ "$LAUNCH_MODE" = "open" ]; then
   # 신규 창이 안 뜨거나 연결 직후 사라지는 사례가 있다. LaunchServices로 새 인스턴스를 요청하되,
   # EMUCAP_* 환경변수는 open --env로 명시 전달한다. 실제 PID는 포트 연결 후 lsof로 역추적한다.
   OPEN_ENV=(--env "EMUCAP_PORT=$PORT" --env "EMUCAP_BUILD_HASH=$EMUCAP_BUILD_HASH" --env "EMUCAP_ADAPTER_DIR=$HERE")
-  OPEN_ENV+=(--env "EMUCAP_MESEN_UPSTREAM_COMMIT=$MESEN_UPSTREAM_COMMIT" --env "EMUCAP_MESEN_PATCHSET_SHA256=$MESEN_PATCHSET_SHA256")
+  OPEN_ENV+=(--env "EMUCAP_MESEN_UPSTREAM_COMMIT=$MESEN_UPSTREAM_COMMIT" --env "EMUCAP_MESEN_PATCHSET_SHA256=$MESEN_PATCHSET_SHA256" --env "EMUCAP_MESEN_BINARY_SHA256=$MESEN_BINARY_SHA256")
   [ -n "$NAME" ] && OPEN_ENV+=(--env "EMUCAP_NAME=$NAME")
   [ -n "$SESSION_TOKEN" ] && OPEN_ENV+=(--env "EMUCAP_SESSION_TOKEN=$SESSION_TOKEN")
   OPEN_ENV+=(--env "EMUCAP_CONTENT=$ROM")

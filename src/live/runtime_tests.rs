@@ -82,6 +82,68 @@ fn commit_atomically_switches_current_and_prunes_old_generation() {
 }
 
 #[test]
+fn generation_commit_refuses_to_prune_an_unreconciled_capture() {
+    use crate::live::capture_capsule::{
+        CaptureCapsuleRepository, CaptureLeaseIdentity, CapturePreparation,
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let first = store.prepare(47812).unwrap();
+    first.commit(&manifest(&first)).unwrap();
+    let lease = CaptureLeaseIdentity::current();
+    let lease_for_record = lease.clone();
+    let launch_id = first.launch_id().to_string();
+    store
+        .update_link_json(47812, first.launch_id(), move |_| {
+            let mut record = crate::live::continuity::LinkRecord::new(launch_id);
+            record.lease = Some(LeaseRecord {
+                control_session_key: lease_for_record.control_session_key,
+                holder: lease_for_record.holder,
+                acquired_at_unix_ms: 1,
+                refreshed_at_unix_ms: 1,
+            });
+            Ok(record)
+        })
+        .unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let staging = output.path().join(".runtime-test.staging-capture");
+    fs::create_dir(&staging).unwrap();
+    CaptureCapsuleRepository::new(store.clone(), 47812, first.launch_id())
+        .create(CapturePreparation {
+            capture_id: "runtime-test".into(),
+            request_digest_sha256: "11".repeat(32),
+            capability_revision: "22".repeat(32),
+            output_root: output.path().to_path_buf(),
+            destination_path: output.path().join("runtime-test"),
+            staging_path: staging,
+            lease,
+        })
+        .unwrap();
+
+    let second = store.prepare(47812).unwrap();
+    let error = second.commit(&manifest(&second)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(
+        store.read_current(47812).unwrap().unwrap().launch_id,
+        first.launch_id()
+    );
+    assert!(store.generation_dir(47812, first.launch_id()).exists());
+
+    let mut exited = store.read_current(47812).unwrap().unwrap();
+    exited.emulator = ProcessIdentity {
+        pid: u32::MAX,
+        start_identity: Some("test-exited-process".into()),
+    };
+    write_atomic_json(&store.current_path(47812), &exited).unwrap();
+    second.commit(&manifest(&second)).unwrap();
+    assert_eq!(
+        store.read_current(47812).unwrap().unwrap().launch_id,
+        second.launch_id()
+    );
+}
+
+#[test]
 fn prepared_generation_cannot_overwrite_a_concurrent_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let store = RuntimeStore::new(tmp.path().join("sessions"));

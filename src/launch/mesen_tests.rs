@@ -115,6 +115,7 @@ fn test_build_metadata() -> BuildMetadata {
         commit: "0123456789abcdef0123456789abcdef01234567".into(),
         host_api: REQUIRED_HOST_API,
         patchset_sha256: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".into(),
+        binary_sha256: "b5d54c39e66671c9731b9f471e585d8262cd4f54963f0c93082d8dcf334d4c78".into(),
     }
 }
 
@@ -135,6 +136,22 @@ fn build_metadata_rejects_host_without_safe_halt_savestates() {
 
     assert!(error.to_string().contains("host API 1 is incompatible"));
     assert!(error.to_string().contains("expected 2"));
+}
+
+#[test]
+fn build_metadata_rejects_a_binary_replaced_after_the_sidecar_was_written() {
+    let publish = tempfile::tempdir().unwrap();
+    let binary = publish.path().join("Mesen");
+    std::fs::write(&binary, "fake").unwrap();
+    std::fs::write(
+        publish.path().join("emucap-mesen-build.json"),
+        serde_json::to_vec(&test_build_metadata()).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(&binary, "replaced").unwrap();
+
+    let error = read_build_metadata(&binary).unwrap_err();
+    assert!(error.to_string().contains("binary_sha256 does not match"));
 }
 
 #[test]
@@ -640,6 +657,7 @@ fn launch_spec_propagates_server_and_host_build_identity() {
         commit: "a".repeat(40),
         host_api: REQUIRED_HOST_API,
         patchset_sha256: "b".repeat(64),
+        binary_sha256: "c".repeat(64),
     };
 
     let spec = launch_spec(&launch, &binary, &host_build);
@@ -653,5 +671,9 @@ fn launch_spec_propagates_server_and_host_build_identity() {
     assert!(spec.env.contains(&(
         "EMUCAP_MESEN_PATCHSET_SHA256".into(),
         host_build.patchset_sha256.clone()
+    )));
+    assert!(spec.env.contains(&(
+        "EMUCAP_MESEN_BINARY_SHA256".into(),
+        host_build.binary_sha256.clone()
     )));
 }

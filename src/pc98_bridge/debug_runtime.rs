@@ -538,6 +538,26 @@ impl<G: GdbTransport> Bridge<G> {
         self.send_cmd(&payload)
     }
 
+    pub(super) fn lua_data_cmd_reply(
+        &mut self,
+        name: &str,
+        arg: Option<&str>,
+    ) -> BridgeResult<String> {
+        let mut payload = format!("qEmucap,{name}");
+        if let Some(arg) = arg {
+            payload.push(',');
+            payload.push_str(&hex::encode(arg.as_bytes()));
+        }
+        let resp = self.send_cmd_data(&payload)?;
+        if resp.is_empty() || resp.starts_with('E') {
+            Err(BridgeError::Emulator(format!(
+                "MAME Lua command {name} failed: {resp}"
+            )))
+        } else {
+            Ok(resp)
+        }
+    }
+
     pub(super) fn current_frame(&mut self) -> Option<u64> {
         // frames_op(runframes/framestep) 직후 run_frames/step 핸들러가 필수로 호출한다 — 그 직전 이벤트
         // (BP 히트가 frame-target과 겹침)의 spurious bare "OK"가 이 frame 응답 자리에 오배달되면, 이후 g가

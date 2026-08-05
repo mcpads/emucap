@@ -1,71 +1,54 @@
 use serde::{Deserialize, Serialize};
 
-pub const FORMAT_VERSION: u32 = 1;
+pub use super::legacy_manifest::{
+    Artifact, ComponentId, LegacyManifest, RingPolicy, RomId, Slice, Trigger, TriggerKind,
+    LEGACY_FORMAT_VERSION,
+};
+pub use super::recording_manifest::{RecordingManifest, RECORDING_FORMAT_VERSION};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Manifest {
-    pub format_version: u32,
-    pub platform: String,
-    pub rom: RomId,
-    pub adapter: ComponentId,
-    pub emulator: ComponentId,
-    pub trigger: Trigger,
-    pub ring_policy: RingPolicy,
-    pub slices: Vec<Slice>,
-    pub input_movie: Option<String>,
+/// Kept as a source-compatible name for the format-1 finalize and tracking APIs.
+pub type Manifest = LegacyManifest;
+pub const FORMAT_VERSION: u32 = LEGACY_FORMAT_VERSION;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum BundleManifest {
+    Legacy(Box<LegacyManifest>),
+    Recording(Box<RecordingManifest>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RomId {
-    pub sha1: String,
-    pub path_hint: Option<String>,
+#[derive(Debug, thiserror::Error)]
+pub enum ManifestDecodeError {
+    #[error("manifest JSON parse failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unsupported format_version: {0}")]
+    UnsupportedFormatVersion(u32),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ComponentId {
-    pub name: String,
-    pub version: String,
+#[derive(Deserialize)]
+struct VersionProbe {
+    format_version: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Trigger {
-    pub kind: TriggerKind,
-    pub at_unix_ms: u64,
-    pub at_frame: u64,
+pub fn parse_manifest(json: &str) -> Result<BundleManifest, ManifestDecodeError> {
+    let version = serde_json::from_str::<VersionProbe>(json)?.format_version;
+    match version {
+        LEGACY_FORMAT_VERSION => Ok(BundleManifest::Legacy(Box::new(serde_json::from_str(
+            json,
+        )?))),
+        RECORDING_FORMAT_VERSION => Ok(BundleManifest::Recording(Box::new(serde_json::from_str(
+            json,
+        )?))),
+        other => Err(ManifestDecodeError::UnsupportedFormatVersion(other)),
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TriggerKind {
-    Retrospective,
-    /// 녹화 창용 예약 변형 — 포맷 변경 없이 처리만 추가하면 된다.
-    RecordWindow,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RingPolicy {
-    pub interval_frames: u32,
-    pub depth: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Slice {
-    pub frame: u64,
-    pub artifacts: Vec<Artifact>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Artifact {
-    Savestate {
-        path: String,
-    },
-    Screenshot {
-        path: String,
-    },
-    /// 세이브스테이트에서 뽑은 WRAM/VRAM/CRAM이 여기로 들어온다.
-    MemoryRegion {
-        name: String,
-        path: String,
-    },
+impl<'de> Deserialize<'de> for BundleManifest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        parse_manifest(&value.to_string()).map_err(serde::de::Error::custom)
+    }
 }

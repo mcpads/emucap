@@ -1,5 +1,7 @@
 use super::broker_link;
-use super::link::{EmulatorLink, LinkError};
+use super::link::{
+    AbortRequest, EmulatorLink, LinkError, ProgressCallControl, RequestCancellation,
+};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::time::Duration;
@@ -469,5 +471,100 @@ fn broker_link_bails_on_working_flood_past_deadline() {
     // 살아있어 write가 안 실패 → 스레드가 100_000회를 다 돌아 h.join이 사실상 무한 대기).
     drop(link);
     rel_tx.send(()).ok();
+    h.join().unwrap();
+}
+
+#[test]
+fn broker_progress_preserves_sequence_and_exact_abort_identity() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let h = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut attach = String::new();
+        reader.read_line(&mut attach).unwrap();
+        let attach: serde_json::Value = serde_json::from_str(attach.trim()).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": attach["id"],
+                "ok": true,
+                "result": {
+                    "attached_name": "recording",
+                    "methods": ["record_window", "abort_recording"],
+                }
+            })
+        )
+        .unwrap();
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": request["id"],
+                "ok": true,
+                "result": {
+                    "status": "working",
+                    "capture_id": "capture-broker",
+                    "sequence": 7,
+                    "frame": 99,
+                    "events": 8,
+                    "bytes": 900,
+                }
+            })
+        )
+        .unwrap();
+        let mut abort = String::new();
+        reader.read_line(&mut abort).unwrap();
+        let abort: serde_json::Value = serde_json::from_str(abort.trim()).unwrap();
+        assert_eq!(abort["method"], "abort_recording");
+        assert_eq!(abort["params"]["capture_id"], "capture-broker");
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": abort["id"], "ok": true, "result": {}})
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": request["id"],
+                "ok": true,
+                "result": {"status": "interrupted", "capture_id": "capture-broker"},
+            })
+        )
+        .unwrap();
+    });
+    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let cancellation = RequestCancellation::default();
+    let trigger = cancellation.clone();
+    let control = ProgressCallControl {
+        cancellation,
+        abort: Some(AbortRequest {
+            method: "abort_recording".into(),
+            params: serde_json::json!({"capture_id": "capture-broker"}),
+        }),
+        max_host_ms: Some(2000),
+    };
+    let mut observed = Vec::new();
+    let result = link
+        .call_with_progress(
+            "record_window",
+            serde_json::json!({"capture_id": "capture-broker"}),
+            &mut |progress| {
+                observed.push((progress.sequence, progress.frame));
+                trigger.cancel();
+                Ok(())
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(observed, vec![(7, 99)]);
+    assert_eq!(result["status"], "interrupted");
     h.join().unwrap();
 }

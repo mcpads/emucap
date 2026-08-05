@@ -191,7 +191,9 @@ if ($metadata.upstream -ne $lockValues.MESEN_REPO -or
     $metadata.commit -ne $lockValues.MESEN_COMMIT -or
     [int]$metadata.host_api -ne [int]$lockValues.MESEN_HOST_API -or
     $metadata.patchset_sha256 -ne $lockValues.MESEN_PATCHSET_SHA256 -or
-    $metadata.patchset_sha256 -notmatch '^[0-9a-fA-F]{64}$') {
+    $metadata.patchset_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    $metadata.binary_sha256 -notmatch '^[0-9a-fA-F]{64}$' -or
+    [string]$metadata.binary_sha256 -ne (Get-FileHash -LiteralPath $sourceMesen -Algorithm SHA256).Hash.ToLowerInvariant()) {
   throw "mesen-patch-required: $metadataPath does not match upstream.lock"
 }
 
@@ -293,6 +295,7 @@ $env:EMUCAP_PORT = "$Port"
 $env:EMUCAP_CONTENT = $Rom
 $env:EMUCAP_MESEN_UPSTREAM_COMMIT = [string]$metadata.commit
 $env:EMUCAP_MESEN_PATCHSET_SHA256 = [string]$metadata.patchset_sha256
+$env:EMUCAP_MESEN_BINARY_SHA256 = [string]$metadata.binary_sha256
 if ($Name) { $env:EMUCAP_NAME = $Name }
 $buildHash = "unknown"
 try {
@@ -306,7 +309,7 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_memory.lua emucap_tx.lua emucap_state_io.lua $entryName 2>$null)
+    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_memory.lua emucap_tx.lua emucap_state_io.lua emucap_recording.lua $entryName 2>$null)
     if ($LASTEXITCODE -ne 0 -or $dirtyFiles.Count -gt 0) {
       $buildHash = "$buildHash-dirty"
     }

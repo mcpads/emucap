@@ -6,6 +6,8 @@
 // 빌드 통합: src/drivers/로 복사 + Makefile.am에 추가 + main.cpp 프레임 루프에서 호출.
 #include "main.h"            // CurGame, MDFNGI, Mednafen 타입, MDFNI_Reset
 #include <mednafen/debug.h>  // DebuggerInfoStruct, AddressSpaceType
+#include <mednafen/movie.h>  // MDFNMOV_IsPlaying(reset-origin capability gate)
+#include <mednafen/netplay.h>  // MDFNnetplay(reset is remote-commanded, not immediate)
 #include <mednafen/state.h>  // MDFNSS_SaveSM / MDFNSS_LoadSM
 #include <mednafen/FileStream.h>
 #include <mednafen/video/png.h>  // PNGWrite(screenshot)
@@ -16,6 +18,7 @@
 #include "emucap_json_num.h"
 #include "emucap_ngp.h"
 #include "emucap_pcfx.h"
+#include "emucap_recording.h"
 #include "emucap_native_failure.h"
 
 extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
@@ -29,11 +32,21 @@ extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 #ifndef EMUCAP_BUILD_HASH
 #define EMUCAP_BUILD_HASH "unknown"
 #endif
+#ifndef EMUCAP_MEDNAFEN_UPSTREAM
+#define EMUCAP_MEDNAFEN_UPSTREAM ""
+#endif
+#ifndef EMUCAP_MEDNAFEN_UPSTREAM_REVISION
+#define EMUCAP_MEDNAFEN_UPSTREAM_REVISION ""
+#endif
+#ifndef EMUCAP_MEDNAFEN_PATCHSET_SHA256
+#define EMUCAP_MEDNAFEN_PATCHSET_SHA256 ""
+#endif
 
 #include <exception>
 #include <atomic>
 #include <chrono>
 #include <stdexcept>
+#include <memory>
 
 #ifdef _WIN32
 #include <winsock2.h>   // Windows 소켓(MinGW) — POSIX sys/socket.h 대체
@@ -85,6 +98,8 @@ static inline std::string emucap_temp_file(const std::string& name) {
 #include <cctype>
 #include <strings.h>  // strcasecmp(set_layer_enable 이름 대소문자 무시 매칭)
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -106,6 +121,10 @@ const int PROTOCOL_VERSION = 1;
 // 명령 단위로 정확히 freeze한다. emucap_cpu_cb는 serve_socket_once 뒤에 정의(여기선 전방선언).
 void emucap_cpu_cb(uint32 PC, bool bpoint);
 void serve_socket_once();
+void cancel_recording_for_disconnect();
+const char* system_shortname();
+bool is_ss();
+bool lookup_button_bit(const std::string& name, uint16_t& bit);
 struct BP { long id; int type; uint32 a1, a2; uint32 public_a1, public_a2;
             bool logical = true; bool pause_on_hit = true;
             uint32 value = 0, value_mask = 0xFFFFFFFF; int val_len = 1; bool has_value = false;
@@ -156,6 +175,10 @@ static const size_t TX_CAP = 8 * 1024 * 1024;
 static const long MAX_SYNC_ADVANCE = 5000;
 static const uint64_t PROGRESS_INTERVAL_MS = 1000;
 uint64_t g_frame = 0;
+std::unique_ptr<EmucapRecording> g_recording;
+bool g_recording_last_valid = false;
+std::string g_recording_last_capture_id;
+EmucapRecordingResult g_recording_last;
 long g_test_adapter_exception_id = -1;
 bool g_internal_failure_active = false;
 char g_internal_failure_operation[128]{};
@@ -280,7 +303,8 @@ void rearm_breakpoints();
 
 void cancel_session_requests() {
   const bool had_request = g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
-      || g_insn_step_id >= 0 || g_test_adapter_exception_id >= 0;
+      || g_insn_step_id >= 0 || g_test_adapter_exception_id >= 0 || g_recording.get();
+  cancel_recording_for_disconnect();
   if (g_def_is_press) g_input_override.release();
   g_def_id = -1;
   g_def_remaining = 0;
@@ -485,6 +509,449 @@ void reply_err(long id, const char* kind, const char* msg) {
   char head[96];
   snprintf(head, sizeof(head), "{\"id\":%ld,\"ok\":false,\"error\":{\"kind\":\"%s\",\"message\":\"", id, kind);
   send_line(std::string(head) + json_escape(msg) + "\"}}");  // msg는 예외 등 비신뢰 → 이스케이프
+}
+
+bool recording_hex_digest(const std::string& value) {
+  if (value.size() != 64) return false;
+  for (const unsigned char c : value) if (!isxdigit(c)) return false;
+  return true;
+}
+
+bool recording_safe_id(const std::string& value) {
+  if (value.empty() || value.size() > 96) return false;
+  for (const unsigned char c : value) {
+    if (!(isalnum(c) || c == '-' || c == '_')) return false;
+  }
+  return true;
+}
+
+bool recording_identity_available() {
+  const char* binary = getenv("EMUCAP_MEDNAFEN_BINARY_SHA256");
+  const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+  return binary && recording_hex_digest(binary)
+      && launch_id && *launch_id
+      && EMUCAP_MEDNAFEN_UPSTREAM[0]
+      && EMUCAP_MEDNAFEN_UPSTREAM_REVISION[0]
+      && recording_hex_digest(EMUCAP_MEDNAFEN_PATCHSET_SHA256);
+}
+
+bool recording_reset_release_available() {
+  // MDFNI_Reset is immediate for the maintained modules except regular Saturn, whose core ignores
+  // MDFN_MSC_RESET in favor of the SMPC reset-button path. Movie playback can also suppress the
+  // command, so neither case may advertise an exact post-reset origin.
+  return !is_ss() && !MDFNnetplay && !MDFNMOV_IsPlaying();
+}
+
+enum RecordingJsonObjectState {
+  RECORDING_JSON_OBJECT_ABSENT,
+  RECORDING_JSON_OBJECT_VALID,
+  RECORDING_JSON_OBJECT_INVALID,
+};
+
+RecordingJsonObjectState recording_json_object(
+    const std::string& line,
+    const char* key,
+    std::string& object) {
+  const std::string marker = std::string("\"") + key + "\"";
+  const std::size_t key_pos = line.find(marker);
+  if (key_pos == std::string::npos) return RECORDING_JSON_OBJECT_ABSENT;
+  if (line.find(marker, key_pos + marker.size()) != std::string::npos)
+    return RECORDING_JSON_OBJECT_INVALID;
+  const std::size_t colon = line.find(':', key_pos + marker.size());
+  if (colon == std::string::npos) return RECORDING_JSON_OBJECT_INVALID;
+  std::size_t begin = colon + 1;
+  while (begin < line.size() && std::isspace(static_cast<unsigned char>(line[begin]))) begin++;
+  if (begin >= line.size() || line[begin] != '{') return RECORDING_JSON_OBJECT_INVALID;
+
+  bool quoted = false;
+  bool escaped = false;
+  unsigned depth = 0;
+  for (std::size_t pos = begin; pos < line.size(); pos++) {
+    const char value = line[pos];
+    if (quoted) {
+      if (escaped) escaped = false;
+      else if (value == '\\') escaped = true;
+      else if (value == '"') quoted = false;
+      continue;
+    }
+    if (value == '"') quoted = true;
+    else if (value == '{') depth++;
+    else if (value == '}') {
+      if (depth == 0) return RECORDING_JSON_OBJECT_INVALID;
+      if (--depth == 0) {
+        object = line.substr(begin, pos - begin + 1);
+        return RECORDING_JSON_OBJECT_VALID;
+      }
+    }
+  }
+  return RECORDING_JSON_OBJECT_INVALID;
+}
+
+bool recording_json_string(
+    const std::string& object,
+    const char* key,
+    std::string& value) {
+  const std::string marker = std::string("\"") + key + "\"";
+  const std::size_t key_pos = object.find(marker);
+  if (key_pos == std::string::npos ||
+      object.find(marker, key_pos + marker.size()) != std::string::npos) return false;
+  const std::size_t colon = object.find(':', key_pos + marker.size());
+  if (colon == std::string::npos) return false;
+  std::size_t pos = colon + 1;
+  while (pos < object.size() && std::isspace(static_cast<unsigned char>(object[pos]))) pos++;
+  if (pos >= object.size() || object[pos++] != '"') return false;
+  value.clear();
+  while (pos < object.size()) {
+    const unsigned char current = static_cast<unsigned char>(object[pos++]);
+    if (current == '"') return true;
+    if (current < 0x20) return false;
+    if (current != '\\') {
+      value.push_back(static_cast<char>(current));
+      continue;
+    }
+    if (pos >= object.size()) return false;
+    const char escaped = object[pos++];
+    switch (escaped) {
+      case '"': value.push_back('"'); break;
+      case '\\': value.push_back('\\'); break;
+      case '/': value.push_back('/'); break;
+      case 'b': value.push_back('\b'); break;
+      case 'f': value.push_back('\f'); break;
+      case 'n': value.push_back('\n'); break;
+      case 'r': value.push_back('\r'); break;
+      case 't': value.push_back('\t'); break;
+      default: return false;
+    }
+  }
+  return false;
+}
+
+bool recording_input_movie(
+    const std::string& line,
+    std::uint64_t frames,
+    std::vector<std::uint16_t>& masks,
+    std::string& error) {
+  std::string object;
+  const RecordingJsonObjectState state =
+      recording_json_object(line, "input_movie", object);
+  if (state == RECORDING_JSON_OBJECT_ABSENT) return true;
+  if (state != RECORDING_JSON_OBJECT_VALID) {
+    error = "input_movie must be an object";
+    return false;
+  }
+
+  std::uint64_t port = 0;
+  std::uint64_t movie_frames = 0;
+  std::uint64_t expected_bytes = 0;
+  const std::string format = json_str(object, "format");
+  std::string path;
+  const std::string sha256 = json_str(object, "sha256");
+  if (!recording_json_string(object, "path", path)
+      || format != EMUCAP_RECORDING_INPUT_MOVIE_FORMAT || path.empty()
+      || !recording_hex_digest(sha256)
+      || emucap_json_u64(object, "port", port) != EmucapJsonNumberStatus::valid
+      || emucap_json_u64(object, "frames", movie_frames) != EmucapJsonNumberStatus::valid
+      || emucap_json_u64(object, "bytes", expected_bytes) != EmucapJsonNumberStatus::valid
+      || port != 0 || movie_frames != frames || expected_bytes < 1
+      || expected_bytes > 1024 * 1024) {
+    error = "input_movie identity is invalid";
+    return false;
+  }
+
+  std::ifstream input(path.c_str(), std::ios::in | std::ios::binary);
+  if (!input) {
+    error = "input_movie open failed";
+    return false;
+  }
+  const std::string text(
+      (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+  if (input.bad() || text.size() != expected_bytes || text.empty() || text.back() != '\n') {
+    error = "input_movie size or terminal newline mismatch";
+    return false;
+  }
+
+  if (!emucap_parse_recording_input_movie(
+          text, frames, lookup_button_bit, masks, error)) {
+    if (error.find("unsupported button") != std::string::npos) {
+      error = std::string("unsupported ") + system_shortname() + " " + error;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool recording_stop_condition(
+    const std::string& line,
+    bool include_frame_completed,
+    std::uint64_t frames,
+    EmucapRecordingRequest& request,
+    std::string& error) {
+  std::string object;
+  const RecordingJsonObjectState state = recording_json_object(line, "stop_on", object);
+  if (state == RECORDING_JSON_OBJECT_ABSENT) return true;
+  if (state != RECORDING_JSON_OBJECT_VALID
+      || json_str(object, "event_class") != "frame_completed"
+      || !include_frame_completed
+      || emucap_json_u64(object, "occurrence", request.stop_occurrence)
+          != EmucapJsonNumberStatus::valid
+      || request.stop_occurrence < 1 || request.stop_occurrence > frames) {
+    error = "stop_on must select an advertised frame_completed occurrence";
+    return false;
+  }
+  request.stop_on_frame_completed = true;
+  return true;
+}
+
+bool recording_input_handler(bool engaged, std::uint16_t mask, std::string& error) {
+  (void)error;
+  if (engaged) g_input_override.engage(mask);
+  else g_input_override.release();
+  return true;
+}
+
+std::string recording_stop_event_json(const EmucapRecordingResult& result) {
+  std::string stop_event = "null";
+  if (result.has_stop_event) {
+    stop_event = "{\"sequence\":" + std::to_string(result.stop_sequence) +
+        ",\"event_class\":\"frame_completed\",\"clock_domain\":\"frame\"," +
+        "\"clock_tick\":" + std::to_string(result.stop_clock_tick) +
+        ",\"frame\":" + std::to_string(result.stop_frame) +
+        ",\"occurrence\":" + std::to_string(result.stop_occurrence) + "}";
+  }
+  return stop_event;
+}
+
+std::string recording_result_json(
+    const std::string& capture_id,
+    const EmucapRecordingResult& result) {
+  std::string reason = result.reason.empty()
+      ? "null"
+      : "\"" + json_escape(result.reason) + "\"";
+  char numbers[640];
+  snprintf(
+      numbers, sizeof(numbers),
+      ",\"f_start\":%llu,\"f_end\":%llu,\"final_frame\":%llu,"
+      "\"frames\":%llu,\"events\":%llu,\"bytes\":%llu,"
+      "\"physical_bytes\":%llu,\"dropped\":%llu,\"truncated\":%s,"
+      "\"first_sequence_gap\":null,\"wall_ms\":%llu,",
+      (unsigned long long)result.f_start,
+      (unsigned long long)result.f_end,
+      (unsigned long long)result.final_frame,
+      (unsigned long long)result.frames,
+      (unsigned long long)result.events,
+      (unsigned long long)result.bytes,
+      (unsigned long long)result.physical_bytes,
+      (unsigned long long)result.dropped,
+      result.truncated ? "true" : "false",
+      (unsigned long long)result.wall_ms);
+  return "{\"status\":\"" + result.status + "\",\"capture_id\":\"" +
+      json_escape(capture_id) + "\",\"operation_outcome\":\"" +
+      result.operation_outcome + "\",\"execution_outcome\":\"" +
+      result.execution_outcome + "\",\"integrity\":\"" + result.integrity +
+      "\",\"reason\":" + reason + numbers + "\"stop_event\":" +
+      recording_stop_event_json(result) +
+      ",\"final_execution_state\":\"" +
+      result.final_execution_state + "\",\"cleanup\":{\"hooks\":\"not_acquired\","
+      "\"transient_input\":\"" +
+      (result.input_acquired
+           ? (result.input_released ? "released" : "unverifiable")
+           : "not_acquired") +
+      "\",\"sink\":\"" +
+      (result.sink_released ? "released" : "unverifiable") + "\"}}";
+}
+
+std::string recording_last_json() {
+  if (!g_recording_last_valid) return "null";
+  const EmucapRecordingResult& result = g_recording_last;
+  std::string reason = result.reason.empty()
+      ? "null"
+      : "\"" + json_escape(result.reason) + "\"";
+  char numbers[384];
+  snprintf(
+      numbers, sizeof(numbers),
+      "\",\"final_frame\":%llu,\"counters\":{\"frames\":%llu,"
+      "\"events\":%llu,\"bytes\":%llu,\"dropped\":%llu},",
+      (unsigned long long)result.final_frame,
+      (unsigned long long)result.frames,
+      (unsigned long long)result.events,
+      (unsigned long long)result.bytes,
+      (unsigned long long)result.dropped);
+  return "{\"capture_id\":\"" + json_escape(g_recording_last_capture_id) +
+      "\",\"operation_outcome\":\"" + result.operation_outcome +
+      "\",\"execution_outcome\":\"" + result.execution_outcome +
+      "\",\"integrity\":\"" + result.integrity +
+      "\",\"final_execution_state\":\"" +
+      result.final_execution_state + numbers +
+      "\"cleanup\":{\"hooks\":\"not_acquired\",\"transient_input\":\"" +
+      (result.input_acquired
+           ? (result.input_released ? "released" : "unverifiable")
+           : "not_acquired") +
+      "\",\"sink\":\"" +
+      (result.sink_released ? "released" : "unverifiable") +
+      "\"},\"stop_event\":" + recording_stop_event_json(result) +
+      ",\"reason\":" + reason + "}";
+}
+
+void remember_recording_result(
+    const std::string& capture_id,
+    const EmucapRecordingResult& result) {
+  g_recording_last_capture_id = capture_id;
+  g_recording_last = result;
+  g_recording_last_valid = true;
+}
+
+void finish_recording(bool reply) {
+  if (!g_recording) return;
+  const long request_id = g_recording->request_id();
+  const std::string capture_id = g_recording->capture_id();
+  const EmucapRecordingResult result = g_recording->result(monotonic_millis());
+  remember_recording_result(capture_id, result);
+  if (result.final_execution_state == "frozen") g_frozen = true;
+  g_recording.reset();
+  if (reply) reply_ok(request_id, recording_result_json(capture_id, result));
+}
+
+void cancel_recording_for_disconnect() {
+  if (!g_recording) return;
+  g_recording->cancel(
+      g_frame, monotonic_millis(), "connection_closed", "frozen");
+  finish_recording(false);
+}
+
+bool recording_conflict() {
+  return g_recording.get() || g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
+      || g_insn_step_id >= 0 || g_input_override.engaged() || !g_bps.empty()
+      || g_trace_enabled || g_watch_enabled || g_break_on_reset;
+}
+
+bool recording_u64(
+    long id,
+    const std::string& line,
+    const char* key,
+    std::uint64_t& value) {
+  if (emucap_json_u64(line, key, value) == EmucapJsonNumberStatus::valid) return true;
+  const std::string message = std::string(key) + " must be an unsigned integer";
+  reply_err(id, "bad_params", message.c_str());
+  return false;
+}
+
+void handle_record_window(long id, const std::string& line) {
+  if (!recording_identity_available()) {
+    reply_err(id, "unsupported", "record_window requires an identity-complete maintained build");
+    return;
+  }
+  if (recording_conflict()) {
+    reply_err(id, "busy", "a temporal operation, input override, or persistent debug hook is active");
+    return;
+  }
+  if (g_frozen && g_frozen_via_cb) {
+    reply_err(
+        id, "unsafe_halt",
+        "record_window requires a proven frame boundary; resume from the instruction-bound halt first");
+    return;
+  }
+  EmucapRecordingRequest request;
+  request.request_id = id;
+  request.capture_id = json_str(line, "capture_id");
+  request.launch_id = json_str(line, "launch_id");
+  request.request_digest_sha256 = json_str(line, "request_digest_sha256");
+  const std::string capability_revision = json_str(line, "capability_revision");
+  const std::string origin = json_str(line, "origin");
+  const bool reset_available = recording_reset_release_available();
+  request.reset_release = origin == "reset_release";
+  const char* expected_launch_id = getenv("EMUCAP_LAUNCH_ID");
+  bool include_frame_completed = false;
+  if (!recording_safe_id(request.capture_id)
+      || !expected_launch_id || request.launch_id != expected_launch_id
+      || !recording_hex_digest(request.request_digest_sha256)
+      || capability_revision != emucap_recording_capability_revision(reset_available)
+      || (origin != "next_frame_boundary" && !request.reset_release)
+      || (request.reset_release && !reset_available)
+      || !emucap_recording_exact_event_classes(line, include_frame_completed)) {
+    reply_err(id, "bad_params", "recording identity, origin, or event contract is invalid");
+    return;
+  }
+  request.include_frame_completed = include_frame_completed;
+  if (!recording_u64(id, line, "frames", request.frames)
+      || !recording_u64(id, line, "max_frames", request.limits.max_frames)
+      || !recording_u64(id, line, "max_events", request.limits.max_events)
+      || !recording_u64(id, line, "max_bytes", request.limits.max_bytes)
+      || !recording_u64(id, line, "max_line_bytes", request.limits.max_line_bytes)
+      || !recording_u64(id, line, "max_host_ms", request.limits.max_host_ms)
+      || !recording_u64(
+          id, line, "progress_interval_ms", request.limits.progress_interval_ms)) return;
+  if (request.frames < 1 || request.frames > 300
+      || request.limits.max_frames != request.frames
+      || request.limits.max_events < request.frames * (include_frame_completed ? 2 : 1)
+      || request.limits.max_events > 100000
+      || request.limits.max_bytes < request.limits.max_line_bytes
+      || request.limits.max_bytes > 64ULL * 1024 * 1024
+      || request.limits.max_line_bytes < 1
+      || request.limits.max_line_bytes > 64ULL * 1024
+      || request.limits.max_host_ms < 1 || request.limits.max_host_ms > 30000
+      || request.limits.progress_interval_ms < 10
+      || request.limits.progress_interval_ms >= request.limits.max_host_ms
+      || g_frame > std::numeric_limits<std::uint64_t>::max() - request.frames) {
+    reply_err(id, "bad_params", "recording frames or limits are outside the advertised bounds");
+    return;
+  }
+  std::string request_error;
+  if (!recording_stop_condition(
+          line, include_frame_completed, request.frames, request, request_error)
+      || !recording_input_movie(line, request.frames, request.input_masks, request_error)) {
+    reply_err(id, "bad_params", request_error.c_str());
+    return;
+  }
+  const std::string endpoint = json_str(line, "endpoint");
+  const std::string token = json_str(line, "token");
+  std::string sink_error;
+  std::unique_ptr<EmucapRecordingSink> sink = emucap_open_recording_sink(
+      endpoint, token, request.capture_id, sink_error);
+  if (!sink) {
+    reply_err(id, "sink_unavailable", sink_error.c_str());
+    return;
+  }
+  const std::uint64_t started_ms = monotonic_millis();
+  if (request.reset_release) MDFNI_Reset();
+  g_recording.reset(new EmucapRecording(
+      request, g_frame, started_ms, std::move(sink), recording_input_handler));
+  const EmucapRecordingEffect initial = g_recording->tick(g_frame, started_ms);
+  if (initial == EmucapRecordingEffect::terminal) {
+    finish_recording(true);
+    return;
+  }
+  g_frozen = false;
+  reply_ok(id, g_recording->progress_json());
+}
+
+void handle_abort_recording(long id, const std::string& line) {
+  const std::string capture_id = json_str(line, "capture_id");
+  const std::string launch_id = json_str(line, "launch_id");
+  if (!g_recording || capture_id != g_recording->capture_id()
+      || launch_id != g_recording->launch_id()) {
+    reply_err(id, "bad_state", "abort identity does not match the active recording");
+    return;
+  }
+  g_recording->cancel(g_frame, monotonic_millis(), "request_cancelled", "frozen");
+  reply_ok(
+      id, "{\"status\":\"completed\",\"capture_id\":\"" +
+          json_escape(capture_id) + "\",\"aborted\":true}");
+  finish_recording(true);
+}
+
+bool service_recording() {
+  if (!g_recording) return false;
+  if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return false;
+  if (!g_recording) return false;
+  const EmucapRecordingEffect effect = g_recording->tick(g_frame, monotonic_millis());
+  if (effect == EmucapRecordingEffect::working && g_tx.empty())
+    reply_ok(g_recording->request_id(), g_recording->progress_json());
+  if (effect == EmucapRecordingEffect::terminal) {
+    finish_recording(true);
+    return false;
+  }
+  serve_socket_once();
+  return g_recording.get() != nullptr;
 }
 
 bool json_u32_arg(
@@ -914,7 +1381,16 @@ void freeze_spin_until_resume() {
   // 빠져나와 진행시킨다 — 안 그러면 BP 히트/명령단위 freeze 상태에서 step이 게임을 못 돌려 frame hook이
   // 안 돌고 timeout 난다. 명령단위 step은 이 같은 스핀을 탈출해 continuous cb가 다음 N명령을 진행한다.
   while (g_frozen && g_step_remaining == 0 && g_insn_remaining == 0) {
-    if (g_fd < 0) break;        // 끊기면 탈출(emulation 계속)
+    // A transport disconnect is not a release event. Reconnect while the GameThread remains
+    // parked in this exact instruction-bound callback; returning would execute the rest of the
+    // frame and silently invalidate the frozen observation point.
+    if (g_fd < 0) {
+      emucap_connect();
+      if (g_fd < 0) {
+        usleep(2000);
+        continue;
+      }
+    }
     serve_socket_once();
     usleep(2000);               // 2ms — busy-spin 방지
   }
@@ -2335,6 +2811,14 @@ void handle(const std::string& line) {
   // 어떤 핸들러 예외(std::bad_alloc 등)도 프레임 루프 밖으로 탈출시키지 않고 reply_err로
   // 변환한다 — 안 그러면 std::terminate로 에뮬레이터 프로세스가 죽는다.
   try {
+  if (method == "abort_recording") {
+    handle_abort_recording(id, line);
+    return;
+  }
+  if (g_recording) {
+    reply_err(id, "busy", "record_window owns guest progress until its terminal response");
+    return;
+  }
   if (method == "hello") {
     const char* sys = system_shortname();
     const bool has_debugger = CurGame && CurGame->Debugger;
@@ -2377,6 +2861,9 @@ void handle(const std::string& line) {
     }
     if (adapter_exception_test_enabled()) {
       methods += ",\"test_adapter_exception\"";
+    }
+    if (recording_identity_available()) {
+      methods += ",\"record_window\"";
     }
     // memory_types: 이 게임의 debugger address space 이름들(없으면 빈 배열). read/write_memory의
     // 유효한 memory_type 목록이며, MCP가 status.memory_types로 표면화한다. 정적 추측 아님.
@@ -2439,6 +2926,17 @@ void handle(const std::string& line) {
                              breakpoint_kinds + ",\"contracts\":" +
                              contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
                              std::to_string(MAX_SYNC_ADVANCE) + "}}";
+    if (recording_identity_available()) {
+      const char* binary_sha256 = getenv("EMUCAP_MEDNAFEN_BINARY_SHA256");
+      hello_resp.pop_back();
+      hello_resp += ",\"recording\":" +
+          emucap_recording_capability_json(recording_reset_release_available()) +
+          ",\"host_build\":{\"upstream\":\"" +
+          json_escape(EMUCAP_MEDNAFEN_UPSTREAM) + "\",\"commit\":\"" +
+          json_escape(EMUCAP_MEDNAFEN_UPSTREAM_REVISION) +
+          "\",\"patchset_sha256\":\"" + EMUCAP_MEDNAFEN_PATCHSET_SHA256 +
+          "\",\"binary_sha256\":\"" + binary_sha256 + "\"}}";
+    }
     // broker 등록용 name(EMUCAP_NAME 설정 시 포함, 직접 모드는 무시됨).
     const char* emu_name = getenv("EMUCAP_NAME");
     const char* session_token = getenv("EMUCAP_SESSION_TOKEN");
@@ -2492,6 +2990,17 @@ void handle(const std::string& line) {
              g_def_is_press ? "timed" : (g_input_override.engaged() ? "persistent" : "native"),
              (unsigned)g_input_override.mask(), MAX_SYNC_ADVANCE);
     std::string resp(buf);
+    if (recording_identity_available()) {
+      resp.pop_back();
+      resp += ",\"recording\":{\"capability_revision\":\"" +
+          std::string(emucap_recording_capability_revision(
+              recording_reset_release_available())) +
+          "\",\"active\":" + (g_recording ? "true" : "false") +
+          ",\"capture_id\":" +
+          (g_recording ? "\"" + json_escape(g_recording->capture_id()) + "\"" : "null") +
+          ",\"frame\":" + std::to_string(g_frame) +
+          ",\"last\":" + recording_last_json() + "}" + "}";
+    }
     if (is_ss()) {
       uint32_t a = g_last_smpc_read_addr.load();
       uint32_t v = g_last_smpc_read_value.load();
@@ -2524,6 +3033,8 @@ void handle(const std::string& line) {
   } else if (
       method == "test_adapter_exception" && adapter_exception_test_enabled()) {
     g_test_adapter_exception_id = id;
+  } else if (method == "record_window") {
+    handle_record_window(id, line);
   } else if (method == "read_memory") {
     handle_read_memory(id, line);
   } else if (method == "find_pattern") {
@@ -3553,8 +4064,21 @@ void emucap_service(uint64_t frame) {
   try {
   g_frame = frame;
   if (g_fd < 0) {
-    emucap_connect();  // 매 프레임 재접속 시도(서버 없으면 즉시 거부)
-    return;
+    if (!g_frozen) {
+      emucap_connect();  // While running, retry each frame; a missing server is rejected immediately.
+      return;
+    }
+    // Transport loss is not a release event for an owned freeze. Remain at this exact frame
+    // boundary and retry the loopback control connection without returning to MDFNI_Emulate.
+    while (g_frozen && g_fd < 0) {
+      emucap_connect();
+      if (g_fd < 0) usleep(2000);
+    }
+  }
+  // A recording transaction owns every guest frame until its terminal boundary. Its event stream
+  // uses a dedicated bounded host sink rather than the live poll_events queue.
+  if (g_recording) {
+    if (service_recording()) return;
   }
   // 지연 명령(run_frames) 진행 중이면 그것만 진행한다(새 명령은 안 받음 — 에이전트 대기 중).
   if (g_def_id >= 0) {
@@ -3630,7 +4154,13 @@ void emucap_service(uint64_t frame) {
     // N명령 후 콜백 안에서 재freeze한다(pause에서 명령단위 step 진입 경로).
     while (g_frozen && g_step_remaining == 0 && g_probe_id < 0 && g_insn_remaining == 0) {
       serve_socket_once();
-      if (g_fd < 0) return;  // 끊기면 자연 재개(스핀 탈출)
+      // A dead control socket is not permission to advance one guest frame. Reconnect inside the
+      // same frozen park; returning here would let MDFNI_Emulate run once before the next service
+      // call and would move the exact observation boundary merely because the MCP restarted.
+      while (g_frozen && g_fd < 0) {
+        emucap_connect();
+        if (g_fd < 0) usleep(2000);
+      }
       usleep(2000);          // 2ms — busy-spin 방지
     }
     return;

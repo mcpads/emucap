@@ -11,86 +11,177 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
-import signal
 import socket
 import subprocess
 import sys
 import tempfile
 import time
 
+from support import (
+    LAUNCHER,
+    ROOT,
+    RecordingSink,
+    Session,
+    default_binary,
+    require_ok,
+    terminate_owned,
+)
 
-ROOT = Path(__file__).resolve().parents[3]
-LAUNCHER = ROOT / "adapters/mesen2/launch.sh"
 EVENT_KINDS = {"snes_obj_eval_start", "snes_obj_handoff"}
+DEEP_EVENT_CLASSES = (
+    "snes_cpu_instruction",
+    "snes_content_read",
+    "snes_transfer_enable",
+    "snes_transfer_access",
+    "snes_device_port_write",
+    "snes_interrupt_delivery",
+    "snes_ppu_obj_consumption_read",
+)
 SNAPSHOT_LENGTHS = {"snesSpriteRam": 0x220, "snesWorkRam": 16}
 
 
-def default_binary() -> Path:
-    machine = platform.machine().lower()
-    if sys.platform == "darwin":
-        rid = "osx-arm64" if machine in {"arm64", "aarch64"} else "osx-x64"
-        return ROOT / (
-            f"adapters/mesen2/work/mesen/bin/{rid}/Release/{rid}/publish/"
-            "Mesen.app/Contents/MacOS/Mesen"
-        )
-    if sys.platform.startswith("linux"):
-        rid = "linux-arm64" if machine in {"arm64", "aarch64"} else "linux-x64"
-        return ROOT / f"adapters/mesen2/work/mesen/bin/{rid}/Release/{rid}/publish/Mesen"
-    return ROOT / "adapters/mesen2/work/mesen/bin/win-x64/Release/Mesen.exe"
+def semantic_recording_params(hello: dict, sink: RecordingSink) -> dict:
+    recording = hello.get("recording", {})
+    advertised = {item.get("id"): item for item in recording.get("event_classes", [])}
+    selected_ids = [
+        "frame_boundary",
+        "snes_ppu_obj_evaluation_start",
+        "snes_ppu_obj_handoff",
+    ]
+    if not all(item in advertised for item in selected_ids):
+        raise RuntimeError(f"semantic recording classes were not advertised: {recording}")
+    return {
+        "capture_id": sink.capture_id,
+        "launch_id": hello["launch_id"],
+        "request_digest_sha256": "ab" * 32,
+        "capability_revision": recording["revision"],
+        "origin": "next_frame_boundary",
+        "frames": 1,
+        "event_classes": [
+            {
+                "id": item,
+                "contract_sha256": advertised[item]["contract_sha256"],
+            }
+            for item in selected_ids
+        ],
+        "limits": {
+            "max_frames": 1,
+            "max_events": 1000,
+            "max_bytes": 1024 * 1024,
+            "max_line_bytes": 4096,
+            "max_host_ms": 30000,
+            "progress_interval_ms": 250,
+        },
+        "sink": {"endpoint": sink.endpoint, "token": sink.token},
+    }
 
 
-class Session:
-    def __init__(self, socket_: socket.socket):
-        self.socket = socket_
-        self.socket.settimeout(30)
-        self.file = socket_.makefile("rwb", buffering=0)
-        self.next_id = 0
-
-    def request(self, method: str, params: dict | None = None) -> dict:
-        request_id = self.next_id
-        self.next_id += 1
-        request = {"v": 1, "id": request_id, "method": method, "params": params or {}}
-        self.file.write(json.dumps(request, separators=(",", ":")).encode() + b"\n")
-        while True:
-            line = self.file.readline()
-            if not line:
-                raise RuntimeError(f"connection closed while waiting for {method}")
-            response = json.loads(line)
-            if response.get("id") != request_id:
-                continue
-            if response.get("result", {}).get("status") == "working":
-                continue
-            return response
-
-    def close(self) -> None:
-        try:
-            self.file.close()
-        finally:
-            self.socket.close()
-
-
-def terminate_owned(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    for _ in range(30):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.1)
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
+def deep_recording_params(hello: dict, sink: RecordingSink) -> dict:
+    recording = hello.get("recording", {})
+    advertised = {item.get("id"): item for item in recording.get("event_classes", [])}
+    selected_ids = ["frame_boundary", *DEEP_EVENT_CLASSES]
+    if recording.get("event_order") != "guest_emission":
+        raise RuntimeError(f"deep recording order was not advertised: {recording}")
+    if not all(item in advertised for item in selected_ids):
+        raise RuntimeError(f"deep recording classes were not advertised: {recording}")
+    return {
+        "capture_id": sink.capture_id,
+        "launch_id": hello["launch_id"],
+        "request_digest_sha256": "cd" * 32,
+        "capability_revision": recording["revision"],
+        "origin": "reset_release",
+        "frames": 1,
+        "event_classes": [
+            {"id": item, "contract_sha256": advertised[item]["contract_sha256"]}
+            for item in selected_ids
+        ],
+        "limits": {
+            "max_frames": 1,
+            "max_events": 100000,
+            "max_bytes": 64 * 1024 * 1024,
+            "max_line_bytes": 4096,
+            "max_host_ms": 30000,
+            "progress_interval_ms": 250,
+        },
+        "sink": {"endpoint": sink.endpoint, "token": sink.token},
+    }
 
 
-def require_ok(response: dict, operation: str) -> dict:
-    if not response.get("ok"):
-        raise RuntimeError(f"{operation} failed: {response}")
-    return response.get("result", {})
+def validate_deep_capture(result: dict, events: list[dict]) -> dict:
+    if result.get("status") != "completed" or result.get("integrity") != "complete":
+        raise RuntimeError(f"deep recording was not complete: {result}")
+    if [event.get("sequence") for event in events] != list(range(len(events))):
+        raise RuntimeError("deep recording sequence is not dense")
+    f_start = result.get("f_start")
+    f_end = result.get("f_end")
+    if not all(
+        isinstance(event.get("frame"), int) and f_start <= event["frame"] < f_end
+        for event in events
+    ):
+        raise RuntimeError(f"deep events escaped terminal frame scope [{f_start},{f_end})")
+    facts = {item.get("id"): item for item in result.get("event_classes", [])}
+    unarmed = [
+        event_class
+        for event_class in DEEP_EVENT_CLASSES
+        if not facts.get(event_class, {}).get("armed")
+    ]
+    if unarmed:
+        raise RuntimeError(f"deep classes were not armed: {unarmed}; {facts}")
+    dropped = [
+        event_class
+        for event_class in DEEP_EVENT_CLASSES
+        if facts[event_class].get("dropped", 0) != 0
+    ]
+    if dropped:
+        raise RuntimeError(f"deep classes reported loss: {dropped}; {facts}")
+    required_samples = (
+        "snes_cpu_instruction",
+        "snes_content_read",
+        "snes_device_port_write",
+        "snes_interrupt_delivery",
+        "snes_ppu_obj_consumption_read",
+    )
+    missing_samples = [
+        event_class
+        for event_class in required_samples
+        if facts[event_class].get("observed", 0) == 0
+    ]
+    if missing_samples:
+        raise RuntimeError(f"expected deep callback facts were absent: {missing_samples}; {facts}")
+    return {
+        "events": len(events),
+        "event_classes": {
+            event_class: facts[event_class]["observed"]
+            for event_class in DEEP_EVENT_CLASSES
+        },
+        "first": events[1] if len(events) > 1 else events[0],
+    }
+
+
+def validate_semantic_capture(result: dict, events: list[dict]) -> dict:
+    if result.get("status") != "completed" or result.get("integrity") != "complete":
+        raise RuntimeError(f"semantic recording was not complete: {result}")
+    if len(events) <= 256 or result.get("events") != len(events):
+        raise RuntimeError(f"semantic recording did not cross the old queue ceiling: {result}")
+    if [event.get("sequence") for event in events] != list(range(len(events))):
+        raise RuntimeError("semantic recording sequence is not dense")
+    facts = {item.get("id"): item for item in result.get("event_classes", [])}
+    for event_class in (
+        "snes_ppu_obj_evaluation_start",
+        "snes_ppu_obj_handoff",
+    ):
+        fact = facts.get(event_class, {})
+        observed = sum(event.get("class") == event_class for event in events)
+        if not fact.get("armed") or fact.get("observed") != observed or fact.get("dropped") != 0:
+            raise RuntimeError(f"semantic class accounting differs: {facts}")
+        if observed == 0:
+            raise RuntimeError(f"semantic class produced no records: {event_class}")
+    sample = next(
+        event for event in events if event.get("class") == "snes_ppu_obj_handoff"
+    )
+    if set(sample.get("payload", {})) != {"cpu", "ppu", "forced_blank"}:
+        raise RuntimeError(f"semantic payload shape differs: {sample}")
+    return {"events": len(events), "event_classes": facts, "sample": sample}
 
 
 def validate_event(event: dict, expected_kind: str, scanline: int) -> dict:
@@ -128,7 +219,7 @@ def main() -> int:
     parser.add_argument("content")
     parser.add_argument("binary", nargs="?")
     parser.add_argument("--scanline", type=int, default=32)
-    parser.add_argument("--event-timeout", type=float, default=10)
+    parser.add_argument("--event-timeout", type=float, default=30)
     args = parser.parse_args()
 
     content = Path(args.content).resolve()
@@ -159,6 +250,7 @@ def main() -> int:
                 "EMUCAP_EMU_HOME": str(home),
                 "MESEN_BIN": str(binary),
                 "EMUCAP_SESSION_TOKEN": token,
+                "EMUCAP_LAUNCH_ID": "launch-mesen-semantic-runtime-test",
                 "EMUCAP_LAUNCH_WAIT": os.environ.get("EMUCAP_TEST_LAUNCH_WAIT", "45"),
                 "EMUCAP_POST_CONNECT_GRACE": "0",
                 "EMUCAP_LOG": str(log_path),
@@ -276,6 +368,64 @@ def main() -> int:
             if listed.get("breakpoints") != []:
                 raise RuntimeError(f"breakpoints remained armed: {listed}")
 
+            failed_sink = RecordingSink("capture-semantic-failure", fail_after_auth=True)
+            failed_sink.start()
+            failed_capture = require_ok(
+                session.request(
+                    "record_window", semantic_recording_params(hello, failed_sink)
+                ),
+                "record_window(sink failure)",
+            )
+            failed_sink.finish()
+            if (
+                failed_capture.get("status") != "failed"
+                or failed_capture.get("integrity") == "complete"
+                or failed_capture.get("cleanup", {}).get("hooks") != "released"
+            ):
+                raise RuntimeError(f"sink failure did not fail-stop cleanly: {failed_capture}")
+            resumed = require_ok(session.request("resume"), "resume after sink failure")
+            if resumed.get("state") != "running":
+                raise RuntimeError(f"sink-failure recovery did not resume: {resumed}")
+
+            deep_sink = RecordingSink("capture-deep-clean")
+            deep_sink.start()
+            deep_capture = require_ok(
+                session.request("record_window", deep_recording_params(hello, deep_sink)),
+                "record_window(deep classes)",
+            )
+            deep_sample = validate_deep_capture(deep_capture, deep_sink.finish())
+            resumed = require_ok(session.request("resume"), "resume after deep recording")
+            if resumed.get("state") != "running":
+                raise RuntimeError(f"deep recording recovery did not resume: {resumed}")
+
+            clean_sink = RecordingSink("capture-semantic-clean")
+            clean_sink.start()
+            clean_capture = require_ok(
+                session.request(
+                    "record_window", semantic_recording_params(hello, clean_sink)
+                ),
+                "record_window(clean retry)",
+            )
+            semantic_sample = validate_semantic_capture(clean_capture, clean_sink.finish())
+            session.close()
+            session = None
+            reconnected_socket, _ = listener.accept()
+            session = Session(reconnected_socket)
+            reconnected_hello = require_ok(
+                session.request("hello", {"session_token": token}), "reconnected hello"
+            )
+            if reconnected_hello.get("launch_id") != hello.get("launch_id"):
+                raise RuntimeError(f"reconnected launch identity differs: {reconnected_hello}")
+            status_after_capture = require_ok(session.request("status"), "recording status")
+            if (
+                status_after_capture.get("state") != "frozen"
+                or status_after_capture.get("recording", {}).get("last", {}).get("capture_id")
+                != "capture-semantic-clean"
+            ):
+                raise RuntimeError(
+                    f"reconnect/status terminal recording identity differs: {status_after_capture}"
+                )
+
             paused = require_ok(session.request("pause"), "pause")
             if paused.get("state") != "frozen":
                 raise RuntimeError(f"pause did not freeze: {paused}")
@@ -300,9 +450,16 @@ def main() -> int:
                         "host_api": hello["mesen_host_api"],
                         "host_build": hello.get("host_build"),
                         "host_feature": "snes_ppu_obj_events",
+                        "launch_id": hello.get("launch_id"),
+                        "recording_capability_revision": hello.get("recording", {}).get(
+                            "revision"
+                        ),
                         "breakpoint_kinds": sorted(EVENT_KINDS),
                         "scanline": args.scanline,
                         "samples": samples,
+                        "semantic_recording": semantic_sample,
+                        "deep_recording": deep_sample,
+                        "sink_failure_recovered": True,
                         "cross_boundary_rejected": True,
                         "pause_save_load_resume": True,
                     },

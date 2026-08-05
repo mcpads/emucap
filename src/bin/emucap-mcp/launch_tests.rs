@@ -4,6 +4,7 @@ use emucap::live::continuity::{ContinuitySnapshot, RuntimeBinding, RuntimeBindin
 use emucap::live::link::{Capabilities, LinkError};
 #[cfg(unix)]
 use emucap::live::runtime::LeaseView;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -87,6 +88,7 @@ fn write_mesen_sidecar(binary: &Path) {
         "commit": value("MESEN_COMMIT"),
         "host_api": value("MESEN_HOST_API").parse::<u32>().unwrap(),
         "patchset_sha256": value("MESEN_PATCHSET_SHA256"),
+        "binary_sha256": hex::encode(Sha256::digest(std::fs::read(binary).unwrap())),
     });
     std::fs::write(
         mesen_launch::build_metadata_path(binary),
