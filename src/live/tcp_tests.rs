@@ -1,4 +1,6 @@
-use super::link::{EmulatorLink, LinkError};
+use super::link::{
+    AbortRequest, EmulatorLink, LinkError, ProgressCallControl, RequestCancellation,
+};
 use super::tcp;
 use crate::test_env::{lock_env, EnvGuard};
 use std::io::{BufRead, BufReader, Write};
@@ -254,6 +256,69 @@ fn tcp_link_preserves_contract_advertisement_from_hello() {
             "snapshot": true
         })]
     );
+    h.join().unwrap();
+}
+
+#[test]
+fn tcp_link_validates_internal_recording_capability_from_hello() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let h = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        let (id, token) = hello_parts(&hello);
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": id,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "methods": ["status", "record_window", "abort_recording"],
+                    "session_token": token,
+                    "recording": {
+                        "revision": super::recording_capability::INITIAL_RECORDING_CAPABILITY_REVISION,
+                        "origins": ["next_frame_boundary"],
+                        "units": ["frames"],
+                        "default_event_classes": ["frame_boundary"],
+                        "event_classes": [{
+                            "id": "frame_boundary",
+                            "contract_sha256": "498fcd52f2fa2327e0af9e9730b4314f0854a6047f57dcde16961b8a4ecb80cd",
+                            "clock_domains": ["frame"],
+                            "exact": true
+                        }],
+                        "limits": {
+                            "max_frames": 300,
+                            "max_events": 100000,
+                            "max_bytes": 67108864,
+                            "max_line_bytes": 65536,
+                            "max_host_ms": 30000,
+                            "progress_interval_ms": 250
+                        }
+                    }
+                }
+            })
+        )
+        .unwrap();
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": status["id"], "ok": true, "result": {}})
+        )
+        .unwrap();
+    });
+    link.call("status", serde_json::json!({})).unwrap();
+    let recording = link.capabilities().recording.as_ref().unwrap();
+    assert_eq!(recording.default_event_classes, vec!["frame_boundary"]);
+    assert_eq!(recording.limits.max_frames, 300);
     h.join().unwrap();
 }
 
@@ -600,6 +665,12 @@ fn tcp_link_reports_actual_ephemeral_port_when_base_is_zero() {
     use super::link::EmulatorLink;
     let _env = lock_env();
     let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(100));
+    assert_eq!(link.base_port(), Some(0));
+    assert_eq!(
+        link.endpoint_port(),
+        None,
+        "the search base is not an assigned listener before the first call"
+    );
     // 에뮬레이터가 없으니 NotConnected지만, 그 과정에서 :0에 바인드되며 임시포트가 잡힌다.
     let _ = link.call("status", serde_json::json!({}));
     let port = link.endpoint_port().expect("바인드된 포트");
@@ -607,6 +678,16 @@ fn tcp_link_reports_actual_ephemeral_port_when_base_is_zero() {
         port, 0,
         "포트 0 바인드 시 OS가 배정한 실제 임시포트를 보고해야(0 오보고 금지)"
     );
+}
+
+#[test]
+fn immediately_bound_link_keeps_zero_as_the_search_base() {
+    use super::link::EmulatorLink;
+    let _env = lock_env();
+    let link = tcp::bind("127.0.0.1:0", Duration::from_millis(100)).unwrap();
+
+    assert_eq!(link.base_port(), Some(0));
+    assert!(link.endpoint_port().is_some_and(|port| port != 0));
 }
 
 #[test]
@@ -1405,6 +1486,139 @@ fn range_scan_reattaches_one_generation_with_confirmed_stale_lease() {
 
 #[cfg(unix)]
 #[test]
+fn range_scan_reattaches_one_anonymous_generation_with_confirmed_stale_lease() {
+    let _env = SessionEnv::with(None);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mednafen".into(),
+            system: "wswan".into(),
+            content: "/games/reclaim.ws".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(&store, base, prepared.launch_id(), None);
+
+    match tcp::select_runtime_generation(&store, base).unwrap() {
+        tcp::RuntimeSelection::Attach { port, token, .. } => {
+            assert_eq!(port, base);
+            assert_eq!(token, prepared.reclaim_token());
+        }
+        _ => panic!("one available anonymous generation should be selected"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn range_scan_does_not_reattach_an_anonymous_generation_with_a_live_holder() {
+    let _env = SessionEnv::with(None);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mednafen".into(),
+            system: "wswan".into(),
+            content: "/games/occupied.ws".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    let mut record = super::continuity::LinkRecord::new(prepared.launch_id().to_string());
+    record.lease = Some(super::runtime::LeaseRecord {
+        control_session_key: None,
+        holder: super::runtime::capture_process(std::process::id()),
+        acquired_at_unix_ms: 1,
+        refreshed_at_unix_ms: 1,
+    });
+    store
+        .update_link_json(base, prepared.launch_id(), |_| Ok(record))
+        .unwrap();
+
+    assert!(matches!(
+        tcp::select_runtime_generation(&store, base).unwrap(),
+        tcp::RuntimeSelection::None
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn successful_reattach_clears_the_runtime_candidate() {
+    let _env = SessionEnv::with(Some("runtime-range-candidate-clear"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mesen2".into(),
+            system: "snes".into(),
+            content: "/games/reclaim.sfc".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(
+        &store,
+        base,
+        prepared.launch_id(),
+        Some(super::runtime::control_session_key().unwrap()),
+    );
+
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(250));
+    link.set_runtime_store(store);
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_eq!(link.runtime_candidates().len(), 1);
+    assert_eq!(link.endpoint_port(), Some(base));
+
+    let peer = std::thread::spawn(move || {
+        let stream = TcpStream::connect(("127.0.0.1", base)).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["status"]);
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(status.trim()).unwrap()["id"].clone();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id": id, "ok": true, "result": {"connected": true}})
+        )
+        .unwrap();
+    });
+
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap(),
+        serde_json::json!({"connected": true})
+    );
+    assert!(link.runtime_candidates().is_empty());
+    peer.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn range_scan_refuses_to_guess_between_two_stale_generations() {
     let _env = SessionEnv::with(Some("runtime-range-ambiguous"));
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1492,7 +1706,11 @@ fn tcp_link_write_timeout_poisons_conn() {
 
 /// hello 후 run_frames에 완료 프레임 없이 working keepalive를 무한히 흘리는 클라이언트(deferred flood).
 /// working은 id가 일치해 매번 consecutive_timeouts를 리셋하므로 3-timeout 가드로는 못 끊는다.
-fn fake_lua_working_flood(addr: String, ready: std::sync::mpsc::Sender<()>) {
+fn fake_lua_working_flood(
+    addr: String,
+    ready: std::sync::mpsc::Sender<()>,
+    stop: std::sync::mpsc::Receiver<()>,
+) {
     let stream = TcpStream::connect(addr).unwrap();
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut w = stream;
@@ -1505,6 +1723,9 @@ fn fake_lua_working_flood(addr: String, ready: std::sync::mpsc::Sender<()>) {
     let id2 = serde_json::from_str::<serde_json::Value>(l2.trim()).unwrap()["id"].clone();
     // 완료를 절대 안 보내고 working만 계속. 서버가 데드라인으로 conn을 드롭하면 write가 실패해 종료.
     for _ in 0..100_000 {
+        if stop.try_recv().is_ok() {
+            break;
+        }
         if writeln!(
             w,
             r#"{{"id":{id2},"ok":true,"result":{{"status":"working"}}}}"#
@@ -1526,7 +1747,8 @@ fn tcp_link_bails_on_working_flood_past_deadline() {
     link.set_deferred_deadline(Duration::from_millis(300));
     let addr = link.local_addr().to_string();
     let (tx, rx) = std::sync::mpsc::channel();
-    let h = std::thread::spawn(move || fake_lua_working_flood(addr, tx));
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let h = std::thread::spawn(move || fake_lua_working_flood(addr, tx, stop_rx));
     rx.recv().unwrap();
     let start = std::time::Instant::now();
     let r = link.call("run_frames", serde_json::json!({ "n": 5 }));
@@ -1541,5 +1763,146 @@ fn tcp_link_bails_on_working_flood_past_deadline() {
         elapsed < Duration::from_millis(1500),
         "deferred 데드라인이 개별 read timeout보다 먼저 컷오프해야: {elapsed:?}"
     );
+    assert!(
+        !link.has_conn(),
+        "a timed-out protocol stream must not be reused after its deadline"
+    );
+    stop_tx.send(()).ok();
     h.join().unwrap();
+}
+
+#[test]
+fn tcp_progress_is_typed_and_cancellation_sends_one_exact_abort() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let h = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["record_window", "abort_recording"]);
+
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: serde_json::Value = serde_json::from_str(request.trim()).unwrap();
+        let request_id = request["id"].clone();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": request_id,
+                "ok": true,
+                "result": {
+                    "status": "working",
+                    "capture_id": "capture-progress",
+                    "sequence": 0,
+                    "frame": 10,
+                    "events": 1,
+                    "bytes": 100,
+                }
+            })
+        )
+        .unwrap();
+
+        let mut abort = String::new();
+        reader.read_line(&mut abort).unwrap();
+        let abort: serde_json::Value = serde_json::from_str(abort.trim()).unwrap();
+        assert_eq!(abort["method"], "abort_recording");
+        assert_eq!(abort["params"]["capture_id"], "capture-progress");
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": abort["id"],
+                "ok": true,
+                "result": {"status": "completed", "aborted": true},
+            })
+        )
+        .unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": request_id,
+                "ok": true,
+                "result": {"status": "interrupted", "capture_id": "capture-progress"},
+            })
+        )
+        .unwrap();
+    });
+
+    let cancellation = RequestCancellation::default();
+    let trigger = cancellation.clone();
+    let control = ProgressCallControl {
+        cancellation,
+        abort: Some(AbortRequest {
+            method: "abort_recording".into(),
+            params: serde_json::json!({"capture_id": "capture-progress"}),
+        }),
+        max_host_ms: Some(2000),
+    };
+    let mut observed = Vec::new();
+    let result = link
+        .call_with_progress(
+            "record_window",
+            serde_json::json!({"capture_id": "capture-progress"}),
+            &mut |progress| {
+                observed.push((progress.sequence, progress.frame));
+                trigger.cancel();
+                Ok(())
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(observed, vec![(0, 10)]);
+    assert_eq!(result["status"], "interrupted");
+    h.join().unwrap();
+}
+
+#[test]
+fn tcp_progress_call_clamps_socket_io_to_the_active_recording_deadline() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["record_window"]);
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        request_seen_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(2));
+    });
+
+    let control = ProgressCallControl {
+        cancellation: RequestCancellation::default(),
+        abort: None,
+        max_host_ms: Some(120),
+    };
+    let started = std::time::Instant::now();
+    let result = link.call_with_progress(
+        "record_window",
+        serde_json::json!({}),
+        &mut |_| Ok(()),
+        &control,
+    );
+    let elapsed = started.elapsed();
+    request_seen_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+    release_tx.send(()).unwrap();
+    peer.join().unwrap();
+
+    assert!(matches!(result, Err(LinkError::Timeout)));
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "120ms total deadline was hidden behind the 2s socket timeout: {elapsed:?}"
+    );
 }

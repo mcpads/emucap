@@ -81,13 +81,55 @@ fn write_memory_schema_exposes_both_input_sources() {
 }
 
 #[test]
+fn record_window_accepts_the_generic_negotiated_extension_shape() {
+    let request: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":120,"event_classes":["frame_boundary"],"limits":{"max_events":1000,"max_bytes":1048576,"max_host_ms":8000}}"#,
+    )
+    .unwrap();
+    assert_eq!(request.output_root, "/tmp/evidence");
+    assert_eq!(request.frames, 120);
+    assert_eq!(request.warmup_frames, 0);
+    assert_eq!(request.event_classes, ["frame_boundary"]);
+    assert_eq!(request.limits.unwrap().max_host_ms, Some(8000));
+    let extended: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":1,"warmup_frames":3,"origin":"reset_release","input_path":"/tmp/movie.txt","event_classes":["frame_boundary","frame_completed"],"stop_on":{"event_class":"frame_completed","occurrence":1}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        extended.origin,
+        Some(RecordWindowOriginArgs::ResetRelease)
+    ));
+    assert_eq!(extended.input_path.as_deref(), Some("/tmp/movie.txt"));
+    assert_eq!(extended.warmup_frames, 3);
+    assert_eq!(extended.stop_on.unwrap().occurrence, 1);
+    let snapshots: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":1,"terminal_snapshots":[{"label":"terminal-wram","memory_type":"wram","address":"0x20","length":16}]}"#,
+    )
+    .unwrap();
+    assert_eq!(snapshots.terminal_snapshots.len(), 1);
+    let snapshot = &snapshots.terminal_snapshots[0];
+    assert_eq!(snapshot.label, "terminal-wram");
+    assert_eq!(snapshot.memory_type, "wram");
+    assert_eq!(snapshot.address.0, 0x20);
+    assert_eq!(snapshot.length.0, 16);
+    let terminal_state: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":1,"terminal_state_profile":"snes_ppu"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        terminal_state.terminal_state_profile.as_deref(),
+        Some("snes_ppu")
+    );
+    assert!(serde_json::from_str::<RecordWindowArgs>(
+        r#"{"output_root":"/tmp/evidence","frames":1,"origin":"reset"}"#
+    )
+    .is_err());
+}
+
+#[test]
 fn frame_args_reject_over_cap() {
     // 상한 초과는 deserialize 단계에서 거부(무한 deferred 루프·raw_call wedge 방지, H2).
     let over = MAX_SYNC_ADVANCE_COUNT + 1;
-    assert!(
-        serde_json::from_str::<RunFramesArgs>(&format!(r#"{{"n":{over}}}"#)).is_err(),
-        "run_frames n 상한 초과는 거부해야"
-    );
     assert!(
         serde_json::from_str::<StepArgs>(&format!(r#"{{"frames":{over}}}"#)).is_err(),
         "step frames 상한 초과는 거부해야"
@@ -115,9 +157,6 @@ fn frame_args_reject_over_cap() {
 #[test]
 fn frame_args_accept_at_cap_and_defaults() {
     // 상한 이내는 통과, 필드 부재 시 기본값(상한 이내)도 통과 — clamp가 정상 사용을 깨지 않아야.
-    let r: RunFramesArgs =
-        serde_json::from_str(&format!(r#"{{"n":{MAX_SYNC_ADVANCE_COUNT}}}"#)).unwrap();
-    assert_eq!(r.n, MAX_SYNC_ADVANCE_COUNT);
     let s: StepArgs = serde_json::from_str("{}").unwrap();
     assert_eq!(s.count, 1, "step count 기본값");
     assert_eq!(s.unit, StepUnit::Frames, "step unit 기본값");

@@ -158,6 +158,23 @@ pub fn get_rom_info(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError
     Ok(ToolOutput::Json(link.call("get_rom_info", json!({}))?))
 }
 
+pub fn change_media(
+    link: &mut dyn EmulatorLink,
+    device: &str,
+    path: Option<&str>,
+    eject: bool,
+    expected_sha1: Option<&str>,
+) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({ "device": device, "eject": eject });
+    if let Some(path) = path {
+        params["path"] = json!(path);
+    }
+    if let Some(expected_sha1) = expected_sha1 {
+        params["expected_sha1"] = json!(expected_sha1);
+    }
+    Ok(ToolOutput::Json(link.call("change_media", params)?))
+}
+
 pub fn status(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
     Ok(ToolOutput::Json(link.call("status", json!({}))?))
 }

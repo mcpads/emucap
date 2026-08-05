@@ -32,6 +32,8 @@ pub struct FeatureContract {
     pub id: String,
     pub surface: String,
     pub methods: Vec<String>,
+    #[serde(default)]
+    pub route: Option<String>,
     pub temporal_classes: Vec<String>,
     pub disposition: String,
     pub expectations: Vec<String>,
@@ -357,6 +359,7 @@ pub fn validate_sources(catalog: &ContractCatalog, registry: &ExceptionRegistry)
     }
 
     let surfaces = ["public", "wire", "test"];
+    let routes = ["input_control", "debug", "analysis"];
     let temporal_classes = ["T0", "T0/P", "T1", "T2", "T3", "T4", "T5"];
     let dispositions = ["retain", "consolidate", "migrate", "evaluate_remove"];
     let mut feature_ids = BTreeSet::new();
@@ -381,6 +384,22 @@ pub fn validate_sources(catalog: &ContractCatalog, registry: &ExceptionRegistry)
                     feature.id
                 ));
             }
+        }
+        if feature.surface == "public" {
+            match feature.route.as_deref() {
+                Some(route) if route.trim().is_empty() => {
+                    errors.push(format!("empty public route for {}", feature.id));
+                }
+                Some(route) if !routes.contains(&route) => {
+                    errors.push(format!("unknown public route {route} for {}", feature.id));
+                }
+                _ => {}
+            }
+        } else if feature.route.is_some() {
+            errors.push(format!(
+                "non-public feature {} cannot declare an MCP route",
+                feature.id
+            ));
         }
         if feature.temporal_classes.is_empty() {
             errors.push(format!("feature has no temporal class: {}", feature.id));

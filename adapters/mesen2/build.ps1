@@ -115,7 +115,8 @@ try {
         (Join-Path $Here "patches/0003-enable-safe-halt-savestates.patch"),
         (Join-Path $Here "patches/0004-restart-command-line-script-after-power-cycle.patch"),
         (Join-Path $Here "patches/0005-add-snes-ppu-obj-boundary-events.patch"),
-        (Join-Path $Here "patches/0006-stop-video-threads-before-emulator-destruction.patch")
+        (Join-Path $Here "patches/0006-stop-video-threads-before-emulator-destruction.patch"),
+        (Join-Path $Here "patches/0007-add-snes-deep-observation-events.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {
@@ -163,12 +164,14 @@ try {
     if (-not $Binary) { throw "Mesen build completed without Mesen.exe under bin/win-x64/Release" }
 
     $Metadata = Join-Path $Binary.DirectoryName "emucap-mesen-build.json"
+    $BinarySha256 = (Get-FileHash -LiteralPath $Binary.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     @{
         upstream = $MesenRepo
         tag = $MesenTag
         commit = $MesenCommit
         host_api = $MesenHostApi
         patchset_sha256 = $MesenPatchsetHash
+        binary_sha256 = $BinarySha256
     } | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $Metadata
 
     Write-Host "OK: $($Binary.FullName)"

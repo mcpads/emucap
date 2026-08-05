@@ -92,12 +92,14 @@ adapter's `step_instructions` wire method), `set_breakpoint`
   The fork folds the override in `NDS_beginProcessingInput` every frame (beating the front end's
   per-frame reset). Injected on ARM9. press_buttons' frame countdown only advances while the emulator
   runs, so resume/continue to let the frames elapse.
-- `touch` — touch the bottom screen (256×192) at `(x, y)`. The fork's `QEmucap,touch:<hexX>,<hexY>[,<hexframes>]`
+- Adapter wire `touch` — touch the bottom screen (256×192) at `(x, y)`. The fork's `QEmucap,touch:<hexX>,<hexY>[,<hexframes>]`
   (or `:release`) → `NDS_setEmucapTouchOverride` folds it every frame in `NDS_beginProcessingInput`
   (applied by `NDS_applyFinalInput`), symmetric with the button override. `frames>0` presses for that
   many frames then lifts (a tap), `release:true` lifts, and with neither it holds until the next touch.
-  This is a screen-coordinate touch, distinct from a button `tap`. Required to get past touch-only
-  titles (e.g. Love Plus). `patches/0005-emucap-touch.patch`.
+  Control MCP presents those distinct effects as input-drawer `hold_touch`, `release_touch`, and
+  `pulse_touch_while_running`; the ambiguous wire name is not agent-facing. This is screen-coordinate
+  touch, distinct from button `tap`. Required to get past touch-only titles (e.g. Love Plus).
+  `patches/0005-emucap-touch.patch`.
 
 **Tier 3 (custom RSP hooks, `patches/0003-emucap-state-disasm.patch`; call_stack is bridge-only)**:
 - `save_state` / `load_state` — the fork's `QEmucap,{save,load}state:<hexpath>` calls DeSmuME's native

@@ -14,7 +14,7 @@ use crate::launch::occupied_graceful;
 
 /// 이 MCP 바이너리가 빌드된 emucap git hash(build.rs가 OUT_DIR에 기록; include_str!로 cargo가 파일 의존성을
 /// 추적해 hash 변경 시 이 파일이 재컴파일된다). status.server_build로 노출. `\n` 없이 정확히 hash 문자열.
-pub(crate) const BUILD_HASH: &str = include_str!(concat!(env!("OUT_DIR"), "/emucap_build_hash"));
+pub(crate) const BUILD_HASH: &str = emucap::build_identity::BUILD_HASH;
 
 #[cfg(test)]
 #[path = "status_tests.rs"]
@@ -23,6 +23,12 @@ mod tests;
 #[path = "status/button_hints.rs"]
 mod button_hints;
 pub(crate) use button_hints::button_hint_for_system;
+
+#[path = "status/continuity.rs"]
+mod continuity;
+pub(crate) use continuity::enrich_continuity;
+#[cfg(test)]
+use continuity::{enrich_runtime_instance, recording_capture_projection};
 
 /// get_rom_info 응답에 균일 `rom_sha1` 필드를 삽입한다 — 정규화된 콘텐츠 해시(content_md5 우선,
 /// 없으면 sha1; 빈값·"skipped:too_large"는 무효로 보고 폴백). 어댑터가 어떤 해시를 쓰든 에이전트가
@@ -134,6 +140,25 @@ pub(crate) fn enrich_status_value(
     }
 }
 
+pub(crate) fn enrich_memory_regions(
+    value: &mut serde_json::Value,
+    memory_regions: &[emucap::live::link::MemoryRegion],
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if !object
+        .get("connected")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+        || object.contains_key("memory_regions")
+        || memory_regions.is_empty()
+    {
+        return;
+    }
+    object.insert("memory_regions".into(), serde_json::json!(memory_regions));
+}
+
 pub(crate) fn enrich_breakpoint_kinds(
     v: &mut serde_json::Value,
     breakpoint_kinds: &[serde_json::Value],
@@ -156,16 +181,34 @@ pub(crate) fn enrich_breakpoint_kinds(
     );
 }
 
+pub(crate) fn enrich_recording_capability(
+    value: &mut serde_json::Value,
+    capability: Option<&emucap::live::recording_capability::RecordingCapability>,
+) {
+    if let Some(capability) = capability {
+        value["recording_capability"] = serde_json::to_value(capability)
+            .unwrap_or_else(|_| serde_json::json!({"available": false}));
+    }
+}
+
 fn public_method_names(methods: &[String]) -> Vec<String> {
     let mut normalized = Vec::with_capacity(methods.len());
-    for method in methods {
-        let method = if method == "step_instructions" {
-            "step"
-        } else {
-            method.as_str()
-        };
+    let push_unique = |normalized: &mut Vec<String>, method: &str| {
         if !normalized.iter().any(|known| known == method) {
             normalized.push(method.to_string());
+        }
+    };
+    for method in methods {
+        match method.as_str() {
+            "run_frames" => {}
+            "press_buttons" => push_unique(&mut normalized, "pulse_while_running"),
+            "touch" => {
+                for public_name in ["hold_touch", "release_touch", "pulse_touch_while_running"] {
+                    push_unique(&mut normalized, public_name);
+                }
+            }
+            "step" | "step_instructions" => push_unique(&mut normalized, "step"),
+            method => push_unique(&mut normalized, method),
         }
     }
     normalized
@@ -207,11 +250,6 @@ pub(crate) fn enrich_contract_status(
             .min(crate::args::MAX_SYNC_ADVANCE_COUNT)
     };
     let step_limit = adapter_sync_limit("/execution_limits/max_sync_advance_count");
-    let run_frames_limit = v
-        .pointer("/execution_limits/frame/max_count")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(step_limit)
-        .min(step_limit);
     if methods.iter().any(|method| method == "write_memory") {
         contracts.constraints.insert(
             "memory.write.input_sources".into(),
@@ -226,19 +264,10 @@ pub(crate) fn enrich_contract_status(
             serde_json::json!(crate::memory_write::FILE_LOAD_TIMEOUT_MS),
         );
     }
-    if methods
-        .iter()
-        .any(|method| method == "step" || method == "step_instructions")
-    {
+    if methods.iter().any(|method| method == "step") {
         contracts.constraints.insert(
             "execution.step.max_count".into(),
             serde_json::json!(step_limit),
-        );
-    }
-    if methods.iter().any(|method| method == "run_frames") {
-        contracts.constraints.insert(
-            "execution.run_frames.max_frames".into(),
-            serde_json::json!(run_frames_limit),
         );
     }
     if contracts.state == "validated" {
@@ -464,7 +493,7 @@ fn build_supported_systems_value() -> serde_json::Value {
             "aliases": ["nintendo64", "nintendo-64"],
             "adapter": "mupen64plus",
             "content": ["z64", "n64", "v64"],
-            "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded run_frames and input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
+            "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
         },
         {
             "system": "msx",
@@ -683,6 +712,8 @@ pub(crate) fn unknown_content_question() -> &'static str {
 const CAPABILITY_FIELDS: &[&str] = &[
     "methods",
     "memory_types",
+    "memory_regions",
+    "media_devices",
     "breakpoint_kinds",
     "input_buttons",
     "contracts",
@@ -690,6 +721,7 @@ const CAPABILITY_FIELDS: &[&str] = &[
     "execution_limits",
     "freeze_policy",
     "bank_tagging",
+    "recording_capability",
 ];
 
 fn capability_revision(value: &serde_json::Value) -> String {
@@ -737,17 +769,27 @@ pub(crate) fn apply_capability_revision(
 }
 
 pub(crate) fn enrich_connected_status(value: &mut serde_json::Value, link: &dyn EmulatorLink) {
+    let base_port = link.base_port();
     let port = link.endpoint_port();
     let token = link.session_token().map(str::to_string);
     let identity = link.capabilities().identity.clone();
     let methods = link.capabilities().methods.clone();
     let memory_types = link.capabilities().memory_types.clone();
+    let memory_regions = link.capabilities().memory_regions.clone();
     let breakpoint_kinds = link.capabilities().breakpoint_kinds.clone();
     let contracts = link.capabilities().contracts.clone();
+    let recording = (port.is_some()
+        && link.continuity().runtime_binding.state
+            == emucap::live::continuity::RuntimeBindingState::Bound)
+        .then(|| link.capabilities().recording.as_ref())
+        .flatten();
     enrich_status_value(value, &methods, &memory_types, identity.system.as_deref());
+    enrich_memory_regions(value, &memory_regions);
     enrich_breakpoint_kinds(value, &breakpoint_kinds);
     enrich_contract_status(value, &identity, &contracts);
+    enrich_recording_capability(value, recording);
     enrich_link_status(value, port, token.as_deref(), Some(&identity));
+    enrich_listener_ports(value, base_port, port);
     enrich_continuity(value, link);
     if let Some(object) = value.as_object_mut() {
         object
@@ -763,13 +805,50 @@ pub(crate) struct ControlObservation {
     pub(crate) disposition: EntryDisposition,
 }
 
+/// Reconcile an unfinished host-owned recording only after the live adapter identity proves that
+/// it is the exact current direct-mode generation. This is intentionally part of status recovery:
+/// after a Control MCP restart, agents should not need to launch or mutate the emulator merely to
+/// close a capture whose adapter-side terminal state is already observable.
+pub(crate) fn reconcile_connected_recording(
+    link: &mut dyn EmulatorLink,
+) -> Result<bool, emucap::live::recording::RecordingError> {
+    reconcile_connected_recording_with_store(link, emucap::live::runtime::RuntimeStore::discover())
+}
+
+fn reconcile_connected_recording_with_store(
+    link: &mut dyn EmulatorLink,
+    store: emucap::live::runtime::RuntimeStore,
+) -> Result<bool, emucap::live::recording::RecordingError> {
+    let Some(port) = link.endpoint_port() else {
+        return Ok(false);
+    };
+    let current = store
+        .read_current(port)
+        .map_err(|error| {
+            emucap::live::recording::RecordingError::Recovery(format!(
+                "runtime capsule could not be read during status recovery: {error}"
+            ))
+        })?
+        .filter(|current| {
+            link.capabilities().identity.launch_id.as_deref() == Some(current.launch_id.as_str())
+        });
+    let Some(current) = current else {
+        return Ok(false);
+    };
+    emucap::live::recording::reconcile_abandoned_capture(link, store, port, &current.launch_id)
+        .map(|outcome| outcome.is_some())
+}
+
 pub(crate) fn observe_control_state(
     link: &mut dyn EmulatorLink,
 ) -> Result<ControlObservation, LinkError> {
-    let port = link.endpoint_port();
+    let base_port = link.base_port();
     let token = link.session_token().map(str::to_string);
-    let (mut status, listener, adapter_connected, observation_uncertain) = match tools::status(link)
-    {
+    let status_result = tools::status(link);
+    // status may perform the first lazy bind and move from base_port to a free listener port. Read
+    // the endpoint only after that operation; a pre-call value is not an assigned port.
+    let port = link.endpoint_port();
+    let (mut status, listener, adapter_connected, observation_uncertain) = match status_result {
         Ok(ToolOutput::Json(mut v)) => {
             enrich_connected_status(&mut v, link);
             (v, ListenerState::Bound, true, false)
@@ -821,6 +900,7 @@ pub(crate) fn observe_control_state(
         }
         Err(e) => return Err(e),
     };
+    enrich_listener_ports(&mut status, base_port, port);
     let mut runtime = observe_runtime(link, listener, adapter_connected);
     if observation_uncertain {
         runtime.control_observation_uncertain = true;
@@ -877,10 +957,12 @@ pub(crate) fn make_bootstrap_value(
     include_installation: bool,
 ) -> Result<serde_json::Value, LinkError> {
     let observation = observe_control_state(link)?;
+    let base_port = link.base_port();
     let port = link.endpoint_port();
     let mut result = serde_json::json!({
         "listener": {
             "state": observation.runtime.listener,
+            "base_port": base_port,
             "port": port,
         },
         "server_build": BUILD_HASH,
@@ -899,6 +981,12 @@ pub(crate) fn make_bootstrap_value(
             "installation": "bootstrap(include=[\"installation\"])"
         }
     });
+    if base_port.is_none() {
+        result["listener"]
+            .as_object_mut()
+            .expect("listener is an object")
+            .remove("base_port");
+    }
     if observation.disposition.reason == EntryReason::TerminalHistory {
         result["terminal_history_available"] = serde_json::json!(true);
     }
@@ -911,6 +999,24 @@ pub(crate) fn make_bootstrap_value(
     Ok(result)
 }
 
+fn enrich_listener_ports(
+    value: &mut serde_json::Value,
+    base_port: Option<u16>,
+    listening_port: Option<u16>,
+) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(base_port) = base_port {
+        object.insert("base_port".into(), serde_json::json!(base_port));
+    }
+    if let Some(listening_port) = listening_port {
+        object.insert("listening_port".into(), serde_json::json!(listening_port));
+    } else {
+        object.remove("listening_port");
+    }
+}
+
 pub(crate) fn is_observation_failure(error: &LinkError) -> bool {
     matches!(
         error,
@@ -919,94 +1025,6 @@ pub(crate) fn is_observation_failure(error: &LinkError) -> bool {
             | LinkError::Timeout
             | LinkError::Protocol(_)
     )
-}
-
-pub(crate) fn enrich_continuity(v: &mut serde_json::Value, link: &dyn EmulatorLink) {
-    let continuity = link.continuity();
-    let Some(object) = v.as_object_mut() else {
-        return;
-    };
-    object.insert(
-        "continuity".into(),
-        serde_json::to_value(&continuity).unwrap_or_else(|_| serde_json::json!({})),
-    );
-    if continuity
-        .runtime_diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.blocks_generation_transition)
-    {
-        object.insert(
-            "next_safe_action".into(),
-            serde_json::json!(
-                "inspect the reported runtime artifact; do not replace a live emulator until ownership is proven"
-            ),
-        );
-    }
-    let candidates = link.runtime_candidates();
-    if !candidates.is_empty() {
-        object.insert(
-            "runtime_candidates".into(),
-            serde_json::Value::Array(candidates),
-        );
-        object.insert(
-            "next_safe_action".into(),
-            serde_json::json!("select an explicit runtime candidate; automatic attach refused"),
-        );
-    }
-    let refreshed_current = link.endpoint_port().and_then(|port| {
-        emucap::live::runtime::RuntimeStore::discover()
-            .read_current(port)
-            .ok()
-            .flatten()
-    });
-    let current = refreshed_current.map(|current| {
-        let mut value = current.public_value_with_lease(&continuity.lease);
-        if let (Some(runtime), Some(termination)) =
-            (value.as_object_mut(), continuity.termination.as_ref())
-        {
-            runtime.insert(
-                "termination".into(),
-                serde_json::to_value(termination).unwrap_or_else(|_| serde_json::json!({})),
-            );
-        }
-        value
-    });
-    enrich_runtime_instance(object, &continuity, current);
-}
-
-fn enrich_runtime_instance(
-    object: &mut serde_json::Map<String, serde_json::Value>,
-    continuity: &emucap::live::continuity::ContinuitySnapshot,
-    current: Option<serde_json::Value>,
-) {
-    if let Some(current) = current {
-        if matches!(
-            continuity.runtime_binding.state,
-            emucap::live::continuity::RuntimeBindingState::Mismatched
-                | emucap::live::continuity::RuntimeBindingState::Unmanaged
-        ) {
-            object.remove("runtime_instance");
-            object.insert("stale_runtime_instance".into(), current);
-            object.insert(
-                "next_safe_action".into(),
-                serde_json::json!(
-                    "use the live emulator identity for observation; do not treat the stale capsule as ownership evidence or edit runtime files"
-                ),
-            );
-        } else {
-            object.remove("stale_runtime_instance");
-            object.insert("runtime_instance".into(), current);
-        }
-    } else if let Some(runtime) = object
-        .get_mut("runtime_instance")
-        .and_then(serde_json::Value::as_object_mut)
-    {
-        runtime.insert(
-            "lease".into(),
-            serde_json::to_value(&continuity.lease)
-                .unwrap_or_else(|_| serde_json::json!({"state": "unknown"})),
-        );
-    }
 }
 
 pub(crate) fn enrich_link_status(

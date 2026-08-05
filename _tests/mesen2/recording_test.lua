@@ -1,0 +1,794 @@
+local adapter_dir = os.getenv("EMUCAP_ADAPTER_DIR") or "adapters/mesen2"
+local Recording = dofile(adapter_dir .. "/emucap_recording.lua")
+
+local CONTRACT = "498fcd52f2fa2327e0af9e9730b4314f0854a6047f57dcde16961b8a4ecb80cd"
+local COMPLETED_CONTRACT = "a335a785a0c109cc7edc6ecab27ff429e386c2ad2eb34769cac4f9cc47378b91"
+local OBJ_EVALUATION_CONTRACT = "0d32bfc67347b3169fd77f9d30beb9c325c64db30f0081c628ba85646ebd763b"
+local OBJ_HANDOFF_CONTRACT = "ad23c438ee6400f5f9cab84d877f490abe24670769e50efd2bf67d932d329bbc"
+local CPU_INSTRUCTION_CONTRACT = "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f2ae73ac4ba81c55af0"
+local REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be7890e318f9b8c4b218a2"
+local LAUNCH = "launch-01test"
+
+local function equal(actual, expected, label)
+  if actual ~= expected then
+    error(string.format("%s: expected %s, got %s", label, tostring(expected), tostring(actual)), 2)
+  end
+end
+
+local function contains(value, pattern, label)
+  if not tostring(value):find(pattern, 1, true) then
+    error(string.format("%s: %q does not contain %q", label, tostring(value), pattern), 2)
+  end
+end
+
+local function fake_sink(options)
+  options = options or {}
+  local sink = { chunks = {}, close_count = 0, writes = 0 }
+  sink.write = function(line)
+    sink.writes = sink.writes + 1
+    if options.error_at == sink.writes then return nil, "injected write error", 0 end
+    if options.partial_at == sink.writes then
+      local sent = math.min(options.partial_bytes or 5, #line - 1)
+      sink.chunks[#sink.chunks + 1] = line:sub(1, sent)
+      return nil, "timeout", sent
+    end
+    sink.chunks[#sink.chunks + 1] = line
+    if options.order then
+      options.order[#options.order + 1] = line:find('"class":"frame_completed"', 1, true)
+        and "event:completed" or "event:boundary"
+    end
+    return #line
+  end
+  sink.close = function()
+    sink.close_count = sink.close_count + 1
+    if options.close_error then return nil, "injected close error" end
+    return true
+  end
+  return sink
+end
+
+local function params(frames, overrides)
+  local p = {
+    capture_id = "capture-test",
+    launch_id = LAUNCH,
+    request_digest_sha256 = string.rep("a", 64),
+    capability_revision = REVISION,
+    origin = "next_frame_boundary",
+    frames = frames,
+    warmup_frames = 0,
+    event_classes = { { id = "frame_boundary", contract_sha256 = CONTRACT } },
+    limits = {
+      max_frames = frames,
+      max_events = 100,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 2000,
+      progress_interval_ms = 100,
+    },
+  }
+  for key, value in pairs(overrides or {}) do p[key] = value end
+  return p
+end
+
+local function decode_buttons(buttons)
+  local decoded = {}
+  for _, button in ipairs(buttons) do
+    if button == "unknown" then return nil, "unknown test button" end
+    decoded[button] = true
+  end
+  return decoded
+end
+
+local function movie_file(text)
+  local path = os.tmpname()
+  local file = assert(io.open(path, "wb"))
+  assert(file:write(text))
+  assert(file:close())
+  return path
+end
+
+do
+  local capability = Recording.capability(function(value) return value end, true, false, true, true)
+  equal(capability.revision,
+    "6f601a701d9a979cde0c118c9fcd4fd4a2d572f529728ca77db5f4ddd99b26b4",
+    "deep capability revision")
+  equal(capability.event_order, "guest_emission", "cross-class event order")
+  equal(#capability.event_classes, 11, "deep event class count")
+  equal(capability.event_classes[5].id, "snes_cpu_instruction", "first deep class")
+  equal(capability.event_classes[5].contract_sha256, CPU_INSTRUCTION_CONTRACT,
+    "instruction contract")
+  equal(capability.event_classes[5].startable, true, "instruction startability")
+  equal(capability.initial_snapshots.memory_types[1], "snesWorkRam",
+    "callback-safe initial snapshot memory")
+  equal(capability.initial_snapshots.max_members, 1, "initial snapshot member bound")
+  equal(capability.initial_snapshots.max_callback_ms, 100, "initial snapshot callback bound")
+  equal(capability.event_classes[11].id, "snes_ppu_obj_consumption_read",
+    "consumption-read class")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
+  local deep = Recording.capability(function(value) return value end, true, false, true, true)
+  local p = params(1, {
+    capability_revision = deep.revision,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_cpu_instruction", contract_sha256 = CPU_INSTRUCTION_CONTRACT },
+    },
+    start_on = { event_class = "snes_cpu_instruction" },
+    initial_snapshots = {
+      { label = "wram", memory_type = "snesWorkRam", address = 0, length = 4 },
+    },
+  })
+  local member = fake_sink()
+  local now = 0
+  local capture_calls = 0
+  local function capture(state)
+    capture_calls = capture_calls + 1
+    assert(state.member_sink.write('{"label":"wram","bytes":4}\n'))
+    assert(state.member_sink.write("ABCD"))
+    now = now + 10
+    return true
+  end
+  local event_sink = fake_sink()
+  local state, effect = Recording.start(
+    p, 101, LAUNCH, 90, 0, event_sink, nil, nil, nil, nil,
+    function() return true end, member, capture, function() return now end)
+  equal(effect.kind, "arm_observation", "event-aligned hook arm")
+  equal(Recording.attach_hooks(state), true, "event-aligned hooks attached")
+  equal(Recording.progress(state).phase, "aligning", "alignment progress phase")
+  local cpu = { pc = 0x808000, opcode = 0xea, a = 1, x = 2, y = 3, sp = 0x1ff,
+    d = 0, dbr = 0x7e, k = 0x80, ps = 0x34, emulation = false, cpu_cycle = 1234 }
+  state, effect = Recording.semantic_event(state, "snes_cpu_instruction", 90, 4567, cpu)
+  equal(effect, nil, "anchor event accepted")
+  equal(capture_calls, 1, "initial snapshot captured once")
+  equal(member.close_count, 1, "initial snapshot sink closes at anchor")
+  equal(state.observation_start.sequence, 1, "anchor sequence follows transaction boundary")
+  equal(state.observation_start.contract_sha256, CPU_INSTRUCTION_CONTRACT,
+    "anchor contract identity")
+  equal(Recording.progress(state).phase, "recording", "post-anchor progress phase")
+  state, effect = Recording.tick(state, 91, 20)
+  equal(effect.kind, "terminal", "event-aligned recording terminal")
+  local result = Recording.result(state, 20)
+  equal(result.observation_start.clock_tick, 4567, "terminal anchor clock")
+  equal(result.observation_start.occurrence, nil, "terminal anchor keeps the closed wire shape")
+  equal(#result.event_classes, 2, "terminal accounting covers every selected class")
+  equal(result.event_classes[1].observed, 1, "aligned transaction-class accounting")
+  equal(result.event_classes[2].observed, 1, "aligned observation-class accounting")
+  equal(result.cleanup.sink, "released", "both sinks released")
+
+  local failed_member = fake_sink()
+  local failed_event_sink = fake_sink()
+  local failed, failed_effect = Recording.start(
+    p, 102, LAUNCH, 100, 0, failed_event_sink, nil, nil, nil, nil,
+    function() return true end, failed_member,
+    function() return nil, "injected member write failure" end,
+    function() return 0 end)
+  equal(failed_effect.kind, "arm_observation", "failure case hook arm")
+  assert(Recording.attach_hooks(failed))
+  failed, failed_effect = Recording.semantic_event(
+    failed, "snes_cpu_instruction", 100, 5000, cpu)
+  equal(failed_effect.kind, "terminal", "initial snapshot failure fail-stops")
+  local failed_result = Recording.result(failed, 0)
+  equal(failed_result.operation_outcome, "failed", "initial snapshot failure outcome")
+  equal(failed_result.integrity, "unverifiable", "initial snapshot failure integrity")
+  equal(failed_result.observation_start, nil, "failed anchor is not admitted")
+  equal(failed_result.cleanup.hooks, "released", "failure removes hooks")
+  equal(failed_result.cleanup.sink, "released", "failure closes both sinks")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
+  local capability = Recording.capability(function(value) return value end, true, false, false, true)
+  equal(capability.revision, REVISION, "capability revision")
+  equal(capability.event_classes[1].contract_sha256, CONTRACT, "capability contract")
+  equal(capability.event_classes[2].contract_sha256, COMPLETED_CONTRACT, "completion contract")
+  equal(capability.event_classes[2].stoppable, true, "completion stoppability")
+  equal(capability.event_classes[3].contract_sha256, OBJ_EVALUATION_CONTRACT,
+    "OBJ evaluation contract")
+  equal(capability.event_classes[4].contract_sha256, OBJ_HANDOFF_CONTRACT,
+    "OBJ handoff contract")
+  equal(capability.class_accounting, true, "per-class terminal accounting")
+  equal(capability.input_movie.format, "frame-full-state-1", "movie format")
+  equal(capability.origins[1], "next_frame_boundary", "Mesen origin")
+  equal(capability.origins[2], "reset_release", "Mesen reset origin")
+  equal(capability.limits.max_frames, 5000, "capability frame bound")
+  equal(capability.input_movie.max_frames, 5000, "movie frame bound")
+  equal(capability.limits.max_host_ms, 250000, "capability host deadline")
+  equal(capability.terminal_state.max_bytes, 128 * 1024, "terminal state byte bound")
+  equal(capability.terminal_state.profiles[1].id, "snes_ppu", "terminal state profile")
+  equal(capability.terminal_state.profiles[1].contract_sha256,
+    "21005a15437abd767cbeda5c7ede8741e2aeac4a006dafedede03a695377eaa2",
+    "terminal state contract")
+  equal(capability.terminal_state.profiles[1].groups[1], "ppu", "terminal state group")
+end
+
+do
+  local capability = Recording.capability(function(value) return value end, false, false, false, false)
+  equal(#capability.event_classes, 2, "non-SNES runtime omits SNES classes")
+  equal(capability.revision,
+    "dea5c89d917c0e645296117dc9b14dcf089a49794dbe72b0319a104016a449bf",
+    "base capability revision")
+  equal(capability.terminal_state, nil, "non-SNES runtime omits terminal state profiles")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
+  local capability = Recording.capability(function(value) return value end, false, false, false, true)
+  equal(capability.revision,
+    "7a63f4233406541101fdd078a4bd6ffbd1a9785efc24664355a6b491bd8f0efd",
+    "SNES state-only capability revision")
+  equal(capability.terminal_state.profiles[1].id, "snes_ppu",
+    "terminal state is independent of semantic hooks")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+local function obj_payload(overrides)
+  local value = {
+    cpu = { pc = 0x808000, a = 1, x = 2, y = 3, sp = 0x1ff,
+      d = 0, dbr = 0x7e, k = 0x80, ps = 0x34 },
+    ppu = { scanline = 12, dot = 44, hclock = 176 },
+    forced_blank = false,
+  }
+  for key, item in pairs(overrides or {}) do value[key] = item end
+  return value
+end
+
+do
+  local p = params(1, {
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+      { id = "snes_ppu_obj_handoff", contract_sha256 = OBJ_HANDOFF_CONTRACT },
+    },
+  })
+  local state = assert(Recording.start(
+    p, 35, LAUNCH, 80, 0, fake_sink(), nil, nil, nil, nil, function() return true end))
+  assert(Recording.attach_hooks(state))
+  state = Recording.semantic_event(state, "snes_ppu_obj_handoff", 80, 3000, obj_payload())
+  local effect
+  state, effect = Recording.tick(state, 81, 100)
+  equal(effect.kind, "terminal", "semantic events do not consume frame-completed occurrences")
+  local result = Recording.result(state, 100)
+  equal(result.operation_outcome, "completed", "mixed event stream completes")
+  equal(result.event_classes[2].observed, 1, "frame-completed accounting is independent")
+  equal(result.event_classes[3].observed, 1, "semantic accounting is independent")
+end
+
+do
+  local p = params(1, {
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_obj_handoff", contract_sha256 = OBJ_HANDOFF_CONTRACT },
+    },
+    limits = {
+      max_frames = 1,
+      max_events = 1000,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 2000,
+      progress_interval_ms = 100,
+    },
+  })
+  local hooks_released = 0
+  local sink = fake_sink()
+  local state, effect = Recording.start(
+    p, 31, LAUNCH, 40, 0, sink, nil, nil, nil, nil,
+    function() hooks_released = hooks_released + 1; return true end)
+  equal(effect.kind, "arm_observation", "semantic recording arm")
+  equal(Recording.attach_hooks(state), true, "semantic hooks attached")
+  for index = 1, 300 do
+    state, effect = Recording.semantic_event(
+      state, "snes_ppu_obj_handoff", 40, 1000 + index, obj_payload())
+    equal(effect, nil, "semantic event accepted " .. index)
+  end
+  state, effect = Recording.tick(state, 41, 4000)
+  equal(effect.kind, "terminal", "semantic recording terminal")
+  local result = Recording.result(state, 4000)
+  equal(result.events, 301, "semantic records bypass live queue ceiling")
+  equal(result.event_classes[1].observed, 1, "frame class accounting")
+  equal(result.event_classes[2].observed, 300, "semantic class accounting")
+  equal(result.event_classes[2].armed, true, "semantic class armed accounting")
+  equal(result.event_classes[2].dropped, 0, "semantic class loss accounting")
+  equal(result.cleanup.hooks, "released", "semantic hook cleanup")
+  equal(hooks_released, 1, "semantic hooks released once")
+end
+
+
+do
+  local p = params(1, {
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_obj_handoff", contract_sha256 = OBJ_HANDOFF_CONTRACT },
+    },
+  })
+  local state = assert(Recording.start(p, 34, LAUNCH, 70, 0, fake_sink()))
+  local result = Recording.result(state, 0)
+  equal(result.event_classes[1].armed, true, "frame class arms at sink boundary")
+  equal(result.event_classes[2].armed, false, "semantic class is not armed before hook install")
+end
+
+do
+  local p = params(1, {
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_obj_evaluation_start", contract_sha256 = OBJ_EVALUATION_CONTRACT },
+    },
+  })
+  local hooks_released = 0
+  local sink = fake_sink({ error_at = 2 })
+  local state = assert(Recording.start(
+    p, 32, LAUNCH, 50, 0, sink, nil, nil, nil, nil,
+    function() hooks_released = hooks_released + 1; return true end))
+  assert(Recording.attach_hooks(state))
+  local effect
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_evaluation_start", 50, 2000, obj_payload())
+  equal(effect.kind, "terminal", "semantic sink failure is fail-stop")
+  equal(Recording.result(state, 1).integrity, "unverifiable", "semantic sink failure integrity")
+  equal(hooks_released, 1, "sink failure releases semantic hooks")
+end
+
+do
+  local p = params(1, {
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_obj_handoff", contract_sha256 = OBJ_HANDOFF_CONTRACT },
+    },
+  })
+  local state = assert(Recording.start(p, 33, LAUNCH, 60, 0, fake_sink()))
+  assert(Recording.attach_hooks(state, false))
+  local invalid = obj_payload()
+  invalid.cpu.pc = 0x1000000
+  local effect
+  state, effect = Recording.semantic_event(state, "snes_ppu_obj_handoff", 60, 3000, invalid)
+  equal(effect.kind, "terminal", "invalid semantic payload fails before write")
+  contains(Recording.result(state, 1).reason, "event_payload_contract_failed",
+    "invalid semantic payload reason")
+end
+
+do
+  local text = "0:a\n1:b\n"
+  local path = movie_file(text)
+  local p = params(2, {
+    origin = "reset_release",
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 2,
+      bytes = #text,
+      sha256 = string.rep("7", 64),
+    },
+  })
+  local prepared, kind, message = Recording.prepare(p, LAUNCH, 90, 0, decode_buttons)
+  equal(prepared ~= nil, true, "reset request prepares before mutation")
+  equal(kind, nil, "reset prepare kind")
+  equal(message, nil, "reset prepare message")
+
+  local sink = fake_sink()
+  local installed = 0
+  equal(sink.writes, 0, "prepare writes no event")
+  local state, effect = Recording.start(
+    p, 30, LAUNCH, 91, 0, sink, decode_buttons,
+    function(input) installed = installed + 1; return input.a ~= nil end,
+    function() return true end, prepared)
+  equal(effect.kind, "arm_observation", "reset release starts at native boundary")
+  equal(installed, 1, "reset offset zero input is armed")
+  equal(state.start_frame, 91, "reset release frame")
+  equal(sink.writes, 1, "reset release emits first boundary")
+  os.remove(path)
+end
+
+do
+  local long = params(1400, {
+    limits = {
+      max_frames = 1400,
+      max_events = 1400,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 70000,
+      progress_interval_ms = 250,
+    },
+  })
+  local validated, kind, message = Recording.validate(long, LAUNCH, 0, 0)
+  equal(validated ~= nil, true, "1400-frame admission")
+  equal(kind, nil, "1400-frame admission kind")
+  equal(message, nil, "1400-frame admission message")
+
+  local over = params(5001)
+  local state, _, over_kind = Recording.start(over, 99, LAUNCH, 0, 0, fake_sink())
+  equal(state, nil, "over-ceiling recording rejects")
+  equal(over_kind, "bad_params", "over-ceiling rejection kind")
+end
+
+do
+  local p = params(2, {
+    warmup_frames = 3,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+      { id = "snes_ppu_obj_handoff", contract_sha256 = OBJ_HANDOFF_CONTRACT },
+    },
+    limits = {
+      max_frames = 5,
+      max_events = 1000,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 2000,
+      progress_interval_ms = 100,
+    },
+  })
+  local state, effect = Recording.start(
+    p, 97, LAUNCH, 100, 0, fake_sink(), nil, nil, nil, nil, function() return true end)
+  equal(effect.kind, "working", "warmup begins without observation hooks")
+  local ignored
+  state, ignored = Recording.semantic_event(
+    state, "snes_ppu_obj_handoff", 100, 1, obj_payload())
+  equal(ignored, nil, "observation event is ignored before its armed interval")
+  state = select(1, Recording.tick(state, 101, 1))
+  state = select(1, Recording.tick(state, 102, 2))
+  state, effect = Recording.tick(state, 103, 3)
+  equal(effect.kind, "arm_observation", "observation arms at the declared guest boundary")
+  equal(Recording.attach_hooks(state), true, "warmup observation hooks attached")
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_handoff", 103, 3000, obj_payload())
+  equal(effect, nil, "tail observation event accepted")
+  state = select(1, Recording.tick(state, 104, 4))
+  state, effect = Recording.tick(state, 105, 5)
+  equal(effect.kind, "terminal", "warmup transaction terminal")
+  local result = Recording.result(state, 5)
+  equal(result.f_origin, 100, "warmup origin")
+  equal(result.f_start, 103, "observation start")
+  equal(result.f_end, 105, "observation end")
+  equal(result.frames, 2, "observation frame count")
+  equal(result.event_classes[1].observed, 5, "transaction frame accounting")
+  equal(result.event_classes[3].observed, 1, "tail event accounting")
+  equal(result.event_classes[1].armed_interval.f_start, 100, "frame class interval start")
+  equal(result.event_classes[1].armed_interval.f_end, 105, "frame class interval end")
+  equal(result.event_classes[3].armed_interval.f_start, 103, "deep class interval start")
+  equal(result.event_classes[3].armed_interval.f_end, 105, "deep class interval end")
+end
+
+do
+  local p = params(2, {
+    warmup_frames = 2,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+    },
+    stop_on = { event_class = "frame_completed", occurrence = 1 },
+    limits = {
+      max_frames = 4,
+      max_events = 100,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 2000,
+      progress_interval_ms = 100,
+    },
+  })
+  local state, effect = Recording.start(p, 96, LAUNCH, 200, 0, fake_sink())
+  state = select(1, Recording.tick(state, 201, 1))
+  state, effect = Recording.tick(state, 202, 2)
+  equal(effect.kind, "arm_observation", "stop counter waits through warmup")
+  assert(Recording.attach_hooks(state, false))
+  state, effect = Recording.tick(state, 203, 3)
+  equal(effect.kind, "terminal", "first observation completion stops")
+  local result = Recording.result(state, 3)
+  equal(result.frames, 1, "stop reports observation frames only")
+  equal(result.stop_event.occurrence, 1, "stop occurrence is observation-relative")
+  equal(result.stop_event.frame, 202, "stop event belongs to the first observation frame")
+end
+
+do
+  local rows = {}
+  for offset = 0, 1399 do rows[#rows + 1] = offset .. ":a\n" end
+  local text = table.concat(rows)
+  local path = movie_file(text)
+  local p = params(1400, {
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 1400,
+      bytes = #text,
+      sha256 = string.rep("6", 64),
+    },
+    limits = {
+      max_frames = 1400,
+      max_events = 5000,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 70000,
+      progress_interval_ms = 250,
+    },
+  })
+  local installed = 0
+  local released = false
+  local state, effect = Recording.start(
+    p, 98, LAUNCH, 100, 0, fake_sink(), decode_buttons,
+    function(input)
+      if input.a then installed = installed + 1 end
+      return true
+    end,
+    function() released = true; return true end)
+  for boundary = 101, 1500 do
+    state, effect = Recording.tick(state, boundary, boundary - 100)
+  end
+  equal(effect.kind, "terminal", "1400-frame terminal")
+  equal(Recording.result(state, 1400).frames, 1400, "1400-frame result")
+  equal(installed, 1400, "1400-frame movie applied whole")
+  equal(released, true, "1400-frame movie releases input")
+  os.remove(path)
+end
+
+do
+  local text = "0:a\n1:b\n2:\n"
+  local path = movie_file(text)
+  local p = params(3, {
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+    },
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 3,
+      bytes = #text,
+      sha256 = string.rep("c", 64),
+    },
+    stop_on = { event_class = "frame_completed", occurrence = 2 },
+  })
+  local order = {}
+  local installed = {}
+  local sink = fake_sink({ order = order })
+  local function install_input(state)
+    installed[#installed + 1] = state
+    order[#order + 1] = state.a and "input:a" or (state.b and "input:b" or "input:none")
+    return true
+  end
+  local function release_input()
+    order[#order + 1] = "input:release"
+    return true
+  end
+  local state, effect = Recording.start(
+    p, 14, LAUNCH, 40, 0, sink, decode_buttons, install_input, release_input)
+  equal(effect.kind, "arm_observation", "movie arm progress")
+  equal(installed[1].a, true, "offset zero input")
+  state, effect = Recording.tick(state, 41, 1)
+  equal(installed[2].b, true, "offset one input")
+  state, effect = Recording.tick(state, 42, 2)
+  equal(effect.kind, "terminal", "event stop terminal")
+  equal(#installed, 2, "unused movie suffix is not applied")
+  local result = Recording.result(state, 2)
+  equal(result.execution_outcome, "event_stop", "event stop outcome")
+  equal(result.frames, 2, "event stop actual frames")
+  equal(result.events, 4, "interleaved event count")
+  equal(result.f_end, 42, "event stop scope")
+  equal(result.stop_event.sequence, 3, "terminal event sequence")
+  equal(result.stop_event.clock_tick, 42, "terminal event clock")
+  equal(result.cleanup.transient_input, "released", "movie input cleanup")
+  contains(sink.chunks[2], '"class":"frame_completed"', "first completion event")
+  contains(sink.chunks[3], '"class":"frame_boundary"', "next boundary event")
+  contains(sink.chunks[4], '"class":"frame_completed"', "stop completion event")
+  local expected_order = {
+    "input:a", "event:boundary", "event:completed", "input:b",
+    "event:boundary", "event:completed", "input:release",
+  }
+  for index, expected in ipairs(expected_order) do
+    equal(order[index], expected, "movie/event ordering " .. index)
+  end
+  equal(#order, #expected_order, "movie/event ordering length")
+  os.remove(path)
+end
+
+do
+  local function schedule(step_ms)
+    local text = "0:a\n1:b\n2:\n"
+    local path = movie_file(text)
+    local order = {}
+    local override = nil
+    local p = params(3, {
+      event_classes = {
+        { id = "frame_boundary", contract_sha256 = CONTRACT },
+        { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+      },
+      input_movie = {
+        path = path,
+        format = "frame-full-state-1",
+        port = 0,
+        frames = 3,
+        bytes = #text,
+        sha256 = string.rep("f", 64),
+      },
+    })
+    local state, effect = Recording.start(
+      p, 16, LAUNCH, 80, 0, fake_sink({ order = order }), decode_buttons,
+      function(input)
+        override = input
+        order[#order + 1] = input.a and "input:a" or (input.b and "input:b" or "input:none")
+        return true
+      end,
+      function()
+        override = nil
+        order[#order + 1] = "input:release"
+        return true
+      end)
+    equal(effect.kind, "arm_observation", "delayed schedule arm")
+    for offset = 1, 3 do
+      state, effect = Recording.tick(state, 80 + offset, step_ms * offset)
+    end
+    equal(effect.kind, "terminal", "delayed schedule terminal")
+    local result = Recording.result(state, step_ms * 3)
+    equal(result.frames, 3, "delayed schedule frames")
+    equal(result.cleanup.transient_input, "released", "delayed schedule cleanup")
+    equal(override, nil, "native input ownership after recording")
+    local native = { keyboard = true }
+    if override then native = override end
+    equal(native.keyboard, true, "native input remains visible after recording")
+    os.remove(path)
+    return table.concat(order, "|")
+  end
+
+  equal(schedule(1), schedule(500), "host delay does not move movie input")
+end
+
+do
+  local text = "0:unknown\n"
+  local path = movie_file(text)
+  local p = params(1, {
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 1,
+      bytes = #text,
+      sha256 = string.rep("d", 64),
+    },
+  })
+  local state, _, kind = Recording.start(p, 15, LAUNCH, 10, 0, fake_sink(), decode_buttons)
+  equal(state, nil, "unknown movie button rejects before arm")
+  equal(kind, "bad_params", "unknown movie button kind")
+  os.remove(path)
+end
+
+do
+  for _, occurrence in ipairs({ 1, 3 }) do
+    local p = params(3, {
+      event_classes = {
+        { id = "frame_boundary", contract_sha256 = CONTRACT },
+        { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+      },
+      stop_on = { event_class = "frame_completed", occurrence = occurrence },
+    })
+    local state, effect = Recording.start(p, 20 + occurrence, LAUNCH, 50, 0, fake_sink())
+    local boundary = 50
+    while effect.kind ~= "terminal" do
+      boundary = boundary + 1
+      state, effect = Recording.tick(state, boundary, boundary - 50)
+    end
+    local result = Recording.result(state, boundary - 50)
+    equal(result.execution_outcome, "event_stop", "first/final stop outcome")
+    equal(result.frames, occurrence, "first/final stop frames")
+    equal(result.events, occurrence * 2, "first/final stop records")
+  end
+end
+
+do
+  local text = "0:a\n"
+  local path = movie_file(text)
+  local p = params(1, {
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 1,
+      bytes = #text,
+      sha256 = string.rep("e", 64),
+    },
+  })
+  local released = false
+  local state, effect = Recording.start(
+    p, 24, LAUNCH, 60, 0, fake_sink({ error_at = 1 }), decode_buttons,
+    function() return true end,
+    function() released = true; return true end)
+  equal(effect.kind, "terminal", "movie sink failure terminal")
+  equal(released, true, "movie sink failure releases input")
+  equal(Recording.result(state, 0).cleanup.transient_input, "released",
+    "movie sink failure cleanup")
+  os.remove(path)
+end
+
+do
+  local sink = fake_sink()
+  local state, effect = Recording.start(params(3), 7, LAUNCH, 40, 1000, sink)
+  equal(effect.kind, "arm_observation", "arm progress")
+  local progress = Recording.progress(state)
+  equal(progress.capture_id, "capture-test", "progress capture identity")
+  equal(progress.sequence, 0, "first progress sequence")
+  equal(progress.events, 1, "first progress event count")
+  contains(sink.chunks[1], '"contract_sha256":"' .. CONTRACT .. '"', "event contract")
+  state = select(1, Recording.tick(state, 41, 1010))
+  state = select(1, Recording.tick(state, 42, 1020))
+  state, effect = Recording.tick(state, 43, 1030)
+  equal(effect.kind, "terminal", "exact terminal")
+  local result = Recording.result(state, 1030.75)
+  equal(result.status, "completed", "terminal status")
+  equal(result.operation_outcome, "completed", "terminal operation")
+  equal(result.integrity, "complete", "terminal integrity")
+  equal(result.f_start, 40, "scope start")
+  equal(result.f_end, 43, "scope end")
+  equal(result.final_frame, 43, "freeze boundary")
+  equal(result.events, 3, "exact event count")
+  equal(result.wall_ms, 30, "fractional host time is normalized to wire integer")
+  equal(result.cleanup.hooks, "not_acquired", "hook cleanup")
+  equal(result.cleanup.sink, "released", "sink cleanup")
+  equal(sink.close_count, 1, "sink close count")
+end
+
+do
+  local sink = fake_sink({ partial_at = 2, partial_bytes = 7 })
+  local state = assert(Recording.start(params(3), 8, LAUNCH, 70, 0, sink))
+  local effect
+  state, effect = Recording.tick(state, 71, 1)
+  equal(effect.kind, "terminal", "partial terminal")
+  local result = Recording.result(state, 1)
+  equal(result.integrity, "unverifiable", "partial integrity")
+  equal(result.events, 1, "partial complete records")
+  equal(result.physical_bytes, result.bytes + 7, "partial physical bytes")
+end
+
+do
+  local sink = fake_sink()
+  local p = params(3)
+  local state = assert(Recording.start(p, 9, LAUNCH, 10, 0, sink))
+  state.limits.max_events = 1 -- internal fault injection after valid admission
+  local effect
+  state, effect = Recording.tick(state, 11, 1)
+  equal(effect.kind, "terminal", "event limit terminal")
+  equal(Recording.result(state, 1).integrity, "lossy", "event limit integrity")
+end
+
+do
+  local sink = fake_sink()
+  local state = assert(Recording.start(params(5), 10, LAUNCH, 20, 0, sink))
+  local effect
+  state, effect = Recording.cancel(state, 21, "request_cancelled")
+  equal(effect.kind, "terminal", "cancel terminal")
+  local result = Recording.result(state, 1)
+  equal(result.status, "interrupted", "cancel wire status")
+  equal(result.operation_outcome, "aborted", "cancel operation")
+  equal(result.integrity, "unverifiable", "cancel integrity")
+  equal(result.dropped, 0, "cancel is not invented producer loss")
+  equal(sink.close_count, 1, "cancel closes sink")
+end
+
+do
+  local bad = params(1)
+  bad.launch_id = "launch-other"
+  local state, effect, kind = Recording.start(bad, 11, LAUNCH, 0, 0, fake_sink())
+  equal(state, nil, "mismatched launch state")
+  equal(effect, nil, "mismatched launch effect")
+  equal(kind, "bad_state", "mismatched launch kind")
+
+  bad = params(1)
+  bad.event_classes[1].contract_sha256 = string.rep("b", 64)
+  state, effect, kind = Recording.start(bad, 12, LAUNCH, 0, 0, fake_sink())
+  equal(state, nil, "mismatched contract state")
+  equal(kind, "unsupported", "mismatched contract kind")
+
+  bad = params(1)
+  bad.limits.max_events = 100001
+  state, effect, kind = Recording.start(bad, 13, LAUNCH, 0, 0, fake_sink())
+  equal(state, nil, "expanded limit state")
+  equal(kind, "bad_params", "expanded limit kind")
+
+  bad = params(1)
+  bad.origin = "unadvertised_origin"
+  state, effect, kind = Recording.start(bad, 14, LAUNCH, 0, 0, fake_sink())
+  equal(state, nil, "unadvertised origin state")
+  equal(kind, "unsupported", "unadvertised origin kind")
+end
+
+print("recording_test: ok")

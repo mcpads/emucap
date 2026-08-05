@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::contracts::ContractAdvertisement;
 
@@ -22,6 +25,8 @@ pub enum LinkError {
     Ambiguous { names: Vec<String> },
     #[error("request timed out")]
     Timeout,
+    #[error("request was cancelled")]
+    Cancelled,
     #[error("protocol error: {0}")]
     Protocol(String),
     #[error("emulator error [{kind}]: {message}")]
@@ -45,6 +50,7 @@ impl LinkError {
             Self::NoSuchEmulator { .. } => "no_such_emulator",
             Self::Ambiguous { .. } => "ambiguous",
             Self::Timeout => "request_timeout",
+            Self::Cancelled => "cancelled",
             Self::Protocol(_) => "protocol_error",
             Self::Emulator { .. } => "emulator_error",
             Self::IdentityMismatch { .. } => "identity_mismatch",
@@ -136,12 +142,134 @@ pub struct Capabilities {
     /// read/write_memory에 유효한 memory_type 이름들 — 어댑터가 hello로 advertise(에뮬레이터의
     /// debugger address space에서; 없으면 빈 vec). MCP는 status에 표면화만 한다(정적 맵 금지).
     pub memory_types: Vec<String>,
+    /// Optional exact, generation-bound sizes for live memory types. Adapters that cannot prove a
+    /// finite region keep this empty; callers must not infer sizes from platform tables.
+    pub memory_regions: Vec<MemoryRegion>,
     /// set_breakpoint가 현재 연결에서 실제로 받는 kind별 구조화된 설명. 플랫폼별 이름과
     /// 범위 의미를 공통 MCP 서버에 정적으로 복제하지 않고 hello 값을 그대로 전달한다.
     pub breakpoint_kinds: Vec<Value>,
     pub contracts: ContractAdvertisement,
+    /// Parsed and validated at hello. Public status advertises it only when the link is direct and
+    /// bound to the exact managed generation and lease.
+    pub recording: Option<super::recording_capability::RecordingCapability>,
     pub identity: EmulatorIdentity,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRegion {
+    pub memory_type: String,
+    pub size: u64,
+}
+
+pub(crate) fn memory_regions_from_hello(
+    value: Option<&Value>,
+    memory_types: &[String],
+) -> Result<Vec<MemoryRegion>, LinkError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let values = value.as_array().ok_or_else(|| {
+        LinkError::Protocol("memory_regions must be an array when advertised".into())
+    })?;
+    let advertised = memory_types
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut regions = Vec::with_capacity(values.len());
+    for value in values {
+        let region: MemoryRegion = serde_json::from_value(value.clone()).map_err(|error| {
+            LinkError::Protocol(format!("invalid memory_regions entry: {error}"))
+        })?;
+        if region.memory_type.is_empty() || region.size == 0 {
+            return Err(LinkError::Protocol(
+                "memory_regions entries require a non-empty memory_type and non-zero size".into(),
+            ));
+        }
+        if !advertised.contains(region.memory_type.as_str()) {
+            return Err(LinkError::Protocol(format!(
+                "memory region {} is not present in memory_types",
+                region.memory_type
+            )));
+        }
+        if !seen.insert(region.memory_type.clone()) {
+            return Err(LinkError::Protocol(format!(
+                "memory region {} is advertised more than once",
+                region.memory_type
+            )));
+        }
+        regions.push(region);
+    }
+    Ok(regions)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WorkingProgress {
+    pub status: String,
+    pub capture_id: String,
+    pub sequence: u64,
+    pub frame: u64,
+    #[serde(default)]
+    pub frames: Option<u64>,
+    pub events: u64,
+    pub bytes: u64,
+    #[serde(default)]
+    pub phase: Option<WorkingProgressPhase>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkingProgressPhase {
+    Warming,
+    Aligning,
+    Recording,
+}
+
+impl WorkingProgress {
+    pub fn parse(value: Value) -> Result<Self, LinkError> {
+        let progress: Self = serde_json::from_value(value)
+            .map_err(|error| LinkError::Protocol(format!("invalid working progress: {error}")))?;
+        if progress.status != super::protocol::STATUS_WORKING
+            || progress.capture_id.is_empty()
+            || progress.capture_id.len() > 96
+        {
+            return Err(LinkError::Protocol(
+                "invalid recording working progress identity".into(),
+            ));
+        }
+        Ok(progress)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RequestCancellation(Arc<AtomicBool>);
+
+impl RequestCancellation {
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AbortRequest {
+    pub method: String,
+    pub params: Value,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProgressCallControl {
+    pub cancellation: RequestCancellation,
+    pub abort: Option<AbortRequest>,
+    /// Host deadline through the guest-affecting adapter terminal. Progress never extends it.
+    pub max_host_ms: Option<u64>,
+}
+
+pub type ProgressObserver<'a> = dyn FnMut(&WorkingProgress) -> Result<(), LinkError> + Send + 'a;
 
 impl Capabilities {
     pub fn empty() -> Self {
@@ -149,8 +277,10 @@ impl Capabilities {
             protocol_version: 0,
             methods: vec![],
             memory_types: vec![],
+            memory_regions: vec![],
             breakpoint_kinds: vec![],
             contracts: ContractAdvertisement::Unreported,
+            recording: None,
             identity: EmulatorIdentity::default(),
         }
     }
@@ -159,6 +289,21 @@ impl Capabilities {
 pub trait EmulatorLink {
     fn capabilities(&self) -> &Capabilities;
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError>;
+    /// Observe typed `working` frames and bind cancellation to this exact request. Ordinary calls
+    /// retain their existing one-response behavior through `call`.
+    fn call_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        observer: &mut ProgressObserver<'_>,
+        control: &ProgressCallControl,
+    ) -> Result<Value, LinkError> {
+        if control.cancellation.is_cancelled() {
+            return Err(LinkError::Cancelled);
+        }
+        let _ = observer;
+        self.call(method, params)
+    }
     /// Whether the link can discard a failed front-side session and attach the same control
     /// session again. Temporal cleanup uses this only for idempotent compensation calls after an
     /// ambiguous transport failure and verifies the launch generation separately.
@@ -168,8 +313,13 @@ pub trait EmulatorLink {
     /// Discard the current front-side session after an adapter has acknowledged an operation that
     /// recreates its transport. The emulator process and launch generation remain intact.
     fn prepare_reconnect(&mut self) {}
-    /// 직접 모드에서 에뮬레이터가 접속해야 하는 포트(자동 선택 결과). status가 에이전트에게
-    /// 알려주려 쓴다. broker 모드 등 포트 개념이 없으면 None.
+    /// Direct-mode search starting point. This is not a listener endpoint and must never be passed
+    /// to an emulator as though it had already been reserved.
+    fn base_port(&self) -> Option<u16> {
+        None
+    }
+    /// Actual selected port that an emulator connects to in direct mode. Status uses this to tell
+    /// callers the assigned endpoint. Returns `None` before binding and in broker mode.
     fn endpoint_port(&self) -> Option<u16> {
         None
     }
@@ -241,8 +391,10 @@ impl FakeLink {
                 protocol_version: 1,
                 methods: vec!["read_memory".into()],
                 memory_types: vec![],
+                memory_regions: vec![],
                 breakpoint_kinds: vec![],
                 contracts: ContractAdvertisement::Unreported,
+                recording: None,
                 identity: EmulatorIdentity::default(),
             },
             response: Ok(result),
@@ -257,8 +409,10 @@ impl FakeLink {
                 protocol_version: 1,
                 methods: vec![],
                 memory_types: vec![],
+                memory_regions: vec![],
                 breakpoint_kinds: vec![],
                 contracts: ContractAdvertisement::Unreported,
+                recording: None,
                 identity: EmulatorIdentity::default(),
             },
             response: Err(e),
@@ -288,6 +442,7 @@ impl EmulatorLink for FakeLink {
                 names: names.clone(),
             }),
             Err(LinkError::Timeout) => Err(LinkError::Timeout),
+            Err(LinkError::Cancelled) => Err(LinkError::Cancelled),
             Err(LinkError::Protocol(s)) => Err(LinkError::Protocol(s.clone())),
             Err(LinkError::Emulator { kind, message }) => Err(LinkError::Emulator {
                 kind: kind.clone(),

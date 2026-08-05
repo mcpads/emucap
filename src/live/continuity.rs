@@ -9,7 +9,9 @@ use std::io;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::link::{Capabilities, EmulatorIdentity, EmulatorLink, LinkError};
+use super::link::{
+    Capabilities, EmulatorIdentity, EmulatorLink, LinkError, ProgressCallControl, ProgressObserver,
+};
 use super::runtime::{
     capture_process, control_session_key, process_state, CurrentManifest, LeaseRecord, LeaseState,
     LeaseView, ProcessIdentity, ProcessState, RuntimeStore, TerminationRecord,
@@ -610,13 +612,53 @@ impl<L: EmulatorLink> ObservedLink<L> {
         Ok(view)
     }
 
-    fn ensure_mutation_lease(&mut self) -> Result<(), LinkError> {
+    fn ensure_mutation_lease(&mut self, method: &str, params: &Value) -> Result<(), LinkError> {
         match self
             .claim_lease()
             .map_err(|e| LinkError::Protocol(format!("lease: {e}")))?
             .state
         {
-            LeaseState::Held => Ok(()),
+            LeaseState::Held => {
+                let Some((port, launch_id)) = self
+                    .current_location()
+                    .map(|(port, launch_id)| (port, launch_id.to_string()))
+                else {
+                    return Ok(());
+                };
+                let capsule = self
+                    .store
+                    .read_capture_json::<super::capture_capsule::CaptureCapsule>(port, &launch_id)
+                    .map_err(|error| {
+                        LinkError::Protocol(format!(
+                            "recording capture safety metadata is invalid: {error}"
+                        ))
+                    })?;
+                let Some(capsule) = capsule else {
+                    return Ok(());
+                };
+                if capsule.generation_mutation_blocker().is_none() {
+                    return Ok(());
+                }
+
+                // The recording executor persists Arming before it sends the one matching wire
+                // transaction. That exact owner/capture pair is the only mutation admitted while
+                // a nonterminal capture exists; every other request must wait for its terminal.
+                let owned_arming = method == "record_window"
+                    && capsule.state == super::capture_capsule::CaptureState::Arming
+                    && params.get("capture_id").and_then(Value::as_str)
+                        == Some(capsule.capture_id.as_str())
+                    && capsule.lease.holder == self.holder
+                    && capsule.lease.control_session_key == self.control_key;
+                if owned_arming {
+                    return Ok(());
+                }
+                Err(LinkError::Emulator {
+                    kind: "recording_quarantined".into(),
+                    message: capsule
+                        .generation_mutation_blocker()
+                        .unwrap_or_else(|| "recording capture safety is unresolved".into()),
+                })
+            }
             // Before a launch generation exists there is no lease to guard; the launcher creates
             // the generation and rotates the reclaim capability atomically with its own checks.
             LeaseState::Unknown if self.current_location().is_none() => Ok(()),
@@ -915,9 +957,29 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
 
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
         if !is_read_only(method) {
-            self.ensure_mutation_lease()?;
+            self.ensure_mutation_lease(method, &params)?;
         }
         let result = self.inner.call(method, params);
+        match &result {
+            Ok(value) => self.record_success(method, value),
+            Err(error) => self.record_failure(method, error),
+        }
+        result
+    }
+
+    fn call_with_progress(
+        &mut self,
+        method: &str,
+        params: Value,
+        observer: &mut ProgressObserver<'_>,
+        control: &ProgressCallControl,
+    ) -> Result<Value, LinkError> {
+        if !is_read_only(method) {
+            self.ensure_mutation_lease(method, &params)?;
+        }
+        let result = self
+            .inner
+            .call_with_progress(method, params, observer, control);
         match &result {
             Ok(value) => self.record_success(method, value),
             Err(error) => self.record_failure(method, error),
@@ -931,6 +993,10 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
 
     fn prepare_reconnect(&mut self) {
         self.inner.prepare_reconnect();
+    }
+
+    fn base_port(&self) -> Option<u16> {
+        self.inner.base_port()
     }
 
     fn endpoint_port(&self) -> Option<u16> {

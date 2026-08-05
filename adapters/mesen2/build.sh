@@ -12,6 +12,14 @@ lock_value() {
   sed -n "s/^$1=//p" "$LOCK_FILE"
 }
 
+sha256_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print tolower($1)}'
+  else
+    sha256sum "$1" | awk '{print tolower($1)}'
+  fi
+}
+
 MESEN_REPO="$(lock_value MESEN_REPO)"
 MESEN_TAG="$(lock_value MESEN_TAG)"
 MESEN_COMMIT="$(lock_value MESEN_COMMIT)"
@@ -89,6 +97,7 @@ PATCHES=(
   "$HERE/patches/0004-restart-command-line-script-after-power-cycle.patch"
   "$HERE/patches/0005-add-snes-ppu-obj-boundary-events.patch"
   "$HERE/patches/0006-stop-video-threads-before-emulator-destruction.patch"
+  "$HERE/patches/0007-add-snes-deep-observation-events.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -158,8 +167,10 @@ fi
 }
 
 METADATA="$(dirname "$BIN")/emucap-mesen-build.json"
-printf '{\n  "upstream": "%s",\n  "tag": "%s",\n  "commit": "%s",\n  "host_api": %s,\n  "patchset_sha256": "%s"\n}\n' \
-  "$MESEN_REPO" "$MESEN_TAG" "$MESEN_COMMIT" "$MESEN_HOST_API" "$MESEN_PATCHSET_SHA256" >"$METADATA"
+BINARY_SHA256="$(sha256_file "$BIN")"
+printf '{\n  "upstream": "%s",\n  "tag": "%s",\n  "commit": "%s",\n  "host_api": %s,\n  "patchset_sha256": "%s",\n  "binary_sha256": "%s"\n}\n' \
+  "$MESEN_REPO" "$MESEN_TAG" "$MESEN_COMMIT" "$MESEN_HOST_API" "$MESEN_PATCHSET_SHA256" \
+  "$BINARY_SHA256" >"$METADATA"
 
 echo "OK: $BIN"
 echo "metadata: $METADATA"

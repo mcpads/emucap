@@ -144,6 +144,16 @@
       "expression": "write.ok => Applied(memory_type,address,bytes)"
     },
     {
+      "id": "MEDIA.CHANGE.APPLY.1",
+      "category": "postcondition",
+      "expression": "change_media.ok => frozen(after) and mounted_media(after,device) = requested_media"
+    },
+    {
+      "id": "MEDIA.CHANGE.ROLLBACK.1",
+      "category": "invariant",
+      "expression": "change_media.failed_after_effect => restored(previous_media) or reports(current_media,rollback_failure)"
+    },
+    {
       "id": "MEM.DUMP.PATH.1",
       "category": "postcondition",
       "expression": "dump.ok => writes_confined_to(request.path) and literal_path(request.path)"
@@ -172,6 +182,21 @@
       "id": "INPUT.PULSE.CLEANUP.1",
       "category": "invariant",
       "expression": "effect_terminal(press) => transient_override_engaged(after) = false"
+    },
+    {
+      "id": "INPUT.TOUCH.HOLD.1",
+      "category": "postcondition",
+      "expression": "hold_touch(x,y).ok => touch_override_engaged(after) and touch_position(after) = (x,y)"
+    },
+    {
+      "id": "INPUT.TOUCH.RELEASE.1",
+      "category": "postcondition",
+      "expression": "release_touch.ok => touch_override_engaged(after) = false"
+    },
+    {
+      "id": "INPUT.TOUCH.PULSE.1",
+      "category": "postcondition",
+      "expression": "pulse_touch(x,y,n).completed => touch_position = (x,y) for the same n-frame window and touch_override_engaged(after) = false"
     },
     {
       "id": "EXEC.PAUSE.HALT.1",
@@ -227,6 +252,51 @@
       "id": "TRACE.AUTHORITY.1",
       "category": "observation",
       "expression": "authority(result) = exact => every frame has exact evidence"
+    },
+    {
+      "id": "RECORD.SCOPE.1",
+      "category": "temporal",
+      "expression": "G(record_completed(q,n) => frame_events(q) = [F_start,F_start+n) and frozen_at(q,F_start+n))"
+    },
+    {
+      "id": "RECORD.CONTINUITY.1",
+      "category": "invariant",
+      "expression": "integrity(q) = complete => sequence(q) continuous and dropped(q) = 0 and not truncated(q)"
+    },
+    {
+      "id": "RECORD.PUBLISH.1",
+      "category": "invariant",
+      "expression": "publication(q) = published => core_validated(q) and manifest_written_last(q) and member_hashes_match(q)"
+    },
+    {
+      "id": "RECORD.FAILSTOP.1",
+      "category": "temporal",
+      "expression": "G(recording(q) and (overflow(q) or sink_failure(q) or generation_change(q)) => F<=D_h effect_terminal(q) and integrity(q) != complete)"
+    },
+    {
+      "id": "RECORD.EFFECT.HOST.1",
+      "category": "temporal",
+      "expression": "G(armed(q) => F<=D_h (effect_terminal(q) or generation_terminated(q)))"
+    },
+    {
+      "id": "RECORD.MOVIE.1",
+      "category": "temporal",
+      "expression": "G(movie_state(q,i) => applied_before(q,F_start+i) and held_through(q,[F_start+i,F_start+i+1)))"
+    },
+    {
+      "id": "RECORD.STOP.1",
+      "category": "temporal",
+      "expression": "G(stop_match(q,e) => final_event(q)=e and frozen_at(q,e.clock_tick) and no_later_input_or_tick(q))"
+    },
+    {
+      "id": "RECORD.RESET.1",
+      "category": "temporal",
+      "expression": "G(reset_release_accepted(q) => sink_armed(q) and first_boundary(q)=first_post_reset_boundary(q))"
+    },
+    {
+      "id": "RECORD.INPUT.CLEANUP.1",
+      "category": "invariant",
+      "expression": "effect_terminal(q) and transient_input_acquired(q) => transient_input_released(q) or generation_terminated(q) or integrity(q)=unverifiable"
     },
     {
       "id": "FAIL.TIMEOUT.NONCRASH.1",
@@ -313,6 +383,7 @@
       "id": "failure.dismiss",
       "surface": "public",
       "methods": ["dismiss_failure"],
+      "route": "debug",
       "temporal_classes": ["T3"],
       "disposition": "retain",
       "expectations": ["TIME.RESPONSE.1", "TIME.CLEANUP.1"]
@@ -334,6 +405,14 @@
       "expectations": []
     },
     {
+      "id": "media.change",
+      "surface": "public",
+      "methods": ["change_media"],
+      "temporal_classes": ["T3"],
+      "disposition": "retain",
+      "expectations": ["MEDIA.CHANGE.APPLY.1", "MEDIA.CHANGE.ROLLBACK.1", "TIME.RESPONSE.1", "TIME.COMPLETE.1", "TIME.GENERATION.1"]
+    },
+    {
       "id": "memory.read",
       "surface": "public",
       "methods": ["read_memory"],
@@ -353,6 +432,7 @@
       "id": "memory.search",
       "surface": "public",
       "methods": ["find_pattern"],
+      "route": "debug",
       "temporal_classes": ["T4"],
       "disposition": "retain",
       "expectations": []
@@ -361,6 +441,7 @@
       "id": "memory.dump",
       "surface": "public",
       "methods": ["dump_memory"],
+      "route": "debug",
       "temporal_classes": ["T4"],
       "disposition": "retain",
       "expectations": ["MEM.DUMP.PATH.1"]
@@ -385,6 +466,7 @@
       "id": "video.inspect",
       "surface": "public",
       "methods": ["get_video_state", "resolve_tile"],
+      "route": "debug",
       "temporal_classes": ["T4"],
       "disposition": "retain",
       "expectations": ["TIME.COMPLETE.1"]
@@ -393,6 +475,7 @@
       "id": "video.layer-control",
       "surface": "public",
       "methods": ["set_layer_enable"],
+      "route": "debug",
       "temporal_classes": ["T0"],
       "disposition": "retain",
       "expectations": []
@@ -401,25 +484,62 @@
       "id": "input.hold",
       "surface": "public",
       "methods": ["set_input"],
+      "route": "input_control",
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
       "expectations": ["INPUT.HOLD.RELEASE.1", "TIME.PERSISTENT.1"]
     },
     {
       "id": "input.pulse",
-      "surface": "public",
+      "surface": "wire",
       "methods": ["press_buttons"],
       "temporal_classes": ["T2"],
       "disposition": "retain",
       "expectations": ["INPUT.PULSE.SAME_WINDOW.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
     },
     {
-      "id": "input.touch",
+      "id": "input.running-pulse",
       "surface": "public",
+      "methods": ["pulse_while_running"],
+      "route": "input_control",
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["INPUT.PULSE.SAME_WINDOW.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
+    },
+    {
+      "id": "input.touch-wire",
+      "surface": "wire",
       "methods": ["touch"],
       "temporal_classes": ["T0/P", "T2"],
+      "disposition": "consolidate",
+      "expectations": ["INPUT.TOUCH.HOLD.1", "INPUT.TOUCH.RELEASE.1", "INPUT.TOUCH.PULSE.1"]
+    },
+    {
+      "id": "input.touch-hold",
+      "surface": "public",
+      "methods": ["hold_touch"],
+      "route": "input_control",
+      "temporal_classes": ["T0/P"],
       "disposition": "retain",
-      "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.PERSISTENT.1"]
+      "expectations": ["INPUT.TOUCH.HOLD.1", "TIME.PERSISTENT.1"]
+    },
+    {
+      "id": "input.touch-release",
+      "surface": "public",
+      "methods": ["release_touch"],
+      "route": "input_control",
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["INPUT.TOUCH.RELEASE.1"]
+    },
+    {
+      "id": "input.touch-running-pulse",
+      "surface": "public",
+      "methods": ["pulse_touch_while_running"],
+      "route": "input_control",
+      "temporal_classes": ["T2"],
+      "disposition": "retain",
+      "expectations": ["INPUT.TOUCH.PULSE.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
     },
     {
       "id": "input.tap",
@@ -433,6 +553,7 @@
       "id": "input.hold-until",
       "surface": "public",
       "methods": ["hold_until"],
+      "route": "input_control",
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
@@ -454,8 +575,8 @@
       "expectations": []
     },
     {
-      "id": "execution.run-frames",
-      "surface": "public",
+      "id": "execution.run-frames-wire",
+      "surface": "wire",
       "methods": ["run_frames"],
       "temporal_classes": ["T2"],
       "disposition": "retain",
@@ -505,6 +626,7 @@
       "id": "state.probe",
       "surface": "public",
       "methods": ["probe"],
+      "route": "debug",
       "temporal_classes": ["T2"],
       "disposition": "retain",
       "expectations": ["PROBE.ATOMIC.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
@@ -526,6 +648,15 @@
       "expectations": ["EVENT.ONCE.1", "EVENT.ATOMIC.1"]
     },
     {
+      "id": "debug.record-window",
+      "surface": "public",
+      "methods": ["record_window"],
+      "route": "debug",
+      "temporal_classes": ["T2", "T4"],
+      "disposition": "retain",
+      "expectations": ["TIME.PROGRESS.1", "TIME.CANCEL.1", "TIME.GENERATION.1", "RECORD.SCOPE.1", "RECORD.CONTINUITY.1", "RECORD.PUBLISH.1", "RECORD.FAILSTOP.1", "RECORD.EFFECT.HOST.1", "RECORD.MOVIE.1", "RECORD.STOP.1", "RECORD.RESET.1", "RECORD.INPUT.CLEANUP.1"]
+    },
+    {
       "id": "debug.disassemble",
       "surface": "public",
       "methods": ["disassemble"],
@@ -537,6 +668,7 @@
       "id": "debug.register-watch",
       "surface": "public",
       "methods": ["watch_register"],
+      "route": "debug",
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
       "expectations": ["TIME.PERSISTENT.1"]
@@ -545,6 +677,7 @@
       "id": "debug.trace",
       "surface": "public",
       "methods": ["set_trace", "get_trace"],
+      "route": "debug",
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
       "expectations": ["TRACE.AUTHORITY.1", "TIME.PERSISTENT.1"]
@@ -553,6 +686,7 @@
       "id": "debug.call-stack",
       "surface": "public",
       "methods": ["call_stack"],
+      "route": "debug",
       "temporal_classes": ["T4"],
       "disposition": "retain",
       "expectations": ["TRACE.AUTHORITY.1"]
@@ -561,6 +695,7 @@
       "id": "debug.break-on-reset",
       "surface": "public",
       "methods": ["break_on_reset"],
+      "route": "debug",
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
       "expectations": ["TIME.PERSISTENT.1"]
@@ -569,6 +704,7 @@
       "id": "analysis.regression",
       "surface": "public",
       "methods": ["regression_run"],
+      "route": "analysis",
       "temporal_classes": ["T5"],
       "disposition": "consolidate",
       "expectations": ["ANALYSIS.PROVENANCE.1"]
@@ -577,6 +713,7 @@
       "id": "analysis.determinism",
       "surface": "public",
       "methods": ["verify_determinism"],
+      "route": "analysis",
       "temporal_classes": ["T5"],
       "disposition": "consolidate",
       "expectations": ["ANALYSIS.PROVENANCE.1"]

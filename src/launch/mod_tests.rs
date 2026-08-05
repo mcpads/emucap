@@ -350,3 +350,20 @@ fn terminate_detached_does_not_escalate_after_target_identity_changes() {
     }
     child.wait().unwrap();
 }
+
+#[cfg(unix)]
+#[test]
+fn invalid_unsigned_pids_are_never_probed_or_signalled() {
+    assert!(!process_alive(0));
+    assert!(!process_alive(u32::MAX));
+
+    let mut predicate_called = false;
+    let error = terminate_detached_checked(u32::MAX, || {
+        predicate_called = true;
+        true
+    })
+    .expect_err("an out-of-range pid must fail before any liveness predicate or signal");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(!predicate_called);
+}

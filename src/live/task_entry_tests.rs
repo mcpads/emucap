@@ -112,6 +112,47 @@ fn entry_classifier_prioritizes_metadata_candidates_and_listener_safety() {
 }
 
 #[test]
+fn completed_stop_proof_outweighs_only_post_stop_transport_uncertainty() {
+    let terminal = RuntimeObservation {
+        transport: TransportState::Stalled,
+        control_observation_uncertain: true,
+        termination_completed: true,
+        current: Some(current(ProcessState::Exited, Some(ProcessState::Exited))),
+        lease: EntryLeaseState::Held,
+        ..RuntimeObservation::empty(ListenerState::Bound)
+    };
+    assert_eq!(
+        classify_entry(&terminal),
+        disposition(EntryState::ReadyForContent, EntryReason::TerminalHistory)
+    );
+
+    let no_completed_stop = RuntimeObservation {
+        termination_completed: false,
+        ..terminal.clone()
+    };
+    assert_eq!(
+        classify_entry(&no_completed_stop),
+        disposition(
+            EntryState::TransitionBlocked,
+            EntryReason::TransportUncertain
+        )
+    );
+
+    let live_process = RuntimeObservation {
+        termination_completed: true,
+        current: Some(current(ProcessState::Alive, None)),
+        ..terminal
+    };
+    assert_eq!(
+        classify_entry(&live_process),
+        disposition(
+            EntryState::TransitionBlocked,
+            EntryReason::TransportUncertain
+        )
+    );
+}
+
+#[test]
 fn entry_classifier_keeps_live_and_crashed_executions_out_of_new_content() {
     let live = RuntimeObservation {
         transport: TransportState::Connected,

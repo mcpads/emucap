@@ -153,6 +153,44 @@ BIN="${MEDNAFEN_BIN:-$(resolve_default_mednafen)}"
 [ -f "$CONTENT" ] || { echo "ERROR: content 없음: $CONTENT" >&2; exit 1; }
 [ -x "$BIN" ] || { echo "ERROR: Mednafen 바이너리 없음: $BIN (adapters/mednafen/build.sh 실행 필요)" >&2; exit 1; }
 
+sha256_path() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    return 1
+  fi
+}
+
+sidecar_field() {
+  sed -n "s/^[[:space:]]*\"$1\":[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$2"
+}
+
+BUILD_SIDECAR="${BIN}.emucap-build.json"
+MEDNAFEN_BINARY_SHA256=""
+MEDNAFEN_UPSTREAM=""
+MEDNAFEN_UPSTREAM_REVISION=""
+MEDNAFEN_PATCHSET_SHA256=""
+if [ -f "$BUILD_SIDECAR" ]; then
+  MEDNAFEN_BINARY_SHA256="$(sidecar_field binary_sha256 "$BUILD_SIDECAR")"
+  MEDNAFEN_UPSTREAM="$(sidecar_field upstream "$BUILD_SIDECAR")"
+  MEDNAFEN_UPSTREAM_REVISION="$(sidecar_field upstream_revision "$BUILD_SIDECAR")"
+  MEDNAFEN_PATCHSET_SHA256="$(sidecar_field patchset_sha256 "$BUILD_SIDECAR")"
+  ACTUAL_BINARY_SHA256="$(sha256_path "$BIN" || true)"
+  for DIGEST in "$MEDNAFEN_BINARY_SHA256" "$MEDNAFEN_PATCHSET_SHA256"; do
+    printf '%s' "$DIGEST" | grep -Eq '^[0-9a-fA-F]{64}$' || {
+        echo "ERROR: Mednafen build sidecar identity is invalid: $BUILD_SIDECAR" >&2
+        exit 2
+      }
+  done
+  [ -n "$MEDNAFEN_UPSTREAM" ] && [ -n "$MEDNAFEN_UPSTREAM_REVISION" ] \
+    && [ "$ACTUAL_BINARY_SHA256" = "$MEDNAFEN_BINARY_SHA256" ] || {
+      echo "ERROR: Mednafen build sidecar does not match the selected binary: $BIN" >&2
+      exit 2
+    }
+fi
+
 PCFX_BIOS=""
 if [ "$MODULE" = "pcfx" ]; then
   PCFX_BIOS="${EMUCAP_PCFX_BIOS:-$EMUCAP_DATA_ROOT/firmware/pcfx.rom}"
@@ -269,6 +307,12 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
 export EMUCAP_PORT="$PORT"
 export EMUCAP_CONTENT="$CONTENT"
 export MEDNAFEN_ALLOWMULTI="${MEDNAFEN_ALLOWMULTI:-1}"
+if [ -n "$MEDNAFEN_BINARY_SHA256" ]; then
+  export EMUCAP_MEDNAFEN_BINARY_SHA256="$MEDNAFEN_BINARY_SHA256"
+  export EMUCAP_MEDNAFEN_UPSTREAM="$MEDNAFEN_UPSTREAM"
+  export EMUCAP_MEDNAFEN_UPSTREAM_REVISION="$MEDNAFEN_UPSTREAM_REVISION"
+  export EMUCAP_MEDNAFEN_PATCHSET_SHA256="$MEDNAFEN_PATCHSET_SHA256"
+fi
 if [ "$MODULE" = "pcfx" ]; then
   # PC-FX has an explicit BIOS argument, so it can use a fully isolated profile.
   export MEDNAFEN_HOME="$RUN_DIR"

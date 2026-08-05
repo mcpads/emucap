@@ -237,7 +237,7 @@
     },
     {
       "id": "nds.input-touch.constraints",
-      "feature": "input.touch",
+      "feature": "input.touch-wire",
       "kind": "parameter_constraint",
       "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
       "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},

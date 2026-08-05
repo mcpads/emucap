@@ -20,14 +20,23 @@ local function runtime_size(api, sys, name)
   return size
 end
 
-function Memory.catalog(api, sys)
-  local names = {}
+function Memory.regions(api, sys)
+  local regions = {}
   local function add(name)
-    if runtime_size(api, sys, name) then names[#names + 1] = name end
+    local size = runtime_size(api, sys, name)
+    if size then regions[#regions + 1] = { memory_type = name, size = size } end
   end
   add(sys.default_memtype)
   for name, _ in pairs(sys.region_sizes or {}) do add(name) end
-  table.sort(names)
+  table.sort(regions, function(a, b) return a.memory_type < b.memory_type end)
+  return regions
+end
+
+function Memory.catalog(api, sys)
+  local names = {}
+  for _, region in ipairs(Memory.regions(api, sys)) do
+    names[#names + 1] = region.memory_type
+  end
   return names
 end
 

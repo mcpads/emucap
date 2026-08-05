@@ -196,10 +196,12 @@ EMUCAP_LOG=/path/to/custom.log \
 adapters/mame-pc98/launch.sh "/path/to/system.hdm" <listening_port>
 ```
 
-Current launch-time floppy mounting is static.  `pc9801rs` exposes `flop1` and
-`flop2`; titles that require a boot/game disk plus more data/demo disks still
-need either a title-specific repack workaround or MCP-level disk swap/mount
-control that has not been implemented yet.
+`pc9801rs` exposes live media devices such as `flop1` and `flop2` in
+`status.media_devices`. For a mid-game disk prompt, call `pause`, then
+`change_media({device:"flop1", path:"/absolute/disk2.hdm"})`, verify the returned
+readback, and call `resume`. Use `eject:true` instead of `path` to eject. The
+bridge rejects a running guest and reset-on-load devices, validates an optional
+`expected_sha1`, and attempts to restore the previous image after a failed load.
 
 For HDI media, MCP connection only proves that MAME and the bridge reached a
 PC-98 machine.  If the HDD controller ROMs or boot path are missing, the machine

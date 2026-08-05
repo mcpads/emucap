@@ -1,0 +1,534 @@
+diff --git i/Core/Debugger/Debugger.cpp w/Core/Debugger/Debugger.cpp
+index 084114c..64527a8 100644
+--- i/Core/Debugger/Debugger.cpp
++++ w/Core/Debugger/Debugger.cpp
+@@ -645,6 +645,18 @@ void Debugger::ProcessEvent(EventType type, std::optional<CpuType> cpuTypeOpt)
+ 	}
+ }
+ 
++bool Debugger::HasEventCallback(EventType type)
++{
++	return _scriptManager->HasEventCallback(type);
++}
++
++void Debugger::ProcessSnesObservationEvent(EventType type, const SnesObservationEvent& event)
++{
++	if(!_scriptManager->HasEventCallback(type)) return;
++	_snesObservationEvent = event;
++	ProcessEvent(type, CpuType::Snes);
++}
++
+ template<CpuType type, typename T>
+ void Debugger::ProcessScripts(uint32_t addr, T& value, MemoryOperationType opType)
+ {
+diff --git i/Core/Debugger/Debugger.h w/Core/Debugger/Debugger.h
+index 4c586d3..04c81d3 100644
+--- i/Core/Debugger/Debugger.h
++++ w/Core/Debugger/Debugger.h
+@@ -51,6 +51,46 @@ struct CpuInfo
+ 	unique_ptr<ExpressionEvaluator> Evaluator;
+ };
+ 
++struct SnesObservationEvent
++{
++	uint64_t Frame = 0;
++	uint64_t MasterClock = 0;
++	uint64_t CpuCycle = 0;
++	uint32_t Pc = 0;
++	uint32_t Address = 0;
++	uint32_t ContentOffset = 0;
++	uint32_t Source = 0;
++	uint32_t Destination = 0;
++	uint32_t TransferSize = 0;
++	uint16_t TableAddress = 0;
++	uint16_t A = 0;
++	uint16_t X = 0;
++	uint16_t Y = 0;
++	uint16_t SP = 0;
++	uint16_t D = 0;
++	uint16_t Scanline = 0;
++	uint16_t Dot = 0;
++	uint16_t HClock = 0;
++	uint8_t DBR = 0;
++	uint8_t K = 0;
++	uint8_t PS = 0;
++	uint8_t Value = 0;
++	uint8_t Opcode = 0;
++	uint8_t Operation = 0;
++	uint8_t Channel = 0;
++	uint8_t TransferMode = 0;
++	uint8_t HdmaBank = 0;
++	uint8_t MemoryKind = 0;
++	bool Emulation = false;
++	bool Hdma = false;
++	bool HdmaIndirect = false;
++	bool Nmi = false;
++	bool TransferActive = false;
++	bool DirectionToBusA = false;
++	bool FixedTransfer = false;
++	bool Decrement = false;
++};
++
+ class Debugger
+ {
+ private:
+@@ -78,6 +118,7 @@ private:
+ 
+ 	SimpleLock _logLock;
+ 	std::list<string> _debuggerLog;
++	SnesObservationEvent _snesObservationEvent = {};
+ 
+ 	atomic<bool> _executionStopped;
+ 	atomic<uint32_t> _breakRequestCount;
+@@ -125,6 +166,9 @@ public:
+ 	void InternalProcessInterrupt(CpuType cpuType, IDebugger& dbg, StepRequest& stepRequest, AddressInfo& src, uint32_t srcAddr, AddressInfo& dest, uint32_t destAddr, AddressInfo& ret, uint32_t retAddr, uint32_t retSp, bool forNmi);
+ 
+ 	void ProcessEvent(EventType type, std::optional<CpuType> cpuType);
++	bool HasEventCallback(EventType type);
++	void ProcessSnesObservationEvent(EventType type, const SnesObservationEvent& event);
++	const SnesObservationEvent& GetSnesObservationEvent() { return _snesObservationEvent; }
+ 
+ 	void ProcessConfigChange();
+ 
+diff --git i/Core/Debugger/LuaApi.cpp w/Core/Debugger/LuaApi.cpp
+index 72ff4d2..f80e5a3 100644
+--- i/Core/Debugger/LuaApi.cpp
++++ w/Core/Debugger/LuaApi.cpp
+@@ -160,6 +160,7 @@ int LuaApi::GetLibrary(lua_State* lua)
+ 
+ 		{ "getCpuCycleCount", LuaApi::GetCpuCycleCount },
+ 		{ "getMasterClock", LuaApi::GetMasterClock },
++		{ "getSnesObservationEvent", LuaApi::GetSnesObservationEvent },
+ 
+ 		{ "selectDrawSurface", LuaApi::SelectDrawSurface },
+ 
+@@ -1111,6 +1112,41 @@ int LuaApi::GetState(lua_State* lua)
+ 	return 1;
+ }
+ 
++int LuaApi::GetSnesObservationEvent(lua_State* lua)
++{
++	LuaCallHelper l(lua);
++	checkparams();
++	errorCond(_emu->GetConsoleType() != ConsoleType::Snes, "SNES observation event is unavailable")
++	const SnesObservationEvent& event = _debugger->GetSnesObservationEvent();
++	Serializer& s = _serializer;
++	s.Reset();
++	SnesObservationEvent copy = event;
++	s.Stream(copy.Frame, "frame");
++	s.Stream(copy.MasterClock, "masterClock");
++	s.Stream(copy.CpuCycle, "cpuCycle");
++	s.Stream(copy.Pc, "pc");
++	s.Stream(copy.Address, "address");
++	s.Stream(copy.ContentOffset, "contentOffset");
++	s.Stream(copy.Source, "source");
++	s.Stream(copy.Destination, "destination");
++	s.Stream(copy.TransferSize, "transferSize");
++	s.Stream(copy.A, "a"); s.Stream(copy.X, "x"); s.Stream(copy.Y, "y");
++	s.Stream(copy.SP, "sp"); s.Stream(copy.D, "d");
++	s.Stream(copy.Scanline, "scanline"); s.Stream(copy.Dot, "dot"); s.Stream(copy.HClock, "hClock");
++	s.Stream(copy.DBR, "dbr"); s.Stream(copy.K, "k"); s.Stream(copy.PS, "ps");
++	s.Stream(copy.Value, "value"); s.Stream(copy.Opcode, "opcode");
++	s.Stream(copy.Operation, "operation"); s.Stream(copy.Channel, "channel");
++	s.Stream(copy.TransferMode, "transferMode"); s.Stream(copy.MemoryKind, "memoryKind");
++	s.Stream(copy.Emulation, "emulation"); s.Stream(copy.Hdma, "hdma");
++	s.Stream(copy.HdmaIndirect, "hdmaIndirect"); s.Stream(copy.Nmi, "nmi");
++	s.Stream(copy.TransferActive, "transferActive");
++	s.Stream(copy.TableAddress, "tableAddress"); s.Stream(copy.HdmaBank, "hdmaBank");
++	s.Stream(copy.DirectionToBusA, "directionToBusA");
++	s.Stream(copy.FixedTransfer, "fixedTransfer"); s.Stream(copy.Decrement, "decrement");
++	GenerateStateTable(s, lua);
++	return 1;
++}
++
+ int LuaApi::GetCpuState(lua_State* lua)
+ {
+ 	LuaCallHelper l(lua);
+@@ -1231,4 +1267,4 @@ int LuaApi::GetMasterClock(lua_State* lua)
+ 	checkparams();
+ 	l.Return(_emu->GetMasterClock());
+ 	return l.ReturnCount();
+-}
+\ No newline at end of file
++}
+diff --git i/Core/Debugger/LuaApi.h w/Core/Debugger/LuaApi.h
+index b0bd02e..f2c9d3f 100644
+--- i/Core/Debugger/LuaApi.h
++++ w/Core/Debugger/LuaApi.h
+@@ -90,6 +90,7 @@ public:
+ 
+ 	static int GetCpuCycleCount(lua_State* lua);
+ 	static int GetMasterClock(lua_State* lua);
++	static int GetSnesObservationEvent(lua_State* lua);
+ 
+ 	static int GetState(lua_State* lua);
+ 	static int GetCpuState(lua_State* lua);
+diff --git i/Core/Debugger/ScriptHost.h w/Core/Debugger/ScriptHost.h
+index d2d19d7..303cdd0 100644
+--- i/Core/Debugger/ScriptHost.h
++++ w/Core/Debugger/ScriptHost.h
+@@ -24,10 +24,11 @@ public:
+ 	void RefreshMemoryCallbackFlags() { _context->RefreshMemoryCallbackFlags(); }
+ 
+ 	void ProcessEvent(EventType eventType, CpuType cpuType);
++	bool HasEventCallback(EventType eventType) { return _context->HasEventCallback(eventType); }
+ 
+ 	template<typename T>
+ 	__forceinline void CallMemoryCallback(AddressInfo relAddr, T& value, CallbackType callbackType, CpuType cpuType)
+ 	{
+ 		_context->CallMemoryCallback(relAddr, value, callbackType, cpuType);
+ 	}
+-};
+\ No newline at end of file
++};
+diff --git i/Core/Debugger/ScriptManager.h w/Core/Debugger/ScriptManager.h
+index d62ed35..dffd633 100644
+--- i/Core/Debugger/ScriptManager.h
++++ w/Core/Debugger/ScriptManager.h
+@@ -30,6 +30,13 @@ public:
+ 	void RemoveScript(int32_t scriptId);
+ 	string GetScriptLog(int32_t scriptId);
+ 	void ProcessEvent(EventType type, CpuType cpuType);
++	bool HasEventCallback(EventType type)
++	{
++		for(unique_ptr<ScriptHost>& script : _scripts) {
++			if(script->HasEventCallback(type)) return true;
++		}
++		return false;
++	}
+ 
+ 	void EnableCpuMemoryCallbacks() { _isCpuMemoryCallbackEnabled = true; }
+ 	bool HasCpuMemoryCallbacks() { return _scripts.size() && _isCpuMemoryCallbackEnabled; }
+@@ -70,4 +77,4 @@ public:
+ 			default: break;
+ 		}
+ 	}
+-};
+\ No newline at end of file
++};
+diff --git i/Core/Debugger/ScriptingContext.h w/Core/Debugger/ScriptingContext.h
+index 9036a71..1746641 100644
+--- i/Core/Debugger/ScriptingContext.h
++++ w/Core/Debugger/ScriptingContext.h
+@@ -82,6 +82,7 @@ public:
+ 
+ 	template<typename T> void CallMemoryCallback(AddressInfo relAddr, T& value, CallbackType type, CpuType cpuType);
+ 	int CallEventCallback(EventType type, CpuType cpuType);
++	bool HasEventCallback(EventType type) { return !_eventCallbacks[(int)type].empty(); }
+ 	bool CheckInitDone();
+ 	bool IsSaveStateAllowed();
+ 
+diff --git i/Core/SNES/Debugger/SnesDebugger.cpp w/Core/SNES/Debugger/SnesDebugger.cpp
+index 9189d58..54246f8 100644
+--- i/Core/SNES/Debugger/SnesDebugger.cpp
++++ w/Core/SNES/Debugger/SnesDebugger.cpp
+@@ -4,6 +4,8 @@
+ #include "SNES/SnesMemoryManager.h"
+ #include "SNES/BaseCartridge.h"
+ #include "SNES/SnesConsole.h"
++#include "SNES/SnesDmaController.h"
++#include "SNES/DmaControllerTypes.h"
+ #include "SNES/Spc.h"
+ #include "SNES/SnesPpu.h"
+ #include "SNES/MemoryMappings.h"
+@@ -39,6 +41,26 @@
+ #include "Utilities/CRC32.h"
+ #include "Shared/MemoryOperationType.h"
+ 
++static SnesObservationEvent MakeSnesObservation(
++	Emulator* emu, SnesMemoryManager* memoryManager, const SnesCpuState& state)
++{
++	SnesObservationEvent event;
++	event.Frame = emu->GetFrameCount();
++	event.MasterClock = memoryManager->GetMasterClock();
++	event.CpuCycle = state.CycleCount;
++	event.Pc = ((uint32_t)state.K << 16) | state.PC;
++	event.A = state.A;
++	event.X = state.X;
++	event.Y = state.Y;
++	event.SP = state.SP;
++	event.D = state.D;
++	event.DBR = state.DBR;
++	event.K = state.K;
++	event.PS = state.PS;
++	event.Emulation = state.EmulationMode;
++	return event;
++}
++
+ SnesDebugger::SnesDebugger(Debugger* debugger, CpuType cpuType) : IDebugger(debugger->GetEmulator())
+ {
+ 	_cpuType = cpuType;
+@@ -150,6 +172,11 @@ void SnesDebugger::ProcessInstruction()
+ 	MemoryOperationInfo operation(pc, opCode, MemoryOperationType::ExecOpCode, _cpuMemType);
+ 	InstructionProgress.LastMemOperation = operation;
+ 	InstructionProgress.StartCycle = state.CycleCount;
++	if(_cpuType == CpuType::Snes && _debugger->HasEventCallback(EventType::SnesInstructionExecution)) {
++		SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, state);
++		event.Opcode = opCode;
++		_debugger->ProcessSnesObservationEvent(EventType::SnesInstructionExecution, event);
++	}
+ 
+ 	if(addressInfo.Address >= 0) {
+ 		uint8_t cpuFlags = state.PS & (ProcFlags::IndexMode8 | ProcFlags::MemoryMode8);
+@@ -225,6 +252,28 @@ void SnesDebugger::ProcessRead(uint32_t addr, uint8_t value, MemoryOperationType
+ 	MemoryOperationInfo operation(addr, value, type, _cpuMemType);
+ 	InstructionProgress.LastMemOperation = operation;
+ 	SnesCpuState& state = GetCpuState();
++	if(_cpuType == CpuType::Snes && addressInfo.Type == MemoryType::SnesPrgRom
++		&& addressInfo.Address >= 0 && _debugger->HasEventCallback(EventType::SnesContentRead)) {
++		SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, state);
++		event.Address = addr;
++		event.ContentOffset = addressInfo.Address;
++		event.Value = value;
++		event.Operation = (uint8_t)type;
++		_debugger->ProcessSnesObservationEvent(EventType::SnesContentRead, event);
++	}
++	if(_cpuType == CpuType::Snes && type == MemoryOperationType::DmaRead
++		&& _debugger->HasEventCallback(EventType::SnesTransferAccess)) {
++		uint8_t active = _console->GetDmaController()->GetObservationActiveChannel();
++		if(active != 0xFF) {
++			SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, state);
++			event.Address = addr;
++			event.Value = value;
++			event.Operation = (uint8_t)type;
++			event.Channel = active & 0x07;
++			event.Hdma = (active & 0x40) != 0;
++			_debugger->ProcessSnesObservationEvent(EventType::SnesTransferAccess, event);
++		}
++	}
+ 
+ 	if(IsRegister(addr)) {
+ 		_eventManager->AddEvent(DebugEventType::Register, operation);
+@@ -283,6 +332,57 @@ void SnesDebugger::ProcessWrite(uint32_t addr, uint8_t value, MemoryOperationTyp
+ 	AddressInfo addressInfo = GetAbsoluteAddress(addr);
+ 	MemoryOperationInfo operation(addr, value, type, _cpuMemType);
+ 	InstructionProgress.LastMemOperation = operation;
++	SnesCpuState& state = GetCpuState();
++	if(_cpuType == CpuType::Snes && addressInfo.Type == MemoryType::SnesRegister
++		&& _debugger->HasEventCallback(EventType::SnesDevicePortWrite)) {
++		SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, state);
++		event.Address = addr;
++		event.Value = value;
++		event.Operation = (uint8_t)type;
++		uint8_t active = _console->GetDmaController()->GetObservationActiveChannel();
++		if(active != 0xFF) {
++			event.TransferActive = true;
++			event.Channel = active & 0x07;
++			event.Hdma = (active & 0x40) != 0;
++		}
++		_debugger->ProcessSnesObservationEvent(EventType::SnesDevicePortWrite, event);
++	}
++	if(_cpuType == CpuType::Snes && type == MemoryOperationType::DmaWrite
++		&& _debugger->HasEventCallback(EventType::SnesTransferAccess)) {
++		uint8_t active = _console->GetDmaController()->GetObservationActiveChannel();
++		if(active != 0xFF) {
++			SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, state);
++			event.Address = addr;
++			event.Value = value;
++			event.Operation = (uint8_t)type;
++			event.Channel = active & 0x07;
++			event.Hdma = (active & 0x40) != 0;
++			_debugger->ProcessSnesObservationEvent(EventType::SnesTransferAccess, event);
++		}
++	}
++	if(_cpuType == CpuType::Snes && (addr & 0xFFFF) >= 0x420B && (addr & 0xFFFF) <= 0x420C
++		&& type != MemoryOperationType::DmaWrite
++		&& _debugger->HasEventCallback(EventType::SnesTransferEnable)) {
++		bool hdma = (addr & 0xFFFF) == 0x420C;
++		for(uint8_t channel = 0; channel < 8; channel++) {
++			DmaChannelConfig config = _console->GetDmaController()->GetChannelConfig(channel);
++			SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, state);
++			event.Value = value;
++			event.Channel = channel;
++			event.Hdma = hdma;
++			event.DirectionToBusA = config.InvertDirection;
++			event.Source = ((uint32_t)config.SrcBank << 16) | config.SrcAddress;
++			event.Destination = 0x2100 | config.DestAddress;
++			event.TransferSize = config.TransferSize == 0 ? 65536 : config.TransferSize;
++			event.TransferMode = config.TransferMode;
++			event.FixedTransfer = config.FixedTransfer;
++			event.Decrement = config.Decrement;
++			event.TableAddress = config.HdmaTableAddress;
++			event.HdmaBank = config.HdmaBank;
++			event.HdmaIndirect = config.HdmaIndirectAddressing;
++			_debugger->ProcessSnesObservationEvent(EventType::SnesTransferEnable, event);
++		}
++	}
+ 	if(addressInfo.Address >= 0 && (addressInfo.Type == MemoryType::SnesWorkRam || addressInfo.Type == MemoryType::SnesSaveRam)) {
+ 		_disassembler->InvalidateCache(addressInfo, _cpuType);
+ 	}
+@@ -389,6 +489,13 @@ void SnesDebugger::ProcessCallStackUpdates(AddressInfo& destAddr, uint32_t destP
+ 
+ void SnesDebugger::ProcessInterrupt(uint32_t originalPc, uint32_t currentPc, bool forNmi)
+ {
++	if(_cpuType == CpuType::Snes && _debugger->HasEventCallback(EventType::SnesInterruptDelivery)) {
++		SnesObservationEvent event = MakeSnesObservation(_emu, _memoryManager, GetCpuState());
++		event.Address = originalPc;
++		event.Destination = currentPc;
++		event.Nmi = forNmi;
++		_debugger->ProcessSnesObservationEvent(EventType::SnesInterruptDelivery, event);
++	}
+ 	AddressInfo ret = _memoryMappings->GetAbsoluteAddress(originalPc);
+ 	AddressInfo dest = _memoryMappings->GetAbsoluteAddress(currentPc);
+ 
+diff --git i/Core/SNES/SnesDmaController.cpp w/Core/SNES/SnesDmaController.cpp
+index 9c96636..b5f082d 100644
+--- i/Core/SNES/SnesDmaController.cpp
++++ w/Core/SNES/SnesDmaController.cpp
+@@ -51,6 +51,7 @@ void SnesDmaController::Reset()
+ 
+ void SnesDmaController::CopyDmaByte(uint32_t addressBusA, uint16_t addressBusB, bool fromBtoA)
+ {
++	_observationActiveChannel = _activeChannel;
+ 	if(fromBtoA) {
+ 		if(addressBusB != 0x2180 || !_memoryManager->IsWorkRam(addressBusA)) {
+ 			uint8_t valToWrite = _memoryManager->ReadDma(addressBusB, false);
+@@ -69,6 +70,7 @@ void SnesDmaController::CopyDmaByte(uint32_t addressBusA, uint16_t addressBusB,
+ 			_memoryManager->IncMasterClock8();
+ 		}
+ 	}
++	_observationActiveChannel = 0xFF;
+ }
+ 
+ void SnesDmaController::RunDma(DmaChannelConfig& channel)
+diff --git i/Core/SNES/SnesDmaController.h w/Core/SNES/SnesDmaController.h
+index d5c9f84..7f6ed75 100644
+--- i/Core/SNES/SnesDmaController.h
++++ w/Core/SNES/SnesDmaController.h
+@@ -21,6 +21,7 @@ private:
+ 	uint32_t _dmaClockCounter = 0;
+ 
+ 	uint8_t _activeChannel = 0; //Used by debugger's event viewer
++	uint8_t _observationActiveChannel = 0xFF;
+ 
+ 	SnesMemoryManager* _memoryManager;
+ 
+@@ -57,7 +58,8 @@ public:
+ 	uint8_t Read(uint16_t addr);
+ 
+ 	uint8_t GetActiveChannel();
++	uint8_t GetObservationActiveChannel() { return _observationActiveChannel; }
+ 	DmaChannelConfig GetChannelConfig(uint8_t channel);
+ 
+ 	void Serialize(Serializer& s) override;
+-};
+\ No newline at end of file
++};
+diff --git i/Core/SNES/SnesPpu.cpp w/Core/SNES/SnesPpu.cpp
+index 2ff0715..42f7ad6 100644
+--- i/Core/SNES/SnesPpu.cpp
++++ w/Core/SNES/SnesPpu.cpp
+@@ -692,9 +692,18 @@ void SnesPpu::FetchSpritePosition(uint8_t spriteIndex)
+ 	static constexpr uint8_t oamHeight[16] = { 8, 8, 8, 16, 16, 32, 32, 32, 16, 32, 64, 32, 64, 64, 64, 32 };
+ 	static constexpr uint16_t sign[2] = { 0x0000, 0xFF00 };
+ 
+-	uint8_t highTableValue = _oamRam[0x200 | (spriteIndex >> 2)] >> ((spriteIndex << 1) & 0x06);
+-	_currentSprite.X = (int16_t)(sign[highTableValue & 0x01] | _oamRam[(spriteIndex << 2)]);
+-	_currentSprite.Y = _oamRam[(spriteIndex << 2) + 1];
++	uint16_t highAddress = 0x200 | (spriteIndex >> 2);
++	uint16_t xAddress = spriteIndex << 2;
++	uint16_t yAddress = xAddress + 1;
++	uint8_t highByte = _oamRam[highAddress];
++	uint8_t xByte = _oamRam[xAddress];
++	uint8_t yByte = _oamRam[yAddress];
++	uint8_t highTableValue = highByte >> ((spriteIndex << 1) & 0x06);
++	_currentSprite.X = (int16_t)(sign[highTableValue & 0x01] | xByte);
++	_currentSprite.Y = yByte;
++	RecordObjConsumption(highAddress, highByte, 0);
++	RecordObjConsumption(xAddress, xByte, 0);
++	RecordObjConsumption(yAddress, yByte, 0);
+ 
+ 	uint8_t mode = _state.OamMode | ((highTableValue & 0x02) << 2);
+ 	_currentSprite.Width = oamWidth[mode];
+@@ -717,7 +726,10 @@ void SnesPpu::FetchSpriteAttributes(uint16_t oamAddress)
+ 		_timeOver = true;
+ 	}
+ 
++	uint8_t tileByte = _oamRam[oamAddress];
+ 	uint8_t flags = _oamRam[oamAddress + 1];
++	RecordObjConsumption(oamAddress, tileByte, 0);
++	RecordObjConsumption(oamAddress + 1, flags, 0);
+ 	bool useSecondTable = (flags & 0x01) != 0;
+ 	_currentSprite.Palette = (flags >> 1) & 0x07;
+ 	_currentSprite.Priority = (flags >> 4) & 0x03;
+@@ -752,8 +764,8 @@ void SnesPpu::FetchSpriteAttributes(uint16_t oamAddress)
+ 	}
+ 
+ 	uint8_t columnCount = (_currentSprite.Width / 8);
+-	uint8_t tileRow = (_oamRam[oamAddress] & 0xF0) >> 4;
+-	uint8_t tileColumn = _oamRam[oamAddress] & 0x0F;
++	uint8_t tileRow = (tileByte & 0xF0) >> 4;
++	uint8_t tileColumn = tileByte & 0x0F;
+ 	uint8_t row = (tileRow + rowOffset) & 0x0F;
+ 	uint8_t columnOffset = _currentSprite.HorizontalMirror ? _currentSprite.ColumnOffset : (columnCount - _currentSprite.ColumnOffset - 1);
+ 	uint8_t tileIndex = (row << 4) | ((tileColumn + columnOffset) & 0x0F);
+@@ -775,6 +787,9 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
+ {
+ 	//The timing for the fetches should be (mostly) accurate (H=272 to 339)
+ 	uint16_t chrData = _vram[_currentSprite.FetchAddress];
++	uint32_t byteAddress = _currentSprite.FetchAddress << 1;
++	RecordObjConsumption(byteAddress, (uint8_t)chrData, 1);
++	RecordObjConsumption(byteAddress + 1, (uint8_t)(chrData >> 8), 1);
+ 	_currentSprite.ChrData[secondCycle] = chrData;
+ 
+ 	if(!secondCycle) {
+@@ -798,6 +813,22 @@ void SnesPpu::FetchSpriteTile(bool secondCycle)
+ 	}
+ }
+ 
++void SnesPpu::RecordObjConsumption(uint32_t address, uint8_t value, uint8_t memoryKind)
++{
++	Debugger* debugger = _emu->InternalGetDebugger();
++	if(!debugger || !debugger->HasEventCallback(EventType::SnesPpuObjConsumptionRead)) return;
++	SnesObservationEvent event;
++	event.Frame = _emu->GetFrameCount();
++	event.MasterClock = _memoryManager->GetMasterClock();
++	event.Address = address;
++	event.Value = value;
++	event.MemoryKind = memoryKind;
++	event.Scanline = _state.Scanline;
++	event.Dot = _state.Cycle;
++	event.HClock = _state.HClock;
++	debugger->ProcessSnesObservationEvent(EventType::SnesPpuObjConsumptionRead, event);
++}
++
+ void SnesPpu::RenderMode0()
+ {
+ 	constexpr uint8_t spritePriorities[4] = { 3, 6, 9, 12 };
+diff --git i/Core/SNES/SnesPpu.h w/Core/SNES/SnesPpu.h
+index 827843b..ea0f88c 100644
+--- i/Core/SNES/SnesPpu.h
++++ w/Core/SNES/SnesPpu.h
+@@ -208,6 +208,7 @@ private:
+ 
+ 	void EvaluateNextLineSprites();
+ 	void FetchSpriteData();
++	void RecordObjConsumption(uint32_t address, uint8_t value, uint8_t memoryKind);
+ 	__forceinline void FetchSpritePosition(uint8_t oamAddress);
+ 	void FetchSpriteAttributes(uint16_t oamAddress);
+ 	void FetchSpriteTile(bool secondCycle);
+@@ -266,4 +267,4 @@ public:
+ 	void Write(uint32_t addr, uint8_t value);
+ 
+ 	void Serialize(Serializer& s) override;
+-};
+\ No newline at end of file
++};
+diff --git i/Core/Shared/EventType.h w/Core/Shared/EventType.h
+index 49509b5..6ca29d4 100644
+--- i/Core/Shared/EventType.h
++++ w/Core/Shared/EventType.h
+@@ -16,6 +16,13 @@ enum class EventType
+ 	CodeBreakIdleSavestate,
+ 	SnesPpuObjEvaluationStart,
+ 	SnesPpuObjScanlineHandoff,
++	SnesInstructionExecution,
++	SnesContentRead,
++	SnesTransferEnable,
++	SnesTransferAccess,
++	SnesDevicePortWrite,
++	SnesInterruptDelivery,
++	SnesPpuObjConsumptionRead,
+ 
+ 	LastValue
+ };

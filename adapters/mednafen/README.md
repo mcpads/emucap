@@ -74,8 +74,10 @@ path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fa
   `./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-debugger` → make.
   Output: `work/mednafen/src/mednafen`.
 - `upstream.lock` fixes the release URL and SHA-256. `build.sh` verifies both a newly downloaded archive and
-  every cached archive before extraction. The adapter `build` identity combines the emucap revision and
-  `mednafen-1.32.1`.
+  every cached archive before extraction. It also pins the complete recording-relevant adapter input
+  digest and writes an adjacent sidecar containing upstream identity, patch-set SHA-256, and the exact
+  produced-binary SHA-256. The launcher verifies that digest before enabling recording. The adapter
+  `build` identity combines the emucap revision and `mednafen-1.32.1`.
 - **`--enable-ss` required**: configure's Saturn auto-detection only turns it on when `host_cpu` is `aarch64*`/`arm64*`,
   but Apple Silicon reports as `arm` and gets dropped. psx is on by default, but `--enable-psx` pins the intent.
 - **Hooks injected by build.sh (no reliance on hand-edits · reproducible)**: ① the main.cpp frame loop (`emucap_service`/
@@ -131,8 +133,19 @@ connects while the protocol round-trip lags, and Mednafen may disconnect shortly
 
 After a disconnect, Mednafen accepts a replacement same-session connection without restarting the
 emulator. Unfinished request IDs and transient presses are canceled and transient input ownership is
-released; execution state, breakpoints, and explicit `set_input` holds remain. A timeout alone is not
-proof that Mednafen exited, so reconnect and query `status` before launching another process.
+released; execution state, breakpoints, and explicit `set_input` holds remain. A frozen state remains
+frozen while the loopback control connection is re-established; transport loss does not advance its
+recorded halt boundary. A timeout alone is not proof that Mednafen exited, so reconnect and query
+`status` before launching another process.
+
+An identity-complete maintained build advertises `recording_capability`. `record_window` owns the
+negotiated bounded interval, writes its selected events to Core's authenticated bounded sink, and
+returns frozen. The capability may independently advertise deterministic port-0 input movies,
+event-conditioned stop, and `reset_release`. Regular Saturn omits `reset_release` because its core
+does not implement Mednafen's simple reset command; other maintained modules expose it only when the
+command cannot be redirected by netplay or suppressed by movie playback. An instruction-bound halt
+that cannot be proved to be a frame boundary is rejected. Normal builds without the verified
+sidecar retain all prior tools but do not advertise recording.
 
 A completed or breakpoint-interrupted `press_buttons` pulse releases its override before the
 terminal response. `set_input([])` explicitly returns port 0 to native input; `resume` does not

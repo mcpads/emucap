@@ -1,8 +1,11 @@
 pub mod analysis;
+pub mod build_identity;
 pub mod bundle;
 pub mod contracts;
 pub mod cue;
+pub mod event_contracts;
 pub mod gdb_rsp;
+pub mod input_movie;
 pub mod launch;
 pub mod live;
 pub mod mcp_result;
@@ -22,6 +25,12 @@ pub mod track;
 
 #[cfg(test)]
 pub(crate) mod test_env;
+
+#[cfg(test)]
+mod event_contracts_tests;
+
+#[cfg(test)]
+mod input_movie_tests;
 
 #[cfg(test)]
 #[path = "mcp_stdio_tests.rs"]

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use emucap::live::broker_link;
 use emucap::live::continuity;
-use emucap::live::link::{EmulatorLink, LinkError};
+use emucap::live::link::{EmulatorIdentity, EmulatorLink, LinkError};
 use emucap::live::tcp;
 use emucap::live::tools::{self, ToolOutput};
 use emucap::mcp_result::{
@@ -11,18 +11,25 @@ use emucap::mcp_result::{
 };
 use rmcp::handler::server::{router::tool::ToolRouter, wrapper::Parameters};
 use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 
 #[path = "emucap-mcp/analysis_surface.rs"]
 mod analysis_surface;
 #[path = "emucap-mcp/args.rs"]
 mod args;
+#[path = "emucap-mcp/debug_surface.rs"]
+mod debug_surface;
+#[path = "emucap-mcp/input_surface.rs"]
+mod input_surface;
 #[path = "emucap-mcp/instructions.rs"]
 mod instructions;
 #[path = "emucap-mcp/launch.rs"]
 mod launch;
 #[path = "emucap-mcp/memory_write.rs"]
 mod memory_write;
+#[path = "emucap-mcp/recording.rs"]
+mod recording;
 #[path = "emucap-mcp/regression.rs"]
 mod regression;
 #[path = "emucap-mcp/status.rs"]
@@ -55,8 +62,15 @@ fn invalid_request_result(message: impl std::fmt::Display) -> CallToolResult {
 }
 
 #[derive(Clone)]
+struct SurfaceStatusCache {
+    identity: EmulatorIdentity,
+    status: serde_json::Value,
+}
+
+#[derive(Clone)]
 struct Emucap {
     link: SharedLink,
+    last_full_surface_status: Arc<Mutex<Option<SurfaceStatusCache>>>,
     tool_router: ToolRouter<Emucap>,
 }
 
@@ -65,6 +79,7 @@ impl Emucap {
     fn new(link: SharedLink) -> Self {
         Self {
             link,
+            last_full_surface_status: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
     }
@@ -79,6 +94,107 @@ impl Emucap {
     /// 재동기화한다(죽은 conn이면 비우고 재수락).
     fn link(&self) -> std::sync::MutexGuard<'_, dyn EmulatorLink + Send + 'static> {
         self.link.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn current_surface_status(&self) -> Result<serde_json::Value, CallToolResult> {
+        let mut link = self.link();
+        match observe_control_state(&mut *link) {
+            Ok(mut observation) => {
+                apply_capability_revision(&mut observation.status, None);
+                if observation
+                    .status
+                    .get("connected")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    self.remember_surface_status(
+                        &link.capabilities().identity,
+                        &observation.status,
+                    );
+                }
+                Ok(observation.status)
+            }
+            Err(error) => Err(link_error_result(error)),
+        }
+    }
+
+    fn remember_surface_status(&self, identity: &EmulatorIdentity, status: &serde_json::Value) {
+        *self
+            .last_full_surface_status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(SurfaceStatusCache {
+            identity: identity.clone(),
+            status: status.clone(),
+        });
+    }
+
+    fn surface_description_status(&self) -> serde_json::Value {
+        let link = self.link();
+        let connected = link.continuity().transport.state
+            == emucap::live::continuity::TransportState::Connected;
+        if connected {
+            let current_identity = &link.capabilities().identity;
+            if let Some(cached) = self
+                .last_full_surface_status
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .filter(|cached| &cached.identity == current_identity)
+            {
+                return cached.status.clone();
+            }
+        }
+        let mut status = serde_json::json!({
+            "connected": false,
+            "methods": [],
+            "contracts": {
+                "catalog": emucap::contracts::CATALOG_ID,
+                "state": "unreported"
+            }
+        });
+        apply_capability_revision(&mut status, None);
+        status
+    }
+
+    fn validate_routed_operation(
+        &self,
+        status: &serde_json::Value,
+        surface: &str,
+        operation: &str,
+        known_revision: Option<&str>,
+        supported: bool,
+        advertised: bool,
+    ) -> Result<(), CallToolResult> {
+        if !supported {
+            return Err(invalid_request_result(format!(
+                "unknown {surface} operation: {operation}; call operation=describe"
+            )));
+        }
+        let Some(current_revision) = status
+            .get("capability_revision")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Err(invalid_request_result(
+                "current capability revision is unavailable; call status and describe again",
+            ));
+        };
+        if known_revision != Some(current_revision) {
+            return Err(link_error_result(LinkError::Emulator {
+                kind: "bad_state".into(),
+                message: format!(
+                    "{surface} capability revision changed or was omitted; call operation=describe and retry with known_capability_revision={current_revision}"
+                ),
+            }));
+        }
+        if !advertised {
+            return Err(link_error_result(LinkError::Emulator {
+                kind: "unsupported".into(),
+                message: format!(
+                    "{operation} is not available in capability revision {current_revision}; call {surface}(operation=describe)"
+                ),
+            }));
+        }
+        Ok(())
     }
 
     #[tool(
@@ -97,7 +213,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Plan which adapter should launch a ROM, disc, or disk. Returns a structured next_action that preserves known input, validated launch arguments, preconditions, and listening_port. Ambiguous media is never guessed."
+        description = "Plan an adapter launch without starting it; returns validated arguments or required user input."
     )]
     async fn launch_plan(&self, Parameters(a): Parameters<LaunchPlanArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -123,9 +239,7 @@ impl Emucap {
         boolean_outcome_result(make_launch(&mut *link, &a), "launched")
     }
 
-    #[tool(
-        description = "Terminate one exact managed launch generation and all of its owned helper processes. Requires status.runtime_instance.launch_id, verifies the current generation, control lease, and process-start identities, preserves failure evidence, and never terminates by executable name. This ends the emulator process; use pause to freeze guest execution."
-    )]
+    #[tool(description = "Terminate the exact managed launch generation after ownership checks.")]
     async fn stop(&self, Parameters(a): Parameters<StopArgs>) -> CallToolResult {
         let mut link = self.link();
         boolean_outcome_result(make_stop(&mut *link, &a), "stopped")
@@ -140,9 +254,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Atomically load a state, advance frames, and read memory. A breakpoint hit invalidates the measurement as status:interrupted."
-    )]
     async fn probe(&self, Parameters(a): Parameters<ProbeArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::probe(
@@ -158,9 +269,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Search an adapter memory region for a hex pattern without transferring the whole region."
-    )]
     async fn find_pattern(&self, Parameters(a): Parameters<FindPatternArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::find_pattern(
@@ -185,7 +293,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Capture the current screen and return PNG data with SHA-256, byte length, and any frame, state, and freshness provenance supplied by the backend."
+        description = "Capture the screen with a hash and available frame and freshness provenance."
     )]
     async fn screenshot(&self, Parameters(a): Parameters<ScreenshotArgs>) -> CallToolResult {
         let mut link = self.link();
@@ -196,9 +304,7 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Read emulator state registers. Filter with groups or omit them for all state. Backends without group filtering ignore the filter and return all available state."
-    )]
+    #[tool(description = "Read emulator state registers, optionally filtered by group.")]
     async fn get_state(&self, Parameters(a): Parameters<StateArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::get_state(&mut *link, &a.groups, a.cpu.as_deref()) {
@@ -207,9 +313,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Decode and return Saturn VDP2 video state by layer (NBG0-3, RBG, and common state). See the adapter README for returned fields, formulas, and character-base correction."
-    )]
     async fn get_video_state(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::get_video_state(&mut *link) {
@@ -218,9 +321,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Resolve a Saturn NBG screen coordinate to the cell's character-data address through scroll, map cell, pattern-name data, and character number. Returns intermediate values; see the adapter documentation for field formulas and character-base correction."
-    )]
     async fn resolve_tile(&self, Parameters(a): Parameters<ResolveTileArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::resolve_tile(&mut *link, a.nbg, a.x, a.y) {
@@ -229,9 +329,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Set or query the persistent video-layer mask. Omit layers and mask to query; restore the full set after analysis."
-    )]
     async fn set_layer_enable(
         &self,
         Parameters(a): Parameters<SetLayerEnableArgs>,
@@ -244,9 +341,7 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Read the running content identity: name, path, size, media_type, and normalized rom_sha1. Pass rom_sha1 unchanged to Tracking MCP run_start. Use a local SHA-1 fallback only when the backend does not provide it."
-    )]
+    #[tool(description = "Read the running content identity and normalized ROM SHA-1.")]
     async fn get_rom_info(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::get_rom_info(&mut *link) {
@@ -260,18 +355,58 @@ impl Emucap {
     }
 
     #[tool(
+        description = "Mount or eject one live media device while frozen. Read device IDs from status.media_devices; provide exactly one of path or eject=true."
+    )]
+    async fn change_media(&self, Parameters(a): Parameters<ChangeMediaArgs>) -> CallToolResult {
+        let mut link = self.link();
+        match tools::change_media(
+            &mut *link,
+            &a.device,
+            a.path.as_deref(),
+            a.eject,
+            a.expected_sha1.as_deref(),
+        ) {
+            Ok(output) => tool_output_result(output),
+            Err(error) => link_error_result(error),
+        }
+    }
+
+    #[tool(
         description = "Read live state and capabilities. Pass the prior capability_revision to omit an unchanged catalog while retaining live state."
     )]
     async fn status(&self, Parameters(a): Parameters<StatusArgs>) -> CallToolResult {
         let mut link = self.link();
         match observe_control_state(&mut *link) {
             Ok(mut observation) => {
-                if observation
+                let connected = observation
                     .status
                     .get("connected")
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                {
+                    .unwrap_or(false);
+                if connected {
+                    match status::reconcile_connected_recording(&mut *link) {
+                        Ok(true) => match observe_control_state(&mut *link) {
+                            Ok(refreshed) => observation = refreshed,
+                            Err(error) => {
+                                observation.status["recording_recovery"] = serde_json::json!({
+                                    "state": "reconciled_but_refresh_failed",
+                                    "error": error.to_string(),
+                                    "next_action": "Call status again; do not edit capture metadata by hand."
+                                });
+                            }
+                        },
+                        Ok(false) => {}
+                        Err(error) => {
+                            observation.status["recording_recovery"] = serde_json::json!({
+                                "state": "blocked",
+                                "error": error.to_string(),
+                                "next_action": "Keep the exact generation isolated and call status again after its former controller has exited or cleanup becomes verifiable."
+                            });
+                        }
+                    }
+                    let mut full_status = observation.status.clone();
+                    apply_capability_revision(&mut full_status, None);
+                    self.remember_surface_status(&link.capabilities().identity, &full_status);
                     apply_capability_revision(
                         &mut observation.status,
                         a.known_capability_revision.as_deref(),
@@ -291,9 +426,6 @@ impl Emucap {
         tool_output_result(ToolOutput::Json(link.failure_context()))
     }
 
-    #[tool(
-        description = "Dismiss a preserved fatal quarantine and continue the emulator's original termination path. Use only when status.methods includes dismiss_failure."
-    )]
     async fn dismiss_failure(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut link = self.link();
         if !link
@@ -313,9 +445,7 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Write memory from exactly one source: inline hex or a bounded input_file slice. File input is snapshotted and hashed first."
-    )]
+    #[tool(description = "Write bounded bytes to an advertised memory region.")]
     async fn write_memory(&self, Parameters(a): Parameters<WriteMemoryArgs>) -> CallToolResult {
         let generation = if a.input_file.is_some() {
             memory_write::generation_marker(self.link().capabilities())
@@ -339,9 +469,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Hold controller or key input until released by set_input with an empty button array. Ownership persists in running and frozen states. Read valid button names from status.input_buttons."
-    )]
     async fn set_input(&self, Parameters(a): Parameters<InputArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::set_input(&mut *l, a.port, &a.buttons) {
@@ -350,10 +477,7 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Press buttons or keys for a real-time frame duration and then release them. Automatically resumes when frozen. Read names from status.input_buttons; use tap for deterministic frozen-state single actions."
-    )]
-    async fn press_buttons(&self, Parameters(a): Parameters<PressArgs>) -> CallToolResult {
+    async fn pulse_while_running(&self, Parameters(a): Parameters<PressArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::press_buttons(&mut *l, a.port, &a.buttons, a.frames) {
             Ok(o) => tool_output_result(o),
@@ -362,8 +486,15 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Control a lower touchscreen at x,y. release:true releases touch; frames performs a timed tap and releases; omitting both holds touch. Use only when this method appears in status.methods."
+        description = "Open persistent, running-time, or device-specific input controls. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
     )]
+    async fn input_control(
+        &self,
+        Parameters(a): Parameters<RoutedOperationArgs>,
+    ) -> CallToolResult {
+        input_surface::execute(self, a).await
+    }
+
     async fn touch(&self, Parameters(a): Parameters<TouchArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::touch(&mut *l, a.port, a.x, a.y, a.frames, a.release) {
@@ -373,7 +504,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Perform a frame-precise tap while frozen, then release input and remain frozen. Intended for one action below auto-repeat timing. Read button names from status.input_buttons."
+        description = "Tap buttons for an exact frame count and return frozen with input released. Read button names from full status."
     )]
     async fn tap(&self, Parameters(a): Parameters<TapArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -383,9 +514,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Advance while frozen with buttons held, stop when watched memory changes, and release input. Use for deterministic movement with memory feedback."
-    )]
     async fn hold_until(&self, Parameters(a): Parameters<HoldUntilArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::hold_until(
@@ -420,17 +548,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Advance for N frames in running free-run mode. This is not frame-exact capture; use pause then step for exact advancement. A breakpoint hit returns status:interrupted; drain its event with poll_events."
-    )]
-    async fn run_frames(&self, Parameters(a): Parameters<RunFramesArgs>) -> CallToolResult {
-        let mut l = self.link();
-        match tools::run_frames(&mut *l, a.n) {
-            Ok(o) => tool_output_result(o),
-            Err(e) => link_error_result(e),
-        }
-    }
-
     #[tool(description = "Freeze at the next supported execution boundary.")]
     async fn pause(&self, Parameters(a): Parameters<CpuArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -441,7 +558,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Advance from frozen by frames or instructions and freeze again. Read allowed units and bounds from the live contract."
+        description = "Advance by an exact number of advertised frame or instruction boundaries and return frozen. Read allowed units and bounds from the live contract."
     )]
     async fn step(&self, Parameters(a): Parameters<StepArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -471,9 +588,7 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Set a breakpoint on memory access, execution, or a supported device boundary and optionally freeze on hit. See argument schemas for kind, range, PC/value filters, and atomic snapshots."
-    )]
+    #[tool(description = "Install one advertised breakpoint kind.")]
     async fn set_breakpoint(&self, Parameters(a): Parameters<BreakpointArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::set_breakpoint(
@@ -496,9 +611,7 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Decode count instructions from address using the connected core's ISA. Use it to inspect instructions around a breakpoint hit PC."
-    )]
+    #[tool(description = "Decode instructions from an advertised address domain.")]
     async fn disassemble(&self, Parameters(a): Parameters<DisassembleArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::disassemble(&mut *l, a.address.get(), a.count) {
@@ -514,9 +627,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Watch a register and optionally freeze on the instruction that moves it outside an inclusive range."
-    )]
     async fn watch_register(&self, Parameters(a): Parameters<WatchRegisterArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::watch_register(
@@ -541,7 +651,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "List active breakpoints with their IDs, kinds, and ranges.")]
+    #[tool(description = "List active breakpoints.")]
     async fn list_breakpoints(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::list_breakpoints(&mut *l) {
@@ -550,7 +660,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "Remove all breakpoints during cleanup.")]
+    #[tool(description = "Remove every active breakpoint during cleanup.")]
     async fn clear_all_breakpoints(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::clear_all_breakpoints(&mut *l) {
@@ -559,7 +669,7 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "Drain queued events such as breakpoint hits.")]
+    #[tool(description = "Drain queued debugger events once.")]
     async fn poll_events(&self, Parameters(a): Parameters<PollEventsArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::poll_events(&mut *l) {
@@ -575,9 +685,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Enable or disable execution tracing and its call-stack and trace ring buffers. This observes every instruction; use it for bounded crash hunting and disable it afterward."
-    )]
     async fn set_trace(&self, Parameters(a): Parameters<SetTraceArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::set_trace(&mut *l, a.enabled) {
@@ -586,9 +693,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Return the N most recent executed instructions in chronological order as [{pc,op,bank?}]. Call set_trace(true) first. bank identifies a paged ROM bank when supported; missing or null means unresolved. Check status.bank_tagging."
-    )]
     async fn get_trace(&self, Parameters(a): Parameters<GetTraceArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::get_trace(&mut *l, a.count) {
@@ -604,9 +708,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Return the current outer-to-inner call-site chain as [{pc,bank?}]. Call set_trace(true) first. Only pc is guaranteed; bank is present when the backend can identify a paged ROM bank. Check status.bank_tagging."
-    )]
     async fn call_stack(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::call_stack(&mut *l) {
@@ -615,9 +716,6 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Freeze when the game executes its reset handler, allowing automatic detection of watchdog resets or crash-to-reset paths."
-    )]
     async fn break_on_reset(&self, Parameters(a): Parameters<BreakOnResetArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::break_on_reset(&mut *l, a.enabled) {
@@ -626,15 +724,23 @@ impl Emucap {
         }
     }
 
-    #[tool(
-        description = "Dump standard memory regions as .bin files plus regions.json and state.json for emucap diff. Read valid regions from status.memory_types."
-    )]
     async fn dump_memory(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::dump_memory(&mut *l, &a.path) {
             Ok(o) => tool_output_result(o),
             Err(e) => link_error_result(e),
         }
+    }
+
+    #[tool(
+        description = "Open optional, data-local, or device-specific debugger operations for the current runtime. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
+    )]
+    async fn debug(
+        &self,
+        Parameters(a): Parameters<RoutedOperationArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        debug_surface::execute(self, a, context).await
     }
 
     #[tool(

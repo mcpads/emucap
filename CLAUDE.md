@@ -26,6 +26,12 @@ breakpoint domains, inputs, and contract limits. A later status may pass
 `known_capability_revision`; an `unchanged` response omits the cached catalog but retains live
 execution and continuity state.
 
+The static Control tool list is a basic remote. Memory writes, disassembly, breakpoints, event
+polling, and live media changes are direct tools. Call `input_control(operation="describe")` for
+persistent or device-specific input, `debug(operation="describe")` for composite or device-specific
+debugger operations, and `analysis(operation="describe")` for optional analysis. Execute a returned
+operation through the same drawer with its capability revision.
+
 Treat connection, guest execution, process state, lease ownership, runtime binding, and preserved
 failure evidence as separate facts. A timeout or disconnected socket does not prove emulator exit.
 Inspect continuity, `runtime_instance` or `stale_runtime_instance`, and `get_failure_context` before
@@ -37,7 +43,7 @@ name. Use `replace:true` only for intentional replacement. End a managed generat
 identity and fails closed on uncertainty.
 
 Wait for each dependent MCP call to finish before issuing the next one. Network request order does
-not prove write/read, load/inspect, or pause/step order. Read adapter contracts before composing
+not prove write/read, load/inspect, or pause/advance order. Read adapter contracts before composing
 time-sensitive primitives.
 
 ## Build and reconnect

@@ -10,6 +10,8 @@
 //! user's file.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 pub const REQUIRED_HOST_API: u32 = 2;
@@ -21,6 +23,7 @@ pub struct BuildMetadata {
     pub commit: String,
     pub host_api: u32,
     pub patchset_sha256: String,
+    pub binary_sha256: String,
 }
 
 fn patch_required(message: impl Into<String>) -> std::io::Error {
@@ -66,6 +69,34 @@ pub fn read_build_metadata(binary: &Path) -> std::io::Result<BuildMetadata> {
             .all(|b| b.is_ascii_hexdigit())
     {
         return Err(patch_required("metadata patchset_sha256 is invalid"));
+    }
+    if metadata.binary_sha256.len() != 64
+        || !metadata
+            .binary_sha256
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(patch_required("metadata binary_sha256 is invalid"));
+    }
+    let mut binary_file = std::fs::File::open(binary)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = binary_file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual_binary_sha256 = hex::encode(hasher.finalize());
+    if !metadata
+        .binary_sha256
+        .eq_ignore_ascii_case(&actual_binary_sha256)
+    {
+        return Err(patch_required(format!(
+            "metadata binary_sha256 does not match {}",
+            binary.display()
+        )));
     }
     Ok(metadata)
 }
@@ -402,7 +433,8 @@ fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> sup
     };
     let mut spec = crate::launch::spec::mesen_spec(binary, l.log_path, l.lua, &opts)
         .env("EMUCAP_MESEN_UPSTREAM_COMMIT", &host_build.commit)
-        .env("EMUCAP_MESEN_PATCHSET_SHA256", &host_build.patchset_sha256);
+        .env("EMUCAP_MESEN_PATCHSET_SHA256", &host_build.patchset_sha256)
+        .env("EMUCAP_MESEN_BINARY_SHA256", &host_build.binary_sha256);
     if let Some(build) = l.build {
         spec = spec.env("EMUCAP_BUILD_HASH", build);
     }

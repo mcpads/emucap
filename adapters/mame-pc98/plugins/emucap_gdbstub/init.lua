@@ -101,6 +101,55 @@ local function hex_to_string(hex)
   return table.concat(out)
 end
 
+local function string_to_hex(value)
+  return (tostring(value or ""):gsub(".", function(ch)
+    return string.format("%02x", string.byte(ch))
+  end))
+end
+
+local function media_device_id(tag, image)
+  local brief = tostring(image.brief_instance_name or "")
+  if brief ~= "" then return brief end
+  local instance = tostring(image.instance_name or "")
+  if instance ~= "" then return instance end
+  return tostring(tag or ""):gsub("^:", "")
+end
+
+local function media_descriptor(tag, image)
+  local mounted = image.exists and true or false
+  return table.concat({
+    string_to_hex(media_device_id(tag, image)),
+    string_to_hex(image.image_type_name or ""),
+    image.is_reset_on_load and "1" or "0",
+    image.must_be_loaded and "1" or "0",
+    mounted and "1" or "0",
+    (mounted and image.readonly) and "1" or "0",
+    string_to_hex(mounted and image.filename or "")
+  }, "|")
+end
+
+local function find_media_device(requested)
+  for tag, image in pairs(manager.machine.images) do
+    local tag_name = tostring(tag or "")
+    if requested == media_device_id(tag, image)
+        or requested == tag_name
+        or requested == tag_name:gsub("^:", "")
+        or requested == tostring(image.instance_name or "") then
+      return tag, image
+    end
+  end
+  return nil, nil
+end
+
+local function media_status_payload()
+  local entries = {}
+  for tag, image in pairs(manager.machine.images) do
+    entries[#entries + 1] = media_descriptor(tag, image)
+  end
+  table.sort(entries)
+  return "MEDIA:" .. table.concat(entries, ";")
+end
+
 local function trim(str)
   return tostring(str):gsub("^%s+", ""):gsub("%s+$", "")
 end
@@ -1163,6 +1212,79 @@ function emucap_gdbstub.startplugin()
 
     if name == "frame" then
       ack_packet(socket, tostring(current_frame()))
+      return true
+    elseif name == "mediastatus" then
+      ack_packet(socket, media_status_payload())
+      return true
+    elseif name == "mediachange" then
+      local spec = hex_to_string(rest or "")
+      if not spec then
+        ack_packet(socket, "MEDIAERR|" .. string_to_hex("invalid media change request") .. "|not_applicable|")
+        return true
+      end
+      local device_hex, action, path_hex = spec:match("^([0-9a-fA-F]+)|([^|]+)|([0-9a-fA-F]*)$")
+      local device = device_hex and hex_to_string(device_hex) or nil
+      local path = path_hex and hex_to_string(path_hex) or nil
+      if not device or device == "" or not path then
+        ack_packet(socket, "MEDIAERR|" .. string_to_hex("invalid media change request") .. "|not_applicable|")
+        return true
+      end
+      local tag, image = find_media_device(device)
+      if not image then
+        ack_packet(socket, "MEDIAERR|" .. string_to_hex("unknown media device: " .. device) .. "|not_applicable|")
+        return true
+      end
+      if image.is_reset_on_load then
+        ack_packet(socket, "MEDIAERR|" .. string_to_hex("media device requires reset on load") .. "|unchanged|" .. media_descriptor(tag, image))
+        return true
+      end
+      if action == "eject" and image.must_be_loaded then
+        ack_packet(socket, "MEDIAERR|" .. string_to_hex("media device must remain loaded") .. "|unchanged|" .. media_descriptor(tag, image))
+        return true
+      end
+
+      local previous_exists = image.exists and true or false
+      local previous_path = previous_exists and tostring(image.filename or "") or ""
+      if action == "eject" then
+        local ok, err = pcall(function() image:unload() end)
+        if ok and not image.exists then
+          ack_packet(socket, "MEDIAOK|" .. media_descriptor(tag, image))
+        else
+          local rollback = "failed"
+          if previous_exists and image.exists and tostring(image.filename or "") == previous_path then
+            rollback = "unchanged"
+          elseif previous_exists and previous_path ~= "" then
+            local restored_ok, restored_error = pcall(function() return image:load(previous_path) end)
+            if restored_ok and restored_error == nil and image.exists
+                and tostring(image.filename or "") == previous_path then rollback = "restored" end
+          elseif not previous_exists and not image.exists then
+            rollback = "unchanged"
+          end
+          ack_packet(socket, "MEDIAERR|" .. string_to_hex(ok and "media remained mounted after unload" or err) .. "|" .. rollback .. "|" .. media_descriptor(tag, image))
+        end
+        return true
+      elseif action ~= "mount" or path == "" then
+        ack_packet(socket, "MEDIAERR|" .. string_to_hex("invalid media action") .. "|unchanged|" .. media_descriptor(tag, image))
+        return true
+      end
+
+      local ok, load_error = pcall(function() return image:load(path) end)
+      if ok and load_error == nil and image.exists and tostring(image.filename or "") == path then
+        ack_packet(socket, "MEDIAOK|" .. media_descriptor(tag, image))
+        return true
+      end
+
+      local rollback = "failed"
+      if previous_exists and previous_path ~= "" then
+        local restored_ok, restored_error = pcall(function() return image:load(previous_path) end)
+        if restored_ok and restored_error == nil and image.exists
+            and tostring(image.filename or "") == previous_path then rollback = "restored" end
+      else
+        local unloaded_ok = pcall(function() image:unload() end)
+        if unloaded_ok and not image.exists then rollback = "restored" end
+      end
+      local reason = ok and tostring(load_error or "media was not mounted after load") or tostring(load_error)
+      ack_packet(socket, "MEDIAERR|" .. string_to_hex(reason) .. "|" .. rollback .. "|" .. media_descriptor(tag, image))
       return true
     elseif name == "snapshot" then
       local path = hex_to_string(rest or "")

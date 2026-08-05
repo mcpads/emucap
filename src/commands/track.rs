@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Context;
 
-use emucap::bundle::manifest::Manifest;
+use emucap::bundle::manifest::{parse_manifest, BundleManifest};
 use emucap::track::id::{IdGen, UlidGen};
 use emucap::track::model::*;
 use emucap::track::{index, query, repro, store};
@@ -20,18 +20,30 @@ pub fn import(bundle: &Path) -> anyhow::Result<()> {
     let gen = UlidGen;
     let text = std::fs::read_to_string(bundle.join("manifest.json"))
         .with_context(|| format!("manifest.json 읽기 실패: {}", bundle.display()))?;
-    let manifest: Manifest = serde_json::from_str(&text).context("manifest 파싱 실패")?;
+    let manifest = parse_manifest(&text).context("failed to parse manifest")?;
+    let (rom_sha1, platform) = match &manifest {
+        BundleManifest::Legacy(manifest) => (manifest.rom.sha1.clone(), manifest.platform.clone()),
+        BundleManifest::Recording(manifest) => (
+            manifest
+                .runtime
+                .content
+                .sha1
+                .clone()
+                .context("recording bundle has no SHA-1 content identity")?,
+            manifest.runtime.system.clone(),
+        ),
+    };
 
     // rom.json 보장(있으면 first_seen·title 보존 — create_run과 동일 불변식). NotFound만 생성
     // 트리거로 좁힌다 — 손상·IO를 '없음'으로 오인해 기존 first_seen을 조용히 덮어쓰지 않는다.
-    match store::load_rom(&root, &manifest.rom.sha1) {
+    match store::load_rom(&root, &rom_sha1) {
         Ok(_) => {}
         Err(store::TrackError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             store::save_rom(
                 &root,
                 &Rom {
-                    sha1: manifest.rom.sha1.clone(),
-                    platform: manifest.platform.clone(),
+                    sha1: rom_sha1.clone(),
+                    platform: platform.clone(),
                     title: None,
                     first_seen: emucap::track::clock::now_rfc3339(),
                 },
@@ -43,7 +55,7 @@ pub fn import(bundle: &Path) -> anyhow::Result<()> {
     let run = Run {
         format_version: RUN_FORMAT_VERSION,
         id: gen.new_id(),
-        rom_sha1: manifest.rom.sha1.clone(),
+        rom_sha1,
         goal: Some("imported".into()),
         description: Some(format!("imported from {}", bundle.display())),
         tags: vec!["imported".into()],

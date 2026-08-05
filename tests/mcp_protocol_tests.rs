@@ -123,7 +123,8 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
                         "protocol_version": 1,
                         "methods": [
                             "status", "reset", "pause", "set_input", "step",
-                            "read_memory", "clear_all_breakpoints", "resume"
+                            "run_frames", "read_memory", "find_pattern",
+                            "clear_all_breakpoints", "resume"
                         ],
                         "memory_types": ["w"],
                         "breakpoint_kinds": [],
@@ -140,7 +141,11 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
                 }
                 "status" => json!({
                     "connected": true,
-                    "execution": {"state": "frozen"}
+                    "execution": {"state": "frozen"},
+                    "execution_limits": {
+                        "max_sync_advance_count": 5000,
+                        "frame": {"max_count": 120}
+                    }
                 }),
                 "read_memory" => json!({"hex": "aa"}),
                 _ => json!({}),
@@ -250,17 +255,52 @@ fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
     assert!(names.contains(&"bootstrap"));
-    assert!(names.windows(2).all(|pair| pair[0] <= pair[1]));
+    assert!(
+        names.windows(2).all(|pair| pair[0] < pair[1]),
+        "tool names must be unique and deterministically ordered"
+    );
     assert!(
         tools
             .iter()
-            .all(|tool| tool["inputSchema"]["additionalProperties"] == false),
-        "every tool must reject undeclared arguments"
+            .all(|tool| tool["inputSchema"]["type"] == "object"
+                && tool["inputSchema"]["additionalProperties"] == false),
+        "every tool must expose a closed object input schema"
     );
+    assert!(tools.iter().all(|tool| {
+        let name = tool["name"].as_str().expect("tool name");
+        (1..=128).contains(&name.len())
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    }));
     if expected_name == "emucap-mcp" {
-        assert!(names.contains(&"analysis"));
-        assert!(!names.contains(&"regression_run"));
-        assert!(!names.contains(&"verify_determinism"));
+        for name in [
+            "step",
+            "change_media",
+            "write_memory",
+            "disassemble",
+            "set_breakpoint",
+            "clear_breakpoint",
+            "list_breakpoints",
+            "clear_all_breakpoints",
+            "poll_events",
+            "input_control",
+            "debug",
+            "analysis",
+        ] {
+            assert!(names.contains(&name), "missing front-panel route: {name}");
+        }
+        for name in [
+            "run_frames",
+            "wait_for_running_frames",
+            "advance_and_freeze",
+            "set_input",
+            "record_window",
+            "regression_run",
+            "verify_determinism",
+        ] {
+            assert!(!names.contains(&name), "drawer operation leaked: {name}");
+        }
         assert!(
             serde_json::to_vec(result)
                 .expect("serialize tools/list result")
@@ -269,6 +309,22 @@ fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String
             "Control tools/list must stay within the discovery byte budget"
         );
     }
+
+    let missing_metadata = server.request(json!({
+        "jsonrpc": "2.0",
+        "id": 20,
+        "method": "tools/list",
+        "params": {}
+    }));
+    assert_eq!(
+        missing_metadata["error"]["code"], -32602,
+        "after modern discovery every request requires protocol metadata"
+    );
+    let repeated_list = server.request(modern_request(21, "tools/list", json!({})));
+    assert_eq!(
+        repeated_list["result"]["tools"], result["tools"],
+        "the static tool list must not depend on prior calls"
+    );
 
     let call = server.request(modern_request(
         3,
@@ -280,6 +336,15 @@ fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String
         .as_array()
         .is_some_and(|content| !content.is_empty()));
     assert!(call["result"]["structuredContent"].is_object());
+    let compatible_text = call["result"]["content"]
+        .as_array()
+        .and_then(|content| content.iter().find(|entry| entry["type"] == "text"))
+        .and_then(|entry| entry["text"].as_str())
+        .expect("structured tool results retain compatible JSON text");
+    assert_eq!(
+        serde_json::from_str::<Value>(compatible_text).expect("compatible text is JSON"),
+        call["result"]["structuredContent"]
+    );
 
     if expected_name == "emucap-mcp" {
         let bootstrap = &call["result"]["structuredContent"];
@@ -488,8 +553,8 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
         .expect("serialize initial Control tools/list")
         .len();
     assert!(
-        initial_size < 31_887,
-        "static analysis dispatcher must reduce default discovery below the prior full-schema baseline; got {initial_size} bytes"
+        initial_size <= 32 * 1024,
+        "default Control tools/list exceeds the 32 KiB context ceiling: {initial_size} bytes"
     );
     let initial_names: Vec<&str> = initial["result"]["tools"]
         .as_array()
@@ -498,10 +563,30 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
         .map(|tool| tool["name"].as_str().expect("tool name"))
         .collect();
     assert!(initial_names.contains(&"analysis"));
+    assert!(initial_names.contains(&"debug"));
+    assert!(initial_names.contains(&"input_control"));
+    assert!(initial_names.contains(&"step"));
     assert!(!initial_names.contains(&"regression_run"));
     assert!(!initial_names.contains(&"verify_determinism"));
     assert_eq!(initial["result"]["ttlMs"], STATIC_MCP_METADATA_TTL_MS);
     assert_eq!(initial["result"]["cacheScope"], "public");
+
+    for (id, name) in [(30, "debug"), (31, "input_control")] {
+        let described = server.request(modern_request(
+            id,
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": {"operation": "describe"}
+            }),
+        ));
+        assert_eq!(described["result"]["structuredContent"]["surface"], name);
+        assert!(described["result"]["structuredContent"]["operations"].is_object());
+        assert_eq!(
+            described["result"]["structuredContent"]["next_action"]["tool"],
+            "status"
+        );
+    }
 
     let described = server.request(modern_request(
         3,
@@ -559,6 +644,42 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
 
     let (_temporary, case_dir) = make_analysis_case();
     let (adapter, calls) = spawn_analysis_adapter(port);
+    let connected = server.request(modern_request(
+        40,
+        "tools/call",
+        json!({"name": "status", "arguments": {}}),
+    ));
+    assert_eq!(connected["result"]["structuredContent"]["connected"], true);
+    let described_debug = server.request(modern_request(
+        41,
+        "tools/call",
+        json!({
+            "name": "debug",
+            "arguments": {"operation": "describe"}
+        }),
+    ));
+    let debug_description = &described_debug["result"]["structuredContent"];
+    assert!(debug_description["operations"]["find_pattern"].is_object());
+    assert!(debug_description["operations"]
+        .get("wait_for_running_frames")
+        .is_none());
+    let revision = debug_description["capability_revision"]
+        .as_str()
+        .expect("debug capability revision");
+    let searched = server.request(modern_request(
+        42,
+        "tools/call",
+        json!({
+            "name": "debug",
+            "arguments": {
+                "operation": "find_pattern",
+                "known_capability_revision": revision,
+                "arguments": {"memory_type": "w", "hex": "aa"}
+            }
+        }),
+    ));
+    assert_ne!(searched["result"]["isError"], true);
+
     let verdict = server.request(modern_request(
         7,
         "tools/call",

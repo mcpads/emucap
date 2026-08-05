@@ -25,8 +25,9 @@ The build scripts fetch the commit pinned in `upstream.lock`, apply every patch 
 after `git apply --check`, remove old native objects, and build only inside ignored
 `adapters/mesen2/work/`. The clean rebuild is required because the upstream POSIX makefile does not
 track header dependencies. `EMUCAP_MESEN_SRC` may name a local git checkout, but it is used only as a
-read-only clone origin. The output sidecar records the upstream commit, host API, and patch-set
-digest. This repository distributes source, patches, and the recipe—not Mesen binaries.
+read-only clone origin. The output sidecar records the upstream commit, host API, patch-set digest,
+and exact produced-binary SHA-256. The launcher verifies that binary digest before use. This
+repository distributes source, patches, and the recipe—not Mesen binaries.
 
 ## 2. Launch live control
 
@@ -105,6 +106,28 @@ Mesen. Unfinished request IDs and transient presses belong to the dead connectio
 native halt state, breakpoints, and explicit `set_input` holds remain. A timeout alone is not proof
 that Mesen exited, so reconnect and query `status` before launching another process.
 
+An identity-complete maintained SNES build advertises `recording_capability`. `record_window` writes
+the selected bounded event stream to Core's authenticated host-owned sink, never through the
+256-entry live `poll_events` queue, and returns at the exact terminal frame boundary with Mesen
+frozen. Event classes and limits come from live status; the initial profile records only the generic
+frame-boundary contract by default, while the same capability can select deterministic port-0 input
+movies and an exact completion-event stop. The SNES profile also advertises `reset_release`: it
+validates and decodes the movie and binds the sink before queueing reset, then establishes the first
+boundary in Mesen's native post-reset callback before the emulation loop releases a guest tick. This
+is a timed soft-reset origin, not a cold-power or equal-memory claim. Legacy/manual hosts and the
+other Mesen system entries keep their existing tools but do not advertise recording.
+The maintained profile also advertises bounded terminal snapshots when the active core exposes
+exact finite `memory_regions`. Core performs those reads only after the recording terminal has
+frozen the exact final frame; they do not use the live event queue or install another Mesen hook.
+With the maintained deep-observation host, `snes_cpu_instruction` is also an optional `startable`
+pre-execution anchor. A request may capture one bounded `snesWorkRam` range in that same callback;
+the binary member travels over a separate authenticated Core-owned sink, and the manifest binds it
+to the exact instruction event. Runtimes without that callback omit both advertisements.
+At a frozen position, `status.reason` reports the most recent halt cause independently of whether
+that position is a proven frame boundary. An exact frame `step` changes the reason to `step` and
+leaves the new boundary eligible for another recording. Breakpoints, instruction halts, transport
+cleanup, and mid-frame recording failures do not inherit that eligibility.
+
 - Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
 - Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`hold_until`/`save_state`/`load_state`/
@@ -141,7 +164,9 @@ that Mesen exited, so reconnect and query `status` before launching another proc
 - **Note**: of the above, `tap`/`hold_until`/`regression_run`/
   `verify_determinism` are not adapter-native — the MCP server (`emucap-mcp`) synthesizes
   them from primitive tools (set_input · step · read_memory, etc.). The native methods the
-  adapter advertises directly are listed in `hello.methods`.
+  adapter advertises directly are listed in `hello.methods`. Agents use direct `tap` for exact
+  frozen input; native `press_buttons` is surfaced only as input-drawer `pulse_while_running`
+  because it leaves execution running.
 
 ### The agent launches Mesen
 
