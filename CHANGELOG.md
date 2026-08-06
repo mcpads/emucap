@@ -4,6 +4,8 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.0-alpha.1
+
 ### Added
 - Added opt-in controlled launch that returns at a frozen guest boundary, plus a capability-bound
   Mesen SNES execution profile for repeatable reset-origin recordings with explicit input movies.
