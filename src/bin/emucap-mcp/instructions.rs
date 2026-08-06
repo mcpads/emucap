@@ -11,6 +11,8 @@ For `input_control` and `debug`, call `operation="describe"`, then execute one r
 
 Use the assigned `listener.port`, never `base_port`. Resolve media through `launch_plan`; do not guess an ambiguous system. Recheck `status`, launch with the planned arguments, then verify connection, identity, contracts, and runtime binding. End only the exact managed generation with `stop(status.runtime_instance.launch_id)`.
 
+The default launch may return with the guest running, so wall time before the next call becomes guest time. When the next action must target the launch entry, request `start_frozen:true` and accept success only with `state=frozen`; do not substitute a sleep or a sampled frame number. A repeatable execution profile is a separate opt-in promise about advertised initial conditions. Require it again on recording only when the live recording capability offers the selected origin.
+
 The launcher owns isolated runtime directories. Do not construct detached commands. A listener collision does not prove ownership. `stop` verifies generation, lease, PID, and start identity; never terminate by executable name.
 
 ## Continuity and failure

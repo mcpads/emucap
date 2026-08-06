@@ -146,6 +146,14 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
 에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
 identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
 
+일반 launch는 guest가 이미 실행 중인 상태로 반환할 수 있다. 첫 후속 동작에 네트워크·에이전트 지연이
+guest time으로 섞이면 안 될 때는 `start_frozen: true`를 요청한다. 지원하는 launcher는 adapter가
+frozen guest 경계에 연결된 뒤에만 성공한다. 이는 launch 이후 guest time을 닫는 계약이며 power-on RAM,
+RTC, save 같은 초기 조건의 동일성을 뜻하지 않는다. 그러한 producer-owned 조건은 live capability가
+광고하는 `execution_profile: "repeatable"`을 별도로 선택하며,
+`record_window(require_repeatable: true)`는 선택한 recording origin이 해당 조건을 지원하지 않으면 reset,
+input, guest advance 전에 거부한다.
+
 `listener.base_port`는 direct mode에서 빈 포트를 찾기 시작하는 값일 뿐이며 다른 살아 있는 MCP 세션이
 이미 사용 중일 수 있다. Launcher는 실제로 할당된 `listener.port` 또는 full `status`의
 `listening_port`만 사용한다. Emulator generation을 `stop`해도 그 세션의 MCP listener는 닫히지 않으며,

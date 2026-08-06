@@ -20,6 +20,7 @@ local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "ea526265eb6a5d6b229d568d2bfe7df
 local SNES_SNAPSHOT_CAPABILITY_REVISION = "3360ead44ccebf59a35aefcba6e5846d645188781682293b508a502343212782"
 local SNES_DEEP_CAPABILITY_REVISION = "6f601a701d9a979cde0c118c9fcd4fd4a2d572f529728ca77db5f4ddd99b26b4"
 local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "cf4f250d1319e642294bc69db241defe50d8a5ff1546f81aac99720b3209890b"
+local SNES_REPEATABLE_CAPABILITY_REVISION = "81a8e91a0680bcf72549d25126c91a3fef1f4205725b7ea6b40f4f9f33d25157"
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -169,7 +170,7 @@ local function copy_limits(limits)
 end
 
 function M.capability(as_array, include_snes_semantic, include_terminal_snapshots, include_snes_deep,
-    include_snes_state)
+    include_snes_state, repeatability_conditions)
   semantic_advertised = include_snes_semantic == true
   deep_advertised = include_snes_deep == true
   local state_advertised = include_snes_state == true
@@ -185,6 +186,11 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
   else
     capability_revision = include_terminal_snapshots and BASE_SNAPSHOT_CAPABILITY_REVISION
       or BASE_CAPABILITY_REVISION
+  end
+  if repeatability_conditions ~= nil then
+    assert(deep_advertised and include_terminal_snapshots and state_advertised,
+      "repeatable recording requires the complete canonical SNES observation surface")
+    capability_revision = SNES_REPEATABLE_CAPABILITY_REVISION
   end
   local event_classes = {
     {
@@ -285,6 +291,14 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
         contract_sha256 = SNES_PPU_STATE_SHA256,
         groups = as_array({ "ppu" }),
       } }),
+    }
+  end
+  if repeatability_conditions ~= nil then
+    capability.repeatability = {
+      profile = "mesen_snes_repeatable",
+      conditions_sha256 = repeatability_conditions,
+      origins = as_array({ "reset_release" }),
+      requires_input_movie = true,
     }
   end
   return capability

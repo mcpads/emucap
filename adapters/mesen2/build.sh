@@ -98,6 +98,7 @@ PATCHES=(
   "$HERE/patches/0005-add-snes-ppu-obj-boundary-events.patch"
   "$HERE/patches/0006-stop-video-threads-before-emulator-destruction.patch"
   "$HERE/patches/0007-add-snes-deep-observation-events.patch"
+  "$HERE/patches/0008-add-controlled-repeatable-start.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

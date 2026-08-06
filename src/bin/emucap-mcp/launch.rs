@@ -25,10 +25,14 @@ mod tests;
 
 #[path = "launch/actions.rs"]
 mod actions;
+#[path = "launch/controlled.rs"]
+mod controlled;
 #[path = "launch/mame_neogeo.rs"]
 mod mame_neogeo;
 #[path = "launch/media.rs"]
 mod media;
+#[path = "launch/mesen.rs"]
+mod mesen;
 #[path = "launch/openmsx.rs"]
 mod openmsx;
 #[path = "launch/plan.rs"]
@@ -43,6 +47,9 @@ mod system;
 pub(crate) use actions::apply_task_entry_transition;
 pub(crate) use plan::make_launch_plan;
 pub(crate) use run::{make_launch, occupied_graceful};
+
+use controlled::*;
+use mesen::*;
 
 #[cfg(test)]
 use media::*;

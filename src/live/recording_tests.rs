@@ -67,6 +67,7 @@ fn capability() -> RecordingCapability {
         terminal_snapshots: None,
         terminal_state: None,
         warmup: None,
+        repeatability: None,
         limits: RecordingLimits {
             max_frames: 300,
             max_events: 100_000,
@@ -474,6 +475,7 @@ fn request(output: &std::path::Path, frames: u64) -> RecordWindowRequest {
         initial_snapshots: vec![],
         terminal_snapshots: vec![],
         terminal_state_profile: None,
+        require_repeatable: false,
         limits: Some(RequestedRecordingLimits {
             max_events: Some(1000),
             max_bytes: Some(1024 * 1024),
@@ -557,6 +559,61 @@ fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract
     });
     request.initial_snapshots[0].address = 1;
     assert!(effective_request(&capability, &["record_window".into()], &regions, &request).is_err());
+}
+
+#[test]
+fn repeatable_selection_refuses_unadvertised_or_ineligible_origins_before_execution() {
+    let output = tempfile::tempdir().unwrap();
+    let mut request = request(output.path(), 1);
+    request.require_repeatable = true;
+    request.origin = Some(RecordingOrigin::ResetRelease);
+    let mut capability = capability();
+
+    let error =
+        effective_request(&capability, &["record_window".into()], &[], &request).unwrap_err();
+    assert!(error.to_string().contains("does not advertise repeatable"));
+
+    capability
+        .origins
+        .push(RecordingCapabilityOrigin::ResetRelease);
+    capability.repeatability = Some(RecordingRepeatabilityCapability {
+        profile: "repeatable_test".into(),
+        conditions_sha256: "ab".repeat(32),
+        origins: vec![RecordingCapabilityOrigin::ResetRelease],
+        requires_input_movie: false,
+    });
+    capability.input_movie = Some(RecordingInputMovieCapability {
+        format: INPUT_MOVIE_FORMAT.into(),
+        port: 0,
+        max_frames: 300,
+        max_bytes: CORE_MAX_INPUT_MOVIE_BYTES,
+        max_buttons_per_frame: 32,
+    });
+    capability.revision = capability.computed_revision().unwrap();
+    effective_request(&capability, &["record_window".into()], &[], &request).unwrap();
+
+    request.origin = Some(RecordingOrigin::NextFrameBoundary);
+    let error =
+        effective_request(&capability, &["record_window".into()], &[], &request).unwrap_err();
+    assert!(error.to_string().contains("NextFrameBoundary"));
+
+    request.origin = Some(RecordingOrigin::ResetRelease);
+    capability
+        .repeatability
+        .as_mut()
+        .unwrap()
+        .requires_input_movie = true;
+    capability.revision = capability.computed_revision().unwrap();
+    let error =
+        effective_request(&capability, &["record_window".into()], &[], &request).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("requires an explicit input movie"));
+
+    let movie = output.path().join("empty-input.movie");
+    std::fs::write(&movie, b"0:\n").unwrap();
+    request.input_path = Some(movie);
+    effective_request(&capability, &["record_window".into()], &[], &request).unwrap();
 }
 
 fn run(harness: &Harness, mode: Mode, delay: Duration, frames: u64) -> RecordWindowResult {

@@ -50,7 +50,19 @@ pub struct RecordingCapability {
     pub terminal_state: Option<RecordingTerminalStateCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup: Option<RecordingWarmupCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeatability: Option<RecordingRepeatabilityCapability>,
     pub limits: RecordingLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingRepeatabilityCapability {
+    pub profile: String,
+    pub conditions_sha256: String,
+    pub origins: Vec<RecordingCapabilityOrigin>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_input_movie: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -166,6 +178,8 @@ struct RecordingCapabilityRevision<'a> {
     terminal_state: &'a Option<RecordingTerminalStateCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warmup: &'a Option<RecordingWarmupCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeatability: &'a Option<RecordingRepeatabilityCapability>,
     limits: &'a RecordingLimits,
 }
 
@@ -193,6 +207,7 @@ impl RecordingCapability {
             terminal_snapshots: &self.terminal_snapshots,
             terminal_state: &self.terminal_state,
             warmup: &self.warmup,
+            repeatability: &self.repeatability,
             limits: &self.limits,
         };
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&material)?)))
@@ -227,6 +242,46 @@ impl RecordingCapability {
             return Err(RecordingCapabilityError::Invalid(
                 "revision does not cover the advertised recording capability".into(),
             ));
+        }
+        if let Some(repeatability) = &self.repeatability {
+            if repeatability.profile.is_empty()
+                || repeatability.profile.len() > 96
+                || !repeatability
+                    .profile
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability profile must be a safe non-empty identifier".into(),
+                ));
+            }
+            if repeatability.conditions_sha256.len() != 64
+                || !repeatability
+                    .conditions_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability conditions_sha256 must be a SHA-256".into(),
+                ));
+            }
+            if repeatability.origins.is_empty()
+                || repeatability.origins.iter().collect::<BTreeSet<_>>().len()
+                    != repeatability.origins.len()
+                || repeatability
+                    .origins
+                    .iter()
+                    .any(|origin| !self.origins.contains(origin))
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability origins must be a non-empty subset of recording origins".into(),
+                ));
+            }
+            if repeatability.requires_input_movie && self.input_movie.is_none() {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability requires an advertised input movie capability".into(),
+                ));
+            }
         }
         if self.origins.first() != Some(&RecordingCapabilityOrigin::NextFrameBoundary)
             || self.origins.len() > 2

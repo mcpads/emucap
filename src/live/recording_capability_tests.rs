@@ -26,6 +26,7 @@ fn capability() -> RecordingCapability {
         terminal_snapshots: None,
         terminal_state: None,
         warmup: None,
+        repeatability: None,
         limits: RecordingLimits {
             max_frames: 300,
             max_events: 100_000,
@@ -48,6 +49,41 @@ fn validates_the_initial_generic_capability_and_defaults() {
     let identities = capability.identities(&[]).unwrap();
     assert_eq!(identities.len(), 1);
     assert_eq!(identities[0].id, "frame_boundary");
+}
+
+#[test]
+fn repeatability_is_bounded_to_declared_origins_and_covered_by_revision() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let mut capability = capability();
+    capability
+        .origins
+        .push(RecordingCapabilityOrigin::ResetRelease);
+    capability.repeatability = Some(RecordingRepeatabilityCapability {
+        profile: "repeatable_test".into(),
+        conditions_sha256: "ab".repeat(32),
+        origins: vec![RecordingCapabilityOrigin::ResetRelease],
+        requires_input_movie: true,
+    });
+    capability.input_movie = Some(RecordingInputMovieCapability {
+        format: INPUT_MOVIE_FORMAT.into(),
+        port: 0,
+        max_frames: capability.limits.max_frames,
+        max_bytes: CORE_MAX_INPUT_MOVIE_BYTES,
+        max_buttons_per_frame: 32,
+    });
+    capability.revision = capability.computed_revision().unwrap();
+    capability.validate(&registry).unwrap();
+
+    let revision = capability.revision.clone();
+    capability.repeatability.as_mut().unwrap().conditions_sha256 = "cd".repeat(32);
+    assert_ne!(capability.computed_revision().unwrap(), revision);
+    assert!(capability.validate(&registry).is_err());
+
+    capability.revision = capability.computed_revision().unwrap();
+    capability.repeatability.as_mut().unwrap().origins =
+        vec![RecordingCapabilityOrigin::NextFrameBoundary];
+    capability.revision = capability.computed_revision().unwrap();
+    capability.validate(&registry).unwrap();
 }
 
 #[test]

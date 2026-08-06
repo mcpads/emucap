@@ -100,6 +100,7 @@ pub(crate) async fn run_record_window(
             })
             .collect(),
         terminal_state_profile: args.terminal_state_profile,
+        require_repeatable: args.require_repeatable,
         limits: args.limits.map(|limits| RequestedRecordingLimits {
             max_events: limits.max_events,
             max_bytes: limits.max_bytes,

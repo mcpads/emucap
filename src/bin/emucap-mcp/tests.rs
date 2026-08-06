@@ -606,6 +606,7 @@ fn record_window_drawer_schema_is_generic_and_requires_an_explicit_evidence_root
             "limits",
             "origin",
             "output_root",
+            "require_repeatable",
             "start_on",
             "stop_on",
             "terminal_snapshots",

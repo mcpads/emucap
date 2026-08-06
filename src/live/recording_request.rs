@@ -42,6 +42,7 @@ pub struct RecordWindowRequest {
     pub initial_snapshots: Vec<InitialSnapshotRequest>,
     pub terminal_snapshots: Vec<TerminalSnapshotRequest>,
     pub terminal_state_profile: Option<String>,
+    pub require_repeatable: bool,
     pub limits: Option<RequestedRecordingLimits>,
 }
 
@@ -101,6 +102,27 @@ pub(super) fn effective_request(
         RecordingOrigin::NextFrameBoundary => RecordingCapabilityOrigin::NextFrameBoundary,
         RecordingOrigin::ResetRelease => RecordingCapabilityOrigin::ResetRelease,
     };
+    if request.require_repeatable
+        && capability
+            .repeatability
+            .as_ref()
+            .is_none_or(|repeatability| !repeatability.origins.contains(&capability_origin))
+    {
+        return Err(RecordingError::Unavailable(format!(
+            "the current runtime does not advertise repeatable recording for origin {origin:?}"
+        )));
+    }
+    if request.require_repeatable
+        && capability
+            .repeatability
+            .as_ref()
+            .is_some_and(|repeatability| repeatability.requires_input_movie)
+        && request.input_path.is_none()
+    {
+        return Err(RecordingError::Invalid(
+            "the selected repeatable profile requires an explicit input movie; use an all-empty movie when no buttons should be pressed".into(),
+        ));
+    }
     if !capability.origins.contains(&capability_origin) {
         return Err(RecordingError::Unavailable(format!(
             "the current runtime does not advertise origin {origin:?}"

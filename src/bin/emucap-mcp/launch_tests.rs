@@ -1,4 +1,5 @@
 use super::*;
+use crate::args::LaunchExecutionProfileArgs;
 #[cfg(unix)]
 use emucap::live::continuity::{ContinuitySnapshot, RuntimeBinding, RuntimeBindingState};
 use emucap::live::link::{Capabilities, LinkError};
@@ -1223,6 +1224,8 @@ fn pc98_display_selects_visible_mame_launch() {
         name: None,
         display: Some(true),
         sound: None,
+        start_frozen: false,
+        execution_profile: None,
         replace: false,
     };
     assert!(!pc98_headless(&args));
@@ -1496,6 +1499,8 @@ struct RuntimeLaunchLink {
     calls: usize,
     available: bool,
     lease_state: LeaseState,
+    ready_state: &'static str,
+    controlled_start: bool,
 }
 
 #[cfg(unix)]
@@ -1509,7 +1514,16 @@ impl RuntimeLaunchLink {
             calls: 0,
             available: true,
             lease_state: LeaseState::Held,
+            ready_state: "running",
+            controlled_start: false,
         }
+    }
+
+    fn controlled(mut self, feature: &str, state: &'static str) -> Self {
+        self.caps.identity.host_features.push(feature.into());
+        self.ready_state = state;
+        self.controlled_start = true;
+        self
     }
 
     fn disconnect(&mut self) {
@@ -1532,10 +1546,18 @@ impl EmulatorLink for RuntimeLaunchLink {
         if self.calls == 1 || !self.available {
             Err(LinkError::NotConnected)
         } else {
-            Ok(serde_json::json!({
+            let mut status = serde_json::json!({
                 "connected": true,
-                "state": "running"
-            }))
+                "state": self.ready_state
+            });
+            if self.controlled_start {
+                status["launch_start"] = serde_json::json!({
+                    "requested_frozen": true,
+                    "controlled": true,
+                    "boundary": "pre_first_instruction"
+                });
+            }
+            Ok(status)
         }
     }
 
@@ -1757,6 +1779,8 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             name: Some("after-orphan".into()),
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -1785,6 +1809,8 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             name: Some("after-unverifiable-lease".into()),
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -1806,6 +1832,8 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             name: Some("after-retired-generation".into()),
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -1854,6 +1882,8 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         name: Some("capsule-test".into()),
         display: None,
         sound: None,
+        start_frozen: false,
+        execution_profile: None,
         replace: false,
     };
 
@@ -1955,6 +1985,114 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn controlled_launch_publishes_only_after_a_frozen_ready_boundary() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let publish = tmp.path().join("publish");
+    std::fs::create_dir_all(&publish).unwrap();
+    let binary = publish.join("fake-mesen");
+    let content = tmp.path().join("game.sfc");
+    std::fs::write(&binary, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    make_executable(&binary);
+    write_mesen_sidecar(&binary);
+    std::fs::write(&content, b"rom").unwrap();
+
+    let _env = EnvRestore::new(&["MESEN_BIN", "EMUCAP_EMU_HOME"]);
+    std::env::set_var("MESEN_BIN", &binary);
+    std::env::set_var("EMUCAP_EMU_HOME", tmp.path().join("emu-home"));
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut link = RuntimeLaunchLink::new(port).controlled("controlled_start", "frozen");
+    let outcome = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: Some("controlled-launch-test".into()),
+            display: None,
+            sound: None,
+            start_frozen: true,
+            execution_profile: None,
+            replace: false,
+        },
+    );
+
+    assert_eq!(outcome["launched"], true, "{outcome}");
+    assert_eq!(outcome["ready"], true, "{outcome}");
+    assert_eq!(outcome["state"], "frozen", "{outcome}");
+    let store = emucap::live::runtime::RuntimeStore::discover();
+    let current = store.read_current(port).unwrap().unwrap();
+    assert_eq!(current.process_state(), ProcessState::Alive);
+    assert_eq!(current.execution_profile, None);
+    assert!(current.start_frozen);
+    current.terminate_owned_processes().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_launch_fails_closed_and_terminates_a_running_entry() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let publish = tmp.path().join("publish");
+    std::fs::create_dir_all(&publish).unwrap();
+    let binary = publish.join("fake-mesen");
+    let content = tmp.path().join("game.sfc");
+    std::fs::write(&binary, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    make_executable(&binary);
+    write_mesen_sidecar(&binary);
+    std::fs::write(&content, b"rom").unwrap();
+
+    let _env = EnvRestore::new(&["MESEN_BIN", "EMUCAP_EMU_HOME"]);
+    std::env::set_var("MESEN_BIN", &binary);
+    std::env::set_var("EMUCAP_EMU_HOME", tmp.path().join("emu-home"));
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+    let mut link = RuntimeLaunchLink::new(port).controlled("controlled_start", "running");
+    let outcome = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: Some("controlled-launch-failure-test".into()),
+            display: None,
+            sound: None,
+            start_frozen: true,
+            execution_profile: None,
+            replace: false,
+        },
+    );
+
+    assert_eq!(outcome["launched"], false, "{outcome}");
+    assert_eq!(
+        outcome["reason"],
+        "controlled launch connected without a frozen guest entry boundary"
+    );
+    assert!(
+        emucap::live::runtime::RuntimeStore::discover()
+            .read_current(port)
+            .unwrap()
+            .is_none(),
+        "a weakened controlled launch must not become current"
+    );
+    let pid = outcome["launcher_outcome"]["pid"].as_u64().unwrap() as u32;
+    let process = emucap::live::runtime::capture_process(pid);
+    for _ in 0..100 {
+        if emucap::live::runtime::process_state(&process) == ProcessState::Exited {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("controlled launch process {pid} survived fail-closed cleanup");
+}
+
 #[test]
 fn adapter_readiness_wait_is_bounded() {
     let mut link = NotConnectedPortLink::new();
@@ -1978,6 +2116,57 @@ fn mesen_readiness_budget_covers_gui_cold_start_without_weakening_other_adapters
 }
 
 #[test]
+fn controlled_launch_contract_distinguishes_time_closure_from_repeatability() {
+    let running = serde_json::json!({ "connected": true, "state": "running" });
+    let frozen = serde_json::json!({
+        "connected": true,
+        "state": "frozen",
+        "launch_start": {
+            "requested_frozen": true,
+            "controlled": true,
+            "boundary": "pre_first_instruction"
+        }
+    });
+    let mut capabilities = Capabilities::empty();
+
+    assert_eq!(
+        controlled_launch_contract_error(false, false, &running, None, &capabilities),
+        None,
+        "ordinary launch retains its running terminal"
+    );
+    assert!(
+        controlled_launch_contract_error(true, false, &running, None, &capabilities)
+            .unwrap()
+            .contains("frozen guest entry")
+    );
+
+    capabilities
+        .identity
+        .host_features
+        .push("controlled_start".into());
+    assert_eq!(
+        controlled_launch_contract_error(true, false, &frozen, None, &capabilities),
+        None,
+        "guest-time closure does not require a repeatable initial-state profile"
+    );
+
+    capabilities
+        .identity
+        .host_features
+        .push("repeatable_recording".into());
+    let profile = emucap::live::runtime::ExecutionProfileIdentity {
+        id: mesen_launch::REPEATABLE_PROFILE_ID.into(),
+        conditions_sha256: mesen_launch::REPEATABLE_CONDITIONS_SHA256.into(),
+    };
+    assert!(
+        controlled_launch_contract_error(true, true, &frozen, Some(&profile), &capabilities)
+            .unwrap()
+            .contains("exact selected recording conditions"),
+        "a label and frozen state cannot replace the live recording capability"
+    );
+}
+
+#[test]
 fn launch_refuses_missing_content_before_binary_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let missing = tmp.path().join("missing.sfc");
@@ -1992,6 +2181,8 @@ fn launch_refuses_missing_content_before_binary_resolution() {
             name: None,
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -2020,6 +2211,8 @@ fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
             name: None,
             display: None,
             sound: Some(true),
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -2031,6 +2224,68 @@ fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
     );
     assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1);
+}
+
+#[test]
+fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = tmp.path().join("game.md");
+    std::fs::write(&content, b"rom").unwrap();
+    let mut link = NotConnectedPortLink::new();
+
+    let out = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("megadrive".into()),
+            name: None,
+            display: None,
+            sound: None,
+            start_frozen: true,
+            execution_profile: None,
+            replace: false,
+        },
+    );
+
+    assert_eq!(out["launched"], false, "{out}");
+    assert_eq!(
+        out["reason"],
+        "start_frozen is currently supported only by Mesen systems"
+    );
+    assert_eq!(out["adapter"], "mednafen");
+    assert_eq!(link.calls, 1, "only the preflight status call is allowed");
+}
+
+#[test]
+fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = tmp.path().join("game.nes");
+    std::fs::write(&content, b"rom").unwrap();
+    let mut link = NotConnectedPortLink::new();
+
+    let out = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("nes".into()),
+            name: None,
+            display: None,
+            sound: None,
+            start_frozen: false,
+            execution_profile: Some(LaunchExecutionProfileArgs::Repeatable),
+            replace: false,
+        },
+    );
+
+    assert_eq!(out["launched"], false, "{out}");
+    assert_eq!(
+        out["reason"],
+        "execution_profile=repeatable is currently supported only for SNES"
+    );
+    assert_eq!(out["adapter"], "mesen2");
+    assert_eq!(link.calls, 1, "only the preflight status call is allowed");
 }
 
 #[test]
@@ -2068,6 +2323,8 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
             name: None,
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -2140,6 +2397,8 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
             name: None,
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -2188,6 +2447,8 @@ fn launch_refuses_occupied_port_before_spawn() {
             name: None,
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );
@@ -2260,6 +2521,8 @@ fn launch_refuses_when_this_session_already_connected() {
             name: Some("dup-B".into()),
             display: None,
             sound: None,
+            start_frozen: false,
+            execution_profile: None,
             replace: false,
         },
     );

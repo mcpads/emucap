@@ -56,6 +56,16 @@ local MESEN_BINARY_SHA256 = os.getenv("EMUCAP_MESEN_BINARY_SHA256")
 local function exact_hex(value, length)
   return type(value) == "string" and #value == length and not value:find("[^0-9a-fA-F]")
 end
+local START_FROZEN = os.getenv("EMUCAP_START_FROZEN") == "1"
+local REPEATABLE_CONDITIONS_SHA256 = os.getenv("EMUCAP_REPEATABLE_CONDITIONS_SHA256")
+local KNOWN_REPEATABLE_CONDITIONS_SHA256 =
+  "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b"
+local REPEATABLE_PROFILE = SYS.system == "snes"
+  and START_FROZEN
+  and os.getenv("EMUCAP_EXECUTION_PROFILE") == "repeatable"
+  and os.getenv("EMUCAP_REPEATABLE_SEED") == "1162696003"
+  and os.getenv("EMUCAP_FIXED_UNIX_TIME") == "788918400"
+  and REPEATABLE_CONDITIONS_SHA256 == KNOWN_REPEATABLE_CONDITIONS_SHA256
 -- Recording evidence names the exact host revision, patch stack, and produced binary. Legacy or
 -- manually launched hosts retain every pre-existing method but do not advertise this capability.
 local RECORDING_SUPPORTED = SYS.system == "snes"
@@ -88,11 +98,11 @@ do local lk = FREEZE_KEY:lower(); if lk == "" or lk == "off" or lk == "none" the
 local freeze_key_ok = true     -- isKeyPressed가 무효 키에 에러 → 1회 보고 후 비활성
 local prev_freeze_key = false  -- 라이징 에지 검출(running→freeze, frozen→resume 토글)
 
-local STATE = "running"       -- "running" | "frozen"
+local STATE = START_FROZEN and "frozen" or "running"
 local freeze_start_ms = nil   -- 마지막 명령 이후 경과 측정(데드맨). frozen 진입/명령 수신 시 갱신.
 -- The current halt cause and its temporal eligibility are independent. A later step must replace
 -- a recording halt's reason, while a completed frame step remains a proven recording boundary.
-local freeze_state = FreezeState.halt("paused", false)
+local freeze_state = FreezeState.halt(START_FROZEN and "launch" or "paused", false)
 -- true only while the patched host services a main-CPU instruction-boundary halt. Frame/PPU steps,
 -- read/write breakpoints, and other mid-instruction halts use the ordinary idle event and keep this
 -- false, so savestate calls fail loudly instead of serializing an unsafe core state.
@@ -492,7 +502,11 @@ function handlers.hello()
     "native_halt_service",
     "native_halt_savestate",
     "paused_start_service",
+    "controlled_start",
   }
+  local repeatable_recording = REPEATABLE_PROFILE and RECORDING_SUPPORTED
+    and HAS_SNES_DEEP_EVENTS and memory_regions ~= nil and #memory_regions > 0
+  if repeatable_recording then host_features[#host_features + 1] = "repeatable_recording" end
   if HAS_SNES_PPU_OBJ_EVENTS then host_features[#host_features + 1] = "snes_ppu_obj_events" end
   if HAS_SNES_DEEP_EVENTS then host_features[#host_features + 1] = "snes_deep_observation_events" end
   local breakpoint_kinds = {
@@ -526,7 +540,8 @@ function handlers.hello()
   if RECORDING_SUPPORTED then
     result.recording = Recording.capability(
       as_array, HAS_SNES_PPU_OBJ_EVENTS, memory_regions ~= nil and #memory_regions > 0,
-      HAS_SNES_DEEP_EVENTS, SYS.system == "snes")
+      HAS_SNES_DEEP_EVENTS, SYS.system == "snes",
+      repeatable_recording and REPEATABLE_CONDITIONS_SHA256 or nil)
   end
   local active_exceptions = { "mesen.execution.instruction-step-absent" }
   if HAS_CALLSTACK then
@@ -693,6 +708,13 @@ function handlers.status()
     host_pause_adoption = true,
     idle_auto_resume_ms = MAX_FREEZE_MS,
     disconnect_auto_resume_ms = RECONNECT_GIVEUP_MS,
+  }
+  r.launch_start = {
+    requested_frozen = START_FROZEN,
+    controlled = START_FROZEN,
+    boundary = START_FROZEN and "pre_first_instruction" or nil,
+    execution_profile = REPEATABLE_PROFILE and "repeatable" or nil,
+    conditions_sha256 = REPEATABLE_PROFILE and REPEATABLE_CONDITIONS_SHA256 or nil,
   }
   if MESEN_UPSTREAM_COMMIT and MESEN_BINARY_SHA256 then
     r.host_build = {
@@ -2236,8 +2258,9 @@ local function handle_in_freeze(line)
   local id, method, p = parse_request(line)
   id = id or 0
   if method == "record_window" then
-    if not FreezeState.can_start_recording(freeze_state) then
-      reply_err(id, "unsafe_halt", "the current frozen position is not a proven frame boundary")
+    if not FreezeState.can_start_recording(freeze_state, p.origin) then
+      reply_err(id, "unsafe_halt",
+        "next-frame recording requires a current frozen position with a proven frame boundary")
     else
       local action = start_recording(id, p)
       if action == "started" then return "resume" end

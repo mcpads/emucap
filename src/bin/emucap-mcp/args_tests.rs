@@ -127,6 +127,28 @@ fn record_window_accepts_the_generic_negotiated_extension_shape() {
 }
 
 #[test]
+fn launch_and_recording_parse_explicit_repeatability_selection() {
+    let launch: LaunchArgs = serde_json::from_str(
+        r#"{"content_path":"/tmp/game.sfc","system":"snes","execution_profile":"repeatable"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        launch.execution_profile,
+        Some(LaunchExecutionProfileArgs::Repeatable)
+    );
+    assert!(
+        !launch.start_frozen,
+        "the launcher applies the profile implication"
+    );
+
+    let recording: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":1,"origin":"reset_release","require_repeatable":true}"#,
+    )
+    .unwrap();
+    assert!(recording.require_repeatable);
+}
+
+#[test]
 fn frame_args_reject_over_cap() {
     // 상한 초과는 deserialize 단계에서 거부(무한 deferred 루프·raw_call wedge 방지, H2).
     let over = MAX_SYNC_ADVANCE_COUNT + 1;

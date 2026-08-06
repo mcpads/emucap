@@ -176,6 +176,11 @@ pub(crate) struct RecordWindowArgs {
     /// Advertised frozen-terminal state profile to preserve as one hashed JSON member.
     #[serde(default)]
     pub(crate) terminal_state_profile: Option<String>,
+    /// Require a live repeatable-recording profile. Refuses before staging,
+    /// reset, input, or guest advance when the current runtime does not
+    /// advertise it.
+    #[serde(default)]
+    pub(crate) require_repeatable: bool,
     /// Optional narrower advertised limits.
     #[serde(default)]
     pub(crate) limits: Option<RecordWindowLimitsArgs>,
@@ -763,11 +768,27 @@ pub(crate) struct LaunchArgs {
     /// than silently ignoring it.
     #[serde(default)]
     pub(crate) sound: Option<bool>,
+    /// Return only after the adapter is connected at a guest-time-closed frozen
+    /// entry boundary. Default: false. Unsupported adapters reject true before
+    /// spawning a process.
+    #[serde(default)]
+    pub(crate) start_frozen: bool,
+    /// Optional execution conditions selected before launch. `repeatable`
+    /// implies start_frozen and is currently available only for SNES on the
+    /// compatible Mesen host.
+    #[serde(default)]
+    pub(crate) execution_profile: Option<LaunchExecutionProfileArgs>,
     /// Explicitly replace a live process recorded by the current capsule. The
     /// launcher terminates only a generation whose PID and process-start identity
     /// both match; unverifiable ownership is rejected.
     #[serde(default)]
     pub(crate) replace: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LaunchExecutionProfileArgs {
+    Repeatable,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

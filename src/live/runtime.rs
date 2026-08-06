@@ -53,7 +53,19 @@ pub struct CurrentManifest {
     pub bridge: Option<ProcessIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<ExecutionProfileIdentity>,
+    /// Committed only after the live adapter proves a frozen launch-entry boundary.
+    #[serde(default)]
+    pub start_frozen: bool,
     pub created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProfileIdentity {
+    pub id: String,
+    pub conditions_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -499,6 +511,8 @@ impl PreparedGeneration {
             emulator: capture_process(spec.emulator_pid),
             bridge: spec.bridge_pid.map(capture_process),
             backend_endpoint: spec.backend_endpoint,
+            execution_profile: None,
+            start_frozen: false,
             created_at_unix_ms: now_unix_ms(),
         }
     }
@@ -591,6 +605,8 @@ impl CurrentManifest {
             "bridge_pid": self.bridge.as_ref().map(|p| p.pid),
             "bridge_process_state": bridge_state,
             "backend_endpoint": self.backend_endpoint,
+            "execution_profile": self.execution_profile,
+            "start_frozen": self.start_frozen,
             "lease": lease,
             "next_safe_action": next_safe_action(emulator_state, bridge_state, lease.state),
         })

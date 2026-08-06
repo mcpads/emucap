@@ -108,6 +108,24 @@ do
 end
 
 do
+  local conditions = "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b"
+  local capability = Recording.capability(
+    function(value) return value end, true, true, true, true, conditions)
+  equal(capability.revision,
+    "81a8e91a0680bcf72549d25126c91a3fef1f4205725b7ea6b40f4f9f33d25157",
+    "repeatable capability revision")
+  equal(capability.repeatability.profile, "mesen_snes_repeatable",
+    "repeatable profile identity")
+  equal(capability.repeatability.conditions_sha256, conditions,
+    "repeatable condition identity")
+  equal(#capability.repeatability.origins, 1, "repeatable origin count")
+  equal(capability.repeatability.origins[1], "reset_release", "repeatable origin")
+  equal(capability.repeatability.requires_input_movie, true,
+    "repeatable input movie requirement")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
   local deep = Recording.capability(function(value) return value end, true, false, true, true)
   local p = params(1, {
     capability_revision = deep.revision,

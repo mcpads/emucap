@@ -183,6 +183,14 @@ arguments. The agent calls `launch`, which waits for adapter readiness, and
 verifies the resulting live and runtime identities with `status`. Launcher
 scripts are developer entry points, not an alternative managed lifecycle.
 
+An ordinary launch can return while the guest is already running. If the first follow-up action
+must not inherit network or agent delay as guest time, request `start_frozen: true`; a supported
+launcher succeeds only after the adapter is connected at a frozen guest boundary. This controls
+post-launch guest time, not power-on RAM, RTC, saves, or other initial conditions. A live-advertised
+`execution_profile: "repeatable"` is the separate opt-in for those producer-owned conditions, and
+`record_window(require_repeatable: true)` fails before reset, input, or guest advance unless the
+selected recording origin is eligible.
+
 `listener.base_port` is only where direct-mode port search begins. It may already
 belong to another live MCP session. Launchers use the assigned `listener.port`
 or full-status `listening_port`. Stopping an emulator generation does not close

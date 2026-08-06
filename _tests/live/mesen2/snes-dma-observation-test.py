@@ -254,7 +254,13 @@ def main() -> int:
                 raise RuntimeError(f"deep observation host feature is absent: {status}")
 
             captured = mcp.tool(
-                "record_window", recording_params(output_root), timeout=90
+                "debug",
+                {
+                    "operation": "record_window",
+                    "known_capability_revision": status["capability_revision"],
+                    "arguments": recording_params(output_root),
+                },
+                timeout=90,
             )
             bundle = Path(captured["bundle_path"])
             manifest = json.loads((bundle / "manifest.json").read_text())

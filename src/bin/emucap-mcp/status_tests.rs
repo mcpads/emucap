@@ -172,6 +172,7 @@ fn recording_status_projects_only_the_negotiated_generic_capability() {
         terminal_snapshots: None,
         terminal_state: None,
         warmup: None,
+        repeatability: None,
         limits: RecordingLimits {
             max_frames: 300,
             max_events: 100_000,
@@ -259,6 +260,7 @@ fn connected_status_exposes_recording_only_for_a_bound_direct_generation() {
         terminal_snapshots: None,
         terminal_state: None,
         warmup: None,
+        repeatability: None,
         limits: RecordingLimits {
             max_frames: 300,
             max_events: 100_000,
