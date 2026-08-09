@@ -17,58 +17,70 @@ import tempfile
 from support import McpProcess, ROOT, default_binary
 
 
-EVENT_CLASS = "snes_ppu_obj_consumption_read"
-SELECTED_CLASSES = ("frame_boundary", "frame_completed", EVENT_CLASS)
+EVENT_PROFILES = {
+    "snes_ppu_obj_consumption_read": {
+        "filters": (
+            ("memory_kind", 1, 1),
+            ("address", 0, 65536),
+        ),
+    },
+    "snes_ppu_cgram_lookup": {
+        "filters": (
+            ("address", 0, 1),
+            ("layer", 5, 1),
+        ),
+    },
+}
 
 
 def require_capability(status: dict) -> None:
     capability = status.get("recording_capability", {})
     advertised = {item.get("id"): item for item in capability.get("event_classes", [])}
-    event = advertised.get(EVENT_CLASS, {})
-    fields = {
-        (item.get("kind"), item.get("path"))
-        for item in event.get("filterable_fields", [])
-    }
-    if (
-        capability.get("event_order") != "guest_emission"
-        or not all(event_class in advertised for event_class in SELECTED_CLASSES)
-        or not event.get("exact")
-        or not event.get("stoppable")
-        or fields != {("u64_range", "memory_kind"), ("u64_range", "address")}
+    if capability.get("event_order") != "guest_emission" or not all(
+        event_class in advertised for event_class in ("frame_boundary", "frame_completed")
     ):
         raise RuntimeError(f"filtered occurrence stop is not advertised: {capability}")
+    for event_class, profile in EVENT_PROFILES.items():
+        event = advertised.get(event_class, {})
+        fields = {
+            (item.get("kind"), item.get("path"))
+            for item in event.get("filterable_fields", [])
+        }
+        required = {
+            ("u64_range", path) for path, _start, _length in profile["filters"]
+        }
+        if not event.get("exact") or not event.get("stoppable") or not required <= fields:
+            raise RuntimeError(
+                f"{event_class} filtered occurrence stop is not advertised: {capability}"
+            )
 
 
-def recording_arguments(output_root: Path, occurrence: int) -> dict:
+def recording_arguments(output_root: Path, event_class: str, occurrence: int) -> dict:
+    profile = EVENT_PROFILES[event_class]
     return {
         "output_root": str(output_root),
         "origin": "reset_release",
         "frames": 10,
-        "event_classes": list(SELECTED_CLASSES),
+        "event_classes": ["frame_boundary", "frame_completed", event_class],
         "event_filters": [
             {
-                "event_class": EVENT_CLASS,
+                "event_class": event_class,
                 "terms": [
                     {
                         "kind": "u64_range",
-                        "path": "memory_kind",
-                        "start": 1,
-                        "length": 1,
-                    },
-                    {
-                        "kind": "u64_range",
-                        "path": "address",
-                        "start": 0,
-                        "length": 65536,
-                    },
+                        "path": path,
+                        "start": start,
+                        "length": length,
+                    }
+                    for path, start, length in profile["filters"]
                 ],
             }
         ],
-        "stop_on": {"event_class": EVENT_CLASS, "occurrence": occurrence},
+        "stop_on": {"event_class": event_class, "occurrence": occurrence},
     }
 
 
-def validate_capture(bundle: Path, occurrence: int) -> dict:
+def validate_capture(bundle: Path, event_class: str, occurrence: int) -> dict:
     manifest = json.loads((bundle / "manifest.json").read_text())
     events = [
         json.loads(line)
@@ -77,7 +89,7 @@ def validate_capture(bundle: Path, occurrence: int) -> dict:
     terminal = manifest.get("terminal", {})
     scope = manifest.get("scope", {})
     stop = terminal.get("stop_event", {})
-    matching = [event for event in events if event.get("class") == EVENT_CLASS]
+    matching = [event for event in events if event.get("class") == event_class]
     if (
         terminal.get("operation_outcome") != "completed"
         or terminal.get("execution_outcome") != "event_stop"
@@ -107,9 +119,12 @@ def validate_capture(bundle: Path, occurrence: int) -> dict:
         or manifest.get("cleanup", {}).get("sink") != "released"
     ):
         raise RuntimeError(f"partial-frame stop closure differs: {manifest}")
+    profile = EVENT_PROFILES[event_class]
     if not all(
-        event["payload"]["memory_kind"] == 1
-        and 0 <= event["payload"]["address"] < 65536
+        all(
+            start <= event["payload"][path] < start + length
+            for path, start, length in profile["filters"]
+        )
         for event in matching
     ):
         raise RuntimeError(f"persisted event escaped the negotiated filter: {matching}")
@@ -184,16 +199,24 @@ def main() -> int:
             launch_id = launched["launch_id"]
             status = mcp.tool("status", {})
             require_capability(status)
-            captured = mcp.tool(
-                "debug",
-                {
-                    "operation": "record_window",
-                    "known_capability_revision": status["capability_revision"],
-                    "arguments": recording_arguments(output_root, args.occurrence),
-                },
-                timeout=90,
-            )
-            evidence = validate_capture(Path(captured["bundle_path"]), args.occurrence)
+            evidence = {}
+            manifest_sha256 = {}
+            for event_class in EVENT_PROFILES:
+                captured = mcp.tool(
+                    "debug",
+                    {
+                        "operation": "record_window",
+                        "known_capability_revision": status["capability_revision"],
+                        "arguments": recording_arguments(
+                            output_root, event_class, args.occurrence
+                        ),
+                    },
+                    timeout=90,
+                )
+                evidence[event_class] = validate_capture(
+                    Path(captured["bundle_path"]), event_class, args.occurrence
+                )
+                manifest_sha256[event_class] = captured.get("manifest_sha256")
             final_status = mcp.tool("status", {})
             if final_status.get("state") != "frozen" or not final_status.get("connected"):
                 raise RuntimeError(f"connection did not survive occurrence stop: {final_status}")
@@ -203,7 +226,7 @@ def main() -> int:
                         "ok": True,
                         "server_build": bootstrap.get("server_build"),
                         "host_build": final_status.get("host_build"),
-                        "manifest_sha256": captured.get("manifest_sha256"),
+                        "manifest_sha256": manifest_sha256,
                         "evidence": evidence,
                     },
                     separators=(",", ":"),

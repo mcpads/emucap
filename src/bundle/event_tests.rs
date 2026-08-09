@@ -110,6 +110,33 @@ fn obj_consumption(sequence: u64, frame: u64, tick: u64, address: u64) -> EventE
     }
 }
 
+fn cgram_lookup(sequence: u64, frame: u64, tick: u64, address: u64) -> EventEnvelope {
+    let identity = EventContractRegistry::builtin()
+        .unwrap()
+        .identities(["snes_ppu_cgram_lookup"])
+        .unwrap()
+        .remove(0);
+    EventEnvelope {
+        sequence,
+        class: identity.id,
+        contract_sha256: identity.contract_sha256,
+        clock: ClockPoint {
+            domain: "snes_master".into(),
+            tick,
+        },
+        frame,
+        payload: json!({
+            "address": address,
+            "value": 0x1234,
+            "layer": 4,
+            "pixel_x": 72,
+            "scanline": 40,
+            "dot": 94,
+            "hclock": 376
+        }),
+    }
+}
+
 fn bytes(events: &[EventEnvelope]) -> Vec<u8> {
     let mut output = Vec::new();
     for event in events {
@@ -430,6 +457,72 @@ fn accepts_only_events_inside_the_declared_payload_filter() {
         validate_address(0x2100),
         Err(EventValidationError::EventOutsideFilter(class))
             if class == "snes_ppu_obj_consumption_read"
+    ));
+}
+
+#[test]
+fn validates_cgram_lookup_payload_and_declared_address_filter() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let classes = registry
+        .identities(["frame_boundary", "snes_ppu_cgram_lookup"])
+        .unwrap();
+    let filters = vec![EventClassFilter {
+        event_class: "snes_ppu_cgram_lookup".into(),
+        terms: vec![EventFilterTerm::U64Range {
+            path: "address".into(),
+            start: 0x80,
+            length: 1,
+        }],
+    }];
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let validate_address = |address| {
+        fs::write(
+            file.path(),
+            bytes(&[event(0, 10), cgram_lookup(1, 10, 12_345, address)]),
+        )
+        .unwrap();
+        validate_event_stream(
+            file.path(),
+            &registry,
+            &EventValidationSpec {
+                f_start: 10,
+                f_end: 11,
+                observation_start: 10,
+                class_intervals: Default::default(),
+                event_classes: classes.clone(),
+                event_filters: filters.clone(),
+                limits: limits(),
+                stop_on: None,
+            },
+        )
+    };
+
+    assert_eq!(validate_address(0x80).unwrap().records, 2);
+    assert!(matches!(
+        validate_address(0x81),
+        Err(EventValidationError::EventOutsideFilter(class))
+            if class == "snes_ppu_cgram_lookup"
+    ));
+
+    let mut invalid = cgram_lookup(1, 10, 12_345, 0x80);
+    invalid.payload["value"] = json!(0x8000);
+    fs::write(file.path(), bytes(&[event(0, 10), invalid])).unwrap();
+    assert!(matches!(
+        validate_event_stream(
+            file.path(),
+            &registry,
+            &EventValidationSpec {
+                f_start: 10,
+                f_end: 11,
+                observation_start: 10,
+                class_intervals: Default::default(),
+                event_classes: classes,
+                event_filters: filters,
+                limits: limits(),
+                stop_on: None,
+            },
+        ),
+        Err(EventValidationError::Payload(_))
     ));
 }
 

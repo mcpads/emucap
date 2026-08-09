@@ -344,12 +344,16 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         "snes_device_port_write",
         "snes_interrupt_delivery",
         "snes_ppu_obj_consumption_read",
+        "snes_ppu_cgram_lookup",
     ] {
         let identity = registry.identities([id]).unwrap().remove(0);
         let startable = identity.id == "snes_cpu_instruction";
-        let stoppable = identity.id == "snes_ppu_obj_consumption_read";
-        let filterable_fields = if identity.id == "snes_ppu_obj_consumption_read" {
-            vec![
+        let stoppable = matches!(
+            identity.id.as_str(),
+            "snes_ppu_obj_consumption_read" | "snes_ppu_cgram_lookup"
+        );
+        let filterable_fields = match identity.id.as_str() {
+            "snes_ppu_obj_consumption_read" => vec![
                 RecordingEventFilterField {
                     path: "memory_kind".into(),
                     kind: RecordingEventFilterKind::U64Range,
@@ -362,9 +366,34 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
                     min: 0,
                     max: 0xffff,
                 },
-            ]
-        } else {
-            vec![]
+            ],
+            "snes_ppu_cgram_lookup" => vec![
+                RecordingEventFilterField {
+                    path: "address".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 0xff,
+                },
+                RecordingEventFilterField {
+                    path: "layer".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 5,
+                },
+                RecordingEventFilterField {
+                    path: "pixel_x".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 0xff,
+                },
+                RecordingEventFilterField {
+                    path: "scanline".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 0xffff,
+                },
+            ],
+            _ => vec![],
         };
         capability.event_classes.push(RecordingEventCapability {
             id: identity.id,
@@ -389,12 +418,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         deep_without_snapshots.revision,
-        "a01b63fdb6b35a4268edbdffb9675621b6712a9e8095bb8f7594067d3ecd355a"
+        "7277dc80b730c662ef2d79e1aace4b54d710ac55babed41cc09f2c1bcae0931f"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "7385af79303c2e05fddb0c06963771180893cfdcc3d821031e78c869e2655970"
+        "573de997b1913c6317d589f1e48fca8a9323c2308b6249a05605943a6812f8b9"
     );
     capability.repeatability = Some(RecordingRepeatabilityCapability {
         profile: "mesen_snes_repeatable".into(),
@@ -406,7 +435,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "a569ed75dc69a68f8584fbe717ddecd2509f49043a330a6b5fce586c89651f83"
+        "6f064e4d2790bd6113c8e304a76f022fdb8abf8d12ec5d2bea3e84599d7eb2a6"
     );
 }
 

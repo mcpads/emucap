@@ -1252,6 +1252,9 @@ local function deep_payload(event_id, event)
   elseif event_id == "snes_ppu_obj_consumption_read" then
     return { memory_kind = event.memoryKind, address = event.address, value = event.value,
       scanline = event.scanline, dot = event.dot, hclock = event.hClock }
+  elseif event_id == "snes_ppu_cgram_lookup" then
+    return { address = event.address, value = event.cgramValue, layer = event.layer,
+      pixel_x = event.pixelX, scanline = event.scanline, dot = event.dot, hclock = event.hClock }
   end
   return nil
 end
@@ -1270,6 +1273,7 @@ local function install_recording_semantic_hooks(state)
     { id = "snes_interrupt_delivery", event_type = emu.eventType.snesInterruptDelivery, deep = true },
     { id = "snes_ppu_obj_consumption_read", event_type = emu.eventType.snesPpuObjConsumptionRead,
       deep = true },
+    { id = "snes_ppu_cgram_lookup", event_type = emu.eventType.snesPpuCgramLookup, deep = true },
   }
   local requested = false
   for _, candidate in ipairs(candidates) do
