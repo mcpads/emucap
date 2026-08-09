@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.14.0-alpha.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.14.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -141,7 +141,10 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
 모든 emucap 작업은 `bootstrap`으로 시작한다. 에이전트에게 "emucap `bootstrap`을 호출해줘"라고
 하면, 기본 응답이 `listener.port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을
 간결하게 돌려준다. 전체 routing catalog는 `bootstrap(include=["systems"])`, build/runtime 경로는
-`bootstrap(include=["installation"])`으로 명시적으로 요청한다. 이후
+`bootstrap(include=["installation"])`으로 명시적으로 요청한다. 기본 응답은 살아 있는 managed runtime
+개수만 포함한다. 기존 generation을 이어갈 때만 `bootstrap(include=["runtimes"])`을 요청하면,
+stable host session ID가 없는 client도 반환된 lease의 exact `launch_id`로 `reattach`할 수 있다. runtime
+파일을 직접 편집할 필요가 없다. 이후
 `launch_plan(content_path, system?)`이 검증된 MCP `launch` 도구 인자를 돌려준다.
 에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
 identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
@@ -169,6 +172,10 @@ time에 섞지 않고 유한한 guest-frame 구간을 소유할 수 있다. 현�
 반환한다. event class와 limit의 권위는 live capability다. 지원하지 않는 adapter는 hook을 설치하거나
 guest를 진행하지 않고 거부한다. 선택적 origin·입력 무비·event stop도 그 exact capability가 광고할
 때만 쓸 수 있으며, 생략하면 기존 next-frame bounded 동작을 유지한다.
+발생률이 높은 event class는 정수 payload field별 filter capability를 추가로 광고할 수 있다. 선택적
+class별 half-open range는 선언한 관측 범위만 좁히며, 제외된 callback은 drop으로 세지 않는다. 범위
+안의 event는 기존 sequence·limit·integrity 규칙을 그대로 따르고, 광고되지 않은 field와 잘못된
+범위는 guest mutation 전에 거절된다.
 `recording_capability.warmup`이 있으면 `warmup_frames`로 저비용 transaction event는 계속 기록하면서
 observation-only hook의 활성화를 정확한 guest frame 경계까지 미룰 수 있다. 입력 무비는 두 구간을 한
 요청 안에서 모두 포함한다.
@@ -187,7 +194,8 @@ active/terminal capsule을 이어 보여주며 event bytes와 private staging pa
 timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종료의 증거가 아니다.
 재실행하기 전에 `status.continuity.runtime_binding`·`status.runtime_instance` 또는
 `status.stale_runtime_instance`·`get_failure_context`를 확인한다.
-살아 있는 소유 generation에는 재부착하고, 의도적으로 교체할 때만 identity가 검증되는
+자동 재부착은 같은 stable control identity로 한정한다. 그 밖에는 bootstrap runtime discovery에서
+명시적으로 available인 exact generation을 골라 `reattach(launch_id=...)`하고, 의도적으로 교체할 때만 identity가 검증되는
 `launch(..., replace: true)`를 쓴다. Flycast fatal quarantine에서는 먼저 보존 문맥을 읽고,
 `status.methods`가 광고할 때만 debug `dismiss_failure` operation을 호출한다.
 
