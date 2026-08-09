@@ -1,0 +1,218 @@
+diff --git i/Core/Debugger/Debugger.h w/Core/Debugger/Debugger.h
+index 04c81d3..5225a4b 100644
+--- i/Core/Debugger/Debugger.h
++++ w/Core/Debugger/Debugger.h
+@@ -63,6 +63,8 @@ struct SnesObservationEvent
+ 	uint32_t Destination = 0;
+ 	uint32_t TransferSize = 0;
+ 	uint16_t TableAddress = 0;
++	uint16_t CgramValue = 0;
++	uint16_t PixelX = 0;
+ 	uint16_t A = 0;
+ 	uint16_t X = 0;
+ 	uint16_t Y = 0;
+@@ -81,6 +83,8 @@ struct SnesObservationEvent
+ 	uint8_t TransferMode = 0;
+ 	uint8_t HdmaBank = 0;
+ 	uint8_t MemoryKind = 0;
++	uint8_t Layer = 0;
++	uint8_t RendererTarget = 0;
+ 	bool Emulation = false;
+ 	bool Hdma = false;
+ 	bool HdmaIndirect = false;
+diff --git i/Core/Debugger/LuaApi.cpp w/Core/Debugger/LuaApi.cpp
+index 8d3e467..14fc454 100644
+--- i/Core/Debugger/LuaApi.cpp
++++ w/Core/Debugger/LuaApi.cpp
+@@ -1140,6 +1140,7 @@ int LuaApi::GetSnesObservationEvent(lua_State* lua)
+ 	s.Stream(copy.Source, "source");
+ 	s.Stream(copy.Destination, "destination");
+ 	s.Stream(copy.TransferSize, "transferSize");
++	s.Stream(copy.CgramValue, "cgramValue"); s.Stream(copy.PixelX, "pixelX");
+ 	s.Stream(copy.A, "a"); s.Stream(copy.X, "x"); s.Stream(copy.Y, "y");
+ 	s.Stream(copy.SP, "sp"); s.Stream(copy.D, "d");
+ 	s.Stream(copy.Scanline, "scanline"); s.Stream(copy.Dot, "dot"); s.Stream(copy.HClock, "hClock");
+@@ -1147,6 +1148,8 @@ int LuaApi::GetSnesObservationEvent(lua_State* lua)
+ 	s.Stream(copy.Value, "value"); s.Stream(copy.Opcode, "opcode");
+ 	s.Stream(copy.Operation, "operation"); s.Stream(copy.Channel, "channel");
+ 	s.Stream(copy.TransferMode, "transferMode"); s.Stream(copy.MemoryKind, "memoryKind");
++	s.Stream(copy.Layer, "layer");
++	s.Stream(copy.RendererTarget, "rendererTarget");
+ 	s.Stream(copy.Emulation, "emulation"); s.Stream(copy.Hdma, "hdma");
+ 	s.Stream(copy.HdmaIndirect, "hdmaIndirect"); s.Stream(copy.Nmi, "nmi");
+ 	s.Stream(copy.TransferActive, "transferActive");
+diff --git i/Core/SNES/SnesPpu.cpp w/Core/SNES/SnesPpu.cpp
+index 42f7ad6..64cee4b 100644
+--- i/Core/SNES/SnesPpu.cpp
++++ w/Core/SNES/SnesPpu.cpp
+@@ -911,6 +911,9 @@ void SnesPpu::RenderMode7()
+ 
+ void SnesPpu::RenderScanline()
+ {
++	Debugger* debugger = _emu->InternalGetDebugger();
++	_cgramLookupDebugger = debugger && debugger->HasEventCallback(EventType::SnesPpuCgramLookup)
++		? debugger : nullptr;
+ 	int32_t hPos = GetCycle();
+ 
+ 	if(hPos <= 255 || _spriteEvalEnd < 255) {
+@@ -976,12 +979,12 @@ void SnesPpu::RenderBgColor()
+ 	for(int x = _drawStartX; x <= _drawEndX; x++) {
+ 		if((_mainScreenFlags[x] & 0x0F) == 0) {
+ 			_state.InternalCgramAddress = 0;
+-			_mainScreenBuffer[x] = _cgram[0];
++			_mainScreenBuffer[x] = ReadCgramForRenderer(0, BackdropLayerIndex, x, CgramLookupTarget::Main);
+ 			_mainScreenFlags[x] = pixelFlags;
+ 		}
+ 		if(_subScreenPriority[x] == 0) {
+ 			_state.InternalCgramAddress = 0;
+-			_subScreenBuffer[x] = _cgram[0];
++			_subScreenBuffer[x] = ReadCgramForRenderer(0, BackdropLayerIndex, x, CgramLookupTarget::Sub);
+ 		}
+ 	}
+ }
+@@ -1009,13 +1012,13 @@ void SnesPpu::RenderSprites(const uint8_t priority[4])
+ 			uint8_t spritePrio = priority[_spritePriority[x]];
+ 			if(drawMain && ((_mainScreenFlags[x] & 0x0F) < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(mainWindowCount, x)) {
+ 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
+-				_mainScreenBuffer[x] = _cgram[paletteRamOffset];
++				_mainScreenBuffer[x] = ReadCgramForRenderer(paletteRamOffset, SpriteLayerIndex, x, CgramLookupTarget::Main);
+ 				_mainScreenFlags[x] = spritePrio | (((_state.ColorMathEnabled & 0x10) && _spritePalette[x] > 3) ? PixelFlags::AllowColorMath : 0);
+ 			}
+ 
+ 			if(drawSub && (_subScreenPriority[x] < spritePrio) && !ProcessMaskWindow<SnesPpu::SpriteLayerIndex>(subWindowCount, x)) {
+ 				uint16_t paletteRamOffset = 128 + (_spritePalette[x] << 4) + _spriteColors[x];
+-				_subScreenBuffer[x] = _cgram[paletteRamOffset];
++				_subScreenBuffer[x] = ReadCgramForRenderer(paletteRamOffset, SpriteLayerIndex, x, CgramLookupTarget::Sub);
+ 				_subScreenPriority[x] = spritePrio;
+ 			}
+ 		}
+@@ -1096,7 +1099,7 @@ void SnesPpu::RenderTilemap()
+ 		}
+ 
+ 		if(color > 0) {
+-			uint16_t rgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, color);
++			uint16_t rgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, color, layerIndex, x);
+ 			if(drawMain && (_mainScreenFlags[x] & 0x0F) < priority && !ProcessMaskWindow<layerIndex>(mainWindowCount, x)) {
+ 				DrawMainPixel(x, rgbColor, priority | pixelFlags);
+ 			}
+@@ -1109,7 +1112,7 @@ void SnesPpu::RenderTilemap()
+ 
+ 		if constexpr(hiResMode) {
+ 			if(hiresSubColor > 0 && drawSub && _subScreenPriority[x] < priority && !ProcessMaskWindow<layerIndex>(subWindowCount, x)) {
+-				uint16_t hiresSubRgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, hiresSubColor);
++				uint16_t hiresSubRgbColor = GetRgbColor<bpp, directColorMode, basePaletteOffset>(paletteIndex, hiresSubColor, layerIndex, x);
+ 				DrawSubPixel(x, hiresSubRgbColor, priority);
+ 			}
+ 		}
+@@ -1117,7 +1120,7 @@ void SnesPpu::RenderTilemap()
+ }
+ 
+ template<uint8_t bpp, bool directColorMode, uint8_t basePaletteOffset>
+-uint16_t SnesPpu::GetRgbColor(uint8_t paletteIndex, uint8_t colorIndex)
++uint16_t SnesPpu::GetRgbColor(uint8_t paletteIndex, uint8_t colorIndex, uint8_t layer, uint16_t pixelX)
+ {
+ 	if constexpr(bpp == 8 && directColorMode) {
+ 		return (
+@@ -1127,13 +1130,38 @@ uint16_t SnesPpu::GetRgbColor(uint8_t paletteIndex, uint8_t colorIndex)
+ 	} else if constexpr(bpp == 8) {
+ 		//Ignore palette bits for 256-color layers
+ 		_state.InternalCgramAddress = basePaletteOffset + colorIndex;
+-		return _cgram[_state.InternalCgramAddress];
++		return ReadCgramForRenderer(_state.InternalCgramAddress, layer, pixelX, CgramLookupTarget::Shared);
+ 	} else {
+ 		_state.InternalCgramAddress = basePaletteOffset + paletteIndex * (1 << bpp) + colorIndex;
+-		return _cgram[_state.InternalCgramAddress];
++		return ReadCgramForRenderer(_state.InternalCgramAddress, layer, pixelX, CgramLookupTarget::Shared);
+ 	}
+ }
+ 
++uint16_t SnesPpu::ReadCgramForRenderer(uint16_t address, uint8_t layer, uint16_t pixelX, CgramLookupTarget target)
++{
++	uint16_t value = _cgram[address];
++	if(_cgramLookupDebugger) {
++		RecordCgramLookup(address, value, layer, pixelX, target);
++	}
++	return value;
++}
++
++void SnesPpu::RecordCgramLookup(uint16_t address, uint16_t value, uint8_t layer, uint16_t pixelX, CgramLookupTarget target)
++{
++	SnesObservationEvent event;
++	event.Frame = _emu->GetFrameCount();
++	event.MasterClock = _memoryManager->GetMasterClock();
++	event.Address = address;
++	event.CgramValue = value;
++	event.Layer = layer;
++	event.RendererTarget = (uint8_t)target;
++	event.PixelX = pixelX;
++	event.Scanline = _state.Scanline;
++	event.Dot = _state.Cycle;
++	event.HClock = _state.HClock;
++	_cgramLookupDebugger->ProcessSnesObservationEvent(EventType::SnesPpuCgramLookup, event);
++}
++
+ bool SnesPpu::IsRenderRequired(uint8_t layerIndex)
+ {
+ 	if(((_state.MainScreenLayers & _configVisibleLayers) >> layerIndex) & 0x01) {
+@@ -1291,7 +1319,7 @@ void SnesPpu::RenderTilemapMode7()
+ 			if(directColorMode) {
+ 				paletteColor = ((colorIndex & 0x07) << 2) | ((colorIndex & 0x38) << 4) | ((colorIndex & 0xC0) << 7);
+ 			} else {
+-				paletteColor = _cgram[colorIndex];
++				paletteColor = ReadCgramForRenderer(colorIndex, layerIndex, x, CgramLookupTarget::Shared);
+ 			}
+ 
+ 			if(drawMain && (_mainScreenFlags[x] & 0x0F) < priority && !ProcessMaskWindow<layerIndex>(mainWindowCount, x)) {
+diff --git i/Core/SNES/SnesPpu.h w/Core/SNES/SnesPpu.h
+index ea0f88c..31bb17d 100644
+--- i/Core/SNES/SnesPpu.h
++++ w/Core/SNES/SnesPpu.h
+@@ -10,6 +10,7 @@ class InternalRegisters;
+ class SnesMemoryManager;
+ class Spc;
+ class EmuSettings;
++class Debugger;
+ 
+ class SnesPpu : public ISerializable
+ {
+@@ -21,6 +22,8 @@ public:
+ private:
+ 	constexpr static int SpriteLayerIndex = 4;
+ 	constexpr static int ColorWindowIndex = 5;
++	constexpr static int BackdropLayerIndex = 5;
++	enum class CgramLookupTarget : uint8_t { Shared = 0, Main = 1, Sub = 2 };
+ 
+ 	Emulator* _emu;
+ 	SnesConsole* _console;
+@@ -28,6 +31,7 @@ private:
+ 	SnesMemoryManager* _memoryManager;
+ 	Spc* _spc;
+ 	EmuSettings* _settings;
++	Debugger* _cgramLookupDebugger = nullptr;
+ 
+ 	//Temporary data used for the tilemap/tile fetching
+ 	LayerData _layerData[4] = {};
+@@ -162,7 +166,10 @@ private:
+ 	void RenderTilemap();
+ 
+ 	template<uint8_t bpp, bool directColorMode, uint8_t basePaletteOffset>
+-	__forceinline uint16_t GetRgbColor(uint8_t paletteIndex, uint8_t colorIndex);
++	__forceinline uint16_t GetRgbColor(uint8_t paletteIndex, uint8_t colorIndex, uint8_t layer, uint16_t pixelX);
++
++	__forceinline uint16_t ReadCgramForRenderer(uint16_t address, uint8_t layer, uint16_t pixelX, CgramLookupTarget target);
++	void RecordCgramLookup(uint16_t address, uint16_t value, uint8_t layer, uint16_t pixelX, CgramLookupTarget target);
+ 
+ 	__forceinline bool IsRenderRequired(uint8_t layerIndex);
+ 
+diff --git i/Core/Shared/EventType.h w/Core/Shared/EventType.h
+index 6ca29d4..0db88f7 100644
+--- i/Core/Shared/EventType.h
++++ w/Core/Shared/EventType.h
+@@ -23,6 +23,7 @@ enum class EventType
+ 	SnesDevicePortWrite,
+ 	SnesInterruptDelivery,
+ 	SnesPpuObjConsumptionRead,
++	SnesPpuCgramLookup,
+ 
+ 	LastValue
+ };

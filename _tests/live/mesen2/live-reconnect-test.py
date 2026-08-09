@@ -31,6 +31,15 @@ ENTRY_BY_SUFFIX = {
     ".gg": "emucap-sms.lua",
     ".gba": "emucap-gba.lua",
 }
+CPU_MEMORY_BY_SUFFIX = {
+    ".sfc": "snesMemory",
+    ".smc": "snesMemory",
+    ".nes": "nesMemory",
+    ".gb": "gbMemory",
+    ".gbc": "gbMemory",
+    ".gg": "smsMemory",
+    ".gba": "gbaMemory",
+}
 
 
 def default_binary() -> Path:
@@ -360,6 +369,65 @@ end, emu.eventType.codeBreakIdleSavestate)
                     f"pause halt did not advertise its savestate-safe boundary: {safe_status}"
                 )
 
+            cpu = baseline["cpu"]
+            pc = cpu.get("cpu.pc", cpu.get("cpu.r15"))
+            if pc is None:
+                raise RuntimeError(f"CPU state lacks a program counter: {cpu}")
+            pc += cpu.get("cpu.k", 0) * 0x10000
+            armed = session.request(
+                "set_breakpoint",
+                {
+                    "kind": "exec",
+                    "memory_type": CPU_MEMORY_BY_SUFFIX[content.suffix.lower()],
+                    "start": pc,
+                    "end": pc,
+                    "pause_on_hit": True,
+                },
+            )
+            breakpoint_id = armed.get("result", {}).get("id")
+            if not armed.get("ok") or not isinstance(breakpoint_id, int):
+                raise RuntimeError(f"exec breakpoint did not arm at frozen PC: {armed}")
+            interrupted_step = session.request("step", {"frames": 1, "unit": "frames"})
+            if (
+                not interrupted_step.get("ok")
+                or interrupted_step.get("result", {}).get("status") != "interrupted"
+                or interrupted_step.get("result", {}).get("reason") != "breakpoint"
+                or interrupted_step.get("result", {}).get("breakpoint_id") != breakpoint_id
+                or interrupted_step.get("result", {}).get("state") != "frozen"
+            ):
+                raise RuntimeError(
+                    "a pausing exec breakpoint did not preempt frame step: "
+                    f"{interrupted_step}"
+                )
+            hit_events = session.request("poll_events")
+            if not any(
+                event.get("type") == "breakpoint_hit"
+                and event.get("breakpoint_id") == breakpoint_id
+                for event in hit_events.get("result", {}).get("events", [])
+            ):
+                raise RuntimeError(
+                    f"interrupted step did not preserve its breakpoint event: {hit_events}"
+                )
+            listed = session.request("list_breakpoints")
+            if not any(
+                breakpoint.get("id") == breakpoint_id
+                for breakpoint in listed.get("result", {}).get("breakpoints", [])
+            ):
+                raise RuntimeError(
+                    f"interrupted step disarmed its persistent breakpoint: {listed}"
+                )
+            stopped = session.request("status")
+            if (
+                stopped.get("result", {}).get("state") != "frozen"
+                or stopped.get("result", {}).get("reason") != "breakpoint"
+            ):
+                raise RuntimeError(
+                    f"interrupted step did not retain the breakpoint halt: {stopped}"
+                )
+            cleared = session.request("clear_breakpoint", {"id": breakpoint_id})
+            if not cleared.get("ok"):
+                raise RuntimeError(f"failed to clear live-test breakpoint: {cleared}")
+
             stepped_frame = session.request("step", {"frames": 1, "unit": "frames"})
             if not stepped_frame.get("ok") or stepped_frame.get("result", {}).get(
                 "status"
@@ -449,6 +517,8 @@ end, emu.eventType.codeBreakIdleSavestate)
                         "pause_held_seconds": args.hold_seconds,
                         "burst_requests": burst_count,
                         "one_frame_step_exact": True,
+                        "breakpoint_preempted_frame_step": True,
+                        "breakpoint_remained_armed_after_step_interrupt": True,
                         "one_instruction_step_refroze": True,
                         "safe_frozen_save_preserved_halt": True,
                         "unsafe_frame_halt_rejected_save": True,

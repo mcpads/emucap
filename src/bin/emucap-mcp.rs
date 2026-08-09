@@ -570,7 +570,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Advance by an exact number of advertised frame or instruction boundaries and return frozen. Read allowed units and bounds from the live contract."
+        description = "Advance by an exact number of advertised frame or instruction boundaries and return frozen. A configured pausing debugger stop preempts the advance and returns status=interrupted with its stop evidence. Read allowed units and bounds from the live contract."
     )]
     async fn step(&self, Parameters(a): Parameters<StepArgs>) -> CallToolResult {
         let mut l = self.link();

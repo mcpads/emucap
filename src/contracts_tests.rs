@@ -111,6 +111,28 @@ fn public_step_and_compatibility_execution_methods_have_contract_owners() {
 }
 
 #[test]
+fn bounded_advance_features_require_pausing_stops_to_preempt_progress() {
+    for feature_id in [
+        "execution.step",
+        "execution.step-instructions-wire",
+        "execution.run-frames-wire",
+    ] {
+        let feature = catalog()
+            .features
+            .iter()
+            .find(|feature| feature.id == feature_id)
+            .unwrap_or_else(|| panic!("missing bounded advance feature {feature_id}"));
+        assert!(
+            feature
+                .expectations
+                .iter()
+                .any(|expectation| expectation == "TIME.STOP.1"),
+            "{feature_id} must preserve configured debugger stops"
+        );
+    }
+}
+
+#[test]
 fn dolphin_native_advertisement_exposes_its_composition_limits() {
     let value = advertisement_value(&[
         "dolphin.breakpoint.exact-exec-only",

@@ -11,6 +11,7 @@ local TRANSFER_ACCESS_SHA256 = "735c6cdf3c8cbddde4b754dc6eea6700888bb03e9cd3c77e
 local DEVICE_PORT_WRITE_SHA256 = "36ffca829da2ceb7f4b76f2d38b12331eade10014dd07ecd61f21403be8e4ca5"
 local INTERRUPT_DELIVERY_SHA256 = "c00494d891e76c380bd782d897c5f5ab4b59d918d49c3a64d78d9d4255c11e38"
 local OBJ_CONSUMPTION_SHA256 = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
+local CGRAM_LOOKUP_SHA256 = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
 local SNES_PPU_STATE_SHA256 = "21005a15437abd767cbeda5c7ede8741e2aeac4a006dafedede03a695377eaa2"
 local BASE_CAPABILITY_REVISION = "dea5c89d917c0e645296117dc9b14dcf089a49794dbe72b0319a104016a449bf"
 local SNES_STATE_CAPABILITY_REVISION = "7a63f4233406541101fdd078a4bd6ffbd1a9785efc24664355a6b491bd8f0efd"
@@ -18,9 +19,9 @@ local SNES_CAPABILITY_REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be78
 local BASE_SNAPSHOT_CAPABILITY_REVISION = "3314d6344f03df096660917a6087b19a62aece996402ecdd1ee992c87131d0aa"
 local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "ea526265eb6a5d6b229d568d2bfe7df503adc54032959a9f73eb361b5e6ade3f"
 local SNES_SNAPSHOT_CAPABILITY_REVISION = "3360ead44ccebf59a35aefcba6e5846d645188781682293b508a502343212782"
-local SNES_DEEP_CAPABILITY_REVISION = "a01b63fdb6b35a4268edbdffb9675621b6712a9e8095bb8f7594067d3ecd355a"
-local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "7385af79303c2e05fddb0c06963771180893cfdcc3d821031e78c869e2655970"
-local SNES_REPEATABLE_CAPABILITY_REVISION = "a569ed75dc69a68f8584fbe717ddecd2509f49043a330a6b5fce586c89651f83"
+local SNES_DEEP_CAPABILITY_REVISION = "1a684845aacb3a1f025d1b72be3664e4cdd520bb5d756e93a574b815e74be00b"
+local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "baaddde76371336e8a042df3f0a413b52cf5fd794b742d4ee0b92b01b908ff7d"
+local SNES_REPEATABLE_CAPABILITY_REVISION = "7f7c1c02af1cdfd226d7af673504f208229f4e4048642b7eaee00c421eab33bf"
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -114,10 +115,23 @@ local OBJ_CONSUMPTION_FIELDS = {
   int_field("scanline", 0xffff), int_field("dot", 0xffff), int_field("hclock", 0xffff),
 }
 
+local CGRAM_LOOKUP_FIELDS = {
+  int_field("address", 0xff), int_field("value", 0x7fff), int_field("layer", 5),
+  int_field("target", 2), int_field("pixel_x", 0xff), int_field("scanline", 0xffff),
+  int_field("dot", 0xffff), int_field("hclock", 0xffff),
+}
+
 local FILTERABLE_FIELDS = {
   snes_ppu_obj_consumption_read = {
     memory_kind = { min = 0, max = 1 },
     address = { min = 0, max = 0xffff },
+  },
+  snes_ppu_cgram_lookup = {
+    address = { min = 0, max = 0xff },
+    layer = { min = 0, max = 5 },
+    target = { min = 0, max = 2 },
+    pixel_x = { min = 0, max = 0xff },
+    scanline = { min = 0, max = 0xffff },
   },
 }
 
@@ -150,6 +164,10 @@ local EVENT_CONTRACTS = {
   },
   snes_ppu_obj_consumption_read = {
     digest = OBJ_CONSUMPTION_SHA256, clock = "snes_master", payload_fields = OBJ_CONSUMPTION_FIELDS,
+    stoppable = true,
+  },
+  snes_ppu_cgram_lookup = {
+    digest = CGRAM_LOOKUP_SHA256, clock = "snes_master", payload_fields = CGRAM_LOOKUP_FIELDS,
     stoppable = true,
   },
 }
@@ -239,6 +257,7 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       { "snes_device_port_write", DEVICE_PORT_WRITE_SHA256 },
       { "snes_interrupt_delivery", INTERRUPT_DELIVERY_SHA256 },
       { "snes_ppu_obj_consumption_read", OBJ_CONSUMPTION_SHA256, true },
+      { "snes_ppu_cgram_lookup", CGRAM_LOOKUP_SHA256, true },
     }) do
       local event = {
         id = item[1], contract_sha256 = item[2],
@@ -247,10 +266,14 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
         stoppable = EVENT_CONTRACTS[item[1]].stoppable or nil,
       }
       if item[3] then
-        event.filterable_fields = as_array({
-          { path = "memory_kind", kind = "u64_range", min = 0, max = 1 },
-          { path = "address", kind = "u64_range", min = 0, max = 0xffff },
-        })
+        local fields = {}
+        for _, path in ipairs(item[1] == "snes_ppu_obj_consumption_read"
+            and { "memory_kind", "address" }
+            or { "address", "layer", "target", "pixel_x", "scanline" }) do
+          local bounds = FILTERABLE_FIELDS[item[1]][path]
+          fields[#fields + 1] = { path = path, kind = "u64_range", min = bounds.min, max = bounds.max }
+        end
+        event.filterable_fields = as_array(fields)
       end
       event_classes[#event_classes + 1] = event
     end

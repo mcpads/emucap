@@ -4,6 +4,20 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.1
+
+### Added
+- Added an opt-in Mesen SNES event for bounded CGRAM renderer lookups. Its payload distinguishes
+  shared pre-routing, main-screen, and sub-screen reads without claiming final display contribution,
+  and supports capability-scoped filters and exact occurrence stops.
+
+### Fixed
+- Exact Mesen steps now let pausing debugger stops preempt the requested advance. The response
+  returns frozen interruption evidence while preserving the breakpoint and its hit event instead of
+  continuing past the stop.
+- Partial-frame recording stops now read terminal memory and state at the actual frozen terminal
+  frame, so published terminal members and manifest coordinates describe the same guest position.
+
 ## 0.14.0
 
 ### Added

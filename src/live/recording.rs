@@ -557,7 +557,7 @@ pub fn record_window(
             port,
             launch_id: &launch_id,
             capability_revision: &capability.revision,
-            final_frame: validation.f_end,
+            final_frame: validation.terminal.final_frame,
             cancellation: &control.cancellation,
         };
         let captured =
