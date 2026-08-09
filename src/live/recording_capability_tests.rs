@@ -381,6 +381,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
                     max: 5,
                 },
                 RecordingEventFilterField {
+                    path: "target".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 2,
+                },
+                RecordingEventFilterField {
                     path: "pixel_x".into(),
                     kind: RecordingEventFilterKind::U64Range,
                     min: 0,
@@ -418,12 +424,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         deep_without_snapshots.revision,
-        "7277dc80b730c662ef2d79e1aace4b54d710ac55babed41cc09f2c1bcae0931f"
+        "1a684845aacb3a1f025d1b72be3664e4cdd520bb5d756e93a574b815e74be00b"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "573de997b1913c6317d589f1e48fca8a9323c2308b6249a05605943a6812f8b9"
+        "baaddde76371336e8a042df3f0a413b52cf5fd794b742d4ee0b92b01b908ff7d"
     );
     capability.repeatability = Some(RecordingRepeatabilityCapability {
         profile: "mesen_snes_repeatable".into(),
@@ -435,7 +441,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "6f064e4d2790bd6113c8e304a76f022fdb8abf8d12ec5d2bea3e84599d7eb2a6"
+        "7f7c1c02af1cdfd226d7af673504f208229f4e4048642b7eaee00c421eab33bf"
     );
 }
 

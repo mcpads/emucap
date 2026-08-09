@@ -226,8 +226,8 @@
     {
       "id": "snes_ppu_cgram_lookup",
       "revision": 1,
-      "contract": "snes_ppu_cgram_lookup/v1;clock=snes_master:nondecreasing;frame=independent;phase=mesen-renderer-lookup-before-final-compositing;coverage=backdrop-obj-bg-and-mode7-cgram-word-reads;address=cgram-word-index;layer=0:bg1,1:bg2,2:bg3,3:bg4,4:obj,5:backdrop;pixel_x=renderer-output-column;dot-hclock=callback-time;direct-color=excluded-no-cgram-read;payload=address:u8,value:u15,layer:u3,pixel_x:u8,scanline:u16,dot:u16,hclock:u16",
-      "contract_sha256": "f4766b353a1e9111d66afe3c8cbc8be0b273c7f629e09ff8aaa98d1406d14780",
+      "contract": "snes_ppu_cgram_lookup/v1;clock=snes_master:nondecreasing;frame=independent;phase=mesen-renderer-lookup-before-final-compositing;coverage=backdrop-obj-bg-and-mode7-cgram-word-reads;address=cgram-word-index;layer=0:bg1,1:bg2,2:bg3,3:bg4,4:obj,5:backdrop;target=0:shared-pre-route,1:main-screen,2:sub-screen;pixel_x=renderer-output-column;dot-hclock=callback-time;direct-color=excluded-no-cgram-read;payload=address:u8,value:u15,layer:u3,target:u2,pixel_x:u8,scanline:u16,dot:u16,hclock:u16",
+      "contract_sha256": "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795",
       "clock_domain": "snes_master",
       "clock_order": "nondecreasing",
       "frame_relation": "independent",
@@ -236,6 +236,7 @@
         { "path": "address", "type": "u64", "min": 0, "max": 255 },
         { "path": "value", "type": "u64", "min": 0, "max": 32767 },
         { "path": "layer", "type": "u64", "min": 0, "max": 5 },
+        { "path": "target", "type": "u64", "min": 0, "max": 2 },
         { "path": "pixel_x", "type": "u64", "min": 0, "max": 255 },
         { "path": "scanline", "type": "u64", "min": 0, "max": 65535 },
         { "path": "dot", "type": "u64", "min": 0, "max": 65535 },

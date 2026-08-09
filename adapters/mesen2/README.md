@@ -139,11 +139,13 @@ the binary member travels over a separate authenticated Core-owned sink, and the
 to the exact instruction event. Runtimes without that callback omit both advertisements.
 The same opt-in profile can record `snes_ppu_cgram_lookup` when Mesen's renderer reads a CGRAM word
 for BG1-4, OBJ, or the backdrop. Its payload identifies the CGRAM word, exact 15-bit value, producer
-layer, output column, and callback-time PPU coordinates. It is filterable by address, layer,
-`pixel_x`, and scanline and can terminate on an exact filtered occurrence. This is a renderer lookup
-before final compositing, not proof that the color won priority or appeared in the displayed frame;
-direct-color paths do not emit it. The ordinary tool surface does not expose this adapter-specific
-class unless the caller opens the recording capability.
+layer, renderer target, output column, and callback-time PPU coordinates. Target `1` and `2` mean
+main and sub screen; target `0` is a shared lookup before screen routing and makes no later-use
+claim. It is filterable by address, layer, target, `pixel_x`, and scanline and can terminate on an
+exact filtered occurrence. This is a renderer lookup before final compositing, not proof that the
+color won priority or appeared in the displayed frame; direct-color paths do not emit it. The
+ordinary tool surface does not expose this adapter-specific class unless the caller opens the
+recording capability.
 At a frozen position, `status.reason` reports the most recent halt cause independently of whether
 that position is a proven frame boundary. An exact frame `step` changes the reason to `step` and
 leaves the new boundary eligible for another recording. Breakpoints, instruction halts, transport

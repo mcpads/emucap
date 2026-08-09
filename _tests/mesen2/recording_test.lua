@@ -7,7 +7,7 @@ local OBJ_EVALUATION_CONTRACT = "0d32bfc67347b3169fd77f9d30beb9c325c64db30f0081c
 local OBJ_HANDOFF_CONTRACT = "ad23c438ee6400f5f9cab84d877f490abe24670769e50efd2bf67d932d329bbc"
 local CPU_INSTRUCTION_CONTRACT = "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f2ae73ac4ba81c55af0"
 local OBJ_CONSUMPTION_CONTRACT = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
-local CGRAM_LOOKUP_CONTRACT = "f4766b353a1e9111d66afe3c8cbc8be0b273c7f629e09ff8aaa98d1406d14780"
+local CGRAM_LOOKUP_CONTRACT = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
 local REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be7890e318f9b8c4b218a2"
 local LAUNCH = "launch-01test"
 
@@ -107,6 +107,7 @@ local function cgram_lookup_payload(overrides)
     address = 0x80,
     value = 0x1234,
     layer = 4,
+    target = 1,
     pixel_x = 72,
     scanline = 40,
     dot = 94,
@@ -119,7 +120,7 @@ end
 do
   local capability = Recording.capability(function(value) return value end, true, false, true, true)
   equal(capability.revision,
-    "7277dc80b730c662ef2d79e1aace4b54d710ac55babed41cc09f2c1bcae0931f",
+    "1a684845aacb3a1f025d1b72be3664e4cdd520bb5d756e93a574b815e74be00b",
     "deep capability revision")
   equal(capability.event_order, "guest_emission", "cross-class event order")
   equal(#capability.event_classes, 12, "deep event class count")
@@ -147,6 +148,8 @@ do
     "CGRAM address filter")
   equal(capability.event_classes[12].filterable_fields[2].path, "layer",
     "CGRAM layer filter")
+  equal(capability.event_classes[12].filterable_fields[3].path, "target",
+    "CGRAM renderer-target filter")
   Recording.capability(function(value) return value end, true, false, false, true)
 end
 
@@ -155,7 +158,7 @@ do
   local capability = Recording.capability(
     function(value) return value end, true, true, true, true, conditions)
   equal(capability.revision,
-    "6f064e4d2790bd6113c8e304a76f022fdb8abf8d12ec5d2bea3e84599d7eb2a6",
+    "7f7c1c02af1cdfd226d7af673504f208229f4e4048642b7eaee00c421eab33bf",
     "repeatable capability revision")
   equal(capability.repeatability.profile, "mesen_snes_repeatable",
     "repeatable profile identity")
@@ -181,6 +184,7 @@ do
       terms = {
         { kind = "u64_range", path = "address", start = 0x80, length = 1 },
         { kind = "u64_range", path = "layer", start = 4, length = 1 },
+        { kind = "u64_range", path = "target", start = 1, length = 1 },
       },
     } },
     stop_on = { event_class = "snes_ppu_cgram_lookup", occurrence = 2 },
@@ -193,10 +197,13 @@ do
     state, "snes_ppu_cgram_lookup", 100, 2000, cgram_lookup_payload({ address = 0x7f })))
   local effect
   state, effect = Recording.semantic_event(
-    state, "snes_ppu_cgram_lookup", 100, 2001, cgram_lookup_payload())
+    state, "snes_ppu_cgram_lookup", 100, 2001, cgram_lookup_payload({ target = 2 }))
+  equal(effect, nil, "sub-screen CGRAM lookup is outside the main-screen filter")
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_cgram_lookup", 100, 2002, cgram_lookup_payload())
   equal(effect, nil, "first filtered CGRAM lookup continues")
   state, effect = Recording.semantic_event(
-    state, "snes_ppu_cgram_lookup", 100, 2002, cgram_lookup_payload({ pixel_x = 73 }))
+    state, "snes_ppu_cgram_lookup", 100, 2003, cgram_lookup_payload({ pixel_x = 73 }))
   equal(effect.kind, "terminal", "second filtered CGRAM lookup stops")
   local result = Recording.result(state, 1)
   equal(result.execution_outcome, "event_stop", "CGRAM event-stop outcome")

@@ -1254,7 +1254,8 @@ local function deep_payload(event_id, event)
       scanline = event.scanline, dot = event.dot, hclock = event.hClock }
   elseif event_id == "snes_ppu_cgram_lookup" then
     return { address = event.address, value = event.cgramValue, layer = event.layer,
-      pixel_x = event.pixelX, scanline = event.scanline, dot = event.dot, hclock = event.hClock }
+      target = event.rendererTarget, pixel_x = event.pixelX, scanline = event.scanline,
+      dot = event.dot, hclock = event.hClock }
   end
   return nil
 end

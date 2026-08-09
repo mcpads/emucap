@@ -110,7 +110,7 @@ fn obj_consumption(sequence: u64, frame: u64, tick: u64, address: u64) -> EventE
     }
 }
 
-fn cgram_lookup(sequence: u64, frame: u64, tick: u64, address: u64) -> EventEnvelope {
+fn cgram_lookup(sequence: u64, frame: u64, tick: u64, address: u64, target: u64) -> EventEnvelope {
     let identity = EventContractRegistry::builtin()
         .unwrap()
         .identities(["snes_ppu_cgram_lookup"])
@@ -129,6 +129,7 @@ fn cgram_lookup(sequence: u64, frame: u64, tick: u64, address: u64) -> EventEnve
             "address": address,
             "value": 0x1234,
             "layer": 4,
+            "target": target,
             "pixel_x": 72,
             "scanline": 40,
             "dot": 94,
@@ -461,24 +462,31 @@ fn accepts_only_events_inside_the_declared_payload_filter() {
 }
 
 #[test]
-fn validates_cgram_lookup_payload_and_declared_address_filter() {
+fn distinguishes_main_and_sub_cgram_lookup_targets() {
     let registry = EventContractRegistry::builtin().unwrap();
     let classes = registry
         .identities(["frame_boundary", "snes_ppu_cgram_lookup"])
         .unwrap();
     let filters = vec![EventClassFilter {
         event_class: "snes_ppu_cgram_lookup".into(),
-        terms: vec![EventFilterTerm::U64Range {
-            path: "address".into(),
-            start: 0x80,
-            length: 1,
-        }],
+        terms: vec![
+            EventFilterTerm::U64Range {
+                path: "address".into(),
+                start: 0x80,
+                length: 1,
+            },
+            EventFilterTerm::U64Range {
+                path: "target".into(),
+                start: 1,
+                length: 1,
+            },
+        ],
     }];
     let file = tempfile::NamedTempFile::new().unwrap();
-    let validate_address = |address| {
+    let validate_lookup = |address, target| {
         fs::write(
             file.path(),
-            bytes(&[event(0, 10), cgram_lookup(1, 10, 12_345, address)]),
+            bytes(&[event(0, 10), cgram_lookup(1, 10, 12_345, address, target)]),
         )
         .unwrap();
         validate_event_stream(
@@ -497,14 +505,19 @@ fn validates_cgram_lookup_payload_and_declared_address_filter() {
         )
     };
 
-    assert_eq!(validate_address(0x80).unwrap().records, 2);
+    assert_eq!(validate_lookup(0x80, 1).unwrap().records, 2);
     assert!(matches!(
-        validate_address(0x81),
+        validate_lookup(0x81, 1),
+        Err(EventValidationError::EventOutsideFilter(class))
+            if class == "snes_ppu_cgram_lookup"
+    ));
+    assert!(matches!(
+        validate_lookup(0x80, 2),
         Err(EventValidationError::EventOutsideFilter(class))
             if class == "snes_ppu_cgram_lookup"
     ));
 
-    let mut invalid = cgram_lookup(1, 10, 12_345, 0x80);
+    let mut invalid = cgram_lookup(1, 10, 12_345, 0x80, 1);
     invalid.payload["value"] = json!(0x8000);
     fs::write(file.path(), bytes(&[event(0, 10), invalid])).unwrap();
     assert!(matches!(

@@ -28,6 +28,7 @@ EVENT_PROFILES = {
         "filters": (
             ("address", 0, 1),
             ("layer", 5, 1),
+            ("target", 1, 1),
         ),
     },
 }
