@@ -38,6 +38,7 @@ local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
 local Dump = require("emucap_dump")
 local Deferred = require("emucap_deferred")
+local Step = require("emucap_step")
 local FreezeState = require("emucap_freeze_state")
 local Memory = require("emucap_memory")
 local Recording = require("emucap_recording")
@@ -114,9 +115,7 @@ local halt_savestate_safe = false
 -- 정지 진입의 linearization point를 고정하고, 비싼 emu.getState() 직렬화를 요청마다 반복하지 않는다.
 -- native halt 중 guest time은 불변이므로 명시적 step/resume에서만 이 스냅샷을 무효화한다.
 local freeze_snapshot = nil
-local pending_step_id = nil   -- step(n) 완료 응답 대기
-local step_remaining = 0       -- step(n)의 남은 단위(청크로 나눠 진행)
-local step_unit = "frames"    -- "frames"(ppuFrame) | "instructions"(stepType.step)
+local step_operation = nil    -- exact step transaction; owns chunking and terminal result
 local STEP_CHUNK = 30          -- 프레임 step 청크(≤1s, keepalive 보장)
 local INSTR_CHUNK = 20000      -- 명령 step 청크(≤1s 안에서 keepalive)
 local TX_CAP = tonumber(os.getenv("EMUCAP_TX_CAP") or "") or (8 * 1024 * 1024)
@@ -154,6 +153,16 @@ local VRAM_RECON_BUDGET = 100000000
 local events = {}              -- poll_events로 드레인
 local dropped = 0              -- 큐 상한 초과로 버린 이벤트 수
 local CPU = nil                -- emu.cpuType.snes (로드 시 설정)
+
+local function queue_event(event, preserve_latest)
+  if #events >= EVENT_CAP then
+    dropped = dropped + 1
+    if not preserve_latest then return false end
+    table.remove(events, 1)
+  end
+  events[#events + 1] = event
+  return true
+end
 
 -- 실행추적(콜스택 + 트레이스): set_trace로 켜면 매 명령 exec 콜백이 (a) 콜스택을 shadow-track
 -- (call push, pop은 SP 되돌아옴으로 감지 — 스택 손상에도 robust), (b) 최근 명령 링버퍼를 채운다. 매 명령이라
@@ -850,6 +859,29 @@ local function flush_deferred(status, reason, bp_id)
   apply_deferred_effect(effect)
 end
 
+local function apply_step_terminal(effect)
+  if effect then reply_ok(effect.id, effect.result) end
+end
+
+-- A configured debugger stop preempts every request-owned guest advance. STATE remains "frozen"
+-- while exact step chunks run, so active operation ownership—not the display state—decides whether
+-- breakExecution must abort the current chunk.
+local function halt_for_debug_stop(reason, bp_id)
+  local step_active = Step.active(step_operation)
+  local deferred_active = deferred ~= nil
+  if STATE == "frozen" and not step_active and not deferred_active then return false end
+
+  flush_deferred("interrupted", reason, bp_id)
+  local effect
+  step_operation, effect = Step.interrupt(step_operation, reason, bp_id, frame)
+  apply_step_terminal(effect)
+  STATE = "frozen"
+  freeze_state = FreezeState.halt(reason, false)
+  freeze_snapshot = nil
+  emu.breakExecution()
+  return true
+end
+
 -- full-range exec 콜백(save/load/probe·watch_register·set_trace)의 상한. 대부분 24비트(0xFFFFFF)면 CPU 실행
 -- 주소를 다 덮지만, GBA(ARM7)는 카트ROM 0x08000000·EWRAM 0x02000000에서 실행하므로 24비트 콜백은 절대
 -- 발화하지 않는다(save_state가 영영 안 끝남). SYS.exec_range_max로 32비트 주소공간을 덮게 한다(SNES/GG/GB는
@@ -1291,7 +1323,7 @@ local function resolve_recording_effect(effect, frame_boundary_proven)
 end
 
 local function recording_conflict()
-  if recording or recording_reset or deferred or pending_step_id or pending_io or input_hold then
+  if recording or recording_reset or deferred or Step.active(step_operation) or pending_io or input_hold then
     return "a conflicting temporal operation or input override is active"
   end
   if #recording_hook_refs > 0 then
@@ -1394,13 +1426,12 @@ end
 -- replacement MCP from ever completing its handshake. Preserve emulator/freeze state, but cancel
 -- only request-scoped work and release a transient press hold.
 abort_inflight = function()
-  local cancelled = deferred ~= nil or pending_step_id ~= nil or pending_io ~= nil
+  local cancelled = deferred ~= nil or Step.active(step_operation) or pending_io ~= nil
     or recording ~= nil or recording_reset ~= nil
   local deferred_effect
   deferred, deferred_effect = Deferred.cancel(deferred)
   apply_deferred_effect(deferred_effect)
-  pending_step_id = nil
-  step_remaining = 0
+  step_operation = Step.cancel(step_operation)
   if pending_io and pending_io.ref then
     pcall(emu.removeMemoryCallback, pending_io.ref, emu.callbackType.exec, IO_LO, IO_HI, CPU)
   end
@@ -1506,53 +1537,37 @@ local function record_hit(bp, addr, value)
     local pc = full_pc(st)
     if pc < bp.pc_min or pc > bp.pc_max then return end
   end
-  if #events >= EVENT_CAP then
-    dropped = dropped + 1
-  else
-    local ev = {
-      type = "breakpoint_hit", breakpoint_id = bp.id, kind = bp.kind,
-      address = addr, value = value or 0, pc = full_pc(st), frame = frame,
-    }
-    -- write BP가 시스템 데이터 포트에 걸렸으면 목적지 주소를 이벤트에 라벨링(런타임 타일맵 추적: CPU의
-    -- 소량 직접 포트 쓰기가 "어느 워드주소로 갔나"를 PC·값과 함께 답하게). 포트 의미는 ISA별이라
-    -- SYS.port_semantics로 위임 — SNES만 $2118/$2122/$2104를 라벨하고, 없는 시스템(GG 등)은 평범한 메모리
-    -- 접근이라 아무 것도 안 붙인다(SNES 하드코딩 누수 제거).
-    if bp.kind == "write" and SYS.port_semantics then
-      SYS.port_semantics(ev, addr, st)
-    end
-    -- 히트 순간 atomic 스냅샷: freeze 후 read 사이 워치독-회피 step(1) 드리프트(+데드맨)로 ZP 등
-    -- 명령단위 상태가 호출마다 변해 "히트 순간"을 못 잡는다. 그래서 히트 시점에 레지스터(항상)와
-    -- set_breakpoint의 snapshot 스펙(mt:addr:len) 메모리를 여기서 잡아 이벤트에 실어 보존 → 이후 드리프트 무관.
-    -- 레지스터 세트는 ISA별이라 SYS.snapshot_regs로 위임(SNES=65816, GG=Z80). pc는 두 ISA 공통(full_pc가
-    -- 뱅크 없는 Z80에선 cpu.pc로 축약).
-    ev.regs = SYS.snapshot_regs(st)
-    ev.regs.pc = full_pc(st)
-    ev.bank = bank_for_pc(st)              -- pc의 ROM 뱅크(GG/GB), 아니면 nil. addr 아닌 pc 기준
-    if bp.snapshot_specs then ev.snapshot = capture_snapshot_specs(bp.snapshot_specs) end
-    events[#events + 1] = ev
+  local ev = {
+    type = "breakpoint_hit", breakpoint_id = bp.id, kind = bp.kind,
+    address = addr, value = value or 0, pc = full_pc(st), frame = frame,
+  }
+  -- write BP가 시스템 데이터 포트에 걸렸으면 목적지 주소를 이벤트에 라벨링(런타임 타일맵 추적: CPU의
+  -- 소량 직접 포트 쓰기가 "어느 워드주소로 갔나"를 PC·값과 함께 답하게). 포트 의미는 ISA별이라
+  -- SYS.port_semantics로 위임 — SNES만 $2118/$2122/$2104를 라벨하고, 없는 시스템(GG 등)은 평범한 메모리
+  -- 접근이라 아무 것도 안 붙인다(SNES 하드코딩 누수 제거).
+  if bp.kind == "write" and SYS.port_semantics then
+    SYS.port_semantics(ev, addr, st)
   end
-  if bp.pause_on_hit and STATE ~= "frozen" then
-    flush_deferred("interrupted", "breakpoint", bp.id)   -- 진행 중 지연 명령 마무리
-    STATE = "frozen"; freeze_state = FreezeState.halt("breakpoint", false)
-    emu.breakExecution()
-  end
+  -- 히트 순간 atomic 스냅샷: freeze 후 read 사이 워치독-회피 step(1) 드리프트(+데드맨)로 ZP 등
+  -- 명령단위 상태가 호출마다 변해 "히트 순간"을 못 잡는다. 그래서 히트 시점에 레지스터(항상)와
+  -- set_breakpoint의 snapshot 스펙(mt:addr:len) 메모리를 여기서 잡아 이벤트에 실어 보존 → 이후 드리프트 무관.
+  -- 레지스터 세트는 ISA별이라 SYS.snapshot_regs로 위임(SNES=65816, GG=Z80). pc는 두 ISA 공통(full_pc가
+  -- 뱅크 없는 Z80에선 cpu.pc로 축약).
+  ev.regs = SYS.snapshot_regs(st)
+  ev.regs.pc = full_pc(st)
+  ev.bank = bank_for_pc(st)              -- pc의 ROM 뱅크(GG/GB), 아니면 nil. addr 아닌 pc 기준
+  if bp.snapshot_specs then ev.snapshot = capture_snapshot_specs(bp.snapshot_specs) end
+  queue_event(ev, bp.pause_on_hit)
+  if bp.pause_on_hit then halt_for_debug_stop("breakpoint", bp.id) end
 end
 
 -- 레지스터 범위 break: 매 명령 exec 콜백에서 호출. 레지스터가 [lo,hi] 벗어나면 그 명령에서 freeze.
 local function record_reg_hit(bp, pc, v)
-  if #events >= EVENT_CAP then
-    dropped = dropped + 1
-  else
-    events[#events + 1] = {
-      type = "register_break", breakpoint_id = bp.id, register = bp.register,
-      value = v, min = bp.min, max = bp.max, pc = pc, frame = frame,
-    }
-  end
-  if bp.pause_on_hit and STATE ~= "frozen" then
-    flush_deferred("interrupted", "register_break", bp.id)
-    STATE = "frozen"; freeze_state = FreezeState.halt("register_break", false)
-    emu.breakExecution()
-  end
+  queue_event({
+    type = "register_break", breakpoint_id = bp.id, register = bp.register,
+    value = v, min = bp.min, max = bp.max, pc = pc, frame = frame,
+  }, bp.pause_on_hit)
+  if bp.pause_on_hit then halt_for_debug_stop("register_break", bp.id) end
 end
 
 -- 레지스터 범위 워치: full-range exec 콜백에서 매 명령 레지스터를 보고 [min,max] 벗어나면 break.
@@ -1684,9 +1699,9 @@ local function setup_vram_recon_bp(bp, budget)
   bp.recon_lo, bp.recon_hi = 0, EXEC_MAX
   bp.seen, bp.budget = 0, budget
   bp.ref = emu.addMemoryCallback(function(pc, opcode)
-    -- freeze 중(Mesen 1초 워치독 회피용 codeBreak 재무장의 step 드리프트)엔 아무 것도 안 한다: per-instruction
-    -- 콜백이 드리프트 명령에 재히트하거나 예산을 태우지 않게. BP는 무장을 유지하고 resume 때 다시 작동한다.
-    if STATE == "frozen" then return end
+    -- 실제 정지 중에는 per-instruction 콜백을 무시해 예산을 태우지 않는다. Exact step은 STATE를
+    -- frozen으로 유지한 채 guest를 진행하므로 예외이며, 그 transaction 안에서도 BP가 발화해야 한다.
+    if STATE == "frozen" and not Step.active(step_operation) then return end
     if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
     bp.seen = bp.seen + 1
     if bp.seen > bp.budget then            -- 예산 초과: 자동해제(무기한 per-instruction으로 emu 스레드 굶김 방지)
@@ -1752,11 +1767,7 @@ function handlers.set_breakpoint(p)
       local state = emu.getState()
       local scanline = state["ppu.scanline"]
       if scanline == nil or scanline < bp.start or scanline > bp.end_ then return end
-      if #events >= EVENT_CAP then
-        if not bp.pause_on_hit then dropped = dropped + 1; return end
-        table.remove(events, 1)
-        dropped = dropped + 1
-      end
+      if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
       local event = {
         type = "device_event",
         breakpoint_id = id,
@@ -1772,11 +1783,8 @@ function handlers.set_breakpoint(p)
         forced_blank = state["ppu.forcedBlank"] or false,
       }
       if bp.snapshot_specs then event.snapshot = capture_snapshot_specs(bp.snapshot_specs) end
-      events[#events + 1] = event
-      if bp.pause_on_hit and STATE ~= "frozen" then
-        flush_deferred("interrupted", bp.kind, id)
-        STATE = "frozen"; freeze_state = FreezeState.halt(bp.kind, false); emu.breakExecution()
-      end
+      queue_event(event, bp.pause_on_hit)
+      if bp.pause_on_hit then halt_for_debug_stop(bp.kind, id) end
     end, event_type)
     breakpoints[id] = bp
     return true, { id = id, mechanism = "snes_ppu_obj_event" }
@@ -1791,14 +1799,10 @@ function handlers.set_breakpoint(p)
       -- 전에 즉시 드롭. pausing BP는 첫 히트에서 freeze해 스스로 멈추므로 예외.
       if #events >= EVENT_CAP and not bp.pause_on_hit then dropped = dropped + 1; return end
       local st = emu.getState()
-      if #events < EVENT_CAP then
-        events[#events + 1] = { type = "breakpoint_hit", breakpoint_id = id, kind = p.kind,
-          address = 0, value = 0, pc = full_pc(st), bank = bank_for_pc(st), frame = frame }
-      else dropped = dropped + 1 end
-      if bp.pause_on_hit and STATE ~= "frozen" then
-        flush_deferred("interrupted", p.kind, id)
-        STATE = "frozen"; freeze_state = FreezeState.halt(p.kind, false); emu.breakExecution()
-      end
+      queue_event({ type = "breakpoint_hit", breakpoint_id = id, kind = p.kind,
+        address = 0, value = 0, pc = full_pc(st), bank = bank_for_pc(st), frame = frame },
+        bp.pause_on_hit)
+      if bp.pause_on_hit then halt_for_debug_stop(p.kind, id) end
     end, evtype)
     breakpoints[id] = bp
     return true, { id = id }
@@ -1844,14 +1848,10 @@ function handlers.set_breakpoint(p)
         if #kept == 0 then return end          -- 관심 채널 없음 → 스킵(플러드 제거)
         chans = kept
       end
-      if #events < EVENT_CAP then
-        events[#events + 1] = { type = "dma", breakpoint_id = id, address = addr, mdmaen = value,
-          channels = as_array(chans), pc = full_pc(st), bank = bank_for_pc(st), frame = frame }
-      else dropped = dropped + 1 end
-      if bp.pause_on_hit and STATE ~= "frozen" then
-        flush_deferred("interrupted", "dma", id)
-        STATE = "frozen"; freeze_state = FreezeState.halt("dma", false); emu.breakExecution()
-      end
+      queue_event({ type = "dma", breakpoint_id = id, address = addr, mdmaen = value,
+        channels = as_array(chans), pc = full_pc(st), bank = bank_for_pc(st), frame = frame },
+        bp.pause_on_hit)
+      if bp.pause_on_hit then halt_for_debug_stop("dma", id) end
     end
     for _, reg in ipairs(regs) do
       bp.dma_refs[#bp.dma_refs + 1] = { ref = emu.addMemoryCallback(on_dma, bp.cbtype, reg, reg, CPU), reg = reg }
@@ -2034,13 +2034,8 @@ function handlers.break_on_reset(p)
     local handler = emu.read16(SYS.reset_vector, emu.memType[SYS.default_memtype], false)  -- 리셋벡터
     reset_bp = { handler = handler }
     reset_bp.ref = emu.addMemoryCallback(function(addr, value)
-      if #events < EVENT_CAP then
-        events[#events + 1] = { type = "crash", reason = "reset_vector", pc = addr, frame = frame }
-      else dropped = dropped + 1 end
-      if STATE ~= "frozen" then
-        flush_deferred("interrupted", "crash", 0)
-        STATE = "frozen"; freeze_state = FreezeState.halt("crash", false); emu.breakExecution()
-      end
+      queue_event({ type = "crash", reason = "reset_vector", pc = addr, frame = frame }, true)
+      halt_for_debug_stop("crash", 0)
     end, emu.callbackType.exec, handler, handler, CPU)
     return true, { watching = true, handler = handler }
   elseif not on and reset_bp then
@@ -2293,9 +2288,8 @@ local function handle_in_freeze(line)
   elseif method == "step" then
     local count, err = bounded_sync_count(p.frames, 1, false)
     if not count then reply_err(id, "bad_params", err); return nil end
-    step_unit = (p.unit == "instructions") and "instructions" or "frames"
-    step_remaining = count
-    pending_step_id = id   -- 완료 응답은 청크들이 끝난 뒤
+    local unit = (p.unit == "instructions") and "instructions" or "frames"
+    step_operation = Step.start(session_epoch, id, unit, count)
     freeze_state = FreezeState.halt("step", false)
     return "step"
   elseif method == "pause" then
@@ -2335,13 +2329,12 @@ end
 local function do_step_chunk()
   -- 명시적 step은 위치를 전진시키므로 freeze 스냅샷을 무효화 → 다음 get_state가 새 위치에서 재캡처.
   freeze_snapshot = nil
-  if step_unit == "instructions" then
-    local chunk = math.min(step_remaining, INSTR_CHUNK)
-    step_remaining = step_remaining - chunk
+  local unit = step_operation.unit
+  local chunk
+  step_operation, chunk = Step.take_chunk(step_operation, STEP_CHUNK, INSTR_CHUNK)
+  if unit == "instructions" then
     emu.step(chunk, emu.stepType.step)   -- CPU 명령 단위
   else
-    local chunk = math.min(step_remaining, STEP_CHUNK)
-    step_remaining = step_remaining - chunk
     emu.step(chunk, emu.stepType.ppuFrame)
   end
 end
@@ -2386,14 +2379,17 @@ local function service_frozen_once()
   if conn and Tx.pending(tx) and flush_tx() == "restarting" then return end
 
   -- 직전 explicit step 청크가 다시 halt한 지점. response가 막혀 있으면 guest를 더 진행하지 않는다.
-  if pending_step_id then
+  if Step.active(step_operation) then
     if Tx.pending(tx) then return end
-    if step_remaining <= 0 then
-      freeze_state = FreezeState.after_step(step_unit)
-      reply_ok(pending_step_id, { status = "completed", frame = frame })
-      pending_step_id = nil
+    local effect
+    step_operation, effect = Step.complete(step_operation, frame)
+    if effect then
+      freeze_state = FreezeState.after_step(effect.result.unit)
+      apply_step_terminal(effect)
     else
-      send_line(string.format('{"id":%d,"ok":true,"result":{"status":"working"}}', pending_step_id))
+      send_line(string.format(
+        '{"id":%d,"ok":true,"result":{"status":"working"}}',
+        step_operation.id))
       do_step_chunk()
     end
     return
@@ -2516,7 +2512,7 @@ emu.addEventCallback(function()
   -- A startFrame while frozen means the host was resumed outside the adapter. Explicit adapter
   -- steps are the exception: they may cross a frame boundary before returning to the native halt.
   if STATE == "frozen" then
-    if pending_step_id then return end
+    if Step.active(step_operation) then return end
     STATE = "running"
     freeze_start_ms = nil
     freeze_disc_ms = nil

@@ -109,6 +109,11 @@
       "expression": "G(completed(advance(unit,n)) => delta_counter(unit) = n)"
     },
     {
+      "id": "TIME.STOP.1",
+      "category": "temporal",
+      "expression": "G(active(advance(q)) and pausing_stop_hit(h) => recorded(h) and F<=I_h (interrupted(q,reason(h)) and effect_terminal(q) and frozen) and no_guest_progress_after(h))"
+    },
+    {
       "id": "TIME.PERSISTENT.1",
       "category": "temporal",
       "expression": "G(persistent_owned and status_requested => status_reports_owner) and G(persistent_owned => persistent_owned W (explicit_release or generation_terminated))"
@@ -616,7 +621,7 @@
       "methods": ["run_frames"],
       "temporal_classes": ["T2"],
       "disposition": "retain",
-      "expectations": ["TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
+      "expectations": ["TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1"]
     },
     {
       "id": "execution.step",
@@ -624,7 +629,7 @@
       "methods": ["step"],
       "temporal_classes": ["T1"],
       "disposition": "retain",
-      "expectations": ["EXEC.STEP.FRAME.1", "EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.GAP.1"]
+      "expectations": ["EXEC.STEP.FRAME.1", "EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.STOP.1", "TIME.GAP.1"]
     },
     {
       "id": "execution.step-instructions-wire",
@@ -632,7 +637,7 @@
       "methods": ["step_instructions"],
       "temporal_classes": ["T1"],
       "disposition": "retain",
-      "expectations": ["EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.GAP.1"]
+      "expectations": ["EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.STOP.1", "TIME.GAP.1"]
     },
     {
       "id": "execution.reset",
