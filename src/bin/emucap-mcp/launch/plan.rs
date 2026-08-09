@@ -948,6 +948,14 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
                 "reason": "local pc9801rs headless set lacks the default pc9801_26 sound-card ROM"
             }
         })
+    } else if adapter == "mednafen" {
+        serde_json::json!({
+            "EMUCAP_MEDNAFEN_FIRMWARE": {
+                "default": emucap::launch::mednafen::default_firmware_root().display().to_string(),
+                "applies_when": "canonical Mednafen BIOS files are available",
+                "reason": "known BIOS files are copied into the emucap-owned per-port Mednafen home; ~/.mednafen is never used"
+            }
+        })
     } else if adapter == "flycast" {
         serde_json::json!({
             "EMUCAP_MUTE": {
@@ -997,9 +1005,9 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         blocked_launch_action(content_path, system, &launch_blockers)
     };
     let bios_required = match system {
-        "saturn" => serde_json::json!("Saturn BIOS under ~/.mednafen/firmware/: sega_101.bin for JP or mpr-17933.bin for US. Boot fails when the required BIOS is absent."),
-        "psx" => serde_json::json!("PSX BIOS under ~/.mednafen/firmware/: scph5500.bin for JP, scph5501.bin for US, or scph5502.bin for EU."),
-        "pce" => serde_json::json!("CD-ROM content requires ~/.mednafen/firmware/syscard3.pce. HuCard ROMs do not."),
+        "saturn" => serde_json::json!("Place sega_101.bin for JP or mpr-17933.bin for NA/EU in the shared emucap firmware directory, or set EMUCAP_MEDNAFEN_FIRMWARE to an absolute inventory directory. The launcher copies it into an isolated profile."),
+        "psx" => serde_json::json!("Place scph5500.bin for JP, scph5501.bin for NA, or scph5502.bin for EU in the shared emucap firmware directory, or set EMUCAP_MEDNAFEN_FIRMWARE to an absolute inventory directory."),
+        "pce" => serde_json::json!("CD-ROM content requires syscard3.pce in the shared emucap firmware directory or EMUCAP_MEDNAFEN_FIRMWARE inventory. HuCard ROMs do not."),
         "pcfx" => serde_json::json!("Requires the PC-FX BIOS version 1.00. Set EMUCAP_PCFX_BIOS to an absolute pcfx.rom path or place it under the emucap-owned firmware directory."),
         "pc98" => serde_json::json!("Requires the MAME pc9801rs machine ROM set. The build script installs it; launch may otherwise fail before connection."),
         "neogeo_mvs" => serde_json::json!("Requires MAME neogeo.zip BIOS and a game-specific MVS .zip ROM set. Set EMUCAP_NEOGEO_BIOS or place neogeo.zip beside the game set."),
@@ -1043,7 +1051,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         } else if adapter == "mupen64plus" {
             "Nintendo 64 launch is headless by default and uses an emucap-owned Mupen64Plus configuration. launch(display:true) explicitly loads the pinned Rice video plugin."
         } else if adapter == "mednafen" {
-            "Mednafen Rust launch is the supported detached path; do not hand-roll raw nohup."
+            "Mednafen Rust launch is the supported detached path. It uses an emucap-owned per-port home and does not read or change ~/.mednafen; do not hand-roll raw nohup."
         } else if adapter == "flycast" {
             "Flycast renders a GUI window and needs the display awake. Rust launch uses an emucap-owned isolated config copy and forces the interpreter when needed; do not run Flycast.app directly."
         } else if adapter == "ppsspp" {
@@ -1062,6 +1070,12 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             })
         } else {
             serde_json::Value::Null
+        },
+        "start_frozen_contract": {
+            "supported": adapter == "mesen2" || adapter == "mednafen",
+            "boundary": if adapter == "mesen2" || adapter == "mednafen" { serde_json::json!("pre_first_instruction") } else { serde_json::Value::Null },
+            "request_with": "launch(..., start_frozen:true)",
+            "repeatable_initial_conditions": system == "snes"
         },
         "next_action": next_action
     })

@@ -313,6 +313,21 @@ pub trait EmulatorLink {
     /// Discard the current front-side session after an adapter has acknowledged an operation that
     /// recreates its transport. The emulator process and launch generation remain intact.
     fn prepare_reconnect(&mut self) {}
+    /// Explicitly bind this control process to one exact returned managed generation. Automatic
+    /// reconnect remains a separate same-control-session path; implementations that do not own a
+    /// direct runtime location reject this operation.
+    fn reattach_runtime(&mut self, _expected_launch_id: &str) -> Result<Value, LinkError> {
+        Err(LinkError::Emulator {
+            kind: "unsupported".into(),
+            message: "this link does not support explicit managed runtime reattachment".into(),
+        })
+    }
+    /// Whether an unmanaged live connection is protected by one exclusive application control
+    /// session. Managed generations use their durable lease instead. Shared or unknown links must
+    /// keep the default false so mutation cannot pass merely because no capsule port is visible.
+    fn has_exclusive_control(&self) -> bool {
+        false
+    }
     /// Direct-mode search starting point. This is not a listener endpoint and must never be passed
     /// to an emulator as though it had already been reserved.
     fn base_port(&self) -> Option<u16> {
@@ -372,6 +387,12 @@ pub trait EmulatorLink {
     /// Public live-generation candidates when direct automatic reattachment is ambiguous or held
     /// by a still-live lease. Empty for links without a direct port range.
     fn runtime_candidates(&self) -> Vec<Value> {
+        Vec::new()
+    }
+    /// Bounded public inventory of live managed generations in the configured direct listener
+    /// range. This is discovery only: returning an entry never grants control or exposes a private
+    /// reclaim capability.
+    fn runtime_reservations(&self) -> Vec<Value> {
         Vec::new()
     }
 }

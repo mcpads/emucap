@@ -19,6 +19,7 @@ const OPERATIONS: &[&str] = &[
     "find_pattern",
     "dump_memory",
     "probe",
+    "power_cycle",
     "get_video_state",
     "resolve_tile",
     "set_layer_enable",
@@ -88,6 +89,12 @@ pub(crate) fn describe(status: &Value) -> Value {
         status,
         "probe",
         "Atomically restore, advance, and read one memory value.",
+    );
+    add::<EmptyArgs>(
+        &mut operations,
+        status,
+        "power_cycle",
+        "Invoke the runtime's native full-reload boundary and return only after the same launch generation and content selection reconnect. This does not prove that battery data reached storage.",
     );
     add::<EmptyArgs>(
         &mut operations,
@@ -220,6 +227,10 @@ pub(crate) async fn execute(
         },
         "probe" => match analysis_surface::parse_arguments(&operation, arguments.arguments) {
             Ok(values) => server.probe(Parameters(values)).await,
+            Err(error) => invalid_request_result(error),
+        },
+        "power_cycle" => match analysis_surface::parse_arguments(&operation, arguments.arguments) {
+            Ok(values) => server.power_cycle(Parameters(values)).await,
             Err(error) => invalid_request_result(error),
         },
         "get_video_state" => {

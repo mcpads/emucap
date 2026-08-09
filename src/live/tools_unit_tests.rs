@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use super::{reset, watch_register, LinkError, ToolOutput};
+use super::{power_cycle, reset, watch_register, LinkError, ToolOutput};
 use crate::live::link::{Capabilities, EmulatorLink, FakeLink};
 use serde_json::json;
 
@@ -9,6 +9,8 @@ struct ResetReconnectLink {
     status_results: VecDeque<Result<serde_json::Value, LinkError>>,
     prepared: bool,
     calls: Vec<String>,
+    operation: &'static str,
+    replacement_launch_id: Option<&'static str>,
 }
 
 impl EmulatorLink for ResetReconnectLink {
@@ -23,12 +25,24 @@ impl EmulatorLink for ResetReconnectLink {
     ) -> Result<serde_json::Value, LinkError> {
         self.calls.push(method.to_string());
         match method {
-            "reset" => Ok(json!({"reset": true, "reconnect": true})),
+            method if method == self.operation => Ok(json!({
+                self.operation: true,
+                "reconnect": true
+            })),
             "status" => {
                 assert!(self.prepared, "old transport must be discarded first");
-                self.status_results
+                let result = self
+                    .status_results
                     .pop_front()
-                    .unwrap_or(Err(LinkError::NotConnected))
+                    .unwrap_or(Err(LinkError::NotConnected));
+                if result.as_ref().ok().is_some_and(|status| {
+                    status.get("connected").and_then(serde_json::Value::as_bool) == Some(true)
+                }) {
+                    if let Some(launch_id) = self.replacement_launch_id {
+                        self.caps.identity.launch_id = Some(launch_id.into());
+                    }
+                }
+                result
             }
             other => panic!("unexpected method: {other}"),
         }
@@ -49,6 +63,8 @@ fn reset_waits_for_replacement_session() {
         ]),
         prepared: false,
         calls: Vec::new(),
+        operation: "reset",
+        replacement_launch_id: None,
     };
 
     let result = reset(&mut link).unwrap();
@@ -61,6 +77,52 @@ fn reset_waits_for_replacement_session() {
         }))
     );
     assert_eq!(link.calls, ["reset", "status", "status"]);
+}
+
+#[test]
+fn power_cycle_waits_for_replacement_session() {
+    let mut link = ResetReconnectLink {
+        caps: Capabilities::empty(),
+        status_results: VecDeque::from([
+            Err(LinkError::NotConnected),
+            Ok(json!({"connected": true, "state": "running"})),
+        ]),
+        prepared: false,
+        calls: Vec::new(),
+        operation: "power_cycle",
+        replacement_launch_id: None,
+    };
+
+    let result = power_cycle(&mut link).unwrap();
+    assert_eq!(
+        result,
+        ToolOutput::Json(json!({
+            "power_cycle": true,
+            "reconnected": true,
+            "state": "running"
+        }))
+    );
+    assert_eq!(link.calls, ["power_cycle", "status", "status"]);
+}
+
+#[test]
+fn reconnecting_operation_rejects_a_replacement_launch_generation() {
+    let mut caps = Capabilities::empty();
+    caps.identity.launch_id = Some("launch-original".into());
+    let mut link = ResetReconnectLink {
+        caps,
+        status_results: VecDeque::from([Ok(json!({
+            "connected": true,
+            "state": "running"
+        }))]),
+        prepared: false,
+        calls: Vec::new(),
+        operation: "power_cycle",
+        replacement_launch_id: Some("launch-replacement"),
+    };
+
+    let error = power_cycle(&mut link).unwrap_err();
+    assert!(matches!(error, LinkError::Emulator { ref kind, .. } if kind == "identity_changed"));
 }
 
 #[test]

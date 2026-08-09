@@ -183,14 +183,19 @@ PATCHSET_SHA256="$({
 inject_check() { grep -qF "$1" "$2" || { echo "ERROR: $3"; exit 1; }; }
 count_of() { grep -cF "$1" "$2" 2>/dev/null || true; }
 
-# 4. main.cpp 훅: emucap.h include + 프레임 루프 서비스 호출(MDFNI_Emulate 직후, SoftFB 직전).
-#    화면 캡처(emucap_capture)도 여기 — 모든 Mednafen 코어의 공통 드라이버 경로라 screenshot 동작.
+# 4. main.cpp 훅: emucap.h include + 첫 MDFNI_Emulate 이전 controlled-start park + 프레임 루프
+#    서비스 호출(MDFNI_Emulate 직후, SoftFB 직전). 화면 캡처(emucap_capture)도 여기 — 모든
+#    Mednafen 코어의 공통 드라이버 경로라 screenshot 동작.
 perl -0777 -pi -e 's/(#include "main\.h"\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
+  "$SRC/src/drivers/main.cpp"
+perl -0777 -pi -e \
+  's/(\n[ \t]*if\(MDFN_UNLIKELY\(StateFuzzTest\)\))/\n\t ::emucap_pre_first_frame();${1}/ unless m{emucap_pre_first_frame}' \
   "$SRC/src/drivers/main.cpp"
 perl -0777 -pi -e \
   's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}{ static uint64_t emucap_frame = 0; ::emucap_service(emucap_frame++); ::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths); }\n${1}${2}/m unless m{emucap_service}' \
   "$SRC/src/drivers/main.cpp"
 inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp 훅 삽입 실패"
+inject_check emucap_pre_first_frame "$SRC/src/drivers/main.cpp" "main.cpp pre-first 훅 삽입 실패"
 
 # 4b. 입력 주입(코어-비특이): mednafen.cpp의 movie/netplay와 동일 위상(Emulate 직전 + MidSync)에서
 #     PortData[0]을 주입한다. 드라이버 Input_Update 주입은 게임 INTBACK이 읽는 스냅샷과 위상이

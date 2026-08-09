@@ -19,7 +19,7 @@ fn broker_link_attaches_and_calls() {
         let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
         writeln!(
             w,
-            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","methods":["status"]}}}}"#
+            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["status"]}}}}"#
         )
         .unwrap();
         let mut c = String::new();
@@ -57,6 +57,7 @@ fn broker_link_preserves_contract_advertisement_from_attach() {
                 "ok": true,
                 "result": {
                     "attached_name": "nds",
+                    "broker_registration_id": 1,
                     "adapter": "desmume-nds-rust-gdb",
                     "system": "nds",
                     "methods": ["status", "step_instructions", "call_stack"],
@@ -119,7 +120,7 @@ fn broker_link_skips_keepalive_and_returns_final() {
         let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
         writeln!(
             w,
-            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","methods":["run_frames"]}}}}"#
+            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["run_frames"]}}}}"#
         )
         .unwrap();
         // run_frames 명령
@@ -233,11 +234,16 @@ fn lazy_broker_link_reattaches_after_protocol_desync() {
 
             let mut attach = String::new();
             reader.read_line(&mut attach).unwrap();
-            let attach_id =
-                serde_json::from_str::<serde_json::Value>(attach.trim()).unwrap()["id"].clone();
+            let attach = serde_json::from_str::<serde_json::Value>(attach.trim()).unwrap();
+            let attach_id = attach["id"].clone();
+            if connection == 1 {
+                assert_eq!(attach["params"]["name"], "g");
+                assert_eq!(attach["params"]["expected_registration_id"], 1);
+                assert_eq!(attach["params"]["expected_launch_id"], "launch-g");
+            }
             writeln!(
                 writer,
-                r#"{{"id":{attach_id},"ok":true,"result":{{"attached_name":"g","methods":["status"]}}}}"#
+                r#"{{"id":{attach_id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"launch_id":"launch-g","methods":["status"]}}}}"#
             )
             .unwrap();
 
@@ -283,7 +289,7 @@ fn broker_link_preserves_partial_reply_across_timeout() {
         let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
         writeln!(
             w,
-            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","methods":["status"]}}}}"#
+            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["status"]}}}}"#
         )
         .unwrap();
         // status#1
@@ -360,7 +366,7 @@ fn broker_link_self_heals_after_consecutive_timeouts() {
         let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
         writeln!(
             w,
-            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","methods":["status"]}}}}"#
+            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["status"]}}}}"#
         )
         .unwrap();
         // 이후 어떤 요청에도 응답하지 않고 소켓을 연 채 hang(EOF 아님 → read 타임아웃 누적).
@@ -403,7 +409,7 @@ fn broker_link_write_timeout_poisons() {
         let id = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
         writeln!(
             w,
-            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","methods":["read_memory"]}}}}"#
+            r#"{{"id":{id},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["read_memory"]}}}}"#
         )
         .unwrap();
         // 이후 요청을 절대 읽지 않는다 — broker recv 버퍼가 차 큰 요청의 write_all이 스톨한다.
@@ -439,7 +445,7 @@ fn broker_link_bails_on_working_flood_past_deadline() {
         let aid = serde_json::from_str::<serde_json::Value>(a.trim()).unwrap()["id"].clone();
         writeln!(
             w,
-            r#"{{"id":{aid},"ok":true,"result":{{"attached_name":"g","methods":["run_frames"]}}}}"#
+            r#"{{"id":{aid},"ok":true,"result":{{"attached_name":"g","broker_registration_id":1,"methods":["run_frames"]}}}}"#
         )
         .unwrap();
         let mut l2 = String::new();
@@ -493,6 +499,7 @@ fn broker_progress_preserves_sequence_and_exact_abort_identity() {
                 "ok": true,
                 "result": {
                     "attached_name": "recording",
+                    "broker_registration_id": 1,
                     "methods": ["record_window", "abort_recording"],
                 }
             })

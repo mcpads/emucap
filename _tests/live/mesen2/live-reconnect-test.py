@@ -122,10 +122,11 @@ def accept(listener: socket.socket, token: str) -> Session:
     if result.get("session_token") != token or result.get("adapter") != "mesen2-live":
         raise RuntimeError(f"identity mismatch: {result}")
     features = set(result.get("host_features", []))
-    if result.get("mesen_host_api") != 2 or not {
+    if result.get("mesen_host_api") != 3 or not {
         "code_break_idle",
         "native_halt_service",
         "native_halt_savestate",
+        "native_power_cycle",
     }.issubset(features):
         raise RuntimeError(f"mesen-patch-required: runtime hello lacks native halt: {result}")
     return session
@@ -280,6 +281,25 @@ end, emu.eventType.codeBreakIdleSavestate)
                     raise RuntimeError(
                         f"post-reset session {reset_index + 1} is not usable: {after_reset}"
                     )
+
+            power_cycle = session.request("power_cycle")
+            if (
+                not power_cycle.get("ok")
+                or power_cycle.get("result", {}).get("reconnect") is not True
+            ):
+                raise RuntimeError(
+                    f"native power cycle was not acknowledged before reconnect: {power_cycle}"
+                )
+            session.close()
+            session = accept(listener, token)
+            after_power_cycle = session.request("status")
+            if (
+                not after_power_cycle.get("ok")
+                or after_power_cycle.get("result", {}).get("state") != "running"
+            ):
+                raise RuntimeError(
+                    f"post-power-cycle session is not usable: {after_power_cycle}"
+                )
 
             paused = session.request("pause")
             if not paused.get("ok") or paused.get("result", {}).get("state") != "frozen":

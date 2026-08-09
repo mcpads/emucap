@@ -196,6 +196,7 @@ pub fn validate_recording(
             observation_start: input.f_start,
             class_intervals: class_intervals.clone(),
             event_classes: input.request.event_classes.clone(),
+            event_filters: input.request.event_filters.clone(),
             limits: input.request.limits.clone(),
             stop_on: input.request.stop_on.clone(),
         },
@@ -250,6 +251,19 @@ pub fn validate_recording(
     let counters_match = input.terminal.counters.events == stream.records
         && input.terminal.counters.bytes == stream.complete_bytes
         && input.terminal.counters.frames == actual_frames;
+    let stop_closes_scope = stream.stop_event.as_ref().is_some_and(|event| {
+        event.frame.checked_add(1) == Some(input.f_end)
+            && if event.event_class == "frame_completed" {
+                input.terminal.final_frame == input.f_end
+            } else {
+                input.terminal.final_frame == event.frame
+            }
+    });
+    let partial_frame_stop = stream.stop_event.as_ref().is_some_and(|event| {
+        event.event_class != "frame_completed"
+            && event.frame.checked_add(1) == Some(input.f_end)
+            && input.terminal.final_frame == event.frame
+    });
     let stop_matches = match input.terminal.execution_outcome {
         ExecutionOutcome::TargetReached => {
             input.f_end == maximum_end
@@ -260,20 +274,35 @@ pub fn validate_recording(
             input.request.stop_on.is_some()
                 && input.terminal.stop_event.is_some()
                 && input.terminal.stop_event == stream.stop_event
-                && stream
-                    .stop_event
-                    .as_ref()
-                    .is_some_and(|event| event.clock_tick == input.f_end)
+                && stop_closes_scope
         }
         _ => input.terminal.stop_event.is_none(),
     };
+    let expected_boundary_records = class_intervals
+        .get("frame_boundary")
+        .map_or(actual_frames, |scope| scope.f_end - scope.f_start);
+    let expected_completed_records = class_intervals
+        .get("frame_completed")
+        .map_or(actual_frames, |scope| scope.f_end - scope.f_start);
+    let terminal_coordinate_matches = match input.terminal.execution_outcome {
+        ExecutionOutcome::TargetReached => input.terminal.final_frame == input.f_end,
+        ExecutionOutcome::EventStop => stop_closes_scope,
+        _ => false,
+    };
+    let completed_frame_coverage = !input
+        .request
+        .event_classes
+        .iter()
+        .any(|identity| identity.id == "frame_completed")
+        || stream.frame_completed_records
+            == expected_completed_records.saturating_sub(u64::from(partial_frame_stop));
     let complete = input.terminal.operation_outcome == OperationOutcome::Completed
         && matches!(
             input.terminal.execution_outcome,
             ExecutionOutcome::TargetReached | ExecutionOutcome::EventStop
         )
         && input.terminal.claimed_integrity == Integrity::Complete
-        && input.terminal.final_frame == input.f_end
+        && terminal_coordinate_matches
         && actual_frames > 0
         && input.terminal.counters.dropped == 0
         && input.terminal.loss.dropped == 0
@@ -286,19 +315,8 @@ pub fn validate_recording(
             .all(|facts| facts.armed && facts.dropped == 0)
         && counters_match
         && stream.completeness == StreamCompleteness::Complete
-        && stream.frame_boundary_records
-            == class_intervals
-                .get("frame_boundary")
-                .map_or(actual_frames, |scope| scope.f_end - scope.f_start)
-        && (!input
-            .request
-            .event_classes
-            .iter()
-            .any(|identity| identity.id == "frame_completed")
-            || stream.frame_completed_records
-                == class_intervals
-                    .get("frame_completed")
-                    .map_or(actual_frames, |scope| scope.f_end - scope.f_start))
+        && stream.frame_boundary_records == expected_boundary_records
+        && completed_frame_coverage
         && stop_matches
         && cleanup_complete(&input.terminal.cleanup)
         && matches!(

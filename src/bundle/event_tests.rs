@@ -3,7 +3,9 @@ use std::fs;
 use serde_json::json;
 
 use super::event::*;
-use super::recording_manifest::{EventClassIdentity, EventStopCondition, RecordingLimits};
+use super::recording_manifest::{
+    EventClassFilter, EventClassIdentity, EventFilterTerm, EventStopCondition, RecordingLimits,
+};
 use crate::event_contracts::EventContractRegistry;
 
 fn identity() -> EventClassIdentity {
@@ -82,6 +84,32 @@ fn obj_handoff(sequence: u64, frame: u64, tick: u64) -> EventEnvelope {
     }
 }
 
+fn obj_consumption(sequence: u64, frame: u64, tick: u64, address: u64) -> EventEnvelope {
+    let identity = EventContractRegistry::builtin()
+        .unwrap()
+        .identities(["snes_ppu_obj_consumption_read"])
+        .unwrap()
+        .remove(0);
+    EventEnvelope {
+        sequence,
+        class: identity.id,
+        contract_sha256: identity.contract_sha256,
+        clock: ClockPoint {
+            domain: "snes_master".into(),
+            tick,
+        },
+        frame,
+        payload: json!({
+            "memory_kind": 1,
+            "address": address,
+            "value": 0x34,
+            "scanline": 17,
+            "dot": 128,
+            "hclock": 512
+        }),
+    }
+}
+
 fn bytes(events: &[EventEnvelope]) -> Vec<u8> {
     let mut output = Vec::new();
     for event in events {
@@ -107,6 +135,7 @@ fn validate(
             observation_start: f_start,
             class_intervals: Default::default(),
             event_classes: vec![identity()],
+            event_filters: vec![],
             limits: limits(),
             stop_on: None,
         },
@@ -171,6 +200,7 @@ fn enforces_line_and_total_byte_bounds_before_unbounded_growth() {
                 observation_start: 10,
                 class_intervals: Default::default(),
                 event_classes: vec![identity()],
+                event_filters: vec![],
                 limits: bounded,
                 stop_on: None,
             }
@@ -190,6 +220,7 @@ fn enforces_line_and_total_byte_bounds_before_unbounded_growth() {
                 observation_start: 10,
                 class_intervals: Default::default(),
                 event_classes: vec![identity()],
+                event_filters: vec![],
                 limits: bounded,
                 stop_on: None,
             }
@@ -267,6 +298,7 @@ fn validates_interleaved_boundaries_and_completions_at_shared_ticks() {
                 .unwrap()
                 .identities(["frame_boundary", "frame_completed"])
                 .unwrap(),
+            event_filters: vec![],
             limits: limits(),
             stop_on: None,
         },
@@ -298,6 +330,7 @@ fn validates_typed_semantic_payload_and_rejects_schema_drift() {
             observation_start: 10,
             class_intervals: Default::default(),
             event_classes: classes.clone(),
+            event_filters: vec![],
             limits: limits(),
             stop_on: None,
         },
@@ -318,6 +351,7 @@ fn validates_typed_semantic_payload_and_rejects_schema_drift() {
                 observation_start: 10,
                 class_intervals: Default::default(),
                 event_classes: classes.clone(),
+                event_filters: vec![],
                 limits: limits(),
                 stop_on: None,
             },
@@ -338,11 +372,64 @@ fn validates_typed_semantic_payload_and_rejects_schema_drift() {
                 observation_start: 10,
                 class_intervals: Default::default(),
                 event_classes: classes,
+                event_filters: vec![],
                 limits: limits(),
                 stop_on: None,
             },
         ),
         Err(EventValidationError::Payload(_))
+    ));
+}
+
+#[test]
+fn accepts_only_events_inside_the_declared_payload_filter() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let classes = registry
+        .identities(["frame_boundary", "snes_ppu_obj_consumption_read"])
+        .unwrap();
+    let filters = vec![EventClassFilter {
+        event_class: "snes_ppu_obj_consumption_read".into(),
+        terms: vec![
+            EventFilterTerm::U64Range {
+                path: "memory_kind".into(),
+                start: 1,
+                length: 1,
+            },
+            EventFilterTerm::U64Range {
+                path: "address".into(),
+                start: 0x2000,
+                length: 0x100,
+            },
+        ],
+    }];
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let validate_address = |address| {
+        fs::write(
+            file.path(),
+            bytes(&[event(0, 10), obj_consumption(1, 10, 12_345, address)]),
+        )
+        .unwrap();
+        validate_event_stream(
+            file.path(),
+            &registry,
+            &EventValidationSpec {
+                f_start: 10,
+                f_end: 11,
+                observation_start: 10,
+                class_intervals: Default::default(),
+                event_classes: classes.clone(),
+                event_filters: filters.clone(),
+                limits: limits(),
+                stop_on: None,
+            },
+        )
+    };
+
+    assert_eq!(validate_address(0x20ff).unwrap().records, 2);
+    assert!(matches!(
+        validate_address(0x2100),
+        Err(EventValidationError::EventOutsideFilter(class))
+            if class == "snes_ppu_obj_consumption_read"
     ));
 }
 
@@ -367,6 +454,7 @@ fn binds_a_stop_occurrence_and_rejects_any_later_record() {
             observation_start: 10,
             class_intervals: Default::default(),
             event_classes: classes.clone(),
+            event_filters: vec![],
             limits: limits(),
             stop_on: Some(stop_on.clone()),
         },
@@ -392,6 +480,7 @@ fn binds_a_stop_occurrence_and_rejects_any_later_record() {
                 observation_start: 10,
                 class_intervals: Default::default(),
                 event_classes: classes,
+                event_filters: vec![],
                 limits: limits(),
                 stop_on: Some(stop_on),
             },

@@ -8,8 +8,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::recording_manifest::{
-    EventClassIdentity, EventStopCondition, EventStopFacts, FrameInterval, ObservationStartFacts,
-    RecordingLimits,
+    EventClassFilter, EventClassIdentity, EventFilterTerm, EventStopCondition, EventStopFacts,
+    FrameInterval, ObservationStartFacts, RecordingLimits, MAX_EVENT_FILTER_TERMS,
 };
 use crate::event_contracts::{
     ClockOrder, EventContract, EventContractError, EventContractRegistry, FrameRelation,
@@ -41,6 +41,7 @@ pub struct EventValidationSpec {
     pub observation_start: u64,
     pub class_intervals: BTreeMap<String, FrameInterval>,
     pub event_classes: Vec<EventClassIdentity>,
+    pub event_filters: Vec<EventClassFilter>,
     pub limits: RecordingLimits,
     pub stop_on: Option<EventStopCondition>,
 }
@@ -128,6 +129,10 @@ pub enum EventValidationError {
     StopCondition(String),
     #[error("event payload does not satisfy contract for {0}")]
     Payload(String),
+    #[error("event filter for {class} is invalid: {reason}")]
+    InvalidFilter { class: String, reason: String },
+    #[error("event payload is outside the declared filter for {0}")]
+    EventOutsideFilter(String),
     #[error("an observation event preceded the declared event-aligned start")]
     EventBeforeObservationStart,
     #[error("the declared event-aligned start does not match the event stream")]
@@ -277,6 +282,65 @@ pub(crate) fn validate_event_stream_at_start(
     let selected_ids: BTreeSet<_> = selected.keys().cloned().collect();
     if selected_ids.is_empty() {
         return Err(EventValidationError::UnselectedClass("<none>".into()));
+    }
+
+    let mut filters = BTreeMap::new();
+    for filter in &spec.event_filters {
+        let contract = selected.get(&filter.event_class).ok_or_else(|| {
+            EventValidationError::InvalidFilter {
+                class: filter.event_class.clone(),
+                reason: "event class is not selected".into(),
+            }
+        })?;
+        if filter.terms.is_empty() || filter.terms.len() > MAX_EVENT_FILTER_TERMS {
+            return Err(EventValidationError::InvalidFilter {
+                class: filter.event_class.clone(),
+                reason: format!("terms must contain 1..={MAX_EVENT_FILTER_TERMS} entries"),
+            });
+        }
+        let mut paths = BTreeSet::new();
+        for term in &filter.terms {
+            if !paths.insert(term.path()) {
+                return Err(EventValidationError::InvalidFilter {
+                    class: filter.event_class.clone(),
+                    reason: format!("duplicate field path {}", term.path()),
+                });
+            }
+            match term {
+                EventFilterTerm::U64Range {
+                    path,
+                    start,
+                    length,
+                } => {
+                    let field = contract
+                        .payload_fields
+                        .iter()
+                        .find(|field| field.path == *path);
+                    let end = start.checked_add(*length);
+                    let valid = field.is_some_and(|field| {
+                        field.value_type == PayloadValueType::U64
+                            && *length > 0
+                            && *start >= field.min.unwrap_or(0)
+                            && end.is_some_and(|end| end - 1 <= field.max.unwrap_or(u64::MAX))
+                    });
+                    if !valid {
+                        return Err(EventValidationError::InvalidFilter {
+                            class: filter.event_class.clone(),
+                            reason: format!("u64_range for {path} is outside its payload contract"),
+                        });
+                    }
+                }
+            }
+        }
+        if filters
+            .insert(filter.event_class.as_str(), filter)
+            .is_some()
+        {
+            return Err(EventValidationError::InvalidFilter {
+                class: filter.event_class.clone(),
+                reason: "duplicate class filter".into(),
+            });
+        }
     }
 
     if let Some(stop_on) = &spec.stop_on {
@@ -434,6 +498,24 @@ pub(crate) fn validate_event_stream_at_start(
         if !validate_payload(contract, &event.payload) {
             return Err(EventValidationError::Payload(event.class));
         }
+        if filters.get(event.class.as_str()).is_some_and(|filter| {
+            !filter.terms.iter().all(|term| match term {
+                EventFilterTerm::U64Range {
+                    path,
+                    start,
+                    length,
+                } => {
+                    let end = start
+                        .checked_add(*length)
+                        .expect("event filters were validated before stream traversal");
+                    payload_value(&event.payload, path)
+                        .and_then(Value::as_u64)
+                        .is_some_and(|value| value >= *start && value < end)
+                }
+            })
+        }) {
+            return Err(EventValidationError::EventOutsideFilter(event.class));
+        }
         if contract.id == "frame_boundary" {
             if event.frame != next_frame_boundary {
                 return Err(EventValidationError::FrameBoundaryOrder {
@@ -499,12 +581,17 @@ pub(crate) fn validate_event_stream_at_start(
         return Err(EventValidationError::ObservationStartMismatch);
     }
 
+    let boundary_end = frame_boundary_interval.map_or(spec.f_end, |scope| scope.f_end);
+    let completed_end = frame_completed_interval.map_or(spec.f_end, |scope| scope.f_end);
+    let completed_frame_coverage = !selected_ids.contains("frame_completed")
+        || next_frame_completed == completed_end
+        || stop_event.as_ref().is_some_and(|event| {
+            event.frame.checked_add(1) == Some(completed_end) && next_frame_completed == event.frame
+        });
     if completeness != StreamCompleteness::PartialFinalLine
         && selected_ids.contains("frame_boundary")
-        && next_frame_boundary == frame_boundary_interval.map_or(spec.f_end, |scope| scope.f_end)
-        && (!selected_ids.contains("frame_completed")
-            || next_frame_completed
-                == frame_completed_interval.map_or(spec.f_end, |scope| scope.f_end))
+        && next_frame_boundary == boundary_end
+        && completed_frame_coverage
     {
         completeness = StreamCompleteness::Complete;
     }

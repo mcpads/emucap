@@ -3,17 +3,11 @@ use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::protocol::{read_ndjson_frame, to_line, Request};
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 페어링된 세션이 stale(hang)인지 — 마지막 활동 이후 threshold를 넘겼는지.
-/// 시계 역행에도 안전하도록 saturating으로 잰다.
-pub fn is_stale(now: Instant, last_seen: Instant, threshold: Duration) -> bool {
-    now.saturating_duration_since(last_seen) > threshold
-}
 
 struct Emu {
     to_emu: TcpStream, // 에뮬레이터로 쓰는 writer
@@ -22,7 +16,6 @@ struct Emu {
     session: Option<TcpStream>, // 페어링된 세션 writer(없으면 드레인)
     gen: u64,                   // 등록 세대(단조 증가). 정리 시 clobber 방지에 씀.
     session_gen: u64,           // 현재 페어링된 세션의 세대(0=없음). 세션 정리 clobber 방지.
-    last_seen: Instant,         // 페어링 세션의 마지막 활동(명령·heartbeat). steal 판정용.
 }
 
 /// 세션→broker 제어 메시지 `_ping`(heartbeat)인지. 에뮬레이터로 전달하지 않고 드레인한다.
@@ -37,12 +30,10 @@ fn is_ping_line(line: &str) -> bool {
         .unwrap_or(false)
 }
 
-// ── 세션-세대 펜싱(steal 안전) ──────────────────────────────
-// stale 세션에서 에뮬레이터를 steal하면, 옛 세션의 in-flight 요청에 대한 응답이 뒤늦게 도착해 신규
-// 세션으로 라우팅될 수 있다. 세션마다 요청 id 공간이 겹치므로(둘 다 1부터) 신규 세션이 그 응답을 자기
-// 것으로 오인할 수 있다. 이를 막으려 세션→에뮬레이터로 나가는 요청 id에 그 세션의 세대(session_gen)를
-// 상위 비트로 박아 세션별 id 네임스페이스를 만든다. 에뮬레이터가 id를 echo하면, 에뮬레이터→세션
-// 라우팅에서 박힌 세대가 *현재 페어링 세션* 세대와 다르면(=옛/steal된 세션의 응답) 버린다(fence).
+// ── 세션-세대 응답 펜싱 ────────────────────────────────────
+// 앞단 세션이 끊긴 뒤 그 세션의 in-flight 응답이 늦게 도착할 수 있다. 세션마다 요청 id 공간이
+// 겹치므로(둘 다 1부터), 다음 명시적 attach가 그 응답을 자기 것으로 오인하지 않게 요청 id에
+// session_gen을 넣고 현재 세션과 다른 응답을 버린다.
 //
 // id는 Lua 어댑터(double, 53비트 가수)도 손실 없이 echo하도록 2^53 아래로 유지한다: 하위 32비트=원본
 // id, 다음 20비트=세대 필드. 원본 id는 세션 수명 내 2^32을 넘지 않고, 세대는 20비트로 접어도 steal 시
@@ -131,16 +122,14 @@ fn write_line(s: &mut TcpStream, line: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 두 리스너를 구동한다(블로킹). 세션 accept는 별도 스레드, 에뮬레이터 accept는 이 스레드.
-/// `stale_threshold`: 페어링 세션이 이만큼 활동(명령·heartbeat)이 없으면 hang으로 보고
-/// 신규 attach가 그 에뮬레이터를 steal할 수 있다.
-pub fn serve(emu_listener: TcpListener, session_listener: TcpListener, stale_threshold: Duration) {
+/// Run both listeners. Session accept runs on a dedicated thread; emulator accept runs here.
+pub fn serve(emu_listener: TcpListener, session_listener: TcpListener) {
     let reg: Shared = Arc::new(Mutex::new(Registry::default()));
     let reg_s = reg.clone();
     std::thread::spawn(move || {
         for s in session_listener.incoming().flatten() {
             let reg = reg_s.clone();
-            std::thread::spawn(move || handle_session(s, reg, stale_threshold));
+            std::thread::spawn(move || handle_session(s, reg));
         }
     });
     for s in emu_listener.incoming().flatten() {
@@ -225,7 +214,6 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
                 session: None,
                 gen,
                 session_gen: 0,
-                last_seen: Instant::now(),
             },
         );
         (nm, gen, old_session)
@@ -286,7 +274,7 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
     }
 }
 
-fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
+fn handle_session(stream: TcpStream, reg: Shared) {
     if stream.set_write_timeout(Some(WRITE_TIMEOUT)).is_err() {
         return;
     }
@@ -310,6 +298,14 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
         .and_then(|p| p.get("name"))
         .and_then(|n| n.as_str())
         .map(String::from);
+    let expected_registration_id = av
+        .get("params")
+        .and_then(|params| params.get("expected_registration_id"))
+        .and_then(|registration| registration.as_u64());
+    let expected_launch_id = av
+        .get("params")
+        .and_then(|params| params.get("expected_launch_id"))
+        .and_then(|launch_id| launch_id.as_str());
     // session writer clone은 lock 밖에서 — FD 고갈 시 패닉(→mutex poison) 대신 조용히 종료.
     let sess_writer = match to_sess.try_clone() {
         Ok(s) => s,
@@ -318,7 +314,7 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
     // 이 세션의 페어링 세대. 종료 정리 시 '내가 설정한 페어링일 때만' unpair하는 데 쓴다.
     let mut my_session_gen = 0u64;
     // 대상 선택 + 페어링 — lock 안에서 try_clone만, 쓰기는 lock 밖.
-    let chosen: Result<(String, Vec<String>, serde_json::Value), String> = {
+    let chosen: Result<(String, Vec<String>, serde_json::Value, u64), String> = {
         let mut g = lock(&reg);
         let names: Vec<String> = g.emus.keys().cloned().collect();
         let pick = match &want {
@@ -339,22 +335,42 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
                 g.next_gen += 1;
                 let sg = g.next_gen;
                 let e = g.emus.get_mut(&nm).unwrap();
-                // 페어링됐고 아직 살아있으면(최근 활동) Busy. stale(hang)이면 steal한다.
-                // 정상 종료 세션은 리더 EOF에서 이미 None이 되고, hang 세션만 여기서 회수된다.
-                if e.session.is_some() && !is_stale(Instant::now(), e.last_seen, stale_threshold) {
-                    Err(r#"{"kind":"busy"}"#.to_string())
-                } else {
-                    // 기존(stale) 세션 소켓을 종료해 구 리더를 EOF로 깨워 정리한다.
-                    if let Some(old) = e.session.take() {
-                        let _ = old.shutdown(std::net::Shutdown::Both);
+                let same_registration =
+                    expected_registration_id.is_none_or(|expected| expected == e.gen);
+                let same_launch = expected_launch_id.is_some_and(|expected| {
+                    e.identity
+                        .get("launch_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(expected)
+                });
+                if expected_launch_id.is_some() && !same_launch {
+                    Err(r#"{"kind":"identity_mismatch","message":"managed launch identity changed"}"#.to_string())
+                } else if !same_registration && !same_launch {
+                    Err(r#"{"kind":"identity_mismatch","message":"broker emulator registration changed"}"#.to_string())
+                } else if e.session.is_some() {
+                    if expected_registration_id.is_none() || !same_registration {
+                        Err(r#"{"kind":"busy"}"#.to_string())
+                    } else {
+                        // A reconnect carrying the exact registration identity is an explicit,
+                        // generation-fenced continuation of the same application link. Wake the
+                        // obsolete front session; session_gen fencing keeps its late replies out.
+                        if let Some(old) = e.session.take() {
+                            let _ = old.shutdown(std::net::Shutdown::Both);
+                        }
+                        let methods = e.methods.clone();
+                        let identity = e.identity.clone();
+                        e.session = Some(sess_writer);
+                        e.session_gen = sg;
+                        my_session_gen = sg;
+                        Ok((nm, methods, identity, e.gen))
                     }
+                } else {
                     let methods = e.methods.clone();
                     let identity = e.identity.clone();
                     e.session = Some(sess_writer);
                     e.session_gen = sg;
-                    e.last_seen = Instant::now();
                     my_session_gen = sg;
-                    Ok((nm, methods, identity))
+                    Ok((nm, methods, identity, e.gen))
                 }
             }
             Err(x) => Err(x),
@@ -370,13 +386,17 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
             return;
         }
     };
-    let (name, methods, identity) = chosen;
+    let (name, methods, identity, registration) = chosen;
     let mut result = serde_json::Map::new();
     result.insert(
         "attached_name".into(),
         serde_json::Value::String(name.clone()),
     );
     result.insert("methods".into(), serde_json::json!(methods));
+    result.insert(
+        "broker_registration_id".into(),
+        serde_json::json!(registration),
+    );
     if let Some(obj) = identity.as_object() {
         for key in [
             "system",
@@ -417,13 +437,7 @@ fn handle_session(stream: TcpStream, reg: Shared, stale_threshold: Duration) {
         let trimmed = line.trim_end();
         let ping = is_ping_line(trimmed);
         let emu = {
-            let mut g = lock(&reg);
-            // 받은 모든 줄(명령·heartbeat)은 활동 신호 — 내가 설정한 페어링일 때만 last_seen 갱신.
-            if let Some(e) = g.emus.get_mut(&name) {
-                if e.session_gen == my_session_gen {
-                    e.last_seen = Instant::now();
-                }
-            }
+            let g = lock(&reg);
             if ping {
                 None // _ping은 에뮬레이터로 전달하지 않고 드레인(heartbeat 전용)
             } else {

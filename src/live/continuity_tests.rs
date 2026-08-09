@@ -56,6 +56,10 @@ impl EmulatorLink for SequenceLink {
     fn endpoint_port(&self) -> Option<u16> {
         Some(self.port)
     }
+
+    fn has_exclusive_control(&self) -> bool {
+        true
+    }
 }
 
 impl EmulatorLink for NoPortLink {
@@ -565,6 +569,28 @@ fn broker_shaped_link_keeps_last_good_in_memory_without_capsule_port() {
     assert_eq!(
         link.failure_context()["link_failure"]["last_status"]["frame"],
         7
+    );
+}
+
+#[test]
+fn shared_link_without_an_exclusive_attachment_rejects_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let inner = NoPortLink(SequenceLink::new(
+        0,
+        "launch-shared",
+        [Outcome::Ok(serde_json::json!({"unexpected": true}))],
+    ));
+    let mut link = ObservedLink::with_store(inner, store);
+
+    assert!(matches!(
+        link.call("write_memory", serde_json::json!({})),
+        Err(LinkError::Busy)
+    ));
+    assert_eq!(
+        link.inner.0.outcomes.len(),
+        1,
+        "inner mutation must not run"
     );
 }
 

@@ -120,7 +120,7 @@ fn test_build_metadata() -> BuildMetadata {
 }
 
 #[test]
-fn build_metadata_rejects_host_without_safe_halt_savestates() {
+fn build_metadata_rejects_an_older_host_api() {
     let publish = tempfile::tempdir().unwrap();
     let binary = publish.path().join("Mesen");
     std::fs::write(&binary, "fake").unwrap();
@@ -135,7 +135,9 @@ fn build_metadata_rejects_host_without_safe_halt_savestates() {
     let error = read_build_metadata(&binary).unwrap_err();
 
     assert!(error.to_string().contains("host API 1 is incompatible"));
-    assert!(error.to_string().contains("expected 2"));
+    assert!(error
+        .to_string()
+        .contains(&format!("expected {REQUIRED_HOST_API}")));
 }
 
 #[test]

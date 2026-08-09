@@ -220,6 +220,7 @@ uint64_t g_layer_enable_mask = ~0ULL;
 // freeze 상태머신: frozen이면 emucap_service가 스핀하며 프레임 진행을 막는다(MDFNI_Emulate 차단).
 // step(N)은 g_step_remaining만큼 프레임을 진행시킨 뒤 재정지하며 g_step_id로 완료 응답.
 bool g_frozen = false;
+bool g_launch_start_controlled = false;
 long g_step_id = -1;
 long g_step_remaining = 0;
 uint64_t g_step_progress_ms = 0;
@@ -292,6 +293,11 @@ int emucap_port() {
   const char* p = getenv("EMUCAP_PORT");
   int port = p ? atoi(p) : 47800;
   return (port > 0 && port < 65536) ? port : 47800;
+}
+
+bool start_frozen_requested() {
+  const char* value = getenv("EMUCAP_START_FROZEN");
+  return value && !strcmp(value, "1");
 }
 
 uint64_t monotonic_millis() {
@@ -2921,7 +2927,8 @@ void handle(const std::string& line) {
              "{\"protocol_version\":%d,\"system\":\"%s\",\"adapter\":\"mednafen\",\"build\":\"%s\","
              "\"debugger\":%s,",
              PROTOCOL_VERSION, sys, EMUCAP_BUILD_HASH, has_debugger ? "true" : "false");
-    std::string hello_resp = std::string(head) + "\"methods\":[" + methods +
+    std::string hello_resp = std::string(head) +
+                             "\"host_features\":[\"controlled_start\"],\"methods\":[" + methods +
                              "],\"memory_types\":[" + mtypes + "],\"breakpoint_kinds\":" +
                              breakpoint_kinds + ",\"contracts\":" +
                              contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
@@ -3026,6 +3033,14 @@ void handle(const std::string& line) {
       resp += json_escape(g_internal_failure_operation);
       resp += "\"}";
     }
+    resp.pop_back();
+    resp += ",\"launch_start\":{\"requested_frozen\":";
+    resp += start_frozen_requested() ? "true" : "false";
+    resp += ",\"controlled\":";
+    resp += g_launch_start_controlled ? "true" : "false";
+    resp += ",\"boundary\":";
+    resp += g_launch_start_controlled ? "\"pre_first_instruction\"" : "null";
+    resp += "}}";
     reply_ok(id, resp);
     recover_native_failure_after_status();
   } else if (method == "get_rom_info") {
@@ -4057,6 +4072,30 @@ void emucap_capture(const void* surface, const void* rect, const void* line_widt
   g_last_surface = (const MDFN_Surface*)surface;
   if (rect) g_last_rect = *(const MDFN_Rect*)rect;
   g_last_lw = (const int32*)line_widths;
+}
+
+void emucap_pre_first_frame() {
+  static bool first = true;
+  if (!first) return;
+  first = false;
+  if (!start_frozen_requested()) return;
+
+  // This hook runs after the game is loaded but before the first MDFNI_Emulate call. Keep the
+  // emulator on this stack frame until an explicit advancing command arrives. A missing or lost
+  // controller is not permission to execute the first guest instruction.
+  g_frozen = true;
+  g_launch_start_controlled = true;
+  while (g_frozen && g_step_remaining == 0 && g_probe_id < 0 && g_insn_remaining == 0) {
+    try {
+      if (g_fd < 0) emucap_connect();
+      if (g_fd >= 0) serve_socket_once();
+    } catch (const std::exception& error) {
+      contain_service_exception("pre_first_frame", error.what());
+    } catch (...) {
+      contain_service_exception("pre_first_frame", "unknown native adapter exception");
+    }
+    usleep(2000);
+  }
 }
 
 // 프레임 루프에서 매 프레임(MDFNI_Emulate 직후) 호출. 논블로킹이되 frozen이면 스핀해 프레임을 막는다.

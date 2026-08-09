@@ -80,6 +80,9 @@ pub(crate) enum BootstrapDetail {
     Systems,
     /// Include build and runtime installation paths.
     Installation,
+    /// Include the bounded inventory of live managed generations in this
+    /// server's direct listener range and their explicit reattach availability.
+    Runtimes,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -143,6 +146,29 @@ pub(crate) struct RecordWindowStartArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RecordWindowFilterTermArgs {
+    /// Match an unsigned payload field in the half-open range [start, start + length).
+    U64Range {
+        /// Advertised payload field path.
+        path: String,
+        /// Inclusive range start.
+        start: Num,
+        /// Positive range length.
+        length: Num,
+    },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowEventFilterArgs {
+    /// Selected event class whose declared scope is narrowed.
+    pub(crate) event_class: String,
+    /// All terms must match. Check the live capability for supported fields.
+    pub(crate) terms: Vec<RecordWindowFilterTermArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordWindowArgs {
     /// Existing absolute directory; Core creates one capture child.
@@ -155,6 +181,9 @@ pub(crate) struct RecordWindowArgs {
     /// Advertised event-class IDs; omit for defaults.
     #[serde(default)]
     pub(crate) event_classes: Vec<String>,
+    /// Optional advertised per-class payload filters. Omit to capture the full selected classes.
+    #[serde(default)]
+    pub(crate) event_filters: Vec<RecordWindowEventFilterArgs>,
     /// Advertised origin; omit for next_frame_boundary.
     #[serde(default)]
     pub(crate) origin: Option<RecordWindowOriginArgs>,
@@ -797,6 +826,14 @@ pub(crate) struct StopArgs {
     /// Exact current launch generation to terminate. Read it from
     /// `status.runtime_instance.launch_id`; a stale or different generation is
     /// rejected without signalling any process.
+    pub(crate) launch_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReattachArgs {
+    /// Exact managed launch generation to take over after its former control
+    /// lease has been returned. Read candidates through runtime discovery.
     pub(crate) launch_id: String,
 }
 

@@ -15,6 +15,7 @@ fn request(frames: u64) -> RecordingRequest {
             .unwrap()
             .identities(["frame_boundary"])
             .unwrap(),
+        event_filters: vec![],
         event_arming: vec![],
         limits: RecordingLimits {
             max_frames: 300,
@@ -86,6 +87,52 @@ fn event_stop_stream(frames: u64, f_start: u64) -> Vec<u8> {
             output.push(b'\n');
             sequence += 1;
         }
+    }
+    output
+}
+
+fn partial_obj_event_stop_stream(f_start: u64) -> Vec<u8> {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let boundary = registry.identities(["frame_boundary"]).unwrap().remove(0);
+    let consumption = registry
+        .identities(["snes_ppu_obj_consumption_read"])
+        .unwrap()
+        .remove(0);
+    let events = [
+        EventEnvelope {
+            sequence: 0,
+            class: boundary.id,
+            contract_sha256: boundary.contract_sha256,
+            clock: ClockPoint {
+                domain: "frame".into(),
+                tick: f_start,
+            },
+            frame: f_start,
+            payload: json!({}),
+        },
+        EventEnvelope {
+            sequence: 1,
+            class: consumption.id,
+            contract_sha256: consumption.contract_sha256,
+            clock: ClockPoint {
+                domain: "snes_master".into(),
+                tick: 123_456,
+            },
+            frame: f_start,
+            payload: json!({
+                "memory_kind": 1_u64,
+                "address": 0x20ff_u64,
+                "value": 0x34_u64,
+                "scanline": 16_u64,
+                "dot": 128_u64,
+                "hclock": 512_u64
+            }),
+        },
+    ];
+    let mut output = Vec::new();
+    for event in events {
+        serde_json::to_writer(&mut output, &event).unwrap();
+        output.push(b'\n');
     }
     output
 }
@@ -351,11 +398,11 @@ fn class_accounting_must_cover_the_exact_selected_set_and_stream_counts() {
 }
 
 #[test]
-fn explicit_loss_with_a_valid_prefix_is_lossy() {
+fn explicit_loss_inside_the_last_scoped_frame_is_lossy() {
     let raw = stream(2, 40);
     let file = tempfile::NamedTempFile::new().unwrap();
     fs::write(file.path(), &raw).unwrap();
-    let mut terminal = terminal(3, raw.len() as u64, 42);
+    let mut terminal = terminal(2, raw.len() as u64, 41);
     terminal.operation_outcome = OperationOutcome::Failed;
     terminal.execution_outcome = ExecutionOutcome::LossDetected;
     terminal.claimed_integrity = Integrity::Lossy;
@@ -369,7 +416,7 @@ fn explicit_loss_with_a_valid_prefix_is_lossy() {
             request: request(3),
             origin: RecordingOrigin::NextFrameBoundary,
             f_start: 40,
-            f_end: 43,
+            f_end: 42,
             observation_start: None,
             terminal,
         },
@@ -517,6 +564,86 @@ fn event_stop_derives_complete_actual_scope_from_the_final_event() {
     .unwrap();
     assert_eq!(validated.integrity(), Integrity::Complete);
     assert_eq!(validated.stream().frame_completed_records, 2);
+}
+
+#[test]
+fn non_frame_event_stop_closes_the_partial_frame_without_changing_its_clock() {
+    let raw = partial_obj_event_stop_stream(40);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::write(file.path(), &raw).unwrap();
+    let registry = EventContractRegistry::builtin().unwrap();
+    let mut request = request(5);
+    request.event_classes = registry
+        .identities([
+            "frame_boundary",
+            "frame_completed",
+            "snes_ppu_obj_consumption_read",
+        ])
+        .unwrap();
+    request.stop_on = Some(EventStopCondition {
+        event_class: "snes_ppu_obj_consumption_read".into(),
+        occurrence: 1,
+    });
+    request.event_filters = vec![EventClassFilter {
+        event_class: "snes_ppu_obj_consumption_read".into(),
+        terms: vec![EventFilterTerm::U64Range {
+            path: "address".into(),
+            start: 0x2000,
+            length: 0x100,
+        }],
+    }];
+    let stop_event = EventStopFacts {
+        sequence: 1,
+        event_class: "snes_ppu_obj_consumption_read".into(),
+        clock_domain: "snes_master".into(),
+        clock_tick: 123_456,
+        frame: 40,
+        occurrence: 1,
+    };
+    let mut terminal = terminal(1, raw.len() as u64, 40);
+    terminal.execution_outcome = ExecutionOutcome::EventStop;
+    terminal.counters.events = 2;
+    terminal.stop_event = Some(stop_event);
+
+    let validated = validate_recording(
+        file.path(),
+        &registry,
+        RecordingValidationInput {
+            request: request.clone(),
+            origin: RecordingOrigin::NextFrameBoundary,
+            f_start: 40,
+            f_end: 41,
+            observation_start: None,
+            terminal: terminal.clone(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(validated.integrity(), Integrity::Complete);
+    assert_eq!(validated.stream().frame_boundary_records, 1);
+    assert_eq!(validated.stream().frame_completed_records, 0);
+    assert_eq!(
+        validated.stream().stop_event.as_ref().unwrap().clock_tick,
+        123_456
+    );
+
+    let mut boundary_claim = terminal;
+    boundary_claim.final_frame = 41;
+    assert!(matches!(
+        validate_recording(
+            file.path(),
+            &registry,
+            RecordingValidationInput {
+                request,
+                origin: RecordingOrigin::NextFrameBoundary,
+                f_start: 40,
+                f_end: 41,
+                observation_start: None,
+                terminal: boundary_claim,
+            },
+        ),
+        Err(RecordingValidationError::InconsistentComplete(_))
+    ));
 }
 
 #[test]

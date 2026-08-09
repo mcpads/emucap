@@ -17,15 +17,22 @@ pub struct SpecOpts<'a> {
     pub headless: bool,
 }
 
+/// Mednafen-specific choices layered on top of the common process options.
+pub struct MednafenSpecOpts<'a> {
+    pub module: Option<&'a str>,
+    pub sound: bool,
+    pub pcfx_bios: Option<&'a Path>,
+    pub start_frozen: bool,
+}
+
 /// Mednafen (Saturn / PSX / PCE / PC-FX / MD / WonderSwan / Neo Geo Pocket). One binary handles every system; `module`
 /// selects it. Mirrors adapters/mednafen/launch.sh: explicit `-sound 0|1`, a 6-button pad for MD
 /// so the raw input mask has a stable 2-byte buffer, `-force_module`, then the content path.
 pub fn mednafen_spec(
     binary: &Path,
     log_path: &Path,
-    module: Option<&str>,
-    sound: bool,
-    pcfx_bios: Option<&Path>,
+    runtime_home: &Path,
+    mednafen: &MednafenSpecOpts,
     opts: &SpecOpts,
 ) -> LaunchSpec {
     let mut spec = LaunchSpec::new(binary, log_path);
@@ -37,29 +44,21 @@ pub fn mednafen_spec(
     {
         spec = spec.args(["-video.driver", "softfb"]);
     }
-    spec = spec.args(["-sound", if sound { "1" } else { "0" }]);
-    if module == Some("pcfx") {
-        // PC-FX has an explicit BIOS argument and needs no settings inherited from ~/.mednafen.
-        // Isolate it without changing the established firmware lookup of the other modules.
-        spec = spec.env(
-            "MEDNAFEN_HOME",
-            log_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .to_string_lossy()
-                .into_owned(),
-        );
+    spec = spec.args(["-sound", if mednafen.sound { "1" } else { "0" }]);
+    spec = spec.env("MEDNAFEN_HOME", runtime_home.to_string_lossy().into_owned());
+    if mednafen.start_frozen {
+        spec = spec.env("EMUCAP_START_FROZEN", "1");
     }
-    if module == Some("md") {
+    if mednafen.module == Some("md") {
         spec = spec.args(["-md.input.auto", "0", "-md.input.port1", "gamepad6"]);
     }
-    if let Some(path) = pcfx_bios {
+    if let Some(path) = mednafen.pcfx_bios {
         spec = spec.args([
             "-pcfx.bios".to_string(),
             path.to_string_lossy().into_owned(),
         ]);
     }
-    if let Some(m) = module {
+    if let Some(m) = mednafen.module {
         spec = spec.args(["-force_module", m]);
     }
     spec = spec

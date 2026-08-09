@@ -11,7 +11,9 @@ For `input_control` and `debug`, call `operation="describe"`, then execute one r
 
 Use the assigned `listener.port`, never `base_port`. Resolve media through `launch_plan`; do not guess an ambiguous system. Recheck `status`, launch with the planned arguments, then verify connection, identity, contracts, and runtime binding. End only the exact managed generation with `stop(status.runtime_instance.launch_id)`.
 
-The default launch may return with the guest running, so wall time before the next call becomes guest time. When the next action must target the launch entry, request `start_frozen:true` and accept success only with `state=frozen`; do not substitute a sleep or a sampled frame number. A repeatable execution profile is a separate opt-in promise about advertised initial conditions. Require it again on recording only when the live recording capability offers the selected origin.
+To continue a generation not selected automatically, inspect `bootstrap(include=["runtimes"])` and call `reattach` only with an exact entry marked available. Never edit runtime files.
+
+The default launch may return with the guest running, so wall time before the next call becomes guest time. When the next action must target the launch entry, inspect `launch_plan.start_frozen_contract`, request `start_frozen:true`, and accept success only with `state=frozen`; do not substitute a sleep or a sampled frame number. A repeatable execution profile is a separate opt-in promise about advertised initial conditions. Require it again on recording only when the live recording capability offers the selected origin.
 
 The launcher owns isolated runtime directories. Do not construct detached commands. A listener collision does not prove ownership. `stop` verifies generation, lease, PID, and start identity; never terminate by executable name.
 
@@ -19,7 +21,7 @@ The launcher owns isolated runtime directories. Do not construct detached comman
 
 Connection, guest execution, process, lease, binding, and failure evidence are independent. Timeout or `connected:false` does not prove exit. Inspect continuity, runtime instance, and `get_failure_context()` before replacement.
 
-Never edit session, generation, lease, or link files. `replace:true` fails closed on unverifiable ownership. `stop` remains available without adapter transport.
+`replace:true` fails closed on unverifiable ownership. `stop` remains available without adapter transport.
 
 ## Ordering and guest time
 
@@ -29,7 +31,7 @@ Wait for each dependent terminal response. Concurrent JSON-RPC requests have no 
 
 Choose bounded input by terminal state: direct `tap` releases ownership and returns frozen; operations ending in `_while_running` release their transient input but leave the guest running. Persistent input and touch holds require their explicit release operation or generation termination. Cleanup failure is operation failure.
 
-Debug `record_window` owns its guest-time interval and returns frozen. Use only its advertised capability. `start_on` needs a selected startable event; initial snapshots need advertised callback-safe memory bounds. Non-`complete` integrity is partial evidence.
+Debug `record_window` owns its guest-time interval and returns frozen. Use only its advertised capability. `start_on` needs a selected startable event; initial snapshots need advertised callback-safe memory bounds. Event filters need advertised per-class fields; excluded callbacks are outside scope, not loss. Non-`complete` integrity is partial evidence.
 
 ## Evidence
 

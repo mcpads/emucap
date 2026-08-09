@@ -155,10 +155,10 @@ pub(crate) fn make_launch(
         });
     }
     let repeatable = a.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
-    if (a.start_frozen || repeatable) && adapter != "mesen2" {
+    if a.start_frozen && adapter != "mesen2" && adapter != "mednafen" {
         return serde_json::json!({
             "launched": false,
-            "reason": "start_frozen is currently supported only by Mesen systems",
+            "reason": "start_frozen is currently supported only by Mesen and Mednafen systems",
             "system": system,
             "adapter": adapter,
         });
@@ -1109,6 +1109,7 @@ pub(super) fn launch_mednafen(
         runtime: Some(runtime),
         headless: !display,
         sound,
+        start_frozen: a.start_frozen,
     };
     match emucap::launch::mednafen::launch(&spec) {
         Ok(pid) => serde_json::json!({
@@ -1122,6 +1123,8 @@ pub(super) fn launch_mednafen(
             "binary": binary.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
+            "emucap_home": emucap::launch::emu_home_dir("mednafen", port).display().to_string(),
+            "isolation": "Mednafen uses an emucap-owned per-port home and copies known BIOS files from the shared emucap firmware inventory; the user's ~/.mednafen profile is not read or changed.",
             "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),

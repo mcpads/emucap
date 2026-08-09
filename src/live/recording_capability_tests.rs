@@ -18,6 +18,7 @@ fn capability() -> RecordingCapability {
             exact: true,
             stoppable: false,
             startable: false,
+            filterable_fields: vec![],
         }],
         event_order: None,
         class_accounting: false,
@@ -220,6 +221,7 @@ fn validates_independently_advertised_reset_movie_and_event_stop() {
         exact: true,
         stoppable: true,
         startable: false,
+        filterable_fields: vec![],
     });
     capability.input_movie = Some(RecordingInputMovieCapability {
         format: INPUT_MOVIE_FORMAT.into(),
@@ -265,6 +267,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         exact: true,
         stoppable: true,
         startable: false,
+        filterable_fields: vec![],
     });
     capability.input_movie = Some(RecordingInputMovieCapability {
         format: INPUT_MOVIE_FORMAT.into(),
@@ -309,6 +312,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
             exact: true,
             stoppable: false,
             startable: false,
+            filterable_fields: vec![],
         });
     }
     let state_groups = vec!["ppu".into()];
@@ -343,13 +347,33 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     ] {
         let identity = registry.identities([id]).unwrap().remove(0);
         let startable = identity.id == "snes_cpu_instruction";
+        let stoppable = identity.id == "snes_ppu_obj_consumption_read";
+        let filterable_fields = if identity.id == "snes_ppu_obj_consumption_read" {
+            vec![
+                RecordingEventFilterField {
+                    path: "memory_kind".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 1,
+                },
+                RecordingEventFilterField {
+                    path: "address".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 0xffff,
+                },
+            ]
+        } else {
+            vec![]
+        };
         capability.event_classes.push(RecordingEventCapability {
             id: identity.id,
             contract_sha256: identity.contract_sha256,
             clock_domains: vec!["snes_master".into()],
             exact: true,
-            stoppable: false,
+            stoppable,
             startable,
+            filterable_fields,
         });
     }
     capability.initial_snapshots = Some(RecordingInitialSnapshotCapability {
@@ -365,12 +389,24 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         deep_without_snapshots.revision,
-        "6f601a701d9a979cde0c118c9fcd4fd4a2d572f529728ca77db5f4ddd99b26b4"
+        "a01b63fdb6b35a4268edbdffb9675621b6712a9e8095bb8f7594067d3ecd355a"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "cf4f250d1319e642294bc69db241defe50d8a5ff1546f81aac99720b3209890b"
+        "7385af79303c2e05fddb0c06963771180893cfdcc3d821031e78c869e2655970"
+    );
+    capability.repeatability = Some(RecordingRepeatabilityCapability {
+        profile: "mesen_snes_repeatable".into(),
+        conditions_sha256: "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b"
+            .into(),
+        origins: vec![RecordingCapabilityOrigin::ResetRelease],
+        requires_input_movie: true,
+    });
+    capability.revision = capability.computed_revision().unwrap();
+    assert_eq!(
+        capability.revision,
+        "a569ed75dc69a68f8584fbe717ddecd2509f49043a330a6b5fce586c89651f83"
     );
 }
 
@@ -389,6 +425,7 @@ fn event_aligned_initial_snapshots_require_exact_guest_order_and_bounds() {
         exact: true,
         stoppable: false,
         startable: true,
+        filterable_fields: vec![],
     });
     capability.event_order = Some(RecordingEventOrder::GuestEmission);
     capability.class_accounting = true;
@@ -417,6 +454,42 @@ fn event_aligned_initial_snapshots_require_exact_guest_order_and_bounds() {
         .as_mut()
         .unwrap()
         .max_callback_ms = CORE_MAX_INITIAL_SNAPSHOT_CALLBACK_MS + 1;
+    capability.revision = capability.computed_revision().unwrap();
+    assert!(capability.validate(&registry).is_err());
+}
+
+#[test]
+fn filterable_fields_are_contract_bound_and_revision_covered() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let identity = registry
+        .identities(["snes_ppu_obj_consumption_read"])
+        .unwrap()
+        .remove(0);
+    let mut capability = capability();
+    capability.event_classes.push(RecordingEventCapability {
+        id: identity.id,
+        contract_sha256: identity.contract_sha256,
+        clock_domains: vec!["snes_master".into()],
+        exact: true,
+        stoppable: false,
+        startable: false,
+        filterable_fields: vec![RecordingEventFilterField {
+            path: "address".into(),
+            kind: RecordingEventFilterKind::U64Range,
+            min: 0,
+            max: 0xffff,
+        }],
+    });
+    let revision_without_filter = {
+        let mut unfiltered = capability.clone();
+        unfiltered.event_classes[1].filterable_fields.clear();
+        unfiltered.computed_revision().unwrap()
+    };
+    capability.revision = capability.computed_revision().unwrap();
+    assert_ne!(capability.revision, revision_without_filter);
+    capability.validate(&registry).unwrap();
+
+    capability.event_classes[1].filterable_fields[0].path = "unknown".into();
     capability.revision = capability.computed_revision().unwrap();
     assert!(capability.validate(&registry).is_err());
 }

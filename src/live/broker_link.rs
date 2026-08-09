@@ -1,12 +1,10 @@
-//! BrokerLink — broker 세션 포트에 접속해 attach 후 명령을 위임하는 EmulatorLink.
+//! Broker-backed emulator link with generation-fenced reconnect.
 use std::io::{BufReader, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::link::{
     AbortRequest, Capabilities, EmulatorIdentity, EmulatorLink, LinkError, ProgressCallControl,
@@ -16,10 +14,6 @@ use super::protocol::{
     parse_response, read_ndjson_frame, result_status, to_line, Request, PROTOCOL_VERSION,
     STATUS_WORKING,
 };
-
-/// 세션 liveness heartbeat 주기. broker가 hang 세션을 stale로 판정하는 임계(기본 15초)보다
-/// 충분히 짧아야 한다(여기선 3회 여유).
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 연속 read 타임아웃이 이 횟수면 broker가 행된 것으로 보고 NotConnected를 올린다 — LazyBrokerLink가
 /// inner를 버리고 재connect+attach하게 해 자가복구시킨다(TcpLink의 drop+재accept에 대응).
@@ -33,33 +27,33 @@ const DEFAULT_DEFERRED_DEADLINE: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 pub struct BrokerLink {
     reader: BufReader<TcpStream>,
-    // writer는 raw_call과 heartbeat 스레드가 공유하므로 Mutex로 보호한다(한 줄 write 단위 락).
-    writer: Arc<Mutex<TcpStream>>,
+    writer: Mutex<TcpStream>,
     caps: Capabilities,
     next_id: u64,
-    hb_stop: Arc<AtomicBool>,
-    hb_handle: Option<JoinHandle<()>>,
     /// 부분 수신한 응답 frame. read timeout 뒤에도 이어 읽되 protocol payload cap을 넘기지 않는다.
     pending: Vec<u8>,
     /// 연속 read 타임아웃 횟수. Ok read 하나로 0 리셋, 임계치면 hung broker로 보고 NotConnected.
     consecutive_timeouts: u32,
     /// deferred 명령의 총 벽시계 상한(working keepalive가 끝없이 와도 유한하게 끊기 위함).
     deferred_deadline: Duration,
-}
-
-impl Drop for BrokerLink {
-    fn drop(&mut self) {
-        self.hb_stop.store(true, Ordering::Relaxed);
-        if let Some(h) = self.hb_handle.take() {
-            let _ = h.join();
-        }
-    }
+    attached_name: String,
+    registration_id: u64,
 }
 
 /// 세션 포트로 접속해 attach{name?}한다. 실패는 명시 LinkError.
 pub fn connect(
     session_addr: &str,
     name: Option<String>,
+    timeout: Duration,
+) -> Result<BrokerLink, LinkError> {
+    connect_expected(session_addr, name, None, None, timeout)
+}
+
+fn connect_expected(
+    session_addr: &str,
+    name: Option<String>,
+    expected_registration_id: Option<u64>,
+    expected_launch_id: Option<String>,
     timeout: Duration,
 ) -> Result<BrokerLink, LinkError> {
     let stream = TcpStream::connect(session_addr).map_err(|_| LinkError::NotConnected)?;
@@ -70,7 +64,7 @@ pub fn connect(
     let reader = BufReader::new(stream.try_clone().map_err(io_e)?);
     let mut link = BrokerLink {
         reader,
-        writer: Arc::new(Mutex::new(stream)),
+        writer: Mutex::new(stream),
         caps: Capabilities {
             protocol_version: PROTOCOL_VERSION,
             methods: vec![],
@@ -82,17 +76,35 @@ pub fn connect(
             identity: EmulatorIdentity::default(),
         },
         next_id: 1,
-        hb_stop: Arc::new(AtomicBool::new(false)),
-        hb_handle: None,
         pending: Vec::new(),
         consecutive_timeouts: 0,
         deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
+        attached_name: String::new(),
+        registration_id: 0,
     };
-    let params = match name {
-        Some(n) => json!({ "name": n }),
-        None => json!({}),
-    };
-    let res = link.raw_call("attach", params)?;
+    let mut params = serde_json::Map::new();
+    if let Some(name) = name {
+        params.insert("name".into(), Value::String(name));
+    }
+    if let Some(registration_id) = expected_registration_id {
+        params.insert(
+            "expected_registration_id".into(),
+            Value::Number(registration_id.into()),
+        );
+    }
+    if let Some(launch_id) = expected_launch_id {
+        params.insert("expected_launch_id".into(), Value::String(launch_id));
+    }
+    let res = link.raw_call("attach", Value::Object(params))?;
+    link.attached_name = res
+        .get("attached_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| LinkError::Protocol("broker attach omitted attached_name".into()))?
+        .to_string();
+    link.registration_id = res
+        .get("broker_registration_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| LinkError::Protocol("broker attach omitted registration identity".into()))?;
     let methods = res
         .get("methods")
         .and_then(|m| m.as_array())
@@ -141,7 +153,6 @@ pub fn connect(
         recording,
         identity: EmulatorIdentity::from_hello(&res),
     };
-    link.start_heartbeat();
     Ok(link)
 }
 
@@ -154,33 +165,6 @@ impl BrokerLink {
     #[cfg(test)]
     pub(crate) fn set_deferred_deadline(&mut self, d: Duration) {
         self.deferred_deadline = d;
-    }
-
-    /// write-only heartbeat 스레드를 시작한다 — broker가 idle 세션을 hang으로 오판해 steal하지
-    /// 않도록 주기적으로 `_ping`을 보낸다(응답 불필요). stop 플래그로 drop 시 종료한다.
-    fn start_heartbeat(&mut self) {
-        let writer = self.writer.clone();
-        let stop = self.hb_stop.clone();
-        let ping = to_line(&Request::new(0, "_ping", json!({})));
-        self.hb_handle = Some(std::thread::spawn(move || {
-            loop {
-                // 주기를 100ms로 쪼개 stop을 빠르게 감지(drop 지연 최소화).
-                let ticks = HEARTBEAT_INTERVAL.as_millis() / 100;
-                for _ in 0..ticks {
-                    if stop.load(Ordering::Relaxed) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                let mut w = writer.lock().unwrap_or_else(|p| p.into_inner());
-                if w.write_all(ping.as_bytes()).is_err() {
-                    return; // 연결 끊김 — 스레드 종료
-                }
-            }
-        }));
     }
 
     fn raw_call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
@@ -354,6 +338,10 @@ fn map_broker_error(raw_line: &str, kind: &str, message: String) -> LinkError {
             let names = extract_names(raw_line);
             LinkError::Ambiguous { names }
         }
+        "identity_mismatch" => LinkError::Emulator {
+            kind: kind.to_string(),
+            message,
+        },
         _ => LinkError::Emulator {
             kind: kind.to_string(),
             message,
@@ -399,6 +387,10 @@ impl EmulatorLink for BrokerLink {
         }
         self.raw_call_inner(method, params, Some(observer), Some(control))
     }
+
+    fn has_exclusive_control(&self) -> bool {
+        !self.attached_name.is_empty() && self.registration_id != 0
+    }
 }
 
 /// 지연 BrokerLink — 첫 call 시에 connect+attach를 시도한다. 실패 시 직접 모드로 폴백하지
@@ -408,6 +400,8 @@ pub struct LazyBrokerLink {
     name: Option<String>,
     timeout: Duration,
     inner: Option<BrokerLink>,
+    expected_registration_id: Option<u64>,
+    expected_launch_id: Option<String>,
 }
 
 /// tcp::lazy에 대응하는 broker 지연 접속 팩토리. EMUCAP_BROKER 모드에서 SharedLink로 감싸
@@ -418,13 +412,27 @@ pub fn lazy(session_addr: &str, name: Option<String>, timeout: Duration) -> Lazy
         name,
         timeout,
         inner: None,
+        expected_registration_id: None,
+        expected_launch_id: None,
     }
 }
 
 impl LazyBrokerLink {
     fn ensure_connected(&mut self) -> Result<&mut BrokerLink, LinkError> {
         if self.inner.is_none() {
-            self.inner = Some(connect(&self.addr, self.name.clone(), self.timeout)?);
+            let link = connect_expected(
+                &self.addr,
+                self.name.clone(),
+                self.expected_registration_id,
+                self.expected_launch_id.clone(),
+                self.timeout,
+            )?;
+            if self.name.is_none() {
+                self.name = Some(link.attached_name.clone());
+            }
+            self.expected_registration_id = Some(link.registration_id);
+            self.expected_launch_id = link.caps.identity.launch_id.clone();
+            self.inner = Some(link);
         }
         Ok(self.inner.as_mut().unwrap())
     }
@@ -492,5 +500,11 @@ impl EmulatorLink for LazyBrokerLink {
 
     fn prepare_reconnect(&mut self) {
         self.inner = None;
+    }
+
+    fn has_exclusive_control(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(EmulatorLink::has_exclusive_control)
     }
 }

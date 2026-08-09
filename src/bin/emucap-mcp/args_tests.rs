@@ -102,6 +102,22 @@ fn record_window_accepts_the_generic_negotiated_extension_shape() {
     assert_eq!(extended.input_path.as_deref(), Some("/tmp/movie.txt"));
     assert_eq!(extended.warmup_frames, 3);
     assert_eq!(extended.stop_on.unwrap().occurrence, 1);
+    let filtered: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":1,"event_classes":["frame_boundary","snes_ppu_obj_consumption_read"],"event_filters":[{"event_class":"snes_ppu_obj_consumption_read","terms":[{"kind":"u64_range","path":"address","start":"0x2000","length":256}]}]}"#,
+    )
+    .unwrap();
+    assert_eq!(filtered.event_filters.len(), 1);
+    match &filtered.event_filters[0].terms[0] {
+        RecordWindowFilterTermArgs::U64Range {
+            path,
+            start,
+            length,
+        } => {
+            assert_eq!(path, "address");
+            assert_eq!(start.0, 0x2000);
+            assert_eq!(length.0, 256);
+        }
+    }
     let snapshots: RecordWindowArgs = serde_json::from_str(
         r#"{"output_root":"/tmp/evidence","frames":1,"terminal_snapshots":[{"label":"terminal-wram","memory_type":"wram","address":"0x20","length":16}]}"#,
     )

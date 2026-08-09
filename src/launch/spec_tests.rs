@@ -17,9 +17,13 @@ fn saturn_spec_has_module_and_content_and_headless() {
     let spec = mednafen_spec(
         Path::new("/run/mednafen"),
         Path::new("/tmp/m.log"),
-        Some("ss"),
-        false,
-        None,
+        Path::new("/tmp/mednafen-home"),
+        &MednafenSpecOpts {
+            module: Some("ss"),
+            sound: false,
+            pcfx_bios: None,
+            start_frozen: true,
+        },
         &opts("game.cue"),
     );
     assert_eq!(
@@ -37,10 +41,13 @@ fn saturn_spec_has_module_and_content_and_headless() {
     assert!(spec
         .env
         .contains(&("EMUCAP_PORT".to_string(), "47800".to_string())));
-    assert!(
-        !spec.env.iter().any(|(key, _)| key == "MEDNAFEN_HOME"),
-        "existing non-PC-FX firmware lookup must remain unchanged"
-    );
+    assert!(spec.env.contains(&(
+        "MEDNAFEN_HOME".to_string(),
+        "/tmp/mednafen-home".to_string()
+    )));
+    assert!(spec
+        .env
+        .contains(&("EMUCAP_START_FROZEN".to_string(), "1".to_string())));
 }
 
 #[test]
@@ -48,9 +55,13 @@ fn md_spec_forces_six_button_pad() {
     let spec = mednafen_spec(
         Path::new("/run/mednafen"),
         Path::new("/tmp/m.log"),
-        Some("md"),
-        false,
-        None,
+        Path::new("/tmp/mednafen-home"),
+        &MednafenSpecOpts {
+            module: Some("md"),
+            sound: false,
+            pcfx_bios: None,
+            start_frozen: false,
+        },
         &opts("game.md"),
     );
     assert_eq!(
@@ -82,9 +93,13 @@ fn name_and_token_are_passed_when_present() {
     let spec = mednafen_spec(
         Path::new("/b"),
         Path::new("/l"),
-        Some("ss"),
-        false,
-        None,
+        Path::new("/home"),
+        &MednafenSpecOpts {
+            module: Some("ss"),
+            sound: false,
+            pcfx_bios: None,
+            start_frozen: false,
+        },
         &o,
     );
     assert!(spec
@@ -100,9 +115,13 @@ fn pce_spec_enables_sound_only_when_requested() {
     let spec = mednafen_spec(
         Path::new("/run/mednafen"),
         Path::new("/tmp/m.log"),
-        Some("pce"),
-        true,
-        None,
+        Path::new("/tmp/mednafen-home"),
+        &MednafenSpecOpts {
+            module: Some("pce"),
+            sound: true,
+            pcfx_bios: None,
+            start_frozen: false,
+        },
         &opts("game.cue"),
     );
     assert_eq!(
@@ -117,13 +136,17 @@ fn pce_spec_enables_sound_only_when_requested() {
 }
 
 #[test]
-fn ngp_spec_preserves_explicit_module_without_user_profile_override() {
+fn ngp_spec_preserves_explicit_module_with_isolated_profile() {
     let spec = mednafen_spec(
         Path::new("/run/mednafen"),
         Path::new("/tmp/m.log"),
-        Some("ngp"),
-        false,
-        None,
+        Path::new("/tmp/mednafen-home"),
+        &MednafenSpecOpts {
+            module: Some("ngp"),
+            sound: false,
+            pcfx_bios: None,
+            start_frozen: false,
+        },
         &opts("game.ngc"),
     );
     assert_eq!(
@@ -135,7 +158,10 @@ fn ngp_spec_preserves_explicit_module_without_user_profile_override() {
         ]
         .concat()
     );
-    assert!(!spec.env.iter().any(|(key, _)| key == "MEDNAFEN_HOME"));
+    assert!(spec.env.contains(&(
+        "MEDNAFEN_HOME".to_string(),
+        "/tmp/mednafen-home".to_string()
+    )));
 }
 
 #[test]
@@ -143,9 +169,13 @@ fn pcfx_spec_preserves_explicit_module_and_sound() {
     let spec = mednafen_spec(
         Path::new("/run/mednafen"),
         Path::new("/tmp/m.log"),
-        Some("pcfx"),
-        true,
-        Some(Path::new("/firmware/pcfx.rom")),
+        Path::new("/tmp/mednafen-home"),
+        &MednafenSpecOpts {
+            module: Some("pcfx"),
+            sound: true,
+            pcfx_bios: Some(Path::new("/firmware/pcfx.rom")),
+            start_frozen: false,
+        },
         &opts("game.cue"),
     );
     assert_eq!(
@@ -165,9 +195,10 @@ fn pcfx_spec_preserves_explicit_module_and_sound() {
         ]
         .concat()
     );
-    assert!(spec
-        .env
-        .contains(&("MEDNAFEN_HOME".to_string(), "/tmp".to_string())));
+    assert!(spec.env.contains(&(
+        "MEDNAFEN_HOME".to_string(),
+        "/tmp/mednafen-home".to_string()
+    )));
 }
 
 #[test]

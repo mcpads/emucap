@@ -117,7 +117,8 @@ try {
         (Join-Path $Here "patches/0005-add-snes-ppu-obj-boundary-events.patch"),
         (Join-Path $Here "patches/0006-stop-video-threads-before-emulator-destruction.patch"),
         (Join-Path $Here "patches/0007-add-snes-deep-observation-events.patch"),
-        (Join-Path $Here "patches/0008-add-controlled-repeatable-start.patch")
+        (Join-Path $Here "patches/0008-add-controlled-repeatable-start.patch"),
+        (Join-Path $Here "patches/0009-expose-lua-power-cycle.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {

@@ -604,8 +604,12 @@ pub fn resume(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutp
     Ok(ToolOutput::Json(link.call("resume", params)?))
 }
 
-pub fn reset(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    let mut result = link.call("reset", json!({}))?;
+fn call_reconnecting_operation(
+    link: &mut dyn EmulatorLink,
+    method: &str,
+) -> Result<ToolOutput, LinkError> {
+    let identity_before = link.capabilities().identity.clone();
+    let mut result = link.call(method, json!({}))?;
     if result.get("reconnect").and_then(Value::as_bool) == Some(true) {
         link.prepare_reconnect();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -613,6 +617,11 @@ pub fn reset(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
         let status = loop {
             match link.call("status", json!({})) {
                 Ok(status) if status.get("connected").and_then(Value::as_bool) == Some(true) => {
+                    require_preserved_reconnect_identity(
+                        method,
+                        &identity_before,
+                        &link.capabilities().identity,
+                    )?;
                     break status;
                 }
                 Ok(_) | Err(LinkError::NotConnected | LinkError::Timeout | LinkError::Busy)
@@ -636,6 +645,55 @@ pub fn reset(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
         }
     }
     Ok(ToolOutput::Json(result))
+}
+
+fn require_preserved_reconnect_identity(
+    method: &str,
+    before: &crate::live::link::EmulatorIdentity,
+    after: &crate::live::link::EmulatorIdentity,
+) -> Result<(), LinkError> {
+    for (field, expected, actual) in [
+        (
+            "launch_id",
+            before.launch_id.as_deref(),
+            after.launch_id.as_deref(),
+        ),
+        (
+            "content",
+            before.content.as_deref(),
+            after.content.as_deref(),
+        ),
+        ("system", before.system.as_deref(), after.system.as_deref()),
+        (
+            "adapter",
+            before.adapter.as_deref(),
+            after.adapter.as_deref(),
+        ),
+        ("build", before.build.as_deref(), after.build.as_deref()),
+        (
+            "session_token",
+            before.session_token.as_deref(),
+            after.session_token.as_deref(),
+        ),
+    ] {
+        if expected.is_some() && expected != actual {
+            return Err(LinkError::Emulator {
+                kind: "identity_changed".into(),
+                message: format!(
+                    "{method} reconnected to a different {field}; refusing to report completion"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn reset(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
+    call_reconnecting_operation(link, "reset")
+}
+
+pub fn power_cycle(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
+    call_reconnecting_operation(link, "power_cycle")
 }
 
 /// 메모리 접근 브레이크포인트(kind=exec/read/write). pc_min/pc_max를 주면 그 접근을 일으킨 명령의

@@ -94,6 +94,7 @@ fn recording_sample() -> RecordingManifest {
                 id: "frame_boundary".into(),
                 contract_sha256: "55".repeat(32),
             }],
+            event_filters: vec![],
             event_arming: vec![],
             limits: RecordingLimits {
                 max_frames: 300,

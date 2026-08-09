@@ -28,6 +28,8 @@ mod instructions;
 mod launch;
 #[path = "emucap-mcp/memory_write.rs"]
 mod memory_write;
+#[path = "emucap-mcp/reattach.rs"]
+mod reattach;
 #[path = "emucap-mcp/recording.rs"]
 mod recording;
 #[path = "emucap-mcp/regression.rs"]
@@ -44,6 +46,7 @@ mod tests;
 use crate::args::*;
 use crate::instructions::SERVER_INSTRUCTIONS;
 use crate::launch::{apply_task_entry_transition, make_launch, make_launch_plan};
+use crate::reattach::make_reattach;
 use crate::regression::{
     default_session_port, ensure_capabilities_loaded, parse_observe_spec, run_one_case,
     verify_determinism_core, DetOutcome,
@@ -206,6 +209,7 @@ impl Emucap {
             &mut *link,
             a.includes(BootstrapDetail::Systems),
             a.includes(BootstrapDetail::Installation),
+            a.includes(BootstrapDetail::Runtimes),
         ) {
             Ok(v) => tool_output_result(ToolOutput::Json(v)),
             Err(e) => link_error_result(e),
@@ -217,7 +221,7 @@ impl Emucap {
     )]
     async fn launch_plan(&self, Parameters(a): Parameters<LaunchPlanArgs>) -> CallToolResult {
         let mut link = self.link();
-        match make_bootstrap_value(&mut *link, false, false) {
+        match make_bootstrap_value(&mut *link, false, false, false) {
             Ok(bootstrap) => {
                 let port = bootstrap
                     .pointer("/listener/port")
@@ -237,6 +241,14 @@ impl Emucap {
     async fn launch(&self, Parameters(a): Parameters<LaunchArgs>) -> CallToolResult {
         let mut link = self.link();
         boolean_outcome_result(make_launch(&mut *link, &a), "launched")
+    }
+
+    #[tool(
+        description = "Reattach one exact managed generation after its former control lease has been returned."
+    )]
+    async fn reattach(&self, Parameters(a): Parameters<ReattachArgs>) -> CallToolResult {
+        let mut link = self.link();
+        boolean_outcome_result(make_reattach(&mut *link, &a), "reattached")
     }
 
     #[tool(description = "Terminate the exact managed launch generation after ownership checks.")]
@@ -583,6 +595,14 @@ impl Emucap {
     async fn reset(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let mut l = self.link();
         match tools::reset(&mut *l) {
+            Ok(o) => tool_output_result(o),
+            Err(e) => link_error_result(e),
+        }
+    }
+
+    async fn power_cycle(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
+        let mut l = self.link();
+        match tools::power_cycle(&mut *l) {
             Ok(o) => tool_output_result(o),
             Err(e) => link_error_result(e),
         }

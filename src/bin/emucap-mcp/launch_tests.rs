@@ -1180,6 +1180,42 @@ fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
 }
 
 #[test]
+fn launch_plan_for_saturn_declares_isolated_firmware_and_controlled_start() {
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/test.cue".into()),
+            system: Some("saturn".into()),
+        },
+    );
+
+    assert_eq!(plan["adapter"], "mednafen");
+    assert!(plan["preconditions"]["bios_required"]
+        .as_str()
+        .unwrap()
+        .contains("EMUCAP_MEDNAFEN_FIRMWARE"));
+    assert!(
+        plan["environment_defaults"]["EMUCAP_MEDNAFEN_FIRMWARE"]["default"]
+            .as_str()
+            .unwrap()
+            .contains("firmware")
+    );
+    assert!(plan["headless_contract"]
+        .as_str()
+        .unwrap()
+        .contains("does not read or change ~/.mednafen"));
+    assert_eq!(plan["start_frozen_contract"]["supported"], true);
+    assert_eq!(
+        plan["start_frozen_contract"]["boundary"],
+        "pre_first_instruction"
+    );
+    assert_eq!(
+        plan["start_frozen_contract"]["repeatable_initial_conditions"],
+        false
+    );
+}
+
+#[test]
 fn launch_plan_for_msx_uses_stock_openmsx_bridge() {
     let plan = make_launch_plan(
         Some(47804),
@@ -2229,7 +2265,7 @@ fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
 #[test]
 fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
     let tmp = tempfile::tempdir().unwrap();
-    let content = tmp.path().join("game.md");
+    let content = tmp.path().join("game.v64");
     std::fs::write(&content, b"rom").unwrap();
     let mut link = NotConnectedPortLink::new();
 
@@ -2238,7 +2274,7 @@ fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
         &LaunchArgs {
             content_path: content.display().to_string(),
             content_path2: None,
-            system: Some("megadrive".into()),
+            system: Some("n64".into()),
             name: None,
             display: None,
             sound: None,
@@ -2251,9 +2287,9 @@ fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
     assert_eq!(out["launched"], false, "{out}");
     assert_eq!(
         out["reason"],
-        "start_frozen is currently supported only by Mesen systems"
+        "start_frozen is currently supported only by Mesen and Mednafen systems"
     );
-    assert_eq!(out["adapter"], "mednafen");
+    assert_eq!(out["adapter"], "mupen64plus");
     assert_eq!(link.calls, 1, "only the preflight status call is allowed");
 }
 

@@ -282,6 +282,7 @@ fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
         "bootstrap",
         "launch_plan",
         "launch",
+        "reattach",
         "stop",
         "status",
         "tap",
@@ -315,6 +316,7 @@ fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
         "pulse_touch_while_running",
         "hold_until",
         "record_window",
+        "power_cycle",
     ] {
         assert!(!visible.contains(name), "drawer operation leaked: {name}");
         assert!(server.get_tool(name).is_none());
@@ -345,6 +347,7 @@ fn drawers_publish_only_current_operations_and_bind_execution_to_the_revision() 
         "capability_revision": "revision-a",
         "methods": [
             "probe",
+            "power_cycle",
             "disassemble",
             "set_input",
             "hold_touch",
@@ -355,6 +358,7 @@ fn drawers_publish_only_current_operations_and_bind_execution_to_the_revision() 
     });
     let debug = debug_surface::describe(&status);
     assert!(debug["operations"]["probe"].is_object());
+    assert!(debug["operations"]["power_cycle"].is_object());
     assert!(debug["operations"].get("disassemble").is_none());
     assert!(debug["operations"].get("record_window").is_none());
     assert_eq!(debug["capability_revision"], "revision-a");
@@ -554,6 +558,23 @@ fn stop_is_exposed_as_a_host_lifecycle_tool_with_required_generation_identity() 
 }
 
 #[test]
+fn reattach_is_exposed_as_an_exact_generation_lifecycle_tool() {
+    let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
+        "127.0.0.1:0",
+        Duration::from_millis(50),
+    )));
+    let tools = Emucap::new(shared).tool_router.list_all();
+    let reattach = tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == "reattach")
+        .expect("reattach tool");
+    let schema = serde_json::to_value(&reattach.input_schema).unwrap();
+    assert_eq!(schema["required"], serde_json::json!(["launch_id"]));
+    assert_eq!(schema["additionalProperties"], false);
+    assert_eq!(schema["properties"]["launch_id"]["type"], "string");
+}
+
+#[test]
 fn debugger_tools_expose_optional_cpu_and_instruction_mode_routing() {
     let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
         "127.0.0.1:0",
@@ -600,6 +621,7 @@ fn record_window_drawer_schema_is_generic_and_requires_an_explicit_evidence_root
         properties,
         [
             "event_classes",
+            "event_filters",
             "frames",
             "initial_snapshots",
             "input_path",

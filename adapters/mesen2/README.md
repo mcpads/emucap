@@ -145,7 +145,10 @@ cleanup, and mid-frame recording failures do not inherit that eligibility.
 - Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
 - Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`hold_until`/`save_state`/`load_state`/
-  `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`.
+  `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`. A compatible host also advertises
+  `power_cycle` through the MCP debug drawer. It invokes Mesen's native full-reload path and returns
+  after the same launch generation and content selection reconnect; callers must verify battery-file
+  persistence separately when that fact matters.
   (`save_state`/`load_state` also work while frozen at a main-CPU instruction boundary created by
   explicit `pause` or an instruction step. They preserve the native halt, and a load refreshes the
   frozen CPU projection before replying. Frame/PPU-step and breakpoint halts return `unsafe_halt`

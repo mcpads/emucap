@@ -134,6 +134,16 @@
       "expression": "G((not current(g) or requested_launch_id != current_launch_id or not lease_held(g)) => stop_rejected(g) and not signal_sent_for(g)) and G(stop_completed(g) => current = g and all_recorded_generation_processes_exited(g) and requested_stop_recorded(g))"
     },
     {
+      "id": "LIFE.HANDOFF.1",
+      "category": "temporal",
+      "expression": "G(reattach_completed(g,c) => requested_generation(c) = g and current(g) and execution_alive(g) and required_backend_usable(g) and lease_held(g,c) and live_identity(c) = g) and G(reattach_rejected(g,c) => not transfer_lease(g,c))"
+    },
+    {
+      "id": "LIFE.RELAY.1",
+      "category": "temporal",
+      "expression": "G(relay_mutation(q,g) => explicit_context(q,g) and exclusive_relay_lease(g) and current_relay_session(q)) and G(heartbeat_stale(c) and not connection_closed(c) => not transfer_lease(c)) and G(relay_reregistration(c,g) => prior_front_closed(c) and live_identity(c) = g)"
+    },
+    {
       "id": "MEM.READ.EXACT.1",
       "category": "postcondition",
       "expression": "read.ok => len(read.bytes) = request.length and read.space = request.memory_type"
@@ -217,6 +227,11 @@
       "id": "EXEC.STEP.INSTR.1",
       "category": "postcondition",
       "expression": "step(n,unit=instructions,cpu).completed => delta_instruction(cpu) = n and frozen(after)"
+    },
+    {
+      "id": "EXEC.POWER_CYCLE.BOUNDARY.1",
+      "category": "postcondition",
+      "expression": "power_cycle.completed => native_power_cycle_boundary and same_generation and same_content_selection and replacement_control_session_ready"
     },
     {
       "id": "STATE.LOAD.COHERENT.1",
@@ -319,6 +334,14 @@
       "expectations": ["CORE.AVAIL.1"]
     },
     {
+      "id": "transport.broker-attach",
+      "surface": "wire",
+      "methods": ["attach"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["LIFE.RELAY.1"]
+    },
+    {
       "id": "lifecycle.bootstrap",
       "surface": "public",
       "methods": ["bootstrap"],
@@ -361,6 +384,19 @@
         "LIFE.LEASE.1",
         "LIFE.TERMINATE.1",
         "LIFE.STOP.1"
+      ]
+    },
+    {
+      "id": "lifecycle.reattach",
+      "surface": "public",
+      "methods": ["reattach"],
+      "temporal_classes": ["T3"],
+      "disposition": "retain",
+      "expectations": [
+        "TIME.RESPONSE.1",
+        "TIME.GENERATION.1",
+        "LIFE.LEASE.1",
+        "LIFE.HANDOFF.1"
       ]
     },
     {
@@ -605,6 +641,15 @@
       "temporal_classes": ["T2"],
       "disposition": "retain",
       "expectations": ["TIME.RESPONSE.1", "TIME.COMPLETE.1", "TIME.GENERATION.1"]
+    },
+    {
+      "id": "execution.power-cycle",
+      "surface": "public",
+      "methods": ["power_cycle"],
+      "route": "debug",
+      "temporal_classes": ["T3"],
+      "disposition": "retain",
+      "expectations": ["EXEC.POWER_CYCLE.BOUNDARY.1", "TIME.RESPONSE.1", "TIME.COMPLETE.1", "TIME.GENERATION.1"]
     },
     {
       "id": "state.save",

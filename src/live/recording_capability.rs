@@ -95,6 +95,23 @@ pub struct RecordingEventCapability {
     pub stoppable: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub startable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filterable_fields: Vec<RecordingEventFilterField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingEventFilterKind {
+    U64Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingEventFilterField {
+    pub path: String,
+    pub kind: RecordingEventFilterKind,
+    pub min: u64,
+    pub max: u64,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -320,6 +337,25 @@ impl RecordingCapability {
                     "event class {} does not exactly match its registered clock",
                     event.id
                 )));
+            }
+            let mut filter_paths = BTreeSet::new();
+            for field in &event.filterable_fields {
+                let registered = contract
+                    .payload_fields
+                    .iter()
+                    .find(|registered| registered.path == field.path);
+                let valid = registered.is_some_and(|registered| {
+                    registered.value_type == crate::event_contracts::PayloadValueType::U64
+                        && field.kind == RecordingEventFilterKind::U64Range
+                        && field.min == registered.min.unwrap_or(0)
+                        && field.max == registered.max.unwrap_or(u64::MAX)
+                });
+                if !filter_paths.insert(field.path.as_str()) || !valid {
+                    return Err(RecordingCapabilityError::Invalid(format!(
+                        "event class {} advertises an invalid filterable field {}",
+                        event.id, field.path
+                    )));
+                }
             }
         }
         if self.event_classes.iter().any(|event| event.startable)

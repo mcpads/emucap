@@ -1344,7 +1344,7 @@ fn aborted_staged_reclaim_token_restores_active_acceptance() {
 }
 
 #[test]
-fn persisted_control_port_recovers_live_generation_auth() {
+fn persisted_control_port_does_not_adopt_generation_without_control_identity() {
     let _env = SessionEnv::with(Some("runtime-auth-reconnect"));
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = probe.local_addr().unwrap().port();
@@ -1372,14 +1372,15 @@ fn persisted_control_port_recovers_live_generation_auth() {
         link.call("status", serde_json::json!({})),
         Err(LinkError::NotConnected)
     ));
-    assert_eq!(link.session_token(), Some(prepared.reclaim_token()));
+    assert_ne!(link.endpoint_port(), Some(port));
+    assert_ne!(link.session_token(), Some(prepared.reclaim_token()));
 
     let _ = std::fs::remove_file(persist);
     let _ = std::fs::remove_file(tcp::session_token_path(port));
 }
 
 #[test]
-fn fallback_port_does_not_adopt_unrelated_generation_auth() {
+fn fallback_port_skips_runtime_reserved_generation() {
     let _env = SessionEnv::with(Some("runtime-auth-fallback"));
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = probe.local_addr().unwrap().port();
@@ -1414,7 +1415,8 @@ fn fallback_port_does_not_adopt_unrelated_generation_auth() {
         link.call("status", serde_json::json!({})),
         Err(LinkError::NotConnected)
     ));
-    assert_eq!(link.endpoint_port(), Some(base));
+    assert_ne!(link.endpoint_port(), Some(base));
+    assert_ne!(link.endpoint_port(), Some(busy_port));
     assert_ne!(link.session_token(), Some(prepared.reclaim_token()));
 
     drop(busy);
@@ -1486,7 +1488,7 @@ fn range_scan_reattaches_one_generation_with_confirmed_stale_lease() {
 
 #[cfg(unix)]
 #[test]
-fn range_scan_reattaches_one_anonymous_generation_with_confirmed_stale_lease() {
+fn range_scan_does_not_reattach_anonymous_generation_with_confirmed_stale_lease() {
     let _env = SessionEnv::with(None);
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = probe.local_addr().unwrap().port();
@@ -1507,13 +1509,149 @@ fn range_scan_reattaches_one_anonymous_generation_with_confirmed_stale_lease() {
         .unwrap();
     install_stale_lease(&store, base, prepared.launch_id(), None);
 
-    match tcp::select_runtime_generation(&store, base).unwrap() {
-        tcp::RuntimeSelection::Attach { port, token, .. } => {
-            assert_eq!(port, base);
-            assert_eq!(token, prepared.reclaim_token());
-        }
-        _ => panic!("one available anonymous generation should be selected"),
-    }
+    assert!(matches!(
+        tcp::select_runtime_generation(&store, base).unwrap(),
+        tcp::RuntimeSelection::Scan { ref reserved_ports }
+            if reserved_ports == &[base]
+    ));
+
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    link.set_runtime_store(store);
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_ne!(link.endpoint_port(), Some(base));
+    assert_ne!(link.session_token(), Some(prepared.reclaim_token()));
+}
+
+#[cfg(unix)]
+#[test]
+fn anonymous_controller_can_explicitly_reattach_exact_returned_generation() {
+    let _env = SessionEnv::with(None);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    let launch_id = prepared.launch_id().to_string();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mednafen".into(),
+            system: "wswan".into(),
+            content: "/games/returned.ws".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(&store, base, &launch_id, None);
+
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    link.set_runtime_store(store.clone());
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    let alternate_port = link.endpoint_port().unwrap();
+    assert_ne!(alternate_port, base);
+
+    let reservations = link.runtime_reservations();
+    assert_eq!(reservations.len(), 1);
+    assert_eq!(reservations[0]["launch_id"], launch_id);
+    assert_eq!(reservations[0]["reattach"]["available"], true);
+
+    let result = link.reattach_runtime(&launch_id).unwrap();
+    assert_eq!(result["listening_port"], base);
+    assert_eq!(result["connection"], "pending");
+    assert_eq!(link.endpoint_port(), Some(base));
+    assert_eq!(link.session_token(), Some(prepared.reclaim_token()));
+    assert_eq!(
+        store
+            .read_link_json::<super::continuity::LinkRecord>(base, &launch_id)
+            .unwrap()
+            .unwrap()
+            .lease
+            .unwrap()
+            .holder
+            .pid,
+        std::process::id()
+    );
+
+    let rebound = std::net::TcpListener::bind(("127.0.0.1", alternate_port));
+    assert!(
+        rebound.is_ok(),
+        "explicit handoff must release the temporary listener"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_reattach_does_not_take_a_live_foreign_lease() {
+    let _env = SessionEnv::with(None);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    let launch_id = prepared.launch_id().to_string();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mednafen".into(),
+            system: "wswan".into(),
+            content: "/games/occupied.ws".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    let mut live_controller = std::process::Command::new("sh")
+        .args(["-c", "sleep 10"])
+        .spawn()
+        .unwrap();
+    let original_holder = super::runtime::capture_process(live_controller.id());
+    let mut record = super::continuity::LinkRecord::new(launch_id.clone());
+    record.lease = Some(super::runtime::LeaseRecord {
+        control_session_key: Some("another-live-controller".into()),
+        holder: original_holder.clone(),
+        acquired_at_unix_ms: 1,
+        refreshed_at_unix_ms: 1,
+    });
+    store
+        .update_link_json(base, &launch_id, |_| Ok(record))
+        .unwrap();
+    store
+        .write_compatibility_token(base, "foreign-generation-token")
+        .unwrap();
+
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    link.set_runtime_store(store.clone());
+    assert!(matches!(
+        link.reattach_runtime(&launch_id),
+        Err(LinkError::Busy)
+    ));
+    assert_eq!(link.endpoint_port(), None);
+    assert_eq!(
+        store.read_compatibility_token(base).unwrap().as_deref(),
+        Some("foreign-generation-token"),
+        "a rejected handoff must not publish another controller's token"
+    );
+    assert_eq!(
+        store
+            .read_link_json::<super::continuity::LinkRecord>(base, &launch_id)
+            .unwrap()
+            .unwrap()
+            .lease
+            .unwrap()
+            .holder,
+        original_holder
+    );
+    let _ = live_controller.kill();
+    let _ = live_controller.wait();
 }
 
 #[cfg(unix)]
@@ -1550,13 +1688,58 @@ fn range_scan_does_not_reattach_an_anonymous_generation_with_a_live_holder() {
 
     assert!(matches!(
         tcp::select_runtime_generation(&store, base).unwrap(),
-        tcp::RuntimeSelection::None
+        tcp::RuntimeSelection::Scan { ref reserved_ports }
+            if reserved_ports == &[base]
     ));
 }
 
 #[cfg(unix)]
 #[test]
-fn successful_reattach_clears_the_runtime_candidate() {
+fn range_scan_does_not_reattach_generation_from_another_control_session() {
+    let _env = SessionEnv::with(Some("runtime-range-current-control"));
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = probe.local_addr().unwrap().port();
+    drop(probe);
+    let tmp = tempfile::tempdir().unwrap();
+    let store = super::runtime::RuntimeStore::new(tmp.path().join("sessions"));
+    let prepared = store.prepare(base).unwrap();
+    prepared
+        .commit(&prepared.manifest(super::runtime::ManifestSpec {
+            adapter: "mame_pc98".into(),
+            system: "pc98".into(),
+            content: "/games/foreign.hdm".into(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: None,
+        }))
+        .unwrap();
+    install_stale_lease(
+        &store,
+        base,
+        prepared.launch_id(),
+        Some("another-control-session".into()),
+    );
+
+    assert!(matches!(
+        tcp::select_runtime_generation(&store, base).unwrap(),
+        tcp::RuntimeSelection::Scan { ref reserved_ports }
+            if reserved_ports == &[base]
+    ));
+
+    let mut link = tcp::lazy(&format!("127.0.0.1:{base}"), Duration::from_millis(50));
+    link.set_runtime_store(store);
+    assert!(matches!(
+        link.call("status", serde_json::json!({})),
+        Err(LinkError::NotConnected)
+    ));
+    assert_ne!(link.endpoint_port(), Some(base));
+    assert_ne!(link.session_token(), Some(prepared.reclaim_token()));
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_reattach_is_not_reported_as_runtime_ambiguity() {
     let _env = SessionEnv::with(Some("runtime-range-candidate-clear"));
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = probe.local_addr().unwrap().port();
@@ -1588,7 +1771,7 @@ fn successful_reattach_clears_the_runtime_candidate() {
         link.call("status", serde_json::json!({})),
         Err(LinkError::NotConnected)
     ));
-    assert_eq!(link.runtime_candidates().len(), 1);
+    assert!(link.runtime_candidates().is_empty());
     assert_eq!(link.endpoint_port(), Some(base));
 
     let peer = std::thread::spawn(move || {
@@ -1646,7 +1829,7 @@ fn range_scan_refuses_to_guess_between_two_stale_generations() {
             &store,
             port,
             prepared.launch_id(),
-            Some("control-old".into()),
+            Some(super::runtime::control_session_key().unwrap()),
         );
     }
 

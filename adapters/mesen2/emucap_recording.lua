@@ -10,7 +10,7 @@ local TRANSFER_ENABLE_SHA256 = "90678005dc54a82c200e9aef01404ca10430ee3a5a329167
 local TRANSFER_ACCESS_SHA256 = "735c6cdf3c8cbddde4b754dc6eea6700888bb03e9cd3c77eda750c5f8a372e60"
 local DEVICE_PORT_WRITE_SHA256 = "36ffca829da2ceb7f4b76f2d38b12331eade10014dd07ecd61f21403be8e4ca5"
 local INTERRUPT_DELIVERY_SHA256 = "c00494d891e76c380bd782d897c5f5ab4b59d918d49c3a64d78d9d4255c11e38"
-local OBJ_CONSUMPTION_SHA256 = "570c5e6c3bf493c0b2e93a59d467fb7300c400993115a08789b8836ad536adc8"
+local OBJ_CONSUMPTION_SHA256 = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local SNES_PPU_STATE_SHA256 = "21005a15437abd767cbeda5c7ede8741e2aeac4a006dafedede03a695377eaa2"
 local BASE_CAPABILITY_REVISION = "dea5c89d917c0e645296117dc9b14dcf089a49794dbe72b0319a104016a449bf"
 local SNES_STATE_CAPABILITY_REVISION = "7a63f4233406541101fdd078a4bd6ffbd1a9785efc24664355a6b491bd8f0efd"
@@ -18,9 +18,9 @@ local SNES_CAPABILITY_REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be78
 local BASE_SNAPSHOT_CAPABILITY_REVISION = "3314d6344f03df096660917a6087b19a62aece996402ecdd1ee992c87131d0aa"
 local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "ea526265eb6a5d6b229d568d2bfe7df503adc54032959a9f73eb361b5e6ade3f"
 local SNES_SNAPSHOT_CAPABILITY_REVISION = "3360ead44ccebf59a35aefcba6e5846d645188781682293b508a502343212782"
-local SNES_DEEP_CAPABILITY_REVISION = "6f601a701d9a979cde0c118c9fcd4fd4a2d572f529728ca77db5f4ddd99b26b4"
-local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "cf4f250d1319e642294bc69db241defe50d8a5ff1546f81aac99720b3209890b"
-local SNES_REPEATABLE_CAPABILITY_REVISION = "81a8e91a0680bcf72549d25126c91a3fef1f4205725b7ea6b40f4f9f33d25157"
+local SNES_DEEP_CAPABILITY_REVISION = "a01b63fdb6b35a4268edbdffb9675621b6712a9e8095bb8f7594067d3ecd355a"
+local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "7385af79303c2e05fddb0c06963771180893cfdcc3d821031e78c869e2655970"
+local SNES_REPEATABLE_CAPABILITY_REVISION = "a569ed75dc69a68f8584fbe717ddecd2509f49043a330a6b5fce586c89651f83"
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -40,6 +40,7 @@ local MAX_INITIAL_SNAPSHOT_MEMBER_BYTES = 128 * 1024
 local MAX_INITIAL_SNAPSHOT_TOTAL_BYTES = 128 * 1024
 local MAX_INITIAL_SNAPSHOT_CALLBACK_MS = 100
 local MAX_TERMINAL_STATE_BYTES = 128 * 1024
+local MAX_EVENT_FILTER_TERMS = 8
 local PROGRESS_MS = 250
 
 local OBJ_PAYLOAD_FIELDS = {
@@ -113,9 +114,16 @@ local OBJ_CONSUMPTION_FIELDS = {
   int_field("scanline", 0xffff), int_field("dot", 0xffff), int_field("hclock", 0xffff),
 }
 
+local FILTERABLE_FIELDS = {
+  snes_ppu_obj_consumption_read = {
+    memory_kind = { min = 0, max = 1 },
+    address = { min = 0, max = 0xffff },
+  },
+}
+
 local EVENT_CONTRACTS = {
   frame_boundary = { digest = FRAME_BOUNDARY_SHA256, clock = "frame" },
-  frame_completed = { digest = FRAME_COMPLETED_SHA256, clock = "frame" },
+  frame_completed = { digest = FRAME_COMPLETED_SHA256, clock = "frame", stoppable = true },
   snes_ppu_obj_evaluation_start = {
     digest = OBJ_EVALUATION_SHA256, clock = "snes_master", payload_fields = OBJ_PAYLOAD_FIELDS,
   },
@@ -142,6 +150,7 @@ local EVENT_CONTRACTS = {
   },
   snes_ppu_obj_consumption_read = {
     digest = OBJ_CONSUMPTION_SHA256, clock = "snes_master", payload_fields = OBJ_CONSUMPTION_FIELDS,
+    stoppable = true,
   },
 }
 
@@ -204,7 +213,7 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       contract_sha256 = FRAME_COMPLETED_SHA256,
       clock_domains = as_array({ "frame" }),
       exact = true,
-      stoppable = true,
+      stoppable = EVENT_CONTRACTS.frame_completed.stoppable,
     },
   }
   if semantic_advertised then
@@ -229,13 +238,21 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       { "snes_transfer_access", TRANSFER_ACCESS_SHA256 },
       { "snes_device_port_write", DEVICE_PORT_WRITE_SHA256 },
       { "snes_interrupt_delivery", INTERRUPT_DELIVERY_SHA256 },
-      { "snes_ppu_obj_consumption_read", OBJ_CONSUMPTION_SHA256 },
+      { "snes_ppu_obj_consumption_read", OBJ_CONSUMPTION_SHA256, true },
     }) do
-      event_classes[#event_classes + 1] = {
+      local event = {
         id = item[1], contract_sha256 = item[2],
         clock_domains = as_array({ "snes_master" }), exact = true,
         startable = item[1] == "snes_cpu_instruction" or nil,
+        stoppable = EVENT_CONTRACTS[item[1]].stoppable or nil,
       }
+      if item[3] then
+        event.filterable_fields = as_array({
+          { path = "memory_kind", kind = "u64_range", min = 0, max = 1 },
+          { path = "address", kind = "u64_range", min = 0, max = 0xffff },
+        })
+      end
+      event_classes[#event_classes + 1] = event
     end
   end
   local capability = {
@@ -330,6 +347,60 @@ local function validate_event_classes(classes)
     return nil, "frame_boundary must be selected"
   end
   return selected, order
+end
+
+local function only_fields(value, allowed)
+  for key in pairs(value) do
+    if not allowed[key] then return false end
+  end
+  return true
+end
+
+local function dense_array(value)
+  if type(value) ~= "table" then return false end
+  local count = 0
+  for key in pairs(value) do
+    if not integer(key) or key < 1 then return false end
+    count = count + 1
+  end
+  return count == #value
+end
+
+local function validate_event_filters(filters, selected)
+  if filters == nil then return {} end
+  if not dense_array(filters) then return nil, "event_filters must be a dense array" end
+  local result, previous_class = {}, nil
+  for _, filter in ipairs(filters) do
+    if type(filter) ~= "table" or not only_fields(filter, { event_class = true, terms = true })
+        or type(filter.event_class) ~= "string" or not selected[filter.event_class]
+        or result[filter.event_class] or not dense_array(filter.terms)
+        or #filter.terms < 1 or #filter.terms > MAX_EVENT_FILTER_TERMS
+        or (previous_class and filter.event_class <= previous_class) then
+      return nil, "event_filters must be canonical, unique, and select recorded classes"
+    end
+    local fields = FILTERABLE_FIELDS[filter.event_class]
+    if not fields then return nil, "event class does not advertise payload filtering" end
+    local terms, previous_path = {}, nil
+    for _, term in ipairs(filter.terms) do
+      if type(term) ~= "table"
+          or not only_fields(term, { kind = true, path = true, start = true, length = true })
+          or term.kind ~= "u64_range" or type(term.path) ~= "string"
+          or not integer(term.start) or not integer(term.length) or term.length < 1
+          or (previous_path and term.path <= previous_path) then
+        return nil, "event filter terms must be canonical u64_range predicates"
+      end
+      local bounds = fields[term.path]
+      if not bounds or term.start < bounds.min or term.start > bounds.max
+          or term.length > bounds.max - term.start + 1 then
+        return nil, "event filter range is outside the advertised payload field"
+      end
+      terms[#terms + 1] = term
+      previous_path = term.path
+    end
+    result[filter.event_class] = terms
+    previous_class = filter.event_class
+  end
+  return result
 end
 
 local function validate_limits(frames, event_count_per_frame, limits)
@@ -442,16 +513,19 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
   local selected, selected_order = validate_event_classes(params.event_classes)
   local event_error = selected_order
   if not selected then return nil, "unsupported", event_error end
+  local event_filters, filter_error = validate_event_filters(params.event_filters, selected)
+  if not event_filters then return nil, "bad_params", filter_error end
   local event_count_per_frame = selected.frame_completed and 2 or 1
   local limits, kind, message = validate_limits(total_frames, event_count_per_frame, params.limits)
   if not limits then return nil, kind, message end
 
   local stop_on = params.stop_on
   if stop_on ~= nil then
-    if type(stop_on) ~= "table" or stop_on.event_class ~= "frame_completed"
-        or not selected.frame_completed or not integer(stop_on.occurrence)
-        or stop_on.occurrence < 1 or stop_on.occurrence > params.frames then
-      return nil, "bad_params", "stop_on must select an advertised frame_completed occurrence"
+    local contract = type(stop_on) == "table" and EVENT_CONTRACTS[stop_on.event_class] or nil
+    if not contract or not contract.stoppable or not selected[stop_on.event_class]
+        or not integer(stop_on.occurrence) or stop_on.occurrence < 1
+        or (stop_on.event_class == "frame_completed" and stop_on.occurrence > params.frames) then
+      return nil, "bad_params", "stop_on must select a positive occurrence of a stoppable class"
     end
   end
   local start_on = params.start_on
@@ -498,6 +572,7 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
     limits = limits,
     selected = selected,
     selected_order = selected_order,
+    event_filters = event_filters,
     stop_on = stop_on,
     start_on = start_on,
     initial_snapshots = initial_snapshots,
@@ -551,6 +626,8 @@ local function mark_terminal(state, operation, execution, integrity, boundary, r
   state.integrity = integrity
   state.final_frame = boundary
   state.actual_end = math.max(state.origin_frame, math.min(boundary, state.maximum_end))
+  state.scope_end = math.min(
+    state.maximum_end, math.max(state.actual_end, state.event_scope_end))
   state.advanced_frames = math.max(state.advanced_frames, state.actual_end - state.origin_frame)
   state.completed_frames = math.max(0, state.actual_end - state.start_frame)
   state.reason = reason
@@ -682,6 +759,16 @@ local function validate_payload(contract, payload)
   return next(actual) == nil and expected_count == #contract.payload_fields
 end
 
+local function matches_event_filter(terms, payload)
+  if not terms then return true end
+  for _, term in ipairs(terms) do
+    local value = payload_value(payload, term.path)
+    if not integer(value) then return nil end
+    if value < term.start or value >= term.start + term.length then return false end
+  end
+  return true
+end
+
 local function event_line(sequence, class, contract, frame, clock_domain, tick, payload)
   local encoded, err = json_value(payload or {})
   if not encoded then return nil, err end
@@ -690,58 +777,59 @@ local function event_line(sequence, class, contract, frame, clock_domain, tick, 
     sequence, class, contract, clock_domain, tick, frame, encoded)
 end
 
-local function write_event(state, class, frame, tick, payload)
+local function write_event(state, class, frame, tick, terminal_frame, payload)
   local contract = EVENT_CONTRACTS[class]
   if not contract or not state.selected[class] then
-    return mark_terminal(state, "failed", "adapter_error", "unverifiable", frame,
+    return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "unselected_event_class")
   end
   payload = payload or {}
   if not validate_payload(contract, payload) then
-    return mark_terminal(state, "failed", "adapter_error", "unverifiable", tick,
+    return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "event_payload_contract_failed")
   end
   if class == "frame_boundary" then
     if frame ~= state.origin_frame + state.boundary_records then
-      return mark_terminal(state, "failed", "adapter_error", "unverifiable", frame,
+      return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
         "frame_boundary_gap_or_regression")
     end
   elseif class == "frame_completed" and frame ~= state.origin_frame + state.completed_records then
-    return mark_terminal(state, "failed", "adapter_error", "unverifiable", tick,
+    return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "frame_completed_gap_or_regression")
   end
 
   local sequence = state.events
   local line, encode_error = event_line(sequence, class, contract.digest, frame, contract.clock, tick, payload)
   if not line then
-    return mark_terminal(state, "failed", "adapter_error", "unverifiable", tick,
+    return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "event_payload_encode_failed: " .. tostring(encode_error))
   end
   if #line > state.limits.max_line_bytes then
-    return mark_terminal(state, "failed", "adapter_error", "unverifiable", tick,
+    return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "event_line_limit_exceeded")
   end
   if state.events + 1 > state.limits.max_events then
     state.dropped = state.dropped + 1
     state.class_dropped[class] = (state.class_dropped[class] or 0) + 1
-    return mark_terminal(state, "failed", "loss_detected", "lossy", tick,
+    return mark_terminal(state, "failed", "loss_detected", "lossy", terminal_frame,
       "event_limit_exceeded")
   end
   if state.physical_bytes + #line > state.limits.max_bytes then
     state.dropped = state.dropped + 1
     state.class_dropped[class] = (state.class_dropped[class] or 0) + 1
-    return mark_terminal(state, "failed", "loss_detected", "lossy", tick,
+    return mark_terminal(state, "failed", "loss_detected", "lossy", terminal_frame,
       "byte_limit_exceeded")
   end
 
   local ok, result, err, partial = pcall(state.sink.write, line)
   if not ok then
-    return mark_terminal(state, "failed", "adapter_error", "unverifiable", tick,
+    return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "sink_write_failed: " .. tostring(result))
   end
   if result == true then result = #line end
   if type(result) == "number" and result == #line then
     state.events = state.events + 1
+    state.event_scope_end = math.max(state.event_scope_end, frame + 1)
     state.class_counts[class] = (state.class_counts[class] or 0) + 1
     state.complete_bytes = state.complete_bytes + #line
     state.physical_bytes = state.physical_bytes + #line
@@ -767,13 +855,38 @@ local function write_event(state, class, frame, tick, payload)
   sent = math.max(0, math.min(sent or 0, #line))
   state.physical_bytes = state.physical_bytes + sent
   if sent > 0 then state.truncated = true end
-  return mark_terminal(state, "failed", "adapter_error", "unverifiable", tick,
+  return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
     "sink_write_failed: " .. tostring(err or "partial write"))
+end
+
+-- The persisted envelope owns the event-contract identity.  Terminal stop facts intentionally
+-- repeat only the coordinates needed to prove that the producer and Core selected the same final
+-- record; keep that wire shape independent from the richer internal write result.
+local function terminal_stop_facts(facts)
+  return {
+    sequence = facts.sequence,
+    event_class = facts.event_class,
+    clock_domain = facts.clock_domain,
+    clock_tick = facts.clock_tick,
+    frame = facts.frame,
+    occurrence = facts.occurrence,
+  }
 end
 
 function M.semantic_event(state, class, frame, tick, payload)
   if not state or not state.active or not state.observation_armed
       or frame < state.start_frame or not state.selected[class] then return state, nil end
+  payload = payload or {}
+  if not validate_payload(EVENT_CONTRACTS[class], payload) then
+    return state, mark_terminal(state, "failed", "adapter_error", "unverifiable", frame,
+      "event_payload_contract_failed")
+  end
+  local matches = matches_event_filter(state.event_filters[class], payload)
+  if matches == nil then
+    return state, mark_terminal(state, "failed", "adapter_error", "unverifiable", frame,
+      "event_filter_evaluation_failed")
+  end
+  if not matches then return state, nil end
   if state.start_on and not state.observation_started then
     if class ~= state.start_on.event_class then return state, nil end
     if #state.initial_snapshots > 0 then
@@ -801,7 +914,7 @@ function M.semantic_event(state, class, frame, tick, payload)
   elseif not state.observation_started then
     return state, nil
   end
-  local effect, facts = write_event(state, class, frame, tick, payload)
+  local effect, facts = write_event(state, class, frame, tick, frame, payload)
   if not effect and state.start_on and not state.observation_start then
     -- Event occurrence is local stop-condition bookkeeping. The public observation anchor has a
     -- closed shape and identifies the exact stream record directly by sequence and clock.
@@ -813,6 +926,11 @@ function M.semantic_event(state, class, frame, tick, payload)
       clock_domain = facts.clock_domain,
       clock_tick = facts.clock_tick,
     }
+  end
+  if not effect and state.stop_on and facts.event_class == state.stop_on.event_class
+      and facts.occurrence == state.stop_on.occurrence then
+    state.stop_event = terminal_stop_facts(facts)
+    return state, mark_terminal(state, "completed", "event_stop", "complete", frame, nil)
   end
   return state, effect
 end
@@ -889,6 +1007,8 @@ function M.start(params, request_id, expected_launch_id, start_frame, now_ms, si
     start_frame = start_frame + validated.warmup_frames,
     maximum_end = start_frame + validated.total_frames,
     actual_end = start_frame,
+    event_scope_end = start_frame,
+    scope_end = start_frame,
     final_frame = nil,
     last_frame = start_frame - 1,
     frames_requested = params.frames,
@@ -907,6 +1027,7 @@ function M.start(params, request_id, expected_launch_id, start_frame, now_ms, si
     limits = validated.limits,
     selected = validated.selected,
     selected_order = validated.selected_order,
+    event_filters = validated.event_filters,
     class_armed = {
       frame_boundary = true,
       frame_completed = validated.selected.frame_completed == true,
@@ -948,7 +1069,7 @@ function M.start(params, request_id, expected_launch_id, start_frame, now_ms, si
   }
   local effect = install_movie_input(state, 1, start_frame)
   if effect then return state, effect end
-  effect = select(1, write_event(state, "frame_boundary", start_frame, start_frame))
+  effect = select(1, write_event(state, "frame_boundary", start_frame, start_frame, start_frame))
   if not effect then
     effect = { kind = validated.warmup_frames == 0 and "arm_observation" or "working" }
   end
@@ -987,7 +1108,7 @@ function M.tick(state, boundary, now_ms)
   local completion
   if state.selected.frame_completed then
     local effect
-    effect, completion = write_event(state, "frame_completed", boundary - 1, boundary)
+    effect, completion = write_event(state, "frame_completed", boundary - 1, boundary, boundary)
     if effect then return state, effect end
   end
   state.advanced_frames = state.advanced_frames + 1
@@ -1000,7 +1121,7 @@ function M.tick(state, boundary, now_ms)
   end
   if state.stop_on and completion and boundary > state.start_frame
       and completion.occurrence == state.stop_on.occurrence then
-    state.stop_event = completion
+    state.stop_event = terminal_stop_facts(completion)
     return state, mark_terminal(state, "completed", "event_stop", "complete", boundary, nil)
   end
   if boundary == state.maximum_end then
@@ -1013,7 +1134,7 @@ function M.tick(state, boundary, now_ms)
 
   local effect = install_movie_input(state, state.advanced_frames + 1, boundary)
   if effect then return state, effect end
-  effect = select(1, write_event(state, "frame_boundary", boundary, boundary))
+  effect = select(1, write_event(state, "frame_boundary", boundary, boundary, boundary))
   if effect then return state, effect end
   if boundary == state.start_frame and not state.observation_armed then
     return state, { kind = "arm_observation" }
@@ -1058,10 +1179,11 @@ function M.result(state, now_ms)
   local input_cleanup = "not_acquired"
   if state.movie then input_cleanup = state.input_released and "released" or "unverifiable" end
   local class_facts = {}
+  local scope_end = state.scope_end or math.max(state.actual_end, state.event_scope_end)
   for _, id in ipairs(state.selected_order) do
     local interval = nil
     if (state.warmup_frames > 0 or state.start_on ~= nil) and state.class_armed[id] then
-      interval = { f_start = state.class_start[id], f_end = state.actual_end }
+      interval = { f_start = state.class_start[id], f_end = scope_end }
     end
     class_facts[#class_facts + 1] = {
       id = id,
@@ -1080,9 +1202,9 @@ function M.result(state, now_ms)
     reason = state.reason,
     f_origin = (state.warmup_frames > 0 or state.start_on ~= nil) and state.origin_frame or nil,
     f_start = state.start_frame,
-    f_end = state.actual_end,
+    f_end = scope_end,
     final_frame = state.final_frame,
-    frames = state.completed_frames,
+    frames = math.max(0, scope_end - state.start_frame),
     events = state.events,
     bytes = state.complete_bytes,
     physical_bytes = state.physical_bytes,

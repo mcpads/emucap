@@ -59,6 +59,7 @@ fn capability() -> RecordingCapability {
             exact: true,
             stoppable: false,
             startable: false,
+            filterable_fields: vec![],
         }],
         event_order: None,
         class_accounting: false,
@@ -468,6 +469,7 @@ fn request(output: &std::path::Path, frames: u64) -> RecordWindowRequest {
         frames,
         warmup_frames: 0,
         event_classes: vec![],
+        event_filters: vec![],
         origin: None,
         input_path: None,
         stop_on: None,
@@ -493,6 +495,96 @@ fn omitted_host_deadline_scales_only_long_explicit_windows() {
 }
 
 #[test]
+fn event_filters_are_capability_scoped_and_canonicalized_before_dispatch() {
+    let registry = crate::event_contracts::EventContractRegistry::builtin().unwrap();
+    let consumption = registry
+        .identities(["snes_ppu_obj_consumption_read"])
+        .unwrap()
+        .remove(0);
+    let mut capability = capability();
+    capability.event_classes.push(RecordingEventCapability {
+        id: consumption.id.clone(),
+        contract_sha256: consumption.contract_sha256,
+        clock_domains: vec!["snes_master".into()],
+        exact: true,
+        stoppable: false,
+        startable: false,
+        filterable_fields: vec![
+            RecordingEventFilterField {
+                path: "memory_kind".into(),
+                kind: RecordingEventFilterKind::U64Range,
+                min: 0,
+                max: 1,
+            },
+            RecordingEventFilterField {
+                path: "address".into(),
+                kind: RecordingEventFilterKind::U64Range,
+                min: 0,
+                max: 0xffff,
+            },
+        ],
+    });
+    capability.revision = capability.computed_revision().unwrap();
+    capability.validate(&registry).unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let mut request = request(output.path(), 1);
+    request.event_classes = vec!["frame_boundary".into(), consumption.id.clone()];
+    request.event_filters = vec![EventClassFilter {
+        event_class: consumption.id.clone(),
+        terms: vec![
+            EventFilterTerm::U64Range {
+                path: "memory_kind".into(),
+                start: 1,
+                length: 1,
+            },
+            EventFilterTerm::U64Range {
+                path: "address".into(),
+                start: 0x2000,
+                length: 0x100,
+            },
+        ],
+    }];
+
+    let effective = effective_request(&capability, &[], &[], &request).unwrap();
+    assert_eq!(
+        effective.request.event_filters[0].terms[0].path(),
+        "address"
+    );
+    assert_eq!(
+        effective.request.event_filters[0].terms[1].path(),
+        "memory_kind"
+    );
+
+    request.event_filters[0].terms[0] = EventFilterTerm::U64Range {
+        path: "memory_kind".into(),
+        start: 1,
+        length: 2,
+    };
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request),
+        Err(RecordingError::Invalid(_))
+    ));
+    request.event_filters[0].terms[0] = EventFilterTerm::U64Range {
+        path: "value".into(),
+        start: 0,
+        length: 1,
+    };
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request),
+        Err(RecordingError::Unavailable(_))
+    ));
+    request.event_filters[0].terms[0] = EventFilterTerm::U64Range {
+        path: "address".into(),
+        start: u64::MAX,
+        length: 2,
+    };
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request),
+        Err(RecordingError::Invalid(_))
+    ));
+}
+
+#[test]
 fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract() {
     let registry = crate::event_contracts::EventContractRegistry::builtin().unwrap();
     let instruction = registry
@@ -507,6 +599,7 @@ fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract
         exact: true,
         stoppable: false,
         startable: true,
+        filterable_fields: vec![],
     });
     capability.event_order = Some(RecordingEventOrder::GuestEmission);
     capability.class_accounting = true;
@@ -1259,6 +1352,7 @@ fn producer_status_cannot_contradict_a_completed_operation() {
         frames: 1,
         warmup_frames: 0,
         event_classes: capability().identities(&[]).unwrap(),
+        event_filters: vec![],
         event_arming: vec![],
         limits: RecordingLimits {
             max_frames: 1,
@@ -1380,6 +1474,7 @@ fn host_sink_failure_or_partial_record_downgrades_an_otherwise_complete_terminal
             frames: 1,
             warmup_frames: 0,
             event_classes: capability().identities(&[]).unwrap(),
+            event_filters: vec![],
             event_arming: vec![],
             limits: RecordingLimits {
                 max_frames: 1,

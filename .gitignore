@@ -28,6 +28,7 @@ regression/**/*.mss
 
 # Rust
 /target
+/deps-build/
 __pycache__/
 
 # macOS 잡파일
