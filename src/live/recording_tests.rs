@@ -27,6 +27,7 @@ use crate::bundle::recording_manifest::*;
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Normal,
+    PartialEventStop,
     Loss,
     CleanupFailed,
     Disconnect,
@@ -160,6 +161,26 @@ impl SyntheticLink {
         });
         capability.revision = capability.computed_revision().unwrap();
     }
+
+    fn enable_obj_event_stop(&mut self) {
+        let identity = crate::event_contracts::EventContractRegistry::builtin()
+            .unwrap()
+            .identities(["snes_ppu_obj_consumption_read"])
+            .unwrap()
+            .remove(0);
+        let capability = self.caps.recording.as_mut().unwrap();
+        capability.event_order = Some(RecordingEventOrder::GuestEmission);
+        capability.event_classes.push(RecordingEventCapability {
+            id: identity.id,
+            contract_sha256: identity.contract_sha256,
+            clock_domains: vec!["snes_master".into()],
+            exact: true,
+            stoppable: true,
+            startable: false,
+            filterable_fields: vec![],
+        });
+        capability.revision = capability.computed_revision().unwrap();
+    }
 }
 
 impl EmulatorLink for SyntheticLink {
@@ -259,6 +280,94 @@ impl EmulatorLink for SyntheticLink {
             phase: None,
         })?;
 
+        if matches!(self.mode, Mode::PartialEventStop) {
+            let contract_for = |id: &str| {
+                params["event_classes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|event| event["id"] == id)
+                    .and_then(|event| event["contract_sha256"].as_str())
+                    .unwrap()
+                    .to_string()
+            };
+            let events = [
+                EventEnvelope {
+                    sequence: 0,
+                    class: "frame_boundary".into(),
+                    contract_sha256: contract_for("frame_boundary"),
+                    clock: ClockPoint {
+                        domain: "frame".into(),
+                        tick: 100,
+                    },
+                    frame: 100,
+                    payload: json!({}),
+                },
+                EventEnvelope {
+                    sequence: 1,
+                    class: "snes_ppu_obj_consumption_read".into(),
+                    contract_sha256: contract_for("snes_ppu_obj_consumption_read"),
+                    clock: ClockPoint {
+                        domain: "snes_master".into(),
+                        tick: 123_456,
+                    },
+                    frame: 100,
+                    payload: json!({
+                        "memory_kind": 1,
+                        "address": 0x2000,
+                        "value": 0x5a,
+                        "scanline": 42,
+                        "dot": 128,
+                        "hclock": 512,
+                    }),
+                },
+            ];
+            let mut bytes = 0_u64;
+            for event in events {
+                let mut line = serde_json::to_vec(&event).unwrap();
+                line.push(b'\n');
+                sink.write_all(&line).unwrap();
+                bytes += line.len() as u64;
+            }
+            drop(sink);
+            self.terminal_frame = 100;
+            return Ok(json!({
+                "status": "completed",
+                "capture_id": capture_id,
+                "operation_outcome": "completed",
+                "execution_outcome": "event_stop",
+                "integrity": "complete",
+                "reason": Value::Null,
+                "f_origin": Value::Null,
+                "f_start": 100,
+                "f_end": 101,
+                "final_frame": 100,
+                "frames": 1,
+                "events": 2,
+                "bytes": bytes,
+                "physical_bytes": bytes,
+                "dropped": 0,
+                "truncated": false,
+                "first_sequence_gap": Value::Null,
+                "stop_event": {
+                    "sequence": 1,
+                    "event_class": "snes_ppu_obj_consumption_read",
+                    "clock_domain": "snes_master",
+                    "clock_tick": 123456,
+                    "frame": 100,
+                    "occurrence": 1,
+                },
+                "wall_ms": 1,
+                "final_execution_state": "frozen",
+                "cleanup": {
+                    "hooks": "released",
+                    "transient_input": "not_acquired",
+                    "sink": "released",
+                },
+                "event_classes": [],
+            }));
+        }
+
         let write_frames = match self.mode {
             Mode::Normal
             | Mode::CleanupFailed
@@ -266,7 +375,9 @@ impl EmulatorLink for SyntheticLink {
             | Mode::TerminalStateReadFailure
             | Mode::SnapshotGenerationChange => total_frames,
             Mode::Loss | Mode::Disconnect => total_frames.min(2),
-            Mode::Reject => unreachable!("rejection returns before opening the sink"),
+            Mode::Reject | Mode::PartialEventStop => {
+                unreachable!("mode returns before frame streaming")
+            }
         };
         let mut bytes = 0_u64;
         for offset in 0..write_frames {
@@ -848,6 +959,67 @@ fn terminal_snapshot_is_read_only_at_the_frozen_terminal_frame_and_reverified() 
         .any(|member| member.role == MemberRole::TerminalSnapshot
             && member.path == "snapshots/terminal-wram.bin"
             && member.bytes == 4));
+}
+
+#[test]
+fn partial_frame_event_stop_reads_terminal_members_at_the_actual_frozen_frame() {
+    let _env = crate::test_env::lock_env();
+    let harness = harness();
+    let mut link = SyntheticLink::new(
+        harness.port,
+        &harness.launch_id,
+        &harness.content,
+        Mode::PartialEventStop,
+        Duration::ZERO,
+    );
+    link.enable_obj_event_stop();
+    link.enable_terminal_snapshots();
+    link.enable_terminal_state();
+    let mut capture_request = request(harness.output.path(), 3);
+    capture_request.event_classes = vec![
+        "frame_boundary".into(),
+        "snes_ppu_obj_consumption_read".into(),
+    ];
+    capture_request.stop_on = Some(EventStopCondition {
+        event_class: "snes_ppu_obj_consumption_read".into(),
+        occurrence: 1,
+    });
+    capture_request.terminal_snapshots = vec![TerminalSnapshotRequest {
+        label: "terminal-wram".into(),
+        memory_type: "workram".into(),
+        address: 2,
+        length: 4,
+    }];
+    capture_request.terminal_state_profile = Some("snes_ppu".into());
+
+    let result = record_window(
+        &mut link,
+        harness.store.clone(),
+        capture_request,
+        RequestCancellation::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+
+    let bundle = std::path::Path::new(&result.bundle_path);
+    assert_eq!(
+        std::fs::read(bundle.join("snapshots/terminal-wram.bin")).unwrap(),
+        vec![2, 3, 4, 5]
+    );
+    let manifest = std::fs::read_to_string(bundle.join("manifest.json")).unwrap();
+    let BundleManifest::Recording(manifest) = parse_manifest(&manifest).unwrap() else {
+        panic!("recording manifest expected")
+    };
+    assert_eq!(manifest.scope.f_end, 101);
+    assert_eq!(manifest.terminal.final_frame, 100);
+    assert!(manifest
+        .members
+        .iter()
+        .any(|member| member.role == MemberRole::TerminalSnapshot));
+    assert!(manifest
+        .members
+        .iter()
+        .any(|member| member.role == MemberRole::TerminalState));
 }
 
 #[test]

@@ -309,6 +309,11 @@
       "expression": "G(stop_match(q,e) => final_event(q)=e and frozen_at(q,e.clock_tick) and no_later_input_or_tick(q))"
     },
     {
+      "id": "RECORD.TERMINAL.POSITION.1",
+      "category": "temporal",
+      "expression": "G(terminal_member_read(q,m) => frozen_at(q,terminal.final_frame) and same_generation(q) and delta_guest_time(q,m)=0)"
+    },
+    {
       "id": "RECORD.RESET.1",
       "category": "temporal",
       "expression": "G(reset_release_accepted(q) => sink_armed(q) and first_boundary(q)=first_post_reset_boundary(q))"
@@ -704,7 +709,7 @@
       "route": "debug",
       "temporal_classes": ["T2", "T4"],
       "disposition": "retain",
-      "expectations": ["TIME.PROGRESS.1", "TIME.CANCEL.1", "TIME.GENERATION.1", "RECORD.SCOPE.1", "RECORD.CONTINUITY.1", "RECORD.PUBLISH.1", "RECORD.FAILSTOP.1", "RECORD.EFFECT.HOST.1", "RECORD.MOVIE.1", "RECORD.STOP.1", "RECORD.RESET.1", "RECORD.INPUT.CLEANUP.1"]
+      "expectations": ["TIME.PROGRESS.1", "TIME.CANCEL.1", "TIME.GENERATION.1", "RECORD.SCOPE.1", "RECORD.CONTINUITY.1", "RECORD.PUBLISH.1", "RECORD.FAILSTOP.1", "RECORD.EFFECT.HOST.1", "RECORD.MOVIE.1", "RECORD.STOP.1", "RECORD.TERMINAL.POSITION.1", "RECORD.RESET.1", "RECORD.INPUT.CLEANUP.1"]
     },
     {
       "id": "debug.disassemble",
