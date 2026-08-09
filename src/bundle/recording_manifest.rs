@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const RECORDING_FORMAT_VERSION: u32 = 2;
+pub const MAX_EVENT_FILTER_TERMS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +60,8 @@ pub struct RecordingRequest {
     pub warmup_frames: u64,
     pub event_classes: Vec<EventClassIdentity>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub event_filters: Vec<EventClassFilter>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_arming: Vec<EventClassArming>,
     pub limits: RecordingLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -73,6 +76,31 @@ pub struct RecordingRequest {
     pub terminal_snapshots: Vec<TerminalSnapshotRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_state: Option<TerminalStateRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EventClassFilter {
+    pub event_class: String,
+    pub terms: Vec<EventFilterTerm>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EventFilterTerm {
+    U64Range {
+        path: String,
+        start: u64,
+        length: u64,
+    },
+}
+
+impl EventFilterTerm {
+    pub fn path(&self) -> &str {
+        match self {
+            Self::U64Range { path, .. } => path,
+        }
+    }
 }
 
 fn is_zero(value: &u64) -> bool {

@@ -164,6 +164,7 @@ fn recording_status_projects_only_the_negotiated_generic_capability() {
             exact: true,
             stoppable: false,
             startable: false,
+            filterable_fields: vec![],
         }],
         event_order: None,
         class_accounting: false,
@@ -172,6 +173,7 @@ fn recording_status_projects_only_the_negotiated_generic_capability() {
         terminal_snapshots: None,
         terminal_state: None,
         warmup: None,
+        repeatability: None,
         limits: RecordingLimits {
             max_frames: 300,
             max_events: 100_000,
@@ -251,6 +253,7 @@ fn connected_status_exposes_recording_only_for_a_bound_direct_generation() {
             exact: true,
             stoppable: false,
             startable: false,
+            filterable_fields: vec![],
         }],
         event_order: None,
         class_accounting: false,
@@ -259,6 +262,7 @@ fn connected_status_exposes_recording_only_for_a_bound_direct_generation() {
         terminal_snapshots: None,
         terminal_state: None,
         warmup: None,
+        repeatability: None,
         limits: RecordingLimits {
             max_frames: 300,
             max_events: 100_000,
@@ -923,10 +927,90 @@ fn bootstrap_distinguishes_the_search_base_from_the_selected_listener() {
         bound: false,
     };
 
-    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, false, false, false).unwrap();
 
     assert_eq!(value["listener"]["base_port"], 47800);
     assert_eq!(value["listener"]["port"], 47801);
+}
+
+struct RuntimeDiscoveryLink {
+    caps: emucap::live::link::Capabilities,
+    listener_blocked: bool,
+}
+
+impl EmulatorLink for RuntimeDiscoveryLink {
+    fn capabilities(&self) -> &emucap::live::link::Capabilities {
+        &self.caps
+    }
+
+    fn call(
+        &mut self,
+        _method: &str,
+        _params: serde_json::Value,
+    ) -> Result<serde_json::Value, LinkError> {
+        if self.listener_blocked {
+            Err(LinkError::PortBusy {
+                addr: "127.0.0.1:47800".into(),
+            })
+        } else {
+            Err(LinkError::NotConnected)
+        }
+    }
+
+    fn base_port(&self) -> Option<u16> {
+        Some(47800)
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(47801)
+    }
+
+    fn runtime_reservations(&self) -> Vec<serde_json::Value> {
+        vec![serde_json::json!({
+            "launch_id": "launch-returned",
+            "port": 47800,
+            "reattach": {
+                "available": true,
+                "tool": "reattach",
+                "arguments": {"launch_id": "launch-returned"},
+            }
+        })]
+    }
+}
+
+#[test]
+fn bootstrap_keeps_runtime_inventory_compact_until_requested() {
+    let mut link = RuntimeDiscoveryLink {
+        caps: emucap::live::link::Capabilities::empty(),
+        listener_blocked: false,
+    };
+
+    let compact = make_bootstrap_value(&mut link, false, false, false).unwrap();
+    assert_eq!(compact["runtime_reservation_count"], 1);
+    assert!(compact.get("runtime_reservations").is_none());
+
+    let detailed = make_bootstrap_value(&mut link, false, false, true).unwrap();
+    assert_eq!(
+        detailed["runtime_reservations"][0]["reattach"]["tool"],
+        "reattach"
+    );
+}
+
+#[test]
+fn blocked_listener_routes_to_runtime_inventory_instead_of_a_status_loop() {
+    let mut link = RuntimeDiscoveryLink {
+        caps: emucap::live::link::Capabilities::empty(),
+        listener_blocked: true,
+    };
+
+    let value = make_bootstrap_value(&mut link, false, false, false).unwrap();
+
+    assert_eq!(value["entry"]["reason"], "listener_blocked");
+    assert_eq!(value["entry"]["primary_action"]["tool"], "bootstrap");
+    assert_eq!(
+        value["entry"]["primary_action"]["arguments"]["include"],
+        serde_json::json!(["runtimes"])
+    );
 }
 
 #[test]
@@ -943,7 +1027,7 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
             identity: EmulatorIdentity::default(),
         },
     };
-    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, false, false, false).unwrap();
     assert_eq!(value["listener"]["state"], "bound");
     assert_eq!(value["listener"]["port"], 47855);
     assert_eq!(value["adapter_connection"]["state"], "disconnected");
@@ -982,8 +1066,8 @@ fn bootstrap_details_are_explicit_opt_in_sections() {
         caps: emucap::live::link::Capabilities::empty(),
     };
 
-    let compact = make_bootstrap_value(&mut link, false, false).unwrap();
-    let value = make_bootstrap_value(&mut link, true, true).unwrap();
+    let compact = make_bootstrap_value(&mut link, false, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, true, true, false).unwrap();
 
     assert!(value["supported_systems"].is_array());
     assert!(value["runtime_paths"].is_object());
@@ -1102,7 +1186,7 @@ fn bootstrap_is_total_when_status_times_out() {
         emucap::live::task_entry::EntryReason::TransportUncertain
     );
 
-    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, false, false, false).unwrap();
     assert_eq!(value["listener"]["port"], 47856);
     assert_eq!(value["adapter_connection"]["state"], "stalled");
     assert_eq!(value["entry"]["state"], "transition_blocked");
@@ -1185,7 +1269,7 @@ fn bootstrap_returns_diagnostic_json_when_runtime_capsule_is_corrupt() {
         blocks_generation_transition: true,
     };
 
-    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, false, false, false).unwrap();
 
     assert_eq!(value["entry"]["state"], "repair_runtime_metadata");
     assert_eq!(value["entry"]["reason"], "runtime_metadata_invalid");
@@ -1202,7 +1286,7 @@ fn bootstrap_does_not_block_on_corrupt_adapter_failure_evidence() {
         blocks_generation_transition: false,
     };
 
-    let value = make_bootstrap_value(&mut link, false, false).unwrap();
+    let value = make_bootstrap_value(&mut link, false, false, false).unwrap();
 
     assert_eq!(value["entry"]["state"], "ready_for_content");
     assert_eq!(value["entry"]["reason"], "ready_no_history");

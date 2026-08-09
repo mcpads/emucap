@@ -10,13 +10,16 @@ use sha2::{Digest, Sha256};
 
 use super::link::{EmulatorIdentity, MemoryRegion};
 use super::recording::RecordingError;
-use super::recording_capability::{RecordingCapability, RecordingCapabilityOrigin};
+use super::recording_capability::{
+    RecordingCapability, RecordingCapabilityOrigin, RecordingEventFilterKind,
+};
 use super::recording_input::{acquire_recording_movie, AcquiredRecordingMovie};
 use super::runtime::CurrentManifest;
 use crate::bundle::recording_manifest::{
-    ContentIdentity, EventArmingScope, EventClassArming, EventStartCondition, EventStopCondition,
-    InitialSnapshotRequest, RecordingOrigin, RecordingRequest, RuntimeIdentity,
-    TerminalSnapshotRequest, TerminalStateRequest,
+    ContentIdentity, EventArmingScope, EventClassArming, EventClassFilter, EventFilterTerm,
+    EventStartCondition, EventStopCondition, InitialSnapshotRequest, RecordingOrigin,
+    RecordingRequest, RuntimeIdentity, TerminalSnapshotRequest, TerminalStateRequest,
+    MAX_EVENT_FILTER_TERMS,
 };
 
 const DEFAULT_RECORDING_HOST_MS_MIN: u64 = 30_000;
@@ -35,6 +38,7 @@ pub struct RecordWindowRequest {
     pub frames: u64,
     pub warmup_frames: u64,
     pub event_classes: Vec<String>,
+    pub event_filters: Vec<EventClassFilter>,
     pub origin: Option<RecordingOrigin>,
     pub input_path: Option<PathBuf>,
     pub stop_on: Option<EventStopCondition>,
@@ -42,6 +46,7 @@ pub struct RecordWindowRequest {
     pub initial_snapshots: Vec<InitialSnapshotRequest>,
     pub terminal_snapshots: Vec<TerminalSnapshotRequest>,
     pub terminal_state_profile: Option<String>,
+    pub require_repeatable: bool,
     pub limits: Option<RequestedRecordingLimits>,
 }
 
@@ -101,12 +106,34 @@ pub(super) fn effective_request(
         RecordingOrigin::NextFrameBoundary => RecordingCapabilityOrigin::NextFrameBoundary,
         RecordingOrigin::ResetRelease => RecordingCapabilityOrigin::ResetRelease,
     };
+    if request.require_repeatable
+        && capability
+            .repeatability
+            .as_ref()
+            .is_none_or(|repeatability| !repeatability.origins.contains(&capability_origin))
+    {
+        return Err(RecordingError::Unavailable(format!(
+            "the current runtime does not advertise repeatable recording for origin {origin:?}"
+        )));
+    }
+    if request.require_repeatable
+        && capability
+            .repeatability
+            .as_ref()
+            .is_some_and(|repeatability| repeatability.requires_input_movie)
+        && request.input_path.is_none()
+    {
+        return Err(RecordingError::Invalid(
+            "the selected repeatable profile requires an explicit input movie; use an all-empty movie when no buttons should be pressed".into(),
+        ));
+    }
     if !capability.origins.contains(&capability_origin) {
         return Err(RecordingError::Unavailable(format!(
             "the current runtime does not advertise origin {origin:?}"
         )));
     }
     let event_classes = capability.identities(&request.event_classes)?;
+    let event_filters = validate_event_filters(capability, &event_classes, &request.event_filters)?;
     validate_start_request(capability, &event_classes, request)?;
     validate_initial_snapshot_request(capability, memory_regions, request)?;
     let event_arming = if request.warmup_frames == 0 && request.start_on.is_none() {
@@ -237,6 +264,7 @@ pub(super) fn effective_request(
             frames: request.frames,
             warmup_frames: request.warmup_frames,
             event_classes,
+            event_filters,
             event_arming,
             limits,
             input_movie: movie.as_ref().map(|movie| movie.identity.clone()),
@@ -249,6 +277,93 @@ pub(super) fn effective_request(
         origin,
         movie,
     })
+}
+
+fn validate_event_filters(
+    capability: &RecordingCapability,
+    selected: &[crate::bundle::recording_manifest::EventClassIdentity],
+    requested: &[EventClassFilter],
+) -> Result<Vec<EventClassFilter>, RecordingError> {
+    let mut classes = BTreeSet::new();
+    let mut filters = Vec::with_capacity(requested.len());
+    for filter in requested {
+        if !classes.insert(filter.event_class.as_str()) {
+            return Err(RecordingError::Invalid(format!(
+                "duplicate event filter for {}",
+                filter.event_class
+            )));
+        }
+        if !selected
+            .iter()
+            .any(|identity| identity.id == filter.event_class)
+        {
+            return Err(RecordingError::Invalid(format!(
+                "filtered event class {} must be selected",
+                filter.event_class
+            )));
+        }
+        if filter.terms.is_empty() || filter.terms.len() > MAX_EVENT_FILTER_TERMS {
+            return Err(RecordingError::Invalid(format!(
+                "event filter for {} must contain 1..={} terms",
+                filter.event_class, MAX_EVENT_FILTER_TERMS
+            )));
+        }
+        let event = capability
+            .event_classes
+            .iter()
+            .find(|event| event.id == filter.event_class)
+            .expect("selected event class was resolved from this capability");
+        let mut paths = BTreeSet::new();
+        let mut terms = filter.terms.clone();
+        for term in &terms {
+            if !paths.insert(term.path()) {
+                return Err(RecordingError::Invalid(format!(
+                    "duplicate event filter path {} for {}",
+                    term.path(),
+                    filter.event_class
+                )));
+            }
+            match term {
+                EventFilterTerm::U64Range {
+                    path,
+                    start,
+                    length,
+                } => {
+                    let field = event
+                        .filterable_fields
+                        .iter()
+                        .find(|field| {
+                            field.path == *path && field.kind == RecordingEventFilterKind::U64Range
+                        })
+                        .ok_or_else(|| {
+                            RecordingError::Unavailable(format!(
+                                "event class {} does not advertise u64_range filtering for {}",
+                                filter.event_class, path
+                            ))
+                        })?;
+                    let end = start.checked_add(*length).ok_or_else(|| {
+                        RecordingError::Invalid(format!(
+                            "event filter range for {}.{} overflows",
+                            filter.event_class, path
+                        ))
+                    })?;
+                    if *length == 0 || *start < field.min || end - 1 > field.max {
+                        return Err(RecordingError::Invalid(format!(
+                            "event filter range for {}.{} is outside {}..={}",
+                            filter.event_class, path, field.min, field.max
+                        )));
+                    }
+                }
+            }
+        }
+        terms.sort_by(|left, right| left.path().cmp(right.path()));
+        filters.push(EventClassFilter {
+            event_class: filter.event_class.clone(),
+            terms,
+        });
+    }
+    filters.sort_by(|left, right| left.event_class.cmp(&right.event_class));
+    Ok(filters)
 }
 
 fn validate_start_request(

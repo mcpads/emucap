@@ -4,6 +4,33 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.0
+
+### Added
+- Added opt-in controlled launch that returns at a frozen guest boundary, plus a capability-bound
+  Mesen SNES execution profile for repeatable reset-origin recordings with explicit input movies.
+  Maintained Mednafen systems now halt before their first guest instruction when controlled launch
+  is requested, without claiming a repeatable initial-state profile.
+- Added capability-scoped recording filters and occurrence stops. The maintained Mesen SNES profile
+  can narrow OBJ-consumption reads by memory kind and address, then close the capture on an exact
+  persisted matching occurrence without routing high-rate records through the live event queue.
+- Added native Mesen power-cycle control and exact managed-generation discovery and reattachment.
+  A returned generation can move to another control session only through its advertised
+  `launch_id`, private reconnect capability, process identity, and returned lease.
+
+### Fixed
+- Mednafen managed launches now use a per-port emucap-owned home and stage canonical BIOS files from
+  the shared emucap firmware inventory instead of reading or changing `~/.mednafen`.
+- Recording preserves frame-domain terminal coordinates on interrupted and partial-frame paths,
+  keeps a non-frame stop's own clock domain, and publishes only canonical terminal stop facts.
+- Foreign or unverifiable runtime generations no longer become implicit cleanup targets. Runtime
+  inventory reports the exact safe handoff action without requiring edits to session files.
+
+### Changed
+- Broker sessions no longer transfer control because a heartbeat is absent or time elapsed.
+  Reconnection requires the same broker registration, or an already-returned front session and the
+  same durable managed launch identity.
+
 ## 0.13.0
 
 ### Added

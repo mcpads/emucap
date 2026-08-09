@@ -955,8 +955,10 @@ pub(crate) fn make_bootstrap_value(
     link: &mut dyn EmulatorLink,
     include_systems: bool,
     include_installation: bool,
+    include_runtimes: bool,
 ) -> Result<serde_json::Value, LinkError> {
     let observation = observe_control_state(link)?;
+    let runtime_reservations = link.runtime_reservations();
     let base_port = link.base_port();
     let port = link.endpoint_port();
     let mut result = serde_json::json!({
@@ -976,9 +978,11 @@ pub(crate) fn make_bootstrap_value(
         },
         "supported_system_ids": supported_system_ids_value(),
         "system_catalog_revision": system_catalog_revision(),
+        "runtime_reservation_count": runtime_reservations.len(),
         "optional_details": {
             "systems": "bootstrap(include=[\"systems\"])",
-            "installation": "bootstrap(include=[\"installation\"])"
+            "installation": "bootstrap(include=[\"installation\"])",
+            "runtimes": "bootstrap(include=[\"runtimes\"])"
         }
     });
     if base_port.is_none() {
@@ -990,11 +994,23 @@ pub(crate) fn make_bootstrap_value(
     if observation.disposition.reason == EntryReason::TerminalHistory {
         result["terminal_history_available"] = serde_json::json!(true);
     }
+    if observation.disposition.reason == EntryReason::ListenerBlocked
+        && !runtime_reservations.is_empty()
+    {
+        result["entry"]["primary_action"] = serde_json::json!({
+            "kind": "call_tool",
+            "tool": "bootstrap",
+            "arguments": {"include": ["runtimes"]},
+        });
+    }
     if include_systems {
         result["supported_systems"] = supported_systems_value();
     }
     if include_installation {
         result["runtime_paths"] = runtime_paths(port);
+    }
+    if include_runtimes {
+        result["runtime_reservations"] = serde_json::Value::Array(runtime_reservations);
     }
     Ok(result)
 }

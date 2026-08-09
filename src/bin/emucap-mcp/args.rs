@@ -80,6 +80,9 @@ pub(crate) enum BootstrapDetail {
     Systems,
     /// Include build and runtime installation paths.
     Installation,
+    /// Include the bounded inventory of live managed generations in this
+    /// server's direct listener range and their explicit reattach availability.
+    Runtimes,
 }
 
 #[derive(Default, Deserialize, JsonSchema)]
@@ -143,6 +146,29 @@ pub(crate) struct RecordWindowStartArgs {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum RecordWindowFilterTermArgs {
+    /// Match an unsigned payload field in the half-open range [start, start + length).
+    U64Range {
+        /// Advertised payload field path.
+        path: String,
+        /// Inclusive range start.
+        start: Num,
+        /// Positive range length.
+        length: Num,
+    },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowEventFilterArgs {
+    /// Selected event class whose declared scope is narrowed.
+    pub(crate) event_class: String,
+    /// All terms must match. Check the live capability for supported fields.
+    pub(crate) terms: Vec<RecordWindowFilterTermArgs>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordWindowArgs {
     /// Existing absolute directory; Core creates one capture child.
@@ -155,6 +181,9 @@ pub(crate) struct RecordWindowArgs {
     /// Advertised event-class IDs; omit for defaults.
     #[serde(default)]
     pub(crate) event_classes: Vec<String>,
+    /// Optional advertised per-class payload filters. Omit to capture the full selected classes.
+    #[serde(default)]
+    pub(crate) event_filters: Vec<RecordWindowEventFilterArgs>,
     /// Advertised origin; omit for next_frame_boundary.
     #[serde(default)]
     pub(crate) origin: Option<RecordWindowOriginArgs>,
@@ -176,6 +205,11 @@ pub(crate) struct RecordWindowArgs {
     /// Advertised frozen-terminal state profile to preserve as one hashed JSON member.
     #[serde(default)]
     pub(crate) terminal_state_profile: Option<String>,
+    /// Require a live repeatable-recording profile. Refuses before staging,
+    /// reset, input, or guest advance when the current runtime does not
+    /// advertise it.
+    #[serde(default)]
+    pub(crate) require_repeatable: bool,
     /// Optional narrower advertised limits.
     #[serde(default)]
     pub(crate) limits: Option<RecordWindowLimitsArgs>,
@@ -763,11 +797,27 @@ pub(crate) struct LaunchArgs {
     /// than silently ignoring it.
     #[serde(default)]
     pub(crate) sound: Option<bool>,
+    /// Return only after the adapter is connected at a guest-time-closed frozen
+    /// entry boundary. Default: false. Unsupported adapters reject true before
+    /// spawning a process.
+    #[serde(default)]
+    pub(crate) start_frozen: bool,
+    /// Optional execution conditions selected before launch. `repeatable`
+    /// implies start_frozen and is currently available only for SNES on the
+    /// compatible Mesen host.
+    #[serde(default)]
+    pub(crate) execution_profile: Option<LaunchExecutionProfileArgs>,
     /// Explicitly replace a live process recorded by the current capsule. The
     /// launcher terminates only a generation whose PID and process-start identity
     /// both match; unverifiable ownership is rejected.
     #[serde(default)]
     pub(crate) replace: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum LaunchExecutionProfileArgs {
+    Repeatable,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -776,6 +826,14 @@ pub(crate) struct StopArgs {
     /// Exact current launch generation to terminate. Read it from
     /// `status.runtime_instance.launch_id`; a stale or different generation is
     /// rejected without signalling any process.
+    pub(crate) launch_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReattachArgs {
+    /// Exact managed launch generation to take over after its former control
+    /// lease has been returned. Read candidates through runtime discovery.
     pub(crate) launch_id: String,
 }
 

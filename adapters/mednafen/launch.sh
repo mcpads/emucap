@@ -22,6 +22,8 @@
 #   MEDNAFEN_FORCE_MODULE=pce|pcfx|psx|ss|md|wswan|ngp  4번째 인자 없을 때 사용
 #   MEDNAFEN_SOUND=0|1                      기본: 0
 #   EMUCAP_PCFX_BIOS=/absolute/pcfx.rom     PC-FX BIOS version 1.00
+#   EMUCAP_MEDNAFEN_FIRMWARE=/absolute/dir  canonical BIOS files; default: <emucap-data>/firmware
+#   EMUCAP_START_FROZEN=1                    halt before the first guest instruction
 #   EMUCAP_HEADLESS=1|0                     기본: 1(SDL_VIDEODRIVER=dummy)
 #   EMUCAP_LAUNCH_WAIT=<seconds>            기본: 20
 #   EMUCAP_POST_CONNECT_GRACE=<seconds>     기본: 3(연결 직후 사망/끊김 검출)
@@ -225,6 +227,39 @@ if [ "$MODULE" = "pcfx" ]; then
   }
 fi
 
+FIRMWARE_ROOT="${EMUCAP_MEDNAFEN_FIRMWARE:-$EMUCAP_DATA_ROOT/firmware}"
+if [ -n "${EMUCAP_MEDNAFEN_FIRMWARE:-}" ]; then
+  case "$FIRMWARE_ROOT" in
+    /*) ;;
+    *)
+      echo "ERROR: EMUCAP_MEDNAFEN_FIRMWARE must be an absolute directory: $FIRMWARE_ROOT" >&2
+      exit 2
+      ;;
+  esac
+  [ -d "$FIRMWARE_ROOT" ] || {
+    echo "ERROR: EMUCAP_MEDNAFEN_FIRMWARE directory does not exist: $FIRMWARE_ROOT" >&2
+    exit 2
+  }
+fi
+
+stage_mednafen_firmware() {
+  local destination="$RUN_DIR/firmware"
+  [ ! -L "$EMUCAP_DATA_ROOT/mednafen" ] && [ ! -L "$RUN_DIR" ] && [ ! -L "$destination" ] || {
+    echo "ERROR: Mednafen runtime home must not be a symlink: $RUN_DIR" >&2
+    return 1
+  }
+  mkdir -p "$destination"
+  [ -d "$FIRMWARE_ROOT" ] || return 0
+  local name source tmp
+  for name in sega_101.bin mpr-17933.bin scph5500.bin scph5501.bin scph5502.bin syscard3.pce; do
+    source="$FIRMWARE_ROOT/$name"
+    [ -f "$source" ] || continue
+    tmp="$destination/${name}.tmp.$$"
+    cp "$source" "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$destination/$name" || { rm -f "$tmp"; return 1; }
+  done
+}
+
 tail_log() {
   echo "---- Mednafen log: $LOG ----" >&2
   if [ -s "$LOG" ]; then
@@ -274,6 +309,8 @@ if command -v lsof >/dev/null 2>&1; then
   fi
 fi
 
+stage_mednafen_firmware
+
 # 런타임↔빌드트리 분리: 기본 빌드 바이너리는 포트별 emucap 데이터 디렉터리로 복사해 실행한다.
 if [ -z "${MEDNAFEN_BIN:-}" ]; then
   RUN_BIN="$RUN_DIR/$(basename "$BIN")"
@@ -298,7 +335,7 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
   echo "  session_token=${SESSION_TOKEN:+present}"
   echo "  token_file=$TOKEN_FILE"
   echo "  module=${MODULE:-<auto>}"
-  echo "  profile=$([ "$MODULE" = "pcfx" ] && printf '%s' "$RUN_DIR" || printf '%s' '<default Mednafen profile>')"
+  echo "  profile=$RUN_DIR"
   echo "  bin=$BIN"
   echo "  wait=${WAIT}s"
   echo "  post_connect_grace=${POST_CONNECT_GRACE}s"
@@ -313,10 +350,7 @@ if [ -n "$MEDNAFEN_BINARY_SHA256" ]; then
   export EMUCAP_MEDNAFEN_UPSTREAM_REVISION="$MEDNAFEN_UPSTREAM_REVISION"
   export EMUCAP_MEDNAFEN_PATCHSET_SHA256="$MEDNAFEN_PATCHSET_SHA256"
 fi
-if [ "$MODULE" = "pcfx" ]; then
-  # PC-FX has an explicit BIOS argument, so it can use a fully isolated profile.
-  export MEDNAFEN_HOME="$RUN_DIR"
-fi
+export MEDNAFEN_HOME="$RUN_DIR"
 if [ -n "$NAME" ]; then
   export EMUCAP_NAME="$NAME"
 fi

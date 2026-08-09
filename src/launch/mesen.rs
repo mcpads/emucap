@@ -14,7 +14,14 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const REQUIRED_HOST_API: u32 = 2;
+pub const REQUIRED_HOST_API: u32 = 3;
+pub const REPEATABLE_PROFILE_ID: &str = "mesen_snes_repeatable";
+pub const REPEATABLE_CONDITIONS_SHA256: &str =
+    "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b";
+const REPEATABLE_SEED: &str = "1162696003";
+const REPEATABLE_UNIX_TIME: &str = "788918400";
+const REPEATABLE_PERSISTENCE_DIRS: [&str; 5] =
+    ["Cheats", "Debugger", "GameConfig", "Satellaview", "Saves"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -420,6 +427,8 @@ pub struct Launch<'a> {
     pub build: Option<&'a str>,
     pub session_token: Option<&'a str>,
     pub runtime: Option<super::RuntimeEnv<'a>>,
+    pub start_frozen: bool,
+    pub repeatable: bool,
 }
 
 fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> super::LaunchSpec {
@@ -438,6 +447,19 @@ fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> sup
     if let Some(build) = l.build {
         spec = spec.env("EMUCAP_BUILD_HASH", build);
     }
+    if l.start_frozen || l.repeatable {
+        spec = spec.env("EMUCAP_START_FROZEN", "1");
+    }
+    if l.repeatable {
+        spec = spec
+            .env("EMUCAP_EXECUTION_PROFILE", "repeatable")
+            .env(
+                "EMUCAP_REPEATABLE_CONDITIONS_SHA256",
+                REPEATABLE_CONDITIONS_SHA256,
+            )
+            .env("EMUCAP_REPEATABLE_SEED", REPEATABLE_SEED)
+            .env("EMUCAP_FIXED_UNIX_TIME", REPEATABLE_UNIX_TIME);
+    }
     spec
 }
 
@@ -446,7 +468,10 @@ fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> sup
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let host_build = read_build_metadata(l.binary)?;
     let portable = prepare_portable_binary(l.binary, l.port)?;
-    ensure_portable_settings(&portable)?;
+    ensure_portable_settings(&portable, l.repeatable)?;
+    if l.repeatable {
+        clear_repeatable_persistence(&portable)?;
+    }
     provision_gba_bios(l, &portable)?;
     let spec = launch_spec(l, &portable.binary, &host_build);
     crate::launch::wake_display_before_gui_launch();
@@ -474,7 +499,26 @@ fn is_gba_launch(l: &Launch) -> bool {
 /// native input defaults. For GBA it also makes the staged Firmware directory the lookup path.
 /// Settings copied from the build are replaced so build-machine state cannot affect an isolated
 /// launch.
-fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> {
+fn portable_settings_bytes(repeatable: bool) -> std::io::Result<Vec<u8>> {
+    if !repeatable {
+        return Ok(PORTABLE_SETTINGS.as_bytes().to_vec());
+    }
+    let mut settings: serde_json::Value = serde_json::from_str(PORTABLE_SETTINGS)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    settings["Snes"] = serde_json::json!({
+        "RamPowerOnState": "Random",
+        "EnableRandomPowerOnState": false,
+        "BsxUseCustomTime": true,
+        "BsxCustomDate": "1995-01-01T00:00:00+00:00",
+        "BsxCustomTime": "00:00:00"
+    });
+    let mut bytes = serde_json::to_vec_pretty(&settings)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn ensure_portable_settings(portable: &PreparedPortable, repeatable: bool) -> std::io::Result<()> {
     if super::has_symlink_component_under(&portable.home, &portable.settings) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -497,7 +541,8 @@ fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> 
         std::fs::create_dir_all(parent)?;
     }
     let tmp = super::unique_sibling_path(&portable.settings, "tmp");
-    if let Err(err) = std::fs::write(&tmp, PORTABLE_SETTINGS.as_bytes()) {
+    let settings = portable_settings_bytes(repeatable)?;
+    if let Err(err) = std::fs::write(&tmp, settings) {
         let _ = std::fs::remove_file(&tmp);
         return Err(err);
     }
@@ -508,6 +553,32 @@ fn ensure_portable_settings(portable: &PreparedPortable) -> std::io::Result<()> 
         }
     }
     super::rename_file_tmp(&tmp, &portable.settings)
+}
+
+fn clear_repeatable_persistence(portable: &PreparedPortable) -> std::io::Result<()> {
+    let data = portable.settings.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "portable Mesen settings have no data directory",
+        )
+    })?;
+    for name in REPEATABLE_PERSISTENCE_DIRS {
+        let path = data.join(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "repeatable Mesen persistence path is not a private directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        std::fs::remove_dir_all(path)?;
+    }
+    Ok(())
 }
 
 /// The default GBA BIOS source when `EMUCAP_GBA_BIOS` is unset: the emucap-owned firmware directory

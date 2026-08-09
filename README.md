@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.13.0 — beta.** This repository remains under active development; interfaces and
+**v0.14.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -177,11 +177,22 @@ Every emucap task starts with `bootstrap`. Ask the agent to "call emucap
 `bootstrap`", and its compact response returns `listener.port`, system IDs, a
 catalog revision, and questions about what to bring up. The full routing catalog
 is available through `bootstrap(include=["systems"])`; build and runtime paths
-through `bootstrap(include=["installation"])`. Then
+through `bootstrap(include=["installation"])`. The compact response includes a live managed-runtime
+count; request `bootstrap(include=["runtimes"])` only when continuing an existing generation. An
+available entry supplies the exact arguments for `reattach`, so a client without a stable host
+session ID can resume a returned lease without editing runtime files. Then
 `launch_plan(content_path, system?)` returns the validated MCP `launch` tool
 arguments. The agent calls `launch`, which waits for adapter readiness, and
 verifies the resulting live and runtime identities with `status`. Launcher
 scripts are developer entry points, not an alternative managed lifecycle.
+
+An ordinary launch can return while the guest is already running. If the first follow-up action
+must not inherit network or agent delay as guest time, request `start_frozen: true`; a supported
+launcher succeeds only after the adapter is connected at a frozen guest boundary. This controls
+post-launch guest time, not power-on RAM, RTC, saves, or other initial conditions. A live-advertised
+`execution_profile: "repeatable"` is the separate opt-in for those producer-owned conditions, and
+`record_window(require_repeatable: true)` fails before reset, input, or guest advance unless the
+selected recording origin is eligible.
 
 `listener.base_port` is only where direct-mode port search begins. It may already
 belong to another live MCP session. Launchers use the assigned `listener.port`
@@ -201,6 +212,10 @@ frame count; it returns with the emulator frozen plus a validated bundle path an
 manifest hash. The live capability is the authority for event classes and limits.
 Optional origin, input movie, and event-stop arguments are valid only when that exact capability
 advertises them; omitting them retains the bounded next-frame behavior.
+High-rate event classes may additionally advertise filterable integer payload fields. Optional
+per-class half-open ranges narrow only the declared observation scope; excluded callbacks are not
+reported as drops, while matching events retain the ordinary sequence, limit, and integrity rules.
+Unadvertised fields and invalid ranges are rejected before guest mutation.
 When `recording_capability.warmup` exists, `warmup_frames` keeps cheap transaction classes active
 while delaying observation-only hooks until the exact guest boundary; the input movie covers both
 intervals in one request.
@@ -226,7 +241,9 @@ status.
 A timeout or `connected: false` reports transport state, not proof that the
 emulator exited. Inspect `status.continuity.runtime_binding`,
 `status.runtime_instance` or `status.stale_runtime_instance`, and
-`get_failure_context` before relaunching. Reattach to a live owned generation;
+`get_failure_context` before relaunching. Automatic reattach is limited to the same stable control
+identity; otherwise select an available exact generation from bootstrap runtime discovery and call
+`reattach(launch_id=...)`;
 use `launch(..., replace: true)` only for an intentional, identity-verified
 replacement. On a Flycast fatal quarantine, read the preserved context first and
 call debug operation `dismiss_failure` only when `status.methods` advertises it.

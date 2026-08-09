@@ -1,0 +1,33 @@
+{
+  "profile": "mesen_snes_repeatable",
+  "system": "snes",
+  "entry_boundary": "pre_first_instruction_frozen",
+  "entropy": {
+    "algorithm": "mesen_mt19937",
+    "seed": 1162696003
+  },
+  "device_time": {
+    "unix_seconds": 788918400
+  },
+  "portable_persistence_removed": [
+    "Cheats",
+    "Debugger",
+    "GameConfig",
+    "Satellaview",
+    "Saves"
+  ],
+  "snes_settings": {
+    "BsxCustomDate": "1995-01-01T00:00:00+00:00",
+    "BsxCustomTime": "00:00:00",
+    "BsxUseCustomTime": true,
+    "EnableRandomPowerOnState": false,
+    "RamPowerOnState": "Random"
+  },
+  "recording": {
+    "origins": [
+      "reset_release"
+    ],
+    "input_movie_port": 0,
+    "requires_input_movie": true
+  }
+}

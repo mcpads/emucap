@@ -6,6 +6,7 @@ local COMPLETED_CONTRACT = "a335a785a0c109cc7edc6ecab27ff429e386c2ad2eb34769cac4
 local OBJ_EVALUATION_CONTRACT = "0d32bfc67347b3169fd77f9d30beb9c325c64db30f0081c628ba85646ebd763b"
 local OBJ_HANDOFF_CONTRACT = "ad23c438ee6400f5f9cab84d877f490abe24670769e50efd2bf67d932d329bbc"
 local CPU_INSTRUCTION_CONTRACT = "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f2ae73ac4ba81c55af0"
+local OBJ_CONSUMPTION_CONTRACT = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be7890e318f9b8c4b218a2"
 local LAUNCH = "launch-01test"
 
@@ -87,10 +88,23 @@ local function movie_file(text)
   return path
 end
 
+local function obj_consumption_payload(overrides)
+  local value = {
+    memory_kind = 1,
+    address = 0x2000,
+    value = 0x34,
+    scanline = 16,
+    dot = 128,
+    hclock = 512,
+  }
+  for key, item in pairs(overrides or {}) do value[key] = item end
+  return value
+end
+
 do
   local capability = Recording.capability(function(value) return value end, true, false, true, true)
   equal(capability.revision,
-    "6f601a701d9a979cde0c118c9fcd4fd4a2d572f529728ca77db5f4ddd99b26b4",
+    "a01b63fdb6b35a4268edbdffb9675621b6712a9e8095bb8f7594067d3ecd355a",
     "deep capability revision")
   equal(capability.event_order, "guest_emission", "cross-class event order")
   equal(#capability.event_classes, 11, "deep event class count")
@@ -104,6 +118,30 @@ do
   equal(capability.initial_snapshots.max_callback_ms, 100, "initial snapshot callback bound")
   equal(capability.event_classes[11].id, "snes_ppu_obj_consumption_read",
     "consumption-read class")
+  equal(capability.event_classes[11].stoppable, true,
+    "consumption-read stoppability")
+  equal(capability.event_classes[11].filterable_fields[1].path, "memory_kind",
+    "consumption memory-kind filter")
+  equal(capability.event_classes[11].filterable_fields[2].path, "address",
+    "consumption address filter")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
+  local conditions = "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b"
+  local capability = Recording.capability(
+    function(value) return value end, true, true, true, true, conditions)
+  equal(capability.revision,
+    "a569ed75dc69a68f8584fbe717ddecd2509f49043a330a6b5fce586c89651f83",
+    "repeatable capability revision")
+  equal(capability.repeatability.profile, "mesen_snes_repeatable",
+    "repeatable profile identity")
+  equal(capability.repeatability.conditions_sha256, conditions,
+    "repeatable condition identity")
+  equal(#capability.repeatability.origins, 1, "repeatable origin count")
+  equal(capability.repeatability.origins[1], "reset_release", "repeatable origin")
+  equal(capability.repeatability.requires_input_movie, true,
+    "repeatable input movie requirement")
   Recording.capability(function(value) return value end, true, false, false, true)
 end
 
@@ -179,6 +217,67 @@ do
 end
 
 do
+  local deep = Recording.capability(function(value) return value end, true, false, true, true)
+  local p = params(2, {
+    capability_revision = deep.revision,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "frame_completed", contract_sha256 = COMPLETED_CONTRACT },
+      { id = "snes_ppu_obj_consumption_read", contract_sha256 = OBJ_CONSUMPTION_CONTRACT },
+    },
+    event_filters = { {
+      event_class = "snes_ppu_obj_consumption_read",
+      terms = {
+        { kind = "u64_range", path = "address", start = 0x2000, length = 0x100 },
+      },
+    } },
+    stop_on = { event_class = "snes_ppu_obj_consumption_read", occurrence = 2 },
+  })
+  local sink = fake_sink()
+  local state = assert(Recording.start(
+    p, 40, LAUNCH, 100, 0, sink, nil, nil, nil, nil, function() return true end))
+  assert(Recording.attach_hooks(state))
+  state = select(1, Recording.semantic_event(
+    state, "snes_ppu_obj_consumption_read", 100, 1000,
+    obj_consumption_payload({ address = 0x1fff })))
+  local effect
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_consumption_read", 100, 1001, obj_consumption_payload())
+  equal(effect, nil, "first filtered occurrence continues")
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_consumption_read", 100, 1002,
+    obj_consumption_payload({ address = 0x20ff }))
+  equal(effect.kind, "terminal", "second filtered occurrence stops")
+  local result = Recording.result(state, 1)
+  equal(result.execution_outcome, "event_stop", "filtered event-stop outcome")
+  equal(result.integrity, "complete", "filtered event-stop integrity")
+  equal(result.final_frame, 100, "partial-frame terminal coordinate")
+  equal(result.f_end, 101, "partial-frame closed scope")
+  equal(result.frames, 1, "partial-frame scope count")
+  equal(result.events, 3, "only persisted filtered events count")
+  equal(result.stop_event.sequence, 2, "stop event is final stream record")
+  equal(result.stop_event.clock_domain, "snes_master", "stop clock domain is preserved")
+  equal(result.stop_event.clock_tick, 1002, "stop clock tick is preserved")
+  equal(result.stop_event.occurrence, 2, "filtered occurrence is preserved")
+  equal(result.stop_event.contract_sha256, nil, "terminal stop facts use the public wire shape")
+  equal(result.event_classes[2].observed, 0, "partial frame has no completion")
+  equal(#sink.chunks, 3, "no record follows the stop event")
+
+  local rejected, rejected_effect, kind = Recording.start(params(1, {
+    capability_revision = deep.revision,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_cpu_instruction", contract_sha256 = CPU_INSTRUCTION_CONTRACT },
+    },
+    stop_on = { event_class = "snes_cpu_instruction", occurrence = 1 },
+  }), 41, LAUNCH, 100, 0, fake_sink())
+  equal(rejected, nil, "non-stoppable class rejects before arm")
+  equal(rejected_effect, nil, "non-stoppable class has no guest effect")
+  equal(kind, "bad_params", "non-stoppable class rejection kind")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
   local capability = Recording.capability(function(value) return value end, true, false, false, true)
   equal(capability.revision, REVISION, "capability revision")
   equal(capability.event_classes[1].contract_sha256, CONTRACT, "capability contract")
@@ -232,6 +331,56 @@ local function obj_payload(overrides)
   }
   for key, item in pairs(overrides or {}) do value[key] = item end
   return value
+end
+
+do
+  local deep = Recording.capability(function(value) return value end, true, false, true, true)
+  local p = params(1, {
+    capability_revision = deep.revision,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_obj_consumption_read", contract_sha256 = OBJ_CONSUMPTION_CONTRACT },
+    },
+    event_filters = { {
+      event_class = "snes_ppu_obj_consumption_read",
+      terms = {
+        { kind = "u64_range", path = "address", start = 0x2000, length = 0x100 },
+        { kind = "u64_range", path = "memory_kind", start = 1, length = 1 },
+      },
+    } },
+  })
+  local sink = fake_sink()
+  local state = assert(Recording.start(
+    p, 37, LAUNCH, 100, 0, sink, nil, nil, nil, nil, function() return true end))
+  assert(Recording.attach_hooks(state))
+  local effect
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_consumption_read", 100, 1000,
+    obj_consumption_payload({ address = 0x1fff }))
+  equal(effect, nil, "out-of-scope event is ignored")
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_consumption_read", 100, 1001,
+    obj_consumption_payload({ address = 0x20ff }))
+  equal(effect, nil, "in-scope event is persisted")
+  state, effect = Recording.tick(state, 101, 1)
+  equal(effect.kind, "terminal", "filtered recording terminal")
+  local result = Recording.result(state, 1)
+  equal(result.events, 2, "filter excludes events before sequence accounting")
+  equal(result.event_classes[2].observed, 1, "filter counts only matching events")
+  equal(result.event_classes[2].dropped, 0, "filter exclusion is not producer loss")
+
+  p.event_filters[1].terms[1].start = 0xffff
+  p.event_filters[1].terms[1].length = 2
+  local rejected, rejected_effect, kind = Recording.start(p, 38, LAUNCH, 100, 0, fake_sink())
+  equal(rejected, nil, "out-of-domain filter rejected before mutation")
+  equal(rejected_effect, nil, "out-of-domain filter has no effect")
+  equal(kind, "bad_params", "out-of-domain filter rejection kind")
+  p.event_filters = { named = p.event_filters[1] }
+  rejected, rejected_effect, kind = Recording.start(p, 39, LAUNCH, 100, 0, fake_sink())
+  equal(rejected, nil, "object-shaped filter collection rejected before mutation")
+  equal(rejected_effect, nil, "object-shaped filter collection has no effect")
+  equal(kind, "bad_params", "object-shaped filter collection rejection kind")
+  Recording.capability(function(value) return value end, true, false, false, true)
 end
 
 do
@@ -748,6 +897,31 @@ do
   state, effect = Recording.tick(state, 11, 1)
   equal(effect.kind, "terminal", "event limit terminal")
   equal(Recording.result(state, 1).integrity, "lossy", "event limit integrity")
+end
+
+do
+  local deep = Recording.capability(function(value) return value end, true, false, true, true)
+  local p = params(1, {
+    capability_revision = deep.revision,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_obj_consumption_read", contract_sha256 = OBJ_CONSUMPTION_CONTRACT },
+    },
+  })
+  local state = assert(Recording.start(
+    p, 36, LAUNCH, 4210, 0, fake_sink(), nil, nil, nil, nil, function() return true end))
+  assert(Recording.attach_hooks(state))
+  state.limits.max_events = 1 -- overflow on the first dense semantic event
+  local effect
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_obj_consumption_read", 4210, 1504075748, obj_consumption_payload())
+  equal(effect.kind, "terminal", "semantic event limit terminal")
+  local result = Recording.result(state, 1)
+  equal(result.reason, "event_limit_exceeded", "semantic event limit reason")
+  equal(result.final_frame, 4210, "semantic terminal stays in the frame domain")
+  equal(result.f_end, 4211, "semantic terminal includes its partial frame in scope")
+  equal(result.frames, 1, "semantic terminal counts one scoped partial frame")
+  Recording.capability(function(value) return value end, true, false, false, true)
 end
 
 do

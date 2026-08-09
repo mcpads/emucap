@@ -207,9 +207,9 @@
     },
     {
       "id": "snes_ppu_obj_consumption_read",
-      "revision": 1,
-      "contract": "snes_ppu_obj_consumption_read/v1;clock=snes_master:nondecreasing;frame=independent;coverage=actual-oam-and-obj-tile-vram-reads;payload=memory_kind:u1,address:u16,value:u8,scanline:u16,dot:u16,hclock:u16",
-      "contract_sha256": "570c5e6c3bf493c0b2e93a59d467fb7300c400993115a08789b8836ad536adc8",
+      "revision": 2,
+      "contract": "snes_ppu_obj_consumption_read/v2;clock=snes_master:nondecreasing;frame=independent;coverage=actual-oam-and-obj-tile-vram-reads;address=byte-offset-selected-by-memory_kind;memory_kind=0:oam,1:vram;payload=memory_kind:u1,address:u16,value:u8,scanline:u16,dot:u16,hclock:u16",
+      "contract_sha256": "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d",
       "clock_domain": "snes_master",
       "clock_order": "nondecreasing",
       "frame_relation": "independent",

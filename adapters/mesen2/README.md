@@ -41,6 +41,20 @@ and `emucap-nes.lua`. They share `emucap-core.lua`; the launcher selects the rig
 script I/O/network permissions and the 60-second per-callback timeout are transient CLI overrides and
 are not written to the user's normal settings.
 
+The default launch preserves the ordinary running behavior. Set `start_frozen: true` when the first
+follow-up request must address the launch entry without making MCP or agent latency part of guest
+time. The compatible host pauses before the ROM can free-run, loads the adapter while that debugger
+boundary is held, and the MCP launch succeeds only after live status reports `frozen`. The contract
+is a guest-time boundary, not a promise about an equal sampled frame number or equal initial memory.
+
+For SNES evidence that also needs producer-owned initial conditions, select
+`execution_profile: "repeatable"`. It implies the frozen entry, uses a fixed emulator entropy and
+device-time configuration, and starts from a fresh emucap-owned persistence set. Verify the live
+recording capability before asking for `record_window(require_repeatable: true)`; this profile also
+requires an explicit dense input movie, including an all-empty movie for no input. The request is
+accepted only for an origin named by that capability. Ordinary launches, other Mesen systems, and
+recording calls that omit the requirement retain their existing behavior.
+
 ## 3. Retrospective-only manual use
 
 `emucap.lua` captures retrospective bundles and does not use the native halt service. It may be loaded
@@ -131,7 +145,10 @@ cleanup, and mid-frame recording failures do not inherit that eligibility.
 - Read: `read_memory`/`find_pattern` (byte-pattern search — direct region scan,
   matching offsets only)/`screenshot`/`get_state`/`get_rom_info`/`status`.
 - Active: `write_memory`/`set_input`/`press_buttons`/`tap`/`hold_until`/`save_state`/`load_state`/
-  `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`.
+  `run_frames`/`pause`/`step`/`resume`/`reset`/`probe`. A compatible host also advertises
+  `power_cycle` through the MCP debug drawer. It invokes Mesen's native full-reload path and returns
+  after the same launch generation and content selection reconnect; callers must verify battery-file
+  persistence separately when that fact matters.
   (`save_state`/`load_state` also work while frozen at a main-CPU instruction boundary created by
   explicit `pause` or an instruction step. They preserve the native halt, and a load refreshes the
   frozen CPU projection before replying. Frame/PPU-step and breakpoint halts return `unsafe_halt`

@@ -1,5 +1,6 @@
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
@@ -14,6 +15,7 @@ use super::link::{
 use super::protocol::{parse_response, read_ndjson_frame, to_line, Request, PROTOCOL_VERSION};
 
 mod call;
+mod reattach;
 
 pub struct TcpLink {
     addr: String,
@@ -59,7 +61,8 @@ type PreacceptResult = Result<(Conn, Capabilities, String), LinkError>;
 
 struct Preaccept {
     rx: Receiver<PreacceptResult>,
-    _handle: JoinHandle<()>,
+    handle: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
 }
 
 fn fresh(addr: &str, listener: Option<TcpListener>, timeout: Duration) -> TcpLink {
@@ -524,10 +527,20 @@ impl TcpLink {
             .ok_or(LinkError::NotConnected)?
             .try_clone()
             .map_err(io_to_link)?;
+        self.start_preaccept(listener);
+        Ok(())
+    }
+
+    fn start_preaccept(&mut self, listener: TcpListener) {
         let timeout = self.timeout;
         let token_source = Arc::clone(&self.preaccept_token);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || loop {
+            if thread_stop.load(Ordering::Acquire) {
+                return;
+            }
             match listener.accept() {
                 Ok((stream, _)) => {
                     let session_token = token_source
@@ -548,11 +561,15 @@ impl TcpLink {
                 }
             }
         });
-        self.preaccept = Some(Preaccept {
-            rx,
-            _handle: handle,
-        });
-        Ok(())
+        self.preaccept = Some(Preaccept { rx, handle, stop });
+    }
+
+    fn cancel_preaccept(&mut self) {
+        let Some(preaccept) = self.preaccept.take() else {
+            return;
+        };
+        preaccept.stop.store(true, Ordering::Release);
+        let _ = preaccept.handle.join();
     }
 
     /// conn을 보유 중이라도, listener에 새 클라이언트가 대기하면(ROM 교체 relaunch 등 새 에뮬 접속)
@@ -593,45 +610,45 @@ impl TcpLink {
         // 지연 바인드: 아직 포트를 안 잡았으면 지금 잡는다. 점유 중이면(다른 인스턴스)
         // graceful하게 NotConnected — 서버는 살아 있고 다음 호출에서 다시 시도한다.
         if self.listener.is_none() {
-            // 자동 포트 선택: 기준 포트가 점유 중이면(다른 세션의 emucap-mcp) 다음 빈 포트로 옮긴다.
-            // 그래서 N개 세션이 전역 설정(같은 EMUCAP_PORT)을 공유해도 각자 다른 포트를 잡아 격리된다.
+            // 자동 포트 선택: 기준 포트가 OS에서 점유됐거나 다른 control identity의 살아 있을 수 있는
+            // generation에 예약됐으면 다음 빈 포트로 옮긴다. 그래서 N개 세션이 전역 설정(같은
+            // EMUCAP_PORT)을 공유해도 각자 다른 포트를 잡아 격리된다.
             // 잡은 포트를 self.addr에 반영 — 에뮬레이터는 이 포트로 접속해야 한다(status가 알려줌).
             let (host, base) = split_addr(&self.addr);
             let mut bound = None;
             self.runtime_candidates.clear();
             let mut reclaim_token = None;
+            let mut reserved_ports = Vec::new();
             if base != 0 {
                 match select_runtime_generation(&self.runtime_store, base)? {
-                    RuntimeSelection::Attach {
-                        port,
-                        token,
-                        candidate,
-                    } => match TcpListener::bind(format!("{host}:{port}")) {
-                        Ok(listener) => {
-                            listener.set_nonblocking(true).map_err(io_to_link)?;
-                            self.addr = listener
-                                .local_addr()
-                                .map(|addr| addr.to_string())
-                                .unwrap_or_else(|_| format!("{host}:{port}"));
-                            self.runtime_candidates = vec![candidate];
-                            reclaim_token = Some(token);
-                            bound = Some(listener);
+                    RuntimeSelection::Attach { port, token } => {
+                        match TcpListener::bind(format!("{host}:{port}")) {
+                            Ok(listener) => {
+                                listener.set_nonblocking(true).map_err(io_to_link)?;
+                                self.addr = listener
+                                    .local_addr()
+                                    .map(|addr| addr.to_string())
+                                    .unwrap_or_else(|_| format!("{host}:{port}"));
+                                reclaim_token = Some(token);
+                                bound = Some(listener);
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                                return Err(LinkError::PortBusy {
+                                    addr: format!("{host}:{port}"),
+                                });
+                            }
+                            Err(error) => return Err(io_to_link(error)),
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-                            self.runtime_candidates = vec![candidate];
-                            return Err(LinkError::PortBusy {
-                                addr: format!("{host}:{port}"),
-                            });
-                        }
-                        Err(error) => return Err(io_to_link(error)),
-                    },
+                    }
                     RuntimeSelection::Blocked(candidates) => {
                         self.runtime_candidates = candidates;
                         return Err(LinkError::PortBusy {
                             addr: format!("{host}:{base}"),
                         });
                     }
-                    RuntimeSelection::None => {}
+                    RuntimeSelection::Scan {
+                        reserved_ports: ports,
+                    } => reserved_ports = ports,
                 }
             }
             // 세션 고정(서버 재시작 시 같은 포트 되찾기): 지난번 바인드한 포트를 먼저 정확히 시도한다.
@@ -639,6 +656,7 @@ impl TcpLink {
             // 세션 고정 의미가 없어 건너뛴다. 점유 중이거나 파일이 없으면 아래 스캔으로 폴백(기존 동작).
             // 단일 bind 시도라 TOCTOU로 막혀도 그냥 폴백 — 절대 블록/루프하지 않는다. base==0(임시포트)이나
             // 안정 세션 id가 없으면(fail-closed) port_persist_path가 None → 영속화를 건너뛰고 스캔만 한다.
+            // persisted port라도 foreign/nonterminal generation에 예약됐으면 재사용하지 않는다.
             let persist_identity = (base != 0).then(own_session_identity).flatten();
             let persisted_port = match persist_identity.as_deref() {
                 Some(_) => read_persisted_port(&self.runtime_store, base).map_err(io_to_link)?,
@@ -648,7 +666,10 @@ impl TcpLink {
             if bound.is_none() {
                 if let Some(pp) = persisted_port {
                     // 이 세션의 범위 안에 있을 때만(범위 밖/쓰레기 값은 무시). 점유면 폴백.
-                    if pp >= base && (pp as u32) < base as u32 + AUTO_PORT_RANGE as u32 {
+                    if pp >= base
+                        && (pp as u32) < base as u32 + AUTO_PORT_RANGE as u32
+                        && !reserved_ports.contains(&pp)
+                    {
                         if let Ok(l) = TcpListener::bind(format!("{host}:{pp}")) {
                             if l.set_nonblocking(true).is_ok() {
                                 self.addr = l
@@ -662,7 +683,7 @@ impl TcpLink {
                     }
                 }
             }
-            // 폴백: 기준 포트부터 빈 포트 스캔(N 세션 자동 격리 — 같은 EMUCAP_PORT 공유 시 각자 다른 포트).
+            // 폴백: 기준 포트부터 OS 점유와 runtime 예약을 모두 건너뛴다.
             if bound.is_none() {
                 for off in 0..AUTO_PORT_RANGE {
                     // u16 범위를 넘으면 0/저포트로 wrap하지 않는다 — 더 높은 후보는 없다.
@@ -670,6 +691,9 @@ impl TcpLink {
                         Some(p) => p,
                         None => break,
                     };
+                    if reserved_ports.contains(&port) {
+                        continue;
+                    }
                     let cand = format!("{host}:{port}");
                     match TcpListener::bind(&cand) {
                         Ok(l) => {
@@ -805,6 +829,14 @@ impl EmulatorLink for TcpLink {
         self.drop_conn();
     }
 
+    fn reattach_runtime(&mut self, expected_launch_id: &str) -> Result<Value, LinkError> {
+        reattach::returned_generation(self, expected_launch_id)
+    }
+
+    fn has_exclusive_control(&self) -> bool {
+        true
+    }
+
     fn base_port(&self) -> Option<u16> {
         Some(self.base_port)
     }
@@ -888,15 +920,89 @@ impl EmulatorLink for TcpLink {
     fn runtime_candidates(&self) -> Vec<Value> {
         self.runtime_candidates.clone()
     }
+
+    fn runtime_reservations(&self) -> Vec<Value> {
+        discover_runtime_reservations(&self.runtime_store, self.base_port)
+    }
+}
+
+fn discover_runtime_reservations(store: &super::runtime::RuntimeStore, base: u16) -> Vec<Value> {
+    if base == 0 {
+        return Vec::new();
+    }
+    let holder = super::runtime::capture_process(std::process::id());
+    let mut reservations = Vec::new();
+    for offset in 0..AUTO_PORT_RANGE {
+        let Some(port) = base.checked_add(offset) else {
+            break;
+        };
+        let Ok(Some(current)) = store.read_current(port) else {
+            continue;
+        };
+        let emulator_state = current.process_state();
+        let bridge_state = current.bridge_process_state();
+        if emulator_state == super::runtime::ProcessState::Exited
+            && bridge_state.is_none_or(|state| state == super::runtime::ProcessState::Exited)
+        {
+            continue;
+        }
+        let record = store
+            .read_link_json::<super::continuity::LinkRecord>(port, &current.launch_id)
+            .ok()
+            .flatten()
+            .filter(|record| record.launch_id == current.launch_id);
+        let lease = record
+            .as_ref()
+            .and_then(|record| record.lease.as_ref())
+            .map(|lease| super::continuity::lease_view(lease, &holder))
+            .unwrap_or_else(super::runtime::LeaseView::unknown);
+        let private_capability_available = store
+            .read_auth(port, &current.launch_id)
+            .ok()
+            .flatten()
+            .is_some();
+        let backend_alive =
+            bridge_state.is_none_or(|state| state == super::runtime::ProcessState::Alive);
+        let can_reattach = emulator_state == super::runtime::ProcessState::Alive
+            && backend_alive
+            && private_capability_available
+            && matches!(
+                lease.state,
+                super::runtime::LeaseState::Held | super::runtime::LeaseState::Available
+            );
+        let mut value = current.public_value_with_lease(&lease);
+        if let Some(object) = value.as_object_mut() {
+            object.insert("port".into(), serde_json::json!(port));
+            object.insert(
+                "reattach".into(),
+                if can_reattach {
+                    serde_json::json!({
+                        "available": true,
+                        "tool": "reattach",
+                        "arguments": {"launch_id": current.launch_id},
+                    })
+                } else {
+                    serde_json::json!({
+                        "available": false,
+                        "reason": if !private_capability_available {
+                            "reclaim_capability_unavailable"
+                        } else if emulator_state != super::runtime::ProcessState::Alive || !backend_alive {
+                            "execution_not_alive"
+                        } else {
+                            "lease_not_returned"
+                        },
+                    })
+                },
+            );
+        }
+        reservations.push(value);
+    }
+    reservations
 }
 
 pub(crate) enum RuntimeSelection {
-    None,
-    Attach {
-        port: u16,
-        token: String,
-        candidate: Value,
-    },
+    Scan { reserved_ports: Vec<u16> },
+    Attach { port: u16, token: String },
     Blocked(Vec<Value>),
 }
 
@@ -907,9 +1013,9 @@ pub(crate) fn select_runtime_generation(
     let control_key = super::runtime::control_session_key();
     let holder = super::runtime::capture_process(std::process::id());
     let mut preferred = Vec::new();
-    let mut reclaimable = Vec::new();
     let mut same_session_blocked = Vec::new();
     let mut unreclaimable = Vec::new();
+    let mut reserved_ports = Vec::new();
     for offset in 0..AUTO_PORT_RANGE {
         let Some(port) = base.checked_add(offset) else {
             break;
@@ -917,17 +1023,28 @@ pub(crate) fn select_runtime_generation(
         let Some(current) = store.read_current(port).map_err(io_to_link)? else {
             continue;
         };
-        if current.process_state() != super::runtime::ProcessState::Alive {
+        let emulator_state = current.process_state();
+        let bridge_state = current.bridge_process_state();
+        let generation_may_be_live = emulator_state != super::runtime::ProcessState::Exited
+            || bridge_state.is_some_and(|state| state != super::runtime::ProcessState::Exited);
+        if !generation_may_be_live {
             continue;
         }
-        let record = store
-            .read_link_json::<super::continuity::LinkRecord>(port, &current.launch_id)
-            .map_err(io_to_link)?
-            .filter(|record| record.launch_id == current.launch_id);
+        // A socket-free port is not free execution ownership. Keep every nonterminal generation's
+        // port out of fresh allocation unless the stable control identity below proves that this
+        // process is its successor and can reattach the exact generation.
+        reserved_ports.push(port);
+        let record =
+            match store.read_link_json::<super::continuity::LinkRecord>(port, &current.launch_id) {
+                Ok(record) => record.filter(|record| record.launch_id == current.launch_id),
+                // Unreadable ownership metadata cannot authorize attach. The current manifest still
+                // proves enough to reserve the port without letting an unrelated capsule block every
+                // other port in the range.
+                Err(_) => continue,
+            };
         let Some(lease) = record.as_ref().and_then(|record| record.lease.as_ref()) else {
-            // No lease means there is no holder whose death can be proven. A same-session
-            // persisted port can still recover through the legacy exact-port path below, but a
-            // range scan must not adopt this generation as merely "available".
+            // Without a lease control key, neither uniqueness nor a private capability proves
+            // that the current control process is the generation's authorized successor.
             continue;
         };
         let lease_state = {
@@ -941,13 +1058,12 @@ pub(crate) fn select_runtime_generation(
                 }
             }
         };
-        // An absent stable control-session key cannot establish same-session preference.  It does
-        // not, however, erase the independently verified fact that the exact previous holder has
-        // exited.  A sole available generation can be reclaimed with its private capability; live
-        // and unverifiable holders remain ineligible below.
         let same_control = control_key.as_ref().is_some_and(|control_key| {
             lease.control_session_key.as_deref() == Some(control_key.as_str())
         });
+        if !same_control {
+            continue;
+        }
         let token = store
             .read_auth(port, &current.launch_id)
             .map_err(io_to_link)?;
@@ -965,38 +1081,30 @@ pub(crate) fn select_runtime_generation(
                 Value::Bool(token.is_some()),
             );
         }
-        if token.is_none() && (same_control || lease_state == super::runtime::LeaseState::Available)
-        {
+        if emulator_state != super::runtime::ProcessState::Alive {
+            same_session_blocked.push(candidate);
+            continue;
+        }
+        if token.is_none() {
             unreclaimable.push(candidate);
             continue;
         }
-        match (same_control, lease_state, token) {
-            (true, super::runtime::LeaseState::Held, Some(token)) => {
+        match (lease_state, token) {
+            (super::runtime::LeaseState::Held, Some(token)) => {
                 preferred.push((port, token, candidate));
             }
-            (true, super::runtime::LeaseState::Available, Some(token)) => {
+            (super::runtime::LeaseState::Available, Some(token)) => {
                 preferred.push((port, token, candidate));
             }
-            (
-                true,
-                super::runtime::LeaseState::Occupied | super::runtime::LeaseState::Unknown,
-                _,
-            ) => {
+            (super::runtime::LeaseState::Occupied | super::runtime::LeaseState::Unknown, _) => {
                 same_session_blocked.push(candidate);
-            }
-            (_, super::runtime::LeaseState::Available, Some(token)) => {
-                reclaimable.push((port, token, candidate));
             }
             _ => {}
         }
     }
     if preferred.len() == 1 {
-        let (port, token, candidate) = preferred.pop().expect("one preferred candidate");
-        return Ok(RuntimeSelection::Attach {
-            port,
-            token,
-            candidate,
-        });
+        let (port, token, _) = preferred.pop().expect("one preferred candidate");
+        return Ok(RuntimeSelection::Attach { port, token });
     }
     if preferred.len() > 1 {
         return Ok(RuntimeSelection::Blocked(
@@ -1009,20 +1117,7 @@ pub(crate) fn select_runtime_generation(
     if !unreclaimable.is_empty() {
         return Ok(RuntimeSelection::Blocked(unreclaimable));
     }
-    if reclaimable.len() == 1 {
-        let (port, token, candidate) = reclaimable.pop().expect("one reclaimable candidate");
-        return Ok(RuntimeSelection::Attach {
-            port,
-            token,
-            candidate,
-        });
-    }
-    if reclaimable.len() > 1 {
-        return Ok(RuntimeSelection::Blocked(
-            reclaimable.into_iter().map(|(_, _, value)| value).collect(),
-        ));
-    }
-    Ok(RuntimeSelection::None)
+    Ok(RuntimeSelection::Scan { reserved_ports })
 }
 
 /// read/write가 설정된 상한 안에 진행하지 못했을 때의 타임아웃(SO_RCVTIMEO/SO_SNDTIMEO). 블로킹

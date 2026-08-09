@@ -30,6 +30,8 @@ do
   state = FreezeState.halt("breakpoint", false)
   equal(FreezeState.can_start_recording(state), false,
     "breakpoint halt does not inherit earlier recording eligibility")
+  equal(FreezeState.can_start_recording(state, "reset_release"), true,
+    "reset release establishes a new boundary instead of inheriting the breakpoint halt")
 end
 
 print("ALL EMUCAP FREEZE STATE TESTS PASSED")

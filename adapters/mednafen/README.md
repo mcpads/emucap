@@ -32,23 +32,22 @@ upstream Mednafen locally to patch and build it.
 BIOS files are copyrighted console firmware. **emucap cannot and will not include them** — the user
 provides them from their own console or dumps. **Never commit BIOS files to the repository.**
 
-**Where they go.** The PC-FX path is isolated from the user's Mednafen profile: set
-`EMUCAP_PCFX_BIOS` to an absolute path, or place `pcfx.rom` in the OS-specific emucap data
-root under `firmware/`. Other Mednafen systems retain the established Mednafen firmware lookup.
-On macOS/Linux that folder is `~/.mednafen/firmware/`. Create it first if it is
-missing (`mkdir -p ~/.mednafen/firmware`), then drop the file in with its exact name (below).
-On **Windows** the Mednafen adapter is BETA and building it from source is non-trivial — do not assume a
-firmware path there; see the **Platforms** note in the top-level `README.md` for the agent-driven fallback
-(install the emulator from upstream and point emucap at it via env overrides) instead of guessing a path.
+**Where they go.** Managed launches never read or update the user's Mednafen profile. Put canonical
+BIOS filenames in the OS-specific emucap data root under `firmware/`, or set
+`EMUCAP_MEDNAFEN_FIRMWARE` to an absolute inventory directory. The launcher copies known files into
+the port-owned Mednafen home before spawn. PC-FX is additionally validated by identity: set
+`EMUCAP_PCFX_BIOS` to an absolute path, or place `pcfx.rom` in that shared emucap firmware directory.
+On **Windows** the Mednafen adapter is BETA and building it from source is non-trivial; use the
+top-level **Platforms** guidance rather than guessing a host-specific emulator profile path.
 
 **Per system — give the user the exact filename and the exact folder:**
 
 | System | BIOS needed? | Exact file → where |
 |--------|--------------|--------------------|
-| **PlayStation** (psx) | **Required** — cannot boot without it | `scph5500.bin` (JP) · `scph5501.bin` (NA) · `scph5502.bin` (EU), matching the disc's region → `~/.mednafen/firmware/` |
-| **PC Engine CD** (pce, CD titles) | **Required** for CD titles | `syscard3.pce` → `~/.mednafen/firmware/` (default; to use another location set `pce.cdbios`/`pce_fast.cdbios`) |
+| **PlayStation** (psx) | **Required** — cannot boot without it | `scph5500.bin` (JP) · `scph5501.bin` (NA) · `scph5502.bin` (EU), matching the disc's region → shared emucap firmware directory |
+| **PC Engine CD** (pce, CD titles) | **Required** for CD titles | `syscard3.pce` → shared emucap firmware directory |
 | **PC-FX** (pcfx) | **Required** — version 1.00 only | `pcfx.rom`, 1 MiB, SHA-256 `4b44ccf5d84cc83daa2e6a2bee00fdafa14eb58bdf5859e96d8861a891675417` → `<emucap-data>/firmware/pcfx.rom`, or set absolute `EMUCAP_PCFX_BIOS` |
-| **Saturn** (ss) | Recommended | `sega_101.bin` (JP), etc. → `~/.mednafen/firmware/`; point at it with `ss.bios_jp` in `~/.mednafen/mednafen.cfg` |
+| **Saturn** (ss) | Recommended | `sega_101.bin` (JP) or `mpr-17933.bin` (NA/EU) → shared emucap firmware directory |
 | **PC Engine HuCard** (`.pce`) | **None** | boots without a BIOS |
 | **Mega Drive / Genesis** | **None** | cartridge ROMs (`.md`/`.gen`/`.smd`, or a `.bin` with a header) boot without a BIOS |
 | **Neo Geo Pocket / Color** | **None** | cartridge ROMs (`.ngp`/`.ngpc`/`.ngc`/`.npc`) use Mednafen's built-in HLE BIOS |
@@ -108,8 +107,16 @@ PC-FX uses an explicit system ID because its disc extensions overlap other CD sy
 {"content_path":"/path/to/pcfx.cue","system":"pcfx","display":false}
 ```
 
-The Rust launcher validates the version 1.00 BIOS before spawning and gives PC-FX a per-port
-`MEDNAFEN_HOME`, so it neither reads nor updates `~/.mednafen`.
+The Rust launcher gives every Mednafen module a per-port `MEDNAFEN_HOME`, so it neither reads nor
+updates `~/.mednafen`. It stages only the canonical BIOS filenames listed above. The PC-FX version
+1.00 image is also validated before spawn.
+
+`launch(..., start_frozen:true)` uses the maintained fork's pre-first-frame hook. It connects and
+services MCP control before the first guest instruction, and launch succeeds only after `status`
+reports `state="frozen"` with `launch_start.boundary="pre_first_instruction"`. This closes agent and
+network delay after launch; it does not claim equal RTC, power-on state, saves, or other initial
+conditions across Saturn/PSX/PCE launches. The separate repeatable execution profile remains
+limited to the systems that advertise it live.
 
 The launcher passes `-sound 1` only when `sound:true` is requested and reports the effective `sound` value in
 its result. `sound:true` is currently a Mednafen-only option; other adapters reject it rather than silently
@@ -170,7 +177,8 @@ On macOS both the Rust and shell launchers select Mednafen's `softfb` video driv
 SDL3-backed SDL2 compatibility layer can block the first OpenGL swap before emulation starts.
 Other environment variables:
 `MEDNAFEN_BIN` (fork binary path, default `work/mednafen/src/mednafen`), `EMUCAP_LAUNCH_WAIT` (connection wait
-seconds, default 20), `EMUCAP_EMU_HOME` (emucap data root), `EMUCAP_LOG` (log path), `EMUCAP_SESSION_TOKEN` (when unspecified, auto-loaded from
+seconds, default 20), `EMUCAP_EMU_HOME` (emucap data root), `EMUCAP_MEDNAFEN_FIRMWARE` (absolute shared BIOS inventory),
+`EMUCAP_START_FROZEN=1` (legacy-launcher controlled entry), `EMUCAP_LOG` (log path), `EMUCAP_SESSION_TOKEN` (when unspecified, auto-loaded from
 the per-port token file reported by `runtime_paths.token_file`). Override the build version with `MEDNAFEN_VER`.)
 So if you used `launch.sh`, a separate `SDL_VIDEODRIVER=dummy` retry is not a new measure.
 If the log ends near `Initializing video...` followed by `Signal has been caught ... SIGTERM`, the

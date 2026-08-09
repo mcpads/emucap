@@ -325,6 +325,7 @@ pub fn record_window(
         "frames": effective.request.frames,
         "warmup_frames": effective.request.warmup_frames,
         "event_classes": effective.request.event_classes,
+        "event_filters": effective.request.event_filters,
         "limits": effective.request.limits,
         "sink": {
             "endpoint": sink.endpoint,

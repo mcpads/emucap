@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use emucap::bundle::recording_manifest::{
-    EventStartCondition, EventStopCondition, InitialSnapshotRequest, RecordingOrigin,
-    TerminalSnapshotRequest,
+    EventClassFilter, EventFilterTerm, EventStartCondition, EventStopCondition,
+    InitialSnapshotRequest, RecordingOrigin, TerminalSnapshotRequest,
 };
 use emucap::live::link::{RequestCancellation, WorkingProgress};
 use emucap::live::recording::{self, RecordWindowRequest, RequestedRecordingLimits};
@@ -10,7 +10,7 @@ use emucap::live::runtime::RuntimeStore;
 use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken};
 use rmcp::service::{RequestContext, RoleServer};
 
-use crate::args::{RecordWindowArgs, RecordWindowOriginArgs};
+use crate::args::{RecordWindowArgs, RecordWindowFilterTermArgs, RecordWindowOriginArgs};
 use crate::{error_result, tool_output_result, SharedLink, ToolOutput};
 
 #[cfg(test)]
@@ -67,6 +67,28 @@ pub(crate) async fn run_record_window(
         frames: args.frames,
         warmup_frames: args.warmup_frames,
         event_classes: args.event_classes,
+        event_filters: args
+            .event_filters
+            .into_iter()
+            .map(|filter| EventClassFilter {
+                event_class: filter.event_class,
+                terms: filter
+                    .terms
+                    .into_iter()
+                    .map(|term| match term {
+                        RecordWindowFilterTermArgs::U64Range {
+                            path,
+                            start,
+                            length,
+                        } => EventFilterTerm::U64Range {
+                            path,
+                            start: start.get(),
+                            length: length.get(),
+                        },
+                    })
+                    .collect(),
+            })
+            .collect(),
         origin: args.origin.map(|origin| match origin {
             RecordWindowOriginArgs::NextFrameBoundary => RecordingOrigin::NextFrameBoundary,
             RecordWindowOriginArgs::ResetRelease => RecordingOrigin::ResetRelease,
@@ -100,6 +122,7 @@ pub(crate) async fn run_record_window(
             })
             .collect(),
         terminal_state_profile: args.terminal_state_profile,
+        require_repeatable: args.require_repeatable,
         limits: args.limits.map(|limits| RequestedRecordingLimits {
             max_events: limits.max_events,
             max_bytes: limits.max_bytes,

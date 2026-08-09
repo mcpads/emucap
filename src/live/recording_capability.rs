@@ -50,7 +50,19 @@ pub struct RecordingCapability {
     pub terminal_state: Option<RecordingTerminalStateCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warmup: Option<RecordingWarmupCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeatability: Option<RecordingRepeatabilityCapability>,
     pub limits: RecordingLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingRepeatabilityCapability {
+    pub profile: String,
+    pub conditions_sha256: String,
+    pub origins: Vec<RecordingCapabilityOrigin>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_input_movie: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -83,6 +95,23 @@ pub struct RecordingEventCapability {
     pub stoppable: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub startable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filterable_fields: Vec<RecordingEventFilterField>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingEventFilterKind {
+    U64Range,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingEventFilterField {
+    pub path: String,
+    pub kind: RecordingEventFilterKind,
+    pub min: u64,
+    pub max: u64,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -166,6 +195,8 @@ struct RecordingCapabilityRevision<'a> {
     terminal_state: &'a Option<RecordingTerminalStateCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     warmup: &'a Option<RecordingWarmupCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeatability: &'a Option<RecordingRepeatabilityCapability>,
     limits: &'a RecordingLimits,
 }
 
@@ -193,6 +224,7 @@ impl RecordingCapability {
             terminal_snapshots: &self.terminal_snapshots,
             terminal_state: &self.terminal_state,
             warmup: &self.warmup,
+            repeatability: &self.repeatability,
             limits: &self.limits,
         };
         Ok(hex::encode(Sha256::digest(serde_json::to_vec(&material)?)))
@@ -227,6 +259,46 @@ impl RecordingCapability {
             return Err(RecordingCapabilityError::Invalid(
                 "revision does not cover the advertised recording capability".into(),
             ));
+        }
+        if let Some(repeatability) = &self.repeatability {
+            if repeatability.profile.is_empty()
+                || repeatability.profile.len() > 96
+                || !repeatability
+                    .profile
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability profile must be a safe non-empty identifier".into(),
+                ));
+            }
+            if repeatability.conditions_sha256.len() != 64
+                || !repeatability
+                    .conditions_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability conditions_sha256 must be a SHA-256".into(),
+                ));
+            }
+            if repeatability.origins.is_empty()
+                || repeatability.origins.iter().collect::<BTreeSet<_>>().len()
+                    != repeatability.origins.len()
+                || repeatability
+                    .origins
+                    .iter()
+                    .any(|origin| !self.origins.contains(origin))
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability origins must be a non-empty subset of recording origins".into(),
+                ));
+            }
+            if repeatability.requires_input_movie && self.input_movie.is_none() {
+                return Err(RecordingCapabilityError::Invalid(
+                    "repeatability requires an advertised input movie capability".into(),
+                ));
+            }
         }
         if self.origins.first() != Some(&RecordingCapabilityOrigin::NextFrameBoundary)
             || self.origins.len() > 2
@@ -265,6 +337,25 @@ impl RecordingCapability {
                     "event class {} does not exactly match its registered clock",
                     event.id
                 )));
+            }
+            let mut filter_paths = BTreeSet::new();
+            for field in &event.filterable_fields {
+                let registered = contract
+                    .payload_fields
+                    .iter()
+                    .find(|registered| registered.path == field.path);
+                let valid = registered.is_some_and(|registered| {
+                    registered.value_type == crate::event_contracts::PayloadValueType::U64
+                        && field.kind == RecordingEventFilterKind::U64Range
+                        && field.min == registered.min.unwrap_or(0)
+                        && field.max == registered.max.unwrap_or(u64::MAX)
+                });
+                if !filter_paths.insert(field.path.as_str()) || !valid {
+                    return Err(RecordingCapabilityError::Invalid(format!(
+                        "event class {} advertises an invalid filterable field {}",
+                        event.id, field.path
+                    )));
+                }
             }
         }
         if self.event_classes.iter().any(|event| event.startable)

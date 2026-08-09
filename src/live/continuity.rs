@@ -209,7 +209,7 @@ impl LinkRecord {
         }
     }
 
-    fn bounded(mut self) -> Self {
+    pub(crate) fn bounded(mut self) -> Self {
         if let Some(identity) = self.last_identity.as_mut() {
             // Reclaim capability is transport auth, never diagnostic evidence.
             identity.session_token = None;
@@ -541,54 +541,14 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 "runtime current generation changed before lease acquisition",
             ));
         }
-        let holder = self.holder.clone();
-        let control_key = self.control_key.clone();
-        let record_launch_id = launch_id.clone();
-        let updated =
-            self.store
-                .update_link_json::<LinkRecord, _>(port, &launch_id, move |record| {
-                    let mut record = record
-                        .filter(|record| record.launch_id == record_launch_id)
-                        .unwrap_or_else(|| LinkRecord::new(record_launch_id.clone()));
-                    let now = super::runtime::now_unix_ms();
-                    match record.lease.as_mut() {
-                        Some(lease) if lease.holder == holder => {
-                            lease.refreshed_at_unix_ms = now;
-                        }
-                        Some(lease) => match process_state(&lease.holder) {
-                            ProcessState::Alive => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    "runtime lease is held by a live controller",
-                                ));
-                            }
-                            ProcessState::Exited => {
-                                *lease = LeaseRecord {
-                                    control_session_key: control_key.clone(),
-                                    holder: holder.clone(),
-                                    acquired_at_unix_ms: now,
-                                    refreshed_at_unix_ms: now,
-                                };
-                            }
-                            ProcessState::Unknown => {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    "runtime lease cannot be reclaimed safely",
-                                ));
-                            }
-                        },
-                        None => {
-                            record.lease = Some(LeaseRecord {
-                                control_session_key: control_key.clone(),
-                                holder: holder.clone(),
-                                acquired_at_unix_ms: now,
-                                refreshed_at_unix_ms: now,
-                            });
-                        }
-                    }
-                    record.updated_at_unix_ms = now;
-                    Ok(record.bounded())
-                });
+        let updated = claim_generation_lease(
+            &self.store,
+            port,
+            &launch_id,
+            self.holder.clone(),
+            self.control_key.clone(),
+            None,
+        );
         let updated = match updated {
             Ok(updated) => updated,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -661,7 +621,11 @@ impl<L: EmulatorLink> ObservedLink<L> {
             }
             // Before a launch generation exists there is no lease to guard; the launcher creates
             // the generation and rotates the reclaim capability atomically with its own checks.
-            LeaseState::Unknown if self.current_location().is_none() => Ok(()),
+            LeaseState::Unknown
+                if self.current_location().is_none() && self.inner.has_exclusive_control() =>
+            {
+                Ok(())
+            }
             LeaseState::Occupied | LeaseState::Available | LeaseState::Unknown => {
                 Err(LinkError::Busy)
             }
@@ -858,6 +822,64 @@ impl<L: EmulatorLink> ObservedLink<L> {
     }
 }
 
+pub(crate) fn claim_generation_lease(
+    store: &RuntimeStore,
+    port: u16,
+    launch_id: &str,
+    holder: ProcessIdentity,
+    control_key: Option<String>,
+    compatibility_token: Option<String>,
+) -> io::Result<LinkRecord> {
+    let record_launch_id = launch_id.to_string();
+    let compatibility_store = store.clone();
+    store.update_current_link_json::<LinkRecord, _>(port, launch_id, move |record| {
+        let mut record = record
+            .filter(|record| record.launch_id == record_launch_id)
+            .unwrap_or_else(|| LinkRecord::new(record_launch_id.clone()));
+        let now = super::runtime::now_unix_ms();
+        match record.lease.as_mut() {
+            Some(lease) if lease.holder == holder => {
+                lease.refreshed_at_unix_ms = now;
+            }
+            Some(lease) => match process_state(&lease.holder) {
+                ProcessState::Alive => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "runtime lease is held by a live controller",
+                    ));
+                }
+                ProcessState::Exited => {
+                    *lease = LeaseRecord {
+                        control_session_key: control_key.clone(),
+                        holder: holder.clone(),
+                        acquired_at_unix_ms: now,
+                        refreshed_at_unix_ms: now,
+                    };
+                }
+                ProcessState::Unknown => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "runtime lease cannot be reclaimed safely",
+                    ));
+                }
+            },
+            None => {
+                record.lease = Some(LeaseRecord {
+                    control_session_key: control_key.clone(),
+                    holder: holder.clone(),
+                    acquired_at_unix_ms: now,
+                    refreshed_at_unix_ms: now,
+                });
+            }
+        }
+        record.updated_at_unix_ms = now;
+        if let Some(token) = compatibility_token.as_deref() {
+            compatibility_store.write_compatibility_token(port, token)?;
+        }
+        Ok(record.bounded())
+    })
+}
+
 fn runtime_binding(
     current: Option<&CurrentManifest>,
     identity: &EmulatorIdentity,
@@ -995,6 +1017,16 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         self.inner.prepare_reconnect();
     }
 
+    fn reattach_runtime(&mut self, expected_launch_id: &str) -> Result<Value, LinkError> {
+        let result = self.inner.reattach_runtime(expected_launch_id);
+        self.refresh_runtime();
+        result
+    }
+
+    fn has_exclusive_control(&self) -> bool {
+        self.inner.has_exclusive_control()
+    }
+
     fn base_port(&self) -> Option<u16> {
         self.inner.base_port()
     }
@@ -1039,6 +1071,10 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
 
     fn runtime_candidates(&self) -> Vec<Value> {
         self.inner.runtime_candidates()
+    }
+
+    fn runtime_reservations(&self) -> Vec<Value> {
+        self.inner.runtime_reservations()
     }
 }
 

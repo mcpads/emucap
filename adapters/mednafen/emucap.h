@@ -21,6 +21,9 @@ inline bool emucap_progress_due(
 }
 
 void emucap_service(uint64_t frame);
+// Called before the first MDFNI_Emulate invocation. When the managed launcher requested a frozen
+// entry, it connects and services control without allowing any guest instruction to execute.
+void emucap_pre_first_frame();
 // 입력 주입: 주입 입력이 있으면 포트0 버퍼를 덮어쓴다. namespace Mednafen 안(mednafen.cpp)과
 // 밖(드라이버) 양쪽에서 호출하므로 extern "C"로 linkage를 고정한다(C++ mangling 불일치 방지).
 extern "C" void emucap_apply_input(unsigned char* port0_data, unsigned port0_len);

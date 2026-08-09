@@ -13,8 +13,13 @@ function M.after_step(unit)
   return M.halt("step", unit == "frames")
 end
 
-function M.can_start_recording(state)
-  return type(state) == "table" and state.frame_boundary_proven == true
+function M.can_start_recording(state, origin)
+  if type(state) ~= "table" then return false end
+  -- reset_release validates and binds its sinks before queuing reset, then establishes a new
+  -- boundary in the native reset callback before the first post-reset guest tick. It therefore
+  -- does not inherit or read from the current halt position. Other origins advance from the
+  -- current position and still require a proven frame boundary.
+  return origin == "reset_release" or state.frame_boundary_proven == true
 end
 
 return M

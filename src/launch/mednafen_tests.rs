@@ -133,3 +133,89 @@ fn pcfx_bios_resolution_rejects_relative_override_before_io() {
     let error = resolve_pcfx_bios().unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidInput);
 }
+
+#[test]
+fn runtime_home_stages_known_firmware_without_reading_user_profile() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE", "HOME"]);
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("operator-firmware");
+    let fake_user = dir.path().join("user");
+    std::fs::create_dir_all(&shared).unwrap();
+    std::fs::create_dir_all(fake_user.join(".mednafen/firmware")).unwrap();
+    std::fs::write(shared.join("sega_101.bin"), b"managed Saturn BIOS").unwrap();
+    std::fs::write(
+        fake_user.join(".mednafen/firmware/sega_101.bin"),
+        b"user Saturn BIOS",
+    )
+    .unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", dir.path().join("emucap"));
+    std::env::set_var("EMUCAP_MEDNAFEN_FIRMWARE", &shared);
+    std::env::set_var("HOME", &fake_user);
+
+    let home = prepare_runtime_home(47800).unwrap();
+
+    assert_eq!(home, dir.path().join("emucap/mednafen/47800"));
+    assert_eq!(
+        std::fs::read(home.join("firmware/sega_101.bin")).unwrap(),
+        b"managed Saturn BIOS"
+    );
+    assert_eq!(
+        std::fs::read(fake_user.join(".mednafen/firmware/sega_101.bin")).unwrap(),
+        b"user Saturn BIOS"
+    );
+}
+
+#[test]
+fn runtime_home_allows_an_absent_default_firmware_inventory() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE"]);
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", dir.path().join("emucap"));
+    std::env::remove_var("EMUCAP_MEDNAFEN_FIRMWARE");
+
+    let home = prepare_runtime_home(47801).unwrap();
+
+    assert!(home.join("firmware").is_dir());
+}
+
+#[test]
+fn explicit_firmware_inventory_must_be_absolute_and_exist() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE"]);
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", dir.path().join("emucap"));
+    std::env::set_var("EMUCAP_MEDNAFEN_FIRMWARE", "relative-firmware");
+    assert_eq!(
+        prepare_runtime_home(47802).unwrap_err().kind(),
+        ErrorKind::InvalidInput
+    );
+
+    std::env::set_var(
+        "EMUCAP_MEDNAFEN_FIRMWARE",
+        dir.path().join("missing-firmware"),
+    );
+    assert_eq!(
+        prepare_runtime_home(47802).unwrap_err().kind(),
+        ErrorKind::NotFound
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn runtime_home_refuses_a_symlinked_port_directory() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE"]);
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let base = dir.path().join("emucap");
+    std::fs::create_dir_all(base.join("mednafen")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), base.join("mednafen/47803")).unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", &base);
+    std::env::remove_var("EMUCAP_MEDNAFEN_FIRMWARE");
+
+    let error = prepare_runtime_home(47803).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::InvalidInput);
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}

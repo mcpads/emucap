@@ -1,0 +1,130 @@
+diff --git i/UI/Utilities/CommandLineHelper.cs w/UI/Utilities/CommandLineHelper.cs
+index dbf6e20..8ec3018 100644
+--- i/UI/Utilities/CommandLineHelper.cs
++++ w/UI/Utilities/CommandLineHelper.cs
+@@ -29,6 +29,7 @@ public class CommandLineHelper
+ 	public int TestRunnerTimeout { get; private set; } = 100;
+ 	public List<string> LuaScriptsToLoad { get; private set; } = new();
+ 	public List<string> FilesToLoad { get; private set; } = new();
++	public bool StartFrozen { get; private set; }
+ 
+ 	private List<string> _errorMessages = new();
+ 
+@@ -36,4 +37,6 @@ public class CommandLineHelper
+ 	public CommandLineHelper(string[] args, bool forStartup)
+ 	{
++		StartFrozen = forStartup && Environment.GetEnvironmentVariable("EMUCAP_START_FROZEN") == "1";
++
+ 		ProcessCommandLineArgs(args, forStartup);
+ 	}
+@@ -147,6 +150,10 @@ public class CommandLineHelper
+ 				scriptWindow.Show();
+ 			}
+ 
++			if(StartFrozen) {
++				ConfigApi.SetEmulationFlag(EmulationFlags.ConsoleMode, false);
++			}
++
+ 			//Shift focus back to main window after opening the script window(s)
+ 			wnd.BringToFront();
+ 		}
+@@ -171,6 +178,13 @@ public class CommandLineHelper
+ 
+ 	public void LoadFiles()
+ 	{
++		if(StartFrozen) {
++			// Initialize the debugger before the ROM begins executing and preserve its initial
++			// instruction boundary until the command-line script can service control requests.
++			ConfigApi.SetEmulationFlag(EmulationFlags.ConsoleMode, true);
++			EmuApi.Pause();
++		}
++
+ 		foreach(string file in FilesToLoad) {
+ 			LoadRomHelper.LoadFile(file);
+ 		}
+diff --git i/Core/Shared/EmuSettings.cpp w/Core/Shared/EmuSettings.cpp
+index 9b56cab..c86c712 100644
+--- i/Core/Shared/EmuSettings.cpp
++++ w/Core/Shared/EmuSettings.cpp
+@@ -1,4 +1,6 @@
+ #include "pch.h"
++#include <cerrno>
++#include <cstdlib>
+ #include <random>
+ #include "Shared/EmuSettings.h"
+ #include "Shared/KeyManager.h"
+@@ -14,8 +16,21 @@ EmuSettings::EmuSettings(Emulator* emu)
+ 	_flags = 0;
+ 	_debuggerFlags = 0;
+ 
+-	std::random_device rd;
+-	_mt = std::mt19937(rd());
++	const char* fixedSeed = std::getenv("EMUCAP_REPEATABLE_SEED");
++	if(fixedSeed) {
++		char* end = nullptr;
++		errno = 0;
++		unsigned long seed = std::strtoul(fixedSeed, &end, 10);
++		if(errno == 0 && end != fixedSeed && *end == '\0' && seed <= UINT32_MAX) {
++			_mt = std::mt19937((uint32_t)seed);
++		} else {
++			std::random_device rd;
++			_mt = std::mt19937(rd());
++		}
++	} else {
++		std::random_device rd;
++		_mt = std::mt19937(rd());
++	}
+ }
+ 
+ void EmuSettings::CopySettings(EmuSettings& src)
+diff --git i/Core/SNES/Coprocessors/SPC7110/Rtc4513.cpp w/Core/SNES/Coprocessors/SPC7110/Rtc4513.cpp
+index 51a3934..5c45873 100644
+--- i/Core/SNES/Coprocessors/SPC7110/Rtc4513.cpp
++++ w/Core/SNES/Coprocessors/SPC7110/Rtc4513.cpp
+@@ -1,4 +1,6 @@
+ #include "pch.h"
++#include <cerrno>
++#include <cstdlib>
+ #include <time.h>
+ #include "SNES/Coprocessors/SPC7110/Rtc4513.h"
+ #include "Shared/Emulator.h"
+@@ -8,6 +10,21 @@
+ #include "Utilities/Serializer.h"
+ #include "Utilities/TimeUtilities.h"
+ 
++static uint64_t CurrentUnixTime()
++{
++	const char* fixedTime = std::getenv("EMUCAP_FIXED_UNIX_TIME");
++	if(fixedTime) {
++		char* end = nullptr;
++		errno = 0;
++		unsigned long long value = std::strtoull(fixedTime, &end, 10);
++		if(errno == 0 && end != fixedTime && *end == '\0') {
++			return (uint64_t)value;
++		}
++	}
++	return std::chrono::duration_cast<std::chrono::seconds>(
++		std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
+ //TODO: Partial implementation
+ //Missing stuff: most flags e.g: 30ADJ, 24/12, CAL/HW, WRAP, etc.
+ 
+@@ -33,7 +50,7 @@ void Rtc4513::LoadBattery()
+ 		}
+ 		_lastTime = time;
+ 	} else {
+-		_lastTime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++		_lastTime = CurrentUnixTime();
+ 	}
+ }
+ 
+@@ -60,7 +77,7 @@ void Rtc4513::UpdateTime()
+ 		_regs[1] = 0;
+ 	}
+ 
+-	uint64_t currentTime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++	uint64_t currentTime = CurrentUnixTime();
+ 	uint32_t elapsedSeconds = (uint32_t)(currentTime - _lastTime);
+ 	if(elapsedSeconds <= 0) {
+ 		return;

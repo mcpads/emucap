@@ -120,7 +120,7 @@ fn test_build_metadata() -> BuildMetadata {
 }
 
 #[test]
-fn build_metadata_rejects_host_without_safe_halt_savestates() {
+fn build_metadata_rejects_an_older_host_api() {
     let publish = tempfile::tempdir().unwrap();
     let binary = publish.path().join("Mesen");
     std::fs::write(&binary, "fake").unwrap();
@@ -135,7 +135,9 @@ fn build_metadata_rejects_host_without_safe_halt_savestates() {
     let error = read_build_metadata(&binary).unwrap_err();
 
     assert!(error.to_string().contains("host API 1 is incompatible"));
-    assert!(error.to_string().contains("expected 2"));
+    assert!(error
+        .to_string()
+        .contains(&format!("expected {REQUIRED_HOST_API}")));
 }
 
 #[test]
@@ -329,7 +331,7 @@ fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
         assert!(source_plist.contains("<string>ca.mesen</string>"));
         assert!(!source_plist.contains("ca.mesen.emucap"));
     }
-    ensure_portable_settings(&portable).unwrap();
+    ensure_portable_settings(&portable, false).unwrap();
 
     // The source app remains read-only input, while the emucap-owned copy gets the deterministic
     // isolated profile needed for native host input.
@@ -431,6 +433,8 @@ fn gba_provision_inputs<'a>(
         build: Some("test-build"),
         session_token: None,
         runtime: None,
+        start_frozen: false,
+        repeatable: false,
     };
     (l, portable)
 }
@@ -442,7 +446,7 @@ fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
     let log = dir.path().join("launch.log");
     let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
 
-    ensure_portable_settings(&portable).unwrap();
+    ensure_portable_settings(&portable, false).unwrap();
 
     let settings = read(&portable.settings);
     assert_eq!(settings["Debug"]["ScriptWindow"]["AllowIoOsAccess"], true);
@@ -476,7 +480,7 @@ fn portable_setup_replaces_build_settings_with_isolated_defaults() {
     std::fs::create_dir_all(portable.settings.parent().unwrap()).unwrap();
     std::fs::write(&portable.settings, br#"{"Video":{"Scale":4}}"#).unwrap();
 
-    ensure_portable_settings(&portable).unwrap();
+    ensure_portable_settings(&portable, false).unwrap();
 
     let settings = read(&portable.settings);
     assert!(settings.get("Video").is_none());
@@ -491,7 +495,7 @@ fn non_gba_also_gets_the_portable_settings_marker() {
     let log = dir.path().join("launch.log");
     let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
 
-    ensure_portable_settings(&portable).unwrap();
+    ensure_portable_settings(&portable, false).unwrap();
 
     assert!(portable.settings.is_file());
     assert_eq!(
@@ -499,6 +503,64 @@ fn non_gba_also_gets_the_portable_settings_marker() {
         false
     );
     assert_eq!(read(&portable.settings)["ConfigUpgrade"], 1);
+}
+
+#[test]
+fn repeatable_profile_pins_power_on_settings_and_clears_prior_guest_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let portable = PreparedPortable {
+        binary: dir.path().join("Mesen"),
+        settings: dir.path().join("settings.json"),
+        home: dir.path().to_path_buf(),
+    };
+    let saves = dir.path().join("Saves");
+    let game_config = dir.path().join("GameConfig");
+    std::fs::create_dir_all(&saves).unwrap();
+    std::fs::create_dir_all(&game_config).unwrap();
+    std::fs::write(saves.join("old.srm"), b"prior state").unwrap();
+    std::fs::write(game_config.join("old.json"), b"prior config").unwrap();
+
+    ensure_portable_settings(&portable, true).unwrap();
+    clear_repeatable_persistence(&portable).unwrap();
+
+    let settings = read(&portable.settings);
+    assert_eq!(settings["Snes"]["RamPowerOnState"], "Random");
+    assert_eq!(settings["Snes"]["EnableRandomPowerOnState"], false);
+    assert_eq!(settings["Snes"]["BsxUseCustomTime"], true);
+    assert!(!saves.exists());
+    assert!(!game_config.exists());
+}
+
+#[test]
+fn repeatable_profile_identity_matches_its_checked_in_condition_record() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/adapters/mesen2/repeatable-profile.json"
+    ));
+    assert_eq!(
+        hex::encode(Sha256::digest(bytes)),
+        REPEATABLE_CONDITIONS_SHA256
+    );
+    let profile: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(profile["profile"], REPEATABLE_PROFILE_ID);
+    assert_eq!(profile["system"], "snes");
+    assert_eq!(
+        profile["entropy"]["seed"].as_u64().unwrap().to_string(),
+        REPEATABLE_SEED
+    );
+    assert_eq!(
+        profile["device_time"]["unix_seconds"]
+            .as_u64()
+            .unwrap()
+            .to_string(),
+        REPEATABLE_UNIX_TIME
+    );
+    assert_eq!(
+        profile["portable_persistence_removed"],
+        json!(REPEATABLE_PERSISTENCE_DIRS)
+    );
+    assert_eq!(profile["recording"]["origins"], json!(["reset_release"]));
+    assert_eq!(profile["recording"]["requires_input_movie"], true);
 }
 
 #[cfg(unix)]
@@ -514,7 +576,7 @@ fn portable_setup_refuses_symlinked_settings() {
     std::fs::write(&target, b"user settings").unwrap();
     std::os::unix::fs::symlink(&target, &portable.settings).unwrap();
 
-    let err = ensure_portable_settings(&portable).unwrap_err();
+    let err = ensure_portable_settings(&portable, false).unwrap_err();
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(&target).unwrap(), b"user settings");
@@ -650,6 +712,8 @@ fn launch_spec_propagates_server_and_host_build_identity() {
         build: Some("server-build"),
         session_token: Some("token"),
         runtime: None,
+        start_frozen: false,
+        repeatable: false,
     };
     let host_build = BuildMetadata {
         upstream: "https://example.invalid/Mesen.git".into(),
@@ -676,4 +740,41 @@ fn launch_spec_propagates_server_and_host_build_identity() {
         "EMUCAP_MESEN_BINARY_SHA256".into(),
         host_build.binary_sha256.clone()
     )));
+}
+
+#[test]
+fn repeatable_launch_spec_implies_controlled_start_and_exact_conditions() {
+    let dir = tempfile::tempdir().unwrap();
+    let binary = dir.path().join("Mesen");
+    let lua = dir.path().join("emucap-snes.lua");
+    let log = dir.path().join("mesen.log");
+    let launch = Launch {
+        binary: &binary,
+        content: "/tmp/game.sfc",
+        lua: &lua,
+        log_path: &log,
+        port: 47800,
+        name: None,
+        build: Some("server-build"),
+        session_token: Some("token"),
+        runtime: None,
+        start_frozen: false,
+        repeatable: true,
+    };
+    let spec = launch_spec(&launch, &binary, &test_build_metadata());
+
+    for expected in [
+        ("EMUCAP_START_FROZEN", "1"),
+        ("EMUCAP_EXECUTION_PROFILE", "repeatable"),
+        (
+            "EMUCAP_REPEATABLE_CONDITIONS_SHA256",
+            REPEATABLE_CONDITIONS_SHA256,
+        ),
+        ("EMUCAP_REPEATABLE_SEED", REPEATABLE_SEED),
+        ("EMUCAP_FIXED_UNIX_TIME", REPEATABLE_UNIX_TIME),
+    ] {
+        assert!(spec
+            .env
+            .contains(&(expected.0.to_string(), expected.1.to_string())));
+    }
 }

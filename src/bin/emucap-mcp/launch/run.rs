@@ -1,5 +1,6 @@
 use super::plan::*;
 use super::*;
+use crate::args::LaunchExecutionProfileArgs;
 
 fn transition_rejection(
     reason: EntryReason,
@@ -149,6 +150,23 @@ pub(crate) fn make_launch(
         return serde_json::json!({
             "launched": false,
             "reason": "sound:true is supported only by Mednafen systems",
+            "system": system,
+            "adapter": adapter,
+        });
+    }
+    let repeatable = a.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
+    if a.start_frozen && adapter != "mesen2" && adapter != "mednafen" {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "start_frozen is currently supported only by Mesen and Mednafen systems",
+            "system": system,
+            "adapter": adapter,
+        });
+    }
+    if repeatable && system != "snes" {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "execution_profile=repeatable is currently supported only for SNES",
             "system": system,
             "adapter": adapter,
         });
@@ -401,7 +419,7 @@ pub(crate) fn make_launch(
     let backend_endpoint = backend_endpoint_from_launch(&outcome);
     // 즉시 exec 실패·동적 로더 오류가 이전 current를 덮지 않게 짧은 process-readiness 창을 둔다.
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let manifest = prepared.manifest(ManifestSpec {
+    let mut manifest = prepared.manifest(ManifestSpec {
         adapter: adapter.into(),
         system: system.into(),
         content: a.content_path.clone(),
@@ -410,6 +428,10 @@ pub(crate) fn make_launch(
         backend_endpoint,
         build: Some(BUILD_HASH.to_string()),
     });
+    manifest.execution_profile = outcome
+        .get("execution_profile")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    manifest.start_frozen = a.start_frozen || repeatable;
     let emulator_state = manifest.process_state();
     let bridge_state = manifest.bridge_process_state();
     if emulator_state != ProcessState::Alive
@@ -459,6 +481,25 @@ pub(crate) fn make_launch(
             return failure;
         }
     };
+    if let Some(reason) = controlled_launch_contract_error(
+        a.start_frozen || repeatable,
+        repeatable,
+        &ready_status,
+        manifest.execution_profile.as_ref(),
+        link.capabilities(),
+    ) {
+        let _ = manifest.terminate_owned_processes();
+        let token_cleanup_error = abort_staged_reclaim(link, direct_reclaim);
+        let _ = prepared.abort();
+        let mut failure = serde_json::json!({
+            "launched": false,
+            "reason": reason,
+            "ready_status": ready_status,
+            "launcher_outcome": outcome,
+        });
+        record_token_cleanup_error(&mut failure, token_cleanup_error);
+        return failure;
+    }
     if let Some(reclaim_token) = direct_reclaim {
         match link.commit_staged_reclaim_token(reclaim_token) {
             Ok(true) => {}
@@ -1035,73 +1076,6 @@ pub(super) fn launch_dolphin(
     }
 }
 
-/// SNES/Mesen leg of `make_launch`: resolve the binary + adapter Lua and hand off to the orchestrator.
-pub(super) fn launch_mesen(
-    port: u16,
-    token: Option<&str>,
-    runtime: RuntimeEnv<'_>,
-    system: &str,
-    a: &LaunchArgs,
-) -> serde_json::Value {
-    let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
-    };
-    let Some(binary) = emucap::launch::mesen::resolve_binary(&root) else {
-        return serde_json::json!({
-            "launched": false,
-            "kind": "mesen-patch-required",
-            "reason": "compatible Mesen binary was not found; run adapters/mesen2/build.sh or build.ps1 on Windows"
-        });
-    };
-    let host_build = match emucap::launch::mesen::require_compatible_build(&root, &binary) {
-        Ok(build) => build,
-        Err(error) => {
-            return serde_json::json!({
-                "launched": false,
-                "kind": "mesen-patch-required",
-                "error": error.to_string(),
-                "next_action": if cfg!(windows) { "adapters/mesen2/build.ps1" } else { "adapters/mesen2/build.sh" },
-            });
-        }
-    };
-    // 시스템별 얇은 엔트리 스크립트(SYS config 설정 후 emucap-core.lua를 require). Mesen은 SNES/GG/GB(+GBC)/GBA/NES 처리.
-    let entry = match system {
-        "gamegear" => "adapters/mesen2/emucap-sms.lua",
-        "gb" | "gbc" => "adapters/mesen2/emucap-gb.lua",
-        "gba" => "adapters/mesen2/emucap-gba.lua",
-        "nes" => "adapters/mesen2/emucap-nes.lua",
-        _ => "adapters/mesen2/emucap-snes.lua",
-    };
-    let lua = root.join(entry);
-    let log = adapter_log_path("mesen2", port, "mesen.log");
-    let spec = emucap::launch::mesen::Launch {
-        binary: &binary,
-        content: &a.content_path,
-        lua: &lua,
-        log_path: &log,
-        port,
-        name: a.name.as_deref(),
-        build: Some(BUILD_HASH),
-        session_token: token,
-        runtime: Some(runtime),
-    };
-    match emucap::launch::mesen::launch(&spec) {
-        Ok(pid) => serde_json::json!({
-            "launched": true,
-            "adapter": "mesen2",
-            "pid": pid,
-            "port": port,
-            "binary": binary.display().to_string(),
-            "host_build": host_build,
-            "log": log.display().to_string(),
-            "emucap_home": emucap::launch::emu_home_dir("mesen2", port).display().to_string(),
-            "isolation": "Mesen runs from an emucap-owned portable copy; user settings.json is not edited.",
-            "next_action": "launch returns after the adapter connects",
-        }),
-        Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
-    }
-}
-
 /// Mednafen leg of `make_launch` (Saturn/PSX/PCE/MD): resolve the built fork (per-port copy unless
 /// MEDNAFEN_BIN is pinned) and hand off with the force_module.
 pub(super) fn launch_mednafen(
@@ -1135,6 +1109,7 @@ pub(super) fn launch_mednafen(
         runtime: Some(runtime),
         headless: !display,
         sound,
+        start_frozen: a.start_frozen,
     };
     match emucap::launch::mednafen::launch(&spec) {
         Ok(pid) => serde_json::json!({
@@ -1148,6 +1123,8 @@ pub(super) fn launch_mednafen(
             "binary": binary.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
+            "emucap_home": emucap::launch::emu_home_dir("mednafen", port).display().to_string(),
+            "isolation": "Mednafen uses an emucap-owned per-port home and copies known BIOS files from the shared emucap firmware inventory; the user's ~/.mednafen profile is not read or changed.",
             "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),

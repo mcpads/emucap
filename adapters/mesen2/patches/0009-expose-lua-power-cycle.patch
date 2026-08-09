@@ -1,0 +1,54 @@
+diff --git i/Core/Debugger/LuaApi.h w/Core/Debugger/LuaApi.h
+--- i/Core/Debugger/LuaApi.h
++++ w/Core/Debugger/LuaApi.h
+@@ -52,6 +52,7 @@ public:
+ 	static int DisplayMessage(lua_State* lua);
+ 
+ 	static int Reset(lua_State* lua);
++	static int PowerCycle(lua_State* lua);
+ 	static int Stop(lua_State* lua);
+ 	static int BreakExecution(lua_State* lua);
+ 	static int Resume(lua_State* lua);
+diff --git i/Core/Debugger/LuaApi.cpp w/Core/Debugger/LuaApi.cpp
+--- i/Core/Debugger/LuaApi.cpp
++++ w/Core/Debugger/LuaApi.cpp
+@@ -130,6 +130,7 @@ int LuaApi::GetLibrary(lua_State* lua)
+ 		{ "displayMessage", LuaApi::DisplayMessage },
+ 
+ 		{ "reset", LuaApi::Reset },
++		{ "powerCycle", LuaApi::PowerCycle },
+ 		{ "stop", LuaApi::Stop },
+ 		{ "breakExecution", LuaApi::BreakExecution },
+ 		{ "resume", LuaApi::Resume },
+@@ -757,6 +758,15 @@ int LuaApi::Reset(lua_State* lua)
+ 	return l.ReturnCount();
+ }
+ 
++int LuaApi::PowerCycle(lua_State* lua)
++{
++	LuaCallHelper l(lua);
++	checkparams();
++	checkinitdone();
++	l.Return(_emu->GetSystemActionManager()->PowerCycle());
++	return l.ReturnCount();
++}
++
+ int LuaApi::Stop(lua_State* lua)
+ {
+ 	LuaCallHelper l(lua);
+diff --git i/UI/Debugger/Documentation/LuaDocumentation.json w/UI/Debugger/Documentation/LuaDocumentation.json
+--- i/UI/Debugger/Documentation/LuaDocumentation.json
++++ w/UI/Debugger/Documentation/LuaDocumentation.json
+@@ -338,6 +338,12 @@
+ 	"returnValue": { "type": "Int", "description": "A 32-bit (signed or unsigned) value." }
+ },
+ {
++	"name": "powerCycle",
++	"category": "Emulation",
++	"description": "Requests a power cycle of the current game through Mesen's native reload path.",
++	"returnValue": { "type": "Bool", "description": "True when the power cycle was queued." }
++},
++{
+ 	"name": "reset",
+ 	"category": "Emulation",
+ 	"description": "Resets the current game. If the console does not have a reset button, this will have the same effect as power cycling."

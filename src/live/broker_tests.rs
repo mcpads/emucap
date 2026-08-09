@@ -1,20 +1,16 @@
 use super::broker;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-// broker를 ephemeral 두 포트로 띄우고 (emu_addr, sess_addr) 반환.
-fn start_broker_with(stale: Duration) -> (String, String) {
+// Start the broker on two ephemeral ports and return (emulator_addr, session_addr).
+fn start_broker() -> (String, String) {
     let emu = TcpListener::bind("127.0.0.1:0").unwrap();
     let sess = TcpListener::bind("127.0.0.1:0").unwrap();
     let ea = emu.local_addr().unwrap().to_string();
     let sa = sess.local_addr().unwrap().to_string();
-    std::thread::spawn(move || broker::serve(emu, sess, stale));
+    std::thread::spawn(move || broker::serve(emu, sess));
     (ea, sa)
-}
-
-fn start_broker() -> (String, String) {
-    start_broker_with(Duration::from_secs(15))
 }
 
 // 가짜 에뮬레이터: 접속→hello 응답(name, methods)→이후 명령 echo 응답.
@@ -284,13 +280,22 @@ fn broker_atomic_two_port_bind() {
 }
 
 fn attach(sa: &str, name: Option<&str>) -> (TcpStream, String) {
+    let params = name
+        .map(|name| serde_json::json!({"name": name}))
+        .unwrap_or_else(|| serde_json::json!({}));
+    attach_with_params(sa, params)
+}
+
+fn attach_with_params(sa: &str, params: serde_json::Value) -> (TcpStream, String) {
     let s = TcpStream::connect(sa).unwrap();
     let mut r = BufReader::new(s.try_clone().unwrap());
     let mut w = s.try_clone().unwrap();
-    let p = name
-        .map(|n| format!(r#"{{"name":"{n}"}}"#))
-        .unwrap_or_else(|| "{}".into());
-    writeln!(w, r#"{{"v":1,"id":1,"method":"attach","params":{p}}}"#).unwrap();
+    writeln!(
+        w,
+        "{}",
+        serde_json::json!({"v": 1, "id": 1, "method": "attach", "params": params})
+    )
+    .unwrap();
     let mut ar = String::new();
     r.read_line(&mut ar).unwrap();
     (s, ar)
@@ -327,6 +332,98 @@ fn broker_second_session_busy() {
     assert!(ar2.contains("busy"), "둘째 세션은 busy: {ar2}");
 }
 
+#[test]
+fn broker_exact_registration_can_resume_the_same_application_link() {
+    let (ea, sa) = start_broker();
+    let _emulator = fake_emu_alive(ea, "g", 4000);
+    std::thread::sleep(Duration::from_millis(100));
+    let (old_session, first) = attach(&sa, Some("g"));
+    let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
+    let registration_id = first["result"]["broker_registration_id"]
+        .as_u64()
+        .expect("broker registration identity");
+
+    let (_new_session, resumed) = attach_with_params(
+        &sa,
+        serde_json::json!({
+            "name": "g",
+            "expected_registration_id": registration_id,
+        }),
+    );
+    assert!(
+        resumed.contains("attached_name") && resumed.contains("broker_registration_id"),
+        "exact registration should resume the same application link: {resumed}"
+    );
+    drop(old_session);
+}
+
+#[test]
+fn broker_rejects_a_reconnect_after_emulator_registration_changes() {
+    let (ea, sa) = start_broker();
+    let _emulator = fake_emu_alive(ea, "g", 4000);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (_session, response) = attach_with_params(
+        &sa,
+        serde_json::json!({
+            "name": "g",
+            "expected_registration_id": u64::MAX,
+        }),
+    );
+    assert!(
+        response.contains("identity_mismatch"),
+        "a stale registration identity must not bind a different emulator: {response}"
+    );
+}
+
+#[test]
+fn broker_accepts_reregistration_only_for_the_same_returned_launch() {
+    let (ea, sa) = start_broker();
+    let _first_emulator = fake_managed_emu_alive(ea.clone(), "g", "launch-same", 4000);
+    std::thread::sleep(Duration::from_millis(100));
+    let (first_session, first) = attach(&sa, Some("g"));
+    let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
+    let first_registration = first["result"]["broker_registration_id"].as_u64().unwrap();
+
+    let _replacement_emulator = fake_managed_emu_alive(ea, "g", "launch-same", 4000);
+    std::thread::sleep(Duration::from_millis(100));
+    let (_continued_session, continued) = attach_with_params(
+        &sa,
+        serde_json::json!({
+            "name": "g",
+            "expected_registration_id": first_registration,
+            "expected_launch_id": "launch-same",
+        }),
+    );
+    let continued: serde_json::Value = serde_json::from_str(continued.trim()).unwrap();
+    assert_eq!(continued["ok"], true);
+    assert_ne!(
+        continued["result"]["broker_registration_id"], first_registration,
+        "adapter re-registration must retain a distinct transport identity"
+    );
+    drop(first_session);
+}
+
+#[test]
+fn broker_rejects_reregistration_for_a_different_launch() {
+    let (ea, sa) = start_broker();
+    let _emulator = fake_managed_emu_alive(ea, "g", "launch-new", 4000);
+    std::thread::sleep(Duration::from_millis(100));
+
+    let (_session, response) = attach_with_params(
+        &sa,
+        serde_json::json!({
+            "name": "g",
+            "expected_registration_id": u64::MAX,
+            "expected_launch_id": "launch-old",
+        }),
+    );
+    assert!(
+        response.contains("identity_mismatch"),
+        "a durable launch mismatch must reject transport recovery: {response}"
+    );
+}
+
 // hello만 응답하고 명령을 echo하지 않은 채 hold_ms 동안 살아있는 에뮬레이터.
 fn fake_emu_alive(addr: String, name: &str, hold_ms: u64) -> std::thread::JoinHandle<()> {
     let name = name.to_string();
@@ -345,22 +442,37 @@ fn fake_emu_alive(addr: String, name: &str, hold_ms: u64) -> std::thread::JoinHa
     })
 }
 
-#[test]
-fn is_stale_only_after_threshold() {
-    let now = Instant::now();
-    let threshold = Duration::from_millis(100);
-    assert!(
-        !broker::is_stale(now, now, threshold),
-        "방금 활동 = 살아있음"
-    );
-    assert!(
-        !broker::is_stale(now, now - Duration::from_millis(50), threshold),
-        "임계 내 = 살아있음"
-    );
-    assert!(
-        broker::is_stale(now, now - Duration::from_millis(200), threshold),
-        "임계 초과 = stale"
-    );
+fn fake_managed_emu_alive(
+    addr: String,
+    name: &str,
+    launch_id: &str,
+    hold_ms: u64,
+) -> std::thread::JoinHandle<()> {
+    let name = name.to_string();
+    let launch_id = launch_id.to_string();
+    std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({
+                "id": 0,
+                "ok": true,
+                "result": {
+                    "protocol_version": 1,
+                    "methods": ["status"],
+                    "name": name,
+                    "launch_id": launch_id,
+                },
+            })
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(hold_ms));
+    })
 }
 
 #[test]
@@ -400,38 +512,36 @@ fn broker_old_session_reader_does_not_clobber_new_pairing() {
 }
 
 #[test]
-fn broker_steals_emulator_from_stale_session() {
-    // 세션이 hang(명령·heartbeat 모두 없음)하면 짧은 stale 임계 후 신규 attach가 steal한다.
-    let (ea, sa) = start_broker_with(Duration::from_millis(150));
+fn broker_does_not_transfer_an_open_session_after_elapsed_time() {
+    // heartbeat 지연은 관측 신호일 뿐이며 열린 세션의 배타 제어권을 이전하지 않는다.
+    let (ea, sa) = start_broker();
     let _e = fake_emu_alive(ea, "g", 4000);
     std::thread::sleep(Duration::from_millis(100));
-    // 세션 A: attach 후 조용(stale 됨).
     let (a_sock, ar_a) = attach(&sa, Some("g"));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
-    std::thread::sleep(Duration::from_millis(350)); // > 150ms 임계
-                                                    // 세션 B: stale A를 steal.
+    std::thread::sleep(Duration::from_millis(350));
     let (_b, ar_b) = attach(&sa, Some("g"));
     assert!(
-        ar_b.contains("attached_name"),
-        "stale 세션에서 steal해야: {ar_b}"
+        ar_b.contains("busy"),
+        "열린 세션은 경과 시간만으로 이전되면 안 된다: {ar_b}"
     );
     let _ = a_sock;
 }
 
 #[test]
-fn broker_keeps_busy_for_active_session() {
-    // _ping(heartbeat)을 보내 살아있는 세션은 idle여도 steal당하지 않는다(busy 유지).
-    let (ea, sa) = start_broker_with(Duration::from_millis(250));
+fn broker_heartbeat_does_not_change_exclusive_control() {
+    // _ping은 transport 관측일 뿐이며 열린 세션의 배타 제어권을 바꾸지 않는다.
+    let (ea, sa) = start_broker();
     let _e = fake_emu_alive(ea, "g", 4000);
     std::thread::sleep(Duration::from_millis(100));
     let (mut a_sock, ar_a) = attach(&sa, Some("g"));
     assert!(ar_a.contains("attached_name"), "A attach: {ar_a}");
-    // A가 heartbeat를 주기적으로 보내 활동 신호 유지.
+    // A가 heartbeat를 주기적으로 보내도 소유권 근거로 사용하지 않는다.
     for _ in 0..4 {
         writeln!(a_sock, r#"{{"v":1,"method":"_ping"}}"#).unwrap();
         std::thread::sleep(Duration::from_millis(60));
     }
-    // 마지막 활동이 임계(250ms) 내 → B는 busy.
+    // A의 연결이 열려 있으므로 B는 busy.
     let (_b, ar_b) = attach(&sa, Some("g"));
     assert!(
         ar_b.contains("busy"),
@@ -440,7 +550,7 @@ fn broker_keeps_busy_for_active_session() {
 }
 
 // hello 응답 후 명령 하나를 읽어 *받은 그대로의 id*를 기억하고, `go` 신호가 올 때까지 응답을 보류한다.
-// 신호가 오면 그 id로 (뒤늦은) 응답을 보낸다 — steal 이후 도착하는 in-flight 응답을 재현한다.
+// The signal releases a late reply after a front-session handoff.
 fn fake_emu_hold_reply(
     addr: String,
     name: &str,
@@ -462,7 +572,7 @@ fn fake_emu_hold_reply(
         let mut cmd = String::new();
         r.read_line(&mut cmd).unwrap();
         let id = serde_json::from_str::<serde_json::Value>(cmd.trim()).unwrap()["id"].clone();
-        // steal이 끝날 때까지 응답 보류.
+        // Hold the reply until the front-session handoff completes.
         let _ = go.recv();
         // A의 요청에 대한 뒤늦은 응답 — 펜싱되어 신규 소유자 B에게 배달되면 안 된다.
         writeln!(w, r#"{{"id":{id},"ok":true,"result":{{"stale":true}}}}"#).unwrap();
@@ -471,10 +581,9 @@ fn fake_emu_hold_reply(
 }
 
 #[test]
-fn broker_fences_stale_response_after_steal() {
-    // steal 안전: stale 세션 A의 in-flight 응답이 뒤늦게 와도, 세대 펜싱으로 신규 소유자 B가 그것을
-    // 자기 응답으로 받지 않아야 한다(A·B가 같은 요청 id를 써도).
-    let (ea, sa) = start_broker_with(Duration::from_millis(150));
+fn broker_fences_a_late_response_after_closed_session_reattach() {
+    // 세션 A가 닫힌 뒤 명시적으로 붙은 B는 A의 늦은 응답을 자기 응답으로 받지 않아야 한다.
+    let (ea, sa) = start_broker();
     let (go_tx, go_rx) = std::sync::mpsc::channel();
     let _e = fake_emu_hold_reply(ea, "g", go_rx);
     std::thread::sleep(Duration::from_millis(100)); // 등록 여유
@@ -488,12 +597,12 @@ fn broker_fences_stale_response_after_steal() {
     }
     std::thread::sleep(Duration::from_millis(80)); // 에뮬레이터가 A 요청을 읽을 시간
 
-    // A가 조용해져(heartbeat 없음) stale → B가 steal.
-    std::thread::sleep(Duration::from_millis(250)); // > 150ms 임계
+    drop(a_sock);
+    std::thread::sleep(Duration::from_millis(100));
     let (b_sock, ar_b) = attach(&sa, Some("g"));
     assert!(
         ar_b.contains("attached_name"),
-        "B가 stale A를 steal: {ar_b}"
+        "A가 닫힌 뒤 B가 명시적으로 attach: {ar_b}"
     );
     // B도 같은 id=7로 자기 요청 전송(겹치는 id 공간 재현).
     {
@@ -516,7 +625,6 @@ fn broker_fences_stale_response_after_steal() {
         !got.contains("stale"),
         "B가 옛 세션 A의 in-flight 응답을 받으면 안 됨(fence): n={n}, got={got:?}"
     );
-    let _ = a_sock;
 }
 
 #[test]

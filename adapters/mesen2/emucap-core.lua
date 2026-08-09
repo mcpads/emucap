@@ -10,6 +10,7 @@ assert(SYS.snapshot_regs,
 -- SP모델과 안 맞는 ISA는 이 셋을 비우면 disassemble·call_stack을 미지원으로 광고·거부한다.
 local HAS_DISASM = SYS.disassemble ~= nil
 local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
+local HAS_POWER_CYCLE = type(emu.powerCycle) == "function"
 local HAS_SNES_PPU_OBJ_EVENTS = SYS.system == "snes"
   and emu.eventType.snesPpuObjEvaluationStart ~= nil
   and emu.eventType.snesPpuObjScanlineHandoff ~= nil
@@ -49,13 +50,25 @@ local HOST = "127.0.0.1"
 -- 포트: 교차-ROM 2-인스턴스를 위해 EMUCAP_PORT로 덮어쓸 수 있다(없으면 47800).
 local PORT = tonumber(os.getenv("EMUCAP_PORT") or "") or 47800
 local PROTOCOL_VERSION = 1
-local MESEN_HOST_API = 2
+-- The Lua script remains usable with the API-2 host. API 3 is an additive capability and must not
+-- make every existing Mesen control method disappear when the native power-cycle hook is absent.
+local MESEN_HOST_API = HAS_POWER_CYCLE and 3 or 2
 local MESEN_UPSTREAM_COMMIT = os.getenv("EMUCAP_MESEN_UPSTREAM_COMMIT")
 local MESEN_PATCHSET_SHA256 = os.getenv("EMUCAP_MESEN_PATCHSET_SHA256")
 local MESEN_BINARY_SHA256 = os.getenv("EMUCAP_MESEN_BINARY_SHA256")
 local function exact_hex(value, length)
   return type(value) == "string" and #value == length and not value:find("[^0-9a-fA-F]")
 end
+local START_FROZEN = os.getenv("EMUCAP_START_FROZEN") == "1"
+local REPEATABLE_CONDITIONS_SHA256 = os.getenv("EMUCAP_REPEATABLE_CONDITIONS_SHA256")
+local KNOWN_REPEATABLE_CONDITIONS_SHA256 =
+  "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b"
+local REPEATABLE_PROFILE = SYS.system == "snes"
+  and START_FROZEN
+  and os.getenv("EMUCAP_EXECUTION_PROFILE") == "repeatable"
+  and os.getenv("EMUCAP_REPEATABLE_SEED") == "1162696003"
+  and os.getenv("EMUCAP_FIXED_UNIX_TIME") == "788918400"
+  and REPEATABLE_CONDITIONS_SHA256 == KNOWN_REPEATABLE_CONDITIONS_SHA256
 -- Recording evidence names the exact host revision, patch stack, and produced binary. Legacy or
 -- manually launched hosts retain every pre-existing method but do not advertise this capability.
 local RECORDING_SUPPORTED = SYS.system == "snes"
@@ -88,11 +101,11 @@ do local lk = FREEZE_KEY:lower(); if lk == "" or lk == "off" or lk == "none" the
 local freeze_key_ok = true     -- isKeyPressed가 무효 키에 에러 → 1회 보고 후 비활성
 local prev_freeze_key = false  -- 라이징 에지 검출(running→freeze, frozen→resume 토글)
 
-local STATE = "running"       -- "running" | "frozen"
+local STATE = START_FROZEN and "frozen" or "running"
 local freeze_start_ms = nil   -- 마지막 명령 이후 경과 측정(데드맨). frozen 진입/명령 수신 시 갱신.
 -- The current halt cause and its temporal eligibility are independent. A later step must replace
 -- a recording halt's reason, while a completed frame step remains a proven recording boundary.
-local freeze_state = FreezeState.halt("paused", false)
+local freeze_state = FreezeState.halt(START_FROZEN and "launch" or "paused", false)
 -- true only while the patched host services a main-CPU instruction-boundary halt. Frame/PPU steps,
 -- read/write breakpoints, and other mid-instruction halts use the ordinary idle event and keep this
 -- false, so savestate calls fail loudly instead of serializing an unsafe core state.
@@ -124,7 +137,7 @@ local recording_last = nil     -- bounded terminal status only; event bytes stay
 local recording_hook_refs = {} -- request-owned semantic callbacks; empty on the ordinary path
 local abort_inflight = nil     -- disconnect 시 새 세션에 옛 response id를 흘리지 않도록 지연 작업 폐기
 local resume_from_freeze = nil -- reset reply flush에서도 frozen ownership을 반환할 수 있게 forward declaration
-local reset_after_reply = false -- reset terminal response를 모두 보낸 뒤 host reset을 실행
+local restart_after_reply = nil -- terminal response 뒤 실행할 "reset" 또는 "power_cycle"
 local next_bp_id = 1
 local breakpoints = {}         -- id -> { ref, kind, start, end, pause_on_hit }
 local reset_bp = nil           -- break_on_reset: 리셋 핸들러 exec BP { ref, handler }
@@ -357,13 +370,20 @@ local function flush_tx()
   if status == "error" then
     emu.log("[emucap] TX error (" .. tostring(err) .. "); reconnecting")
     disconnect()
-  elseif status == "complete" and reset_after_reply then
-    -- Some Mesen systems power cycle by recreating the debugger and Lua context. Send the terminal
-    -- response first; the host then waits for the replacement script session before closing reset.
-    reset_after_reply = false
-    emu.reset()
+  elseif status == "complete" and restart_after_reply then
+    -- Reset and power cycle may recreate the debugger and Lua context. Send the terminal response
+    -- first; the host then waits for the replacement script session before closing the operation.
+    local operation = restart_after_reply
+    restart_after_reply = nil
+    if operation == "power_cycle" then
+      if emu.powerCycle() == false then
+        emu.log("[emucap] native power cycle was not queued; waiting host request will time out")
+      end
+    else
+      emu.reset()
+    end
     if STATE == "frozen" then resume_from_freeze() end
-    return "resetting"
+    return "restarting"
   end
   return status
 end
@@ -482,6 +502,7 @@ function handlers.hello()
                 "set_breakpoint", "watch_register", "clear_breakpoint", "list_breakpoints",
                 "clear_all_breakpoints", "poll_events", "set_trace", "get_trace",
                 "break_on_reset", "dump_memory", "find_pattern", "probe", "reset" }
+  if HAS_POWER_CYCLE then method_list[#method_list + 1] = "power_cycle" end
   if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
   if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
   if RECORDING_SUPPORTED then
@@ -492,7 +513,12 @@ function handlers.hello()
     "native_halt_service",
     "native_halt_savestate",
     "paused_start_service",
+    "controlled_start",
   }
+  if HAS_POWER_CYCLE then host_features[#host_features + 1] = "native_power_cycle" end
+  local repeatable_recording = REPEATABLE_PROFILE and RECORDING_SUPPORTED
+    and HAS_SNES_DEEP_EVENTS and memory_regions ~= nil and #memory_regions > 0
+  if repeatable_recording then host_features[#host_features + 1] = "repeatable_recording" end
   if HAS_SNES_PPU_OBJ_EVENTS then host_features[#host_features + 1] = "snes_ppu_obj_events" end
   if HAS_SNES_DEEP_EVENTS then host_features[#host_features + 1] = "snes_deep_observation_events" end
   local breakpoint_kinds = {
@@ -526,7 +552,8 @@ function handlers.hello()
   if RECORDING_SUPPORTED then
     result.recording = Recording.capability(
       as_array, HAS_SNES_PPU_OBJ_EVENTS, memory_regions ~= nil and #memory_regions > 0,
-      HAS_SNES_DEEP_EVENTS, SYS.system == "snes")
+      HAS_SNES_DEEP_EVENTS, SYS.system == "snes",
+      repeatable_recording and REPEATABLE_CONDITIONS_SHA256 or nil)
   end
   local active_exceptions = { "mesen.execution.instruction-step-absent" }
   if HAS_CALLSTACK then
@@ -694,6 +721,13 @@ function handlers.status()
     idle_auto_resume_ms = MAX_FREEZE_MS,
     disconnect_auto_resume_ms = RECONNECT_GIVEUP_MS,
   }
+  r.launch_start = {
+    requested_frozen = START_FROZEN,
+    controlled = START_FROZEN,
+    boundary = START_FROZEN and "pre_first_instruction" or nil,
+    execution_profile = REPEATABLE_PROFILE and "repeatable" or nil,
+    conditions_sha256 = REPEATABLE_PROFILE and REPEATABLE_CONDITIONS_SHA256 or nil,
+  }
   if MESEN_UPSTREAM_COMMIT and MESEN_BINARY_SHA256 then
     r.host_build = {
       upstream = "https://github.com/nesdev-org/MesenCE.git",
@@ -740,8 +774,18 @@ end
 -- 게임을 리셋한다(리셋 버튼 없으면 전원 재투입과 동일). 로드된 ROM 바이트는 그대로이므로
 -- "처음부터 다시"엔 쓰되, 리빌드한 ROM 검증은 Mesen의 "Reload ROM" 단축키를 쓴다(Lua 미노출).
 function handlers.reset()
-  reset_after_reply = true
+  restart_after_reply = "reset"
   return true, { reset = true, reconnect = true }
+end
+
+-- Mesen의 native power-cycle 경로로 ROM을 다시 로드한다. 이 경로는 battery save를
+-- 시도하지만, 이 핸들러는 실제 파일 저장 성공을 증명하지 않는다.
+function handlers.power_cycle()
+  if not HAS_POWER_CYCLE then
+    return false, "unsupported", "the active Mesen host does not expose native power cycle"
+  end
+  restart_after_reply = "power_cycle"
+  return true, { power_cycle = true, reconnect = true }
 end
 
 function handlers.abort_recording(p)
@@ -1380,7 +1424,7 @@ abort_inflight = function()
     -- exact request until the native reset callback, then close it before the first post-reset tick.
     recording_reset.cancelled = true
   end
-  reset_after_reply = false
+  restart_after_reply = nil
   if cancelled then pcall(emu.log, "[emucap] connection closed; cancelled unfinished requests and waiting to reconnect") end
 end
 
@@ -2236,8 +2280,9 @@ local function handle_in_freeze(line)
   local id, method, p = parse_request(line)
   id = id or 0
   if method == "record_window" then
-    if not FreezeState.can_start_recording(freeze_state) then
-      reply_err(id, "unsafe_halt", "the current frozen position is not a proven frame boundary")
+    if not FreezeState.can_start_recording(freeze_state, p.origin) then
+      reply_err(id, "unsafe_halt",
+        "next-frame recording requires a current frozen position with a proven frame boundary")
     else
       local action = start_recording(id, p)
       if action == "started" then return "resume" end
@@ -2338,7 +2383,7 @@ local function service_frozen_once()
   if not freeze_snapshot then freeze_snapshot = emu.getState() end
 
   -- 미완성 response cursor를 한 번만 전진시킨다. would-block이면 다음 idle event까지 기다린다.
-  if conn and Tx.pending(tx) and flush_tx() == "resetting" then return end
+  if conn and Tx.pending(tx) and flush_tx() == "restarting" then return end
 
   -- 직전 explicit step 청크가 다시 halt한 지점. response가 막혀 있으면 guest를 더 진행하지 않는다.
   if pending_step_id then
@@ -2467,7 +2512,7 @@ emu.addEventCallback(function()
   halt_savestate_safe = false
   frame = frame + 1
   if not conn then connect(); return end
-  if Tx.pending(tx) and flush_tx() == "resetting" then return end
+  if Tx.pending(tx) and flush_tx() == "restarting" then return end
   -- A startFrame while frozen means the host was resumed outside the adapter. Explicit adapter
   -- steps are the exception: they may cross a frame boundary before returning to the native halt.
   if STATE == "frozen" then

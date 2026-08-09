@@ -53,7 +53,19 @@ pub struct CurrentManifest {
     pub bridge: Option<ProcessIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backend_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<ExecutionProfileIdentity>,
+    /// Committed only after the live adapter proves a frozen launch-entry boundary.
+    #[serde(default)]
+    pub start_frozen: bool,
     pub created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionProfileIdentity {
+    pub id: String,
+    pub conditions_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -350,6 +362,42 @@ impl RuntimeStore {
         result
     }
 
+    /// Update the exact current generation's link record while holding the port's current writer
+    /// lock. This is the ownership transition boundary used by lease acquisition: a generation
+    /// replacement cannot race between checking `current.json` and publishing the new lease.
+    pub fn update_current_link_json<T, F>(
+        &self,
+        port: u16,
+        expected_launch_id: &str,
+        update: F,
+    ) -> io::Result<T>
+    where
+        T: Serialize + DeserializeOwned,
+        F: FnOnce(Option<T>) -> io::Result<T>,
+    {
+        validate_launch_id(expected_launch_id)?;
+        let current_lock = self.session_dir(port).join(".current.lock");
+        let lock = open_private_lock(&current_lock)?;
+        lock_with_deadline(&lock, std::time::Duration::from_millis(250))?;
+        let result = (|| {
+            let current = self.read_current(port)?.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "runtime current generation disappeared before lease acquisition",
+                )
+            })?;
+            if current.launch_id != expected_launch_id {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "runtime current generation changed before lease acquisition",
+                ));
+            }
+            self.update_link_json(port, expected_launch_id, update)
+        })();
+        let _ = fs2::FileExt::unlock(&lock);
+        result
+    }
+
     pub fn read_capture_json<T: DeserializeOwned>(
         &self,
         port: u16,
@@ -499,6 +547,8 @@ impl PreparedGeneration {
             emulator: capture_process(spec.emulator_pid),
             bridge: spec.bridge_pid.map(capture_process),
             backend_endpoint: spec.backend_endpoint,
+            execution_profile: None,
+            start_frozen: false,
             created_at_unix_ms: now_unix_ms(),
         }
     }
@@ -591,6 +641,8 @@ impl CurrentManifest {
             "bridge_pid": self.bridge.as_ref().map(|p| p.pid),
             "bridge_process_state": bridge_state,
             "backend_endpoint": self.backend_endpoint,
+            "execution_profile": self.execution_profile,
+            "start_frozen": self.start_frozen,
             "lease": lease,
             "next_safe_action": next_safe_action(emulator_state, bridge_state, lease.state),
         })

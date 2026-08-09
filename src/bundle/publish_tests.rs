@@ -19,6 +19,7 @@ fn request(frames: u64) -> RecordingRequest {
             .unwrap()
             .identities(["frame_boundary"])
             .unwrap(),
+        event_filters: vec![],
         event_arming: vec![],
         limits: RecordingLimits {
             max_frames: 300,
