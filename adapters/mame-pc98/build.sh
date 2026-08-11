@@ -36,6 +36,7 @@ OWNER_FILE="$WORK/${MAME_WORK_OWNER_FILE:-.emucap-mame-pc98-work}"
 SRC="$WORK/mame-src"
 TARBALL="$WORK/${TAG}.tar.gz"
 PATCH_DIR="${MAME_PATCH_DIR:-$HERE/patches}"
+PATCHSET_SHA256="${MAME_PATCHSET_SHA256:-$MAME_LOCK_PATCHSET_SHA256}"
 JOBS="${MAME_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
 WRAPPER="$WORK/mame"
 RAW_LINK="$WORK/mame.raw"
@@ -104,18 +105,33 @@ fi
   exit 1
 }
 
+PATCHES=()
+if [ -d "$PATCH_DIR" ]; then
+  while IFS= read -r source_patch; do
+    [ -n "$source_patch" ] && PATCHES+=("$source_patch")
+  done < <(find "$PATCH_DIR" -type f -name '*.patch' | sort)
+fi
+if command -v shasum >/dev/null 2>&1; then
+  ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
+else
+  ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256sum | awk '{print $1}')"
+fi
+[ "$ACTUAL_PATCHSET_SHA256" = "$PATCHSET_SHA256" ] || {
+  echo "ERROR: MAME patch stack does not match upstream.lock" >&2
+  echo "  expected=$PATCHSET_SHA256" >&2
+  echo "  actual=$ACTUAL_PATCHSET_SHA256" >&2
+  exit 1
+}
+
 echo "-> Extracting fresh source"
 safe_rm_rf_under_work "$SRC"
 mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
 
-if [ -d "$PATCH_DIR" ]; then
-  while IFS= read -r patch; do
-    [ -n "$patch" ] || continue
-    echo "-> Applying $(basename "$patch")"
-    patch -d "$SRC" -p1 <"$patch"
-  done < <(find "$PATCH_DIR" -type f -name '*.patch' | sort)
-fi
+for source_patch in "${PATCHES[@]}"; do
+  echo "-> Applying $(basename "$source_patch")"
+  patch -d "$SRC" -p1 <"$source_patch"
+done
 
 echo "-> Building MAME $VER"
 make_args=(NOWERROR=1)

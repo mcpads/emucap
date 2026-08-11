@@ -306,7 +306,9 @@ debugger halt to service requests without advancing the guest.
   controller input; Wii supports emulated Wii Remote 1 core buttons without
   claiming IR, motion, or extensions. → `adapters/dolphin/README.md`
 - **MAME (PC-98)** — build MAME from source with `adapters/mame-pc98/build.sh`
-  (slow, uses a lot of disk). → `adapters/mame-pc98/README.md`
+  (slow, uses a lot of disk). The pinned build provides keyboard input plus
+  relative pointer movement, frozen click, and drag operations without taking
+  persistent ownership from a visible native mouse. → `adapters/mame-pc98/README.md`
 - **MAME (Neo Geo MVS/AES/CD, experimental)** — build the dedicated pinned MAME subset with
   `adapters/mame-neogeo/build.sh`, then build `emucap-mame-neogeo-bridge`. Launch
   requires an explicit system ID. MVS uses a user-supplied `neogeo.zip` plus a matching

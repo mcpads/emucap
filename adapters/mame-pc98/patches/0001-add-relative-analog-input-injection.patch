@@ -1,0 +1,138 @@
+diff --git a/src/emu/ioport.h b/src/emu/ioport.h
+--- a/src/emu/ioport.h
++++ b/src/emu/ioport.h
+@@ -580,5 +580,6 @@ public:
+ 	bool digital_value() const { return m_digital_value; }
+ 	void set_value(ioport_value value);
++	void add_relative_value(s32 delta);
+ 	void clear_value();
+ 
+ 	bool cocktail() const { return ((m_flags & FIELD_FLAG_COCKTAIL) != 0); }
+@@ -823,6 +824,7 @@ public:
+ 
+ 	// programmatic override (for script bindings)
+ 	void set_value(s32 value);
++	void add_relative_value(s32 delta);
+ 	void clear_value();
+ 
+ private:
+@@ -871,6 +873,7 @@ private:
+ 	s64                 m_positionalscale;      // scale factor to divide a joystick into positions
+ 
+ 	// misc flags
+ 	bool                m_absolute;             // is this an absolute or relative input?
++	s32                 m_pending_relative;     // programmatic relative motion for the next input sample
+ 	bool                m_wraps;                // does the control wrap around?
+ 	bool                m_autocenter;           // autocenter this input?
+diff --git a/src/emu/ioport.cpp b/src/emu/ioport.cpp
+--- a/src/emu/ioport.cpp
++++ b/src/emu/ioport.cpp
+@@ -26,5 +26,6 @@
+ #include <cctype>
+ #include <ctime>
++#include <limits>
+ #include <sstream>
+ #include <type_traits>
+ 
+@@ -792,6 +793,18 @@ void ioport_field::set_value(ioport_value value)
+ }
+ 
+ 
++//-------------------------------------------------
++//  add_relative_value - add programmatic motion
++//  to the accumulated analog input
++//-------------------------------------------------
++
++void ioport_field::add_relative_value(s32 delta)
++{
++	if (is_analog())
++		live().analog->add_relative_value(delta);
++}
++
++
+ //-------------------------------------------------
+ //  clear_value - clear programmatic override
+ //-------------------------------------------------
+@@ -3589,6 +3602,7 @@ analog_field::analog_field(ioport_field &field)
+ 	m_keyscaleneg(0),
+ 	m_positionalscale(0),
+ 	m_absolute(false),
++	m_pending_relative(0),
+ 	m_wraps(false),
+ 	m_autocenter(false),
+ 	m_single_scale(false),
+@@ -3837,6 +3851,22 @@ void analog_field::set_value(s32 value)
+ }
+ 
+ 
++//-------------------------------------------------
++//  add_relative_value - queue programmatic motion
++//  for the next relative input sample
++//-------------------------------------------------
++
++void analog_field::add_relative_value(s32 delta)
++{
++	// Relative OSD inputs use RELATIVE_PER_PIXEL raw units.  Queue the converted delta rather
++	// than changing m_accum immediately: PORT_RESET axes clear m_accum at the next frame before
++	// they apply device motion.  The pending value is consumed beside that native frame delta.
++	s64 const raw_delta = (s64(delta) * osd::input_device::RELATIVE_PER_PIXEL * 100) / m_sensitivity;
++	s64 const pending = std::clamp<s64>(s64(m_pending_relative) + raw_delta, std::numeric_limits<s32>::min(), std::numeric_limits<s32>::max());
++	m_pending_relative = s32(pending);
++}
++
++
+ //-------------------------------------------------
+ //  clear_value - clear programmatic override
+ //-------------------------------------------------
+@@ -3982,6 +4012,9 @@ void analog_field::frame_update(running_machine &machine)
+ 	if (m_field.analog_reset())
+ 		m_accum = 0;
+ 
++	delta = s32(std::clamp<s64>(s64(delta) + m_pending_relative, std::numeric_limits<s32>::min(), std::numeric_limits<s32>::max()));
++	m_pending_relative = 0;
++
+ 	// apply the delta to the accumulated value
+ 	m_accum += delta;
+ 
+diff --git a/src/frontend/mame/luaengine_input.cpp b/src/frontend/mame/luaengine_input.cpp
+--- a/src/frontend/mame/luaengine_input.cpp
++++ b/src/frontend/mame/luaengine_input.cpp
+@@ -270,5 +270,23 @@ void lua_engine::initialize_input(sol::table &emu)
+ 	auto ioport_field_type = sol().registry().new_usertype<ioport_field>("ioport_field", sol::no_constructor);
+ 	ioport_field_type.set_function("set_value", &ioport_field::set_value);
++	ioport_field_type.set_function(
++			"add_relative_value",
++			[] (sol::this_state s, ioport_field &f, s32 delta)
++			{
++				switch (f.type())
++				{
++				case IPT_DIAL:
++				case IPT_DIAL_V:
++				case IPT_TRACKBALL_X:
++				case IPT_TRACKBALL_Y:
++				case IPT_MOUSE_X:
++				case IPT_MOUSE_Y:
++					break;
++				default:
++					luaL_error(s, "add_relative_value is only applicable to relative analog fields");
++				}
++				f.add_relative_value(delta);
++			});
+ 	ioport_field_type.set_function("clear_value", &ioport_field::clear_value);
+ 	ioport_field_type.set_function(
+ 			"set_sensitivity",
+diff --git a/docs/source/luascript/ref-input.rst b/docs/source/luascript/ref-input.rst
+--- a/docs/source/luascript/ref-input.rst
++++ b/docs/source/luascript/ref-input.rst
+@@ -266,6 +266,11 @@ field:set_value(value)
+     Set the value of the I/O port field.  For digital fields, the value is
+     compared to zero to determine whether the field should be active; for
+     analog fields, the value must be right-aligned and in the correct range.
++field:add_relative_value(delta)
++    Queue a signed relative delta for the next analog input sample.  The delta
++    uses the field's adjusted units and is combined with native input for that
++    sample rather than creating a persistent override.  Raises an error
++    for fields that do not represent relative analog controls.
+ field:clear_value()
+     Clear programmatically overridden value and restore the field’s regular
+     behaviour.

@@ -248,7 +248,9 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   Wii IR·motion·extension은 지원 범위가 아니다.
   → `adapters/dolphin/README.md`
 - **MAME PC-98** — `adapters/mame-pc98/build.sh`로 MAME을 소스에서 빌드한다(시간이 오래
-  걸리고 디스크를 많이 쓴다). → `adapters/mame-pc98/README.md`
+  걸리고 디스크를 많이 쓴다). 고정된 빌드는 키보드 입력과 상대 포인터 이동, frozen 클릭·드래그를
+  제공하며 창에 연결된 네이티브 마우스 입력권을 지속적으로 차지하지 않는다.
+  → `adapters/mame-pc98/README.md`
 - **MAME Neo Geo MVS/AES/CD (실험적)** — `adapters/mame-neogeo/build.sh`로 전용 고정 MAME subset을
   빌드하고 `emucap-mame-neogeo-bridge`를 빌드한다. MVS는 사용자가 준비한 `neogeo.zip` BIOS와
   해당 MAME 버전에 맞는 게임 ROM set을 사용한다. AES는 `aes.zip`과 ZIP stem이 고정된 MAME

@@ -22,7 +22,7 @@ if [ ! -x "$RAW" ]; then
 fi
 
 if [ "${MAME_ALLOW_VISIBLE:-0}" = "1" ]; then
-  exec "$RAW" "$@"
+  exec "$RAW" "$@" -mouse
 fi
 
 export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-dummy}"
@@ -34,6 +34,7 @@ exec "$RAW" "$@" \
   -window \
   -nomaximize \
   -sound none \
+  -mouse \
   -keyboardprovider none \
   -mouseprovider none \
   -output none

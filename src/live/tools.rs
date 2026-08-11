@@ -9,6 +9,9 @@ use sha2::{Digest, Sha256};
 use super::link::{EmulatorLink, LinkError};
 use super::temporal::finish_with_cleanup;
 
+mod pointer;
+pub use pointer::{click_pointer, drag_pointer, move_pointer};
+
 #[derive(Debug, PartialEq)]
 pub enum ToolOutput {
     Json(Value),
@@ -248,6 +251,13 @@ fn validate_sync_advance(label: &str, count: u64) -> Result<(), LinkError> {
     Ok(())
 }
 
+fn validate_positive_sync_advance(label: &str, count: u64) -> Result<(), LinkError> {
+    if count == 0 {
+        return Err(bad_params(format!("{label} count must be at least 1")));
+    }
+    validate_sync_advance(label, count)
+}
+
 pub fn set_input(
     link: &mut dyn EmulatorLink,
     port: u64,
@@ -307,19 +317,23 @@ fn one_tap(
     buttons: &[String],
     press_frames: u64,
     expected_launch_id: Option<&str>,
-) -> Result<(), LinkError> {
+) -> Result<Option<(Value, &'static str)>, LinkError> {
     if let Err(primary) = link.call("set_input", json!({ "port": port, "buttons": buttons })) {
         // A lost set_input response is ambiguous: the adapter may already own the override. Always
         // issue an explicit release before returning the original error.
         return finish_transient_input(link, port, expected_launch_id, Err(primary));
     }
-    let outcome = link
-        .call("step", json!({ "frames": press_frames.max(1) }))
-        .map(|_| ());
-    finish_transient_input(link, port, expected_launch_id, outcome)?;
-    let release_edge = link.call("step", json!({ "frames": 1 })).map(|_| ());
-    finish_frozen(link, expected_launch_id, release_edge)?;
-    Ok(())
+    let outcome = link.call("step", json!({ "frames": press_frames.max(1) }));
+    let press = finish_transient_input(link, port, expected_launch_id, outcome)?;
+    if press.get("status").and_then(Value::as_str) == Some("interrupted") {
+        return Ok(Some((press, "press")));
+    }
+    let release_edge = link.call("step", json!({ "frames": 1 }));
+    let release_edge = finish_frozen(link, expected_launch_id, release_edge)?;
+    if release_edge.get("status").and_then(Value::as_str) == Some("interrupted") {
+        return Ok(Some((release_edge, "release_edge")));
+    }
+    Ok(None)
 }
 
 fn combine_temporal_cleanup_error(primary: Option<LinkError>, cleanup: LinkError) -> LinkError {
@@ -472,12 +486,30 @@ pub fn tap(
     validate_sync_advance("tap trailing frame", after_frames)?;
     link.call("pause", json!({}))?; // 멱등
     let launch_id = link.capabilities().identity.launch_id.clone();
-    one_tap(link, port, buttons, press_frames, launch_id.as_deref())?;
+    if let Some((mut interrupted, phase)) =
+        one_tap(link, port, buttons, press_frames, launch_id.as_deref())?
+    {
+        if let Some(object) = interrupted.as_object_mut() {
+            object.insert("operation".into(), json!("tap"));
+            object.insert("phase".into(), json!(phase));
+            object.insert("tapped".into(), json!(buttons));
+            object.insert("state".into(), json!("frozen"));
+        }
+        return Ok(ToolOutput::Json(interrupted));
+    }
     if after_frames > 0 {
-        let outcome = link
-            .call("step", json!({ "frames": after_frames }))
-            .map(|_| ());
-        finish_frozen(link, launch_id.as_deref(), outcome)?;
+        let outcome = link.call("step", json!({ "frames": after_frames }));
+        let trailing = finish_frozen(link, launch_id.as_deref(), outcome)?;
+        if trailing.get("status").and_then(Value::as_str) == Some("interrupted") {
+            let mut interrupted = trailing;
+            if let Some(object) = interrupted.as_object_mut() {
+                object.insert("operation".into(), json!("tap"));
+                object.insert("phase".into(), json!("after_release"));
+                object.insert("tapped".into(), json!(buttons));
+                object.insert("state".into(), json!("frozen"));
+            }
+            return Ok(ToolOutput::Json(interrupted));
+        }
     }
     Ok(ToolOutput::Json(json!({
         "tapped": buttons, "press_frames": press_frames, "after_frames": after_frames, "state": "frozen"

@@ -78,13 +78,20 @@ fn accept_within(listener: &TcpListener, timeout: Duration) -> TcpStream {
     }
 }
 
-fn complete_initial_gdb_query(mut gdb: TcpStream) -> TcpStream {
+fn complete_initial_gdb_freeze(mut gdb: TcpStream) -> TcpStream {
     gdb.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     let mut query = [0u8; 5];
     gdb.read_exact(&mut query).unwrap();
     assert_eq!(&query, b"$?#3f");
     gdb.write_all(b"+$S05#b8").unwrap();
     let mut ack = [0u8; 1];
+    gdb.read_exact(&mut ack).unwrap();
+    assert_eq!(ack[0], b'+');
+
+    let mut interrupt = [0u8; 1];
+    gdb.read_exact(&mut interrupt).unwrap();
+    assert_eq!(interrupt[0], 0x03);
+    gdb.write_all(b"$S05#b8").unwrap();
     gdb.read_exact(&mut ack).unwrap();
     assert_eq!(ack[0], b'+');
     gdb
@@ -99,7 +106,7 @@ fn connected_bridge() -> (ChildGuard, ChildGuard, TcpStream, TcpStream) {
         gdb_listener.local_addr().unwrap().port(),
         emulator.0.id(),
     );
-    let gdb = complete_initial_gdb_query(accept_within(&gdb_listener, Duration::from_secs(3)));
+    let gdb = complete_initial_gdb_freeze(accept_within(&gdb_listener, Duration::from_secs(3)));
     let front = accept_within(&front_listener, Duration::from_secs(3));
     assert!(!emulator.wait_for_exit(Duration::from_millis(1)));
     (emulator, bridge, gdb, front)

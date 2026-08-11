@@ -497,6 +497,44 @@ impl Emucap {
         }
     }
 
+    async fn move_pointer(&self, Parameters(a): Parameters<MovePointerArgs>) -> CallToolResult {
+        let mut link = self.link();
+        match tools::move_pointer(&mut *link, a.port, a.dx, a.dy, a.frames) {
+            Ok(output) => tool_output_result(output),
+            Err(error) => link_error_result(error),
+        }
+    }
+
+    async fn click_pointer(&self, Parameters(a): Parameters<ClickPointerArgs>) -> CallToolResult {
+        let mut link = self.link();
+        match tools::click_pointer(
+            &mut *link,
+            a.port,
+            &a.button,
+            a.press_frames,
+            a.after_frames,
+        ) {
+            Ok(output) => tool_output_result(output),
+            Err(error) => link_error_result(error),
+        }
+    }
+
+    async fn drag_pointer(&self, Parameters(a): Parameters<DragPointerArgs>) -> CallToolResult {
+        let mut link = self.link();
+        match tools::drag_pointer(
+            &mut *link,
+            a.port,
+            &a.button,
+            a.dx,
+            a.dy,
+            a.move_frames,
+            a.after_frames,
+        ) {
+            Ok(output) => tool_output_result(output),
+            Err(error) => link_error_result(error),
+        }
+    }
+
     #[tool(
         description = "Open persistent, running-time, or device-specific input controls. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
     )]

@@ -239,6 +239,7 @@ This is the adapter wire surface. The Control MCP publishes both stepping paths 
 - `probe`
 - `set_input`
 - `press_buttons`
+- `move_pointer` (only when the pinned relative-input patch is present)
 - `get_state`
 - `pause`
 - `resume`
@@ -338,15 +339,38 @@ identity concerns: MCP replays frozen keyboard input with `set_input` plus frame
 `step`, clears transient breakpoints, and reads the predicate target.
 
 `set_input` and `press_buttons` use MAME I/O port field overrides for the
-PC-98 keyboard.  Canonical key names include `enter`, `esc`, `space`, directions,
+PC-98 keyboard and mouse buttons.  Canonical key names include `enter`, `esc`, `space`, directions,
 `backspace`, `tab`, `del`, `ins`, `home`, `help`, `stop`, `copy`, `shift`,
 `ctrl`, `f1`..`f10`, `vf1`..`vf5`, letters `a`..`z`, and digits `0`..`9`.
 Aliases include `start`/`return` -> `enter`, `escape` -> `esc`, and `select` ->
-`space`.  `press_buttons(["enter"], frames=8)` was verified to advance the
+`space`. Mouse buttons are `mouse_left`, `mouse_right`, and `mouse_middle`.
+`press_buttons(["enter"], frames=8)` was verified to advance the
 N88-BASIC boot prompt, and `press_buttons(["l"], frames=6)` typed `l` at the
 prompt.  `tap(["enter"], press_frames=2, after_frames=10)` was verified to
 advance from the boot prompt while returning to frozen state, and
 four sequential `tap` calls for `l`, `i`, `s`, and `t` typed `list`.
+
+The pinned MAME patch adds relative analog deltas to MAME's existing mouse
+accumulator. It does not use a persistent analog override, so a completed MCP
+move does not lock out a visible launch's native mouse. The adapter advertises
+`move_pointer` only when that host API and both PC-98 mouse axes are present;
+the system-MAME smoke fallback therefore fails closed instead of claiming the
+operation. Managed launch also enables MAME's mouse device explicitly. Headless
+launch keeps the host provider disabled while accepting injected deltas; visible
+launch keeps native mouse input available. PC-98 motion is signed and relative,
+with each `dx` and `dy` limited
+to -127..127 and a maximum 120-frame movement window. Split larger travel into
+acknowledged moves. Absolute coordinates and wheel input are not advertised
+because the PC-98 mouse port does not provide those controls.
+
+At the Control MCP surface, call `input_control(operation="describe")` and use
+the returned capability revision. A capable session exposes `move_pointer`,
+`click_pointer`, and `drag_pointer`: a movement delta enters MAME's device state
+before an exact frame advance, while the visible cursor follows the guest's own
+mouse poll. Increase movement frames when a later screenshot or click must see
+that update. Clicks use left/right/middle buttons, and drags hold the selected
+button only during movement. All three return frozen; click and drag also
+guarantee an explicit button release or report cleanup failure.
 
 `status`, `step(frames=N)`, and `run_frames(N)` include the MAME screen frame
 counter as `frame` when a screen is available.  `step(frames=N)` is a

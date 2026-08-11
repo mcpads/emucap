@@ -87,6 +87,40 @@ fn touch_modes_are_named_by_ownership_and_terminal_execution_state() {
 }
 
 #[test]
+fn pointer_composites_require_live_pointer_buttons_and_relative_motion() {
+    let value = enriched_from(
+        serde_json::json!({
+            "connected": true,
+            "input_buttons": {
+                "buttons": ["enter", "mouse_left", "mouse_right", "mouse_middle"],
+                "available": ["enter", "mouse_left", "mouse_right", "mouse_middle"]
+            }
+        }),
+        &["set_input", "step", "pause", "move_pointer"],
+    );
+    for method in ["move_pointer", "click_pointer", "drag_pointer"] {
+        assert!(has_method(&value, method), "missing {method}");
+    }
+
+    let no_motion = enriched_from(
+        serde_json::json!({
+            "connected": true,
+            "input_buttons": {"available": ["mouse_left"]}
+        }),
+        &["set_input", "step", "pause"],
+    );
+    assert!(has_method(&no_motion, "click_pointer"));
+    assert!(!has_method(&no_motion, "drag_pointer"));
+
+    let no_button = enriched_from(
+        serde_json::json!({"connected": true, "input_buttons": {"available": ["enter"]}}),
+        &["set_input", "step", "pause", "move_pointer"],
+    );
+    assert!(!has_method(&no_button, "click_pointer"));
+    assert!(!has_method(&no_button, "drag_pointer"));
+}
+
+#[test]
 fn write_memory_exposes_host_input_bounds() {
     let value = enriched(&["write_memory"]);
     assert_eq!(

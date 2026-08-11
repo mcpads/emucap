@@ -458,6 +458,31 @@
       ]
     },
     {
+      "id": "pc98.pointer-relative.constraints",
+      "feature": "input.pointer-move",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.UNIT.1", "CORE.BOUND.1", "INPUT.POINTER.MOVE.1"],
+      "scope": {"adapter": "mame-pc98-rust-gdb", "systems": ["pc98"]},
+      "activation": {"port": "not_zero", "delta": "outside_signed_8_bit", "frames": "above_120"},
+      "constraints": {
+        "input.pointer.ports.allowed": [0],
+        "input.pointer.coordinate_mode": "relative",
+        "input.pointer.delta.min": -127,
+        "input.pointer.delta.max": 127,
+        "input.pointer.zero_delta_allowed": false,
+        "input.pointer.move.max_frames": 120,
+        "input.pointer.absolute_supported": false,
+        "input.pointer.wheel_supported": false
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:pc98-pointer-port-rejected",
+        "contract-test:pc98-pointer-delta-bounds",
+        "contract-test:pc98-pointer-frame-cap",
+        "runtime-test:pc98-relative-pointer-move-frozen-native-handoff"
+      ]
+    },
+    {
       "id": "pc98-legacy.call-stack.best-effort",
       "feature": "debug.call-stack",
       "kind": "variation_binding",

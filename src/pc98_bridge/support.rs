@@ -66,6 +66,18 @@ pub(super) fn optional_num(params: &Value, key: &str) -> BridgeResult<Option<u64
     }
 }
 
+pub(super) fn required_signed_num(params: &Value, key: &str) -> BridgeResult<i64> {
+    let value = params
+        .get(key)
+        .ok_or_else(|| BridgeError::BadParams(format!("missing required param: {key}")))?;
+    match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(raw) => raw.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+    .ok_or_else(|| BridgeError::BadParams(format!("invalid signed numeric param: {key}")))
+}
+
 pub(super) fn require_input_port_zero(params: &Value) -> BridgeResult<()> {
     if optional_num(params, "port")?.unwrap_or(0) != 0 {
         return Err(BridgeError::BadParams(
@@ -122,8 +134,11 @@ pub(super) fn input_buttons_json() -> Value {
             "insert": "ins",
             "bksp": "backspace",
             "bs": "backspace",
+            "left_click": "mouse_left",
+            "right_click": "mouse_right",
+            "middle_click": "mouse_middle",
         },
-        "notes": "PC-98 uses keyboard inputs. Prefer enter/esc/space/up/down/left/right plus letter, digit, f1-f10, and vf1-vf5 keys.",
+        "notes": "PC-98 accepts keyboard inputs and mouse_left/mouse_right/mouse_middle. Pointer position is relative hardware state; use move_pointer instead of absolute coordinates.",
     })
 }
 
@@ -161,6 +176,9 @@ pub(super) fn input_alias(key: &str) -> Option<&'static str> {
         "delete" => Some("del"),
         "insert" => Some("ins"),
         "bksp" | "bs" => Some("backspace"),
+        "left_click" => Some("mouse_left"),
+        "right_click" => Some("mouse_right"),
+        "middle_click" => Some("mouse_middle"),
         _ => None,
     }
 }
@@ -182,6 +200,7 @@ pub(super) fn command_expects_stop(payload: &str) -> bool {
         || payload.starts_with("qEmucap,framestep")
         || payload.starts_with("qEmucap,runframes")
         || payload.starts_with("qEmucap,press")
+        || payload.starts_with("qEmucap,pointermove")
 }
 
 pub(super) fn parse_breakpoint_reply(resp: &str) -> BridgeResult<(String, u64)> {
