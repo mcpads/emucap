@@ -67,6 +67,11 @@ local input_aliases = {
   bksp = "backspace",
   bs = "backspace"
 }
+local pc98_pointer_buttons = {
+  ["mouse left button"] = "mouse_left",
+  ["mouse right button"] = "mouse_right",
+  ["mouse middle button"] = "mouse_middle",
+}
 
 local function chksum(str)
   local sum = 0
@@ -217,6 +222,8 @@ function emucap_gdbstub.startplugin()
   local hold_requested = false
   local rxbuf = ""
   local input_fields = {}
+  local pointer_fields = {}
+  local pointer_relative_available = false
   local active_input_fields = {}
   local release_input_frame
   local frame_wait_target
@@ -371,6 +378,8 @@ function emucap_gdbstub.startplugin()
       clear_inputs()
     end
     input_fields = {}
+    pointer_fields = {}
+    pointer_relative_available = false
     active_input_fields = {}
     release_input_frame = nil
     if break_on_reset_enabled and socket and debugger and cpu then
@@ -381,29 +390,46 @@ function emucap_gdbstub.startplugin()
         pending_reset = makele(cpu.state[map.pcreg].value, map.addrsize) .. "|" .. regs_payload(map)
       end
     end
-    for _, port in pairs(manager.machine.ioport.ports) do
+    for tag, port in pairs(manager.machine.ioport.ports) do
       for _, field in pairs(port.fields) do
         if is_neogeo_profile then
           local key = neogeo_input_name(field)
           if key and not input_fields[key] then
             input_fields[key] = field
           end
-        elseif field.type_class == "keyboard" then
-          local names = { field.name, field.default_name }
-          for _, name in ipairs(names) do
-            local n = norm_key(name)
-            if n ~= "" and not input_fields[n] then
-              input_fields[n] = field
-            end
-            for part in tostring(name):gmatch("([^/]+)") do
-              local p = norm_key(part)
-              if p ~= "" and not input_fields[p] then
-                input_fields[p] = field
+        else
+          local pointer_button = pc98_pointer_buttons[trim(field.name):lower()]
+          if pointer_button then
+            input_fields[pointer_button] = field
+          end
+          local normalized_tag = tostring(tag or ""):gsub("^:", "")
+          if normalized_tag == "MOUSE_X" then
+            pointer_fields.x = field
+          elseif normalized_tag == "MOUSE_Y" then
+            pointer_fields.y = field
+          end
+          if field.type_class == "keyboard" then
+            local names = { field.name, field.default_name }
+            for _, name in ipairs(names) do
+              local n = norm_key(name)
+              if n ~= "" and not input_fields[n] then
+                input_fields[n] = field
+              end
+              for part in tostring(name):gmatch("([^/]+)") do
+                local p = norm_key(part)
+                if p ~= "" and not input_fields[p] then
+                  input_fields[p] = field
+                end
               end
             end
           end
         end
       end
+    end
+    if pointer_fields.x and pointer_fields.y then
+      local x_ok, x_method = pcall(function() return pointer_fields.x.add_relative_value end)
+      local y_ok, y_method = pcall(function() return pointer_fields.y.add_relative_value end)
+      pointer_relative_available = x_ok and y_ok and x_method ~= nil and y_method ~= nil
     end
     -- A synchronous reset completes at this notifier, not when soft_reset merely
     -- accepts the request.
@@ -1530,6 +1556,39 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E08:" .. tostring(unresolved or ""))
       end
       return true
+    elseif name == "pointerstatus" then
+      ack_packet(socket, pointer_relative_available and "RELATIVE" or "NONE")
+      return true
+    elseif name == "pointermove" then
+      local spec = hex_to_string(rest or "")
+      if not spec or not pointer_relative_available then
+        ack_packet(socket, "E18")
+        return true
+      end
+      local frames, dx, dy = spec:match("^(%d+):([+-]?%d+):([+-]?%d+)$")
+      frames, dx, dy = tonumber(frames or ""), tonumber(dx or ""), tonumber(dy or "")
+      if not frames or frames < 1 or not dx or not dy or (dx == 0 and dy == 0)
+          or dx < -127 or dx > 127 or dy < -127 or dy > 127 then
+        ack_packet(socket, "E00")
+        return true
+      end
+      if frame_wait_target then
+        ack_packet(socket, "E09")
+        return true
+      end
+      local moved, move_error = pcall(function()
+        if dx ~= 0 then pointer_fields.x:add_relative_value(dx) end
+        if dy ~= 0 then pointer_fields.y:add_relative_value(dy) end
+      end)
+      if not moved then
+        print("emucap_gdbstub: pointer move failed " .. tostring(move_error))
+        ack_packet(socket, "E18")
+      elseif start_frame_wait(frames, true) then
+        -- Reply is deferred until the exact movement window ends frozen.
+      else
+        ack_packet(socket, "E09")
+      end
+      return true
     elseif name == "framestep" or name == "runframes" then
       local frames = tonumber(hex_to_string(rest or "") or "")
       if not frames or frames < 1 then
@@ -1705,7 +1764,7 @@ function emucap_gdbstub.startplugin()
       end
       return true
     elseif name == "inputfields" then
-      -- 이 머신이 런타임에 실제 등록한 키보드 ioport 필드 이름을 정렬해 돌려준다. 브리지는
+      -- 이 머신이 런타임에 실제 등록한 디지털 입력 필드 이름을 정렬해 돌려준다. 브리지는
       -- 이를 status.input_buttons.available로 노출하고 미가용 버튼 에러에 가용 목록을 붙인다.
       local keys = {}
       for k, _ in pairs(input_fields) do

@@ -95,6 +95,14 @@ impl GdbTransport for FakeGdb {
     }
 }
 
+#[test]
+fn bridge_startup_confirms_a_live_stop_before_advertising_frozen() {
+    let bridge = Bridge::new(FakeGdb::with(&[("?", "S05")]), GdbBridgeEnv::default());
+
+    assert!(bridge.frozen);
+    assert_eq!(bridge.gdb.interrupts, 1);
+}
+
 fn i386_regs_hex(values: &[(&str, u32)]) -> String {
     let mut out = Vec::new();
     for name in I386_REGS {
@@ -308,6 +316,7 @@ fn hello_advertises_only_implemented_rust_methods() {
                 "qEmucap,mediastatus".into(),
                 media_status("flop1", Some("/tmp/disk1.hdm")),
             ),
+            ("qEmucap,pointerstatus".into(), "NONE".into()),
         ]),
         env,
     );
@@ -1005,12 +1014,104 @@ fn input_rejects_nonzero_port_and_oversized_pulse_before_mutation() {
 }
 
 #[test]
+fn relative_pointer_move_advances_exact_window_and_returns_frozen() {
+    let fake = FakeGdb::with(&[
+        ("?", "S05"),
+        ("qEmucap,pointerstatus", "RELATIVE"),
+        ("qEmucap,pointermove,333a2d353a37", "OK"),
+        ("qEmucap,frame", "42"),
+    ]);
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+    let response = bridge.handle_request(Request::new(
+        20,
+        "move_pointer",
+        json!({"dx": -5, "dy": 7, "frames": 3}),
+    ));
+    assert!(response.ok, "{:?}", response.error);
+    assert_eq!(
+        response.result.unwrap(),
+        json!({
+            "status": "completed",
+            "dx": -5,
+            "dy": 7,
+            "frames": 3,
+            "frame": 42,
+            "state": "frozen",
+        })
+    );
+    assert!(bridge.frozen);
+}
+
+#[test]
+fn relative_pointer_move_is_not_advertised_without_patched_mame_api() {
+    let fake = FakeGdb::with(&[
+        ("?", "S05"),
+        ("qEmucap,mediastatus", "MEDIA:"),
+        ("qEmucap,pointerstatus", "NONE"),
+    ]);
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+    let response = bridge.handle_request(Request::new(20, "hello", json!({})));
+    let methods = response.result.unwrap()["methods"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(!methods.iter().any(|method| method == "move_pointer"));
+}
+
+#[test]
+fn relative_pointer_move_advertises_patched_capability_and_constraints() {
+    let fake = FakeGdb::with(&[
+        ("?", "S05"),
+        ("qEmucap,mediastatus", "MEDIA:"),
+        ("qEmucap,pointerstatus", "RELATIVE"),
+    ]);
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+    let response = bridge.handle_request(Request::new(20, "hello", json!({})));
+    let result = response.result.unwrap();
+    assert!(result["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|method| method == "move_pointer"));
+    assert_eq!(result["capability_notes"]["relative_pointer"], true);
+    assert!(result["contracts"]["active_exceptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|id| id == "pc98.pointer-relative.constraints"));
+}
+
+#[test]
+fn relative_pointer_move_rejects_port_delta_and_frame_bounds_before_motion() {
+    for params in [
+        json!({"port": 1, "dx": 1, "dy": 1, "frames": 1}),
+        json!({"dx": MAX_POINTER_DELTA + 1, "dy": 0, "frames": 1}),
+        json!({"dx": 0, "dy": -MAX_POINTER_DELTA - 1, "frames": 1}),
+        json!({"dx": 0, "dy": 0, "frames": 1}),
+        json!({"dx": 1, "dy": 0, "frames": 0}),
+        json!({"dx": 1, "dy": 0, "frames": MAX_SYNC_TIMED_INPUT_FRAMES + 1}),
+    ] {
+        let fake = FakeGdb::with(&[("?", "S05"), ("qEmucap,pointerstatus", "RELATIVE")]);
+        let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+        let response = bridge.handle_request(Request::new(20, "move_pointer", params));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert!(!bridge
+            .gdb
+            .calls
+            .iter()
+            .any(|call| call.starts_with("qEmucap,pointermove")));
+    }
+}
+
+#[test]
 fn status_reports_plugin_input_ownership() {
     let fake = FakeGdb::with(&[
         ("?", "S05"),
         ("qEmucap,mediastatus", "MEDIA:"),
         ("qEmucap,inputfields", "enter"),
         ("qEmucap,inputstatus", "-1"),
+        ("qEmucap,pointerstatus", "NONE"),
         ("qEmucap,frame", "42"),
     ]);
     let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
@@ -1268,6 +1369,7 @@ fn status_drains_nonblocking_stop_when_running() {
         ("qEmucap,mediastatus", "MEDIA:"),
         ("qEmucap,inputfields", "enter,esc,space,a,b"),
         ("qEmucap,inputstatus", "0"),
+        ("qEmucap,pointerstatus", "NONE"),
         ("qEmucap,frame", "12"),
     ])
     .with_nonblocking(&["S05"]);

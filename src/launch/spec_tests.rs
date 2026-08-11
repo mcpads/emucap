@@ -321,6 +321,7 @@ fn mame_spec_isolates_dirs_and_loads_floppy() {
         .windows(2)
         .any(|w| w == ["-cfg_directory".to_string(), "/iso/mame/cfg".to_string()]));
     assert!(spec.args.contains(&"emucap_gdbstub".to_string()));
+    assert!(spec.args.contains(&"-mouse".to_string()));
     // .hdm is a floppy.
     assert!(spec
         .args
@@ -382,4 +383,5 @@ fn mame_spec_visible_mode_authorizes_wrapper_without_headless_options() {
     }
     assert!(spec.args.iter().any(|arg| arg == "-window"));
     assert!(spec.args.iter().any(|arg| arg == "-nomaximize"));
+    assert!(spec.args.iter().any(|arg| arg == "-mouse"));
 }

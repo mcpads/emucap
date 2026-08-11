@@ -9,6 +9,7 @@ struct Rec {
     reads: Vec<String>, // read_memory가 차례로 돌려줄 hex(끝나면 마지막 값 반복)
     read_i: usize,
     fail_calls: Vec<usize>,
+    interrupt_calls: Vec<usize>,
     caps: Capabilities,
 }
 impl Rec {
@@ -19,6 +20,7 @@ impl Rec {
             reads: reads.iter().map(|s| s.to_string()).collect(),
             read_i: 0,
             fail_calls: vec![],
+            interrupt_calls: vec![],
             caps: Capabilities {
                 protocol_version: 1,
                 methods: vec![],
@@ -33,6 +35,10 @@ impl Rec {
     }
     fn with_fail_calls(mut self, calls: &[usize]) -> Self {
         self.fail_calls = calls.to_vec();
+        self
+    }
+    fn with_interrupt_calls(mut self, calls: &[usize]) -> Self {
+        self.interrupt_calls = calls.to_vec();
         self
     }
     fn with_methods(mut self, methods: &[&str]) -> Self {
@@ -51,6 +57,13 @@ impl EmulatorLink for Rec {
         self.calls.push((method.to_string(), params));
         if self.fail_calls.contains(&self.calls.len()) {
             return Err(LinkError::Timeout);
+        }
+        if self.interrupt_calls.contains(&self.calls.len()) {
+            return Ok(json!({
+                "status": "interrupted",
+                "reason": "breakpoint",
+                "state": "frozen"
+            }));
         }
         // Mesen처럼: resume은 frozen에서만 허용(running에서 부르면 not_paused 에러).
         if method == "resume" && self.state != "frozen" {
@@ -203,6 +216,122 @@ fn frozen_tap_projection_is_independent_of_host_delay() {
             vec!["a".to_string()],
             vec![]
         ]
+    );
+}
+
+#[test]
+fn pointer_operations_are_exact_compositions_with_frozen_terminal_state() {
+    let mut move_link = Rec::new("frozen", &[]).with_methods(&["pause", "move_pointer"]);
+    move_pointer(&mut move_link, 0, -4, 7, 3).unwrap();
+    assert_eq!(
+        move_link.calls,
+        vec![
+            ("pause".into(), json!({})),
+            (
+                "move_pointer".into(),
+                json!({"port": 0, "dx": -4, "dy": 7, "frames": 3})
+            ),
+        ]
+    );
+
+    let mut click_link = Rec::new("frozen", &[]).with_methods(&["pause", "set_input", "step"]);
+    click_pointer(&mut click_link, 0, "left", 2, 0).unwrap();
+    assert_eq!(
+        click_link.calls,
+        vec![
+            ("pause".into(), json!({})),
+            (
+                "set_input".into(),
+                json!({"port": 0, "buttons": ["mouse_left"]})
+            ),
+            ("step".into(), json!({"frames": 2})),
+            ("set_input".into(), json!({"port": 0, "buttons": []})),
+            ("step".into(), json!({"frames": 1})),
+        ]
+    );
+
+    let mut drag_link =
+        Rec::new("frozen", &[]).with_methods(&["pause", "set_input", "move_pointer", "step"]);
+    let output = drag_pointer(&mut drag_link, 0, "right", 9, -3, 2, 1).unwrap();
+    let ToolOutput::Json(output) = output else {
+        panic!("drag_pointer must return JSON")
+    };
+    assert_eq!(output["state"], "frozen");
+    assert_eq!(
+        drag_link.calls,
+        vec![
+            ("pause".into(), json!({})),
+            (
+                "set_input".into(),
+                json!({"port": 0, "buttons": ["mouse_right"]})
+            ),
+            (
+                "move_pointer".into(),
+                json!({"port": 0, "dx": 9, "dy": -3, "frames": 2})
+            ),
+            ("set_input".into(), json!({"port": 0, "buttons": []})),
+            ("step".into(), json!({"frames": 1})),
+            ("step".into(), json!({"frames": 1})),
+        ]
+    );
+}
+
+#[test]
+fn drag_pointer_failure_releases_button_and_refreezes() {
+    let mut link = Rec::new("frozen", &[])
+        .with_methods(&["pause", "set_input", "move_pointer", "step"])
+        .with_fail_calls(&[3]);
+    let error = drag_pointer(&mut link, 0, "left", 1, 1, 1, 0).unwrap_err();
+    assert!(matches!(error, LinkError::Timeout));
+    assert_eq!(
+        link.methods(),
+        vec!["pause", "set_input", "move_pointer", "set_input", "pause"]
+    );
+    assert_eq!(link.calls[3].1, json!({"port": 0, "buttons": []}));
+}
+
+#[test]
+fn pointer_composites_reject_noop_and_invalid_button_before_transport() {
+    let mut link =
+        Rec::new("frozen", &[]).with_methods(&["pause", "set_input", "move_pointer", "step"]);
+    assert!(move_pointer(&mut link, 0, 0, 0, 1).is_err());
+    assert!(move_pointer(&mut link, 0, 1, 0, 0).is_err());
+    assert!(click_pointer(&mut link, 0, "wheel", 2, 0).is_err());
+    assert!(click_pointer(&mut link, 0, "left", 0, 0).is_err());
+    assert!(drag_pointer(&mut link, 0, "left", 0, 0, 1, 0).is_err());
+    assert!(link.calls.is_empty());
+}
+
+#[test]
+fn pointer_composites_release_without_stepping_past_breakpoint_interruptions() {
+    let mut click_link = Rec::new("frozen", &[])
+        .with_methods(&["pause", "set_input", "step"])
+        .with_interrupt_calls(&[3]);
+    let click = click_pointer(&mut click_link, 0, "left", 2, 0).unwrap();
+    let ToolOutput::Json(click) = click else {
+        panic!("click result must be JSON")
+    };
+    assert_eq!(click["status"], "interrupted");
+    assert_eq!(click["phase"], "press");
+    assert_eq!(click["clicked"], false);
+    assert_eq!(
+        click_link.methods(),
+        vec!["pause", "set_input", "step", "set_input"]
+    );
+
+    let mut drag_link = Rec::new("frozen", &[])
+        .with_methods(&["pause", "set_input", "move_pointer", "step"])
+        .with_interrupt_calls(&[3]);
+    let drag = drag_pointer(&mut drag_link, 0, "left", 4, 2, 2, 0).unwrap();
+    let ToolOutput::Json(drag) = drag else {
+        panic!("drag result must be JSON")
+    };
+    assert_eq!(drag["status"], "interrupted");
+    assert_eq!(drag["phase"], "movement");
+    assert_eq!(drag["released"], true);
+    assert_eq!(
+        drag_link.methods(),
+        vec!["pause", "set_input", "move_pointer", "set_input"]
     );
 }
 

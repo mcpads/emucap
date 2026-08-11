@@ -288,6 +288,23 @@ pub(crate) fn enrich_contract_status(
 }
 
 fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contracts::ContractStatus) {
+    let pointer_button_available = v
+        .get("input_buttons")
+        .and_then(|buttons| {
+            buttons
+                .get("available")
+                .or_else(|| buttons.get("buttons"))
+                .or(Some(buttons))
+        })
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|buttons| {
+            buttons.iter().any(|button| {
+                matches!(
+                    button.as_str(),
+                    Some("mouse_left" | "mouse_right" | "mouse_middle")
+                )
+            })
+        });
     let Some(methods) = v
         .get_mut("methods")
         .and_then(serde_json::Value::as_array_mut)
@@ -308,12 +325,16 @@ fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contract
     let tap_ready =
         frame_step_available && raw_has("set_input") && raw_has("step") && raw_has("pause");
     let hold_until_ready = tap_ready && raw_has("read_memory");
+    let click_pointer_ready = tap_ready && pointer_button_available;
+    let drag_pointer_ready = click_pointer_ready && raw_has("move_pointer");
     let probe_ready = raw_has("probe");
     let replay_ready = probe_ready || raw_has("load_state");
 
     for (ready, method) in [
         (tap_ready, "tap"),
         (hold_until_ready, "hold_until"),
+        (click_pointer_ready, "click_pointer"),
+        (drag_pointer_ready, "drag_pointer"),
         (replay_ready, "regression_run"),
         (replay_ready, "verify_determinism"),
     ] {

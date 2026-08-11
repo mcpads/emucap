@@ -4,6 +4,18 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.2
+
+### Added
+- Added capability-scoped relative pointer movement, left/right/middle clicks, and drags for
+  PC-98. Each operation advances an explicit number of guest frames, releases transient buttons,
+  and returns frozen without replacing native input ownership after completion.
+
+### Fixed
+- PC-98 managed launch now enables the MAME mouse device and establishes a real GDB interrupt
+  before reporting its initial frozen state, instead of mistaking the initial stop reply for a
+  completed pause.
+
 ## 0.14.1
 
 ### Added

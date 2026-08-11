@@ -3,13 +3,22 @@ use super::*;
 impl<G: GdbTransport> Bridge<G> {
     pub(super) fn hello(&mut self) -> BridgeResult<Value> {
         let media = self.media_status()?;
+        let methods = self.advertised_methods();
+        let mut active_exceptions = vec![
+            "pc98.call-stack.best-effort",
+            "pc98.input-hold.port-zero-only",
+            "pc98.input-pulse.constraints",
+        ];
+        if methods.contains(&"move_pointer") {
+            active_exceptions.push("pc98.pointer-relative.constraints");
+        }
         let mut result = json!({
             "protocol_version": PROTOCOL_VERSION,
             "system": "pc98",
             "adapter": "mame-pc98-rust-gdb",
             "backend": "lua-gdbstub",
             "debugger": true,
-            "methods": METHODS,
+            "methods": methods,
             "memory_types": memory_type_names(),
             "media_devices": media.devices,
             "breakpoint_kinds": [
@@ -18,18 +27,15 @@ impl<G: GdbTransport> Bridge<G> {
                 {"kind":"write", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
                 {"kind":"access", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
             ],
-            "contracts": crate::contracts::advertisement_value(&[
-                "pc98.call-stack.best-effort",
-                "pc98.input-hold.port-zero-only",
-                "pc98.input-pulse.constraints",
-            ]),
+            "contracts": crate::contracts::advertisement_value(&active_exceptions),
             "region_sizes": region_sizes_json(),
             "capability_notes": {
                 "backend": "lua-gdbstub",
                 "rust_bridge": true,
-                "implemented_methods": METHODS,
+                "implemented_methods": methods,
                 "screenshot": true,
                 "input": true,
+                "relative_pointer": methods.contains(&"move_pointer"),
                 "frame_step": true,
                 "step_units": ["frames", "instructions"],
                 "breakpoints": true,
@@ -72,6 +78,15 @@ impl<G: GdbTransport> Bridge<G> {
             obj.insert("available".into(), json!(available));
         }
         let input_override = self.input_override_info();
+        let methods = self.advertised_methods();
+        let mut active_exceptions = vec![
+            "pc98.call-stack.best-effort",
+            "pc98.input-hold.port-zero-only",
+            "pc98.input-pulse.constraints",
+        ];
+        if methods.contains(&"move_pointer") {
+            active_exceptions.push("pc98.pointer-relative.constraints");
+        }
         Ok(json!({
             "connected": true,
             "system": "pc98",
@@ -83,17 +98,15 @@ impl<G: GdbTransport> Bridge<G> {
             "memory_types": memory_type_names(),
             "media_devices": media.devices,
             "mounted_media": media.mounted,
-            "contracts": crate::contracts::advertisement_value(&[
-                "pc98.call-stack.best-effort",
-                "pc98.input-hold.port-zero-only",
-                "pc98.input-pulse.constraints",
-            ]),
+            "methods": methods,
+            "contracts": crate::contracts::advertisement_value(&active_exceptions),
             "capability_notes": {
                 "backend": "lua-gdbstub",
                 "rust_bridge": true,
-                "implemented_methods": METHODS,
+                "implemented_methods": methods,
                 "screenshot": true,
                 "input": true,
+                "relative_pointer": methods.contains(&"move_pointer"),
                 "frame_step": true,
                 "step_units": ["frames", "instructions"],
                 "breakpoints": true,

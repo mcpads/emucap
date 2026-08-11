@@ -321,6 +321,7 @@ ARGS+=(
 if [ "${MAME_READCONFIG:-0}" != "1" ]; then
   ARGS+=(-noreadconfig)
 fi
+ARGS+=(-mouse)
 if [ "$HEADLESS" = "1" ]; then
   export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-dummy}"
   ARGS+=(-video none -videodriver dummy -window -nomaximize -sound none -keyboardprovider none -mouseprovider none -output none)

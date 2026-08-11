@@ -386,6 +386,62 @@ pub(crate) struct PressArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct MovePointerArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+    /// Signed horizontal relative movement. Read backend bounds from status contracts.
+    pub(crate) dx: i64,
+    /// Signed vertical relative movement. Read backend bounds from status contracts.
+    pub(crate) dy: i64,
+    /// Exact guest frames to advance after queueing the relative delta. Increase this when guest
+    /// software polls its pointer less often. Default: 1.
+    #[serde(default = "one", deserialize_with = "deser_positive_input_frames")]
+    pub(crate) frames: u64,
+}
+
+fn left_pointer_button() -> String {
+    "left".into()
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClickPointerArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+    /// Pointer button: left, right, or middle. Default: left.
+    #[serde(default = "left_pointer_button")]
+    pub(crate) button: String,
+    /// Exact frames for which the button is held. Default: 2.
+    #[serde(default = "two", deserialize_with = "deser_positive_input_frames")]
+    pub(crate) press_frames: u64,
+    /// Additional frames to advance after release. Default: 0.
+    #[serde(default, deserialize_with = "deser_frame_count")]
+    pub(crate) after_frames: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DragPointerArgs {
+    #[serde(default)]
+    pub(crate) port: u64,
+    /// Pointer button: left, right, or middle. Default: left.
+    #[serde(default = "left_pointer_button")]
+    pub(crate) button: String,
+    /// Signed horizontal relative movement. Read backend bounds from status contracts.
+    pub(crate) dx: i64,
+    /// Signed vertical relative movement. Read backend bounds from status contracts.
+    pub(crate) dy: i64,
+    /// Exact frames to keep the button held after queueing movement. Increase this when guest
+    /// software polls its pointer less often. Default: 1.
+    #[serde(default = "one", deserialize_with = "deser_positive_input_frames")]
+    pub(crate) move_frames: u64,
+    /// Additional frames to advance after the release edge. Default: 0.
+    #[serde(default, deserialize_with = "deser_frame_count")]
+    pub(crate) after_frames: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TouchArgs {
     #[serde(default)]
     pub(crate) port: u64,
@@ -522,6 +578,21 @@ pub(crate) const MAX_INPUT_HOLD_FRAMES: u64 = MAX_SYNC_ADVANCE_COUNT;
 
 fn deser_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     let n = u64::deserialize(d)?;
+    if n > MAX_INPUT_HOLD_FRAMES {
+        return Err(serde::de::Error::custom(format!(
+            "input hold duration {n} exceeds the limit {MAX_INPUT_HOLD_FRAMES}; an oversized request could outlive the link deadline and leave input ownership active"
+        )));
+    }
+    Ok(n)
+}
+
+fn deser_positive_input_frames<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+    let n = u64::deserialize(d)?;
+    if n == 0 {
+        return Err(serde::de::Error::custom(
+            "pointer input frame duration must be at least 1",
+        ));
+    }
     if n > MAX_INPUT_HOLD_FRAMES {
         return Err(serde::de::Error::custom(format!(
             "input hold duration {n} exceeds the limit {MAX_INPUT_HOLD_FRAMES}; an oversized request could outlive the link deadline and leave input ownership active"

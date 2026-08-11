@@ -227,6 +227,7 @@ pub fn mame_spec(binary: &Path, log_path: &Path, o: &MameOpts) -> LaunchSpec {
         "-plugin".into(),
         "emucap_gdbstub".into(),
         "-noreadconfig".into(),
+        "-mouse".into(),
     ];
     if o.headless {
         args.extend(

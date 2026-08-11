@@ -199,6 +199,26 @@
       "expression": "effect_terminal(press) => transient_override_engaged(after) = false"
     },
     {
+      "id": "INPUT.POINTER.MOVE.1",
+      "category": "postcondition",
+      "expression": "move_pointer(dx,dy,n).completed => integrated_relative_delta(dx,dy) in the same n-frame window and frozen(after)"
+    },
+    {
+      "id": "INPUT.POINTER.HANDOFF.1",
+      "category": "invariant",
+      "expression": "effect_terminal(move_pointer) => pointer_override_engaged(after) = false"
+    },
+    {
+      "id": "INPUT.POINTER.CLICK.1",
+      "category": "postcondition",
+      "expression": "click_pointer(button,n).completed => button held for n frames and released(after) and frozen(after)"
+    },
+    {
+      "id": "INPUT.POINTER.DRAG.1",
+      "category": "postcondition",
+      "expression": "drag_pointer(button,dx,dy,n).completed => button held while relative delta is integrated and released(after) and frozen(after)"
+    },
+    {
       "id": "INPUT.TOUCH.HOLD.1",
       "category": "postcondition",
       "expression": "hold_touch(x,y).ok => touch_override_engaged(after) and touch_position(after) = (x,y)"
@@ -603,6 +623,33 @@
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "input.pointer-move",
+      "surface": "public",
+      "methods": ["move_pointer"],
+      "route": "input_control",
+      "temporal_classes": ["T1"],
+      "disposition": "retain",
+      "expectations": ["INPUT.POINTER.MOVE.1", "INPUT.POINTER.HANDOFF.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "input.pointer-click",
+      "surface": "public",
+      "methods": ["click_pointer"],
+      "route": "input_control",
+      "temporal_classes": ["T1"],
+      "disposition": "retain",
+      "expectations": ["INPUT.POINTER.CLICK.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1", "TIME.GAP.1"]
+    },
+    {
+      "id": "input.pointer-drag",
+      "surface": "public",
+      "methods": ["drag_pointer"],
+      "route": "input_control",
+      "temporal_classes": ["T1"],
+      "disposition": "retain",
+      "expectations": ["INPUT.POINTER.DRAG.1", "INPUT.POINTER.HANDOFF.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1", "TIME.GAP.1"]
     },
     {
       "id": "execution.pause",

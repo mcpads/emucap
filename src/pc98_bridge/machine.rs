@@ -124,6 +124,82 @@ impl<G: GdbTransport> Bridge<G> {
         }))
     }
 
+    pub(super) fn move_pointer(&mut self, params: &Value) -> BridgeResult<Value> {
+        require_input_port_zero(params)?;
+        if !self.pointer_relative_available() {
+            return Err(BridgeError::BadState(
+                "relative pointer movement is unavailable in this MAME build".into(),
+            ));
+        }
+        let dx = required_signed_num(params, "dx")?;
+        let dy = required_signed_num(params, "dy")?;
+        if dx == 0 && dy == 0 {
+            return Err(BridgeError::BadParams(
+                "move_pointer requires a non-zero relative delta".into(),
+            ));
+        }
+        if !(-MAX_POINTER_DELTA..=MAX_POINTER_DELTA).contains(&dx)
+            || !(-MAX_POINTER_DELTA..=MAX_POINTER_DELTA).contains(&dy)
+        {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 relative pointer deltas must be between -{MAX_POINTER_DELTA} and {MAX_POINTER_DELTA}; split larger movement"
+            )));
+        }
+        let frames = optional_num(params, "frames")?.unwrap_or(1);
+        if frames == 0 {
+            return Err(BridgeError::BadParams(
+                "move_pointer frames must be at least 1".into(),
+            ));
+        }
+        if frames > MAX_SYNC_TIMED_INPUT_FRAMES {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 synchronous move_pointer supports at most {MAX_SYNC_TIMED_INPUT_FRAMES} frames; split the movement"
+            )));
+        }
+        let arg = format!("{frames}:{dx}:{dy}");
+        let stop = self.deferred_lua_op("pointermove", &arg, frames)?;
+        self.frozen = true;
+        if let Some(raw) = stop {
+            return Ok(json!({
+                "status": "interrupted",
+                "reason": "breakpoint",
+                "raw": raw,
+                "dx": dx,
+                "dy": dy,
+                "frames": frames,
+                "frame": self.current_frame(),
+                "state": "frozen",
+            }));
+        }
+        Ok(json!({
+            "status": "completed",
+            "dx": dx,
+            "dy": dy,
+            "frames": frames,
+            "frame": self.current_frame(),
+            "state": "frozen",
+        }))
+    }
+
+    pub(super) fn pointer_relative_available(&mut self) -> bool {
+        if let Some(available) = self.pointer_relative {
+            return available;
+        }
+        let available = self
+            .lua_cmd_reply("pointerstatus", None)
+            .is_ok_and(|reply| reply == "RELATIVE");
+        self.pointer_relative = Some(available);
+        available
+    }
+
+    pub(super) fn advertised_methods(&mut self) -> Vec<&'static str> {
+        METHODS
+            .iter()
+            .copied()
+            .filter(|method| *method != "move_pointer" || self.pointer_relative_available())
+            .collect()
+    }
+
     pub(super) fn input_override_info(&mut self) -> Value {
         let Ok(raw) = self.lua_cmd_reply("inputstatus", None) else {
             return json!({ "observable": false });
@@ -203,7 +279,7 @@ impl<G: GdbTransport> Bridge<G> {
             available.join(", ")
         };
         BridgeError::Emulator(format!(
-            "PC-98 key(s) not registered on this machine: {}; available: {}",
+            "PC-98 input(s) not registered on this machine: {}; available: {}",
             unavailable.join(", "),
             avail_str
         ))

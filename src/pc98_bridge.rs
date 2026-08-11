@@ -19,6 +19,7 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 const MAX_READ_CHUNK: usize = 0x4000;
 const MAX_FIND_LEN: usize = 128 * 1024;
 const MAX_SYNC_TIMED_INPUT_FRAMES: u64 = 120;
+const MAX_POINTER_DELTA: i64 = 127;
 const TRACE_CAP: usize = 4096;
 const LEGACY_STATE_FORMAT: &str = "emucap-mame-pc98-state-v1";
 const STATE_FORMAT: &str = "emucap-mame-pc98-state-v2";
@@ -45,6 +46,7 @@ const METHODS: &[&str] = &[
     "screenshot",
     "set_input",
     "press_buttons",
+    "move_pointer",
     "reset",
     "break_on_reset",
     "step",
@@ -179,6 +181,9 @@ const PC98_INPUT_BUTTONS: &[&str] = &[
     "7",
     "8",
     "9",
+    "mouse_left",
+    "mouse_right",
+    "mouse_middle",
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -243,11 +248,15 @@ pub struct Bridge<G> {
     bps: BTreeMap<u64, Breakpoint>,
     next_bp: u64,
     input_fields: Option<Vec<String>>,
+    pointer_relative: Option<bool>,
 }
 
 impl<G: GdbTransport> Bridge<G> {
     pub fn new(mut gdb: G, env: GdbBridgeEnv) -> Self {
-        let frozen = gdb.send("?").is_ok();
+        // `?` reports the most recent stop reason; it does not stop a running target.  Treating a
+        // successful reply as a live freeze lets guest time drift between launch and the first
+        // operation.  Synchronize the backend with an actual interrupt before advertising frozen.
+        let frozen = gdb.send("?").is_ok() && gdb.interrupt().is_ok();
         Self {
             gdb,
             env,
@@ -258,6 +267,7 @@ impl<G: GdbTransport> Bridge<G> {
             bps: BTreeMap::new(),
             next_bp: 1,
             input_fields: None,
+            pointer_relative: None,
         }
     }
 
@@ -284,6 +294,7 @@ impl<G: GdbTransport> Bridge<G> {
             "screenshot" => self.screenshot(),
             "set_input" => self.set_input(&req.params),
             "press_buttons" => self.press_buttons(&req.params),
+            "move_pointer" => self.move_pointer(&req.params),
             "reset" => self.reset(),
             "break_on_reset" => self.break_on_reset(&req.params),
             "step" => self.step(&req.params),
