@@ -305,6 +305,7 @@ fn mame_opts<'a>(media: &'a str) -> MameOpts<'a> {
         pluginspath: Path::new("/a/plugins"),
         media,
         headless: true,
+        sound: false,
         cbus0: None,
         flop2: None,
         name: None,
@@ -328,6 +329,20 @@ fn mame_spec_isolates_dirs_and_loads_floppy() {
         .windows(2)
         .any(|w| w == ["-flop1".to_string(), "game.hdm".to_string()]));
     assert!(!spec.args.iter().any(|a| a == "-hard"));
+}
+
+#[test]
+fn mame_spec_installs_an_explicit_pc98_sound_board() {
+    let mut opts = mame_opts("game.hdm");
+    opts.sound = true;
+    opts.cbus0 = Some("pc9801_86");
+    let spec = mame_spec(Path::new("/mame"), Path::new("/l"), &opts);
+
+    assert!(spec
+        .args
+        .windows(2)
+        .any(|args| args == ["-cbus:0".to_string(), "pc9801_86".to_string()]));
+    assert!(!spec.args.windows(2).any(|args| args[0] == "-sound"));
 }
 
 #[test]
@@ -384,4 +399,27 @@ fn mame_spec_visible_mode_authorizes_wrapper_without_headless_options() {
     assert!(spec.args.iter().any(|arg| arg == "-window"));
     assert!(spec.args.iter().any(|arg| arg == "-nomaximize"));
     assert!(spec.args.iter().any(|arg| arg == "-mouse"));
+}
+
+#[test]
+fn mame_spec_keeps_sound_independent_of_display() {
+    for headless in [true, false] {
+        let mut silent = mame_opts("game.hdm");
+        silent.headless = headless;
+        let silent = mame_spec(Path::new("/mame"), Path::new("/l"), &silent);
+        assert!(silent
+            .args
+            .windows(2)
+            .any(|pair| pair == ["-sound", "none"]));
+        assert!(!silent.env.iter().any(|(key, _)| key == "MAME_ALLOW_SOUND"));
+
+        let mut audible = mame_opts("game.hdm");
+        audible.headless = headless;
+        audible.sound = true;
+        let audible = mame_spec(Path::new("/mame"), Path::new("/l"), &audible);
+        assert!(!audible.args.iter().any(|arg| arg == "-sound"));
+        assert!(audible
+            .env
+            .contains(&("MAME_ALLOW_SOUND".to_string(), "1".to_string())));
+    }
 }

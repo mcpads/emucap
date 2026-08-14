@@ -4,6 +4,20 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.3
+
+### Added
+- PC-98 launches can select a PC-9801-26K or PC-9801-86 C-bus sound board independently of
+  host audio output. Omitting the option keeps the sound slot empty, and launch planning reports
+  the available choices and ROM requirement.
+
+### Fixed
+- PC-98 managed and legacy launches now honor explicit audio independently of display visibility.
+  Silent-by-default probes remain silent, while `sound:true` uses MAME's host-selected audio
+  provider without implying that a C-bus sound board or its ROMs are installed.
+- PC-98 save states now preserve and restore the last presented raster image without advancing
+  guest time, preventing a restored frozen state from displaying a stale black frame.
+
 ## 0.14.2
 
 ### Added

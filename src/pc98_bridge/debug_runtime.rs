@@ -314,6 +314,39 @@ impl<G: GdbTransport> Bridge<G> {
         Ok(out)
     }
 
+    pub(super) fn save_presented_framebuffer(
+        &mut self,
+        path: &Path,
+    ) -> BridgeResult<serde_json::Map<String, Value>> {
+        parse_framebuffer_response(
+            &self.lua_cmd_reply("savepixels", Some(path.to_string_lossy().as_ref()))?,
+            "savepixels",
+        )
+    }
+
+    pub(super) fn restore_presented_framebuffer(&mut self, path: &Path) -> BridgeResult<Value> {
+        let frame_before = self.current_frame();
+        let parsed = parse_framebuffer_response(
+            &self.lua_cmd_reply("loadpixels", Some(path.to_string_lossy().as_ref()))?,
+            "loadpixels",
+        )?;
+        let frame_after = self.current_frame();
+        if let (Some(before), Some(after)) = (frame_before, frame_after) {
+            if before != after {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME framebuffer restore advanced from frame {before} to {after}"
+                )));
+            }
+        }
+        let mut out = parsed;
+        out.insert("status".into(), json!("completed"));
+        out.insert("strategy".into(), json!("saved_presented_framebuffer"));
+        out.insert("frames_advanced".into(), json!(0));
+        out.insert("frame_before".into(), json!(frame_before));
+        out.insert("frame_after".into(), json!(frame_after));
+        Ok(Value::Object(out))
+    }
+
     pub(super) fn write_state_regions(
         &mut self,
         regions: &[(String, Vec<u8>)],
@@ -322,6 +355,31 @@ impl<G: GdbTransport> Bridge<G> {
             self.write_region_bytes(memory_type, 0, data)?;
         }
         Ok(())
+    }
+
+    pub(super) fn finish_state_load(&mut self) -> BridgeResult<Value> {
+        let frame_before = self.current_frame();
+        let response = self.lua_cmd_reply("finishload", None)?;
+        if response != "OK" {
+            return Err(BridgeError::Emulator(format!(
+                "MAME state-load postload callbacks failed: {response}"
+            )));
+        }
+        let frame_after = self.current_frame();
+        if let (Some(before), Some(after)) = (frame_before, frame_after) {
+            if before != after {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME state-load visual refresh advanced from frame {before} to {after}"
+                )));
+            }
+        }
+        Ok(json!({
+            "status": "completed",
+            "strategy": "postload_callbacks",
+            "frames_advanced": 0,
+            "frame_before": frame_before,
+            "frame_after": frame_after,
+        }))
     }
 
     pub(super) fn write_region_bytes(

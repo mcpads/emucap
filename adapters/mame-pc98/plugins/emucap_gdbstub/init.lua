@@ -1129,6 +1129,47 @@ function emucap_gdbstub.startplugin()
     return size == 1 or size == 2 or size == 4 or size == 8
   end
 
+  local function save_presented_framebuffer(path)
+    local screen = manager.machine.screens:at(1)
+    if not screen then
+      return nil, "no screen"
+    end
+    local pixels, width, height = screen:presented_pixels()
+    local expected = width * height * 4
+    if not pixels or #pixels ~= expected then
+      return nil, "presented framebuffer size mismatch"
+    end
+    local file, file_err = io.open(path, "wb")
+    if not file then
+      return nil, "framebuffer open failed: " .. tostring(file_err)
+    end
+    file:write(pixels)
+    file:close()
+    return width, height, expected
+  end
+
+  local function restore_presented_framebuffer(path)
+    local screen = manager.machine.screens:at(1)
+    if not screen then
+      return nil, "no screen"
+    end
+    local file, file_err = io.open(path, "rb")
+    if not file then
+      return nil, "framebuffer open failed: " .. tostring(file_err)
+    end
+    local pixels = file:read("*a")
+    file:close()
+    local width, height = screen.width, screen.height
+    local expected = width * height * 4
+    if #pixels ~= expected then
+      return nil, "framebuffer size mismatch"
+    end
+    if not screen:restore_presented_pixels(pixels, width, height) then
+      return nil, "screen rejected presented framebuffer"
+    end
+    return width, height, expected
+  end
+
   local function save_items_to_dir(path)
     local manifest_path = path .. "/manifest.txt"
     local manifest, manifest_err = io.open(manifest_path, "wb")
@@ -1461,6 +1502,43 @@ function emucap_gdbstub.startplugin()
       else
         print("emucap_gdbstub: loaditems failed " .. tostring(ok and skipped_or_err or restored_or_err))
         ack_packet(socket, "E16")
+      end
+      return true
+    elseif name == "savepixels" then
+      local path = hex_to_string(rest or "")
+      if not path or path == "" then
+        ack_packet(socket, "E00")
+        return true
+      end
+      local ok, width_or_err, height_or_err, bytes_or_err = pcall(function() return save_presented_framebuffer(path) end)
+      if ok and width_or_err then
+        ack_packet(socket, "OK|" .. tostring(width_or_err) .. "|" .. tostring(height_or_err) .. "|" .. tostring(bytes_or_err))
+      else
+        print("emucap_gdbstub: savepixels failed " .. tostring(ok and height_or_err or width_or_err))
+        ack_packet(socket, "E18")
+      end
+      return true
+    elseif name == "finishload" then
+      local ok, finish_err = pcall(function() manager.machine:finish_state_load() end)
+      if ok then
+        ack_packet(socket, "OK")
+      else
+        print("emucap_gdbstub: finishload failed " .. tostring(finish_err))
+        ack_packet(socket, "E17")
+      end
+      return true
+    elseif name == "loadpixels" then
+      local path = hex_to_string(rest or "")
+      if not path or path == "" then
+        ack_packet(socket, "E00")
+        return true
+      end
+      local ok, width_or_err, height_or_err, bytes_or_err = pcall(function() return restore_presented_framebuffer(path) end)
+      if ok and width_or_err then
+        ack_packet(socket, "OK|" .. tostring(width_or_err) .. "|" .. tostring(height_or_err) .. "|" .. tostring(bytes_or_err))
+      else
+        print("emucap_gdbstub: loadpixels failed " .. tostring(ok and height_or_err or width_or_err))
+        ack_packet(socket, "E19")
       end
       return true
     elseif name == "regload" then

@@ -1,0 +1,123 @@
+diff --git a/src/emu/screen.h b/src/emu/screen.h
+--- a/src/emu/screen.h
++++ b/src/emu/screen.h
+@@ -402,6 +402,8 @@ public:
+ 	// pixel-level access
+ 	u32 pixel(s32 x, s32 y);
+ 	void pixels(u32* buffer);
++	void presented_pixels(u32 *buffer);
++	bool restore_presented_pixels(void const *buffer, size_t bytes, u32 width, u32 height);
+ 
+ 	// updating
+ 	int partial_updates() const { return m_partial_updates_this_frame; }
+diff --git a/src/emu/screen.cpp b/src/emu/screen.cpp
+--- a/src/emu/screen.cpp
++++ b/src/emu/screen.cpp
+@@ -1568,6 +1568,65 @@ void screen_device::pixels(u32 *buffer)
+ }
+ 
+ 
++//-------------------------------------------------
++//  presented_pixels - copy the last bitmap that was
++//  published to the render texture
++//-------------------------------------------------
++
++void screen_device::presented_pixels(u32 *buffer)
++{
++	screen_bitmap &bitmap = m_bitmap[m_curtexture];
++	if (!bitmap.valid() || bitmap.format() != BITMAP_FORMAT_RGB32)
++		return;
++
++	for (int y = m_visarea.min_y; y <= m_visarea.max_y; y++)
++	{
++		u32 const *source = &bitmap.as_rgb32().pix(y, m_visarea.min_x);
++		std::copy_n(source, m_visarea.width(), buffer);
++		buffer += m_visarea.width();
++	}
++}
++
++
++//-------------------------------------------------
++//  restore_presented_pixels - restore an observed
++//  raster image without advancing emulated time
++//-------------------------------------------------
++
++bool screen_device::restore_presented_pixels(void const *buffer, size_t bytes, u32 width, u32 height)
++{
++	if (m_type == SCREEN_TYPE_VECTOR || m_type == SCREEN_TYPE_SVG ||
++			(m_video_attributes & (VIDEO_SELF_RENDER | VIDEO_VARIABLE_WIDTH)) ||
++			width != u32(m_visarea.width()) || height != u32(m_visarea.height()) ||
++			bytes != (size_t(width) * size_t(height) * sizeof(u32)))
++		return false;
++
++	for (screen_bitmap &bitmap : m_bitmap)
++	{
++		if (!bitmap.valid() || bitmap.format() != BITMAP_FORMAT_RGB32)
++			return false;
++	}
++
++	u8 const *source = reinterpret_cast<u8 const *>(buffer);
++	for (screen_bitmap &bitmap : m_bitmap)
++	{
++		for (int y = m_visarea.min_y; y <= m_visarea.max_y; y++)
++		{
++			void *destination = &bitmap.as_rgb32().pix(y, m_visarea.min_x);
++			std::memcpy(destination, source, size_t(width) * sizeof(u32));
++			source += size_t(width) * sizeof(u32);
++		}
++		source = reinterpret_cast<u8 const *>(buffer);
++	}
++
++	// Publish through the ordinary texture/container path.  Both raster buffers contain
++	// the same saved image, so the normal buffer swap cannot expose an uninitialised frame.
++	m_changed = true;
++	update_quads();
++	return true;
++}
++
++
+ //-------------------------------------------------
+ //  update_quads - set up the quads for this
+ //  screen
+diff --git a/src/frontend/mame/luaengine.cpp b/src/frontend/mame/luaengine.cpp
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -1492,5 +1492,6 @@ void lua_engine::initialize()
+ 	machine_type["palettes"] = sol::property([] (running_machine &m) { return devenum<palette_interface_enumerator>(m.root_device()); });
+ 	machine_type["screens"] = sol::property([] (running_machine &m) { return devenum<screen_device_enumerator>(m.root_device()); });
++	machine_type.set_function("finish_state_load", [] (running_machine &m) { m.save().dispatch_postload(); });
+ 	machine_type["cassettes"] = sol::property([] (running_machine &m) { return devenum<cassette_device_enumerator>(m.root_device()); });
+ 	machine_type["images"] = sol::property([] (running_machine &m) { return devenum<image_interface_enumerator>(m.root_device()); });
+ 	machine_type["slots"] = sol::property([](running_machine &m) { return devenum<slot_interface_enumerator>(m.root_device()); });
+@@ -1889,13 +1890,31 @@ void lua_engine::initialize()
+ 	screen_dev_type.set_function(
+ 			"pixels",
+ 			[] (screen_device &sdev, sol::this_state s)
+ 			{
+ 				const rectangle &visarea = sdev.visible_area();
+ 				luaL_Buffer buff;
+ 				int size = visarea.height() * visarea.width() * 4;
+ 				u32 *const ptr = reinterpret_cast<u32 *>(luaL_buffinitsize(s, &buff, size));
+ 				sdev.pixels(ptr);
+ 				luaL_pushresultsize(&buff, size);
+ 				return std::make_tuple(sol::make_reference(s, sol::stack_reference(s, -1)), visarea.width(), visarea.height());
+ 			});
++	screen_dev_type.set_function(
++			"presented_pixels",
++			[] (screen_device &sdev, sol::this_state s)
++			{
++				const rectangle &visarea = sdev.visible_area();
++				luaL_Buffer buff;
++				int size = visarea.height() * visarea.width() * 4;
++				u32 *const ptr = reinterpret_cast<u32 *>(luaL_buffinitsize(s, &buff, size));
++				sdev.presented_pixels(ptr);
++				luaL_pushresultsize(&buff, size);
++				return std::make_tuple(sol::make_reference(s, sol::stack_reference(s, -1)), visarea.width(), visarea.height());
++			});
++	screen_dev_type.set_function(
++			"restore_presented_pixels",
++			[] (screen_device &sdev, std::string_view data, u32 width, u32 height)
++			{
++				return sdev.restore_presented_pixels(data.data(), data.size(), width, height);
++			});
+ 	screen_dev_type["screen_type"] = sol::property(&screen_device::screen_type);

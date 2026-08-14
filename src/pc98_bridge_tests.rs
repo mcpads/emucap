@@ -134,6 +134,7 @@ fn media_status(id: &str, path: Option<&str>) -> String {
 struct StateSaveGdb {
     regs_hex: String,
     save_items_dir: Option<PathBuf>,
+    framebuffer_path: Option<PathBuf>,
     reads: usize,
     fail_at_read: Option<usize>,
 }
@@ -143,6 +144,7 @@ impl StateSaveGdb {
         Self {
             regs_hex,
             save_items_dir: None,
+            framebuffer_path: None,
             reads: 0,
             fail_at_read: None,
         }
@@ -153,6 +155,7 @@ impl StateSaveGdb {
         Self {
             regs_hex,
             save_items_dir: None,
+            framebuffer_path: None,
             reads: 0,
             fail_at_read: Some(fail_at_read),
         }
@@ -181,6 +184,17 @@ impl GdbTransport for StateSaveGdb {
             std::fs::write(path.join("manifest.txt"), "item\n")?;
             self.save_items_dir = Some(path);
             return Ok("OK|1|0".into());
+        }
+        if let Some(hex_path) = payload.strip_prefix("qEmucap,savepixels,") {
+            let bytes = hex::decode(hex_path)
+                .map_err(|_| GdbError::Emulator("bad savepixels path hex".into()))?;
+            let path = PathBuf::from(
+                String::from_utf8(bytes)
+                    .map_err(|_| GdbError::Emulator("bad savepixels path utf8".into()))?,
+            );
+            std::fs::write(&path, [1_u8, 2, 3, 4, 5, 6, 7, 8])?;
+            self.framebuffer_path = Some(path);
+            return Ok("OK|2|1|8".into());
         }
         if let Some(rest) = payload.strip_prefix('m') {
             let Some((_addr, len_hex)) = rest.split_once(',') else {
@@ -212,6 +226,8 @@ struct StateLoadGdb {
     writes: Vec<String>,
     regprobe_specs: Vec<String>,
     load_items_dirs: Vec<PathBuf>,
+    loaded_framebuffers: Vec<PathBuf>,
+    completed_state_loads: usize,
 }
 
 impl StateLoadGdb {
@@ -243,6 +259,21 @@ impl GdbTransport for StateLoadGdb {
         if payload.starts_with('M') {
             self.writes.push(payload.into());
             return Ok("OK".into());
+        }
+        if payload == "qEmucap,finishload" {
+            self.completed_state_loads += 1;
+            return Ok("OK".into());
+        }
+        if let Some(hex_path) = payload.strip_prefix("qEmucap,loadpixels,") {
+            let bytes = hex::decode(hex_path)
+                .map_err(|_| GdbError::Emulator("bad loadpixels path hex".into()))?;
+            let path = PathBuf::from(
+                String::from_utf8(bytes)
+                    .map_err(|_| GdbError::Emulator("bad loadpixels path utf8".into()))?,
+            );
+            assert_eq!(std::fs::read(&path)?, [1_u8, 2, 3, 4, 5, 6, 7, 8]);
+            self.loaded_framebuffers.push(path);
+            return Ok("OK|2|1|8".into());
         }
         if let Some(hex_regs) = payload.strip_prefix("qEmucap,regload,") {
             let bytes =
@@ -280,6 +311,8 @@ fn write_test_state(path: &Path, regs_hex: &str) {
     zip.write_all(&[0xAA, 0xBB]).unwrap();
     zip.start_file(SAVE_ITEMS_MANIFEST, options).unwrap();
     zip.write_all(b"item\n").unwrap();
+    zip.start_file(FRAMEBUFFER_MEMBER, options).unwrap();
+    zip.write_all(&[1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
     zip.start_file("state.json", options).unwrap();
     let manifest = json!({
         "format": STATE_FORMAT,
@@ -294,6 +327,13 @@ fn write_test_state(path: &Path, regs_hex: &str) {
             "file": "tvram.bin",
         }],
         "save_items": {"items": 1, "skipped": 0, "dir": SAVE_ITEMS_DIR},
+        "framebuffer": {
+            "file": FRAMEBUFFER_MEMBER,
+            "encoding": "mame_rgb32_native",
+            "width": 2,
+            "height": 1,
+            "bytes": 8,
+        },
         "state_restore": state_restore_info(),
     });
     zip.write_all(&serde_json::to_vec(&manifest).unwrap())
@@ -1441,13 +1481,17 @@ fn save_state_writes_python_compatible_zip_bundle() {
     );
     assert!(result["bytes"].as_u64().unwrap() > 0);
     assert!(bridge.gdb.reads > 0);
+    assert!(bridge.gdb.framebuffer_path.is_some());
 
     let file = File::open(&out).unwrap();
     let mut zip = ZipArchive::new(file).unwrap();
     assert!(zip.by_name(SAVE_ITEMS_MANIFEST).is_ok());
+    assert!(zip.by_name(FRAMEBUFFER_MEMBER).is_ok());
     let manifest = read_state_manifest(&mut zip).unwrap();
     assert_eq!(manifest["format"], STATE_FORMAT);
     assert_eq!(manifest["registers_hex"], regs);
+    assert_eq!(manifest["framebuffer"]["width"], 2);
+    assert_eq!(manifest["framebuffer"]["height"], 1);
     assert_eq!(
         manifest["regions"].as_array().unwrap().len(),
         DUMP_REGION_NAMES.len()
@@ -1591,6 +1635,9 @@ fn pause_preserves_real_bp_hit_buffered_before_interrupt() {
 
 #[test]
 fn load_state_restores_save_items_memory_and_registers() {
+    // Loading a frozen PC-98 state must also rebuild the visible screen at that same
+    // boundary. Requiring zero advanced frames prevents a hidden step from trading
+    // debugger accuracy for a fresh image.
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state.zip");
     let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
@@ -1608,8 +1655,16 @@ fn load_state_restores_save_items_memory_and_registers() {
     assert_eq!(result["save_items_restored"], 1);
     assert_eq!(result["restore_strategy"], "lua_register_load_hold");
     assert_eq!(result["post_restore_instruction_exact"], true);
+    assert_eq!(result["visual_refresh"]["status"], "completed");
+    assert_eq!(result["visual_refresh"]["frames_advanced"], 0);
+    assert_eq!(
+        result["visual_refresh"]["strategy"],
+        "saved_presented_framebuffer"
+    );
     assert_eq!(bridge.gdb.writes, vec!["Ma0000,2:aabb"]);
     assert_eq!(bridge.gdb.load_items_dirs.len(), 1);
+    assert_eq!(bridge.gdb.loaded_framebuffers.len(), 1);
+    assert_eq!(bridge.gdb.completed_state_loads, 1);
 }
 
 #[test]

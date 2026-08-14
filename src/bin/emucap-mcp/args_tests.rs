@@ -165,6 +165,21 @@ fn launch_and_recording_parse_explicit_repeatability_selection() {
 }
 
 #[test]
+fn launch_parses_only_supported_pc98_sound_boards() {
+    let launch: LaunchArgs = serde_json::from_str(
+        r#"{"content_path":"/tmp/game.hdi","system":"pc98","sound":true,"pc98_sound_board":"pc9801_86"}"#,
+    )
+    .unwrap();
+    assert_eq!(launch.pc98_sound_board, Some(Pc98SoundBoardArgs::Pc9801_86));
+    assert_eq!(launch.sound, Some(true));
+
+    assert!(serde_json::from_str::<LaunchArgs>(
+        r#"{"content_path":"/tmp/game.hdi","system":"pc98","pc98_sound_board":"pc9801_118"}"#,
+    )
+    .is_err());
+}
+
+#[test]
 fn frame_args_reject_over_cap() {
     // 상한 초과는 deserialize 단계에서 거부(무한 deferred 루프·raw_call wedge 방지, H2).
     let over = MAX_SYNC_ADVANCE_COUNT + 1;

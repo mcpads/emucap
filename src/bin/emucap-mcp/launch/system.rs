@@ -65,3 +65,7 @@ pub(super) fn adapter_for_system(system: &str) -> (&'static str, Option<&'static
         _ => ("", None),
     }
 }
+
+pub(super) fn adapter_supports_sound(adapter: &str) -> bool {
+    matches!(adapter, "mednafen" | "mame_pc98")
+}

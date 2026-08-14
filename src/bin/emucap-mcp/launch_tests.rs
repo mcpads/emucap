@@ -1,5 +1,5 @@
 use super::*;
-use crate::args::LaunchExecutionProfileArgs;
+use crate::args::{LaunchExecutionProfileArgs, Pc98SoundBoardArgs};
 #[cfg(unix)]
 use emucap::live::continuity::{ContinuitySnapshot, RuntimeBinding, RuntimeBindingState};
 use emucap::live::link::{Capabilities, LinkError};
@@ -1119,6 +1119,26 @@ fn launch_plan_for_pc98_uses_repo_launcher_and_headless_contract() {
     assert_eq!(plan["adapter"], "mame_pc98");
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "pc98");
+    assert_eq!(plan["preferred_launcher"]["args"]["sound"], false);
+    assert_eq!(
+        plan["preferred_launcher"]["args"]["pc98_sound_board"],
+        serde_json::Value::Null
+    );
+    assert_eq!(plan["sound_contract"]["supported"], true);
+    assert_eq!(plan["sound_contract"]["default"], false);
+    assert_eq!(plan["sound_contract"]["independent_of_display"], true);
+    assert_eq!(
+        plan["sound_contract"]["hardware_requirement"]["argument"],
+        "pc98_sound_board"
+    );
+    assert_eq!(
+        plan["sound_contract"]["hardware_requirement"]["choices"],
+        serde_json::json!(["pc9801_26", "pc9801_86"])
+    );
+    assert_eq!(
+        plan["sound_contract"]["hardware_requirement"]["independent_of_host_output"],
+        true
+    );
     assert_eq!(plan["environment_defaults"]["MAME_CBUS0"]["default"], "");
     assert!(plan["headless_contract"]
         .as_str()
@@ -1260,6 +1280,7 @@ fn pc98_display_selects_visible_mame_launch() {
         name: None,
         display: Some(true),
         sound: None,
+        pc98_sound_board: None,
         start_frozen: false,
         execution_profile: None,
         replace: false,
@@ -1518,7 +1539,9 @@ impl EmulatorLink for NotConnectedPortLink {
     }
 
     fn endpoint_port(&self) -> Option<u16> {
-        Some(47810)
+        // Keep pure launch-policy tests outside the managed listener range used by local MCP
+        // sessions. A real session capsule must never change an otherwise deterministic test.
+        Some(60000)
     }
 
     fn session_token(&self) -> Option<&str> {
@@ -1815,6 +1838,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             name: Some("after-orphan".into()),
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -1845,6 +1869,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             name: Some("after-unverifiable-lease".into()),
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -1868,6 +1893,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             name: Some("after-retired-generation".into()),
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -1918,6 +1944,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         name: Some("capsule-test".into()),
         display: None,
         sound: None,
+        pc98_sound_board: None,
         start_frozen: false,
         execution_profile: None,
         replace: false,
@@ -2052,6 +2079,7 @@ fn controlled_launch_publishes_only_after_a_frozen_ready_boundary() {
             name: Some("controlled-launch-test".into()),
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: true,
             execution_profile: None,
             replace: false,
@@ -2100,6 +2128,7 @@ fn controlled_launch_fails_closed_and_terminates_a_running_entry() {
             name: Some("controlled-launch-failure-test".into()),
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: true,
             execution_profile: None,
             replace: false,
@@ -2217,6 +2246,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
             name: None,
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -2232,7 +2262,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
 }
 
 #[test]
-fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
+fn launch_rejects_sound_for_unsupported_adapter_before_binary_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let content = tmp.path().join("game.sfc");
     std::fs::write(&content, b"rom").unwrap();
@@ -2247,6 +2277,7 @@ fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
             name: None,
             display: None,
             sound: Some(true),
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -2256,10 +2287,61 @@ fn launch_rejects_sound_for_non_mednafen_before_binary_resolution() {
     assert_eq!(out["launched"], false);
     assert_eq!(
         out["reason"],
-        "sound:true is supported only by Mednafen systems"
+        "sound:true is supported only by Mednafen and PC-98 systems"
     );
     assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1);
+}
+
+#[test]
+fn launch_rejects_pc98_sound_board_for_other_systems_before_binary_resolution() {
+    let tmp = tempfile::tempdir().unwrap();
+    let content = tmp.path().join("game.sfc");
+    std::fs::write(&content, b"rom").unwrap();
+    let mut link = NotConnectedPortLink::new();
+
+    let out = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("snes".into()),
+            name: None,
+            display: None,
+            sound: None,
+            pc98_sound_board: Some(Pc98SoundBoardArgs::Pc9801_86),
+            start_frozen: false,
+            execution_profile: None,
+            replace: false,
+        },
+    );
+
+    assert_eq!(out["launched"], false);
+    assert_eq!(
+        out["reason"],
+        "pc98_sound_board is supported only for PC-98"
+    );
+    assert_eq!(out["adapter"], "mesen2");
+    assert_eq!(link.calls, 1);
+}
+
+#[test]
+fn launch_sound_admission_matches_the_documented_adapters() {
+    assert!(adapter_supports_sound("mednafen"));
+    assert!(adapter_supports_sound("mame_pc98"));
+    for adapter in [
+        "mesen2",
+        "mame_neogeo",
+        "mupen64plus",
+        "openmsx",
+        "flycast",
+        "desmume_nds",
+        "ppsspp",
+        "pcsx2",
+        "dolphin",
+    ] {
+        assert!(!adapter_supports_sound(adapter), "{adapter}");
+    }
 }
 
 #[test]
@@ -2278,6 +2360,7 @@ fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
             name: None,
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: true,
             execution_profile: None,
             replace: false,
@@ -2309,6 +2392,7 @@ fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
             name: None,
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: Some(LaunchExecutionProfileArgs::Repeatable),
             replace: false,
@@ -2359,6 +2443,7 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
             name: None,
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -2433,6 +2518,7 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
             name: None,
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -2483,6 +2569,7 @@ fn launch_refuses_occupied_port_before_spawn() {
             name: None,
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,
@@ -2557,6 +2644,7 @@ fn launch_refuses_when_this_session_already_connected() {
             name: Some("dup-B".into()),
             display: None,
             sound: None,
+            pc98_sound_board: None,
             start_frozen: false,
             execution_profile: None,
             replace: false,

@@ -4,6 +4,8 @@
 # This wrapper is intentionally conservative: unless visible mode is explicitly
 # allowed, it appends headless/video-isolating options after the caller's
 # arguments so saved mame.ini fullscreen/window settings cannot steal focus.
+# Host audio remains disabled unless MAME_ALLOW_SOUND=1 is explicit; visibility
+# and audio authorization are independent.
 set -euo pipefail
 
 usage() {
@@ -27,14 +29,19 @@ fi
 
 export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-dummy}"
 
-exec "$RAW" "$@" \
-  -noreadconfig \
-  -video none \
-  -videodriver dummy \
-  -window \
-  -nomaximize \
-  -sound none \
-  -mouse \
-  -keyboardprovider none \
-  -mouseprovider none \
+SAFE_ARGS=(
+  -noreadconfig
+  -video none
+  -videodriver dummy
+  -window
+  -nomaximize
+  -mouse
+  -keyboardprovider none
+  -mouseprovider none
   -output none
+)
+if [ "${MAME_ALLOW_SOUND:-0}" != "1" ]; then
+  SAFE_ARGS+=(-sound none)
+fi
+
+exec "$RAW" "$@" "${SAFE_ARGS[@]}"
