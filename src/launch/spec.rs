@@ -185,6 +185,7 @@ pub struct MameOpts<'a> {
     pub pluginspath: &'a Path,
     pub media: &'a str,
     pub headless: bool,
+    pub sound: bool,
     pub cbus0: Option<&'a str>,
     pub flop2: Option<&'a str>,
     pub name: Option<&'a str>,
@@ -238,8 +239,6 @@ pub fn mame_spec(binary: &Path, log_path: &Path, o: &MameOpts) -> LaunchSpec {
                 "dummy",
                 "-window",
                 "-nomaximize",
-                "-sound",
-                "none",
                 "-keyboardprovider",
                 "none",
                 "-mouseprovider",
@@ -250,7 +249,10 @@ pub fn mame_spec(binary: &Path, log_path: &Path, o: &MameOpts) -> LaunchSpec {
             .map(String::from),
         );
     } else {
-        args.extend(["-window", "-nomaximize", "-sound", "none"].map(String::from));
+        args.extend(["-window", "-nomaximize"].map(String::from));
+    }
+    if !o.sound {
+        args.extend(["-sound", "none"].map(String::from));
     }
     if let Some(c) = o.cbus0 {
         args.push("-cbus:0".into());
@@ -286,6 +288,11 @@ pub fn mame_spec(binary: &Path, log_path: &Path, o: &MameOpts) -> LaunchSpec {
         // visible mode is explicitly authorized. Without this flag, display=true is converted
         // back to headless after the Rust launcher has built the correct visible arguments.
         spec = spec.env("MAME_ALLOW_VISIBLE", "1");
+    }
+    if o.sound {
+        // The repo-local safe wrapper defaults to silence. Explicit authorization lets MAME's
+        // platform-neutral `auto` provider choose an available host audio backend.
+        spec = spec.env("MAME_ALLOW_SOUND", "1");
     }
     if let Some(name) = o.name {
         spec = spec.env("EMUCAP_NAME", name);

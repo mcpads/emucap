@@ -119,8 +119,8 @@ conditions across Saturn/PSX/PCE launches. The separate repeatable execution pro
 limited to the systems that advertise it live.
 
 The launcher passes `-sound 1` only when `sound:true` is requested and reports the effective `sound` value in
-its result. `sound:true` is currently a Mednafen-only option; other adapters reject it rather than silently
-ignoring it.
+its result. PC-98 also supports the common `sound` launch option; unsupported adapters reject `true` rather
+than silently ignoring it.
 
 `launch.sh` is the legacy fallback. The actual port is authoritatively the `listening_port` from MCP `status`
 (the example is 47800). Calling `status` sets up the MCP listener, so do not skip it. `launch.sh` refuses to

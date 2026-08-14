@@ -13,8 +13,9 @@
 #   MAME_CBUS0=<slot option>              default: empty for pc9801rs; set to a slot option to override
 #   MAME_READCONFIG=1                     opt in to user mame.ini; default ignores it
 #   MAME_FLOP2=/path/to/second.hdm
-#   MAME_HEADLESS=1|0                    default: 1 (-noreadconfig -video none -sound none)
+#   MAME_HEADLESS=1|0                    default: 1 (-noreadconfig -video none)
 #   MAME_ALLOW_VISIBLE=1                 required with MAME_HEADLESS=0
+#   MAME_SOUND=1|0                       default: 0; independent of MAME_HEADLESS
 #   EMUCAP_PC98_BRIDGE_BIN=/path/to/emucap-mame-pc98-bridge
 #   EMUCAP_LOG=/path/to/custom.log       default: <emucap-data>/mame-pc98/<port>/mame-pc98.log
 set -euo pipefail
@@ -136,6 +137,7 @@ else
 fi
 BACKEND="lua-gdbstub"
 HEADLESS="${MAME_HEADLESS:-1}"
+SOUND="${MAME_SOUND:-0}"
 WAIT="${EMUCAP_LAUNCH_WAIT:-20}"
 POST_CONNECT_GRACE="${EMUCAP_POST_CONNECT_GRACE:-2}"
 LOG="${EMUCAP_LOG:-$RUN_DIR/mame-pc98.log}"
@@ -179,6 +181,13 @@ command -v "$MAME_BIN" >/dev/null 2>&1 || { echo "ERROR: MAME not found: $MAME_B
 if [ "$HEADLESS" != "1" ] && [ "${MAME_ALLOW_VISIBLE:-0}" != "1" ]; then
   echo "ERROR: visible MAME launch is disabled by default. Set MAME_ALLOW_VISIBLE=1 with MAME_HEADLESS=0 if a window is intentional." >&2
   exit 2
+fi
+if [ "$SOUND" != "0" ] && [ "$SOUND" != "1" ]; then
+  echo "ERROR: MAME_SOUND must be 0 or 1, got: $SOUND" >&2
+  exit 2
+fi
+if [ "$SOUND" = "1" ]; then
+  export MAME_ALLOW_SOUND=1
 fi
 export MAME_GDB_PORT="$GDB_PORT"
 if [ -f "$LOCAL_MAME_RAW_BIN" ] && [ -x "$LOCAL_MAME_RAW_BIN" ] && [ "$MAME_BIN" = "$LOCAL_MAME_BIN" ]; then
@@ -288,6 +297,7 @@ fi
   echo "  mame_home=$MAME_HOME"
   echo "  backend=$BACKEND"
   echo "  headless=$HEADLESS"
+  echo "  sound=$SOUND"
   echo "  pluginpath=$PLUGINPATH"
   echo "  gdb_port=$GDB_PORT"
   if [ "${MAME_CBUS0+x}" = "x" ]; then
@@ -324,9 +334,12 @@ fi
 ARGS+=(-mouse)
 if [ "$HEADLESS" = "1" ]; then
   export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-dummy}"
-  ARGS+=(-video none -videodriver dummy -window -nomaximize -sound none -keyboardprovider none -mouseprovider none -output none)
+  ARGS+=(-video none -videodriver dummy -window -nomaximize -keyboardprovider none -mouseprovider none -output none)
 else
-  ARGS+=(-window -nomaximize -sound none)
+  ARGS+=(-window -nomaximize)
+fi
+if [ "$SOUND" != "1" ]; then
+  ARGS+=(-sound none)
 fi
 if [ "${MAME_CBUS0+x}" = "x" ]; then
   ARGS+=(-cbus:0 "$MAME_CBUS0")

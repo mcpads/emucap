@@ -1,6 +1,6 @@
 use super::{
     default_rompath, gdb_port_for_emucap_port, repo_local_binary, resolve_bridge_launch,
-    resolve_flop2, Launch,
+    resolve_cbus0, resolve_flop2, Launch,
 };
 use crate::test_env::{lock_env, EnvGuard};
 #[cfg(unix)]
@@ -116,6 +116,8 @@ fn default_bridge_selection_uses_rust_binary() {
         session_token: None,
         runtime: None,
         headless: true,
+        sound: false,
+        cbus0: None,
     };
 
     let selected = resolve_bridge_launch(&launch, 48800).unwrap();
@@ -165,6 +167,8 @@ fn rust_bridge_selection_uses_explicit_binary() {
         session_token: Some("token"),
         runtime: None,
         headless: true,
+        sound: false,
+        cbus0: None,
     };
 
     let selected = resolve_bridge_launch(&launch, 48800).unwrap();
@@ -192,6 +196,16 @@ fn resolve_flop2_prefers_explicit_over_env() {
 }
 
 #[test]
+fn resolve_cbus0_prefers_the_typed_launch_choice_over_the_legacy_environment() {
+    assert_eq!(
+        resolve_cbus0(Some("pc9801_86"), Some("pc9801_26")),
+        Some("pc9801_86")
+    );
+    assert_eq!(resolve_cbus0(None, Some("pc9801_26")), Some("pc9801_26"));
+    assert_eq!(resolve_cbus0(None, None), None);
+}
+
+#[test]
 fn rust_bridge_selection_fails_before_mame_when_binary_missing() {
     let _lock = lock_env();
     let _env = EnvGuard::new(&["EMUCAP_PC98_BRIDGE", "EMUCAP_PC98_BRIDGE_BIN"]);
@@ -212,6 +226,8 @@ fn rust_bridge_selection_fails_before_mame_when_binary_missing() {
         session_token: None,
         runtime: None,
         headless: true,
+        sound: false,
+        cbus0: None,
     };
 
     let err = resolve_bridge_launch(&launch, 48800).unwrap_err();

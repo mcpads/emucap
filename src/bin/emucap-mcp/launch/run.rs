@@ -146,10 +146,18 @@ pub(crate) fn make_launch(
         });
     };
     let (adapter, module) = adapter_for_system(system);
-    if a.sound == Some(true) && adapter != "mednafen" {
+    if a.sound == Some(true) && !adapter_supports_sound(adapter) {
         return serde_json::json!({
             "launched": false,
-            "reason": "sound:true is supported only by Mednafen systems",
+            "reason": "sound:true is supported only by Mednafen and PC-98 systems",
+            "system": system,
+            "adapter": adapter,
+        });
+    }
+    if a.pc98_sound_board.is_some() && system != "pc98" {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "pc98_sound_board is supported only for PC-98",
             "system": system,
             "adapter": adapter,
         });
@@ -672,6 +680,7 @@ pub(super) fn launch_mame(
         return serde_json::json!({ "launched": false, "reason": "MAME binary was not found; build it with adapters/mame-pc98/build.sh or set MAME_BIN" });
     };
     let headless = pc98_headless(a);
+    let sound = a.sound.unwrap_or(false);
     let log = adapter_log_path("mame-pc98", port, "mame-pc98.log");
     let spec = emucap::launch::mame::Launch {
         binary: &binary,
@@ -685,6 +694,8 @@ pub(super) fn launch_mame(
         session_token: token,
         runtime: Some(runtime),
         headless,
+        sound,
+        cbus0: a.pc98_sound_board.map(|board| board.mame_slot()),
     };
     match emucap::launch::mame::launch(&spec) {
         Ok(launched) => serde_json::json!({
@@ -695,6 +706,8 @@ pub(super) fn launch_mame(
             "bridge_pid": launched.bridge_pid,
             "bridge": launched.bridge_kind,
             "display": !headless,
+            "sound": sound,
+            "pc98_sound_board": a.pc98_sound_board.map(|board| board.mame_slot()),
             "gdb_port": launched.gdb_port,
             "port": port,
             "binary": binary.display().to_string(),

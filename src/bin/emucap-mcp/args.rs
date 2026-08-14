@@ -864,10 +864,15 @@ pub(crate) struct LaunchArgs {
     #[serde(default)]
     pub(crate) display: Option<bool>,
     /// Enable audio output independently of display. Currently supported by
-    /// Mednafen systems. Default: false. Unsupported adapters reject true rather
-    /// than silently ignoring it.
+    /// Mednafen and PC-98 systems. Default: false. Unsupported adapters reject
+    /// true rather than silently ignoring it.
     #[serde(default)]
     pub(crate) sound: Option<bool>,
+    /// Optional emulated sound board for PC-98. This is independent of host
+    /// audio output: set `sound:true` as well to hear the selected board.
+    /// Omit this field to keep the C-bus sound slot empty.
+    #[serde(default)]
+    pub(crate) pc98_sound_board: Option<Pc98SoundBoardArgs>,
     /// Return only after the adapter is connected at a guest-time-closed frozen
     /// entry boundary. Default: false. Unsupported adapters reject true before
     /// spawning a process.
@@ -883,6 +888,22 @@ pub(crate) struct LaunchArgs {
     /// both match; unverifiable ownership is rejected.
     #[serde(default)]
     pub(crate) replace: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Pc98SoundBoardArgs {
+    Pc9801_26,
+    Pc9801_86,
+}
+
+impl Pc98SoundBoardArgs {
+    pub(crate) fn mame_slot(self) -> &'static str {
+        match self {
+            Self::Pc9801_26 => "pc9801_26",
+            Self::Pc9801_86 => "pc9801_86",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]

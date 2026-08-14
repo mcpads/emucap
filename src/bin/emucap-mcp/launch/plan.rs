@@ -4,7 +4,7 @@ use super::actions::{
 use super::media::{content_markers, ext_lower};
 use super::*;
 
-pub(super) use super::system::{adapter_for_system, normalize_system};
+pub(super) use super::system::{adapter_for_system, adapter_supports_sound, normalize_system};
 
 pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
@@ -937,15 +937,18 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "system": system,
         "name": format!("{system}_session"),
     });
-    if adapter == "mednafen" {
+    if adapter_supports_sound(adapter) {
         preferred_launcher_args["sound"] = serde_json::json!(false);
+    }
+    if adapter == "mame_pc98" {
+        preferred_launcher_args["pc98_sound_board"] = serde_json::Value::Null;
     }
     let environment_defaults = if adapter == "mame_pc98" {
         serde_json::json!({
             "MAME_CBUS0": {
                 "default": "",
-                "applies_when": "machine is pc9801rs and MAME_CBUS0 is unset",
-                "reason": "local pc9801rs headless set lacks the default pc9801_26 sound-card ROM"
+                "applies_when": "pc98_sound_board is omitted and the legacy environment variable is unset",
+                "reason": "legacy fallback only; prefer the validated pc98_sound_board launch argument"
             }
         })
     } else if adapter == "mednafen" {
@@ -1045,7 +1048,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "inference": inference,
         "button_hint": button_hint_for_system(Some(system)),
         "headless_contract": if adapter == "mame_pc98" {
-            "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It disables pc9801rs cbus:0 unless MAME_CBUS0 is explicitly set; do not run work/mame.raw or system mame directly."
+            "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It keeps pc9801rs cbus:0 empty unless pc98_sound_board is selected; do not run work/mame.raw or system mame directly."
         } else if adapter == "mame_neogeo" {
             "Neo Geo MVS, AES, and CD launch headless by default and use profile-specific emucap-owned MAME homes. launch(display:true) opens a window without reading or changing the user's MAME configuration."
         } else if adapter == "mupen64plus" {
@@ -1061,12 +1064,24 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         } else {
             "Use the Rust launch tool from this plan."
         },
-        "sound_contract": if adapter == "mednafen" {
+        "sound_contract": if adapter_supports_sound(adapter) {
             serde_json::json!({
                 "supported": true,
                 "default": false,
                 "enable_with": "launch(..., sound:true)",
-                "independent_of_display": true
+                "independent_of_display": true,
+                "hardware_requirement": if adapter == "mame_pc98" {
+                    serde_json::json!({
+                        "argument": "pc98_sound_board",
+                        "choices": ["pc9801_26", "pc9801_86"],
+                        "default": null,
+                        "independent_of_host_output": true,
+                        "rompath_environment": "MAME_ROMPATH",
+                        "note": "Selecting a board installs emulated hardware but does not enable host output. Use sound:true as well, and provide the matching MAME board ROM set."
+                    })
+                } else {
+                    serde_json::Value::Null
+                }
             })
         } else {
             serde_json::Value::Null

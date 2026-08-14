@@ -102,11 +102,20 @@ pub struct Launch<'a> {
     pub session_token: Option<&'a str>,
     pub runtime: Option<super::RuntimeEnv<'a>>,
     pub headless: bool,
+    /// Host audio output. This does not select or provide an emulated C-bus sound board.
+    pub sound: bool,
+    /// Validated C-bus slot 0 selection. None falls back to the legacy
+    /// `MAME_CBUS0` environment variable before defaulting to an empty slot.
+    pub cbus0: Option<&'a str>,
 }
 
 /// 2번째 플로피 경로 결정: 명시 param(launch 툴 `content_path2` → `Launch.flop2`)이 우선, 없으면
 /// `MAME_FLOP2` 환경변수를 폴백으로(legacy launch.sh 동형). 둘 다 없으면 None(단일 매체).
 fn resolve_flop2<'a>(explicit: Option<&'a str>, env: Option<&'a str>) -> Option<&'a str> {
+    explicit.or(env)
+}
+
+fn resolve_cbus0<'a>(explicit: Option<&'a str>, env: Option<&'a str>) -> Option<&'a str> {
     explicit.or(env)
 }
 
@@ -244,10 +253,11 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
         path
     };
     let pluginspath = l.repo_root.join("adapters/mame-pc98/plugins");
-    // Disable the pc9801rs C-bus slot 0 (the pc9801_26 sound board) by default: its ROMs (26k_wyka*)
-    // are usually absent from a user's romset and MAME refuses to start the machine without them.
-    // `MAME_CBUS0` overrides (e.g. to load a specific board).
-    let cbus0 = std::env::var("MAME_CBUS0").unwrap_or_default();
+    // Keep slot 0 empty by default because sound-board ROMs are not part of the
+    // PC-98 machine set. The typed launch choice takes precedence; MAME_CBUS0
+    // remains a legacy escape hatch for the shell launcher.
+    let cbus0_env = std::env::var("MAME_CBUS0").ok();
+    let cbus0 = resolve_cbus0(l.cbus0, cbus0_env.as_deref()).unwrap_or("");
     // 2번째 플로피: 명시 param 우선, 없으면 MAME_FLOP2 폴백(legacy launch.sh 동형). System+Sampling
     // 2장짜리 게임은 두 장을 동시에 물려야 인게임까지 부팅된다 — 1장이면 검정 hang.
     let flop2_env = std::env::var("MAME_FLOP2").ok();
@@ -260,7 +270,8 @@ pub fn launch(l: &Launch) -> std::io::Result<Launched> {
         pluginspath: &pluginspath,
         media: l.content,
         headless: l.headless,
-        cbus0: Some(&cbus0),
+        sound: l.sound,
+        cbus0: Some(cbus0),
         flop2,
         name: l.name,
         session_token: l.session_token,
