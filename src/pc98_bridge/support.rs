@@ -454,15 +454,17 @@ pub(super) fn mark_event_enriched(event: &mut Value) {
 pub(super) fn state_restore_info() -> Value {
     json!({
         "format": STATE_FORMAT,
-        "scope": "cpu-register-packet-plus-ram-tvram-gvram-plus-mame-save-items",
+        "scope": "cpu-register-packet-plus-ram-tvram-gvram-plus-mame-save-items-plus-presented-framebuffer",
         "deterministic_replay": true,
         "hidden_device_state": true,
         "save_manager_items": true,
         "save_manager_restore": "best_effort_lua_item_write",
         "post_restore_instruction_exact": true,
+        "presented_framebuffer": true,
+        "presented_framebuffer_restore": "exact_saved_raster_without_guest_advance",
         "native_atomic_machine_state_load": false,
         "freeze_strategy": "lua_frozen_socket_service",
-        "notes": "PC-98 state bundles restore RAM/TVRAM/GVRAM, MAME save-manager items exposed through Lua, and the i386 register packet.",
+        "notes": "PC-98 state bundles restore RAM/TVRAM/GVRAM, MAME save-manager items exposed through Lua, the i386 register packet, and the last presented raster image.",
     })
 }
 
@@ -591,6 +593,42 @@ pub(super) fn state_format(manifest: &Value) -> BridgeResult<String> {
     Ok(format.into())
 }
 
+pub(super) fn parse_framebuffer_response(
+    response: &str,
+    command: &str,
+) -> BridgeResult<serde_json::Map<String, Value>> {
+    let parts: Vec<_> = response.split('|').collect();
+    if parts.len() != 4 || parts[0] != "OK" {
+        return Err(BridgeError::Emulator(format!(
+            "MAME {command} failed: {response}"
+        )));
+    }
+    let parse = |name: &str, raw: &str| {
+        raw.parse::<u64>().map_err(|_| {
+            BridgeError::Emulator(format!(
+                "MAME {command} returned invalid {name}: {response}"
+            ))
+        })
+    };
+    let width = parse("width", parts[1])?;
+    let height = parse("height", parts[2])?;
+    let bytes = parse("byte count", parts[3])?;
+    let expected = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| BridgeError::Emulator(format!("MAME {command} dimensions overflow")))?;
+    if width == 0 || height == 0 || bytes != expected {
+        return Err(BridgeError::Emulator(format!(
+            "MAME {command} returned inconsistent framebuffer geometry: {response}"
+        )));
+    }
+    Ok(serde_json::Map::from_iter([
+        ("width".into(), json!(width)),
+        ("height".into(), json!(height)),
+        ("bytes".into(), json!(bytes)),
+    ]))
+}
+
 pub(super) fn extract_save_items<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     manifest: &Value,
@@ -646,6 +684,75 @@ pub(super) fn extract_save_items<R: Read + Seek>(
         fs::write(dest, bytes)?;
     }
     Ok(Some(out_dir))
+}
+
+pub(super) fn extract_presented_framebuffer<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    manifest: &Value,
+    target_root: &Path,
+) -> BridgeResult<Option<PathBuf>> {
+    let Some(framebuffer) = manifest.get("framebuffer").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let member = framebuffer
+        .get("file")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BridgeError::BadParams("PC-98 state framebuffer is missing file".into()))?;
+    if member != FRAMEBUFFER_MEMBER {
+        return Err(BridgeError::BadParams(format!(
+            "unsupported PC-98 state framebuffer member: {member}"
+        )));
+    }
+    let encoding = framebuffer
+        .get("encoding")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            BridgeError::BadParams("PC-98 state framebuffer is missing encoding".into())
+        })?;
+    if encoding != "mame_rgb32_native" {
+        return Err(BridgeError::BadParams(format!(
+            "unsupported PC-98 state framebuffer encoding: {encoding}"
+        )));
+    }
+    let width = framebuffer
+        .get("width")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| BridgeError::BadParams("PC-98 state framebuffer is missing width".into()))?;
+    let height = framebuffer
+        .get("height")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            BridgeError::BadParams("PC-98 state framebuffer is missing height".into())
+        })?;
+    let expected = framebuffer
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| BridgeError::BadParams("PC-98 state framebuffer is missing bytes".into()))?;
+    if expected == 0 || expected > 16 * 1024 * 1024 {
+        return Err(BridgeError::BadParams(format!(
+            "PC-98 state framebuffer byte count is invalid: {expected}"
+        )));
+    }
+    if width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        != Some(expected)
+    {
+        return Err(BridgeError::BadParams(format!(
+            "PC-98 state framebuffer geometry differs from byte count: {width}x{height}, bytes={expected}"
+        )));
+    }
+    let mut member_file = archive.by_name(FRAMEBUFFER_MEMBER)?;
+    if member_file.size() != expected {
+        return Err(BridgeError::BadParams(format!(
+            "PC-98 state framebuffer size differs: manifest={expected}, archive={}",
+            member_file.size()
+        )));
+    }
+    let output = target_root.join("framebuffer.rgb32");
+    let mut file = File::create(&output)?;
+    std::io::copy(&mut member_file, &mut file)?;
+    Ok(Some(output))
 }
 
 pub(super) fn read_state_regions<R: Read + Seek>(

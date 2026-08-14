@@ -166,6 +166,22 @@ safe wrapper automatically.  For the legacy shell launcher, use both
 Visible launches use MAME's real video and keyboard providers and request a
 windowed, non-maximized window.
 
+Host audio is also off by default and is independent of display visibility. Use
+`launch(..., sound:true)` with either display mode. The launcher leaves MAME's
+audio provider on `auto`, so each supported host selects its own available
+backend instead of inheriting a macOS-specific provider name. For the legacy
+shell path, set `MAME_SOUND=1`. This controls host audio output only.
+
+The MCP launcher separately accepts optional
+`pc98_sound_board:"pc9801_26"` or
+`pc98_sound_board:"pc9801_86"`. Omission keeps C-bus slot 0 empty. Selecting a
+board installs that emulated device but does not enable host output, so audible
+sound normally requires both `sound:true` and `pc98_sound_board`. The matching
+MAME `pc9801_26.zip` or `pc9801_86.zip` ROM set must be available on the MAME
+rompath; emucap does not distribute or copy it. MAME 0.288 also lists the
+PC-9801-118, but its board ROM is undumped in the pinned source, so emucap does
+not advertise it as a supported choice.
+
 Do not run raw MAME directly for PC-98 probes.  If a direct diagnostic command
 is needed, use `adapters/mame-pc98/work/mame` or
 `EMUCAP_MAME_RAW_BIN=/path/to/mame adapters/mame-pc98/mame-headless.sh ...`.
@@ -182,8 +198,10 @@ The current local `pc9801rs` set is enough for a headless boot when the default
 adapters/mame-pc98/launch.sh "/path/to/system.hdm" <listening_port> pc98-session pc9801rs
 ```
 
-Set `MAME_CBUS0=<slot>` explicitly only when you have the matching sound-card
-ROMs and want to override that headless default.
+For MCP launches, use `pc98_sound_board` rather than an environment variable.
+The legacy shell path retains `MAME_CBUS0=<slot>` as an escape hatch when the
+matching sound-card ROMs are present. An explicit MCP argument takes precedence
+over a server-process `MAME_CBUS0` value.
 
 Optional:
 
@@ -191,6 +209,7 @@ Optional:
 MAME_FLOP2="/path/to/sampling.hdm" \
 MAME_GDB_PORT=3264 \
 MAME_HEADLESS=1 \
+MAME_SOUND=1 \
 MAME_HOME=/path/to/custom-mame-home \
 EMUCAP_LOG=/path/to/custom.log \
 adapters/mame-pc98/launch.sh "/path/to/system.hdm" <listening_port>
@@ -284,16 +303,23 @@ than a cartridge ROM; regression ROM checks use the same `sha1` field.
 
 `save_state`/`load_state` use an emucap-specific zip bundle with format
 `emucap-mame-pc98-state-v2`, not MAME's native `.sta` format.  The bundle stores
-the i386 register packet, RAM, TVRAM, GVRAM regions, and MAME save-manager items
-exposed through Lua; legacy `emucap-mame-pc98-state-v1` bundles remain readable.
+the i386 register packet, RAM, TVRAM, GVRAM regions, MAME save-manager items
+exposed through Lua, and the last raster image actually presented by MAME;
+legacy bundles remain readable.
 Loading restores save-manager items first, writes the memory regions back, and
-restores registers through the Lua bridge's `regload` command.  This is useful
+finishes MAME's post-load callbacks before restoring the saved presented raster,
+then restores registers through the Lua bridge's `regload` command.  Restoring
+the raster does not run a frame or otherwise advance guest time, so an immediate
+`screenshot` observes the image saved at that boundary instead of a stale or
+newly cleared render buffer.  Older bundles without a captured raster still load,
+but report `visual_refresh.status=unavailable`.  This is useful
 for memory-surface inspection and includes the registered MAME device items.
 After `regload`, the Lua plugin keeps servicing the GDB socket while the
 debugger is stopped, so MCP `read_memory` and `get_state` observe the restored
 instruction slot before it executes.  This is deterministic replay at the MCP
 surface, but it is still not a native C++ MAME machine-state load.
-`load_state` returns `restore_strategy`, `post_restore_instruction_exact`, and
+`load_state` returns `restore_strategy`, `post_restore_instruction_exact`,
+`visual_refresh` (including `frames_advanced=0`), and
 the observed post-load `observed_pc`/`observed_eip`/`observed_cs` fields.  The
 adapter reports `state_restore.deterministic_replay=true`,
 `state_restore.hidden_device_state=true`, and

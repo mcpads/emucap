@@ -25,6 +25,7 @@ const LEGACY_STATE_FORMAT: &str = "emucap-mame-pc98-state-v1";
 const STATE_FORMAT: &str = "emucap-mame-pc98-state-v2";
 const SAVE_ITEMS_DIR: &str = "saveitems";
 const SAVE_ITEMS_MANIFEST: &str = "saveitems/manifest.txt";
+const FRAMEBUFFER_MEMBER: &str = "screen/framebuffer.rgb32";
 const METHODS: &[&str] = &[
     "hello",
     "status",

@@ -265,6 +265,10 @@ impl<G: GdbTransport> Bridge<G> {
             let mut save_items = self.save_lua_save_items(&save_items_dir)?;
             save_items.insert("dir".into(), json!(SAVE_ITEMS_DIR));
             let save_items_members = save_item_members(&save_items_dir)?;
+            let framebuffer_path = save_items_dir.join("framebuffer.rgb32");
+            let mut framebuffer = self.save_presented_framebuffer(&framebuffer_path)?;
+            framebuffer.insert("file".into(), json!(FRAMEBUFFER_MEMBER));
+            framebuffer.insert("encoding".into(), json!("mame_rgb32_native"));
             let file = File::create(&partial_path)?;
             let mut zip = ZipWriter::new(file);
             let options =
@@ -293,6 +297,9 @@ impl<G: GdbTransport> Bridge<G> {
                 let mut file = File::open(src_path)?;
                 std::io::copy(&mut file, &mut zip)?;
             }
+            zip.start_file(FRAMEBUFFER_MEMBER, options)?;
+            let mut framebuffer_file = File::open(&framebuffer_path)?;
+            std::io::copy(&mut framebuffer_file, &mut zip)?;
             zip.start_file("state.json", options)?;
             let manifest = json!({
                 "format": STATE_FORMAT,
@@ -301,6 +308,7 @@ impl<G: GdbTransport> Bridge<G> {
                 "registers_hex": regs_hex,
                 "regions": regions,
                 "save_items": save_items,
+                "framebuffer": framebuffer,
                 "state_restore": state_restore_info(),
             });
             zip.write_all(&serde_json::to_vec(&manifest)?)?;
@@ -312,6 +320,7 @@ impl<G: GdbTransport> Bridge<G> {
                 "format": STATE_FORMAT,
                 "regions": regions.len(),
                 "save_items": save_items,
+                "framebuffer": framebuffer,
                 "bytes": bytes,
                 "state_restore": state_restore_info(),
             }))
@@ -340,6 +349,8 @@ impl<G: GdbTransport> Bridge<G> {
             let manifest = read_state_manifest(&mut archive)?;
             let state_format = state_format(&manifest)?;
             let save_items_dir = extract_save_items(&mut archive, &manifest, &load_items_dir)?;
+            let framebuffer_path =
+                extract_presented_framebuffer(&mut archive, &manifest, &load_items_dir)?;
             let regions = read_state_regions(&mut archive, &manifest)?;
             let regs_hex = manifest
                 .get("registers_hex")
@@ -352,6 +363,16 @@ impl<G: GdbTransport> Bridge<G> {
                 None => serde_json::Map::new(),
             };
             self.write_state_regions(&regions)?;
+            let postload = self.finish_state_load()?;
+            let visual_refresh = match framebuffer_path {
+                Some(path) => self.restore_presented_framebuffer(&path)?,
+                None => json!({
+                    "status": "unavailable",
+                    "strategy": "not_captured",
+                    "reason": "the state predates presented-framebuffer capture",
+                    "frames_advanced": 0,
+                }),
+            };
             let mut restore_result = serde_json::Map::new();
             restore_result.insert("restore_strategy".into(), json!("memory_only"));
             restore_result.insert("post_restore_instruction_exact".into(), json!(true));
@@ -364,6 +385,8 @@ impl<G: GdbTransport> Bridge<G> {
             out.insert("format".into(), json!(state_format));
             out.insert("regions".into(), json!(regions.len()));
             out.insert("state_restore".into(), state_restore_info());
+            out.insert("postload".into(), postload);
+            out.insert("visual_refresh".into(), visual_refresh);
             out.extend(save_items_result);
             out.extend(restore_result);
             Ok(Value::Object(out))
