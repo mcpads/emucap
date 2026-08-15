@@ -82,7 +82,7 @@ fn unreported_adapter_is_not_promoted() {
 
 #[test]
 fn known_scoped_advertisement_validates() {
-    let value = advertisement_value(&["nds.execution.frame-step-absent"]);
+    let value = advertisement_value(&["nds.execution.frame-step-vblank"]);
     let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
     let status = validate_advertisement(
         &ad,
@@ -93,8 +93,145 @@ fn known_scoped_advertisement_validates() {
     assert_eq!(status.state, "validated", "{:?}", status.errors);
     assert_eq!(
         status.constraints["execution.step.units"],
-        json!(["instructions"])
+        json!(["frames", "instructions"])
     );
+    assert_eq!(
+        status.constraints["execution.step.frames.clock"],
+        json!("nds_vblank_start_complete")
+    );
+    assert_eq!(
+        status.constraints["execution.step.frames.cpu"],
+        json!("shared_scheduler")
+    );
+    assert_eq!(
+        status.constraints["execution.step.frames.terminal_state"],
+        json!("frozen")
+    );
+}
+
+#[test]
+fn ppsspp_frame_step_advertises_vblank_clock_and_frozen_terminal() {
+    let value = advertisement_value(&["ppsspp.execution.frame-step-vblank"]);
+    let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+    let methods = ["status", "step", "step_instructions"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let status = validate_advertisement(&ad, Some("ppsspp-rust-ws"), Some("psp"), &methods);
+
+    assert_eq!(status.state, "validated", "{:?}", status.errors);
+    assert_eq!(
+        status.constraints["execution.step.units"],
+        json!(["frames", "instructions"])
+    );
+    assert_eq!(
+        status.constraints["execution.step.frames.clock"],
+        json!("psp_vblank_start")
+    );
+    assert_eq!(
+        status.constraints["execution.step.frames.terminal_state"],
+        json!("frozen")
+    );
+    assert_eq!(
+        status.constraints["execution.step.frames.presented_output"],
+        json!("not_claimed")
+    );
+}
+
+#[test]
+fn ppsspp_call_stack_advertises_frozen_best_effort_boundary() {
+    let value = advertisement_value(&["ppsspp.call-stack.frozen-best-effort"]);
+    let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+    let methods = ["status", "call_stack"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let status = validate_advertisement(&ad, Some("ppsspp-rust-ws"), Some("psp"), &methods);
+
+    assert_eq!(status.state, "validated", "{:?}", status.errors);
+    assert_eq!(
+        status.constraints["debug.call-stack.execution_states.allowed"],
+        json!(["frozen"])
+    );
+    assert_eq!(status.constraints["debug.call-stack.max_depth"], json!(256));
+    assert_eq!(status.authority["debug.call-stack"], json!("best_effort"));
+}
+
+#[test]
+fn neogeo_call_stack_advertises_frozen_best_effort_boundary() {
+    let value = advertisement_value(&["neogeo.call-stack.frozen-best-effort"]);
+    let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+    let methods = ["status", "call_stack"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    for system in ["neogeo_mvs", "neogeo_aes", "neogeo_cd"] {
+        let status =
+            validate_advertisement(&ad, Some("mame-neogeo-rust-gdb"), Some(system), &methods);
+        assert_eq!(status.state, "validated", "{:?}", status.errors);
+        assert_eq!(
+            status.constraints["debug.call-stack.execution_states.allowed"],
+            json!(["frozen"])
+        );
+        assert_eq!(status.constraints["debug.call-stack.max_depth"], json!(64));
+        assert_eq!(status.authority["debug.call-stack"], json!("best_effort"));
+    }
+}
+
+#[test]
+fn mesen_instruction_step_advertises_main_cpu_scope_without_the_absent_exception() {
+    for system in ["snes", "gamegear", "gb", "gba", "nes"] {
+        let value = advertisement_value(&["mesen.execution.instruction-step-main-cpu"]);
+        let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+        let methods = ["status", "step", "step_instructions"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        let status = validate_advertisement(&ad, Some("mesen2-live"), Some(system), &methods);
+
+        assert_eq!(status.state, "validated", "{system}: {:?}", status.errors);
+        assert_eq!(
+            status.constraints["execution.step.instructions.cpu"],
+            json!("main")
+        );
+        assert_eq!(
+            status.constraints["execution.step.instructions.auxiliary_clocks"],
+            json!("unspecified")
+        );
+        assert!(!status
+            .active_exceptions
+            .iter()
+            .any(|id| id == "mesen.execution.instruction-step-absent"));
+    }
+}
+
+#[test]
+fn dolphin_reset_advertises_native_button_release_and_frozen_terminal() {
+    for system in ["gamecube", "gc", "ngc", "wii"] {
+        let value = advertisement_value(&["dolphin.reset.native-button-tap"]);
+        let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+        let methods = ["status", "reset"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+
+        let status = validate_advertisement(&ad, Some("dolphin-native"), Some(system), &methods);
+
+        assert_eq!(status.state, "validated", "{system}: {:?}", status.errors);
+        assert_eq!(
+            status.constraints["execution.reset.kind"],
+            json!("native_reset_button_tap")
+        );
+        assert_eq!(
+            status.constraints["execution.reset.completion_boundary"],
+            json!("button_release")
+        );
+        assert_eq!(
+            status.constraints["execution.reset.terminal_state"],
+            json!("frozen")
+        );
+    }
 }
 
 #[test]
@@ -135,7 +272,7 @@ fn bounded_advance_features_require_pausing_stops_to_preempt_progress() {
 #[test]
 fn dolphin_native_advertisement_exposes_its_composition_limits() {
     let value = advertisement_value(&[
-        "dolphin.breakpoint.exact-exec-only",
+        "dolphin.breakpoint.pausing-subset",
         "dolphin.input-hold.port-zero-only",
         "dolphin.state-save.frozen-only",
         "dolphin.state-load.frozen-only",
@@ -170,6 +307,14 @@ fn dolphin_native_advertisement_exposes_its_composition_limits() {
     );
     assert_eq!(status.authority["debug.call-stack"], json!("best_effort"));
     assert_eq!(
+        status.constraints["breakpoint.kinds.allowed"],
+        json!(["exec", "read", "write"])
+    );
+    assert_eq!(
+        status.constraints["breakpoint.native_ownership"],
+        json!("remove_only_matching_emucap_id")
+    );
+    assert_eq!(
         status.constraints["video.capture.execution_states.allowed"],
         json!(["running"])
     );
@@ -178,7 +323,7 @@ fn dolphin_native_advertisement_exposes_its_composition_limits() {
 #[test]
 fn dolphin_wii_input_uses_the_scoped_port_zero_contract() {
     let value = advertisement_value(&[
-        "dolphin.breakpoint.exact-exec-only",
+        "dolphin.breakpoint.pausing-subset",
         "dolphin.input-hold.port-zero-only",
         "dolphin.state-save.frozen-only",
         "dolphin.state-load.frozen-only",
@@ -212,7 +357,7 @@ fn unknown_exception_is_unvalidated() {
 
 #[test]
 fn scope_mismatch_is_unvalidated() {
-    let value = advertisement_value(&["nds.execution.frame-step-absent"]);
+    let value = advertisement_value(&["nds.execution.frame-step-vblank"]);
     let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
     let status = validate_advertisement(&ad, Some("wrong"), Some("nds"), &identity_methods());
     assert_eq!(status.state, "unvalidated");

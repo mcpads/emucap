@@ -111,6 +111,7 @@ const BASE_METHODS: &[&str] = &[
     "clear_all_breakpoints",
     "poll_events",
     "disassemble",
+    "call_stack",
 ];
 const ACTIVE_EXCEPTIONS: &[&str] = &[
     "n64.state-read.frozen-only",
@@ -122,6 +123,7 @@ const ACTIVE_EXCEPTIONS: &[&str] = &[
     "n64.execution-resume.r4300-only",
     "n64.input-set.port-zero-only",
     "n64.breakpoint.pausing-subset",
+    "n64.call-stack.frozen-best-effort",
 ];
 
 static DEBUG_READY: AtomicBool = AtomicBool::new(false);
@@ -320,6 +322,7 @@ impl Mupen64PlusHost {
             "clear_all_breakpoints" => self.clear_all_breakpoints(),
             "poll_events" => self.poll_events(&request.params),
             "disassemble" => self.disassemble(&request.params),
+            "call_stack" => self.call_stack(&request.params),
             other => Err(N64Error::Unsupported(other.into())),
         };
         match result {

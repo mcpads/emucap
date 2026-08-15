@@ -96,6 +96,68 @@ impl<T: WsTransport> PpssppBridge<T> {
         Ok(json!({ "instructions": instructions }))
     }
 
+    /// Read PPSSPP's native MIPS stack walk for the currently scheduled PSP thread. The upstream
+    /// debugger requires a halted CPU, and silently pausing here would create a stop event and move
+    /// a running guest before the caller's next observation, so running state is rejected instead.
+    /// PPSSPP derives frames from MIPS code analysis plus the thread's entry/stack bounds; optimized
+    /// or unusual prologues can end the walk early, hence the advertised best-effort authority.
+    pub(super) fn call_stack(&mut self, params: &Value) -> BridgeResult<Value> {
+        if let Some(cpu) = params.get("cpu") {
+            let cpu = cpu.as_str().ok_or_else(|| {
+                BridgeError::BadParams("psp cpu must be a string: main or mips".into())
+            })?;
+            if !matches!(cpu, "main" | "mips") {
+                return Err(BridgeError::BadParams(format!(
+                    "unsupported psp cpu: {cpu}; valid: main, mips"
+                )));
+            }
+        }
+        if !self.cpu_is_stepping()? {
+            return Err(BridgeError::BadState(
+                "call_stack requires a frozen PSP CPU; call pause first".into(),
+            ));
+        }
+        let response = self.ws.call("hle.backtrace", json!({}))?;
+        let source_frames = response
+            .get("frames")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                BridgeError::Emulator("hle.backtrace: reply had no frames array".into())
+            })?;
+        const MAX_STACK_DEPTH: usize = 256;
+        if source_frames.len() > MAX_STACK_DEPTH {
+            return Err(BridgeError::Emulator(format!(
+                "hle.backtrace returned {} frames; maximum is {MAX_STACK_DEPTH}",
+                source_frames.len()
+            )));
+        }
+        let mut frames = Vec::with_capacity(source_frames.len());
+        for (index, frame) in source_frames.iter().enumerate() {
+            let required = |name: &str| {
+                frame.get(name).and_then(Value::as_u64).ok_or_else(|| {
+                    BridgeError::Emulator(format!(
+                        "hle.backtrace: frame {index} had no numeric {name}"
+                    ))
+                })
+            };
+            frames.push(json!({
+                "pc": required("pc")?,
+                "entry": required("entry")?,
+                "sp": required("sp")?,
+                "stack_size": required("stackSize")?,
+                "code": frame.get("code").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+        let depth = frames.len();
+        Ok(json!({
+            "frames": frames,
+            "depth": depth,
+            "order": "innermost_to_outermost",
+            "method": "ppsspp_native_mips_stack_walk",
+            "authority": "best_effort",
+        }))
+    }
+
     /// `cpu.status.stepping` — the real CPU-debugger halt indicator (see the `status()` note on why
     /// `game.status.paused` is not it).
     pub(super) fn cpu_is_stepping(&mut self) -> BridgeResult<bool> {
@@ -391,40 +453,67 @@ impl<T: WsTransport> PpssppBridge<T> {
         Ok(json!({ "state": "running" }))
     }
 
-    /// Wire method `step` retained for older hosts and direct calls. The current public MCP routes
-    /// instruction stepping to the `step_instructions` wire method. PPSSPP has no frame-advance
-    /// primitive, so a frame-step request is rejected rather than silently reinterpreted as an
-    /// instruction count (which would make a 60-frame advance step 60 instructions and derail
-    /// freeze-step/tap).
-    /// `unit:"instructions"` (and the lenient bare `step` with no unit and no `frames`) route to the
-    /// same `cpu.stepInto` logic as the `step_instructions` wire method.
-    ///
-    /// Advertisement: this wire method is *not* in `METHODS` (so the MCP's `has("step")` frame-step
-    /// composites — `tap`/`hold_until` — stay correctly disabled on PSP, since they
-    /// drive frame `step` which PPSSPP cannot do), and it is *not* claimed as "planned" either
-    /// (frame-step is a permanent gap, not a pending feature). The stepping that does work is
-    /// advertised as `step_instructions` in `METHODS` plus `step_units == ["instructions"]`.
-    /// The dispatch arm stays for wire compatibility and lets a frame-step request return a precise
-    /// `unsupported` rather than `unknown_method`.
+    /// Public frame stepping uses the fork's `emucap.frameStep`, whose clock is emulated PSP
+    /// VBlank start. Instruction stepping keeps the existing `cpu.stepInto` route. Older direct
+    /// callers that omit both `unit` and `frames` retain their instructions-only interpretation;
+    /// the MCP always sends `{frames:n}` for frame units, so the two meanings are unambiguous.
     pub(super) fn step(&mut self, params: &Value) -> BridgeResult<Value> {
         match params.get("unit").and_then(Value::as_str) {
-            Some("instructions") => {}
+            Some("instructions") => return self.step_instructions(params),
+            Some("frames") => return self.step_frames(params),
             Some(other) => {
                 return Err(BridgeError::Unsupported(format!(
-                    "step unit={other} (psp bridge steps by instructions only — PPSSPP has no frame-advance)"
+                    "step unit={other}; valid PSP units are frames and instructions"
                 )));
             }
             None => {
                 if params.get("frames").is_some() {
-                    return Err(BridgeError::Unsupported(
-                        "psp bridge: frame step unsupported — PPSSPP has no frame-advance primitive. \
-                         Use step(unit=instructions) instead."
-                            .into(),
-                    ));
+                    return self.step_frames(params);
                 }
             }
         }
         self.step_instructions(params)
+    }
+
+    /// Advance from a debugger halt to exactly `count` emulated PSP VBlank-start boundaries, then
+    /// halt again. The fork returns `interrupted` with a partial count when a breakpoint or another
+    /// core stop wins. A host presentation is deliberately not implied by completion.
+    pub(super) fn step_frames(&mut self, params: &Value) -> BridgeResult<Value> {
+        let count = step_count(params)?;
+        if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(BridgeError::BadParams(format!(
+                "frame count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
+                crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            )));
+        }
+        let deadline = crate::live::temporal::OperationDeadline::after(
+            crate::live::temporal::MAX_SYNC_OPERATION_TIME,
+        );
+        let status_timeout = deadline.remaining_timeout().ok_or_else(|| {
+            BridgeError::Emulator("frame step deadline expired before CPU status".into())
+        })?;
+        if !self.cpu_is_stepping_with_timeout(status_timeout)? {
+            let pause_timeout = deadline.remaining_timeout().ok_or_else(|| {
+                BridgeError::Emulator("frame step deadline expired before halting the CPU".into())
+            })?;
+            self.ws
+                .call_with_timeout("cpu.stepping", json!({}), pause_timeout)?;
+        }
+        let frame_timeout = deadline.remaining_timeout().ok_or_else(|| {
+            BridgeError::Emulator("frame step deadline expired before backend advance".into())
+        })?;
+        let response = self.ws.call_with_timeout(
+            "emucap.frameStep",
+            json!({ "count": count }),
+            frame_timeout,
+        )?;
+        if deadline.expired() {
+            return Err(BridgeError::Emulator(format!(
+                "frame step exceeded the {} ms operation deadline; the fork was required to halt before replying",
+                crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis()
+            )));
+        }
+        Ok(response)
     }
 
     /// `cpu.stepInto`, called `count` times (PPSSPP has no step-count parameter — see
@@ -543,9 +632,8 @@ impl<T: WsTransport> PpssppBridge<T> {
         ))
     }
 
-    /// Drain PPSSPP's spontaneous events, keep the `cpu.stepping` stops (a breakpoint hit or a
-    /// stepping-request completion — PPSSPP does not distinguish them at the wire, see the module
-    /// doc), and normalize each into `{type, pc, ticks, regs, [breakpoint_id, kind, address, id]}`.
+    /// Drain PPSSPP's spontaneous events, keep the `cpu.stepping` stops, and normalize each into
+    /// `{type, pc, ticks, reason?, relatedAddress?, regs, [breakpoint_id, kind, address, id]}`.
     /// Non-stop events (`cpu.resume`, `input.*`, log lines, ...) are dropped, not queued — mirroring
     /// the NDS bridge dropping its own SIGINT stops. `breakpoint_id` filters like the NDS bridge: a
     /// non-matching event is held in `self.events` for a later poll instead of being dropped.
@@ -586,22 +674,61 @@ impl<T: WsTransport> PpssppBridge<T> {
         Ok(json!({ "events": out, "dropped": dropped }))
     }
 
-    /// Build the base `{type:"stop", pc, ticks, regs}` shape from a raw `cpu.stepping` event, then
-    /// classify it as a breakpoint hit if possible. An exec breakpoint is matched directly (the
-    /// event's `pc` equals the breakpoint address). A memory breakpoint cannot be matched that way
-    /// — the event's `pc` is the accessing instruction's address, not the watched address — so it is
-    /// attributed via a `memory.breakpoint.list` hit-count delta: the first tracked memory
-    /// breakpoint whose `hits` grew since the last check is reported as the source. Simultaneous
-    /// memory breakpoint hits are a known best-effort limitation (only one is attributed per event).
+    /// Build the base stop shape from a raw `cpu.stepping` event, then classify an actual breakpoint
+    /// reason by its producer-supplied related address. Explicit non-breakpoint reasons are terminal:
+    /// they must never be reinterpreted just because their PC happens to equal a registered exec
+    /// breakpoint. Older compatible forks emitted no reason; only for those bare events do we retain
+    /// the PC / memory-hit-counter inference below.
     pub(super) fn enrich_stop(&mut self, event: Value) -> BridgeResult<Value> {
         let pc = event.get("pc").and_then(Value::as_u64);
         let ticks = event.get("ticks").cloned().unwrap_or(Value::Null);
         let mut out = json!({ "type": "stop", "pc": pc, "ticks": ticks });
+        let reason = event.get("reason").and_then(Value::as_str);
+        let related_address = event.get("relatedAddress").and_then(Value::as_u64);
+        if let Some(reason) = reason {
+            out["reason"] = json!(reason);
+        }
+        if let Some(address) = related_address {
+            out["relatedAddress"] = json!(address);
+        }
         match self.fetch_cpu_state() {
             Ok(state) => out["regs"] = state,
             Err(err) => out["regs_error"] = json!(err.to_string()),
         }
 
+        if let Some(reason) = reason {
+            match reason {
+                "cpu.breakpoint" => {
+                    let address = related_address.or(pc);
+                    if let Some(address) = address {
+                        if let Some((&id, _)) = self
+                            .bps
+                            .iter()
+                            .find(|(_, bp)| bp.kind == "exec" && bp.address == address)
+                        {
+                            mark_breakpoint_hit(&mut out, id, "exec", address);
+                        }
+                    }
+                }
+                "memory.breakpoint" => {
+                    if let Some(address) = related_address {
+                        if let Some((&id, bp)) = self
+                            .bps
+                            .iter()
+                            .find(|(_, bp)| bp.kind != "exec" && bp.address == address)
+                        {
+                            let kind = bp.kind.clone();
+                            mark_breakpoint_hit(&mut out, id, &kind, address);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(out);
+        }
+
+        // Compatibility fallback for older emucap PPSSPP builds whose cpu.stepping event omitted
+        // the stop reason. Never use this path when the producer supplied an explicit reason.
         if let Some(pc) = pc {
             if let Some((&id, _)) = self
                 .bps

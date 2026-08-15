@@ -263,7 +263,7 @@ struct CSFrame {
 std::vector<CSFrame> g_callstack;
 static const size_t CALLSTACK_CAP = 256;
 std::string g_sp_reg_name;  // 캐시된 SP 레지스터 이름(set_trace 켤 때 해소; 매 명령 스캔 회피)
-// break_on_reset(카트리지 전용 — MD/PCE): 게임이 리셋 벡터를 재실행하면(워치독 리셋·크래시→리셋) freeze한다.
+// break_on_reset(카트리지 전용 — MD/PCE/WS): 게임이 리셋 벡터를 재실행하면(워치독 리셋·크래시→리셋) freeze한다.
 // 디스크(SS/PSX)는 "리셋"이 BIOS 부팅이라 개념이 안 맞아 미advertise(exec BP를 BIOS 엔트리에 거는 대체 사용).
 bool g_break_on_reset = false;
 uint32 g_reset_entry = 0;  // 리셋 진입 PC(enable 시 벡터에서 읽음)
@@ -1098,6 +1098,13 @@ const char* system_shortname() {
 
 bool is_psx() {
   return !strcmp(system_shortname(), "psx");
+}
+
+uint32 fold_psx_exec_address(uint32 address) {
+  static const uint32 masks[8] = {
+      0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+      0x7FFFFFFFu, 0x1FFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+  return address & masks[address >> 29];
 }
 
 bool is_pce() {
@@ -2773,8 +2780,12 @@ void handle_call_stack(long id) {
   reply_ok(id, out);
 }
 
-// 리셋 진입 PC를 벡터에서 읽는다 — MD(68000): $4의 32비트 BE longword; PCE(HuC6280): $FFFE의 16비트 LE word.
+// Reset entry address: MD reads a big-endian longword at $4, PCE reads a little-endian word at
+// $FFFE, and WonderSwan uses the 20-bit physical form of reset CS:IP FFFF:0000 (0xFFFF0).
 uint32 read_reset_entry() {
+  // WonderSwan has a fixed architectural reset vector and does not need a named
+  // Mednafen address space. Check it before the MD/PCE address-space lookup.
+  if (is_ws()) return 0xFFFF0u;
   AddressSpaceType* sp = find_aspace("cpu");
   if (!sp) return 0;
   if (is_md()) {
@@ -2790,10 +2801,10 @@ uint32 read_reset_entry() {
   return 0;
 }
 
-// break_on_reset(enabled): 게임이 리셋 진입을 실행하면 freeze한다(source="reset"). 카트리지 MD/PCE 전용 —
+// break_on_reset(enabled): 게임이 리셋 진입을 실행하면 freeze한다(source="reset"). 카트리지 MD/PCE/WS 전용 —
 // 디스크(SS/PSX)는 "리셋"=BIOS 부팅이라 개념이 안 맞아 미advertise·거부(exec BP를 BIOS 엔트리에 거는 대체).
 void handle_break_on_reset(long id, const std::string& line) {
-  if (!is_md() && !is_pce()) {
+  if (!is_md() && !is_pce() && !is_ws()) {
     reply_err(id, "unsupported",
               "break_on_reset is available only for cartridge systems; use an exec breakpoint at the BIOS entry for disc systems");
     return;
@@ -2847,9 +2858,9 @@ void handle(const std::string& line) {
     }
     // Saturn 전용 VDP2 디코드 메서드. SS일 때만 advertise(다른 시스템엔 미advertise — 발견 표면 최소화).
     // PeekRawReg는 ss 코어 심볼이라 ss 외엔 의미 없음. has_debugger와 함께 조건을 확인한다.
-    // break_on_reset: 카트리지(MD/PCE)만 리셋 벡터가 있어 advertise한다 — 디스크(SS/PSX)는 "리셋"이 BIOS
+    // break_on_reset: 카트리지(MD/PCE/WS)만 리셋 벡터가 있어 advertise한다 — 디스크(SS/PSX)는 "리셋"이 BIOS
     // 부팅이라 개념이 안 맞으므로 미advertise(status.methods가 현실 반영 — "보이는데 안 됨" 없음).
-    if (has_debugger && (is_md() || is_pce())) {
+    if (has_debugger && (is_md() || is_pce() || is_ws())) {
       methods += ",\"break_on_reset\"";
     }
     if (has_debugger && is_ss()) {
@@ -3245,6 +3256,18 @@ void handle(const std::string& line) {
                   "Neo Geo Pocket TLCS exec breakpoint addresses are 24-bit");
         return;
       }
+    } else if (is_psx()) {
+      if (type == BPOINT_PC) {
+        const uint32 folded_start = fold_psx_exec_address(start);
+        const uint32 folded_end = fold_psx_exec_address(end);
+        if (folded_end < folded_start) {
+          reply_err(id, "bad_params",
+                    "PlayStation exec breakpoint range crosses incompatible CPU address mirrors");
+          return;
+        }
+        start = folded_start;
+        end = folded_end;
+      }
     } else if (is_pce()) {
       // HuC6280 exec BP는 16비트 논리 주소(MPR 뱅킹) — 코어(pce/debug.cpp)가 i<65536만 arm하고 거대 span은
       // O(span) 루프라, MD/SS/WS처럼 범위 밖을 조용히 드롭하지 않고 명확히 거부한다(exec 상한이 DoS도 캡).
@@ -3546,7 +3569,8 @@ void handle(const std::string& line) {
                     : g_bps[i].type == BPOINT_AUX_WRITE ? "write" : "exec";
       char b[192];
       snprintf(b, sizeof(b), "%s{\"id\":%ld,\"kind\":\"%s\",\"start\":%u,\"end\":%u,\"logical\":%s,\"pause_on_hit\":%s",
-               i ? "," : "", g_bps[i].id, k, (unsigned)g_bps[i].a1, (unsigned)g_bps[i].a2,
+               i ? "," : "", g_bps[i].id, k, (unsigned)g_bps[i].public_a1,
+               (unsigned)g_bps[i].public_a2,
                g_bps[i].logical ? "true" : "false",
                g_bps[i].pause_on_hit ? "true" : "false");
       arr += b;
@@ -3650,15 +3674,17 @@ void handle(const std::string& line) {
           snprintf(b, sizeof(b), ",\"value\":%u", (unsigned)h.value);
           arr += b;
         }
-        if (!h.source.empty()) {
-          arr += ",\"source\":\"";
-          arr += json_escape(h.source);
-          arr += "\"";
-        }
-        if (h.has_source_addr) {
-          snprintf(b, sizeof(b), ",\"source_address\":%u", (unsigned)h.source_addr);
-          arr += b;
-        }
+      }
+      // Event provenance applies to execution boundaries such as reset as well
+      // as to memory accesses, so it must not be nested under has_access.
+      if (!h.source.empty()) {
+        arr += ",\"source\":\"";
+        arr += json_escape(h.source);
+        arr += "\"";
+      }
+      if (h.has_source_addr) {
+        snprintf(b, sizeof(b), ",\"source_address\":%u", (unsigned)h.source_addr);
+        arr += b;
       }
       if (!h.registers.empty()) {
         arr += ",\"registers\":";
@@ -3793,8 +3819,16 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
         enqueue_bp_hit(hit, g_watch_pause);
       }
     }
-    // break_on_reset: 게임이 리셋 진입 PC를 실행하면(워치독 리셋·크래시→리셋) freeze한다(source="reset").
-    if (g_break_on_reset && PC == g_reset_entry) {
+    // The WonderSwan callback reports only the 16-bit IP. Combine it with CS before comparison;
+    // comparing IP=0 alone would falsely report every segment boundary as a reset.
+    uint32 reset_address = PC;
+    if (g_break_on_reset && is_ws()) {
+      uint32 cs = 0;
+      reset_address = read_register_by_name("CS", cs)
+                          ? (((cs & 0xFFFFu) << 4) + (PC & 0xFFFFu)) & 0xFFFFFu
+                          : 0xFFFFFFFFu;
+    }
+    if (g_break_on_reset && reset_address == g_reset_entry) {
       BPHit hit{};
       hit.pc = PC;
       hit.source = "reset";
@@ -3856,9 +3890,10 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
       if (b.pause_on_hit) should_freeze = true;
     }
   } else {
+    const uint32 exec_pc = is_psx() ? fold_psx_exec_address(PC) : PC;
     for (auto& b : g_bps) {
       if (b.adapter_bp) continue;
-      if (b.type != BPOINT_PC || PC < b.a1 || PC > b.a2) continue;
+      if (b.type != BPOINT_PC || exec_pc < b.a1 || exec_pc > b.a2) continue;
       if (!bp_pc_allows(b, PC)) continue;
       matched = true;
       matched_breakpoints.push_back(&b);

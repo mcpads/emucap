@@ -15,6 +15,20 @@
       "verification": ["contract-test:mesen-step-units"]
     },
     {
+      "id": "mesen.execution.instruction-step-main-cpu",
+      "feature": "execution.step",
+      "kind": "variation_binding",
+      "targets": ["EXEC.STEP.INSTR.1"],
+      "scope": {"adapter": "mesen2-live", "systems": ["snes", "gamegear", "gb", "gba", "nes"]},
+      "activation": {"method": "step_instructions"},
+      "constraints": {
+        "execution.step.instructions.cpu": "main",
+        "execution.step.instructions.auxiliary_clocks": "unspecified"
+      },
+      "public_behavior": {"invalid": "unsupported"},
+      "verification": ["contract-test:mesen-instruction-step-main-cpu"]
+    },
+    {
       "id": "mesen.call-stack.best-effort",
       "feature": "debug.call-stack",
       "kind": "variation_binding",
@@ -186,15 +200,25 @@
       "verification": ["contract-test:flycast-set-input-port-rejected"]
     },
     {
-      "id": "nds.execution.frame-step-absent",
+      "id": "nds.execution.frame-step-vblank",
       "feature": "execution.step",
-      "kind": "capability_absent",
-      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
+      "kind": "variation_binding",
+      "targets": ["EXEC.STEP.FRAME.1", "TIME.EXACT.1", "TIME.STOP.1"],
       "scope": {"adapter": "desmume-nds-rust-gdb", "systems": ["nds"]},
-      "activation": {"native_frame_step": false},
-      "constraints": {"execution.step.units": ["instructions"]},
-      "public_behavior": {"invalid": "unsupported"},
-      "verification": ["contract-test:nds-step-units"]
+      "activation": {"method": "step"},
+      "constraints": {
+        "execution.step.units": ["frames", "instructions"],
+        "execution.step.frames.clock": "nds_vblank_start_complete",
+        "execution.step.frames.cpu": "shared_scheduler",
+        "execution.step.frames.terminal_state": "frozen",
+        "execution.step.frames.presented_output": "not_claimed"
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:nds-step-units",
+        "runtime-test:nds-vblank-frame-step-frozen",
+        "runtime-test:nds-frame-step-breakpoint-preemption"
+      ]
     },
     {
       "id": "nds.call-stack.best-effort",
@@ -253,15 +277,23 @@
       ]
     },
     {
-      "id": "ppsspp.execution.frame-step-absent",
+      "id": "ppsspp.execution.frame-step-vblank",
       "feature": "execution.step",
-      "kind": "capability_absent",
-      "targets": ["CORE.AVAIL.1", "EXEC.STEP.FRAME.1"],
+      "kind": "variation_binding",
+      "targets": ["EXEC.STEP.FRAME.1", "TIME.EXACT.1", "TIME.STOP.1"],
       "scope": {"adapter": "ppsspp-rust-ws", "systems": ["psp"]},
-      "activation": {"native_frame_step": false},
-      "constraints": {"execution.step.units": ["instructions"]},
-      "public_behavior": {"invalid": "unsupported"},
-      "verification": ["contract-test:ppsspp-step-units"]
+      "activation": {"method": "step"},
+      "constraints": {
+        "execution.step.units": ["frames", "instructions"],
+        "execution.step.frames.clock": "psp_vblank_start",
+        "execution.step.frames.terminal_state": "frozen",
+        "execution.step.frames.presented_output": "not_claimed"
+      },
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:ppsspp-step-units",
+        "runtime-test:ppsspp-vblank-frame-step-frozen"
+      ]
     },
     {
       "id": "ppsspp.input-hold.port-zero-only",
@@ -273,6 +305,24 @@
       "constraints": {"input.ports.allowed": [0]},
       "public_behavior": {"invalid": "bad_params"},
       "verification": ["contract-test:ppsspp-set-input-port-rejected"]
+    },
+    {
+      "id": "ppsspp.call-stack.frozen-best-effort",
+      "feature": "debug.call-stack",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "ppsspp-rust-ws", "systems": ["psp"]},
+      "activation": {"method": "call_stack", "execution_state": "not_frozen"},
+      "constraints": {
+        "debug.call-stack.execution_states.allowed": ["frozen"],
+        "debug.call-stack.max_depth": 256
+      },
+      "authority": {"debug.call-stack": "best_effort"},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:ppsspp-call-stack-running-rejected",
+        "runtime-test:ppsspp-call-stack-frozen-best-effort"
+      ]
     },
     {
       "id": "ppsspp.input-pulse.constraints",
@@ -522,31 +572,43 @@
       ]
     },
     {
-      "id": "dolphin.breakpoint.exact-exec-only",
+      "id": "dolphin.breakpoint.pausing-subset",
       "feature": "debug.breakpoint",
       "kind": "parameter_constraint",
-      "targets": ["CORE.PARAM.1", "BP.ARMED.1"],
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
       "scope": {
         "adapter": "dolphin-native",
         "systems": ["gamecube", "gc", "ngc", "wii"]
       },
       "activation": {
-        "kind": "not_exec",
-        "range": "not_exact",
+        "kind": "not_exec_read_write",
+        "exec_range": "not_exact",
+        "read_write_memory_type": "not_main",
+        "read_write_span": "above_65536",
+        "access_ambiguity": "within_7_bytes",
         "pause_on_hit": false,
         "conditions": "present"
       },
       "constraints": {
-        "breakpoint.kinds.allowed": ["exec"],
-        "breakpoint.range": "exact",
+        "breakpoint.kinds.allowed": ["exec", "read", "write"],
+        "breakpoint.exec.range": "exact",
+        "breakpoint.exec.address": "aligned_powerpc_effective_u32",
+        "breakpoint.read_write.memory_types.allowed": ["main"],
+        "breakpoint.read_write.address": "powerpc_effective_u32",
+        "breakpoint.read_write.max_span": 65536,
+        "breakpoint.read_write.max_access_width": 8,
+        "breakpoint.overlap.access_identity.allowed": false,
         "breakpoint.pause_on_hit.allowed": [true],
-        "breakpoint.conditions.supported": false
+        "breakpoint.conditions.supported": false,
+        "breakpoint.snapshot.supported": false,
+        "breakpoint.max_count": 128,
+        "breakpoint.native_ownership": "remove_only_matching_emucap_id"
       },
       "public_behavior": {"invalid": "bad_params"},
       "verification": [
-        "contract-test:dolphin-breakpoint-kind-rejected",
-        "contract-test:dolphin-breakpoint-range-rejected",
-        "contract-test:dolphin-breakpoint-options-rejected"
+        "contract-test:dolphin-breakpoint-subset-rejected-before-mutation",
+        "contract-test:dolphin-breakpoint-trigger-identity-non-overlap",
+        "runtime-test:dolphin-watchpoint-hit-context-and-native-ownership"
       ]
     },
     {
@@ -630,6 +692,24 @@
       "constraints": {},
       "authority": {"debug.call-stack": "best_effort"},
       "verification": ["contract-test:dolphin-call-stack-authority"]
+    },
+    {
+      "id": "dolphin.reset.native-button-tap",
+      "feature": "execution.reset",
+      "kind": "variation_binding",
+      "targets": ["TIME.COMPLETE.1", "TIME.GENERATION.1"],
+      "scope": {
+        "adapter": "dolphin-native",
+        "systems": ["gamecube", "gc", "ngc", "wii"]
+      },
+      "activation": {"method": "reset"},
+      "constraints": {
+        "execution.reset.kind": "native_reset_button_tap",
+        "execution.reset.completion_boundary": "button_release",
+        "execution.reset.terminal_state": "frozen"
+      },
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["runtime-test:dolphin-reset-button-release-frozen"]
     },
     {
       "id": "openmsx.state-read.frozen-only",
@@ -759,6 +839,24 @@
       "constraints": {"state.read.execution_states.allowed": ["frozen"]},
       "public_behavior": {"invalid": "bad_state"},
       "verification": ["contract-test:neogeo-state-running-rejected"]
+    },
+    {
+      "id": "neogeo.call-stack.frozen-best-effort",
+      "feature": "debug.call-stack",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "mame-neogeo-rust-gdb", "systems": ["neogeo_mvs", "neogeo_aes", "neogeo_cd"]},
+      "activation": {"method": "call_stack", "execution_state": "not_frozen"},
+      "constraints": {
+        "debug.call-stack.execution_states.allowed": ["frozen"],
+        "debug.call-stack.max_depth": 64
+      },
+      "authority": {"debug.call-stack": "best_effort"},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:neogeo-call-stack-running-rejected",
+        "runtime-test:neogeo-call-stack-frozen-native"
+      ]
     },
     {
       "id": "neogeo.state-save.frozen-only",
@@ -946,6 +1044,26 @@
       "constraints": {"memory.read.execution_states.allowed": ["frozen"]},
       "public_behavior": {"invalid": "bad_state"},
       "verification": ["contract-test:n64-read-running-rejected"]
+    },
+    {
+      "id": "n64.call-stack.frozen-best-effort",
+      "feature": "debug.call-stack",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "mupen64plus-native", "systems": ["n64"]},
+      "activation": {"method": "call_stack", "execution_state": "not_frozen"},
+      "constraints": {
+        "debug.call-stack.execution_states.allowed": ["frozen"],
+        "debug.call-stack.cpus.allowed": ["r4300"],
+        "debug.call-stack.max_depth": 64,
+        "debug.call-stack.scan_bytes": 4096
+      },
+      "authority": {"debug.call-stack": "best_effort"},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:n64-call-stack-r4300-frozen-best-effort",
+        "runtime-test:n64-call-stack-bounded-stack-scan"
+      ]
     },
     {
       "id": "n64.memory-read.bounded",

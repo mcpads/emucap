@@ -5,11 +5,13 @@ assert(SYS and SYS.buttons and SYS.cpu_type and SYS.default_memtype and SYS.addr
   "emucap-core: global SYS config is missing; set SYS in the entry script before loading the core")
 assert(SYS.snapshot_regs,
   "emucap-core: SYS.snapshot_regs is missing; the entry script must provide it")
--- disassemble/op_is_call/op_is_return은 optional이다. Lua ISA 디코더와 SP기반 콜스택 모델이 맞는
--- 시스템(SNES=65816·GG=Z80·GB=SM83)만 제공한다. ARM(GBA)처럼 디코더가 크고 콜스택이 LR기반이라 코어의
--- SP모델과 안 맞는 ISA는 이 셋을 비우면 disassemble·call_stack을 미지원으로 광고·거부한다.
+-- disassemble/op_is_call/op_is_return are optional.  An ISA whose calls do not fit the generic SP
+-- shadow model can instead provide a bounded SYS.call_stack(state) implementation.
 local HAS_DISASM = SYS.disassemble ~= nil
-local HAS_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
+local HAS_SHADOW_CALLSTACK = (SYS.op_is_call ~= nil) and (SYS.op_is_return ~= nil)
+local HAS_HOST_NATIVE_CALLSTACK = type(emu.getCallstack) == "function"
+local HAS_NATIVE_CALLSTACK = SYS.native_call_stack and HAS_HOST_NATIVE_CALLSTACK
+local HAS_CALLSTACK = HAS_SHADOW_CALLSTACK or HAS_NATIVE_CALLSTACK
 local HAS_POWER_CYCLE = type(emu.powerCycle) == "function"
 local HAS_SNES_PPU_OBJ_EVENTS = SYS.system == "snes"
   and emu.eventType.snesPpuObjEvaluationStart ~= nil
@@ -42,6 +44,7 @@ local Step = require("emucap_step")
 local FreezeState = require("emucap_freeze_state")
 local Memory = require("emucap_memory")
 local Recording = require("emucap_recording")
+local NativeCallstack = require("emucap_native_callstack")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -51,9 +54,9 @@ local HOST = "127.0.0.1"
 -- 포트: 교차-ROM 2-인스턴스를 위해 EMUCAP_PORT로 덮어쓸 수 있다(없으면 47800).
 local PORT = tonumber(os.getenv("EMUCAP_PORT") or "") or 47800
 local PROTOCOL_VERSION = 1
--- The Lua script remains usable with the API-2 host. API 3 is an additive capability and must not
--- make every existing Mesen control method disappear when the native power-cycle hook is absent.
-local MESEN_HOST_API = HAS_POWER_CYCLE and 3 or 2
+-- Older scripts remain usable with API 2/3 hosts.  The pinned launcher requires API 4, whose added
+-- native call-stack hook is advertised only by entries that use it.
+local MESEN_HOST_API = HAS_HOST_NATIVE_CALLSTACK and 4 or (HAS_POWER_CYCLE and 3 or 2)
 local MESEN_UPSTREAM_COMMIT = os.getenv("EMUCAP_MESEN_UPSTREAM_COMMIT")
 local MESEN_PATCHSET_SHA256 = os.getenv("EMUCAP_MESEN_PATCHSET_SHA256")
 local MESEN_BINARY_SHA256 = os.getenv("EMUCAP_MESEN_BINARY_SHA256")
@@ -503,10 +506,10 @@ function handlers.hello()
   if emu and emu.memType then
     memory_regions = Memory.regions(emu, SYS)
   end
-  -- disassemble/call_stack은 ISA 구현(SYS.disassemble·op_is_call/op_is_return)이 있을 때만 advertise한다.
-  -- GBA처럼 미제공이면 methods에서 빠져 status.methods에 안 뜨고, 호출 시 handler가 unsupported로 거부한다.
+  -- Advertise only the ISA operations implemented by the selected entry.
   local method_list = { "read_memory", "screenshot", "get_state", "get_rom_info", "status",
                 "write_memory", "set_input", "pause", "step", "resume",
+                "step_instructions",
                 "run_frames", "press_buttons", "save_state", "load_state",
                 "set_breakpoint", "watch_register", "clear_breakpoint", "list_breakpoints",
                 "clear_all_breakpoints", "poll_events", "set_trace", "get_trace",
@@ -523,8 +526,10 @@ function handlers.hello()
     "native_halt_savestate",
     "paused_start_service",
     "controlled_start",
+    "native_instruction_step",
   }
   if HAS_POWER_CYCLE then host_features[#host_features + 1] = "native_power_cycle" end
+  if HAS_HOST_NATIVE_CALLSTACK then host_features[#host_features + 1] = "native_call_stack" end
   local repeatable_recording = REPEATABLE_PROFILE and RECORDING_SUPPORTED
     and HAS_SNES_DEEP_EVENTS and memory_regions ~= nil and #memory_regions > 0
   if repeatable_recording then host_features[#host_features + 1] = "repeatable_recording" end
@@ -564,7 +569,7 @@ function handlers.hello()
       HAS_SNES_DEEP_EVENTS, SYS.system == "snes",
       repeatable_recording and REPEATABLE_CONDITIONS_SHA256 or nil)
   end
-  local active_exceptions = { "mesen.execution.instruction-step-absent" }
+  local active_exceptions = { "mesen.execution.instruction-step-main-cpu" }
   if HAS_CALLSTACK then
     active_exceptions[#active_exceptions + 1] = "mesen.call-stack.best-effort"
   end
@@ -2071,7 +2076,7 @@ local function trace_cb(addr, value)
     { pc = addr, op = op, bank = cur_banks and SYS.bank_of(addr, cur_banks) or nil }
   trace_idx = trace_idx + 1
   -- 콜스택 shadow-track은 op_is_call/op_is_return이 있는 ISA만 갱신한다(GBA엔 없어 트레이스 링만 채운다).
-  if not HAS_CALLSTACK then return end
+  if not HAS_SHADOW_CALLSTACK then return end
   -- 지연 prompt-pop: 직전 명령이 return류였다 → 이제 그 return이 실행돼 SP가 (taken이면) 올라와 있다.
   -- 복원된 SP로 reconcile: 미성립 조건부 RET는 SP 불변이라 pop 안 되고, taken이면 호출자가 아직 push하기 전
   -- 리턴 지점에서 pop돼 masking을 막고, 인터럽트 리턴은 유저 프레임보다 낮은 SP라 유저 프레임을 안 건드린다.
@@ -2138,7 +2143,19 @@ end
 -- (live getState를 다시 호출하지 않아도 freeze 진입 시점과 같은 SP를 쓰도록 get_state와 frozen_state를 공유).
 function handlers.call_stack()
   if not HAS_CALLSTACK then
-    return false, "unsupported", "call_stack not supported for " .. SYS.system .. " (no SP-based call-stack model for this ISA)"
+    return false, "unsupported", "call_stack not supported for " .. SYS.system
+  end
+  if HAS_NATIVE_CALLSTACK then
+    if STATE ~= "frozen" then
+      return false, "bad_state", "call_stack requires frozen execution; call pause first"
+    end
+    local ok, native_frames = pcall(emu.getCallstack, CPU)
+    if not ok then
+      return false, "emulator_error", "native call_stack failed: " .. tostring(native_frames)
+    end
+    local state = frozen_state()
+    return true, NativeCallstack.capture(
+      full_pc(state), state["cpu.cpsr.thumb"], native_frames)
   end
   reconcile_callstack(frozen_state()["cpu.sp"])
   local out = {}
@@ -2244,7 +2261,7 @@ local function dispatch(line)
     emu.breakExecution()   -- 실제 freeze는 codeBreak에서
     return
   end
-  if method == "step" or method == "resume" then
+  if method == "step" or method == "step_instructions" or method == "resume" then
     reply_err(id, "not_paused", "step and resume require frozen state")
     return
   end
@@ -2290,10 +2307,9 @@ local function handle_in_freeze(line)
   elseif method == "resume" then
     reply_ok(id, { state = "running" })
     return "resume"
-  elseif method == "step" then
-    local count, err = bounded_sync_count(p.frames, 1, false)
-    if not count then reply_err(id, "bad_params", err); return nil end
-    local unit = (p.unit == "instructions") and "instructions" or "frames"
+  elseif method == "step" or method == "step_instructions" then
+    local unit, count, err = Step.parse_wire_step(method, p, MAX_SYNC_ADVANCE)
+    if not unit then reply_err(id, "bad_params", err); return nil end
     step_operation = Step.start(session_epoch, id, unit, count)
     freeze_state = FreezeState.halt("step", false)
     return "step"

@@ -309,7 +309,7 @@ try {
     $buildHash = "$buildHash-dirty"
   } else {
     $entryName = Split-Path -Leaf $lua
-    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_memory.lua emucap_step.lua emucap_tx.lua emucap_state_io.lua emucap_recording.lua $entryName 2>$null)
+    $dirtyFiles = @(& git -C $here status --porcelain -- emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua emucap_step.lua emucap_tx.lua emucap_state_io.lua emucap_recording.lua $entryName 2>$null)
     if ($LASTEXITCODE -ne 0 -or $dirtyFiles.Count -gt 0) {
       $buildHash = "$buildHash-dirty"
     }

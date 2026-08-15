@@ -1,0 +1,143 @@
+diff --git a/Source/Core/Core/PowerPC/BreakPoints.h b/Source/Core/Core/PowerPC/BreakPoints.h
+index 696cbd8c8b..16a684ac46 100644
+--- a/Source/Core/Core/PowerPC/BreakPoints.h
++++ b/Source/Core/Core/PowerPC/BreakPoints.h
+@@ -24,6 +24,7 @@ struct TBreakPoint
+   bool log_on_hit = false;
+   bool break_on_hit = false;
+   std::optional<Expression> condition;
++  u64 emucap_breakpoint_id = 0;
+ };
+ 
+ struct TMemCheck
+@@ -44,6 +45,7 @@ struct TMemCheck
+   u32 num_hits = 0;
+ 
+   std::optional<Expression> condition;
++  u64 emucap_breakpoint_id = 0;
+ 
+   // returns whether to break
+   bool Action(Core::System& system, u64 value, u32 addr, bool write, size_t size, u32 pc);
+@@ -71,6 +73,8 @@ public:
+   void Add(u32 address, bool break_on_hit, bool log_on_hit, std::optional<Expression> condition);
+   void Add(u32 address);
+   void Add(TBreakPoint bp);
++  bool AddEmuCap(TBreakPoint bp);
++  bool RemoveEmuCap(u64 id);
+   // Add temporary breakpoint (e.g., Step Over, Run to Here)
+   // It can be on the same address of a regular breakpoint (it will have priority in this case)
+   // It's cleared whenever the emulation is paused for any reason
+@@ -123,6 +127,8 @@ public:
+   void AddFromStrings(const TMemChecksStr& mc_strings);
+ 
+   DelayedMemCheckUpdate Add(TMemCheck memory_check);
++  bool AddEmuCap(TMemCheck memory_check, u32 ambiguity_margin);
++  bool RemoveEmuCap(u64 id);
+ 
+   bool ToggleEnable(u32 address);
+ 
+diff --git a/Source/Core/Core/PowerPC/BreakPoints.cpp b/Source/Core/Core/PowerPC/BreakPoints.cpp
+index b405f40cac..6320496868 100644
+--- a/Source/Core/Core/PowerPC/BreakPoints.cpp
++++ b/Source/Core/Core/PowerPC/BreakPoints.cpp
+@@ -13,6 +13,7 @@
+ #include "Common/CommonTypes.h"
+ #include "Common/Logging/Log.h"
+ #include "Core/Core.h"
++#include "Core/EmuCap.h"
+ #include "Core/Debugger/DebugInterface.h"
+ #include "Core/PowerPC/Expression.h"
+ #include "Core/PowerPC/JitInterface.h"
+@@ -120,6 +121,15 @@ void BreakPoints::Add(TBreakPoint bp)
+   m_breakpoints.emplace_back(std::move(bp));
+ }
+ 
++bool BreakPoints::AddEmuCap(TBreakPoint bp)
++{
++  if (bp.emucap_breakpoint_id == 0 || GetRegularBreakpoint(bp.address) != nullptr)
++    return false;
++
++  Add(std::move(bp));
++  return true;
++}
++
+ void BreakPoints::Add(u32 address)
+ {
+   BreakPoints::Add(address, true, false, std::nullopt);
+@@ -204,6 +214,18 @@ bool BreakPoints::Remove(u32 address)
+   return true;
+ }
+ 
++bool BreakPoints::RemoveEmuCap(u64 id)
++{
++  const auto iter = std::ranges::find(m_breakpoints, id, &TBreakPoint::emucap_breakpoint_id);
++  if (iter == m_breakpoints.end())
++    return false;
++
++  const u32 address = iter->address;
++  m_breakpoints.erase(iter);
++  m_system.GetJitInterface().InvalidateICache(address, 4, true);
++  return true;
++}
++
+ void BreakPoints::Clear()
+ {
+   for (const TBreakPoint& bp : m_breakpoints)
+@@ -315,6 +337,44 @@ DelayedMemCheckUpdate MemChecks::Add(TMemCheck memory_check)
+   return DelayedMemCheckUpdate(this, true);
+ }
+ 
++bool MemChecks::AddEmuCap(TMemCheck memory_check, u32 ambiguity_margin)
++{
++  if (memory_check.emucap_breakpoint_id == 0)
++    return false;
++
++  {
++    const Core::CPUThreadGuard guard(m_system);
++    const u64 start = memory_check.start_address;
++    const u64 end = memory_check.end_address;
++    const bool conflicts = std::ranges::any_of(m_mem_checks, [&](const TMemCheck& existing) {
++      return static_cast<u64>(existing.start_address) <= end + ambiguity_margin &&
++             start <= static_cast<u64>(existing.end_address) + ambiguity_margin;
++    });
++    if (conflicts)
++      return false;
++    m_mem_checks.emplace_back(std::move(memory_check));
++  }
++  Update();
++  return true;
++}
++
++bool MemChecks::RemoveEmuCap(u64 id)
++{
++  bool removed = false;
++  {
++    const Core::CPUThreadGuard guard(m_system);
++    const auto iter = std::ranges::find(m_mem_checks, id, &TMemCheck::emucap_breakpoint_id);
++    if (iter != m_mem_checks.end())
++    {
++      m_mem_checks.erase(iter);
++      removed = true;
++    }
++  }
++  if (removed)
++    Update();
++  return removed;
++}
++
+ bool MemChecks::ToggleEnable(u32 address)
+ {
+   auto iter = std::ranges::find(m_mem_checks, address, &TMemCheck::start_address);
+@@ -438,7 +498,12 @@ bool TMemCheck::Action(Core::System& system, u64 value, u32 addr, bool write, siz
+                      addr, ppc_symbol_db.GetDescription(addr));
+     }
+     if (break_on_hit)
++    {
++      if (emucap_breakpoint_id != 0)
++        EmuCap::NotifyMemoryBreakpointHit(system, value, addr, write, size, pc,
++                                          emucap_breakpoint_id);
+       return true;
++    }
+   }
+   return false;
+ }

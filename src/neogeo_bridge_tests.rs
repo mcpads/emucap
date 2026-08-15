@@ -140,6 +140,7 @@ fn hello_advertises_only_proven_initial_surface() {
         "clear_all_breakpoints",
         "poll_events",
         "disassemble",
+        "call_stack",
     ] {
         assert!(
             value["methods"]
@@ -171,6 +172,56 @@ fn hello_advertises_only_proven_initial_surface() {
         &methods,
     );
     assert_eq!(status.state, "validated", "{:?}", status.errors);
+}
+
+#[test]
+fn native_call_stack_is_frozen_bounded_and_innermost_first() {
+    let gdb = FakeGdb::with(&["STACK|1000|10ff00|1|0|2|200,400,206,10fefc|400,800,406,10fef8"]);
+    let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    bridge.frozen = true;
+    let response = bridge.handle_request(request(1, "call_stack", json!({"cpu":"m68000"})));
+    assert!(response.ok, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["depth"], 3);
+    assert_eq!(result["frames"][0]["pc"], 0x1000);
+    assert_eq!(result["frames"][1]["pc"], 0x400);
+    assert_eq!(result["frames"][1]["target"], 0x800);
+    assert_eq!(result["frames"][2]["pc"], 0x200);
+    assert_eq!(result["order"], "innermost_to_outermost");
+    assert_eq!(result["complete_since_reset"], true);
+    assert_eq!(result["truncated"], false);
+    assert_eq!(bridge.gdb.sent, vec!["qEmucap,callstack"]);
+}
+
+#[test]
+fn native_call_stack_rejects_running_or_secondary_cpu_before_backend_calls() {
+    let mut bridge =
+        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_cd").unwrap();
+    let running = bridge.handle_request(request(1, "call_stack", json!({})));
+    assert_eq!(running.error.unwrap().kind, "bad_state");
+    bridge.frozen = true;
+    let secondary = bridge.handle_request(request(2, "call_stack", json!({"cpu":"z80"})));
+    assert_eq!(secondary.error.unwrap().kind, "bad_params");
+    assert!(bridge.gdb.sent.is_empty());
+}
+
+#[test]
+fn native_call_stack_rejects_malformed_or_inconsistent_backend_payloads() {
+    for payload in [
+        "not-a-stack",
+        "STACK|1000|10ff00|1|0|2|200,400,206,10fefc",
+        "STACK|1000|10ff00|maybe|0|0",
+    ] {
+        let mut bridge = NeoGeoBridge::new(
+            FakeGdb::with(&[payload]),
+            GdbBridgeEnv::default(),
+            "neogeo_aes",
+        )
+        .unwrap();
+        bridge.frozen = true;
+        let response = bridge.handle_request(request(1, "call_stack", json!({})));
+        assert_eq!(response.error.unwrap().kind, "emulator_error");
+    }
 }
 
 #[test]

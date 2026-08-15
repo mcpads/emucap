@@ -101,6 +101,7 @@ PATCHES=(
   "$HERE/patches/0008-add-controlled-repeatable-start.patch"
   "$HERE/patches/0009-expose-lua-power-cycle.patch"
   "$HERE/patches/0010-add-snes-cgram-lookup-events.patch"
+  "$HERE/patches/0011-expose-lua-callstack.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

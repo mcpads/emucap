@@ -76,6 +76,7 @@ const MAX_FIND_LEN: usize = 128 * 1024;
 const MAX_SYNC_TIMED_INPUT_FRAMES: u64 = 120;
 const TIMED_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const TIMED_INPUT_DEADLINE: Duration = Duration::from_millis(4_000);
+const FRAME_STEP_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 const METHODS: &[&str] = &[
     "hello",
@@ -86,6 +87,7 @@ const METHODS: &[&str] = &[
     "get_state",
     "find_pattern",
     "dump_memory",
+    "step",
     "step_instructions",
     "set_breakpoint",
     "clear_breakpoint",
@@ -130,6 +132,23 @@ enum CpuId {
 enum TimedOverrideTerminal {
     Completed,
     Interrupted { frames_elapsed: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameStepTerminal {
+    Idle,
+    Running,
+    Completed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameStepStatus {
+    terminal: FrameStepTerminal,
+    start: u64,
+    end: u64,
+    requested: u64,
+    completed: u64,
 }
 
 impl CpuId {

@@ -1,0 +1,236 @@
+--- a/src/emu/debug/debugcpu.h
++++ b/src/emu/debug/debugcpu.h
+@@ -15,6 +15,7 @@
+ 
+ #include <set>
+ #include <utility>
++#include <vector>
+ 
+ 
+ //**************************************************************************
+@@ -36,6 +37,14 @@
+ class device_debug
+ {
+ public:
++	struct callstack_frame
++	{
++		offs_t source;
++		offs_t target;
++		offs_t return_address;
++		u64 stack_pointer;
++	};
++
+ 	// construction/destruction
+ 	device_debug(device_t &device);
+ 	~device_debug();
+@@ -136,6 +145,13 @@
+ 	// history
+ 	std::pair<offs_t, bool> history_pc(int index) const;
+ 
++	// bounded native call stack (disabled unless a debugger consumer opts in)
++	void callstack_enable(bool enable);
++	void callstack_clear(bool complete = false);
++	const std::vector<callstack_frame> &callstack_frames() const { return m_callstack_frames; }
++	bool callstack_complete() const { return m_callstack_complete; }
++	u64 callstack_dropped() const { return m_callstack_dropped; }
++
+ 	// pc tracking
+ 	void set_track_pc(bool value);
+ 	bool track_pc_visited(offs_t pc) const;
+@@ -170,6 +186,7 @@
+ 
+ 	// internal helpers
+ 	void prepare_for_step_overout(offs_t pc);
++	void update_callstack(offs_t curpc);
+ 	void errorlog_write_line(const char *line);
+ 
+ 	// breakpoint and watchpoint helpers
+@@ -212,6 +229,19 @@
+ 	offs_t                  m_pc_history[HISTORY_SIZE]; // history of recent PCs
+ 	u32                     m_pc_history_index;         // current history index
+ 	u32                     m_pc_history_valid;         // number of valid PC history entries
++
++	// opt-in call stack tracking
++	static constexpr size_t CALLSTACK_CAPACITY = 256;
++	std::vector<callstack_frame> m_callstack_frames;
++	bool                    m_callstack_enabled;
++	bool                    m_callstack_complete;
++	bool                    m_callstack_have_previous;
++	offs_t                  m_callstack_previous_pc;
++	offs_t                  m_callstack_previous_next;
++	u32                     m_callstack_previous_flags;
++	u64                     m_callstack_previous_sp;
++	u64                     m_callstack_dropped;
++	const device_state_entry *m_callstack_sp_entry;
+ 
+ 	// breakpoints and watchpoints
+ 	std::multimap<offs_t, std::unique_ptr<debug_breakpoint>> m_bplist;     // list of breakpoints
+--- a/src/emu/debug/debugcpu.cpp
++++ b/src/emu/debug/debugcpu.cpp
+@@ -502,6 +502,16 @@
+ 	, m_was_waiting(true)
+ 	, m_pc_history_index(0)
+ 	, m_pc_history_valid(0)
++	, m_callstack_frames()
++	, m_callstack_enabled(false)
++	, m_callstack_complete(false)
++	, m_callstack_have_previous(false)
++	, m_callstack_previous_pc(0)
++	, m_callstack_previous_next(0)
++	, m_callstack_previous_flags(0)
++	, m_callstack_previous_sp(0)
++	, m_callstack_dropped(0)
++	, m_callstack_sp_entry(nullptr)
+ 	, m_bplist()
+ 	, m_rplist()
+ 	, m_eplist()
+@@ -863,6 +873,11 @@
+ 	// note that we are in the debugger code
+ 	debugcpu.set_within_instruction(true);
+ 
++	// Keep this dormant for ordinary MAME users.  Consumers that need a native call stack
++	// explicitly enable it through the debugger API.
++	if (m_callstack_enabled)
++		update_callstack(curpc);
++
+ 	// update the history
+ 	m_pc_history[m_pc_history_index] = curpc;
+ 	m_pc_history_index = (m_pc_history_index + 1) % std::size(m_pc_history);
+@@ -987,6 +1002,106 @@
+ 
+ 	// no longer in debugger code
+ 	debugcpu.set_within_instruction(false);
++}
++
++
++//-------------------------------------------------
++//  callstack_enable - enable the bounded native
++//  call stack tracker
++//-------------------------------------------------
++
++void device_debug::callstack_enable(bool enable)
++{
++	if (m_callstack_enabled != enable)
++	{
++		m_callstack_enabled = enable;
++		m_callstack_sp_entry = nullptr;
++		if (enable && m_state)
++		{
++			for (auto const &entry : m_state->state_entries())
++			{
++				if (!std::strcmp(entry->symbol(), "SP"))
++				{
++					m_callstack_sp_entry = entry.get();
++					break;
++				}
++			}
++		}
++		callstack_clear(false);
++	}
++}
++
++
++//-------------------------------------------------
++//  callstack_clear - discard observations that no
++//  longer belong to the current execution history
++//-------------------------------------------------
++
++void device_debug::callstack_clear(bool complete)
++{
++	m_callstack_frames.clear();
++	m_callstack_complete = complete;
++	m_callstack_have_previous = false;
++	m_callstack_previous_pc = 0;
++	m_callstack_previous_next = 0;
++	m_callstack_previous_flags = 0;
++	m_callstack_previous_sp = 0;
++	m_callstack_dropped = 0;
++}
++
++
++//-------------------------------------------------
++//  update_callstack - observe one completed control
++//  transfer and prepare the next one
++//-------------------------------------------------
++
++void device_debug::update_callstack(offs_t curpc)
++{
++	u64 const current_sp = m_callstack_sp_entry ? m_callstack_sp_entry->value() : 0;
++	if (m_callstack_have_previous)
++	{
++		if ((m_callstack_previous_flags & util::disasm_interface::STEP_OVER) != 0 &&
++				(m_callstack_previous_flags & util::disasm_interface::STEP_COND) == 0 &&
++				curpc != m_callstack_previous_next)
++		{
++			if (m_callstack_frames.size() == CALLSTACK_CAPACITY)
++			{
++				m_callstack_frames.erase(m_callstack_frames.begin());
++				++m_callstack_dropped;
++				m_callstack_complete = false;
++			}
++			m_callstack_frames.push_back(callstack_frame{
++				m_callstack_previous_pc,
++				curpc,
++				m_callstack_previous_next,
++				m_callstack_previous_sp });
++		}
++		else if ((m_callstack_previous_flags & util::disasm_interface::STEP_OUT) != 0)
++		{
++			auto match = std::find_if(
++				m_callstack_frames.rbegin(),
++				m_callstack_frames.rend(),
++				[curpc, current_sp] (callstack_frame const &frame)
++				{
++					return frame.return_address == curpc && frame.stack_pointer == current_sp;
++				});
++			if (match != m_callstack_frames.rend())
++				m_callstack_frames.erase(match.base() - 1, m_callstack_frames.end());
++		}
++	}
++
++	debug_disasm_buffer buffer(device());
++	u32 const result = buffer.disassemble_info(curpc);
++	if ((result & util::disasm_interface::SUPPORTED) == 0)
++	{
++		m_callstack_have_previous = false;
++		return;
++	}
++	m_callstack_previous_pc = curpc;
++	m_callstack_previous_next = buffer.next_pc_wrap(curpc, result & util::disasm_interface::LENGTHMASK);
++	m_callstack_previous_flags = result;
++	m_callstack_previous_sp = current_sp;
++	m_callstack_have_previous = true;
+ }
+ 
+ 
+--- a/src/frontend/mame/luaengine_debug.cpp
++++ b/src/frontend/mame/luaengine_debug.cpp
+@@ -412,6 +412,28 @@
+ 				dev.single_step(steps);
+ 			});
+ 	device_debug_type.set_function("go", &device_debug::go);
++	device_debug_type.set_function("callstack_enable", &device_debug::callstack_enable);
++	device_debug_type.set_function("callstack_clear", &device_debug::callstack_clear);
++	device_debug_type.set_function("callstack",
++			[this] (device_debug &dev)
++			{
++				sol::table result = sol().create_table();
++				sol::table frames = sol().create_table();
++				int index = 1;
++				for (device_debug::callstack_frame const &frame : dev.callstack_frames())
++				{
++					sol::table item = sol().create_table();
++					item["source"] = frame.source;
++					item["target"] = frame.target;
++					item["return_address"] = frame.return_address;
++					item["stack_pointer"] = frame.stack_pointer;
++					frames[index++] = std::move(item);
++				}
++				result["frames"] = std::move(frames);
++				result["complete"] = dev.callstack_complete();
++				result["dropped"] = dev.callstack_dropped();
++				return result;
++			});
+ 	device_debug_type.set_function("bpset",
+ 			[] (device_debug &dev, offs_t address, char const *cond, char const *act)
+ 			{

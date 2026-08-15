@@ -1390,7 +1390,7 @@ fn contract_status_distinguishes_unreported_from_validated() {
 
     let hello = serde_json::json!({
         "contracts": emucap::contracts::advertisement_value(&[
-            "nds.execution.frame-step-absent",
+            "nds.execution.frame-step-vblank",
             "nds.call-stack.best-effort",
         ])
     });
@@ -1404,13 +1404,13 @@ fn contract_status_distinguishes_unreported_from_validated() {
     assert_eq!(
         validated["contracts"]["active_exceptions"],
         serde_json::json!([
-            "nds.execution.frame-step-absent",
+            "nds.execution.frame-step-vblank",
             "nds.call-stack.best-effort"
         ])
     );
     assert_eq!(
         validated["contracts"]["constraints"]["execution.step.units"],
-        serde_json::json!(["instructions"])
+        serde_json::json!(["frames", "instructions"])
     );
     assert_eq!(
         validated["contracts"]["authority"]["debug.call-stack"],
@@ -1449,8 +1449,8 @@ fn adapter_provided_status_methods_are_also_normalized() {
 #[test]
 fn instruction_only_step_does_not_admit_frame_composites() {
     let identity = EmulatorIdentity {
-        adapter: Some("desmume-nds-rust-gdb".into()),
-        system: Some("nds".into()),
+        adapter: Some("mupen64plus-native".into()),
+        system: Some("n64".into()),
         ..Default::default()
     };
     let methods = [
@@ -1465,7 +1465,7 @@ fn instruction_only_step_does_not_admit_frame_composites() {
     .collect::<Vec<_>>();
     let hello = serde_json::json!({
         "contracts": emucap::contracts::advertisement_value(&[
-            "nds.execution.frame-step-absent"
+            "n64.execution.frame-step-absent"
         ])
     });
     let mut value = serde_json::json!({"connected": true});

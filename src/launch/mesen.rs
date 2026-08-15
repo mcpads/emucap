@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const REQUIRED_HOST_API: u32 = 3;
+pub const REQUIRED_HOST_API: u32 = 4;
 pub const REPEATABLE_PROFILE_ID: &str = "mesen_snes_repeatable";
 pub const REPEATABLE_CONDITIONS_SHA256: &str =
     "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b";

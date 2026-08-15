@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::spec::{dolphin_spec, SpecOpts};
 
-pub const REQUIRED_HOST_API: u32 = 2;
+pub const REQUIRED_HOST_API: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {

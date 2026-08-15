@@ -4,8 +4,8 @@
 -- gbaVideoRam/gbaPaletteRam/gbaSpriteRam/gbaSaveRam/gbaPrgRom. 콘솔 밖 read는 zero-fill(실측).
 --
 -- disassemble는 ARM7TDMI Lua 디코더로 제공한다(ARM 32비트 + Thumb 16비트, CPSR T비트로 모드 판정).
--- op_is_call/op_is_return은 미제공 — ARM 콜스택은 LR기반이라 코어의 SP모델과 안 맞는다(이번 범위 밖).
--- 따라서 disassemble는 광고되고 call_stack은 미지원으로 광고·거부된다.
+-- The GBA call stack uses Mesen's bounded native debugger stack.  Mesen distinguishes ARM/Thumb
+-- calls, branch returns and IRQ frames while executing, so no full Lua instruction trace is needed.
 -- memory/state/screenshot/input/BP/save·load·probe·watch_register·set_trace는 상속.
 SYS = {
   system = "gba",
@@ -435,8 +435,6 @@ SYS.disassemble = function(read_byte, start, count)
   return out
 end
 
--- op_is_call/op_is_return 미제공(위 헤더 참조) — call_stack은 이번 범위 밖(LR기반)이라 코어가 미구현 광고.
-
 local dir = os.getenv("EMUCAP_ADAPTER_DIR")
 if not dir or dir == "" then
   -- 폴백: env가 없으면(수동 Script Window 로드 등) 이 스크립트 파일 경로에서 어댑터 디렉터리를 도출한다.
@@ -445,4 +443,5 @@ if not dir or dir == "" then
 end
 assert(dir and dir ~= "", "emucap-gba: EMUCAP_ADAPTER_DIR is unset and the script path could not be derived; use launch or load this script from a file")
 package.path = dir .. "/?.lua;" .. package.path
+SYS.native_call_stack = true
 require("emucap-core")

@@ -1,0 +1,161 @@
+diff --git a/desmume/src/NDSSystem.cpp b/desmume/src/NDSSystem.cpp
+index c97919b..d45491d 100755
+--- a/desmume/src/NDSSystem.cpp
++++ b/desmume/src/NDSSystem.cpp
+@@ -67,6 +67,9 @@ extern HWND DisViewWnd[2];
+ 
+ #ifdef GDB_STUB
+ #include "gdbstub.h"
++// Implemented by the GDB stub; advances emucap's shared-scheduler frame clock
++// after this file completes one VBlank-start event.
++void emucap_gdbstub_vblank_start_complete();
+ #define GDBSTUB_MUTEX_LOCK() gdbstub_mutex_lock()
+ #define GDBSTUB_MUTEX_UNLOCK() gdbstub_mutex_unlock()
+ #else
+@@ -1513,6 +1516,10 @@ static void execHardware_hstart_vblankStart()
+ 	nds.idleFrameCounter &= 15;
+ 	nds.idleCycles[0] = 0;
+ 	nds.idleCycles[1] = 0;
++
++#ifdef GDB_STUB
++	emucap_gdbstub_vblank_start_complete();
++#endif
+ }
+ 
+ static u16 execHardware_gen_vmatch_goal()
+diff --git a/desmume/src/gdbstub/gdbstub.cpp b/desmume/src/gdbstub/gdbstub.cpp
+index a1ec083..91be5c8 100644
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -70,6 +70,27 @@ slock *cpu_mutex = NULL;
+ // stops, or resets.
+ static struct gdb_stub_state *emucap_gdb_stubs[2] = { NULL, NULL };
+ 
++enum emucap_frame_step_terminal {
++  EMUCAP_FRAME_STEP_IDLE,
++  EMUCAP_FRAME_STEP_RUNNING,
++  EMUCAP_FRAME_STEP_COMPLETED,
++  EMUCAP_FRAME_STEP_INTERRUPTED
++};
++
++struct emucap_frame_step_state {
++  enum emucap_frame_step_terminal terminal;
++  struct gdb_stub_state *owner;
++  uint64_t clock;
++  uint64_t start;
++  uint64_t end;
++  uint32_t requested;
++  uint32_t completed;
++};
++
++static struct emucap_frame_step_state emucap_frame_step = {
++  EMUCAP_FRAME_STEP_IDLE, NULL, 0, 0, 0, 0, 0
++};
++
+ #ifdef __GNUC__
+ #define UNUSED_PARM( parm) parm __attribute__((unused))
+ #else
+@@ -373,6 +394,11 @@ static void emucap_start_gdb_stubs() {
+ }
+ 
+ static void emucap_stop_sibling_gdb_stubs(struct gdb_stub_state *source) {
++  if (emucap_frame_step.terminal == EMUCAP_FRAME_STEP_RUNNING) {
++    emucap_frame_step.terminal = EMUCAP_FRAME_STEP_INTERRUPTED;
++    emucap_frame_step.end = emucap_frame_step.clock;
++  }
++
+   for (int i = 0; i < 2; i++) {
+     struct gdb_stub_state *stub = emucap_gdb_stubs[i];
+     if (stub == NULL) continue;
+@@ -392,6 +418,60 @@ static void emucap_stop_sibling_gdb_stubs(struct gdb_stub_state *source) {
+   }
+ }
+ 
++void emucap_gdbstub_vblank_start_complete() {
++  emucap_frame_step.clock++;
++  if (emucap_frame_step.terminal != EMUCAP_FRAME_STEP_RUNNING)
++    return;
++
++  emucap_frame_step.completed++;
++  if (emucap_frame_step.completed < emucap_frame_step.requested)
++    return;
++
++  struct gdb_stub_state *owner = emucap_frame_step.owner;
++  emucap_frame_step.terminal = EMUCAP_FRAME_STEP_COMPLETED;
++  emucap_frame_step.end = emucap_frame_step.clock;
++  if (owner == NULL)
++    return;
++
++  NDS_debug_break();
++  owner->cpu_ctrl->remove_post_ex_fn(owner->cpu_ctrl->data);
++  emucap_stop_sibling_gdb_stubs(owner);
++  owner->stop_type = STOP_STEP_BREAK;
++  owner->stop_address = 0;
++  indicateCPUStop_gdb(owner);
++}
++
++static bool emucap_begin_frame_step(struct gdb_stub_state *owner, uint32_t count) {
++  if (owner == NULL || count == 0 || emucap_frame_step.terminal == EMUCAP_FRAME_STEP_RUNNING)
++    return false;
++  if (emucap_gdb_stubs[0] == NULL || emucap_gdb_stubs[1] == NULL)
++    return false;
++
++  emucap_frame_step.terminal = EMUCAP_FRAME_STEP_RUNNING;
++  emucap_frame_step.owner = owner;
++  emucap_frame_step.start = emucap_frame_step.clock;
++  emucap_frame_step.end = emucap_frame_step.clock;
++  emucap_frame_step.requested = count;
++  emucap_frame_step.completed = 0;
++  return true;
++}
++
++static uint32_t emucap_format_frame_step_status(char *out, size_t capacity) {
++  const char *terminal = "idle";
++  switch (emucap_frame_step.terminal) {
++    case EMUCAP_FRAME_STEP_RUNNING: terminal = "running"; break;
++    case EMUCAP_FRAME_STEP_COMPLETED: terminal = "completed"; break;
++    case EMUCAP_FRAME_STEP_INTERRUPTED: terminal = "interrupted"; break;
++    case EMUCAP_FRAME_STEP_IDLE: break;
++  }
++  return (uint32_t)snprintf(
++      out, capacity, "%s:%llx,%llx,%x,%x", terminal,
++      (unsigned long long)emucap_frame_step.start,
++      (unsigned long long)emucap_frame_step.end,
++      (unsigned)emucap_frame_step.requested,
++      (unsigned)emucap_frame_step.completed);
++}
++
+ static void emucap_reset_and_stop_gdb_stubs() {
+   NDS_Reset();
+ 
+@@ -1151,6 +1231,9 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       send_size = snprintf( (char *)out_ptr, BUFMAX, "%d",
+                             NDS_getEmucapTouchOverrideRemaining());
+     }
++    else if ( strncmp( (const char *)packet, "qEmucap,framestepstatus", 23) == 0) {
++      send_size = emucap_format_frame_step_status((char *)out_ptr, BUFMAX);
++    }
+     // emucap disassemble: qEmucap,disasm:<hexaddr>,<hexcount>[,<mode>] -> base64 of
+     // newline-separated "<addr>|<opcode>|<text>" rows on this stub's CPU. mode is an
+     // optional single char: 'a'=ARM, 't'=Thumb; absent = auto from the CPU CPSR T-bit.
+@@ -1212,6 +1295,20 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       strcpy( (char *)out_ptr, "OK");
+       send_size = 2;
+     }
++    // emucap shared frame advance: run both CPUs until `count` completed
++    // VBlank-start events. The eventual stop packet is asynchronous, like `c`.
++    else if ( strncmp( (const char *)packet, "QEmucap,framestep:", 18) == 0) {
++      const uint8_t *p = &packet[18];
++      uint32_t count = 0;
++      if (!hexToInt(&p, &count) || !emucap_begin_frame_step(stub, count)) {
++        strcpy((char *)out_ptr, "E01");
++        send_size = 3;
++      } else {
++        send_reply = 0;
++        emucap_start_gdb_stubs();
++        infopipe_send(stub, 1);
++      }
++    }
+     break;
+ 
+   case 'c':

@@ -92,7 +92,7 @@ EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo u
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   if [ -n "$(git -C "$HERE" status --porcelain -- \
-    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_memory.lua \
+    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua \
     emucap_step.lua \
     emucap_tx.lua emucap_state_io.lua emucap_recording.lua \
     "$(basename "$LUA")" 2>/dev/null)" ]; then

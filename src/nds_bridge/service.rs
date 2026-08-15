@@ -25,7 +25,7 @@ impl<G: GdbTransport> NdsBridge<G> {
                 {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
             ],
             "contracts": crate::contracts::advertisement_value(&[
-                "nds.execution.frame-step-absent",
+                "nds.execution.frame-step-vblank",
                 "nds.call-stack.best-effort",
                 "nds.input-hold.port-zero-only",
                 "nds.input-pulse.constraints",
@@ -77,7 +77,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             "state": if self.primary_frozen() { "frozen" } else { "running" },
             "memory_types": self.memory_type_names(),
             "contracts": crate::contracts::advertisement_value(&[
-                "nds.execution.frame-step-absent",
+                "nds.execution.frame-step-vblank",
                 "nds.call-stack.best-effort",
                 "nds.input-hold.port-zero-only",
                 "nds.input-pulse.constraints",
@@ -385,28 +385,144 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     pub(super) fn step(&mut self, params: &Value) -> NdsResult<Value> {
-        // NDS는 프레임 step을 못 한다 — GDB-RSP엔 프레임 개념이 없고, DeSmuME fork에 run-frames 훅이 아직 없다.
-        // 이전 호스트와 직접 wire 호출을 위한 호환 경로다. 현재 공개 MCP의 instruction step은
-        // wire step_instructions로 들어온다. unit이 없는데 frames가 오면 진짜 프레임-step 요청이라 거부한다 —
-        // 명령으로 조용히 오해석하면 (60프레임→60명령) freeze-step/tap이 어긋난다.
         match params.get("unit").and_then(Value::as_str) {
-            Some("instructions") => {}
+            Some("instructions") => return self.step_instructions(params),
+            Some("frames") => return self.step_frames(params),
             Some(other) => {
-                return Err(NdsBridgeError::Unsupported(format!(
-                    "step unit={other} (nds bridge steps by instructions only)"
+                return Err(NdsBridgeError::BadParams(format!(
+                    "step unit={other}; valid NDS units are frames and instructions"
                 )));
             }
             None => {
                 if params.get("frames").is_some() {
-                    return Err(NdsBridgeError::Unsupported(
-                        "nds bridge: frame stepping is unsupported because GDB-RSP has no frame concept. Use step(unit=instructions). The DeSmuME fork does not expose a frame-run primitive."
-                            .into(),
-                    ));
+                    return self.step_frames(params);
                 }
             }
         }
+        self.step_instructions(params)
+    }
+
+    /// Advance the shared ARM9/ARM7 scheduler to exactly `count` completed VBlank-start events.
+    /// Either CPU may preempt the operation with a breakpoint; the bridge watches both endpoints,
+    /// then classifies the stop using fork-owned status instead of guessing from the terminal PC.
+    pub(super) fn step_frames(&mut self, params: &Value) -> NdsResult<Value> {
+        if let Some(cpu) = params.get("cpu").and_then(Value::as_str) {
+            if cpu != "both" {
+                return Err(NdsBridgeError::BadParams(format!(
+                    "NDS frame stepping advances the shared scheduler; omit cpu or use cpu=both (got {cpu})"
+                )));
+            }
+        }
+        if self.arm7.is_none() {
+            return Err(NdsBridgeError::Emulator(
+                "NDS frame stepping requires both ARM9 and ARM7 GDB endpoints so either CPU can report a preempting breakpoint"
+                    .into(),
+            ));
+        }
         let count = step_count(params)?;
-        self.step_cpu(params, count)
+        if count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(NdsBridgeError::BadParams(format!(
+                "frame count {count} exceeds the synchronous cap {}; split the advance and verify each terminal response",
+                crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            )));
+        }
+
+        self.drain_scheduler_stops()?;
+        if !self.primary_frozen() {
+            self.arm9.pause()?;
+            self.set_scheduler_frozen(true);
+        }
+        let deadline = crate::live::temporal::OperationDeadline::after(
+            crate::live::temporal::MAX_SYNC_OPERATION_TIME,
+        );
+        self.arm9.begin_frame_step(count)?;
+        self.set_scheduler_frozen(false);
+
+        loop {
+            let observed = if let Some(stop) = self.arm9.take_stop_nonblocking()? {
+                Some((CpuId::Arm9, stop))
+            } else {
+                self.arm7
+                    .as_mut()
+                    .expect("ARM7 presence checked before frame advance")
+                    .take_stop_nonblocking()?
+                    .map(|stop| (CpuId::Arm7, stop))
+            };
+
+            if let Some((source, stop)) = observed {
+                self.set_scheduler_frozen(true);
+                let status = self.arm9.frame_step_status()?;
+                return self.finish_frame_step(count, source, stop, status);
+            }
+
+            if deadline.expired() {
+                let stop = self.arm9.gdb.interrupt().map_err(|err| {
+                    NdsBridgeError::Emulator(format!(
+                        "NDS frame step exceeded the {} ms deadline and the terminal interrupt failed: {err}",
+                        crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis()
+                    ))
+                })?;
+                self.set_scheduler_frozen(true);
+                let status = self.arm9.frame_step_status()?;
+                if status.terminal == FrameStepTerminal::Interrupted {
+                    self.arm9.note_stop(stop);
+                }
+                return Err(NdsBridgeError::Emulator(format!(
+                    "NDS frame step exceeded the {} ms deadline after {} of {} VBlank-start events; both CPUs are frozen",
+                    crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis(),
+                    status.completed,
+                    count
+                )));
+            }
+            std::thread::sleep(FRAME_STEP_POLL_INTERVAL);
+        }
+    }
+
+    fn finish_frame_step(
+        &mut self,
+        requested: u64,
+        source: CpuId,
+        stop: String,
+        status: FrameStepStatus,
+    ) -> NdsResult<Value> {
+        if status.requested != requested {
+            return Err(NdsBridgeError::Emulator(format!(
+                "DeSmuME frame-step request mismatch: bridge requested {requested}, fork reported {}",
+                status.requested
+            )));
+        }
+        match status.terminal {
+            FrameStepTerminal::Completed if status.completed == requested => Ok(json!({
+                "status": "completed",
+                "unit": "frames",
+                "count": status.completed,
+                "requested": requested,
+                "clock": "nds_vblank_start_complete",
+                "start_frame": status.start,
+                "end_frame": status.end,
+                "state": "frozen",
+                "cpus": {"arm9":"frozen", "arm7":"frozen"},
+            })),
+            FrameStepTerminal::Interrupted => {
+                self.cpu_mut(source)?.note_stop(stop);
+                Ok(json!({
+                    "status": "interrupted",
+                    "unit": "frames",
+                    "count": status.completed,
+                    "requested": requested,
+                    "clock": "nds_vblank_start_complete",
+                    "start_frame": status.start,
+                    "end_frame": status.end,
+                    "stop_cpu": source.as_str(),
+                    "state": "frozen",
+                    "cpus": {"arm9":"frozen", "arm7":"frozen"},
+                }))
+            }
+            other => Err(NdsBridgeError::Emulator(format!(
+                "DeSmuME stopped with inconsistent frame-step terminal {other:?}: completed {} of {requested}",
+                status.completed
+            ))),
+        }
     }
 
     pub(super) fn step_instructions(&mut self, params: &Value) -> NdsResult<Value> {

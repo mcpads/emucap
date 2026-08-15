@@ -119,7 +119,8 @@ try {
         (Join-Path $Here "patches/0007-add-snes-deep-observation-events.patch"),
         (Join-Path $Here "patches/0008-add-controlled-repeatable-start.patch"),
         (Join-Path $Here "patches/0009-expose-lua-power-cycle.patch"),
-        (Join-Path $Here "patches/0010-add-snes-cgram-lookup-events.patch")
+        (Join-Path $Here "patches/0010-add-snes-cgram-lookup-events.patch"),
+        (Join-Path $Here "patches/0011-expose-lua-callstack.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {

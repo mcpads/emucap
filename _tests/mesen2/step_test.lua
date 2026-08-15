@@ -8,6 +8,45 @@ local function eq(actual, expected, message)
   end
 end
 
+-- The two compatible wire spellings normalize to one exact operation, while malformed requests
+-- fail before the core can arm native stepping.
+do
+  local unit, count, err = Step.parse_wire_step("step", { frames = 3 }, 5000)
+  eq(unit, "frames", "frame wire unit")
+  eq(count, 3, "frame wire count")
+  eq(err, nil, "frame wire error")
+
+  unit, count, err = Step.parse_wire_step(
+    "step", { count = 4, unit = "instructions" }, 5000)
+  eq(unit, "instructions", "unit-aware instruction unit")
+  eq(count, 4, "unit-aware instruction count")
+  eq(err, nil, "unit-aware instruction error")
+
+  unit, count, err = Step.parse_wire_step("step_instructions", { count = 5 }, 5000)
+  eq(unit, "instructions", "instruction alias unit")
+  eq(count, 5, "instruction alias count")
+  eq(err, nil, "instruction alias error")
+end
+
+do
+  local invalid = {
+    { "step", { unit = "cycles", count = 1 }, "invalid unit" },
+    { "step", { count = 0 }, "zero count" },
+    { "step", { count = -1 }, "negative count" },
+    { "step", { count = 1.5 }, "fractional count" },
+    { "step", { count = 1, frames = 1 }, "ambiguous count" },
+    { "step", { count = 5001 }, "over-limit count" },
+    { "step_instructions", { frames = 1 }, "instruction frames alias" },
+    { "step_instructions", { count = 1, unit = "frames" }, "instruction unit mismatch" },
+  }
+  for _, case in ipairs(invalid) do
+    local unit, count, err = Step.parse_wire_step(case[1], case[2], 5000)
+    eq(unit, nil, case[3] .. " unit")
+    eq(count, nil, case[3] .. " count")
+    if type(err) ~= "string" or err == "" then error("FAIL " .. case[3] .. ": missing error") end
+  end
+end
+
 -- A completed step can claim its exact requested count only after every chunk was consumed.
 do
   local state = Step.start(3, 42, "frames", 31)

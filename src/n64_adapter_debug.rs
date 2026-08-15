@@ -1,6 +1,6 @@
-//! R4300 breakpoint, event, reset, and disassembly support.
+//! R4300 breakpoint, event, reset, disassembly, and bounded call-stack support.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::ffi::CStr;
 use std::ptr;
 
@@ -20,7 +20,106 @@ const MAX_BREAKPOINTS: usize = 128;
 const MAX_SNAPSHOTS: usize = 16;
 const MAX_SNAPSHOT_BYTES: u64 = 0x4000;
 const MAX_DISASSEMBLY_COUNT: u64 = 64;
+const MAX_CALL_STACK_DEPTH: usize = 64;
+const CALL_STACK_SCAN_BYTES: u32 = 4096;
 const N64_ADDRESS_SPACE_SIZE: u64 = u32::MAX as u64 + 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct R4300StackFrame {
+    pub(super) pc: u32,
+    pub(super) kind: &'static str,
+    pub(super) stack_address: Option<u32>,
+}
+
+pub(super) fn r4300_rdram_offset(address: u32) -> Option<u32> {
+    match address {
+        0x8000_0000..=0x807f_ffff => Some(address - 0x8000_0000),
+        0xa000_0000..=0xa07f_ffff => Some(address - 0xa000_0000),
+        _ => None,
+    }
+}
+
+pub(super) fn r4300_code_address(address: u32) -> bool {
+    r4300_rdram_offset(address).is_some()
+        || (0xa400_0000..0xa400_1000).contains(&address)
+        || (0xb000_0000..0xc000_0000).contains(&address)
+}
+
+pub(super) fn r4300_link_instruction(opcode: u32) -> bool {
+    match opcode >> 26 {
+        0x03 => true,                                         // JAL
+        0x00 => opcode & 0x3f == 0x09,                        // JALR
+        0x01 => matches!((opcode >> 16) & 0x1f, 0x10..=0x13), // BLTZAL/BGEZAL and likely forms
+        _ => false,
+    }
+}
+
+fn admit_r4300_return<F>(
+    frames: &mut Vec<R4300StackFrame>,
+    seen: &mut BTreeSet<u32>,
+    candidate: u32,
+    stack_address: Option<u32>,
+    read_word: &mut F,
+) where
+    F: FnMut(u32) -> u32,
+{
+    let callsite = match candidate.checked_sub(8) {
+        Some(callsite) if r4300_code_address(candidate) && r4300_code_address(callsite) => callsite,
+        _ => return,
+    };
+    if r4300_link_instruction(read_word(callsite)) && seen.insert(candidate) {
+        frames.push(R4300StackFrame {
+            pc: candidate,
+            kind: if stack_address.is_some() {
+                "stack_scan"
+            } else {
+                "ra"
+            },
+            stack_address,
+        });
+    }
+}
+
+pub(super) fn walk_r4300_stack<F>(
+    pc: u32,
+    ra: u32,
+    sp: u32,
+    mut read_word: F,
+) -> Vec<R4300StackFrame>
+where
+    F: FnMut(u32) -> u32,
+{
+    let mut frames = vec![R4300StackFrame {
+        pc,
+        kind: "pc",
+        stack_address: None,
+    }];
+    let mut seen = BTreeSet::from([pc]);
+    admit_r4300_return(&mut frames, &mut seen, ra, None, &mut read_word);
+
+    let Some(offset) = r4300_rdram_offset(sp) else {
+        return frames;
+    };
+    let available = (RDRAM_SIZE as u32).saturating_sub(offset);
+    let scan_bytes = CALL_STACK_SCAN_BYTES.min(available);
+    let start = sp.saturating_add(3) & !3;
+    let end = sp.saturating_add(scan_bytes);
+    let mut address = start;
+    while address.checked_add(4).is_some_and(|next| next <= end)
+        && frames.len() < MAX_CALL_STACK_DEPTH
+    {
+        let candidate = read_word(address);
+        admit_r4300_return(
+            &mut frames,
+            &mut seen,
+            candidate,
+            Some(address),
+            &mut read_word,
+        );
+        address += 4;
+    }
+    frames
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -720,5 +819,56 @@ impl Mupen64PlusHost {
             }));
         }
         Ok(json!({"instructions":instructions, "cpu":"r4300"}))
+    }
+
+    pub(super) fn call_stack(&self, params: &Value) -> N64Result<Value> {
+        require_r4300(params)?;
+        self.require_frozen("call_stack")?;
+        let pc_ptr = unsafe { (self.api.debug_get_cpu_data_ptr)(M64P_CPU_PC) } as *const u32;
+        let regs_ptr = unsafe { (self.api.debug_get_cpu_data_ptr)(M64P_CPU_REG_REG) } as *const u64;
+        if pc_ptr.is_null() || regs_ptr.is_null() {
+            return Err(N64Error::BadState(
+                "Mupen64Plus returned a null R4300 state pointer".into(),
+            ));
+        }
+        let pc = unsafe { *pc_ptr };
+        let sp = unsafe { *regs_ptr.add(29) } as u32;
+        let ra = unsafe { *regs_ptr.add(31) } as u32;
+        let frames = walk_r4300_stack(pc, ra, sp, |address| {
+            let bytes = (0..4)
+                .map(|byte| unsafe { (self.api.debug_mem_read8)(address + byte) })
+                .collect::<Vec<_>>();
+            u32::from_be_bytes(bytes.try_into().expect("four R4300 bytes"))
+        });
+        let output = frames
+            .iter()
+            .map(|frame| {
+                let mut value = json!({
+                    "pc": frame.pc,
+                    "kind": frame.kind,
+                    "validated_callsite": frame.kind != "pc",
+                });
+                if frame.kind != "pc" {
+                    value["callsite"] = json!(frame.pc - 8);
+                }
+                if let Some(address) = frame.stack_address {
+                    value["stack_address"] = json!(address);
+                    value["stack_offset"] = json!(address.saturating_sub(sp));
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        let depth = output.len();
+        Ok(json!({
+            "frames": output,
+            "depth": depth,
+            "cpu": "r4300",
+            "order": "innermost_to_outermost",
+            "method": "ra_and_bounded_stack_scan",
+            "authority": "best_effort",
+            "sp": sp,
+            "ra": ra,
+            "scan_bytes": CALL_STACK_SCAN_BYTES,
+        }))
     }
 }

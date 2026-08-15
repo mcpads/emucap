@@ -158,6 +158,10 @@ cleanup, and mid-frame recording failures do not inherit that eligibility.
   `power_cycle` through the MCP debug drawer. It invokes Mesen's native full-reload path and returns
   after the same launch generation and content selection reconnect; callers must verify battery-file
   persistence separately when that fact matters.
+  Public `step(count=N, unit="instructions")` uses Mesen's native debugger step for exactly N
+  instructions of the profile's main CPU and returns frozen. It does not claim an exact amount of
+  auxiliary CPU or PPU progress. The raw `step_instructions` method is a wire-compatibility alias,
+  not a second public control.
   (`save_state`/`load_state` also work while frozen at a main-CPU instruction boundary created by
   explicit `pause` or an instruction step. They preserve the native halt, and a load refreshes the
   frozen CPU projection before replying. Frame/PPU-step and breakpoint halts return `unsafe_halt`
@@ -359,11 +363,11 @@ with these differences:
 - **memory_types**: `gbaMemory` (full ARM7 bus), `gbaIntWorkRam`, `gbaExtWorkRam`, `gbaVideoRam`,
   `gbaPaletteRam`, `gbaSpriteRam`, `gbaSaveRam`, `gbaPrgRom`, `gbaBootRom`. `status.memory_types` is
   authoritative.
-- **`disassemble` supported; `call_stack` not implemented yet**: the ARM7 decoder handles ARM and
-  Thumb instructions including `SUBS PC,LR,#4`, PUSH/POP, scaled-register `LDR`, and `MRS SPSR`.
-  `call_stack` is not built yet — ARM's
-  LR-based return does not fit the core's SP-based call-stack model, so `call_stack` is not advertised.
-  Everything else (read/write_memory, get_state,
+- **Native disassembly and call stack**: the ARM7 decoder handles ARM and Thumb instructions
+  including `SUBS PC,LR,#4`, PUSH/POP, scaled-register `LDR`, and `MRS SPSR`. `call_stack` uses
+  Mesen's native ARM7 call-stack capture at a frozen boundary and is advertised as best-effort:
+  LR/exception state and optimized control flow can make the result partial, and no sound CPU is
+  mixed into it. Everything else (read/write_memory, get_state,
   frame step, breakpoints, screenshot, input, save/load_state) works as on SNES.
   `status.methods` is authoritative.
 

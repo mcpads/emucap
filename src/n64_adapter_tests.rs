@@ -74,6 +74,47 @@ fn numeric_parameters_accept_decimal_and_prefixed_hex() {
 }
 
 #[test]
+fn r4300_link_classifier_distinguishes_calls_from_plain_jumps() {
+    assert!(debug::r4300_link_instruction(0x0c00_0000));
+    assert!(debug::r4300_link_instruction(0x03e0_f809));
+    assert!(debug::r4300_link_instruction(0x0410_0000));
+    assert!(!debug::r4300_link_instruction(0x0800_0000));
+    assert!(!debug::r4300_link_instruction(0x03e0_0008));
+}
+
+#[test]
+fn r4300_rdram_aliases_share_one_bounded_stack_region() {
+    assert_eq!(debug::r4300_rdram_offset(0x8000_0020), Some(0x20));
+    assert_eq!(debug::r4300_rdram_offset(0xa000_0020), Some(0x20));
+    assert_eq!(debug::r4300_rdram_offset(0x8080_0000), None);
+    assert_eq!(debug::r4300_rdram_offset(0xa080_0000), None);
+}
+
+#[test]
+fn r4300_stack_walk_keeps_only_validated_return_addresses() {
+    let pc = 0x8000_1000;
+    let ra = 0x8000_2008;
+    let sp = 0x8001_0000;
+    let words = std::collections::BTreeMap::from([
+        (0x8000_2000, 0x0c00_0000),
+        (0x8000_3000, 0x03e0_f809),
+        (sp + 4, 0x8123_4568),
+        (sp + 8, 0x8000_3008),
+        (sp + 12, ra),
+    ]);
+    let frames = debug::walk_r4300_stack(pc, ra, sp, |address| {
+        words.get(&address).copied().unwrap_or(0)
+    });
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0].pc, pc);
+    assert_eq!(frames[0].kind, "pc");
+    assert_eq!(frames[1].pc, ra);
+    assert_eq!(frames[1].kind, "ra");
+    assert_eq!(frames[2].pc, 0x8000_3008);
+    assert_eq!(frames[2].stack_address, Some(sp + 8));
+}
+
+#[test]
 fn initial_contract_advertisement_validates() {
     let exceptions = exceptions_for(true);
     let hello = json!({
@@ -91,8 +132,14 @@ fn initial_contract_advertisement_validates() {
         &methods,
     );
     assert_eq!(status.state, "validated", "{:?}", status.errors);
+    assert_eq!(status.authority["debug.call-stack"], json!("best_effort"));
+    assert_eq!(
+        status.constraints["debug.call-stack.cpus.allowed"],
+        json!(["r4300"])
+    );
     for method in [
         "step_instructions",
+        "call_stack",
         "set_input",
         "press_buttons",
         "screenshot",
@@ -126,6 +173,7 @@ fn headless_contract_removes_frame_step_and_reports_the_exception() {
         json!(["instructions"])
     );
     assert!(methods.iter().any(|method| method == "set_input"));
+    assert!(methods.iter().any(|method| method == "call_stack"));
     for unavailable in [
         "step",
         "press_buttons",

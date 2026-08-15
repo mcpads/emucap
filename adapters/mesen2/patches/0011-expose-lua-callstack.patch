@@ -1,0 +1,90 @@
+diff --git a/Core/Debugger/LuaApi.cpp b/Core/Debugger/LuaApi.cpp
+--- a/Core/Debugger/LuaApi.cpp
++++ b/Core/Debugger/LuaApi.cpp
+@@ -8,6 +8,7 @@
+ #include "Debugger/ScriptingContext.h"
+ #include "Debugger/MemoryAccessCounter.h"
+ #include "Debugger/CdlManager.h"
++#include "Debugger/CallstackManager.h"
+ #include "Debugger/LabelManager.h"
+ #include "Shared/SystemActionManager.h"
+ #include "Shared/Video/DebugHud.h"
+@@ -159,6 +160,7 @@ int LuaApi::GetLibrary(lua_State* lua)
+ 		{ "setState", LuaApi::SetState },
+ 		{ "getCpuState", LuaApi::GetCpuState },
+ 		{ "setCpuState", LuaApi::SetCpuState },
++		{ "getCallstack", LuaApi::GetCallstack },
+ 
+ 		{ "getCpuCycleCount", LuaApi::GetCpuCycleCount },
+ 		{ "getMasterClock", LuaApi::GetMasterClock },
+@@ -1276,6 +1278,40 @@ int LuaApi::GetCpuCycleCount(lua_State* lua)
+ 	return l.ReturnCount();
+ }
+ 
++int LuaApi::GetCallstack(lua_State* lua)
++{
++	LuaCallHelper l(lua);
++	l.ForceParamCount(1);
++	CpuType cpuType = (CpuType)l.ReadInteger((uint32_t)_context->GetDefaultCpuType());
++	checkEnum(CpuType, cpuType, "invalid cpu type");
++
++	StackFrameInfo frames[512] = {};
++	uint32_t frameCount = 0;
++	CallstackManager* manager = _debugger->GetCallstackManager(cpuType);
++	if(manager) {
++		manager->GetCallstack(frames, frameCount);
++	}
++
++	lua_createtable(lua, frameCount, 0);
++	for(uint32_t i = 0; i < frameCount; i++) {
++		StackFrameInfo& frame = frames[i];
++		lua_createtable(lua, 0, 11);
++		lua_pushintvalue(source, frame.Source);
++		lua_pushintvalue(target, frame.Target);
++		lua_pushintvalue(returnAddress, frame.Return);
++		lua_pushintvalue(returnStackPointer, frame.ReturnStackPointer);
++		lua_pushintvalue(flags, frame.Flags);
++		lua_pushintvalue(absoluteSource, frame.AbsSource.Address);
++		lua_pushintvalue(sourceMemoryType, frame.AbsSource.Type);
++		lua_pushintvalue(absoluteTarget, frame.AbsTarget.Address);
++		lua_pushintvalue(targetMemoryType, frame.AbsTarget.Type);
++		lua_pushintvalue(absoluteReturn, frame.AbsReturn.Address);
++		lua_pushintvalue(returnMemoryType, frame.AbsReturn.Type);
++		lua_rawseti(lua, -2, i + 1);
++	}
++	return 1;
++}
++
+ int LuaApi::GetMasterClock(lua_State* lua)
+ {
+ 	LuaCallHelper l(lua);
+diff --git a/Core/Debugger/LuaApi.h b/Core/Debugger/LuaApi.h
+--- a/Core/Debugger/LuaApi.h
++++ b/Core/Debugger/LuaApi.h
+@@ -90,6 +90,7 @@ public:
+ 	static void ReadStateTable(Serializer& s, lua_State* lua);
+ 
+ 	static int GetCpuCycleCount(lua_State* lua);
++	static int GetCallstack(lua_State* lua);
+ 	static int GetMasterClock(lua_State* lua);
+ 	static int GetSnesObservationEvent(lua_State* lua);
+ 
+diff --git a/UI/Debugger/Documentation/LuaDocumentation.json b/UI/Debugger/Documentation/LuaDocumentation.json
+--- a/UI/Debugger/Documentation/LuaDocumentation.json
++++ b/UI/Debugger/Documentation/LuaDocumentation.json
+@@ -143,6 +143,15 @@
+ 	],
+ 	"returnValue": { "type": "Array", "description": "Array of ints" }
+ },
++{
++	"name": "getCallstack",
++	"category": "Emulation",
++	"description": "Returns the debugger's bounded call stack for the specified CPU. Frames are ordered from outermost to innermost and include source, target, return address, absolute memory identity and interrupt flags.",
++	"parameters": [
++		{ "name": "cpuType", "type": "Enum", "enumName": "cpuType", "description": "CPU type", "defaultValue": "main CPU" }
++	],
++	"returnValue": { "type": "Array", "description": "Array of stack-frame tables. Empty when the selected CPU has no call-stack manager." }
++},
+ {
+ 	"name": "getCdlData",
+ 	"category": "Miscellaneous",

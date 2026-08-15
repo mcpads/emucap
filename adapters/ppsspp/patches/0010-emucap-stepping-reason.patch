@@ -1,0 +1,61 @@
+--- a/Core/Core.cpp
++++ b/Core/Core.cpp
+@@ -87,6 +87,7 @@
+ static bool powerSaving = false;
+ static bool g_breakAfterFrame = false;
+ static BreakReason g_breakReason = BreakReason::None;
++static u32 g_breakRelatedAddress = 0;
+ 
+ static MIPSExceptionInfo g_exceptionInfo;
+ 
+@@ -294,6 +295,7 @@ void Core_RunLoopUntil(u64 globalticks) {
+ 			if (g_breakAfterFrame && coreState == CORE_NEXTFRAME) {
+ 				g_breakAfterFrame = false;
+ 				g_breakReason = BreakReason::AfterFrame;
++				g_breakRelatedAddress = 0;
+ 				coreState = CORE_STEPPING_CPU;
+ 			}
+ 			break;  // Will loop around to go to RUNNING_GE or NEXTFRAME, which will exit.
+@@ -341,6 +343,11 @@ bool Core_RequestCPUStep(CPUStepType type, int stepSize) {
+ 		break;
+ 	}
+ 	g_cpuStepCommand = { type, stepSize };
++	// The next stepping notification belongs to this debugger command, not to the reason that
++	// originally halted the CPU.  Keeping the old reason here can make a completed single-step look
++	// like a second hit on the preceding breakpoint.
++	g_breakReason = BreakReason::DebugStep;
++	g_breakRelatedAddress = 0;
+ 	return true;
+ }
+ 
+@@ -528,6 +535,7 @@ void Core_Break(BreakReason reason, u32 relatedAddress) {
+ 		mipsTracer.stop_tracing();
+ 
+ 		g_breakReason = reason;
++		g_breakRelatedAddress = relatedAddress;
+ 		g_cpuStepCommand.type = CPUStepType::None;
+ 		g_cpuStepCommand.reason = reason;
+ 		g_cpuStepCommand.relatedAddr = relatedAddress;
+@@ -556,6 +564,7 @@ void Core_Resume() {
+ 	Core_ResetException();
+ 	coreState = CORE_RUNNING_CPU;
+ 	g_breakReason = BreakReason::None;
++	g_breakRelatedAddress = 0;
+ 	System_Notify(SystemNotification::DEBUG_MODE_CHANGE);
+ }
+ 
+@@ -585,10 +594,10 @@ int Core_GetSteppingCounter() {
+ SteppingReason Core_GetSteppingReason() {
+ 	SteppingReason r{};
+ 	std::lock_guard<std::mutex> lock(g_stepMutex);
+-	if (!g_cpuStepCommand.empty()) {
+-		r.reason = g_cpuStepCommand.reason;
+-		r.relatedAddress = g_cpuStepCommand.relatedAddr;
+-	}
++	// Core_Break intentionally clears the pending step command before the broadcaster runs.  The
++	// reason therefore belongs to the halted core state, not to the lifetime of g_cpuStepCommand.
++	r.reason = g_breakReason;
++	r.relatedAddress = g_breakRelatedAddress;
+ 	return r;
+ }
+ 

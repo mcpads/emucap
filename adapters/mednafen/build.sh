@@ -281,6 +281,21 @@ inject_check 'void CheckCPUBPCallB(bool write, uint32 address, unsigned int len,
 inject_check 'if(write) emucap_bp_record_value(len, address, 1, value);' "$SRC/src/psx/debug.cpp" "psx/debug.cpp write value 기록 삽입 실패"
 inject_check 'else emucap_bp_record(len, address, 0);' "$SRC/src/psx/debug.cpp" "psx/debug.cpp read fallback 기록 삽입 실패"
 
+# KUSEG, KSEG0, and KSEG1 can name the same physical PlayStation code. Upstream folds the PC for
+# LogFunc but compares execution breakpoints against the raw PC, so a low-address breakpoint can
+# silently miss execution through KSEG0 or KSEG1. Compare with the same folded address that the
+# adapter stores for the native range.
+perl -0777 -pi -e 's{(static bool FoundBPoint;\n)}{${1}\nstatic uint32 EmuCapFoldExecAddress(uint32 address)\n{\n static const uint32 masks[8] = { 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x1FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF };\n return address & masks[address >> 29];\n}\n} unless m{EmuCapFoldExecAddress}' \
+  "$SRC/src/psx/debug.cpp"
+perl -0777 -pi -e 's{(static void CPUHandler\(const pscpu_timestamp_t timestamp, uint32 PC\)\n\{)}{${1}\n const uint32 emucap_exec_pc = EmuCapFoldExecAddress(PC);} unless m{emucap_exec_pc}' \
+  "$SRC/src/psx/debug.cpp"
+perl -0777 -pi -e 's{\n  static const uint32 addr_mask\[8\] = \{ 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0x7FFFFFFF, 0x1FFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF \};\n  uint32 tpc = PC & addr_mask\[PC >> 29\];;}{\n  const uint32 tpc = emucap_exec_pc;}' \
+  "$SRC/src/psx/debug.cpp"
+perl -0777 -pi -e 's{if\(PC >= bpit->A\[0\] && PC <= bpit->A\[1\]\)}{if(emucap_exec_pc >= bpit->A[0] && emucap_exec_pc <= bpit->A[1])}' \
+  "$SRC/src/psx/debug.cpp"
+inject_check 'const uint32 emucap_exec_pc = EmuCapFoldExecAddress(PC);' "$SRC/src/psx/debug.cpp" "psx/debug.cpp exec PC fold 삽입 실패"
+inject_check 'if(emucap_exec_pc >= bpit->A[0] && emucap_exec_pc <= bpit->A[1])' "$SRC/src/psx/debug.cpp" "psx/debug.cpp mirrored exec BP 비교 삽입 실패"
+
 # 4g. 입력 진단 — PSX(psx/input/gamepad.cpp): UpdateInput이 읽은 버튼 비트(d8[0..1]) 기록.
 perl -0777 -pi -e 's/(#include "gamepad\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \
   "$SRC/src/psx/input/gamepad.cpp"

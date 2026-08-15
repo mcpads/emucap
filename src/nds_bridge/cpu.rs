@@ -53,6 +53,33 @@ impl<G: GdbTransport> CpuConn<G> {
         Ok(())
     }
 
+    /// Read one asynchronous stop without classifying it yet. Shared frame stepping watches both
+    /// CPU endpoints and must first ask the fork whether the stop is its own exact VBlank terminal
+    /// or a breakpoint that preempted the advance.
+    pub(super) fn take_stop_nonblocking(&mut self) -> NdsResult<Option<String>> {
+        let Some(packet) = self.gdb.recv_nonblocking()? else {
+            return Ok(None);
+        };
+        if !is_stop_packet(&packet) {
+            return Err(NdsBridgeError::Emulator(format!(
+                "unexpected asynchronous GDB packet while waiting for frame stop: {packet}"
+            )));
+        }
+        Ok(Some(packet))
+    }
+
+    pub(super) fn begin_frame_step(&mut self, count: u64) -> NdsResult<()> {
+        self.gdb
+            .send_no_reply(&format!("QEmucap,framestep:{count:x}"))?;
+        self.frozen = false;
+        Ok(())
+    }
+
+    pub(super) fn frame_step_status(&mut self) -> NdsResult<FrameStepStatus> {
+        let response = self.send_cmd("qEmucap,framestepstatus")?;
+        parse_frame_step_status(&response)
+    }
+
     pub(super) fn read_regs_hex(&mut self) -> NdsResult<String> {
         let resp = self.send_cmd("g")?;
         if resp.starts_with('E') {

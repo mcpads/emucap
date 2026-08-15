@@ -28,20 +28,21 @@ pub(super) fn capability_notes() -> Value {
         "planned_methods": planned,
         "screenshot": true,
         "input": true,
-        "frame_step": false,
-        "step_units": ["instructions"],
+        "frame_step": true,
+        "step_units": ["frames", "instructions"],
         "breakpoints": true,
         "watch_register": false,
         "trace": false,
         "state_restore": true,
         "disassemble": true,
-        "call_stack": false,
+        "call_stack": true,
     })
 }
 
 pub(super) fn error_kind(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::BadParams(_) => "bad_params",
+        BridgeError::BadState(_) => "bad_state",
         BridgeError::UnknownMethod(_) => "unknown_method",
         BridgeError::Unsupported(_) => "unsupported",
         BridgeError::Emulator(_) => "emulator_error",

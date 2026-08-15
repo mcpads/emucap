@@ -500,7 +500,7 @@ fn build_supported_systems_value() -> serde_json::Value {
             "aliases": ["gameboyadvance", "game-boy-advance", "agb"],
             "adapter": "mesen2",
             "content": ["gba"],
-            "notes": "ARM7: disassemble/call_stack are unsupported; memory/state/BP/save/input/screenshot are supported."
+            "notes": "ARM7TDMI: disassembly and a frozen native best-effort call stack are supported together with memory, state, breakpoints, save/load, input, screenshot, and exact main-CPU instruction stepping."
         },
         {
             "system": "nes",
@@ -514,7 +514,7 @@ fn build_supported_systems_value() -> serde_json::Value {
             "aliases": ["nintendo64", "nintendo-64"],
             "adapter": "mupen64plus",
             "content": ["z64", "n64", "v64"],
-            "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
+            "notes": "The Unix adapter uses the pinned Mupen64Plus pure interpreter. Both modes expose pause/resume, reset, R4300 instruction step and state, a bounded frozen best-effort R4300 call stack, bounded frozen RDRAM access, port-0 persistent input with explicit release, R4300 exec/read/write breakpoints, event polling, and disassembly. Visible launch also exposes exact rendered-frame step, bounded input pulse, current PNG capture, and completion-checked native save/load. Headless launch omits rendered-frame operations. RSP state is not exposed."
         },
         {
             "system": "msx",
@@ -637,13 +637,14 @@ fn build_supported_systems_value() -> serde_json::Value {
             "aliases": ["ds", "nintendo-ds", "desmume"],
             "adapter": "desmume_nds",
             "content": ["nds"],
+            "notes": "The shared ARM9/ARM7 scheduler supports exact VBlank-start frame stepping as well as routed instruction stepping. Frozen best-effort call stacks use PC/LR and the APCS r11 chain for the selected CPU."
         },
         {
             "system": "psp",
             "aliases": ["ppsspp", "playstation-portable"],
             "adapter": "ppsspp",
             "content": ["iso", "cso", "pbp"],
-            "notes": ".iso is shared with Saturn/PSX/PCE/MD/Dreamcast — a PSP GAME ISO9660 header disambiguates automatically; otherwise pass system=psp explicitly."
+            "notes": ".iso is shared with Saturn/PSX/PCE/MD/Dreamcast — a PSP GAME ISO9660 header disambiguates automatically; otherwise pass system=psp explicitly. The pinned fork exposes exact emulated VBlank-start frame stepping and PPSSPP's frozen native best-effort MIPS stack walk."
         },
         {
             "system": "ps2",
