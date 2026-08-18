@@ -620,6 +620,7 @@ fn record_window_drawer_schema_is_generic_and_requires_an_explicit_evidence_root
     assert_eq!(
         properties,
         [
+            "event_arming_overrides",
             "event_classes",
             "event_filters",
             "frames",

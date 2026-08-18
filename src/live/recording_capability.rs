@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::bundle::recording_manifest::{EventClassIdentity, RecordingLimits};
+use crate::bundle::recording_manifest::{EventArmingScope, EventClassIdentity, RecordingLimits};
 use crate::event_contracts::{EventContractError, EventContractRegistry};
 pub use crate::input_movie::INPUT_MOVIE_FORMAT;
 use crate::live::temporal::{MAX_SYNC_ADVANCE_COUNT, MAX_SYNC_OPERATION_MS};
@@ -173,6 +173,15 @@ pub struct RecordingTerminalStateProfile {
 pub struct RecordingWarmupCapability {
     pub max_frames: u64,
     pub transaction_event_classes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub selectable_event_scopes: Vec<RecordingEventScopeCapability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingEventScopeCapability {
+    pub id: String,
+    pub scopes: Vec<EventArmingScope>,
 }
 
 #[derive(Serialize)]
@@ -479,15 +488,30 @@ impl RecordingCapability {
                 .iter()
                 .map(String::as_str)
                 .collect();
+            let mut selectable_classes = BTreeSet::new();
+            let selectable_scopes_are_valid = warmup.selectable_event_scopes.iter().all(|entry| {
+                let scopes = entry.scopes.iter().copied().collect::<BTreeSet<_>>();
+                let default_scope = if transaction_classes.contains(entry.id.as_str()) {
+                    EventArmingScope::Transaction
+                } else {
+                    EventArmingScope::Observation
+                };
+                ids.contains(entry.id.as_str())
+                    && selectable_classes.insert(entry.id.as_str())
+                    && scopes.len() == entry.scopes.len()
+                    && scopes.len() > 1
+                    && scopes.contains(&default_scope)
+            });
             if warmup.max_frames == 0
                 || warmup.max_frames > self.limits.max_frames
                 || transaction_classes.len() != warmup.transaction_event_classes.len()
                 || !transaction_classes.contains("frame_boundary")
                 || !transaction_classes.iter().all(|id| ids.contains(id))
+                || !selectable_scopes_are_valid
                 || !self.class_accounting
             {
                 return Err(RecordingCapabilityError::Invalid(
-                    "warmup bounds, transaction classes, or class accounting are invalid".into(),
+                    "warmup bounds, event scopes, or class accounting are invalid".into(),
                 ));
             }
         }

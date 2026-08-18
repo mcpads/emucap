@@ -13,15 +13,15 @@ local INTERRUPT_DELIVERY_SHA256 = "c00494d891e76c380bd782d897c5f5ab4b59d918d49c3
 local OBJ_CONSUMPTION_SHA256 = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local CGRAM_LOOKUP_SHA256 = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
 local SNES_PPU_STATE_SHA256 = "21005a15437abd767cbeda5c7ede8741e2aeac4a006dafedede03a695377eaa2"
-local BASE_CAPABILITY_REVISION = "dea5c89d917c0e645296117dc9b14dcf089a49794dbe72b0319a104016a449bf"
-local SNES_STATE_CAPABILITY_REVISION = "7a63f4233406541101fdd078a4bd6ffbd1a9785efc24664355a6b491bd8f0efd"
-local SNES_CAPABILITY_REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be7890e318f9b8c4b218a2"
-local BASE_SNAPSHOT_CAPABILITY_REVISION = "3314d6344f03df096660917a6087b19a62aece996402ecdd1ee992c87131d0aa"
-local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "ea526265eb6a5d6b229d568d2bfe7df503adc54032959a9f73eb361b5e6ade3f"
-local SNES_SNAPSHOT_CAPABILITY_REVISION = "3360ead44ccebf59a35aefcba6e5846d645188781682293b508a502343212782"
-local SNES_DEEP_CAPABILITY_REVISION = "1a684845aacb3a1f025d1b72be3664e4cdd520bb5d756e93a574b815e74be00b"
-local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "baaddde76371336e8a042df3f0a413b52cf5fd794b742d4ee0b92b01b908ff7d"
-local SNES_REPEATABLE_CAPABILITY_REVISION = "7f7c1c02af1cdfd226d7af673504f208229f4e4048642b7eaee00c421eab33bf"
+local BASE_CAPABILITY_REVISION = "20520b327e06f8ed30387f20f8609b861ceb4306ac1d955f6fb7a38b7489e885"
+local SNES_STATE_CAPABILITY_REVISION = "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e"
+local SNES_CAPABILITY_REVISION = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
+local BASE_SNAPSHOT_CAPABILITY_REVISION = "7d673b3f299c2f5f8ba91cf12475385581ec6f18ad38efa1b25a6a3ef7cde08d"
+local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "cb17d9a46ab4f50c18090efe88841d86eec924683089b451301e4cf209400702"
+local SNES_SNAPSHOT_CAPABILITY_REVISION = "c257a841cde44e9911d371a3e3521db1fe11e09dc5177075e76211605080fef2"
+local SNES_DEEP_CAPABILITY_REVISION = "a37de2f20517d122a960f9ed98f243664ebce7eb15b693fc4ad5d6de1229e00c"
+local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "302875a198ab9036285ee242245218132f1096d43aef1151d16cbfb307a637fd"
+local SNES_REPEATABLE_CAPABILITY_REVISION = "338356d4b8f9c7c02b7923f4429afcf3e7db0ed3c7c1ba6d4dad535fb8fe1b13"
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -289,6 +289,10 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
     warmup = {
       max_frames = MAX_FRAMES,
       transaction_event_classes = as_array({ "frame_boundary", "frame_completed" }),
+      selectable_event_scopes = as_array({
+        { id = "frame_boundary", scopes = as_array({ "transaction", "observation" }) },
+        { id = "frame_completed", scopes = as_array({ "transaction", "observation" }) },
+      }),
     },
     input_movie = {
       format = INPUT_MOVIE_FORMAT,
@@ -426,7 +430,42 @@ local function validate_event_filters(filters, selected)
   return result
 end
 
-local function validate_limits(frames, event_count_per_frame, limits)
+local function validate_event_arming(arming, selected, selected_order, warmup_frames, start_on)
+  local scoped = warmup_frames > 0 or start_on ~= nil
+  if not scoped then
+    if arming ~= nil and (not dense_array(arming) or #arming > 0) then
+      return nil, "event_arming requires warmup_frames or start_on"
+    end
+    local defaults = {}
+    for _, id in ipairs(selected_order) do
+      defaults[id] = (id == "frame_boundary" or id == "frame_completed")
+        and "transaction" or "observation"
+    end
+    return defaults
+  end
+  if not dense_array(arming) or #arming ~= #selected_order then
+    return nil, "event_arming must cover every selected event class"
+  end
+  local result = {}
+  for index, entry in ipairs(arming) do
+    local id = selected_order[index]
+    if type(entry) ~= "table" or not only_fields(entry, { id = true, scope = true })
+        or entry.id ~= id or not selected[id] or result[id]
+        or (entry.scope ~= "transaction" and entry.scope ~= "observation") then
+      return nil, "event_arming must be canonical and match selected event classes"
+    end
+    local boundary_class = id == "frame_boundary" or id == "frame_completed"
+    if (not boundary_class and entry.scope ~= "observation")
+        or (boundary_class and entry.scope == "observation"
+          and (warmup_frames == 0 or start_on ~= nil)) then
+      return nil, "event class does not advertise the requested warmup scope"
+    end
+    result[id] = entry.scope
+  end
+  return result
+end
+
+local function validate_limits(required_events, frames, limits)
   if type(limits) ~= "table" then
     return nil, "bad_params", "limits must be an object"
   end
@@ -447,7 +486,7 @@ local function validate_limits(frames, event_count_per_frame, limits)
   if limits.max_frames ~= frames then
     return nil, "bad_params", "max_frames must equal the requested frame count"
   end
-  if limits.max_events < frames * event_count_per_frame
+  if limits.max_events < required_events
       or limits.max_line_bytes > limits.max_bytes then
     return nil, "bad_params", "limits cannot contain the required frame stream"
   end
@@ -538,8 +577,26 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
   if not selected then return nil, "unsupported", event_error end
   local event_filters, filter_error = validate_event_filters(params.event_filters, selected)
   if not event_filters then return nil, "bad_params", filter_error end
-  local event_count_per_frame = selected.frame_completed and 2 or 1
-  local limits, kind, message = validate_limits(total_frames, event_count_per_frame, params.limits)
+
+  local start_on = params.start_on
+  if start_on ~= nil then
+    if type(start_on) ~= "table" or start_on.event_class ~= "snes_cpu_instruction"
+        or not selected.snes_cpu_instruction then
+      return nil, "bad_params",
+        "start_on must select the advertised startable snes_cpu_instruction class"
+    end
+  end
+  local event_scopes, arming_error = validate_event_arming(
+    params.event_arming, selected, selected_order, warmup_frames, start_on)
+  if not event_scopes then return nil, "bad_params", arming_error end
+  local required_events = 0
+  for _, id in ipairs({ "frame_boundary", "frame_completed" }) do
+    if selected[id] then
+      required_events = required_events
+        + (event_scopes[id] == "observation" and params.frames or total_frames)
+    end
+  end
+  local limits, kind, message = validate_limits(required_events, total_frames, params.limits)
   if not limits then return nil, kind, message end
 
   local stop_on = params.stop_on
@@ -549,14 +606,6 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
         or not integer(stop_on.occurrence) or stop_on.occurrence < 1
         or (stop_on.event_class == "frame_completed" and stop_on.occurrence > params.frames) then
       return nil, "bad_params", "stop_on must select a positive occurrence of a stoppable class"
-    end
-  end
-  local start_on = params.start_on
-  if start_on ~= nil then
-    if type(start_on) ~= "table" or start_on.event_class ~= "snes_cpu_instruction"
-        or not selected.snes_cpu_instruction then
-      return nil, "bad_params",
-        "start_on must select the advertised startable snes_cpu_instruction class"
     end
   end
   local initial_snapshots = params.initial_snapshots or {}
@@ -595,6 +644,7 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
     limits = limits,
     selected = selected,
     selected_order = selected_order,
+    event_scopes = event_scopes,
     event_filters = event_filters,
     stop_on = stop_on,
     start_on = start_on,
@@ -806,17 +856,21 @@ local function write_event(state, class, frame, tick, terminal_frame, payload)
     return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "unselected_event_class")
   end
+  local scope_start = state.class_start[class]
+  if scope_start ~= nil and frame < scope_start then return nil, nil end
+  state.class_armed[class] = true
   payload = payload or {}
   if not validate_payload(contract, payload) then
     return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "event_payload_contract_failed")
   end
   if class == "frame_boundary" then
-    if frame ~= state.origin_frame + state.boundary_records then
+    if frame ~= state.class_start.frame_boundary + state.boundary_records then
       return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
         "frame_boundary_gap_or_regression")
     end
-  elseif class == "frame_completed" and frame ~= state.origin_frame + state.completed_records then
+  elseif class == "frame_completed"
+      and frame ~= state.class_start.frame_completed + state.completed_records then
     return mark_terminal(state, "failed", "adapter_error", "unverifiable", terminal_frame,
       "frame_completed_gap_or_regression")
   end
@@ -1051,14 +1105,8 @@ function M.start(params, request_id, expected_launch_id, start_frame, now_ms, si
     selected = validated.selected,
     selected_order = validated.selected_order,
     event_filters = validated.event_filters,
-    class_armed = {
-      frame_boundary = true,
-      frame_completed = validated.selected.frame_completed == true,
-    },
-    class_start = {
-      frame_boundary = start_frame,
-      frame_completed = validated.selected.frame_completed and start_frame or nil,
-    },
+    class_armed = {},
+    class_start = {},
     class_counts = {},
     class_dropped = {},
     stop_on = validated.stop_on,
@@ -1090,6 +1138,11 @@ function M.start(params, request_id, expected_launch_id, start_frame, now_ms, si
     capture_initial = capture_initial,
     wall_ms = wall_ms,
   }
+  for _, id in ipairs(state.selected_order) do
+    local scope = validated.event_scopes[id]
+    state.class_armed[id] = scope == "transaction"
+    state.class_start[id] = scope == "transaction" and state.origin_frame or state.start_frame
+  end
   local effect = install_movie_input(state, 1, start_frame)
   if effect then return state, effect end
   effect = select(1, write_event(state, "frame_boundary", start_frame, start_frame, start_frame))

@@ -39,6 +39,7 @@ pub struct RecordWindowRequest {
     pub warmup_frames: u64,
     pub event_classes: Vec<String>,
     pub event_filters: Vec<EventClassFilter>,
+    pub event_arming_overrides: Vec<EventClassArming>,
     pub origin: Option<RecordingOrigin>,
     pub input_path: Option<PathBuf>,
     pub stop_on: Option<EventStopCondition>,
@@ -136,26 +137,7 @@ pub(super) fn effective_request(
     let event_filters = validate_event_filters(capability, &event_classes, &request.event_filters)?;
     validate_start_request(capability, &event_classes, request)?;
     validate_initial_snapshot_request(capability, memory_regions, request)?;
-    let event_arming = if request.warmup_frames == 0 && request.start_on.is_none() {
-        Vec::new()
-    } else {
-        let transaction_classes = capability
-            .warmup
-            .as_ref()
-            .map(|warmup| warmup.transaction_event_classes.as_slice())
-            .unwrap_or(&[]);
-        event_classes
-            .iter()
-            .map(|identity| EventClassArming {
-                id: identity.id.clone(),
-                scope: if transaction_classes.contains(&identity.id) {
-                    EventArmingScope::Transaction
-                } else {
-                    EventArmingScope::Observation
-                },
-            })
-            .collect()
-    };
+    let event_arming = resolve_event_arming(capability, &event_classes, request)?;
     validate_terminal_snapshot_request(capability, methods, memory_regions, request)?;
     let terminal_state = validate_terminal_state_request(capability, methods, request)?;
     if !event_classes
@@ -277,6 +259,85 @@ pub(super) fn effective_request(
         origin,
         movie,
     })
+}
+
+fn resolve_event_arming(
+    capability: &RecordingCapability,
+    selected: &[crate::bundle::recording_manifest::EventClassIdentity],
+    request: &RecordWindowRequest,
+) -> Result<Vec<EventClassArming>, RecordingError> {
+    if request.warmup_frames == 0 && request.start_on.is_none() {
+        if !request.event_arming_overrides.is_empty() {
+            return Err(RecordingError::Invalid(
+                "event_arming_overrides require warmup_frames".into(),
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    if request.start_on.is_some() && !request.event_arming_overrides.is_empty() {
+        return Err(RecordingError::Invalid(
+            "event_arming_overrides cannot be combined with start_on".into(),
+        ));
+    }
+    let warmup = capability.warmup.as_ref().ok_or_else(|| {
+        RecordingError::Unavailable(
+            "the current runtime does not advertise recording warmup".into(),
+        )
+    })?;
+    let selected_ids = selected
+        .iter()
+        .map(|identity| identity.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut overrides = std::collections::BTreeMap::new();
+    for requested in &request.event_arming_overrides {
+        if !selected_ids.contains(requested.id.as_str()) {
+            return Err(RecordingError::Invalid(format!(
+                "event arming override {} must select a recorded class",
+                requested.id
+            )));
+        }
+        if overrides
+            .insert(requested.id.as_str(), requested.scope)
+            .is_some()
+        {
+            return Err(RecordingError::Invalid(format!(
+                "duplicate event arming override {}",
+                requested.id
+            )));
+        }
+        let advertised = warmup
+            .selectable_event_scopes
+            .iter()
+            .find(|entry| entry.id == requested.id)
+            .ok_or_else(|| {
+                RecordingError::Unavailable(format!(
+                    "event class {} does not advertise selectable warmup scopes",
+                    requested.id
+                ))
+            })?;
+        if !advertised.scopes.contains(&requested.scope) {
+            return Err(RecordingError::Unavailable(format!(
+                "event class {} does not advertise scope {:?}",
+                requested.id, requested.scope
+            )));
+        }
+    }
+    Ok(selected
+        .iter()
+        .map(|identity| EventClassArming {
+            id: identity.id.clone(),
+            scope: overrides
+                .get(identity.id.as_str())
+                .copied()
+                .unwrap_or_else(|| {
+                    if warmup.transaction_event_classes.contains(&identity.id) {
+                        EventArmingScope::Transaction
+                    } else {
+                        EventArmingScope::Observation
+                    }
+                }),
+        })
+        .collect())
 }
 
 fn validate_event_filters(

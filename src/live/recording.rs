@@ -332,6 +332,10 @@ pub fn record_window(
             "token": sink.token,
         },
     });
+    if !effective.request.event_arming.is_empty() {
+        params["event_arming"] = serde_json::to_value(&effective.request.event_arming)
+            .map_err(|error| RecordingError::Invalid(error.to_string()))?;
+    }
     if let (Some(movie), Some(path)) = (&effective.movie, &staged_movie_path) {
         let path = path.to_str().ok_or_else(|| {
             RecordingError::Invalid("staged input movie path is not UTF-8".into())
