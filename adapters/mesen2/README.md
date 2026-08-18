@@ -83,6 +83,10 @@ after a crash, new launches are blocked until it is dismissed.
 Recommended path: call the MCP `launch` tool. It verifies the pinned compatible host, copies its
 complete app bundle (macOS) or publish directory into an emucap-owned portable directory, applies
 required options without modifying the user's default settings, and keeps native input available.
+Runtime refresh carries the Mesen-owned data directories, including `Saves`, into the staged
+replacement before the atomic swap. A repeatable SNES launch uses a separate disposable portable
+root; clearing that root cannot delete the ordinary emucap profile or the user's standard Mesen
+data.
 Every system gets a minimal portable `settings.json` that asks Mesen to initialize its built-in
 Xbox and keyboard mappings in memory; it does not copy or modify the user's custom mappings. GBA
 also stages its BIOS into that same portable home.
@@ -130,6 +134,11 @@ validates and decodes the movie and binds the sink before queueing reset, then e
 boundary in Mesen's native post-reset callback before the emulation loop releases a guest tick. This
 is a timed soft-reset origin, not a cold-power or equal-memory claim. Legacy/manual hosts and the
 other Mesen system entries keep their existing tools but do not advertise recording.
+For warmup requests, `frame_boundary` and `frame_completed` also advertise selectable transaction
+or observation emission scopes. The default remains transaction scope. An observation override
+suppresses warmup records and their event, byte, and drop accounting while the dense input movie
+and guest frame progression continue; it does not claim that Mesen removed the underlying frame
+callback.
 The maintained profile also advertises bounded terminal snapshots when the active core exposes
 exact finite `memory_regions`. Core performs those reads only after the recording terminal has
 frozen the exact final frame; they do not use the live event queue or install another Mesen hook.
@@ -158,6 +167,10 @@ cleanup, and mid-frame recording failures do not inherit that eligibility.
   `power_cycle` through the MCP debug drawer. It invokes Mesen's native full-reload path and returns
   after the same launch generation and content selection reconnect; callers must verify battery-file
   persistence separately when that fact matters.
+  Public `step(count=N, unit="instructions")` uses Mesen's native debugger step for exactly N
+  instructions of the profile's main CPU and returns frozen. It does not claim an exact amount of
+  auxiliary CPU or PPU progress. The raw `step_instructions` method is a wire-compatibility alias,
+  not a second public control.
   (`save_state`/`load_state` also work while frozen at a main-CPU instruction boundary created by
   explicit `pause` or an instruction step. They preserve the native halt, and a load refreshes the
   frozen CPU projection before replying. Frame/PPU-step and breakpoint halts return `unsafe_halt`
@@ -359,11 +372,11 @@ with these differences:
 - **memory_types**: `gbaMemory` (full ARM7 bus), `gbaIntWorkRam`, `gbaExtWorkRam`, `gbaVideoRam`,
   `gbaPaletteRam`, `gbaSpriteRam`, `gbaSaveRam`, `gbaPrgRom`, `gbaBootRom`. `status.memory_types` is
   authoritative.
-- **`disassemble` supported; `call_stack` not implemented yet**: the ARM7 decoder handles ARM and
-  Thumb instructions including `SUBS PC,LR,#4`, PUSH/POP, scaled-register `LDR`, and `MRS SPSR`.
-  `call_stack` is not built yet — ARM's
-  LR-based return does not fit the core's SP-based call-stack model, so `call_stack` is not advertised.
-  Everything else (read/write_memory, get_state,
+- **Native disassembly and call stack**: the ARM7 decoder handles ARM and Thumb instructions
+  including `SUBS PC,LR,#4`, PUSH/POP, scaled-register `LDR`, and `MRS SPSR`. `call_stack` uses
+  Mesen's native ARM7 call-stack capture at a frozen boundary and is advertised as best-effort:
+  LR/exception state and optimized control flow can make the result partial, and no sound CPU is
+  mixed into it. Everything else (read/write_memory, get_state,
   frame step, breakpoints, screenshot, input, save/load_state) works as on SNES.
   `status.methods` is authoritative.
 

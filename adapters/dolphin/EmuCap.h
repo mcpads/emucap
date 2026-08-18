@@ -9,6 +9,8 @@
 // response carries EMUCAP_SESSION_TOKEN, EMUCAP_NAME, and EMUCAP_CONTENT when present.
 #pragma once
 
+#include <cstddef>
+
 #include "Common/CommonTypes.h"
 
 struct GCPadStatus;
@@ -39,10 +41,18 @@ void ApplyInputOverride(int pad_num, GCPadStatus* status);
 // extension state remain owned by Dolphin.
 void ApplyWiimoteInputOverride(int wiimote_num, WiimoteEmu::DesiredWiimoteState* state);
 
-// Called by the PowerPC breakpoint handler after it has confirmed a real hit.
-// The adapter filters this against breakpoints registered through emucap.
-void NotifyBreakpointHit(Core::System& system, u32 address);
+// Called by the PowerPC breakpoint handler after it has confirmed a real adapter-owned hit.
+void NotifyBreakpointHit(Core::System& system, u32 address, u64 breakpoint_id);
+
+// Called by Dolphin's native memory-check path before a matching write commits or after a read has
+// fetched its value, but before the PowerPC instruction completes.
+void NotifyMemoryBreakpointHit(Core::System& system, u64 value, u32 address, bool write,
+                               size_t size, u32 pc, u64 breakpoint_id);
 
 // Called after Dolphin has presented a non-duplicate frame and returned the CPU to stepping mode.
 void NotifyFrameStepComplete();
+
+// Called by the adapter-owned reset-button release event on the CPU thread. The token prevents a
+// user, movie, or other native reset tap from completing an emucap request.
+void NotifyResetTapComplete(Core::System& system, u64 token);
 }  // namespace EmuCap

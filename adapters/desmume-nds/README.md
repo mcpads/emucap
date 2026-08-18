@@ -30,7 +30,8 @@ adapters/desmume-nds/build.sh
 Clones TASEmulators/desmume into an emucap-owned work tree (`adapters/desmume-nds/work`) pinned to a
 known-good commit, applies the patch stack in order (`0001` headless → `0002` screenshot/input →
 `0003` savestate/disasm → `0004` reset → `0005` touch → `0006` GDB buffers → `0007` input status →
-`0008` GDB I/O deadlines → `0009` SIGPIPE suppression → `0010` shared-scheduler GDB state),
+`0008` GDB I/O deadlines → `0009` SIGPIPE suppression → `0010` shared-scheduler GDB state →
+`0011` exact VBlank frame step),
 and builds `desmume-cli` with meson
 (`-Dfrontend-cli -Dgdb-stub`; the gdb-stub build disables the JIT and runs the interpreter). Because
 later patches extend the same `gdbstub.cpp` regions, build.sh resets the tree and re-applies the whole
@@ -118,9 +119,16 @@ adapter's `step_instructions` wire method), `set_breakpoint`
 - `reset` — the fork's `QEmucap,reset` calls DeSmuME `NDS_Reset` (a power cycle). ARM9 returns to
   `0x02000800`, ARM7 returns to `0x02380000`, and both stay halted (stub breakpoints survive the
   reset).
+- `step(unit="frames")` — `patches/0011-emucap-vblank-frame-step.patch` advances the shared NDS
+  scheduler by exactly the requested number of emulated VBlank-start boundaries. Both ARM9 and
+  ARM7 return frozen; a pausing breakpoint on either CPU interrupts the request before the target
+  and reports the partial count. This device clock is independent of host rendering and therefore
+  works in headless and display modes.
 
-**Not yet supported (needs more fork hooks)**: `run_frames` (a frame counter), `watch_register`,
-`set_trace` / `get_trace`, `break_on_reset`. `status.capability_notes` is authoritative — the
+The MCP `tap` and `hold_until` composites use that exact frame step and return frozen after releasing
+their transient input. Raw wire `run_frames` remains unsupported because it has running-terminal
+semantics and would duplicate the clearer exact-step path. Also unsupported: `watch_register`,
+`set_trace` / `get_trace`, and `break_on_reset`. `status.capability_notes` is authoritative — the
 interface doesn't accumulate caveats: names are shared, availability is in `status`.
 
 ## Dual-CPU execution model (important)

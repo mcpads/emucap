@@ -1,6 +1,6 @@
 # MAME Neo Geo adapter
 
-This experimental adapter accepts three explicit profiles: `neogeo_mvs`, `neogeo_aes`, and
+This adapter accepts three explicit profiles: `neogeo_mvs`, `neogeo_aes`, and
 `neogeo_cd`. Hyper Neo Geo 64 is not an alias. Neo Geo Pocket/Color is the separate Mednafen
 `ngp` profile.
 
@@ -32,6 +32,8 @@ remains headless. The supported surface includes:
   run-frames;
 - pausing 68000 exec/read/write breakpoints with public IDs, hit-time registers, bounded atomic RAM
   snapshots, one-shot event polling, and frozen-PC disassembly;
+- a frozen-only, best-effort 68000 call stack from MAME's bounded native call/return history, with
+  explicit completeness and dropped-history fields;
 - frozen-frame PNG capture with frame and SHA-256 provenance;
 - player-one A/B/C/D and directions with explicit ownership release; MVS adds coin/start/service,
   while AES and CD add start/select;
@@ -76,6 +78,6 @@ cargo run --release --example mame_neogeo_cd_smoke -- \
 
 One synchronous frame advance is capped by `status.execution_limits.frame.max_count`; longer
 travel must be split into terminally acknowledged calls. The current adapter does not expose
-trace, call stacks, or the Z80 state. Breakpoint conditions, value filters, non-pausing hits, and
+trace or the Z80 state. Breakpoint conditions, value filters, non-pausing hits, and
 memory types other than the profile RAM are rejected before mutation. Results for MVS, AES, CD,
 and Pocket/Color remain profile-specific and do not establish Hyper Neo Geo 64 support.

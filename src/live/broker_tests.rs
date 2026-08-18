@@ -166,7 +166,7 @@ fn broker_attach_preserves_contract_advertisement() {
                     "system": "nds",
                     "methods": ["status", "step_instructions", "call_stack"],
                     "contracts": crate::contracts::advertisement_value(&[
-                        "nds.execution.frame-step-absent",
+                        "nds.execution.frame-step-vblank",
                         "nds.call-stack.best-effort",
                     ]),
                 }
@@ -201,7 +201,7 @@ fn broker_attach_preserves_contract_advertisement() {
     assert_eq!(
         value["result"]["contracts"]["active_exceptions"],
         serde_json::json!([
-            "nds.execution.frame-step-absent",
+            "nds.execution.frame-step-vblank",
             "nds.call-stack.best-effort"
         ])
     );

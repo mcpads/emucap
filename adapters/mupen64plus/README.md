@@ -1,6 +1,6 @@
 # Mupen64Plus N64 adapter
 
-This experimental adapter pins the upstream 2.6.0 source bundle, builds the core
+This adapter pins the upstream 2.6.0 source bundle, builds the core
 with debugger support, and keeps build products under `work/`. Standard N64 cartridge images do
 not require a BIOS. N64DD is outside this adapter's current scope.
 
@@ -24,7 +24,10 @@ screenshot configuration only inside that runtime directory.
 The common surface is status and ROM identity, pause/resume, synchronous reset, R4300 state and
 exact instruction stepping, bounded RDRAM reads/writes while frozen, port-0 `set_input`,
 R4300 exec/read/write breakpoints with hit-time evidence, event polling, and disassembly. An empty
-input set releases the injected scancodes without disabling native keyboard state.
+input set releases the injected scancodes without disabling native keyboard state. Frozen sessions
+also expose a bounded, best-effort R4300 call stack reconstructed from native control-transfer
+history. It reports completeness and dropped history explicitly; it never mixes RSP frames into the
+main-CPU result.
 
 Visible launch additionally advertises rendered-frame stepping, bounded `run_frames`,
 `press_buttons`, PNG screenshot, and native save/load. Its callback barrier freezes inside the
@@ -66,6 +69,6 @@ closes the ROM, shuts down the core, and unloads each library in reverse order. 
 frontend before execution follows the same closure path.
 
 Headless launch has no video callback. It keeps instruction stepping, persistent input, reset,
-R4300 breakpoints, event polling, and disassembly, but omits frame step, `run_frames`, input pulse,
-screenshot, and save/load because their completion currently depends on the rendered-frame
-barrier. RSP state remains unadvertised.
+R4300 breakpoints, event polling, disassembly, and frozen best-effort call stack, but omits frame
+step, `run_frames`, input pulse, screenshot, and save/load because their completion currently
+depends on the rendered-frame barrier. RSP state remains unadvertised.

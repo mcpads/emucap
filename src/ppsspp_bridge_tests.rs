@@ -217,13 +217,77 @@ fn unknown_method_reports_unknown_method_kind() {
 }
 
 #[test]
-fn step_frame_request_is_unsupported_not_reinterpreted_as_instructions() {
-    // The MCP frame-step tool sends wire `step` with `{frames:n}` and no `unit`. PPSSPP has no
-    // frame-advance, so this must be rejected — not silently stepped as n instructions.
-    let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
+fn step_frame_request_uses_exact_vblank_command_and_reports_frozen_terminal() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        (
+            "cpu.status",
+            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+        ),
+        ("cpu.stepping", json!({"event":"cpu.stepping"})),
+        (
+            "emucap.frameStep",
+            json!({
+                "event":"emucap.frameStep",
+                "status":"completed",
+                "unit":"frames",
+                "count":60,
+                "completed":60,
+                "start_vblank":100,
+                "end_vblank":160,
+                "state":"frozen"
+            }),
+        ),
+    ]));
     let resp = bridge.handle_request(Request::new(1, "step", json!({"frames": 60})));
-    assert!(!resp.ok);
-    assert_eq!(resp.error.unwrap().kind, "unsupported");
+    assert!(resp.ok, "{:?}", resp.error);
+    let result = resp.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["completed"], 60);
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(bridge.ws.calls[0].0, "cpu.status");
+    assert_eq!(bridge.ws.calls[1].0, "cpu.stepping");
+    assert_eq!(
+        bridge.ws.calls[2],
+        ("emucap.frameStep".into(), json!({"count":60}))
+    );
+    assert_eq!(
+        bridge.ws.call_timeouts.last().unwrap().0,
+        "emucap.frameStep"
+    );
+}
+
+#[test]
+fn step_frame_preserves_breakpoint_preemption_as_interrupted_partial_result() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        (
+            "cpu.status",
+            json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+        ),
+        (
+            "emucap.frameStep",
+            json!({
+                "event":"emucap.frameStep",
+                "status":"interrupted",
+                "unit":"frames",
+                "count":120,
+                "completed":7,
+                "start_vblank":10,
+                "end_vblank":17,
+                "state":"frozen"
+            }),
+        ),
+    ]));
+    let resp = bridge.handle_request(Request::new(1, "step", json!({"frames": 120})));
+    assert!(resp.ok, "{:?}", resp.error);
+    let result = resp.result.unwrap();
+    assert_eq!(result["status"], "interrupted");
+    assert_eq!(result["completed"], 7);
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(
+        bridge.ws.calls.len(),
+        2,
+        "already-frozen CPU must not be paused again"
+    );
 }
 
 #[test]
@@ -297,10 +361,12 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
         "dump_memory",
         "get_state",
         "disassemble",
+        "call_stack",
         "set_breakpoint",
         "clear_breakpoint",
         "list_breakpoints",
         "clear_all_breakpoints",
+        "step",
         "step_instructions",
         "pause",
         "resume",
@@ -314,19 +380,12 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
     ] {
         assert!(methods.iter().any(|m| m == wanted), "missing {wanted}");
     }
-    // Frame-based `step` must not be advertised as callable (PPSSPP has no frame advance), so
-    // the MCP's `has("step")` frame-step composites stay off on PSP.
-    assert!(
-        !methods.iter().any(|m| m == "step"),
-        "should not advertise frame-based step"
-    );
-
     let caps = &result["capability_notes"];
     assert_eq!(caps["disassemble"], true);
+    assert_eq!(caps["call_stack"], true);
     assert_eq!(caps["breakpoints"], true);
-    // Stepping IS available, at instruction granularity only — this is the disclosure of
-    // the step capability, so `step` is *not* listed as a "planned"/not-yet-callable method.
-    assert_eq!(caps["step_units"], json!(["instructions"]));
+    assert_eq!(caps["step_units"], json!(["frames", "instructions"]));
+    assert_eq!(caps["frame_step"], true);
     assert_eq!(caps["screenshot"], true);
     assert_eq!(caps["input"], true);
     assert_eq!(caps["state_restore"], true);
@@ -336,11 +395,14 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
     assert_eq!(
         contracts["active_exceptions"],
         json!([
-            "ppsspp.execution.frame-step-absent",
+            "ppsspp.execution.frame-step-vblank",
+            "ppsspp.call-stack.frozen-best-effort",
             "ppsspp.input-hold.port-zero-only",
             "ppsspp.input-pulse.constraints"
         ])
     );
+    // The adapter advertises stable exception identities. The MCP derives their compact
+    // constraints from the registry after scope validation rather than duplicating them here.
     assert!(contracts.get("constraints").is_none());
     let advertised_methods: Vec<String> = methods
         .iter()
@@ -359,10 +421,7 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
         contract_status.errors
     );
 
-    // capability_notes.planned_methods discloses real emucap tool names not dispatched today
-    // (all platform-gapped → an "unsupported"). Frame `step` is NOT here: it is a
-    // permanent gap conveyed by step_units, not a pending feature — advertising it as planned
-    // while wire `step {unit:instructions}` is dispatched-and-working would misrepresent it.
+    // Implemented frame `step` must never appear in the not-yet-callable list.
     let planned = caps["planned_methods"].as_array().unwrap();
     assert!(
         !planned.iter().any(|m| m == "step"),
@@ -708,6 +767,54 @@ fn disassemble_requires_address() {
     let resp = bridge.handle_request(Request::new(1, "disassemble", json!({"count": 2})));
     assert!(!resp.ok);
     assert_eq!(resp.error.unwrap().kind, "bad_params");
+}
+
+#[test]
+fn call_stack_maps_ppsspp_native_mips_backtrace() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("cpu.status", json!({"event":"cpu.status","stepping":true})),
+        (
+            "hle.backtrace",
+            json!({
+                "event": "hle.backtrace",
+                "frames": [
+                    {"pc": 0x08801234u32, "entry": 0x08801200u32, "sp": 0x09ff1000u32, "stackSize": 32, "code": "jal 0x08802000"},
+                    {"pc": 0x08800100u32, "entry": 0x08800080u32, "sp": 0x09ff1020u32, "stackSize": 64, "code": "jr ra"},
+                ],
+            }),
+        ),
+    ]));
+    let response = bridge.handle_request(Request::new(1, "call_stack", json!({"cpu":"mips"})));
+    assert!(response.ok, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["depth"], 2);
+    assert_eq!(result["order"], "innermost_to_outermost");
+    assert_eq!(result["authority"], "best_effort");
+    assert_eq!(result["frames"][0]["pc"], 0x08801234u32);
+    assert_eq!(result["frames"][0]["stack_size"], 32);
+    assert_eq!(result["frames"][1]["code"], "jr ra");
+}
+
+#[test]
+fn call_stack_rejects_running_before_backtrace_mutation() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+        "cpu.status",
+        json!({"event":"cpu.status","stepping":false}),
+    )]));
+    let response = bridge.handle_request(Request::new(1, "call_stack", json!({})));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_state");
+    assert_eq!(bridge.ws.calls.len(), 1);
+    assert_eq!(bridge.ws.calls[0].0, "cpu.status");
+}
+
+#[test]
+fn call_stack_rejects_unknown_cpu_before_backend_calls() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
+    let response = bridge.handle_request(Request::new(1, "call_stack", json!({"cpu":"arm9"})));
+    assert!(!response.ok);
+    assert_eq!(response.error.unwrap().kind, "bad_params");
+    assert!(bridge.ws.calls.is_empty());
 }
 
 // --- set_breakpoint / clear_breakpoint / list_breakpoints / clear_all_breakpoints ---
@@ -1356,6 +1463,106 @@ fn poll_events_classifies_exec_breakpoint_hit_by_pc_match() {
     assert_eq!(events[0]["breakpoint_id"], 1);
     assert_eq!(events[0]["id"], 1);
     assert_eq!(events[0]["regs"]["cpu.pc"], 0x0880_4004u32);
+}
+
+#[test]
+fn poll_events_uses_explicit_exec_breakpoint_reason_and_related_address() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("cpu.breakpoint.add", json!({"event":"cpu.breakpoint.add"})),
+        ("cpu.getAllRegs", gpr_only_pc(0x0880_4010)),
+    ]));
+    bridge.handle_request(Request::new(
+        1,
+        "set_breakpoint",
+        json!({"address": 0x0880_4004u32}),
+    ));
+    bridge.ws.push_event(json!({
+        "event": "cpu.stepping",
+        "pc": 0x0880_4010u32,
+        "ticks": 42,
+        "reason": "cpu.breakpoint",
+        "relatedAddress": 0x0880_4004u32,
+    }));
+    let response = bridge.handle_request(Request::new(2, "poll_events", json!({})));
+    let event = response.result.unwrap()["events"][0].clone();
+    assert_eq!(event["type"], "breakpoint_hit");
+    assert_eq!(event["breakpoint_id"], 1);
+    assert_eq!(event["address"], 0x0880_4004u32);
+    assert_eq!(event["reason"], "cpu.breakpoint");
+    assert_eq!(event["relatedAddress"], 0x0880_4004u32);
+}
+
+#[test]
+fn explicit_non_breakpoint_reason_is_not_reclassified_by_matching_pc() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("cpu.breakpoint.add", json!({"event":"cpu.breakpoint.add"})),
+        ("cpu.getAllRegs", gpr_only_pc(0x0880_4004)),
+    ]));
+    bridge.handle_request(Request::new(
+        1,
+        "set_breakpoint",
+        json!({"address": 0x0880_4004u32}),
+    ));
+    bridge.ws.push_event(json!({
+        "event": "cpu.stepping",
+        "pc": 0x0880_4004u32,
+        "ticks": 43,
+        "reason": "ui.frameAdvance",
+        "relatedAddress": 12,
+    }));
+    let response = bridge.handle_request(Request::new(2, "poll_events", json!({})));
+    let event = response.result.unwrap()["events"][0].clone();
+    assert_eq!(event["type"], "stop");
+    assert_eq!(event["reason"], "ui.frameAdvance");
+    assert!(event.get("breakpoint_id").is_none());
+    assert_eq!(
+        bridge.ws.calls.len(),
+        2,
+        "must not consult breakpoint counters"
+    );
+}
+
+#[test]
+fn poll_events_uses_explicit_memory_breakpoint_reason_without_counter_probe() {
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        (
+            "memory.breakpoint.add",
+            json!({"event":"memory.breakpoint.add"}),
+        ),
+        (
+            "memory.breakpoint.list",
+            json!({
+                "event": "memory.breakpoint.list",
+                "breakpoints": [
+                    {"address": 0x0880_0100u32, "size": 4, "hits": 0},
+                ],
+            }),
+        ),
+        ("cpu.getAllRegs", gpr_only_pc(0x0880_9000)),
+    ]));
+    bridge.handle_request(Request::new(
+        1,
+        "set_breakpoint",
+        json!({"kind": "write", "memory_type": "main", "start": 0x100, "length": 4}),
+    ));
+    bridge.ws.push_event(json!({
+        "event": "cpu.stepping",
+        "pc": 0x0880_9000u32,
+        "ticks": 7,
+        "reason": "memory.breakpoint",
+        "relatedAddress": 0x0880_0100u32,
+    }));
+    let response = bridge.handle_request(Request::new(2, "poll_events", json!({})));
+    let event = response.result.unwrap()["events"][0].clone();
+    assert_eq!(event["type"], "breakpoint_hit");
+    assert_eq!(event["kind"], "write");
+    assert_eq!(event["breakpoint_id"], 1);
+    assert_eq!(event["address"], 0x0880_0100u32);
+    assert_eq!(
+        bridge.ws.calls.len(),
+        3,
+        "no hit-counter probe after an exact reason"
+    );
 }
 
 #[test]

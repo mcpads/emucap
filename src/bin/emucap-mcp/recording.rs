@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use emucap::bundle::recording_manifest::{
-    EventClassFilter, EventFilterTerm, EventStartCondition, EventStopCondition,
-    InitialSnapshotRequest, RecordingOrigin, TerminalSnapshotRequest,
+    EventArmingScope, EventClassArming, EventClassFilter, EventFilterTerm, EventStartCondition,
+    EventStopCondition, InitialSnapshotRequest, RecordingOrigin, TerminalSnapshotRequest,
 };
 use emucap::live::link::{RequestCancellation, WorkingProgress};
 use emucap::live::recording::{self, RecordWindowRequest, RequestedRecordingLimits};
@@ -10,7 +10,10 @@ use emucap::live::runtime::RuntimeStore;
 use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken};
 use rmcp::service::{RequestContext, RoleServer};
 
-use crate::args::{RecordWindowArgs, RecordWindowFilterTermArgs, RecordWindowOriginArgs};
+use crate::args::{
+    RecordWindowArgs, RecordWindowEventScopeArgs, RecordWindowFilterTermArgs,
+    RecordWindowOriginArgs,
+};
 use crate::{error_result, tool_output_result, SharedLink, ToolOutput};
 
 #[cfg(test)]
@@ -87,6 +90,17 @@ pub(crate) async fn run_record_window(
                         },
                     })
                     .collect(),
+            })
+            .collect(),
+        event_arming_overrides: args
+            .event_arming_overrides
+            .into_iter()
+            .map(|arming| EventClassArming {
+                id: arming.event_class,
+                scope: match arming.scope {
+                    RecordWindowEventScopeArgs::Transaction => EventArmingScope::Transaction,
+                    RecordWindowEventScopeArgs::Observation => EventArmingScope::Observation,
+                },
             })
             .collect(),
         origin: args.origin.map(|origin| match origin {

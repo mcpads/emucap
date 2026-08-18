@@ -35,8 +35,8 @@ CPU_MEMORY_BY_SUFFIX = {
     ".sfc": "snesMemory",
     ".smc": "snesMemory",
     ".nes": "nesMemory",
-    ".gb": "gbMemory",
-    ".gbc": "gbMemory",
+    ".gb": "gameboyMemory",
+    ".gbc": "gameboyMemory",
     ".gg": "smsMemory",
     ".gba": "gbaMemory",
 }
@@ -131,13 +131,23 @@ def accept(listener: socket.socket, token: str) -> Session:
     if result.get("session_token") != token or result.get("adapter") != "mesen2-live":
         raise RuntimeError(f"identity mismatch: {result}")
     features = set(result.get("host_features", []))
-    if result.get("mesen_host_api") != 3 or not {
+    if result.get("mesen_host_api") != 4 or not {
         "code_break_idle",
         "native_halt_service",
         "native_halt_savestate",
         "native_power_cycle",
+        "native_instruction_step",
+        "native_call_stack",
     }.issubset(features):
         raise RuntimeError(f"mesen-patch-required: runtime hello lacks native halt: {result}")
+    if "step_instructions" not in result.get("methods", []):
+        raise RuntimeError(f"instruction step wire method is not advertised: {result}")
+    active_exceptions = set(result.get("contracts", {}).get("active_exceptions", []))
+    if (
+        "mesen.execution.instruction-step-main-cpu" not in active_exceptions
+        or "mesen.execution.instruction-step-absent" in active_exceptions
+    ):
+        raise RuntimeError(f"instruction step contract scope is stale: {result}")
     return session
 
 
@@ -387,7 +397,7 @@ end, emu.eventType.codeBreakIdleSavestate)
             breakpoint_id = armed.get("result", {}).get("id")
             if not armed.get("ok") or not isinstance(breakpoint_id, int):
                 raise RuntimeError(f"exec breakpoint did not arm at frozen PC: {armed}")
-            interrupted_step = session.request("step", {"frames": 1, "unit": "frames"})
+            interrupted_step = session.request("step_instructions", {"count": 5000})
             if (
                 not interrupted_step.get("ok")
                 or interrupted_step.get("result", {}).get("status") != "interrupted"
@@ -396,7 +406,7 @@ end, emu.eventType.codeBreakIdleSavestate)
                 or interrupted_step.get("result", {}).get("state") != "frozen"
             ):
                 raise RuntimeError(
-                    "a pausing exec breakpoint did not preempt frame step: "
+                    "a pausing exec breakpoint did not preempt instruction step: "
                     f"{interrupted_step}"
                 )
             hit_events = session.request("poll_events")
@@ -449,18 +459,40 @@ end, emu.eventType.codeBreakIdleSavestate)
                     f"frame-step halt did not fail-loud before serialization: {unsafe_save}"
                 )
 
-            stepped_instruction = session.request(
-                "step", {"frames": 1, "unit": "instructions"}
-            )
+            stepped_instruction = session.request("step_instructions", {"count": 3})
             if not stepped_instruction.get("ok") or stepped_instruction.get("result", {}).get(
                 "status"
             ) != "completed":
-                raise RuntimeError(f"one-instruction step failed: {stepped_instruction}")
+                raise RuntimeError(f"three-instruction step failed: {stepped_instruction}")
+            if (
+                stepped_instruction.get("result", {}).get("unit") != "instructions"
+                or stepped_instruction.get("result", {}).get("count") != 3
+                or stepped_instruction.get("result", {}).get("state") != "frozen"
+            ):
+                raise RuntimeError(
+                    f"instruction step terminal evidence is incomplete: {stepped_instruction}"
+                )
             after_instruction_step = freeze_signature(session)
-            # One CPU instruction may cross a frame boundary, and its visible register projection
+            # An instruction step may cross a frame boundary, and its visible register projection
             # may be unchanged (e.g. a self-branch or a console HALT/interrupt boundary). Mesen's
             # native StepRequest owns the exact instruction count; this live gate verifies that its
             # completed reply returns to the compatible native halt instead of free-running.
+            instruction_state_path = home / "instruction-halt.mss"
+            instruction_state_path.write_bytes(old_state)
+            instruction_saved = session.request(
+                "save_state", {"path": str(instruction_state_path)}
+            )
+            if not instruction_saved.get("ok") or instruction_state_path.read_bytes() == old_state:
+                raise RuntimeError(
+                    f"instruction halt did not support safe frozen save: {instruction_saved}"
+                )
+            after_instruction_save = freeze_signature(session)
+            if after_instruction_save != after_instruction_step:
+                raise RuntimeError(
+                    "instruction-halt save changed guest state: "
+                    f"before={after_instruction_step} after={after_instruction_save}"
+                )
+
             loaded = session.request("load_state", {"path": str(state_path)})
             if (
                 not loaded.get("ok")
@@ -517,9 +549,10 @@ end, emu.eventType.codeBreakIdleSavestate)
                         "pause_held_seconds": args.hold_seconds,
                         "burst_requests": burst_count,
                         "one_frame_step_exact": True,
-                        "breakpoint_preempted_frame_step": True,
+                        "breakpoint_preempted_instruction_step": True,
                         "breakpoint_remained_armed_after_step_interrupt": True,
-                        "one_instruction_step_refroze": True,
+                        "three_instruction_step_refroze": True,
+                        "instruction_halt_save_preserved_halt": True,
                         "safe_frozen_save_preserved_halt": True,
                         "unsafe_frame_halt_rejected_save": True,
                         "safe_frozen_load_restored_cpu": True,

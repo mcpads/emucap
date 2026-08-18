@@ -24,7 +24,8 @@ impl<T: WsTransport> PpssppBridge<T> {
             "methods": METHODS,
             "memory_types": MEMORY_TYPES,
             "contracts": crate::contracts::advertisement_value(&[
-                "ppsspp.execution.frame-step-absent",
+                "ppsspp.execution.frame-step-vblank",
+                "ppsspp.call-stack.frozen-best-effort",
                 "ppsspp.input-hold.port-zero-only",
                 "ppsspp.input-pulse.constraints",
             ]),
@@ -74,7 +75,8 @@ impl<T: WsTransport> PpssppBridge<T> {
                 {"kind":"write", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
             ],
             "contracts": crate::contracts::advertisement_value(&[
-                "ppsspp.execution.frame-step-absent",
+                "ppsspp.execution.frame-step-vblank",
+                "ppsspp.call-stack.frozen-best-effort",
                 "ppsspp.input-hold.port-zero-only",
                 "ppsspp.input-pulse.constraints",
             ]),

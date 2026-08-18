@@ -210,7 +210,9 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   format via CRAM_Mode) · `backup` (32KB) · `physical` (SH-2 external bus), etc.
 - **PSX (4 kinds)**: `cpu` (32-bit CPU bus — auto-decodes KUSEG/KSEG0/KSEG1 mirrors · scratchpad · BIOS · HW;
   exec BP and value reads happen here) · `ram` (main RAM 2MB direct) · `spu` (SPU RAM 512KB) · `gpu` (VRAM 1MB).
-  MIPS is little-endian, so multi-byte value assembly is LE.
+  MIPS is little-endian, so multi-byte value assembly is LE. Exec breakpoint ranges accept any
+  equivalent KUSEG/KSEG0/KSEG1 address and fold only the native comparison; the public address and
+  hit-time raw PC remain unchanged.
 - **PCE exact (`pce`)**: `cpu` (HuC6280 16-bit logical — reflects the current MPR mapping, exec/read/write BP and value reads happen here) ·
   `physical` (21-bit physical) · `ram` (8KB, 32KB on SGX) · `vram0` (VDC VRAM, byte address) · `vram1` (SGX VDC-B VRAM, read/write BP) · `sat0` (VDC SAT) ·
   `pram` (VCE palette) · `adpcm` (CD ADPCM RAM, CD titles) · `acram` (Arcade Card) · `bram` · `psgram0..5`.
@@ -239,7 +241,9 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   the segment, so it would silently watch the wrong physical address). Value-conditioned **read** BPs support `value_len`
   1–4; value-conditioned **write** BPs are `value_len=1` only — V30MZ writes a word/long as separate bytes, so the write
   hook injects one byte and cannot reconstruct a multi-byte value (rejected, not silently missed).
-  Not supported for wswan: `break_on_reset`; `get_video_state` / `resolve_tile` (video/tile/palette live in main RAM,
+  `break_on_reset` freezes at the architectural reset entry FFFF:0000 (physical 0xFFFF0) and records
+  `source:"reset"`; comparing the full CS:IP-derived address avoids false hits at unrelated IP=0
+  boundaries. Not supported for wswan: `get_video_state` / `resolve_tile` (video/tile/palette live in main RAM,
   reachable via `ram`/`physical`, but there is no dedicated video decoder); `call_stack` is best-effort (V30MZ opcode
   classification with prefix skipping, no full instruction decode). Everything else in the Mednafen debugger surface
   (read/write, get\_state, disassemble via built-in zedis, screenshot, save/load, exec/read/write BP, find\_pattern,
@@ -336,6 +340,14 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   against raw bytes) · read_memory (cpu/ram, KSEG mirror folding · LE) · write_memory · save/load_state round-trip ·
   screenshot · input injection (running the menu to completion from title → start → DATA SELECT → new game → character select) · exec/write BP
   freeze.
+- **PSX/WS debugger boundary smoke** proves a public low PSX BIOS exec breakpoint against KSEG1
+  execution and a WS reset stop at FFFF:0000 on an isolated listener/profile, then terminates only
+  the exact child processes it launched:
+
+  ```sh
+  cargo run --release --example mednafen_debug_boundaries_smoke -- \
+    <psx.cue> <ws.rom> <scph5500.bin>
+  ```
 - **Input injection point**: injected not at the driver's `Input_Update` but in the core-agnostic `mednafen.cpp`, right
   before Emulate (same phase as movie/netplay) and at MidSync. An Input_Update injection can be out of phase with when
   the game reads the input snapshot (the Saturn SMPC INTBACK path). PSX has no SMPC, so the game reads PortData directly

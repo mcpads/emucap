@@ -3,8 +3,8 @@
 The adapter that gives emucap PlayStation Portable support. Headless PPSSPP already exposes an
 external debugger over its own JSON WebSocket (`debugger.ppsspp.org`); the emucap **PSP bridge**
 (`emucap-ppsspp-bridge`) is a pure WebSocket client that relays it to the emucap wire protocol. A
-small repo-owned fork adds the two commands PPSSPP's stock API is missing (savestate, and a
-screenshot variant that works while the game is running).
+small repo-owned fork adds missing lifecycle and exact-time hooks: savestate, a screenshot variant
+that works while the game is running, exact VBlank frame stepping, and trustworthy stop provenance.
 
 ## Architecture
 
@@ -64,6 +64,12 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
   - `patches/0008-emucap-correlate-async-debugger-acks.patch` echoes request tickets on
     asynchronous CPU stepping and resume events. The bridge tickets every command, so a delayed
     reply or error is queued instead of satisfying an unrelated later request.
+  - `patches/0009-emucap-vblank-frame-step.patch` adds `emucap.frameStep`, an exact advance from
+    one frozen PSP VBlank-start boundary to another. A debugger stop preempts the request and
+    returns its partial count; completion does not claim that a host frame was presented.
+  - `patches/0010-emucap-stepping-reason.patch` preserves the native stop reason and related
+    address after PPSSPP clears the pending step command, so breakpoint events no longer need to
+    infer every stop from PC or hit-count deltas.
 - `cpu.stepInto`/`stepOver`/`stepOut`/`runUntil`/`nextHLE` ack via a *differently named* spontaneous
   `cpu.stepping` event rather than a reply of their own name (`SteppingSubscriber.cpp`) — the bridge
   handles this with a send-then-wait-for-a-different-event primitive, not a naive call/reply demux.
@@ -219,18 +225,22 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
 - `save_state`/`load_state` — `savestate.save`/`savestate.load`. The fork's handler breaks the CPU
   into stepping if it's running, waits for the save/load to complete, then restores the prior
   run/halt state — so this works regardless of whether the CPU is running or halted.
+- `step(unit="frames")` — `emucap.frameStep` advances exactly the requested number of emulated PSP
+  VBlank-start boundaries and returns frozen. A breakpoint or other native stop returns
+  `interrupted` with the completed count. The MCP `tap`, `hold_until`, `regression_run`, and
+  `verify_determinism` composites are admitted on top of this exact clock and native savestate.
+
+**Tier 3 (stock debugger data with an emucap contract)**:
+- `call_stack` — frozen-only `hle.backtrace`, bounded to 256 frames. PPSSPP derives the stack from
+  MIPS code analysis and thread entry/stack bounds; optimized or unusual prologues can end the walk
+  early, so `status.contracts` advertises `debug.call-stack="best_effort"` rather than an
+  authoritative unwind.
 
 **Not yet supported (`status.capability_notes.planned_methods`/other gaps — `status.methods` is
 authoritative, not this list)**:
-- `step(unit="frames")` — only instruction-based stepping exists today; no
-  fork/PPSSPP primitive advances by video frame yet.
-- `run_frames`, and the MCP-composed `tap`/`hold_until` — all depend on a
-  frame-level `step`, which this bridge doesn't dispatch.
-- `probe`, `find_pattern`, `watch_register`, `set_trace`/`get_trace`, `call_stack`,
+- raw wire `run_frames` — exact frozen-terminal frame `step` is the supported time primitive.
+- `probe`, `find_pattern`, `watch_register`, `set_trace`/`get_trace`,
   `break_on_reset` — no bridge/fork hook yet.
-- The MCP-composed `regression_run`/`verify_determinism` — both replay paths
-  need either `probe` or a frame-level `step`, neither of which exists here yet, so they report
-  `unsupported`.
 - Structured breakpoint value-conditions (`value`/`value_mask`/`value_len`) — unsupported; use a
   raw `condition` expression (PPSSPP's own expression language) instead, or
   `pc_min`/`pc_max`, which the bridge compiles into one automatically.
@@ -241,12 +251,10 @@ authoritative, not this list)**:
 
 - **Halt-on-start**: `--debugger` forces `startBreak=true` — `resume` to run after the bridge
   attaches.
-- **`reason` is a dead field**: PPSSPP's `cpu.stepping` stop event never actually populates its
-  `reason`/`relatedAddress` fields (`Core_Break()` clears the step-command type in the same breath
-  it would record the reason) — a breakpoint hit and a plain stepping-completion produce the
-  identical bare `{pc, ticks}` event. `poll_events` classifies a hit by matching `pc` against
-  tracked exec breakpoints, and for memory breakpoints by a `memory.breakpoint.list` hit-count
-  delta (simultaneous memory-breakpoint hits are best-effort — only one is attributed per event).
+- **Stop provenance**: fork patch 0010 retains PPSSPP's native `reason` and `relatedAddress` after
+  `Core_Break()` clears the pending step command. `poll_events` uses those fields first and retains
+  PC matching and memory-breakpoint hit-count deltas only as compatibility fallbacks for older
+  hosts. Simultaneous fallback-only memory hits remain best-effort.
 - **Ack-name mismatch**: `cpu.stepInto`/`stepOver`/`stepOut`/`runUntil`/`nextHLE` ack via a
   `cpu.stepping` event, not a reply of their own name — a naive client that blocks for a reply
   literally named `cpu.stepInto` hangs forever.

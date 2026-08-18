@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.14.3 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.14.4 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -156,6 +156,9 @@ RTC, save 같은 초기 조건의 동일성을 뜻하지 않는다. 그러한 pr
 광고하는 `execution_profile: "repeatable"`을 별도로 선택하며,
 `record_window(require_repeatable: true)`는 선택한 recording origin이 해당 조건을 지원하지 않으면 reset,
 input, guest advance 전에 거부한다.
+Mesen의 격리 runtime을 갱신할 때는 일반 profile의 battery save와 portable data를 보존한다. Repeatable
+profile은 별도의 폐기 가능한 portable root를 사용하므로, 깨끗한 초기 조건을 만들기 위해 일반 profile이나
+사용자의 표준 Mesen 저장을 삭제하지 않는다.
 
 `listener.base_port`는 direct mode에서 빈 포트를 찾기 시작하는 값일 뿐이며 다른 살아 있는 MCP 세션이
 이미 사용 중일 수 있다. Launcher는 실제로 할당된 `listener.port` 또는 full `status`의
@@ -176,9 +179,11 @@ guest를 진행하지 않고 거부한다. 선택적 origin·입력 무비·even
 class별 half-open range는 선언한 관측 범위만 좁히며, 제외된 callback은 drop으로 세지 않는다. 범위
 안의 event는 기존 sequence·limit·integrity 규칙을 그대로 따르고, 광고되지 않은 field와 잘못된
 범위는 guest mutation 전에 거절된다.
-`recording_capability.warmup`이 있으면 `warmup_frames`로 저비용 transaction event는 계속 기록하면서
-observation-only hook의 활성화를 정확한 guest frame 경계까지 미룰 수 있다. 입력 무비는 두 구간을 한
-요청 안에서 모두 포함한다.
+`recording_capability.warmup`이 있으면 `warmup_frames` 동안 producer 기본 transaction class는 계속
+기록하고 observation event 발행은 정확한 guest frame 경계까지 미룬다.
+`warmup.selectable_event_scopes`에 있는 class는 `event_arming_overrides`로 광고된 scope를 선택할 수 있고,
+생략하면 producer 기본값을 유지한다. 선택한 scope는 stream과 event·byte·drop 회계 구간을 정하며 native
+emulator hook의 설치 여부까지 약속하지 않는다. 입력 무비는 두 구간을 한 요청 안에서 모두 포함한다.
 선택한 event가 `startable`이면 `start_on`으로 첫 occurrence에 observation 시작을 맞출 수 있다.
 `initial_snapshots`는 capability가 광고한 callback-safe memory type과 상한을 추가로 요구하며, Core가
 별도 인증 binary sink로 받아 manifest의 exact anchor event와 member hash를 묶는다. 선택적 terminal snapshot은

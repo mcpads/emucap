@@ -1,0 +1,224 @@
+--- a/Core/Core.h
++++ b/Core/Core.h
+@@ -96,6 +96,30 @@
+ };
+ SteppingReason Core_GetSteppingReason();
+ 
++// A debugger-owned frame advance is measured at PSP VBlank start, not at host presentation.
++// It starts only from CORE_STEPPING_CPU and terminates in the same state.  Any other Core_Break
++// while it is active interrupts the advance rather than being hidden by it.
++enum class EmucapFrameStepStatus {
++	Idle,
++	Running,
++	Completed,
++	Interrupted,
++	TimedOut,
++};
++
++struct EmucapFrameStepResult {
++	EmucapFrameStepStatus status = EmucapFrameStepStatus::Idle;
++	u32 requested = 0;
++	u32 completed = 0;
++	u64 startVblank = 0;
++	u64 endVblank = 0;
++};
++
++bool Core_EmucapBeginFrameStep(u32 count, u64 startVblank);
++EmucapFrameStepResult Core_EmucapWaitFrameStep(u32 timeoutMilliseconds);
++EmucapFrameStepResult Core_EmucapCancelFrameStep();
++void Core_EmucapFrameBoundary(u64 vblank);
++
+ enum class CoreLifecycle {
+ 	STARTING,
+ 	// Note: includes failure cases.  Guaranteed call after STARTING.
+--- a/Core/Core.cpp
++++ b/Core/Core.cpp
+@@ -70,6 +70,11 @@
+ static std::condition_variable m_InactiveCond;
+ static std::mutex m_hInactiveMutex;
+ 
++static std::condition_variable g_emucapFrameStepCond;
++static std::mutex g_emucapFrameStepMutex;
++static EmucapFrameStepResult g_emucapFrameStep;
++static bool g_emucapFrameStepFinishing = false;
++
+ static int steppingCounter = 0;
+ static std::set<CoreLifecycleFunc> lifecycleFuncs;
+ 
+@@ -90,6 +95,72 @@
+ 
+ BreakReason Core_BreakReason() {
+ 	return g_breakReason;
++}
++
++bool Core_EmucapBeginFrameStep(u32 count, u64 startVblank) {
++	std::lock_guard<std::mutex> guard(g_emucapFrameStepMutex);
++	if (count == 0 || coreState != CORE_STEPPING_CPU || g_emucapFrameStep.status == EmucapFrameStepStatus::Running)
++		return false;
++	g_emucapFrameStep.status = EmucapFrameStepStatus::Running;
++	g_emucapFrameStep.requested = count;
++	g_emucapFrameStep.completed = 0;
++	g_emucapFrameStep.startVblank = startVblank;
++	g_emucapFrameStep.endVblank = startVblank;
++	g_emucapFrameStepFinishing = false;
++	return true;
++}
++
++EmucapFrameStepResult Core_EmucapWaitFrameStep(u32 timeoutMilliseconds) {
++	std::unique_lock<std::mutex> guard(g_emucapFrameStepMutex);
++	if (g_emucapFrameStep.status == EmucapFrameStepStatus::Running) {
++		const bool stopped = g_emucapFrameStepCond.wait_for(
++			guard,
++			std::chrono::milliseconds(timeoutMilliseconds),
++			[] { return g_emucapFrameStep.status != EmucapFrameStepStatus::Running; });
++		if (!stopped) {
++			EmucapFrameStepResult timedOut = g_emucapFrameStep;
++			timedOut.status = EmucapFrameStepStatus::TimedOut;
++			return timedOut;
++		}
++	}
++	return g_emucapFrameStep;
++}
++
++EmucapFrameStepResult Core_EmucapCancelFrameStep() {
++	std::lock_guard<std::mutex> guard(g_emucapFrameStepMutex);
++	if (g_emucapFrameStep.status == EmucapFrameStepStatus::Running)
++		g_emucapFrameStep.status = EmucapFrameStepStatus::Interrupted;
++	g_emucapFrameStepFinishing = false;
++	g_emucapFrameStepCond.notify_all();
++	return g_emucapFrameStep;
++}
++
++static void Core_EmucapObserveBreak(BreakReason reason) {
++	std::lock_guard<std::mutex> guard(g_emucapFrameStepMutex);
++	if (g_emucapFrameStep.status != EmucapFrameStepStatus::Running)
++		return;
++	g_emucapFrameStep.status = g_emucapFrameStepFinishing && reason == BreakReason::FrameAdvance
++		? EmucapFrameStepStatus::Completed
++		: EmucapFrameStepStatus::Interrupted;
++	g_emucapFrameStepFinishing = false;
++	g_emucapFrameStepCond.notify_all();
++}
++
++void Core_EmucapFrameBoundary(u64 vblank) {
++	bool shouldBreak = false;
++	{
++		std::lock_guard<std::mutex> guard(g_emucapFrameStepMutex);
++		if (g_emucapFrameStep.status != EmucapFrameStepStatus::Running)
++			return;
++		g_emucapFrameStep.completed++;
++		g_emucapFrameStep.endVblank = vblank;
++		if (g_emucapFrameStep.completed >= g_emucapFrameStep.requested) {
++			g_emucapFrameStepFinishing = true;
++			shouldBreak = true;
++		}
++	}
++	if (shouldBreak)
++		Core_Break(BreakReason::FrameAdvance, (u32)vblank);
+ }
+ 
+ const char *CoreStateToString(CoreState state) {
+@@ -147,6 +218,8 @@
+ 	if (stage == CoreLifecycle::STARTING) {
+ 		Core_ResetException();
+ 	}
++	if (stage == CoreLifecycle::STOPPING || stage == CoreLifecycle::MEMORY_REINITING)
++		Core_EmucapCancelFrameStep();
+ 
+ 	for (auto func : lifecycleFuncs) {
+ 		func(stage);
+@@ -462,6 +535,7 @@
+ 		_assert_msg_(reason != BreakReason::None, "No reason specified for break");
+ 		Core_UpdateState(CORE_STEPPING_CPU);
+ 	}
++	Core_EmucapObserveBreak(reason);
+ 	System_Notify(SystemNotification::DEBUG_MODE_CHANGE);
+ }
+ 
+--- a/Core/HW/Display.cpp
++++ b/Core/HW/Display.cpp
+@@ -25,6 +25,7 @@
+ #include "Common/TimeUtil.h"
+ #include "Common/Data/Text/StringWriter.h"
+ #include "Core/Config.h"
++#include "Core/Core.h"
+ #include "Core/System.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HLE/sceKernel.h"
+@@ -229,6 +230,7 @@
+ void DisplayFireVblankStart() {
+ 	frameStartTicks = CoreTiming::GetTicks();
+ 	numVBlanks++;
++	Core_EmucapFrameBoundary((u64)numVBlanks);
+ 
+ 	isVblank = 1;
+ 	vCount++; // vCount increases at each VBLANK.
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -22,6 +22,7 @@
+ #include "Core/Debugger/WebSocket/WebSocketUtils.h"
+ #include "Core/Core.h"
+ #include "Core/HLE/HLE.h"
++#include "Core/HW/Display.h"
+ #include "Core/HLE/sceKernelThread.h"
+ #include "Core/MIPS/MIPSDebugInterface.h"
+ #include "Core/MIPS/MIPSStackWalk.h"
+@@ -41,6 +42,7 @@
+ 	void Out(DebuggerRequest &req);
+ 	void RunUntil(DebuggerRequest &req);
+ 	void HLE(DebuggerRequest &req);
++	void Frame(DebuggerRequest &req);
+ 
+ protected:
+ 	uint32_t GetNextAddress(DebugInterface *cpuDebug);
+@@ -56,9 +58,50 @@
+ 	map["cpu.stepOut"]  = [p](DebuggerRequest &req) { p->Out(req); };
+ 	map["cpu.runUntil"] = [p](DebuggerRequest &req) { p->RunUntil(req); };
+ 	map["cpu.nextHLE"]  = [p](DebuggerRequest &req) { p->HLE(req); };
++	map["emucap.frameStep"] = [p](DebuggerRequest &req) { p->Frame(req); };
+ 	return p;
+ }
+ 
++// Advance by an exact number of emulated PSP VBlank-start boundaries and halt again.  Host
++// presentation is intentionally not part of this contract: headless and displayed runs share the
++// same emulated clock.  A breakpoint or other Core_Break wins and reports an interrupted partial
++// advance.  The bounded wait leaves enough time for the bridge to receive the terminal reply.
++void WebSocketSteppingState::Frame(DebuggerRequest &req) {
++	if (!currentDebugMIPS->isAlive())
++		return req.Fail("CPU not started");
++	if (coreState != CORE_STEPPING_CPU)
++		return req.Fail("CPU must be halted before emucap.frameStep");
++
++	uint32_t count = 0;
++	if (!req.ParamU32("count", &count))
++		return;
++	if (count == 0 || count > 5000)
++		return req.Fail("count must be between 1 and 5000");
++
++	const u64 startVblank = (u64)__DisplayGetNumVblanks();
++	if (!Core_EmucapBeginFrameStep(count, startVblank))
++		return req.Fail("another frame advance is active or the CPU is not halted");
++
++	Core_Resume();
++	EmucapFrameStepResult result = Core_EmucapWaitFrameStep(240000);
++	if (result.status == EmucapFrameStepStatus::TimedOut) {
++		Core_Break(BreakReason::DebugBreak, 0);
++		Core_WaitInactive();
++		Core_EmucapCancelFrameStep();
++		return req.Fail("frame advance timed out after 240000 ms; CPU halt was requested");
++	}
++
++	Core_WaitInactive();
++	JsonWriter &json = req.Respond();
++	json.writeString("status", result.status == EmucapFrameStepStatus::Completed ? "completed" : "interrupted");
++	json.writeString("unit", "frames");
++	json.writeUint("count", result.requested);
++	json.writeUint("completed", result.completed);
++	json.writeUint("start_vblank", (uint32_t)result.startVblank);
++	json.writeUint("end_vblank", (uint32_t)result.endVblank);
++	json.writeString("state", "frozen");
++}
++
+ static DebugInterface *CPUFromRequest(DebuggerRequest &req, uint32_t *threadID = nullptr) {
+ 	if (!req.HasParam("thread")) {
+ 		if (threadID)

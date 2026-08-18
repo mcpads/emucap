@@ -349,6 +349,15 @@ function emucap_gdbstub.startplugin()
       finish_pending_reset_reply("E05")
       return
     end
+    if is_neogeo_profile then
+      local stack_ok, stack_error = pcall(function()
+        cpu.debug:callstack_enable(true)
+        cpu.debug:callstack_clear(true)
+      end)
+      if not stack_ok then
+        print("emucap_gdbstub: native call stack unavailable " .. tostring(stack_error))
+      end
+    end
     consolelog = debugger.consolelog
     breaks = breaks or { byaddr = {}, byidx = {}, pause = {} }
     watches = watches or { byaddr = {}, byidx = {} }
@@ -489,6 +498,12 @@ function emucap_gdbstub.startplugin()
   end)
 
   post_load_subscription = emu.add_machine_post_load_notifier(function()
+    if is_neogeo_profile and cpu then
+      local stack_ok, stack_error = pcall(function() cpu.debug:callstack_clear(false) end)
+      if not stack_ok then
+        print("emucap_gdbstub: call stack clear after load failed " .. tostring(stack_error))
+      end
+    end
     if pending_load then
       finish_state_operation("OK")
     end
@@ -1683,6 +1698,43 @@ function emucap_gdbstub.startplugin()
       stop_debugger()
       ack_packet(socket, "OK")
       service_frozen_socket()
+      return true
+    elseif name == "callstack" then
+      if not is_neogeo_profile or not cpu or running then
+        ack_packet(socket, "E1A")
+        return true
+      end
+      local ok, stack_or_error = pcall(function()
+        local native = cpu.debug:callstack()
+        local native_frames = native.frames or {}
+        local map = regmaps[cpu.shortname]
+        local pc = tonumber(cpu.state[map.pcreg].value) or 0
+        local sp = tonumber(cpu.state.SP.value) or 0
+        local parts = {
+          "STACK",
+          string.format("%x", pc),
+          string.format("%x", sp),
+          native.complete and "1" or "0",
+          tostring(native.dropped or 0),
+          tostring(#native_frames),
+        }
+        local first = math.max(1, #native_frames - 62)
+        for index = first, #native_frames do
+          local frame = native_frames[index]
+          parts[#parts + 1] = string.format("%x,%x,%x,%x",
+            frame.source or 0,
+            frame.target or 0,
+            frame.return_address or 0,
+            frame.stack_pointer or 0)
+        end
+        return table.concat(parts, "|")
+      end)
+      if ok then
+        ack_packet(socket, stack_or_error)
+      else
+        print("emucap_gdbstub: call stack failed " .. tostring(stack_or_error))
+        ack_packet(socket, "E1A")
+      end
       return true
     elseif name == "dasm" then
       local spec = hex_to_string(rest or "")

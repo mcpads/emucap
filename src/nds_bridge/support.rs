@@ -197,6 +197,48 @@ pub(super) fn step_count(params: &Value) -> NdsResult<u64> {
     Ok(count.max(1))
 }
 
+pub(super) fn parse_frame_step_status(value: &str) -> NdsResult<FrameStepStatus> {
+    let (terminal, fields) = value.split_once(':').ok_or_else(|| {
+        NdsBridgeError::Emulator(format!("invalid DeSmuME frame-step status: {value:?}"))
+    })?;
+    let terminal = match terminal {
+        "idle" => FrameStepTerminal::Idle,
+        "running" => FrameStepTerminal::Running,
+        "completed" => FrameStepTerminal::Completed,
+        "interrupted" => FrameStepTerminal::Interrupted,
+        other => {
+            return Err(NdsBridgeError::Emulator(format!(
+                "unknown DeSmuME frame-step terminal: {other:?}"
+            )))
+        }
+    };
+    let parsed = fields
+        .split(',')
+        .map(|field| u64::from_str_radix(field, 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            NdsBridgeError::Emulator(format!("invalid DeSmuME frame-step counters: {value:?}"))
+        })?;
+    if parsed.len() != 4 {
+        return Err(NdsBridgeError::Emulator(format!(
+            "invalid DeSmuME frame-step field count: {value:?}"
+        )));
+    }
+    let status = FrameStepStatus {
+        terminal,
+        start: parsed[0],
+        end: parsed[1],
+        requested: parsed[2],
+        completed: parsed[3],
+    };
+    if status.completed > status.requested || status.end < status.start {
+        return Err(NdsBridgeError::Emulator(format!(
+            "inconsistent DeSmuME frame-step status: {value:?}"
+        )));
+    }
+    Ok(status)
+}
+
 pub(super) fn required_num(params: &Value, key: &str) -> NdsResult<u64> {
     let value = params
         .get(key)

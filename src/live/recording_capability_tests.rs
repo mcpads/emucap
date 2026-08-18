@@ -1,7 +1,7 @@
 use serde_json::json;
 
 use super::recording_capability::*;
-use crate::bundle::recording_manifest::RecordingLimits;
+use crate::bundle::recording_manifest::{EventArmingScope, RecordingLimits};
 use crate::event_contracts::EventContractRegistry;
 
 fn capability() -> RecordingCapability {
@@ -287,11 +287,21 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.warmup = Some(RecordingWarmupCapability {
         max_frames: 5_000,
         transaction_event_classes: vec!["frame_boundary".into(), "frame_completed".into()],
+        selectable_event_scopes: vec![
+            RecordingEventScopeCapability {
+                id: "frame_boundary".into(),
+                scopes: vec![EventArmingScope::Transaction, EventArmingScope::Observation],
+            },
+            RecordingEventScopeCapability {
+                id: "frame_completed".into(),
+                scopes: vec![EventArmingScope::Transaction, EventArmingScope::Observation],
+            },
+        ],
     });
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "dea5c89d917c0e645296117dc9b14dcf089a49794dbe72b0319a104016a449bf"
+        "20520b327e06f8ed30387f20f8609b861ceb4306ac1d955f6fb7a38b7489e885"
     );
     capability.terminal_snapshots = Some(RecordingTerminalSnapshotCapability {
         max_members: 8,
@@ -301,7 +311,30 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "3314d6344f03df096660917a6087b19a62aece996402ecdd1ee992c87131d0aa"
+        "7d673b3f299c2f5f8ba91cf12475385581ec6f18ad38efa1b25a6a3ef7cde08d"
+    );
+    let state_groups = vec!["ppu".into()];
+    let mut state_only = capability.clone();
+    state_only.terminal_state = Some(RecordingTerminalStateCapability {
+        max_bytes: 128 * 1024,
+        profiles: vec![RecordingTerminalStateProfile {
+            id: "snes_ppu".into(),
+            contract_sha256: terminal_state_contract_sha256(&state_groups).unwrap(),
+            groups: state_groups,
+        }],
+    });
+    let mut state_only_without_snapshots = state_only.clone();
+    state_only_without_snapshots.terminal_snapshots = None;
+    state_only_without_snapshots.revision =
+        state_only_without_snapshots.computed_revision().unwrap();
+    assert_eq!(
+        state_only_without_snapshots.revision,
+        "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e"
+    );
+    state_only.revision = state_only.computed_revision().unwrap();
+    assert_eq!(
+        state_only.revision,
+        "cb17d9a46ab4f50c18090efe88841d86eec924683089b451301e4cf209400702"
     );
     for id in ["snes_ppu_obj_evaluation_start", "snes_ppu_obj_handoff"] {
         let identity = registry.identities([id]).unwrap().remove(0);
@@ -329,12 +362,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     semantic_without_snapshots.revision = semantic_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         semantic_without_snapshots.revision,
-        "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be7890e318f9b8c4b218a2"
+        "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "3360ead44ccebf59a35aefcba6e5846d645188781682293b508a502343212782"
+        "c257a841cde44e9911d371a3e3521db1fe11e09dc5177075e76211605080fef2"
     );
     for id in [
         "snes_cpu_instruction",
@@ -424,12 +457,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         deep_without_snapshots.revision,
-        "1a684845aacb3a1f025d1b72be3664e4cdd520bb5d756e93a574b815e74be00b"
+        "a37de2f20517d122a960f9ed98f243664ebce7eb15b693fc4ad5d6de1229e00c"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "baaddde76371336e8a042df3f0a413b52cf5fd794b742d4ee0b92b01b908ff7d"
+        "302875a198ab9036285ee242245218132f1096d43aef1151d16cbfb307a637fd"
     );
     capability.repeatability = Some(RecordingRepeatabilityCapability {
         profile: "mesen_snes_repeatable".into(),
@@ -441,7 +474,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "7f7c1c02af1cdfd226d7af673504f208229f4e4048642b7eaee00c421eab33bf"
+        "338356d4b8f9c7c02b7923f4429afcf3e7db0ed3c7c1ba6d4dad535fb8fe1b13"
     );
 }
 
@@ -467,6 +500,7 @@ fn event_aligned_initial_snapshots_require_exact_guest_order_and_bounds() {
     capability.warmup = Some(RecordingWarmupCapability {
         max_frames: capability.limits.max_frames,
         transaction_event_classes: vec!["frame_boundary".into()],
+        selectable_event_scopes: vec![],
     });
     capability.initial_snapshots = Some(RecordingInitialSnapshotCapability {
         memory_types: vec!["snesWorkRam".into()],
@@ -489,6 +523,30 @@ fn event_aligned_initial_snapshots_require_exact_guest_order_and_bounds() {
         .as_mut()
         .unwrap()
         .max_callback_ms = CORE_MAX_INITIAL_SNAPSHOT_CALLBACK_MS + 1;
+    capability.revision = capability.computed_revision().unwrap();
+    assert!(capability.validate(&registry).is_err());
+}
+
+#[test]
+fn selectable_warmup_event_scopes_are_identity_and_revision_bound() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let mut capability = capability();
+    capability.class_accounting = true;
+    capability.warmup = Some(RecordingWarmupCapability {
+        max_frames: capability.limits.max_frames,
+        transaction_event_classes: vec!["frame_boundary".into()],
+        selectable_event_scopes: vec![RecordingEventScopeCapability {
+            id: "frame_boundary".into(),
+            scopes: vec![EventArmingScope::Transaction, EventArmingScope::Observation],
+        }],
+    });
+    let previous_revision = capability.revision.clone();
+    capability.revision = capability.computed_revision().unwrap();
+    assert_ne!(capability.revision, previous_revision);
+    capability.validate(&registry).unwrap();
+
+    capability.warmup.as_mut().unwrap().selectable_event_scopes[0].scopes =
+        vec![EventArmingScope::Transaction, EventArmingScope::Transaction];
     capability.revision = capability.computed_revision().unwrap();
     assert!(capability.validate(&registry).is_err());
 }

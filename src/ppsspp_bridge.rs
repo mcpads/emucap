@@ -19,7 +19,8 @@
 //! `savestate.load`, stock PPSSPP exposes no WS savestate command), `reset` (stock `game.reset`),
 //! and `get_rom_info` (stock `game.status` for id/title + a locally computed sha1 of the
 //! `EMUCAP_CONTENT` image, since PPSSPP's WS API never exposes a content path or hash). `step`
-//! (frame-based stepping) has no PPSSPP WS/fork primitive and is not advertised.
+//! advances to an exact emulated PSP VBlank-start boundary through the fork's
+//! `emucap.frameStep`; it does not claim that a host-rendered frame was presented.
 //!
 //! Two PPSSPP protocol quirks shape the stepping/pause/resume/poll_events code below:
 //! - `cpu.stepInto`/`cpu.stepOver`/`cpu.stepOut`/`cpu.runUntil`/`cpu.nextHLE` have **no synchronous
@@ -27,14 +28,11 @@
 //!   step completes (`SteppingSubscriber.cpp`). The fork echoes each request's `ticket` on these
 //!   asynchronous stepping/resume acknowledgements, so the transport can correlate them just as it
 //!   does ordinary same-name replies and errors.
-//! - The `cpu.stepping` event's optional `reason`/`relatedAddress` fields (which would otherwise say
-//!   *why* the CPU stopped, e.g. `"cpu.breakpoint"`) are in practice never populated — `Core_Break()`
-//!   sets `g_cpuStepCommand.type = CPUStepType::None` in the same breath it stores the reason, which
-//!   makes `Core_GetSteppingReason()`'s `!g_cpuStepCommand.empty()` guard immediately false. So a
-//!   breakpoint hit and a plain stepping-request completion produce the *same* bare `{pc, ticks}`
-//!   event; `poll_events` classifies a hit by matching the event's `pc` against tracked exec
-//!   breakpoints (mirroring the NDS bridge) and, for memory breakpoints (which trip on a data access
-//!   at some *other* pc), by a `memory.breakpoint.list` hit-count delta.
+//! - The emucap fork preserves the halted generation's `reason`/`relatedAddress` after
+//!   `Core_Break()` clears its pending step command. `poll_events` therefore attributes a hit only
+//!   when PPSSPP says it stopped for `cpu.breakpoint` or `memory.breakpoint`. Bare events from an
+//!   older compatible fork retain the previous PC/hit-count inference as a compatibility fallback;
+//!   an explicit non-breakpoint reason is never reinterpreted as a hit.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -123,10 +121,12 @@ const METHODS: &[&str] = &[
     "dump_memory",
     "get_state",
     "disassemble",
+    "call_stack",
     "set_breakpoint",
     "clear_breakpoint",
     "list_breakpoints",
     "clear_all_breakpoints",
+    "step",
     "step_instructions",
     "pause",
     "resume",
@@ -139,11 +139,8 @@ const METHODS: &[&str] = &[
     "reset",
 ];
 
-/// PSP surface concretely planned for later tasks — none right now. Frame-based `step` is *not*
-/// here: PPSSPP has no frame-advance primitive, so it is a permanent platform gap (an
-/// `unsupported`), not a pending feature. It must not be advertised as "planned", which would imply
-/// it is merely not-yet-callable; the instruction-granularity capability is advertised on the wire
-/// as `step_instructions` and normalized by the MCP to `step` with an instructions-only constraint.
+/// PSP surface concretely planned for later tasks — none right now. Frame and instruction stepping
+/// are both implemented and advertised, then normalized by the MCP to one public `step` tool.
 /// Surfaced under `capability_notes.planned_methods` (alongside `UNSUPPORTED_METHODS`, below) so a
 /// caller can see the target shape while `methods` reflects what works right now.
 const PLANNED_METHODS: &[&str] = &[];
@@ -236,6 +233,8 @@ fn button_list(raw: Option<&Value>) -> BridgeResult<Vec<String>> {
 pub enum BridgeError {
     #[error("{0}")]
     BadParams(String),
+    #[error("{0}")]
+    BadState(String),
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("unsupported on psp (planned): {0}")]
@@ -361,6 +360,7 @@ impl<T: WsTransport> PpssppBridge<T> {
             "dump_memory" => self.dump_memory(&req.params),
             "get_state" => self.get_state(&req.params),
             "disassemble" => self.disassemble(&req.params),
+            "call_stack" => self.call_stack(&req.params),
             "set_breakpoint" => self.set_breakpoint(&req.params),
             "clear_breakpoint" => self.clear_breakpoint(&req.params),
             "list_breakpoints" => self.list_breakpoints(),

@@ -31,7 +31,7 @@ Wait for each dependent terminal response. Concurrent JSON-RPC requests have no 
 
 Choose by terminal state: `tap` returns frozen; `_while_running` leaves the guest running. Use only described pointer operations. They return frozen and release transient buttons. Motion enters device state before its exact advance, but the visible cursor follows guest polling; increase movement frames before screenshot or click. Persistent input and touch holds need explicit release or generation termination. Cleanup failure fails the operation.
 
-Debug `record_window` owns its guest-time interval and returns frozen. Use only its advertised capability. `start_on` needs a selected startable event; initial snapshots need advertised callback-safe memory bounds. Event filters need advertised per-class fields; excluded callbacks are outside scope, not loss. Non-`complete` integrity is partial evidence.
+Debug `record_window` owns guest time and returns frozen. Use advertised event classes, limits, startable anchors, callback-safe snapshots, filter fields, and warmup scope pairs. Excluded callbacks are outside scope, not loss; omission keeps producer defaults. Non-`complete` integrity is partial evidence.
 
 ## Evidence
 

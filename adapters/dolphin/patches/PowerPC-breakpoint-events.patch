@@ -10,11 +10,13 @@ index fbc00a09f3..d86e3bd843 100644
  #include "Core/CoreTiming.h"
  #include "Core/HW/CPU.h"
  #include "Core/HW/SystemTimers.h"
-@@ -660,6 +661,7 @@ bool PowerPCManager::CheckAndHandleBreakPoints()
+@@ -660,6 +661,9 @@ bool PowerPCManager::CheckAndHandleBreakPoints()
  {
    if (CheckBreakPoints())
    {
-+    EmuCap::NotifyBreakpointHit(m_system, m_ppc_state.pc);
++    const TBreakPoint* breakpoint = m_breakpoints.GetBreakpoint(m_ppc_state.pc);
++    if (breakpoint && breakpoint->emucap_breakpoint_id != 0)
++      EmuCap::NotifyBreakpointHit(m_system, m_ppc_state.pc, breakpoint->emucap_breakpoint_id);
      m_system.GetCPU().Break();
      if (GDBStub::IsActive())
        GDBStub::TakeControl();

@@ -16,10 +16,11 @@ The patch stack adds:
 
 - native service startup and shutdown hooks;
 - GameCube controller and emulated Wii Remote core-button override support;
-- exact PowerPC exec-breakpoint events;
+- owned PowerPC exec/read/write breakpoint events with hit-time access context;
 - PowerPC disassembly and ABI stack walking;
 - bounded current-frame screenshot capture;
 - synchronous savestate capture and restore;
+- synchronous hardware reset-button release completion;
 - build-system entries for the native service.
 
 The upstream revision and patchset digest are pinned in `upstream.lock`. The launcher accepts only a
@@ -77,19 +78,27 @@ The native adapter currently advertises:
 
 - `read_memory`, `write_memory`;
 - `get_state`, `status`;
-- `pause`, `resume`, frame- and instruction-unit `step`;
-- `set_breakpoint`, `clear_breakpoint`, `clear_all_breakpoints`, `list_breakpoints`, `poll_events`;
+- `pause`, `resume`, frame- and instruction-unit `step`, bounded native `reset`;
+- `set_breakpoint`, `clear_breakpoint`, `clear_all_breakpoints`, `list_breakpoints`, `poll_events`
+  for owned PowerPC exec/read/write breakpoints;
 - `disassemble`, `call_stack`;
 - frozen core only: `save_state`, `load_state`;
 - running core only: `screenshot`;
 - GameCube and Wii: `set_input`, with a system-specific port-0 button surface.
 
-It does not currently advertise read/write watchpoints, tracing, real Wii Remote input, IR,
-motion, or extension injection. These methods must not be inferred from dormant handler code.
+It does not currently advertise tracing, real Wii Remote input, IR, motion, or extension injection.
+These methods must not be inferred from dormant handler code.
+
+Read/write watchpoints use PowerPC effective addresses and are pausing only. A hit preserves the
+public breakpoint ID, access-phase instruction PC, effective address, byte length, and value. Each
+range is inclusive and bounded to 64 KiB; at most 128 adapter-owned breakpoints may exist. Ranges
+whose distance could let one native access overlap more than one owned watchpoint are rejected, so
+one native stop cannot be ambiguously attributed. Adapter-owned breakpoints never clear or rewrite
+unrelated breakpoints created in Dolphin's own debugger.
 
 The adapter publishes its feature-contract declaration. The Control MCP validates the declared
-exact exec breakpoint, system-specific port 0 input, frozen savestate, and running screenshot
-limits before admitting composite tools.
+exact exec/read/write breakpoint surface, system-specific port 0 input, frozen savestate, and
+running screenshot limits before admitting composite tools.
 
 ### Memory and registers
 
@@ -104,6 +113,13 @@ the GPU queue at the next emulated field boundary, and returns only after the CP
 An emucap breakpoint hit interrupts the operation and leaves the core frozen. Both units accept at
 most 15 steps per request so the synchronous operation remains inside the control-link deadline.
 Split longer advances into checked calls.
+
+`reset` owns an isolated native reset-button press and release, resumes only for that guest-time
+window, and freezes in the exact release callback. This is the same hardware reset-button surface
+used by Dolphin's UI; completion does not claim that guest software has finished rebooting. A
+pausing emucap breakpoint may preempt it. Interruption and timeout cancel the adapter-owned release
+event, force the button unpressed, and leave the core frozen. User and movie reset taps use a
+different event identity and cannot complete or be canceled by an emucap request.
 
 ### Breakpoints
 

@@ -12,6 +12,51 @@ local function integer(value, name, minimum)
     "emucap_step: " .. name .. " must be >= " .. tostring(minimum))
 end
 
+local function parse_count(params, field, max_count)
+  local value = params[field]
+  if value == nil then value = 1 end
+  if type(value) ~= "number" or value ~= math.floor(value) then
+    return nil, "step count must be an integer"
+  end
+  if value < 1 then return nil, "step count must be at least 1" end
+  if value > max_count then
+    return nil, string.format(
+      "step count %s exceeds synchronous limit %d; split the request and verify each terminal response",
+      tostring(value), max_count)
+  end
+  return value
+end
+
+function M.parse_wire_step(method, params, max_count)
+  assert(type(params) == "table", "emucap_step: params must be a table")
+  integer(max_count, "maximum count", 1)
+
+  if method == "step_instructions" then
+    if params.unit ~= nil and params.unit ~= "instructions" then
+      return nil, nil, "step_instructions accepts only the instructions unit"
+    end
+    if params.frames ~= nil then
+      return nil, nil, "step_instructions accepts count, not frames"
+    end
+    local count, err = parse_count(params, "count", max_count)
+    if not count then return nil, nil, err end
+    return "instructions", count
+  end
+
+  if method ~= "step" then return nil, nil, "unsupported step method" end
+  local unit = params.unit or "frames"
+  if not VALID_UNIT[unit] then
+    return nil, nil, "step unit must be frames or instructions"
+  end
+  if params.count ~= nil and params.frames ~= nil then
+    return nil, nil, "step accepts either count or frames, not both"
+  end
+  local field = params.count ~= nil and "count" or "frames"
+  local count, err = parse_count(params, field, max_count)
+  if not count then return nil, nil, err end
+  return unit, count
+end
+
 local function validate(state)
   if state == nil then return end
   assert(type(state) == "table", "emucap_step: state must be a table or nil")

@@ -185,6 +185,111 @@ fn portable_patched_publish_copies_runtime_dependencies_and_sidecar() {
 }
 
 #[test]
+fn portable_patched_publish_refresh_preserves_guest_data() {
+    let src = tempfile::tempdir().unwrap();
+    let emu_home = tempfile::tempdir().unwrap();
+    let source_bin = src.path().join("Mesen");
+    std::fs::write(&source_bin, "fake mesen").unwrap();
+    std::fs::write(src.path().join("Mesen.dll"), "runtime v1").unwrap();
+    std::fs::write(
+        src.path().join("emucap-mesen-build.json"),
+        serde_json::to_vec(&test_build_metadata()).unwrap(),
+    )
+    .unwrap();
+
+    let first = with_emu_home(emu_home.path(), || {
+        prepare_portable_binary(&source_bin, 47916).unwrap()
+    });
+    let data = first.settings.parent().unwrap();
+    std::fs::create_dir_all(data.join("Saves")).unwrap();
+    std::fs::create_dir_all(data.join("GameConfig")).unwrap();
+    std::fs::write(data.join("Saves/game.srm"), b"battery state").unwrap();
+    std::fs::write(data.join("GameConfig/game.json"), b"game config").unwrap();
+    std::fs::write(data.join("stale-runtime.txt"), b"remove with old runtime").unwrap();
+    std::fs::write(src.path().join("Mesen.dll"), "runtime v2").unwrap();
+
+    let refreshed = with_emu_home(emu_home.path(), || {
+        prepare_portable_binary(&source_bin, 47916).unwrap()
+    });
+    let refreshed_data = refreshed.settings.parent().unwrap();
+
+    assert_eq!(
+        std::fs::read(refreshed_data.join("Saves/game.srm")).unwrap(),
+        b"battery state"
+    );
+    assert_eq!(
+        std::fs::read(refreshed_data.join("GameConfig/game.json")).unwrap(),
+        b"game config"
+    );
+    assert_eq!(
+        std::fs::read_to_string(refreshed_data.join("Mesen.dll")).unwrap(),
+        "runtime v2"
+    );
+    assert!(!refreshed_data.join("stale-runtime.txt").exists());
+}
+
+#[test]
+fn repeatable_portable_is_separate_from_ordinary_guest_data() {
+    let src = tempfile::tempdir().unwrap();
+    let emu_home = tempfile::tempdir().unwrap();
+    let source_bin = src.path().join("Mesen");
+    let lua = src.path().join("emucap-snes.lua");
+    let log = src.path().join("mesen.log");
+    std::fs::write(&source_bin, "fake mesen").unwrap();
+    std::fs::write(
+        src.path().join("emucap-mesen-build.json"),
+        serde_json::to_vec(&test_build_metadata()).unwrap(),
+    )
+    .unwrap();
+
+    with_emu_home(emu_home.path(), || {
+        let mut request = Launch {
+            binary: &source_bin,
+            content: "/tmp/game.sfc",
+            lua: &lua,
+            log_path: &log,
+            port: 47917,
+            name: None,
+            build: None,
+            session_token: None,
+            runtime: None,
+            start_frozen: false,
+            repeatable: false,
+        };
+        let ordinary = prepare_launch_portable(&request).unwrap();
+        let ordinary_save = ordinary.settings.parent().unwrap().join("Saves/game.srm");
+        std::fs::create_dir_all(ordinary_save.parent().unwrap()).unwrap();
+        std::fs::write(&ordinary_save, b"ordinary battery state").unwrap();
+
+        request.repeatable = true;
+        let repeatable = prepare_launch_portable(&request).unwrap();
+        assert_eq!(repeatable.home, ordinary.home.join("repeatable"));
+        assert!(ordinary_save.is_file());
+        assert!(!repeatable.settings.parent().unwrap().join("Saves").exists());
+
+        let transient_save = repeatable
+            .settings
+            .parent()
+            .unwrap()
+            .join("Saves/transient.srm");
+        std::fs::create_dir_all(transient_save.parent().unwrap()).unwrap();
+        std::fs::write(&transient_save, b"discardable repeatable state").unwrap();
+
+        let refreshed_repeatable = prepare_launch_portable(&request).unwrap();
+        assert!(!refreshed_repeatable
+            .settings
+            .parent()
+            .unwrap()
+            .join("Saves/transient.srm")
+            .exists());
+        assert_eq!(
+            std::fs::read(&ordinary_save).unwrap(),
+            b"ordinary battery state"
+        );
+    });
+}
+
+#[test]
 fn repository_lock_rejects_sidecar_from_another_revision() {
     let root = tempfile::tempdir().unwrap();
     let publish = tempfile::tempdir().unwrap();
@@ -340,6 +445,22 @@ fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
     assert_eq!(v["ConfigUpgrade"], 1);
     assert_eq!(v["DefaultKeyMappings"], "Xbox, ArrowKeys");
     assert_eq!(read(&source_settings), json!({"Video": {"Scale": 4}}));
+
+    let save = portable.settings.parent().unwrap().join("Saves/game.srm");
+    std::fs::create_dir_all(save.parent().unwrap()).unwrap();
+    std::fs::write(&save, b"portable battery state").unwrap();
+    std::fs::write(&source_resource, "updated resource").unwrap();
+
+    let refreshed = with_emu_home(emu_home.path(), || {
+        prepare_portable_binary(&source_bin, 47912).unwrap()
+    });
+
+    assert_eq!(std::fs::read(&save).unwrap(), b"portable battery state");
+    assert_eq!(
+        std::fs::read_to_string(refreshed.home.join("Mesen.app/Contents/Resources/icon.txt"))
+            .unwrap(),
+        "updated resource"
+    );
 }
 
 #[cfg(target_os = "macos")]

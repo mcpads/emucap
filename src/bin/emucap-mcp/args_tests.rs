@@ -90,6 +90,7 @@ fn record_window_accepts_the_generic_negotiated_extension_shape() {
     assert_eq!(request.frames, 120);
     assert_eq!(request.warmup_frames, 0);
     assert_eq!(request.event_classes, ["frame_boundary"]);
+    assert!(request.event_arming_overrides.is_empty());
     assert_eq!(request.limits.unwrap().max_host_ms, Some(8000));
     let extended: RecordWindowArgs = serde_json::from_str(
         r#"{"output_root":"/tmp/evidence","frames":1,"warmup_frames":3,"origin":"reset_release","input_path":"/tmp/movie.txt","event_classes":["frame_boundary","frame_completed"],"stop_on":{"event_class":"frame_completed","occurrence":1}}"#,
@@ -102,6 +103,14 @@ fn record_window_accepts_the_generic_negotiated_extension_shape() {
     assert_eq!(extended.input_path.as_deref(), Some("/tmp/movie.txt"));
     assert_eq!(extended.warmup_frames, 3);
     assert_eq!(extended.stop_on.unwrap().occurrence, 1);
+    let scoped: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":1,"warmup_frames":3,"event_classes":["frame_boundary"],"event_arming_overrides":[{"event_class":"frame_boundary","scope":"observation"}]}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        scoped.event_arming_overrides[0].scope,
+        RecordWindowEventScopeArgs::Observation
+    ));
     let filtered: RecordWindowArgs = serde_json::from_str(
         r#"{"output_root":"/tmp/evidence","frames":1,"event_classes":["frame_boundary","snes_ppu_obj_consumption_read"],"event_filters":[{"event_class":"snes_ppu_obj_consumption_read","terms":[{"kind":"u64_range","path":"address","start":"0x2000","length":256}]}]}"#,
     )

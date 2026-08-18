@@ -25,6 +25,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #ifdef _WIN32
@@ -51,6 +52,7 @@ using SOCKET = int;
 #include "Core/Debugger/Debugger_SymbolMap.h"
 #include "Core/Debugger/PPCDebugInterface.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/Wiimote.h"
 #include "Core/HW/WiimoteEmu/DesiredWiimoteState.h"
@@ -80,7 +82,21 @@ std::mutex s_ev_mutex;
 std::deque<picojson::value> s_events;
 
 std::mutex s_bp_mutex;
-std::map<int, u32> s_breakpoints;  // id -> address
+enum class BreakpointKind
+{
+  Exec,
+  Read,
+  Write,
+};
+
+struct PublicBreakpoint
+{
+  BreakpointKind kind;
+  u32 start;
+  u32 end;
+};
+
+std::map<int, PublicBreakpoint> s_breakpoints;
 int s_next_bp = 1;
 std::atomic<u64> s_file_sequence{0};
 std::string s_handler_error_kind;
@@ -89,14 +105,23 @@ std::string s_handler_error;
 constexpr uint64_t MAX_SYNC_ADVANCE_COUNT = 15;
 constexpr uint64_t MAX_MEMORY_READ_BYTES = 16 * 1024 * 1024;
 constexpr uint64_t MAX_MEMORY_WRITE_BYTES = 16 * 1024;
+constexpr size_t MAX_BREAKPOINTS = 128;
+constexpr u64 MAX_BREAKPOINT_SPAN = 64 * 1024;
+constexpr u64 MAX_POWERPC_ACCESS_WIDTH = 8;
 constexpr auto SYNC_RESPONSE_BUDGET = std::chrono::seconds(4);
 constexpr auto FRAME_STEP_WORK_BUDGET = std::chrono::seconds(3);
+constexpr auto RESET_WORK_BUDGET = std::chrono::seconds(3);
 constexpr auto STEP_WAIT_SLICE = std::chrono::seconds(1);
 
 std::mutex s_frame_step_mutex;
 std::condition_variable s_frame_step_cv;
 u64 s_frame_step_completions = 0;
 u64 s_breakpoint_interruptions = 0;
+
+std::mutex s_reset_mutex;
+std::condition_variable s_reset_cv;
+std::atomic<u64> s_next_reset_token{1};
+u64 s_completed_reset_token = 0;
 
 // GameCube and Wii input have separate identities and consumer clocks.
 std::mutex s_input_mutex;
@@ -193,6 +218,30 @@ bool IsGameCubeSystem(const std::string& system)
 bool IsWiiSystem(const std::string& system)
 {
   return system == "wii";
+}
+
+const char* BreakpointKindName(BreakpointKind kind)
+{
+  switch (kind)
+  {
+  case BreakpointKind::Exec:
+    return "exec";
+  case BreakpointKind::Read:
+    return "read";
+  case BreakpointKind::Write:
+    return "write";
+  }
+  return "unknown";
+}
+
+bool AccessIdentityConflicts(const PublicBreakpoint& left, const PublicBreakpoint& right)
+{
+  if (left.kind == BreakpointKind::Exec || right.kind == BreakpointKind::Exec)
+    return left.kind == right.kind && left.start == right.start;
+
+  const u64 margin = MAX_POWERPC_ACCESS_WIDTH - 1;
+  return static_cast<u64>(left.start) <= static_cast<u64>(right.end) + margin &&
+         static_cast<u64>(right.start) <= static_cast<u64>(left.end) + margin;
 }
 
 bool WiiInputAvailable()
@@ -374,27 +423,32 @@ picojson::object Hello(Core::System&, const picojson::object&)
        {"read_memory", "write_memory", "get_state", "status", "pause", "resume",
         "step", "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
         "clear_all_breakpoints", "poll_events", "disassemble", "call_stack", "save_state",
-        "load_state", "screenshot"})
+        "load_state", "screenshot", "reset"})
   {
     methods.push_back(picojson::value(std::string(m)));
   }
   if (gamecube || wii_input)
     methods.push_back(picojson::value(std::string("set_input")));
   r["methods"] = picojson::value(methods);
-  picojson::object breakpoint_kind;
-  breakpoint_kind["kind"] = picojson::value(std::string("exec"));
-  breakpoint_kind["range_unit"] = picojson::value(std::string("address"));
-  breakpoint_kind["range_mode"] = picojson::value(std::string("exact"));
-  breakpoint_kind["memory_type_used"] = picojson::value(false);
-  breakpoint_kind["snapshot"] = picojson::value(false);
   picojson::array breakpoint_kinds;
-  breakpoint_kinds.push_back(picojson::value(breakpoint_kind));
+  for (const auto [kind, range_mode, memory_type_used] :
+       {std::tuple{"exec", "exact", false}, std::tuple{"read", "inclusive", true},
+        std::tuple{"write", "inclusive", true}})
+  {
+    picojson::object breakpoint_kind;
+    breakpoint_kind["kind"] = picojson::value(std::string(kind));
+    breakpoint_kind["range_unit"] = picojson::value(std::string("address"));
+    breakpoint_kind["range_mode"] = picojson::value(std::string(range_mode));
+    breakpoint_kind["memory_type_used"] = picojson::value(memory_type_used);
+    breakpoint_kind["snapshot"] = picojson::value(false);
+    breakpoint_kinds.push_back(picojson::value(breakpoint_kind));
+  }
   r["breakpoint_kinds"] = picojson::value(breakpoint_kinds);
   picojson::array active_exceptions;
   for (const char* id :
-       {"dolphin.breakpoint.exact-exec-only", "dolphin.state-save.frozen-only",
+       {"dolphin.breakpoint.pausing-subset", "dolphin.state-save.frozen-only",
         "dolphin.state-load.frozen-only", "dolphin.screenshot.running-only",
-        "dolphin.call-stack.best-effort"})
+        "dolphin.call-stack.best-effort", "dolphin.reset.native-button-tap"})
   {
     active_exceptions.push_back(picojson::value(std::string(id)));
   }
@@ -647,6 +701,81 @@ picojson::object Resume(Core::System& system, const picojson::object&)
   return r;
 }
 
+bool CancelResetTap(Core::System& system)
+{
+  auto completed = std::make_shared<Common::Event>();
+  Core::RunOnCPUThread(system, [&system, completed] {
+    system.GetProcessorInterface().CancelEmucapResetButtonTap();
+    completed->Set();
+  });
+  return completed->WaitFor(STEP_WAIT_SLICE);
+}
+
+picojson::object Reset(Core::System& system, const picojson::object& p)
+{
+  if (!p.empty())
+    return Fail("bad_params", "reset does not accept parameters");
+  const Core::State state = Core::GetState(system);
+  if (state != Core::State::Running && state != Core::State::Paused)
+    return Fail("bad_state", "reset requires a running or frozen core");
+
+  // Reset is a bounded debugger transaction, not an asynchronous UI button click. Establish one
+  // frozen starting position, arm an adapter-owned reset tap, and resume only until its native
+  // release callback or an emucap breakpoint stops execution.
+  Core::SetState(system, Core::State::Paused);
+  const u64 token = s_next_reset_token.fetch_add(1);
+  u64 interruption_before = 0;
+  {
+    std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+    interruption_before = s_breakpoint_interruptions;
+  }
+  system.GetProcessorInterface().EmucapResetButtonTap(token);
+  Core::SetState(system, Core::State::Running);
+
+  const auto deadline = std::chrono::steady_clock::now() + RESET_WORK_BUDGET;
+  bool completed = false;
+  bool interrupted = false;
+  while (!completed && !interrupted && !s_stop.load())
+  {
+    {
+      std::unique_lock<std::mutex> lock(s_reset_mutex);
+      s_reset_cv.wait_until(lock, deadline);
+      completed = s_completed_reset_token == token;
+    }
+    {
+      std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+      interrupted = s_breakpoint_interruptions != interruption_before;
+    }
+    if (std::chrono::steady_clock::now() >= deadline)
+      break;
+  }
+
+  if (completed)
+  {
+    picojson::object r;
+    r["status"] = picojson::value(std::string("completed"));
+    r["reset"] = picojson::value(std::string("native_button_tap"));
+    r["completion_boundary"] = picojson::value(std::string("button_release"));
+    r["state"] = picojson::value(std::string("frozen"));
+    return r;
+  }
+
+  Core::SetState(system, Core::State::Paused);
+  if (!CancelResetTap(system))
+    return Fail("timeout", "reset stopped but reset-button cleanup did not complete");
+  if (interrupted)
+  {
+    picojson::object r;
+    r["status"] = picojson::value(std::string("interrupted"));
+    r["reset"] = picojson::value(std::string("native_button_tap"));
+    r["state"] = picojson::value(std::string("frozen"));
+    return r;
+  }
+  if (s_stop.load())
+    return Fail("not_connected", "Dolphin stopped while reset was in progress");
+  return Fail("timeout", "reset button did not reach its native release boundary");
+}
+
 picojson::object StepInstructions(Core::System& system, const picojson::object& p)
 {
   uint64_t count = 1;
@@ -804,11 +933,19 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
 
 picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
 {
+  BreakpointKind kind = BreakpointKind::Exec;
   const auto kind_it = p.find("kind");
-  if (kind_it != p.end() &&
-      (!kind_it->second.is<std::string>() || kind_it->second.get<std::string>() != "exec"))
+  if (kind_it != p.end())
   {
-    return Fail("bad_params", "only exec breakpoints are supported");
+    if (!kind_it->second.is<std::string>())
+      return Fail("bad_params", "kind must be exec, read, or write");
+    const std::string& requested_kind = kind_it->second.get<std::string>();
+    if (requested_kind == "read")
+      kind = BreakpointKind::Read;
+    else if (requested_kind == "write")
+      kind = BreakpointKind::Write;
+    else if (requested_kind != "exec")
+      return Fail("bad_params", "kind must be exec, read, or write");
   }
   uint64_t addr = 0;
   if (!GetU64(p, "start", addr))
@@ -816,10 +953,28 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
   uint64_t end = addr;
   if (p.count("end") && !GetU64(p, "end", end))
     return Fail("bad_params", "end must be an integer");
-  if (end != addr)
-    return Fail("bad_params", "only exact-address breakpoints are supported");
-  if (addr > UINT32_MAX || (addr & 3) != 0)
-    return Fail("bad_params", "PowerPC exec breakpoint address must be aligned and 32-bit");
+  if (end < addr || end > UINT32_MAX)
+    return Fail("bad_params", "breakpoint range must be an inclusive 32-bit range");
+  if (kind == BreakpointKind::Exec)
+  {
+    if (end != addr)
+      return Fail("bad_params", "PowerPC exec breakpoints require start equal to end");
+    if ((addr & 3) != 0)
+      return Fail("bad_params", "PowerPC exec breakpoint address must be four-byte aligned");
+  }
+  else
+  {
+    const u64 span = end - addr + 1;
+    if (span > MAX_BREAKPOINT_SPAN)
+      return Fail("bad_params", "Dolphin read/write breakpoint span exceeds 65536 bytes");
+  }
+  const auto memory_type_it = p.find("memory_type");
+  if (memory_type_it != p.end() &&
+      (!memory_type_it->second.is<std::string>() ||
+       memory_type_it->second.get<std::string>() != "main"))
+  {
+    return Fail("bad_params", "Dolphin breakpoints use memory_type main");
+  }
   const auto pause_it = p.find("pause_on_hit");
   if (pause_it != p.end() &&
       (!pause_it->second.is<bool>() || !pause_it->second.get<bool>()))
@@ -838,22 +993,69 @@ picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
     if (p.count(field))
       return Fail("bad_params", std::string(field) + " is not supported for Dolphin breakpoints");
   }
-  const int id = s_next_bp++;
+
+  const PublicBreakpoint breakpoint{kind, static_cast<u32>(addr), static_cast<u32>(end)};
+  int id = 0;
   {
     std::lock_guard<std::mutex> lk(s_bp_mutex);
-    s_breakpoints[id] = static_cast<u32>(addr);
+    if (s_breakpoints.size() >= MAX_BREAKPOINTS)
+      return Fail("bad_params", "Dolphin supports at most 128 public breakpoints");
+    for (const auto& [existing_id, existing] : s_breakpoints)
+    {
+      if (AccessIdentityConflicts(existing, breakpoint))
+      {
+        return Fail("bad_params", "Dolphin breakpoint could share one native access with public "
+                                  "breakpoint id " +
+                                      std::to_string(existing_id));
+      }
+    }
+    id = s_next_bp++;
+    s_breakpoints.emplace(id, breakpoint);
   }
+
+  bool armed = false;
+  if (kind == BreakpointKind::Exec)
   {
     SafeAccess sa(system);
     auto& breakpoints = system.GetPowerPC().GetBreakPoints();
     breakpoints.EnableBreaking(true);
-    breakpoints.Add(static_cast<u32>(addr));
-    // Existing JIT and CachedInterpreter blocks may lack the new breakpoint check. Clear the
-    // complete cache so recompilation inserts it; invalidating one instruction is insufficient.
-    system.GetJitInterface().ClearCache(sa.guard);
+    TBreakPoint native_breakpoint;
+    native_breakpoint.address = breakpoint.start;
+    native_breakpoint.is_enabled = true;
+    native_breakpoint.break_on_hit = true;
+    native_breakpoint.emucap_breakpoint_id = static_cast<u64>(id);
+    armed = breakpoints.AddEmuCap(std::move(native_breakpoint));
+    if (armed)
+      system.GetJitInterface().ClearCache(sa.guard);
+  }
+  else
+  {
+    auto& memchecks = system.GetPowerPC().GetMemChecks();
+    memchecks.EnableBreaking(true);
+    TMemCheck native_breakpoint;
+    native_breakpoint.start_address = breakpoint.start;
+    native_breakpoint.end_address = breakpoint.end;
+    native_breakpoint.is_ranged = breakpoint.start != breakpoint.end;
+    native_breakpoint.is_break_on_read = kind == BreakpointKind::Read;
+    native_breakpoint.is_break_on_write = kind == BreakpointKind::Write;
+    native_breakpoint.break_on_hit = true;
+    native_breakpoint.emucap_breakpoint_id = static_cast<u64>(id);
+    armed = memchecks.AddEmuCap(std::move(native_breakpoint),
+                                static_cast<u32>(MAX_POWERPC_ACCESS_WIDTH - 1));
+  }
+  if (!armed)
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    s_breakpoints.erase(id);
+    return Fail("bad_params", "Dolphin has a native breakpoint that conflicts with this range");
   }
   picojson::object r;
   r["id"] = picojson::value(static_cast<double>(id));
+  r["kind"] = picojson::value(std::string(BreakpointKindName(kind)));
+  r["memory_type"] = picojson::value(std::string("main"));
+  r["start"] = picojson::value(static_cast<double>(breakpoint.start));
+  r["end"] = picojson::value(static_cast<double>(breakpoint.end));
+  r["pause_on_hit"] = picojson::value(true);
   return r;
 }
 
@@ -862,37 +1064,33 @@ picojson::object ClearBreakpoint(Core::System& system, const picojson::object& p
   uint64_t id = 0;
   if (!GetU64(p, "id", id))
     return Fail("id required");
-  u32 address = 0;
+  PublicBreakpoint breakpoint{};
   {
     std::lock_guard<std::mutex> lk(s_bp_mutex);
     const auto it = s_breakpoints.find(static_cast<int>(id));
     if (it == s_breakpoints.end())
       return Fail("breakpoint not found");
-    address = it->second;
+    breakpoint = it->second;
   }
+  bool native_removed = false;
+  if (breakpoint.kind == BreakpointKind::Exec)
   {
     SafeAccess sa(system);
-    bool address_still_used = false;
-    {
-      std::lock_guard<std::mutex> lk(s_bp_mutex);
-      s_breakpoints.erase(static_cast<int>(id));
-      for (const auto& entry : s_breakpoints)
-      {
-        if (entry.second == address)
-        {
-          address_still_used = true;
-          break;
-        }
-      }
-    }
-    if (!address_still_used)
-    {
-      system.GetPowerPC().GetBreakPoints().Remove(address);
+    native_removed = system.GetPowerPC().GetBreakPoints().RemoveEmuCap(id);
+    if (native_removed)
       system.GetJitInterface().ClearCache(sa.guard);
-    }
+  }
+  else
+  {
+    native_removed = system.GetPowerPC().GetMemChecks().RemoveEmuCap(id);
+  }
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    s_breakpoints.erase(static_cast<int>(id));
   }
   picojson::object r;
   r["cleared"] = picojson::value(static_cast<double>(id));
+  r["native_removed"] = picojson::value(native_removed);
   return r;
 }
 
@@ -900,13 +1098,15 @@ picojson::object ListBreakpoints(Core::System&, const picojson::object&)
 {
   picojson::array bps;
   std::lock_guard<std::mutex> lk(s_bp_mutex);
-  for (const auto& [id, addr] : s_breakpoints)
+  for (const auto& [id, breakpoint] : s_breakpoints)
   {
     picojson::object b;
     b["id"] = picojson::value(static_cast<double>(id));
-    b["kind"] = picojson::value(std::string("exec"));
-    b["start"] = picojson::value(static_cast<double>(addr));
-    b["end"] = picojson::value(static_cast<double>(addr));
+    b["kind"] = picojson::value(std::string(BreakpointKindName(breakpoint.kind)));
+    b["memory_type"] = picojson::value(std::string("main"));
+    b["start"] = picojson::value(static_cast<double>(breakpoint.start));
+    b["end"] = picojson::value(static_cast<double>(breakpoint.end));
+    b["pause_on_hit"] = picojson::value(true);
     bps.push_back(picojson::value(b));
   }
   picojson::object r;
@@ -916,30 +1116,36 @@ picojson::object ListBreakpoints(Core::System&, const picojson::object&)
 
 picojson::object ClearAllBreakpoints(Core::System& system, const picojson::object&)
 {
-  std::vector<u32> addresses;
-  size_t cleared = 0;
+  std::vector<std::pair<int, PublicBreakpoint>> breakpoints;
   {
     std::lock_guard<std::mutex> lk(s_bp_mutex);
-    cleared = s_breakpoints.size();
-    addresses.reserve(s_breakpoints.size());
-    for (const auto& [id, address] : s_breakpoints)
+    breakpoints.assign(s_breakpoints.begin(), s_breakpoints.end());
+  }
+  size_t native_removed = 0;
+  for (const auto& [id, breakpoint] : breakpoints)
+  {
+    bool removed = false;
+    if (breakpoint.kind == BreakpointKind::Exec)
     {
-      (void)id;
-      if (std::find(addresses.begin(), addresses.end(), address) == addresses.end())
-        addresses.push_back(address);
+      SafeAccess sa(system);
+      removed = system.GetPowerPC().GetBreakPoints().RemoveEmuCap(static_cast<u64>(id));
+      if (removed)
+        system.GetJitInterface().ClearCache(sa.guard);
     }
-    s_breakpoints.clear();
+    else
+    {
+      removed = system.GetPowerPC().GetMemChecks().RemoveEmuCap(static_cast<u64>(id));
+    }
+    if (removed)
+      ++native_removed;
   }
   {
-    SafeAccess sa(system);
-    auto& breakpoints = system.GetPowerPC().GetBreakPoints();
-    for (const u32 address : addresses)
-      breakpoints.Remove(address);
-    if (!addresses.empty())
-      system.GetJitInterface().ClearCache(sa.guard);
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    s_breakpoints.clear();
   }
   picojson::object r;
-  r["cleared"] = picojson::value(static_cast<double>(cleared));
+  r["cleared"] = picojson::value(static_cast<double>(breakpoints.size()));
+  r["native_removed"] = picojson::value(static_cast<double>(native_removed));
   return r;
 }
 
@@ -1200,6 +1406,7 @@ Handler Lookup(const std::string& m)
   if (m == "call_stack") return CallStack;
   if (m == "pause") return Pause;
   if (m == "resume") return Resume;
+  if (m == "reset") return Reset;
   if (m == "step") return StepFrames;
   if (m == "step_instructions") return StepInstructions;
   if (m == "set_breakpoint") return SetBreakpoint;
@@ -1365,37 +1572,74 @@ void ApplyWiimoteInputOverride(int wiimote_num, WiimoteEmu::DesiredWiimoteState*
   ++s_wii_sample_sequence;
 }
 
-void NotifyBreakpointHit(Core::System& system, u32 address)
+void SignalBreakpointInterruption()
 {
-  std::vector<int> ids;
+  {
+    std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+    ++s_breakpoint_interruptions;
+  }
+  s_frame_step_cv.notify_all();
+  s_reset_cv.notify_all();
+}
+
+void NotifyBreakpointHit(Core::System& system, u32 address, u64 breakpoint_id)
+{
   {
     std::lock_guard<std::mutex> lk(s_bp_mutex);
-    for (const auto& [id, breakpoint_address] : s_breakpoints)
+    const auto it = s_breakpoints.find(static_cast<int>(breakpoint_id));
+    if (it == s_breakpoints.end() || it->second.kind != BreakpointKind::Exec ||
+        it->second.start != address)
     {
-      if (breakpoint_address == address)
-        ids.push_back(id);
+      return;
+    }
+  }
+  picojson::object event;
+  event["type"] = picojson::value(std::string("breakpoint_hit"));
+  event["breakpoint_id"] = picojson::value(static_cast<double>(breakpoint_id));
+  event["kind"] = picojson::value(std::string("exec"));
+  event["memory_type"] = picojson::value(std::string("main"));
+  event["address"] = picojson::value(static_cast<double>(address));
+  event["pc"] = picojson::value(static_cast<double>(address));
+  event["registers"] = picojson::value(CpuState(system.GetPPCState()));
+  PushEvent(picojson::value(event));
+  SignalBreakpointInterruption();
+}
+
+void NotifyMemoryBreakpointHit(Core::System& system, u64 value, u32 address, bool write,
+                               size_t size, u32 pc, u64 breakpoint_id)
+{
+  BreakpointKind kind = write ? BreakpointKind::Write : BreakpointKind::Read;
+  {
+    std::lock_guard<std::mutex> lk(s_bp_mutex);
+    const auto it = s_breakpoints.find(static_cast<int>(breakpoint_id));
+    if (it == s_breakpoints.end() || it->second.kind != kind || size == 0 ||
+        static_cast<u64>(address) + size - 1 < it->second.start || address > it->second.end)
+    {
+      return;
     }
   }
 
-  for (const int id : ids)
-  {
-    picojson::object event;
-    event["type"] = picojson::value(std::string("breakpoint_hit"));
-    event["breakpoint_id"] = picojson::value(static_cast<double>(id));
-    event["kind"] = picojson::value(std::string("exec"));
-    event["address"] = picojson::value(static_cast<double>(address));
-    event["pc"] = picojson::value(static_cast<double>(address));
-    event["registers"] = picojson::value(CpuState(system.GetPPCState()));
-    PushEvent(picojson::value(event));
-  }
-  if (!ids.empty())
-  {
-    {
-      std::lock_guard<std::mutex> lock(s_frame_step_mutex);
-      ++s_breakpoint_interruptions;
-    }
-    s_frame_step_cv.notify_all();
-  }
+  const u64 masked_value =
+      size >= sizeof(u64) ? value : value & ((static_cast<u64>(1) << (size * 8)) - 1);
+  char encoded_value[17]{};
+  std::snprintf(encoded_value, sizeof(encoded_value), "%0*llx", static_cast<int>(size * 2),
+                static_cast<unsigned long long>(masked_value));
+  picojson::object event;
+  event["type"] = picojson::value(std::string("breakpoint_hit"));
+  event["breakpoint_id"] = picojson::value(static_cast<double>(breakpoint_id));
+  event["kind"] = picojson::value(std::string(BreakpointKindName(kind)));
+  event["memory_type"] = picojson::value(std::string("main"));
+  event["address"] = picojson::value(static_cast<double>(address));
+  event["length"] = picojson::value(static_cast<double>(size));
+  event["pc"] = picojson::value(static_cast<double>(pc));
+  event["value_hex"] = picojson::value(std::string(encoded_value));
+  event["access_phase"] = picojson::value(
+      std::string(write ? "before_write_commit" : "after_read_before_instruction_complete"));
+  if (size <= 4)
+    event["value"] = picojson::value(static_cast<double>(masked_value));
+  event["registers"] = picojson::value(CpuState(system.GetPPCState()));
+  PushEvent(picojson::value(event));
+  SignalBreakpointInterruption();
 }
 
 void NotifyFrameStepComplete()
@@ -1405,6 +1649,18 @@ void NotifyFrameStepComplete()
     ++s_frame_step_completions;
   }
   s_frame_step_cv.notify_all();
+}
+
+void NotifyResetTapComplete(Core::System& system, u64 token)
+{
+  // Stop in the same CPU-thread callback that releases the adapter-owned reset button. The
+  // adapter thread may observe this only after the guest can no longer advance beyond it.
+  system.GetCPU().Break();
+  {
+    std::lock_guard<std::mutex> lock(s_reset_mutex);
+    s_completed_reset_token = token;
+  }
+  s_reset_cv.notify_all();
 }
 
 void Start(Core::System& system)
@@ -1428,6 +1684,7 @@ void Stop()
 {
   s_stop.store(true);
   s_frame_step_cv.notify_all();
+  s_reset_cv.notify_all();
   {
     std::lock_guard<std::mutex> lk(s_socket_mutex);
     if (s_active_socket != INVALID_SOCKET)

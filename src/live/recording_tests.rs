@@ -141,7 +141,19 @@ impl SyntheticLink {
         capability.warmup = Some(RecordingWarmupCapability {
             max_frames: capability.limits.max_frames,
             transaction_event_classes: vec!["frame_boundary".into()],
+            selectable_event_scopes: vec![],
         });
+        capability.revision = capability.computed_revision().unwrap();
+    }
+
+    fn enable_selectable_boundary_scopes(&mut self) {
+        self.enable_warmup();
+        let capability = self.caps.recording.as_mut().unwrap();
+        capability.warmup.as_mut().unwrap().selectable_event_scopes =
+            vec![RecordingEventScopeCapability {
+                id: "frame_boundary".into(),
+                scopes: vec![EventArmingScope::Transaction, EventArmingScope::Observation],
+            }];
         capability.revision = capability.computed_revision().unwrap();
     }
 
@@ -368,13 +380,28 @@ impl EmulatorLink for SyntheticLink {
             }));
         }
 
+        let boundary_scope = params["event_arming"]
+            .as_array()
+            .and_then(|arming| arming.iter().find(|entry| entry["id"] == "frame_boundary"))
+            .and_then(|entry| entry["scope"].as_str())
+            .unwrap_or("transaction");
+        let event_frame_offset = if boundary_scope == "observation" {
+            warmup_frames
+        } else {
+            0
+        };
+        let expected_event_frames = if boundary_scope == "observation" {
+            frames
+        } else {
+            total_frames
+        };
         let write_frames = match self.mode {
             Mode::Normal
             | Mode::CleanupFailed
             | Mode::SnapshotReadFailure
             | Mode::TerminalStateReadFailure
-            | Mode::SnapshotGenerationChange => total_frames,
-            Mode::Loss | Mode::Disconnect => total_frames.min(2),
+            | Mode::SnapshotGenerationChange => expected_event_frames,
+            Mode::Loss | Mode::Disconnect => expected_event_frames.min(2),
             Mode::Reject | Mode::PartialEventStop => {
                 unreachable!("mode returns before frame streaming")
             }
@@ -388,9 +415,9 @@ impl EmulatorLink for SyntheticLink {
                 contract_sha256: contract.clone(),
                 clock: ClockPoint {
                     domain: "frame".into(),
-                    tick: 100 + offset,
+                    tick: 100 + event_frame_offset + offset,
                 },
-                frame: 100 + offset,
+                frame: 100 + event_frame_offset + offset,
                 payload: json!({}),
             })
             .unwrap();
@@ -401,8 +428,8 @@ impl EmulatorLink for SyntheticLink {
                 status: "working".into(),
                 capture_id: capture_id.clone(),
                 sequence: offset + 1,
-                frame: 101 + offset,
-                frames: Some(offset + 1),
+                frame: 101 + event_frame_offset + offset,
+                frames: Some(event_frame_offset + offset + 1),
                 events: offset + 1,
                 bytes,
                 phase: None,
@@ -435,12 +462,12 @@ impl EmulatorLink for SyntheticLink {
                 "id": "frame_boundary",
                 "armed": true,
                 "armed_interval": if warmup_frames > 0 {
-                    json!({"f_start": 100, "f_end": 100 + total_frames})
+                    json!({"f_start": 100 + event_frame_offset, "f_end": 100 + total_frames})
                 } else {
                     Value::Null
                 },
                 "observed": write_frames,
-                "dropped": total_frames - write_frames,
+                "dropped": expected_event_frames - write_frames,
             }])
         } else {
             json!([])
@@ -460,7 +487,7 @@ impl EmulatorLink for SyntheticLink {
             "events": write_frames,
             "bytes": bytes,
             "physical_bytes": bytes,
-            "dropped": total_frames - write_frames,
+            "dropped": expected_event_frames - write_frames,
             "truncated": false,
             "first_sequence_gap": Value::Null,
             "wall_ms": 1,
@@ -581,6 +608,7 @@ fn request(output: &std::path::Path, frames: u64) -> RecordWindowRequest {
         warmup_frames: 0,
         event_classes: vec![],
         event_filters: vec![],
+        event_arming_overrides: vec![],
         origin: None,
         input_path: None,
         stop_on: None,
@@ -717,6 +745,7 @@ fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract
     capability.warmup = Some(RecordingWarmupCapability {
         max_frames: 300,
         transaction_event_classes: vec!["frame_boundary".into()],
+        selectable_event_scopes: vec![],
     });
     capability.initial_snapshots = Some(RecordingInitialSnapshotCapability {
         memory_types: vec!["snesWorkRam".into()],
@@ -763,6 +792,58 @@ fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract
     });
     request.initial_snapshots[0].address = 1;
     assert!(effective_request(&capability, &["record_window".into()], &regions, &request).is_err());
+}
+
+#[test]
+fn warmup_event_scope_overrides_require_live_advertisement_and_selected_classes() {
+    let output = tempfile::tempdir().unwrap();
+    let mut capability = capability();
+    capability.class_accounting = true;
+    capability.warmup = Some(RecordingWarmupCapability {
+        max_frames: capability.limits.max_frames,
+        transaction_event_classes: vec!["frame_boundary".into()],
+        selectable_event_scopes: vec![RecordingEventScopeCapability {
+            id: "frame_boundary".into(),
+            scopes: vec![EventArmingScope::Transaction, EventArmingScope::Observation],
+        }],
+    });
+    capability.revision = capability.computed_revision().unwrap();
+    let mut request = request(output.path(), 2);
+    request.warmup_frames = 3;
+    request.event_arming_overrides = vec![EventClassArming {
+        id: "frame_boundary".into(),
+        scope: EventArmingScope::Observation,
+    }];
+
+    let effective = effective_request(&capability, &[], &[], &request).unwrap();
+    assert_eq!(
+        effective.request.event_arming,
+        vec![EventClassArming {
+            id: "frame_boundary".into(),
+            scope: EventArmingScope::Observation,
+        }]
+    );
+
+    request.event_arming_overrides.push(EventClassArming {
+        id: "frame_boundary".into(),
+        scope: EventArmingScope::Transaction,
+    });
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request),
+        Err(RecordingError::Invalid(_))
+    ));
+    request.event_arming_overrides.truncate(1);
+    capability
+        .warmup
+        .as_mut()
+        .unwrap()
+        .selectable_event_scopes
+        .clear();
+    capability.revision = capability.computed_revision().unwrap();
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request),
+        Err(RecordingError::Unavailable(_))
+    ));
 }
 
 #[test]
@@ -913,6 +994,61 @@ fn warmup_is_one_transaction_with_exact_per_class_arming_scope() {
             f_end: 105,
         })
     );
+}
+
+#[test]
+fn observation_scoped_boundaries_exclude_warmup_from_stream_and_accounting() {
+    let _env = crate::test_env::lock_env();
+    let harness = harness();
+    let mut link = SyntheticLink::new(
+        harness.port,
+        &harness.launch_id,
+        &harness.content,
+        Mode::Normal,
+        Duration::ZERO,
+    );
+    link.enable_selectable_boundary_scopes();
+    let mut capture_request = request(harness.output.path(), 2);
+    capture_request.warmup_frames = 3;
+    capture_request.event_arming_overrides = vec![EventClassArming {
+        id: "frame_boundary".into(),
+        scope: EventArmingScope::Observation,
+    }];
+    let result = record_window(
+        &mut link,
+        harness.store.clone(),
+        capture_request,
+        RequestCancellation::default(),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(result.frames, 2);
+    assert_eq!(result.events, 2);
+    let manifest =
+        std::fs::read_to_string(std::path::Path::new(&result.bundle_path).join("manifest.json"))
+            .unwrap();
+    let BundleManifest::Recording(manifest) = parse_manifest(&manifest).unwrap() else {
+        panic!("recording manifest expected")
+    };
+    assert_eq!(manifest.scope.f_origin, Some(100));
+    assert_eq!(manifest.scope.f_start, 103);
+    assert_eq!(manifest.scope.f_end, 105);
+    assert_eq!(
+        manifest.request.event_arming,
+        vec![EventClassArming {
+            id: "frame_boundary".into(),
+            scope: EventArmingScope::Observation,
+        }]
+    );
+    assert_eq!(
+        manifest.terminal.event_classes[0].armed_interval,
+        Some(FrameInterval {
+            f_start: 103,
+            f_end: 105,
+        })
+    );
+    assert_eq!(manifest.terminal.event_classes[0].observed, 2);
+    assert_eq!(manifest.terminal.event_classes[0].dropped, 0);
 }
 
 #[test]

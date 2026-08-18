@@ -42,6 +42,7 @@ const MVS_METHODS: &[&str] = &[
     "clear_all_breakpoints",
     "poll_events",
     "disassemble",
+    "call_stack",
 ];
 const CD_METHODS: &[&str] = &[
     "hello",
@@ -65,6 +66,7 @@ const CD_METHODS: &[&str] = &[
     "clear_all_breakpoints",
     "poll_events",
     "disassemble",
+    "call_stack",
 ];
 const MVS_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.state-read.frozen-only",
@@ -79,6 +81,7 @@ const MVS_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.execution-pause.machine-global",
     "neogeo.execution-resume.machine-global",
     "neogeo.breakpoint.pausing-subset",
+    "neogeo.call-stack.frozen-best-effort",
 ];
 const CD_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.state-read.frozen-only",
@@ -91,6 +94,7 @@ const CD_ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.execution-pause.machine-global",
     "neogeo.execution-resume.machine-global",
     "neogeo.breakpoint.pausing-subset",
+    "neogeo.call-stack.frozen-best-effort",
 ];
 const MVS_RAM_BASE: u64 = 0x10_0000;
 const MVS_RAM_SIZE: u64 = 0x1_0000;
@@ -278,6 +282,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "clear_all_breakpoints" => self.clear_all_breakpoints(),
             "poll_events" => self.poll_events(&req.params),
             "disassemble" => self.disassemble(&req.params),
+            "call_stack" => self.call_stack(&req.params),
             other => Err(BridgeError::UnknownMethod(other.into())),
         };
         match result {
@@ -489,6 +494,100 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             regs.insert((*name).into(), json!(value));
         }
         Ok(json!({"M68K": regs, "frame": self.current_frame()?}))
+    }
+
+    fn call_stack(&mut self, params: &Value) -> BridgeResult<Value> {
+        require_main_cpu(params)?;
+        self.require_frozen("call_stack")?;
+        let raw = self.lua_cmd("callstack", None)?;
+        let mut fields = raw.split('|');
+        if fields.next() != Some("STACK") {
+            return Err(BridgeError::Emulator(
+                "invalid MAME native call stack response".into(),
+            ));
+        }
+        let parse_hex = |name: &str, value: Option<&str>| -> BridgeResult<u64> {
+            u64::from_str_radix(value.unwrap_or(""), 16)
+                .map_err(|_| BridgeError::Emulator(format!("invalid MAME call stack {name}")))
+        };
+        let pc = parse_hex("pc", fields.next())?;
+        let sp = parse_hex("sp", fields.next())?;
+        let complete = match fields.next() {
+            Some("1") => true,
+            Some("0") => false,
+            _ => {
+                return Err(BridgeError::Emulator(
+                    "invalid MAME call stack completeness flag".into(),
+                ))
+            }
+        };
+        let parse_decimal = |name: &str, value: Option<&str>| -> BridgeResult<u64> {
+            value
+                .unwrap_or("")
+                .parse()
+                .map_err(|_| BridgeError::Emulator(format!("invalid MAME call stack {name}")))
+        };
+        let dropped = parse_decimal("dropped count", fields.next())?;
+        let native_depth = parse_decimal("native depth", fields.next())?;
+        const MAX_NATIVE_FRAMES: usize = 63;
+        let mut native_frames = Vec::new();
+        for (index, encoded) in fields.enumerate() {
+            if native_frames.len() == MAX_NATIVE_FRAMES {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME returned more than {MAX_NATIVE_FRAMES} native call frames"
+                )));
+            }
+            let values = encoded.split(',').collect::<Vec<_>>();
+            if values.len() != 4 {
+                return Err(BridgeError::Emulator(format!(
+                    "invalid MAME call stack frame {index}"
+                )));
+            }
+            native_frames.push((
+                parse_hex("source", Some(values[0]))?,
+                parse_hex("target", Some(values[1]))?,
+                parse_hex("return address", Some(values[2]))?,
+                parse_hex("return stack pointer", Some(values[3]))?,
+            ));
+        }
+        let expected = usize::try_from(native_depth.min(MAX_NATIVE_FRAMES as u64))
+            .expect("bounded native stack depth");
+        if native_frames.len() != expected {
+            return Err(BridgeError::Emulator(format!(
+                "MAME call stack declared {native_depth} native frames but returned {}",
+                native_frames.len()
+            )));
+        }
+        let mut frames = vec![json!({
+            "pc": pc,
+            "sp": sp,
+            "kind": "pc",
+        })];
+        for (source, target, return_address, return_stack_pointer) in
+            native_frames.into_iter().rev()
+        {
+            frames.push(json!({
+                "pc": source,
+                "kind": "call",
+                "target": target,
+                "return_address": return_address,
+                "return_stack_pointer": return_stack_pointer,
+            }));
+        }
+        let depth = frames.len();
+        Ok(json!({
+            "frames": frames,
+            "depth": depth,
+            "cpu": "m68000",
+            "order": "innermost_to_outermost",
+            "method": "mame-native-control-transfer-history",
+            "authority": "best_effort",
+            "complete_since_reset": complete && dropped == 0,
+            "native_depth": native_depth,
+            "dropped": dropped,
+            "truncated": native_depth > MAX_NATIVE_FRAMES as u64 || dropped > 0,
+            "max_depth": MAX_NATIVE_FRAMES + 1,
+        }))
     }
 
     fn save_state(&mut self, params: &Value) -> BridgeResult<Value> {

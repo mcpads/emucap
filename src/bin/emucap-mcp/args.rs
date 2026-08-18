@@ -168,6 +168,22 @@ pub(crate) struct RecordWindowEventFilterArgs {
     pub(crate) terms: Vec<RecordWindowFilterTermArgs>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RecordWindowEventScopeArgs {
+    Transaction,
+    Observation,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowEventArmingArgs {
+    /// Selected event class whose advertised warmup scope is overridden.
+    pub(crate) event_class: String,
+    /// Producer-advertised event emission scope.
+    pub(crate) scope: RecordWindowEventScopeArgs,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordWindowArgs {
@@ -184,6 +200,11 @@ pub(crate) struct RecordWindowArgs {
     /// Optional advertised per-class payload filters. Omit to capture the full selected classes.
     #[serde(default)]
     pub(crate) event_filters: Vec<RecordWindowEventFilterArgs>,
+    /// Optional per-class warmup emission scopes. Requires positive warmup_frames without
+    /// start_on. Use only combinations advertised by the live recording capability. Omit to
+    /// preserve the producer default.
+    #[serde(default)]
+    pub(crate) event_arming_overrides: Vec<RecordWindowEventArmingArgs>,
     /// Advertised origin; omit for next_frame_boundary.
     #[serde(default)]
     pub(crate) origin: Option<RecordWindowOriginArgs>,

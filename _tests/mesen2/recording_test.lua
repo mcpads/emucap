@@ -8,7 +8,7 @@ local OBJ_HANDOFF_CONTRACT = "ad23c438ee6400f5f9cab84d877f490abe24670769e50efd2b
 local CPU_INSTRUCTION_CONTRACT = "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f2ae73ac4ba81c55af0"
 local OBJ_CONSUMPTION_CONTRACT = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local CGRAM_LOOKUP_CONTRACT = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
-local REVISION = "f303cc902eb1006eaab2dbd9c05a739a7184b4a4e2be7890e318f9b8c4b218a2"
+local REVISION = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
 local LAUNCH = "launch-01test"
 
 local function equal(actual, expected, label)
@@ -69,6 +69,16 @@ local function params(frames, overrides)
     },
   }
   for key, value in pairs(overrides or {}) do p[key] = value end
+  if (p.warmup_frames > 0 or p.start_on ~= nil) and p.event_arming == nil then
+    p.event_arming = {}
+    for _, class in ipairs(p.event_classes) do
+      p.event_arming[#p.event_arming + 1] = {
+        id = class.id,
+        scope = (class.id == "frame_boundary" or class.id == "frame_completed")
+          and "transaction" or "observation",
+      }
+    end
+  end
   return p
 end
 
@@ -120,7 +130,7 @@ end
 do
   local capability = Recording.capability(function(value) return value end, true, false, true, true)
   equal(capability.revision,
-    "1a684845aacb3a1f025d1b72be3664e4cdd520bb5d756e93a574b815e74be00b",
+    "a37de2f20517d122a960f9ed98f243664ebce7eb15b693fc4ad5d6de1229e00c",
     "deep capability revision")
   equal(capability.event_order, "guest_emission", "cross-class event order")
   equal(#capability.event_classes, 12, "deep event class count")
@@ -158,7 +168,7 @@ do
   local capability = Recording.capability(
     function(value) return value end, true, true, true, true, conditions)
   equal(capability.revision,
-    "7f7c1c02af1cdfd226d7af673504f208229f4e4048642b7eaee00c421eab33bf",
+    "338356d4b8f9c7c02b7923f4429afcf3e7db0ed3c7c1ba6d4dad535fb8fe1b13",
     "repeatable capability revision")
   equal(capability.repeatability.profile, "mesen_snes_repeatable",
     "repeatable profile identity")
@@ -358,6 +368,10 @@ do
   equal(capability.event_classes[4].contract_sha256, OBJ_HANDOFF_CONTRACT,
     "OBJ handoff contract")
   equal(capability.class_accounting, true, "per-class terminal accounting")
+  equal(capability.warmup.selectable_event_scopes[1].id, "frame_boundary",
+    "boundary scope selection")
+  equal(capability.warmup.selectable_event_scopes[1].scopes[2], "observation",
+    "observation scope selection")
   equal(capability.input_movie.format, "frame-full-state-1", "movie format")
   equal(capability.origins[1], "next_frame_boundary", "Mesen origin")
   equal(capability.origins[2], "reset_release", "Mesen reset origin")
@@ -376,7 +390,7 @@ do
   local capability = Recording.capability(function(value) return value end, false, false, false, false)
   equal(#capability.event_classes, 2, "non-SNES runtime omits SNES classes")
   equal(capability.revision,
-    "dea5c89d917c0e645296117dc9b14dcf089a49794dbe72b0319a104016a449bf",
+    "20520b327e06f8ed30387f20f8609b861ceb4306ac1d955f6fb7a38b7489e885",
     "base capability revision")
   equal(capability.terminal_state, nil, "non-SNES runtime omits terminal state profiles")
   Recording.capability(function(value) return value end, true, false, false, true)
@@ -385,7 +399,7 @@ end
 do
   local capability = Recording.capability(function(value) return value end, false, false, false, true)
   equal(capability.revision,
-    "7a63f4233406541101fdd078a4bd6ffbd1a9785efc24664355a6b491bd8f0efd",
+    "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e",
     "SNES state-only capability revision")
   equal(capability.terminal_state.profiles[1].id, "snes_ppu",
     "terminal state is independent of semantic hooks")
@@ -667,6 +681,77 @@ do
   equal(result.event_classes[1].armed_interval.f_end, 105, "frame class interval end")
   equal(result.event_classes[3].armed_interval.f_start, 103, "deep class interval start")
   equal(result.event_classes[3].armed_interval.f_end, 105, "deep class interval end")
+end
+
+do
+  local text = "0:a\n1:b\n2:a\n3:b\n4:a\n"
+  local path = movie_file(text)
+  local p = params(2, {
+    warmup_frames = 3,
+    event_arming = {
+      { id = "frame_boundary", scope = "observation" },
+    },
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 5,
+      bytes = #text,
+      sha256 = string.rep("6", 64),
+    },
+    limits = {
+      max_frames = 5,
+      max_events = 2,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 2000,
+      progress_interval_ms = 100,
+    },
+  })
+  local installed, released = 0, false
+  local sink = fake_sink()
+  local state, effect = Recording.start(
+    p, 95, LAUNCH, 300, 0, sink, decode_buttons,
+    function() installed = installed + 1; return true end,
+    function() released = true; return true end)
+  equal(effect.kind, "working", "observation-only boundary warmup begins")
+  equal(sink.writes, 0, "warmup emits no observation-only boundary")
+  state = select(1, Recording.tick(state, 301, 1))
+  state = select(1, Recording.tick(state, 302, 2))
+  state, effect = Recording.tick(state, 303, 3)
+  equal(effect.kind, "arm_observation", "observation-only boundary begins at f_start")
+  equal(sink.writes, 1, "f_start boundary is the first emitted record")
+  assert(Recording.attach_hooks(state, false))
+  state = select(1, Recording.tick(state, 304, 4))
+  state, effect = Recording.tick(state, 305, 5)
+  equal(effect.kind, "terminal", "observation-only boundary reaches the target")
+  local result = Recording.result(state, 5)
+  equal(result.events, 2, "warmup boundaries do not consume event accounting")
+  equal(result.dropped, 0, "excluded warmup callbacks are not drops")
+  equal(result.event_classes[1].observed, 2, "observation boundary count")
+  equal(result.event_classes[1].armed_interval.f_start, 303,
+    "observation boundary interval start")
+  equal(result.event_classes[1].armed_interval.f_end, 305,
+    "observation boundary interval end")
+  equal(installed, 5, "input movie continues through warmup and observation")
+  equal(released, true, "input movie is released at the frozen terminal")
+  os.remove(path)
+
+  local rejected, rejected_effect, rejected_kind = Recording.start(params(1, {
+    warmup_frames = 1,
+    event_arming = {},
+    limits = {
+      max_frames = 2,
+      max_events = 2,
+      max_bytes = 1024 * 1024,
+      max_line_bytes = 4096,
+      max_host_ms = 2000,
+      progress_interval_ms = 100,
+    },
+  }), 94, LAUNCH, 400, 0, fake_sink())
+  equal(rejected, nil, "incomplete event arming rejects before recording")
+  equal(rejected_effect, nil, "incomplete event arming has no guest effect")
+  equal(rejected_kind, "bad_params", "incomplete event arming rejection kind")
 end
 
 do

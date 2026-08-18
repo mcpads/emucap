@@ -92,7 +92,7 @@ EMUCAP_BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo u
 LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   if [ -n "$(git -C "$HERE" status --porcelain -- \
-    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_memory.lua \
+    emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua \
     emucap_step.lua \
     emucap_tx.lua emucap_state_io.lua emucap_recording.lua \
     "$(basename "$LUA")" 2>/dev/null)" ]; then
@@ -317,9 +317,49 @@ copy_file_replace() {
   }
 }
 
+preserve_portable_data() {
+  local old_root="$1" staged_root="$2" relative_data_root="$3"
+  local manifest="$HERE/portable-data-dirs.txt"
+  local old_data staged_data name old_dir staged_dir
+  [ -f "$manifest" ] || {
+    echo "ERROR: portable Mesen data manifest is missing: $manifest" >&2
+    return 1
+  }
+  old_data="$old_root/$relative_data_root"
+  staged_data="$staged_root/$relative_data_root"
+  [ -d "$old_data" ] || return 0
+  while IFS= read -r name || [ -n "$name" ]; do
+    [ -n "$name" ] || continue
+    case "$name" in
+      */*|*\\*|.|..)
+        echo "ERROR: invalid portable Mesen data directory name: $name" >&2
+        return 1
+        ;;
+    esac
+    old_dir="$old_data/$name"
+    staged_dir="$staged_data/$name"
+    if [ -L "$old_dir" ] || { [ -e "$old_dir" ] && [ ! -d "$old_dir" ]; }; then
+      echo "ERROR: portable Mesen data path is not a private directory: $old_dir" >&2
+      return 1
+    fi
+    [ -d "$old_dir" ] || continue
+    if [ -L "$staged_dir" ] || { [ -e "$staged_dir" ] && [ ! -d "$staged_dir" ]; }; then
+      echo "ERROR: staged Mesen data path is not a directory: $staged_dir" >&2
+      return 1
+    fi
+    mkdir -p "$staged_dir"
+    if command -v ditto >/dev/null 2>&1; then
+      ditto "$old_dir" "$staged_dir"
+    else
+      cp -R "$old_dir"/. "$staged_dir"/
+    fi
+  done < "$manifest"
+}
+
 copy_app_bundle_replace() {
   local src_app="$1"
   local dst_app="$2"
+  local relative_data_root="$3"
   local tmp_app backup_app
   local had_dst=0
   case "$dst_app" in
@@ -327,6 +367,10 @@ copy_app_bundle_replace() {
     "$PORTABLE_SAFE_ROOT"/*) ;;
     *) echo "ERROR: unsafe portable app path: $dst_app" >&2; return 1 ;;
   esac
+  if [ -L "$dst_app" ]; then
+    echo "ERROR: portable app target is a symlink: $dst_app" >&2
+    return 1
+  fi
   tmp_app="$(unique_runtime_path "$dst_app" "tmp")"
   backup_app="$(unique_runtime_path "$dst_app" "old")"
   mkdir -p "$(dirname "$dst_app")"
@@ -337,6 +381,12 @@ copy_app_bundle_replace() {
     }
   else
     cp -R "$src_app" "$tmp_app" || {
+      rm -rf -- "$tmp_app"
+      return 1
+    }
+  fi
+  if [ -d "$dst_app" ]; then
+    preserve_portable_data "$dst_app" "$tmp_app" "$relative_data_root" || {
       rm -rf -- "$tmp_app"
       return 1
     }
@@ -409,7 +459,7 @@ prepare_portable_mesen() {
     app_name="$(basename "$source_app")"
     portable_app="$emu_home/$app_name"
     rel="${source_bin#"$source_app"/}"
-    copy_app_bundle_replace "$source_app" "$portable_app" || {
+    copy_app_bundle_replace "$source_app" "$portable_app" "$(dirname "$rel")" || {
       echo "ERROR: portable Mesen.app 복사 실패: $source_app → $portable_app" >&2
       exit 1
     }
@@ -423,7 +473,7 @@ prepare_portable_mesen() {
     case "$portable_dir/" in
       "$source_dir/"*) echo "ERROR: portable destination이 source publish directory 내부임: $portable_dir" >&2; exit 1 ;;
     esac
-    copy_app_bundle_replace "$source_dir" "$portable_dir" || {
+    copy_app_bundle_replace "$source_dir" "$portable_dir" "." || {
       echo "ERROR: portable Mesen publish directory 복사 실패: $source_dir → $portable_dir" >&2
       exit 1
     }
@@ -570,10 +620,10 @@ mkdir -p "$(dirname "$LOG")" "$RUN_DIR"
   echo "  launch_mode=${EMUCAP_MESEN_LAUNCH_MODE:-auto}"
 } >>"$LOG"
 
-# GBA는 Mesen이 실 BIOS(gba_bios.bin)를 데이터폴더의 Firmware에서 찾는다. 없으면 GUI 창을 띄워 사람에게
-# 물어 헤드리스·에이전트-주도 모델을 깬다. 포터블 .app 재생성이 Firmware를 비우므로 재생성 후·launch 전에
-# 여기서 provision한다. 출처는 설정 계약(하드코딩된 사용자 경로 없음): EMUCAP_GBA_BIOS(명시) →
-# emucap 소유 firmware 디렉터리(비커밋). BIOS가 없거나 크기가 잘못되면 launch 전에 실패한다.
+# Mesen loads the real GBA BIOS from the portable Firmware directory. Runtime refresh preserves a
+# staged BIOS, but the first launch still provisions it from an explicit override or the shared
+# emucap-owned firmware inventory. Missing or malformed firmware fails before a GUI prompt can block
+# an agent-driven launch.
 if is_gba_launch; then
   GBA_BIOS="${EMUCAP_GBA_BIOS:-$EMUCAP_MESEN_BASE/firmware/gba_bios.bin}"
   FW_DIR="$(dirname "$MESEN_BIN")/Firmware"

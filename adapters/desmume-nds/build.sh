@@ -29,6 +29,7 @@ PATCH7="$HERE/patches/0007-emucap-input-status.patch"
 PATCH8="$HERE/patches/0008-emucap-gdb-io-deadline.patch"
 PATCH9="$HERE/patches/0009-emucap-gdb-no-sigpipe.patch"
 PATCH10="$HERE/patches/0010-emucap-shared-scheduler-state.patch"
+PATCH11="$HERE/patches/0011-emucap-vblank-frame-step.patch"
 WORK_INPUT="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 [ ! -L "$WORK_INPUT" ] || { echo "ERROR: DeSmuME work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
 mkdir -p "$WORK_INPUT"
@@ -48,18 +49,19 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 [ -f "$PATCH8" ] || { echo "ERROR: emucap gdb I/O deadline patch not found: $PATCH8" >&2; exit 1; }
 [ -f "$PATCH9" ] || { echo "ERROR: emucap gdb SIGPIPE patch not found: $PATCH9" >&2; exit 1; }
 [ -f "$PATCH10" ] || { echo "ERROR: emucap shared-scheduler state patch not found: $PATCH10" >&2; exit 1; }
+[ -f "$PATCH11" ] || { echo "ERROR: emucap VBlank frame-step patch not found: $PATCH11" >&2; exit 1; }
 
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11"; do
       cat "$patch"
     done | shasum -a 256 | awk '{print $1}'
   )"
 elif command -v sha256sum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11"; do
       cat "$patch"
     done | sha256sum | awk '{print $1}'
   )"
@@ -121,7 +123,8 @@ for entry in \
   "$PATCH7|emucap input-status patch (0007)" \
   "$PATCH8|emucap gdb I/O deadline patch (0008)" \
   "$PATCH9|emucap gdb SIGPIPE patch (0009)" \
-  "$PATCH10|emucap shared-scheduler state patch (0010)"; do
+  "$PATCH10|emucap shared-scheduler state patch (0010)" \
+  "$PATCH11|emucap VBlank frame-step patch (0011)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"

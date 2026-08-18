@@ -62,7 +62,7 @@ fn broker_link_preserves_contract_advertisement_from_attach() {
                     "system": "nds",
                     "methods": ["status", "step_instructions", "call_stack"],
                     "contracts": crate::contracts::advertisement_value(&[
-                        "nds.execution.frame-step-absent",
+                        "nds.execution.frame-step-vblank",
                         "nds.call-stack.best-effort",
                     ]),
                 }
@@ -78,7 +78,7 @@ fn broker_link_preserves_contract_advertisement_from_attach() {
             assert_eq!(
                 value.active_exceptions,
                 vec![
-                    "nds.execution.frame-step-absent".to_string(),
+                    "nds.execution.frame-step-vblank".to_string(),
                     "nds.call-stack.best-effort".to_string()
                 ]
             );

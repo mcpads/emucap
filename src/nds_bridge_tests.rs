@@ -11,6 +11,7 @@ struct FakeGdb {
     fail_interrupt: bool,
     /// When set, `recv_nonblocking()` returns an error — models a drain-stops socket failure.
     fail_nonblocking: bool,
+    nonblocking_delay: usize,
     interrupts: usize,
     /// Stop packets that become readable only after the next continue packet. This models a
     /// breakpoint reached by resumed execution without pretending the stop existed beforehand.
@@ -50,7 +51,7 @@ impl GdbTransport for FakeGdb {
 
     fn send_no_reply(&mut self, payload: &str) -> Result<(), GdbError> {
         self.calls.push(payload.into());
-        if payload == "c" {
+        if payload == "c" || payload.starts_with("QEmucap,framestep:") {
             self.nonblocking
                 .append(&mut self.nonblocking_after_continue);
         }
@@ -70,6 +71,10 @@ impl GdbTransport for FakeGdb {
     fn recv_nonblocking(&mut self) -> Result<Option<String>, GdbError> {
         if self.fail_nonblocking {
             return Err(GdbError::Emulator("fake nonblocking failure".into()));
+        }
+        if self.nonblocking_delay > 0 {
+            self.nonblocking_delay -= 1;
+            return Ok(None);
         }
         Ok(self.nonblocking.pop_front())
     }
@@ -141,6 +146,7 @@ fn hello_advertises_only_tier1_truths() {
         "get_state",
         "set_breakpoint",
         "poll_events",
+        "step",
         "step_instructions",
         "screenshot",
         "set_input",
@@ -163,19 +169,20 @@ fn hello_advertises_only_tier1_truths() {
     let caps = &result["capability_notes"];
     assert_eq!(caps["screenshot"], true);
     assert_eq!(caps["input"], true);
-    assert_eq!(caps["frame_step"], false);
+    assert_eq!(caps["frame_step"], true);
+    assert_eq!(caps["frame_step_clock"], "nds_vblank_start_complete");
     assert_eq!(caps["breakpoints"], true);
     assert_eq!(caps["state_restore"], true);
     assert_eq!(caps["disassemble"], true);
     assert_eq!(caps["call_stack"], true);
-    assert_eq!(caps["step_units"], json!(["instructions"]));
+    assert_eq!(caps["step_units"], json!(["frames", "instructions"]));
 
     let contracts = &result["contracts"];
     assert_eq!(contracts["catalog"], crate::contracts::CATALOG_ID);
     assert_eq!(
         contracts["active_exceptions"],
         json!([
-            "nds.execution.frame-step-absent",
+            "nds.execution.frame-step-vblank",
             "nds.call-stack.best-effort",
             "nds.input-hold.port-zero-only",
             "nds.input-pulse.constraints",
@@ -199,6 +206,90 @@ fn hello_advertises_only_tier1_truths() {
         "{:?}",
         contract_status.errors
     );
+}
+
+#[test]
+fn frame_step_completes_on_exact_shared_vblank_count_without_queuing_its_own_stop() {
+    let mut arm9 = FakeGdb::with(&[
+        ("?", "S05"),
+        ("qEmucap,framestepstatus", "completed:a,d,3,3"),
+    ]);
+    arm9.nonblocking_after_continue.push_back("S05".into());
+    let arm7 = FakeGdb::with(&[("?", "S05")]);
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
+
+    let response = bridge.handle_request(Request::new(1, "step", json!({"frames": 3})));
+    assert!(response.ok, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["unit"], "frames");
+    assert_eq!(result["count"], 3);
+    assert_eq!(result["start_frame"], 10);
+    assert_eq!(result["end_frame"], 13);
+    assert_eq!(result["state"], "frozen");
+    assert!(bridge.arm9.frozen);
+    assert!(bridge.arm7.as_ref().unwrap().frozen);
+    assert!(bridge.arm9.events.is_empty());
+    assert_eq!(
+        bridge.arm9.gdb.calls,
+        vec![
+            "?".to_string(),
+            "QEmucap,framestep:3".to_string(),
+            "qEmucap,framestepstatus".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn arm7_breakpoint_preempts_shared_frame_step_and_remains_reportable() {
+    let arm9 = FakeGdb::with(&[
+        ("?", "S05"),
+        ("qEmucap,framestepstatus", "interrupted:20,21,4,1"),
+    ]);
+    let mut arm7 = FakeGdb::with(&[("?", "S05")]);
+    arm7.nonblocking.push_back("S05".into());
+    arm7.nonblocking_delay = 1;
+    let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
+
+    let response = bridge.handle_request(Request::new(
+        1,
+        "step",
+        json!({"unit":"frames", "count":4, "cpu":"both"}),
+    ));
+    assert!(response.ok, "{:?}", response.error);
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "interrupted");
+    assert_eq!(result["count"], 1);
+    assert_eq!(result["requested"], 4);
+    assert_eq!(result["stop_cpu"], "arm7");
+    assert_eq!(bridge.arm7.as_ref().unwrap().events.len(), 1);
+    assert_eq!(bridge.arm7.as_ref().unwrap().events[0]["cpu"], "arm7");
+}
+
+#[test]
+fn frame_step_requires_both_stop_channels_and_shared_cpu_scope() {
+    let mut bridge = bridge_arm9_only(&[("?", "S05")]);
+    let missing_arm7 =
+        bridge.handle_request(Request::new(1, "step", json!({"unit":"frames", "count":1})));
+    assert!(!missing_arm7.ok);
+    assert!(missing_arm7
+        .error
+        .unwrap()
+        .message
+        .contains("requires both ARM9 and ARM7"));
+
+    let mut bridge = NdsBridge::new(
+        FakeGdb::with(&[("?", "S05")]),
+        Some(FakeGdb::with(&[("?", "S05")])),
+        GdbBridgeEnv::default(),
+    );
+    let per_cpu = bridge.handle_request(Request::new(
+        2,
+        "step",
+        json!({"unit":"frames", "count":1, "cpu":"arm9"}),
+    ));
+    assert!(!per_cpu.ok);
+    assert_eq!(per_cpu.error.unwrap().kind, "bad_params");
 }
 
 #[test]
@@ -375,20 +466,6 @@ fn step_method_treats_frames_with_instructions_unit_as_instruction_count() {
             .count(),
         1
     );
-}
-
-#[test]
-fn step_method_rejects_bare_frames_as_unsupported_frame_step() {
-    // A bare {frames:N} (the frame-step tool, no unit) has no NDS meaning → reject, do not
-    // silently run N instructions.
-    let mut bridge = bridge_arm9_only(&[("?", "S05")]);
-    let response = bridge.handle_request(Request::new(9, "step", json!({"frames": 60})));
-    assert!(!response.ok);
-    assert!(response
-        .error
-        .unwrap()
-        .message
-        .contains("frame stepping is unsupported"));
 }
 
 #[test]

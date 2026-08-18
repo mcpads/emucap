@@ -457,7 +457,9 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "Write bounded bytes to an advertised memory region.")]
+    #[tool(
+        description = "Write bounded bytes from inline hex or an MCP-host raw-file slice to an advertised memory region."
+    )]
     async fn write_memory(&self, Parameters(a): Parameters<WriteMemoryArgs>) -> CallToolResult {
         let generation = if a.input_file.is_some() {
             memory_write::generation_marker(self.link().capabilities())
