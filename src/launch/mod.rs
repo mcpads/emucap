@@ -553,6 +553,18 @@ fn unique_sibling_path(path: &Path, label: &str) -> PathBuf {
 }
 
 pub(crate) fn copy_dir_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
+    copy_dir_replace_preserving_dirs(src, dst, &[])
+}
+
+/// Atomically refresh a runtime directory while carrying selected data directories from the old
+/// runtime into the staged replacement. `preserved_dirs` are relative to `dst`; every component
+/// must be a normal path component. This keeps runtime refresh and persistent guest data ownership
+/// separate without ever exposing a half-copied destination.
+pub(crate) fn copy_dir_replace_preserving_dirs(
+    src: &Path,
+    dst: &Path,
+    preserved_dirs: &[PathBuf],
+) -> std::io::Result<()> {
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -579,6 +591,65 @@ pub(crate) fn copy_dir_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
         // initial copy does not leak it, matching every other error path in this function.
         let _ = std::fs::remove_dir_all(&tmp);
         return Err(e);
+    }
+
+    for relative in preserved_dirs {
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "preserved runtime data path must be relative and normalized: {}",
+                    relative.display()
+                ),
+            ));
+        }
+        let old_data = dst.join(relative);
+        let old_metadata = match std::fs::symlink_metadata(&old_data) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(error);
+            }
+        };
+        if old_metadata.file_type().is_symlink() || !old_metadata.is_dir() {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "preserved runtime data path is not a private directory: {}",
+                    old_data.display()
+                ),
+            ));
+        }
+        let staged_data = tmp.join(relative);
+        match std::fs::symlink_metadata(&staged_data) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "staged runtime data path is not a directory: {}",
+                        staged_data.display()
+                    ),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(error);
+            }
+        }
+        if let Err(error) = copy_dir_contents(&old_data, &staged_data) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(error);
+        }
     }
 
     if !dst.exists() {

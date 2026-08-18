@@ -112,15 +112,44 @@ function Replace-PortableFile([string]$Source, [string]$Destination) {
   }
 }
 
-function Replace-PortableDirectory([string]$Source, [string]$Destination) {
+function Replace-PortableDirectory([string]$Source, [string]$Destination, [string[]]$PreservedDirectories) {
   $parent = Split-Path -Parent $Destination
   New-Item -ItemType Directory -Force -Path $parent | Out-Null
+  if (Test-Path -LiteralPath $Destination) {
+    $destinationItem = Get-Item -LiteralPath $Destination -Force
+    if (-not $destinationItem.PSIsContainer -or ($destinationItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+      throw "portable directory target is not a private directory: $Destination"
+    }
+  }
   $suffix = [System.Guid]::NewGuid().ToString("N")
   $tmp = "$Destination.tmp.$suffix"
   $backup = "$Destination.old.$suffix"
   $hadExisting = Test-Path -LiteralPath $Destination
   try {
     Copy-Item -LiteralPath $Source -Destination $tmp -Recurse
+    if ($hadExisting) {
+      foreach ($name in $PreservedDirectories) {
+        if (-not $name -or $name -match '[/\\]' -or $name -eq '.' -or $name -eq '..') {
+          throw "invalid portable Mesen data directory name: $name"
+        }
+        $oldData = Join-Path $Destination $name
+        if (-not (Test-Path -LiteralPath $oldData)) { continue }
+        $oldItem = Get-Item -LiteralPath $oldData -Force
+        if (-not $oldItem.PSIsContainer -or ($oldItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+          throw "portable Mesen data path is not a private directory: $oldData"
+        }
+        $stagedData = Join-Path $tmp $name
+        if (Test-Path -LiteralPath $stagedData) {
+          $stagedItem = Get-Item -LiteralPath $stagedData -Force
+          if (-not $stagedItem.PSIsContainer -or ($stagedItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "staged Mesen data path is not a directory: $stagedData"
+          }
+        } else {
+          New-Item -ItemType Directory -Force -Path $stagedData | Out-Null
+        }
+        Get-ChildItem -LiteralPath $oldData -Force | Copy-Item -Destination $stagedData -Recurse -Force
+      }
+    }
     if ($hadExisting) { Move-Item -LiteralPath $Destination -Destination $backup }
     Move-Item -LiteralPath $tmp -Destination $Destination
     if ($hadExisting -and (Test-Path -LiteralPath $backup)) {
@@ -259,7 +288,12 @@ if ($portableFull.Equals($sourceDir, [System.StringComparison]::OrdinalIgnoreCas
     $portableFull.StartsWith($sourceDir + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)) {
   throw "portable destination must not be inside source publish directory: $portableFull"
 }
-Replace-PortableDirectory $sourceDir $portableDir
+$portableDataManifest = Join-Path $here "portable-data-dirs.txt"
+if (-not (Test-Path -LiteralPath $portableDataManifest -PathType Leaf)) {
+  throw "portable Mesen data manifest is missing: $portableDataManifest"
+}
+$portableDataDirectories = @(Get-Content -LiteralPath $portableDataManifest | Where-Object { $_ })
+Replace-PortableDirectory $sourceDir $portableDir $portableDataDirectories
 
 $settings = Join-Path $portableDir "settings.json"
 $settingsTemplate = Join-Path $here "portable-settings.json"

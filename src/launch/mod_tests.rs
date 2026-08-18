@@ -215,6 +215,34 @@ fn copy_dir_replace_refuses_symlinked_directory_destination() {
 
 #[cfg(unix)]
 #[test]
+fn copy_dir_replace_refuses_symlinked_preserved_data_without_replacing_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&dst).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(src.join("runtime.txt"), "new runtime").unwrap();
+    std::fs::write(dst.join("runtime.txt"), "old runtime").unwrap();
+    std::fs::write(outside.join("game.srm"), "outside save").unwrap();
+    std::os::unix::fs::symlink(&outside, dst.join("Saves")).unwrap();
+
+    let err = copy_dir_replace_preserving_dirs(&src, &dst, &[PathBuf::from("Saves")]).unwrap_err();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(
+        std::fs::read_to_string(dst.join("runtime.txt")).unwrap(),
+        "old runtime"
+    );
+    assert_eq!(
+        std::fs::read_to_string(outside.join("game.srm")).unwrap(),
+        "outside save"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn copy_dir_replace_preserves_symlinks() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");

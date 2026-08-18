@@ -1,0 +1,16 @@
+Avi
+Backups
+Cheats
+Debugger
+Dumps
+Firmware
+GameConfig
+HdPacks
+LuaScriptData
+Movies
+RecentGames
+Satellaview
+SaveStates
+Saves
+Screenshots
+Wave

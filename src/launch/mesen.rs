@@ -20,6 +20,10 @@ pub const REPEATABLE_CONDITIONS_SHA256: &str =
     "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b";
 const REPEATABLE_SEED: &str = "1162696003";
 const REPEATABLE_UNIX_TIME: &str = "788918400";
+const PORTABLE_DATA_DIRS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/adapters/mesen2/portable-data-dirs.txt"
+));
 const REPEATABLE_PERSISTENCE_DIRS: [&str; 5] =
     ["Cheats", "Debugger", "GameConfig", "Satellaview", "Saves"];
 
@@ -328,6 +332,23 @@ pub fn prepare_portable_binary(
     port: u16,
 ) -> std::io::Result<PreparedPortable> {
     let home = super::emu_home_dir("mesen2", port);
+    prepare_portable_binary_in_home(source_binary, port, home, true)
+}
+
+fn portable_data_paths(data_root: &Path) -> Vec<PathBuf> {
+    PORTABLE_DATA_DIRS
+        .lines()
+        .filter(|name| !name.is_empty())
+        .map(|name| data_root.join(name))
+        .collect()
+}
+
+fn prepare_portable_binary_in_home(
+    source_binary: &Path,
+    port: u16,
+    home: PathBuf,
+    preserve_data: bool,
+) -> std::io::Result<PreparedPortable> {
     std::fs::create_dir_all(&home)?;
 
     let (binary, settings) = if source_binary.starts_with(&home) {
@@ -353,7 +374,16 @@ pub fn prepare_portable_binary(
             )
         })?;
         let dst_root = home.join(app_name);
-        super::copy_dir_replace(app_root, &dst_root)?;
+        let data_root = rel.parent().unwrap_or_else(|| Path::new(""));
+        if preserve_data {
+            super::copy_dir_replace_preserving_dirs(
+                app_root,
+                &dst_root,
+                &portable_data_paths(data_root),
+            )?;
+        } else {
+            super::copy_dir_replace(app_root, &dst_root)?;
+        }
         let binary = dst_root.join(rel);
         let settings = binary.parent().unwrap_or(&dst_root).join("settings.json");
         (binary, settings)
@@ -383,7 +413,15 @@ pub fn prepare_portable_binary(
                 ),
             ));
         }
-        super::copy_dir_replace(source_dir, &dst_dir)?;
+        if preserve_data {
+            super::copy_dir_replace_preserving_dirs(
+                source_dir,
+                &dst_dir,
+                &portable_data_paths(Path::new("")),
+            )?;
+        } else {
+            super::copy_dir_replace(source_dir, &dst_dir)?;
+        }
         let binary = dst_dir.join(exe_name);
         let settings = dst_dir.join("settings.json");
         (binary, settings)
@@ -465,9 +503,22 @@ fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> sup
 
 /// Prepare an emucap-owned portable Mesen copy and launch it detached with the ROM + adapter Lua and
 /// the emucap environment. Returns the child pid.
+fn prepare_launch_portable(l: &Launch<'_>) -> std::io::Result<PreparedPortable> {
+    if l.repeatable {
+        prepare_portable_binary_in_home(
+            l.binary,
+            l.port,
+            super::emu_home_dir("mesen2", l.port).join("repeatable"),
+            false,
+        )
+    } else {
+        prepare_portable_binary(l.binary, l.port)
+    }
+}
+
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let host_build = read_build_metadata(l.binary)?;
-    let portable = prepare_portable_binary(l.binary, l.port)?;
+    let portable = prepare_launch_portable(l)?;
     ensure_portable_settings(&portable, l.repeatable)?;
     if l.repeatable {
         clear_repeatable_persistence(&portable)?;
