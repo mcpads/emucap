@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.14.3 — beta.** This repository remains under active development; interfaces and
+**v0.14.4 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -193,6 +193,9 @@ post-launch guest time, not power-on RAM, RTC, saves, or other initial condition
 `execution_profile: "repeatable"` is the separate opt-in for those producer-owned conditions, and
 `record_window(require_repeatable: true)` fails before reset, input, or guest advance unless the
 selected recording origin is eligible.
+For Mesen, refreshing the isolated runtime preserves the ordinary profile's battery saves and other
+portable data. The repeatable profile uses a separate disposable portable root, so obtaining fresh
+initial conditions never deletes the ordinary profile's data or the user's standard Mesen files.
 
 `listener.base_port` is only where direct-mode port search begins. It may already
 belong to another live MCP session. Launchers use the assigned `listener.port`
@@ -216,9 +219,12 @@ High-rate event classes may additionally advertise filterable integer payload fi
 per-class half-open ranges narrow only the declared observation scope; excluded callbacks are not
 reported as drops, while matching events retain the ordinary sequence, limit, and integrity rules.
 Unadvertised fields and invalid ranges are rejected before guest mutation.
-When `recording_capability.warmup` exists, `warmup_frames` keeps cheap transaction classes active
-while delaying observation-only hooks until the exact guest boundary; the input movie covers both
-intervals in one request.
+When `recording_capability.warmup` exists, `warmup_frames` keeps the producer's default transaction
+classes active while delaying observation event emission until the exact guest boundary. Classes
+listed in `warmup.selectable_event_scopes` may instead use an advertised scope through
+`event_arming_overrides`; omission preserves the producer default. The selected scope controls the
+stream and its event, byte, and drop accounting, not whether a native emulator hook remains
+installed. The input movie covers both intervals in one request.
 When a selected event is marked `startable`, optional `start_on` can align the observation interval
 to its first occurrence. `initial_snapshots` additionally require the capability's callback-safe
 memory type and bounds; Core receives them through a separate authenticated binary sink and binds

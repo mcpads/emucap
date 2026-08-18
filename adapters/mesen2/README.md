@@ -83,6 +83,10 @@ after a crash, new launches are blocked until it is dismissed.
 Recommended path: call the MCP `launch` tool. It verifies the pinned compatible host, copies its
 complete app bundle (macOS) or publish directory into an emucap-owned portable directory, applies
 required options without modifying the user's default settings, and keeps native input available.
+Runtime refresh carries the Mesen-owned data directories, including `Saves`, into the staged
+replacement before the atomic swap. A repeatable SNES launch uses a separate disposable portable
+root; clearing that root cannot delete the ordinary emucap profile or the user's standard Mesen
+data.
 Every system gets a minimal portable `settings.json` that asks Mesen to initialize its built-in
 Xbox and keyboard mappings in memory; it does not copy or modify the user's custom mappings. GBA
 also stages its BIOS into that same portable home.
@@ -130,6 +134,11 @@ validates and decodes the movie and binds the sink before queueing reset, then e
 boundary in Mesen's native post-reset callback before the emulation loop releases a guest tick. This
 is a timed soft-reset origin, not a cold-power or equal-memory claim. Legacy/manual hosts and the
 other Mesen system entries keep their existing tools but do not advertise recording.
+For warmup requests, `frame_boundary` and `frame_completed` also advertise selectable transaction
+or observation emission scopes. The default remains transaction scope. An observation override
+suppresses warmup records and their event, byte, and drop accounting while the dense input movie
+and guest frame progression continue; it does not claim that Mesen removed the underlying frame
+callback.
 The maintained profile also advertises bounded terminal snapshots when the active core exposes
 exact finite `memory_regions`. Core performs those reads only after the recording terminal has
 frozen the exact final frame; they do not use the live event queue or install another Mesen hook.

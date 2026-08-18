@@ -4,6 +4,26 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.4
+
+### Added
+- Expanded the baseline debugger surface with exact Mesen main-CPU instruction stepping, exact
+  VBlank-boundary frame stepping for Nintendo DS and PSP, frozen best-effort call stacks for GBA,
+  Nintendo 64, Neo Geo, and PSP, and bounded Dolphin read/write watchpoints and native reset.
+- Recording event classes can opt into producer-advertised transaction or observation scopes.
+  Omitted overrides preserve each producer's existing default, and invalid selections fail before
+  guest mutation.
+- MCP discovery now states that `write_memory` accepts either inline hexadecimal data or a bounded
+  raw-file slice on the MCP host.
+
+### Fixed
+- Mesen runtime refresh now preserves battery saves and other portable data. Repeatable SNES
+  launches use a separate disposable profile instead of clearing the ordinary emucap profile.
+- PPSSPP frame stepping preserves native debugger stop reasons, and Mednafen breakpoint handling
+  preserves the requested address identity and terminal execution provenance.
+- WonderSwan reset-origin recording now arms its native reset guard without requiring an address
+  space that the event does not have.
+
 ## 0.14.3
 
 ### Added
