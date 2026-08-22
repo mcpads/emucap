@@ -4,6 +4,8 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.6
+
 ### Fixed
 - Managed CUE, GDI, CCD, TOC, and M3U launches now bind a SHA-256 identity over the entry and every
   loader-declared member before starting the emulator. This includes Mednafen's implicit SBI
