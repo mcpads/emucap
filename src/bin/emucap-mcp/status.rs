@@ -24,31 +24,17 @@ mod tests;
 mod button_hints;
 pub(crate) use button_hints::button_hint_for_system;
 
+#[path = "status/content_identity.rs"]
+mod content_identity;
+#[cfg(test)]
+use content_identity::content_identity_for_rom_info_with_store;
+pub(crate) use content_identity::{content_identity_for_rom_info, normalize_rom_sha1};
+
 #[path = "status/continuity.rs"]
 mod continuity;
 pub(crate) use continuity::enrich_continuity;
 #[cfg(test)]
 use continuity::{enrich_runtime_instance, recording_capture_projection};
-
-/// get_rom_info 응답에 균일 `rom_sha1` 필드를 삽입한다 — 정규화된 콘텐츠 해시(content_md5 우선,
-/// 없으면 sha1; 빈값·"skipped:too_large"는 무효로 보고 폴백). 어댑터가 어떤 해시를 쓰든 에이전트가
-/// 플랫폼별 필드를 고를 필요 없이 이 필드를 추적 MCP run_start에 넘긴다. 해시를 전혀 안 주는 백엔드는
-/// 무효라 필드가 안 생긴다(→ 호출자 shasum 폴백). 기존 필드는 보존하고 이미 있으면 덮어쓰지 않는다.
-pub(crate) fn normalize_rom_sha1(v: &mut serde_json::Value) {
-    fn valid(s: Option<&str>) -> Option<&str> {
-        s.filter(|s| !s.is_empty() && *s != "skipped:too_large")
-    }
-    let Some(obj) = v.as_object_mut() else { return };
-    if obj.contains_key("rom_sha1") {
-        return;
-    }
-    let canon = valid(obj.get("content_md5").and_then(|x| x.as_str()))
-        .or_else(|| valid(obj.get("sha1").and_then(|x| x.as_str())))
-        .map(String::from);
-    if let Some(c) = canon {
-        obj.insert("rom_sha1".into(), serde_json::json!(c));
-    }
-}
 
 pub(crate) fn enrich_status_value(
     v: &mut serde_json::Value,

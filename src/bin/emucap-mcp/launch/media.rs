@@ -1,5 +1,27 @@
 use std::path::Path;
 
+use crate::args::LaunchArgs;
+
+pub(super) fn approved_content_identity(
+    args: &LaunchArgs,
+    adapter: &str,
+) -> Result<Option<emucap::content_identity::ContentIdentity>, serde_json::Value> {
+    emucap::content_identity::identify_approved_composite_content_for_adapter(
+        Path::new(&args.content_path),
+        adapter,
+        args.indirect_media_approval.as_ref(),
+    )
+    .map_err(|error| {
+        serde_json::json!({
+            "launched": false,
+            "reason": "approved composite content identity could not be established",
+            "error": error.to_string(),
+            "content_path": &args.content_path,
+            "next_action": "Call launch_plan, review every indirect media member, and retry with the exact returned approval.",
+        })
+    })
+}
+
 pub(super) fn ext_lower(path: &str) -> Option<String> {
     Path::new(path)
         .extension()
@@ -10,7 +32,7 @@ pub(super) fn ext_lower(path: &str) -> Option<String> {
 fn read_prefix(path: &Path, max: usize) -> Option<Vec<u8>> {
     use std::io::Read;
 
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = emucap::path_safety::open_regular_file_no_follow(path).ok()?;
     let mut buffer = vec![0; max];
     let length = file.read(&mut buffer).ok()?;
     buffer.truncate(length);
@@ -21,7 +43,7 @@ pub(super) fn read_iso9660_system_cnf(path: &Path) -> Option<Vec<u8>> {
     use std::io::{Read, Seek, SeekFrom};
 
     const SECTOR: u64 = 2048;
-    let mut file = std::fs::File::open(path).ok()?;
+    let mut file = emucap::path_safety::open_regular_file_no_follow(path).ok()?;
     let mut descriptor = [0u8; SECTOR as usize];
     file.seek(SeekFrom::Start(16 * SECTOR)).ok()?;
     file.read_exact(&mut descriptor).ok()?;
@@ -86,11 +108,10 @@ pub(super) fn content_markers(path: Option<&str>) -> serde_json::Value {
     let mut scanned_files = Vec::new();
     let mut candidates = Vec::new();
 
-    if ext_lower(path).as_deref() == Some("cue") {
-        if let Ok(references) = emucap::cue::validate_graph(path_ref) {
-            candidates.extend(references.into_iter().map(|reference| reference.path));
-        }
-    } else {
+    if !matches!(
+        ext_lower(path).as_deref(),
+        Some("cue" | "gdi" | "ccd" | "toc" | "m3u")
+    ) {
         candidates.push(path_ref.to_path_buf());
     }
 

@@ -1,4 +1,3 @@
-use super::media::ext_lower;
 use super::plan::*;
 use super::*;
 use crate::args::LaunchExecutionProfileArgs;
@@ -137,18 +136,6 @@ pub(crate) fn make_launch(
             "next_action": "Verify content_path, then call launch_plan(content_path, system) again.",
         });
     }
-    if ext_lower(&a.content_path).as_deref() == Some("cue") {
-        if let Err(error) = emucap::cue::validate_graph(Path::new(&a.content_path)) {
-            return serde_json::json!({
-                "launched": false,
-                "reason": "CUE graph is missing, unsafe, or outside its directory",
-                "error": error.to_string(),
-                "content_path": &a.content_path,
-                "next_action": "Keep every CUE track under the CUE directory, remove symlinks, and call launch_plan again.",
-            });
-        }
-    }
-
     let inference = infer_system(Some(&a.content_path), a.system.as_deref());
     let Some(system) = inference.get("system").and_then(|v| v.as_str()) else {
         return serde_json::json!({
@@ -219,6 +206,12 @@ pub(crate) fn make_launch(
             }
         }
     }
+    // Bind the approved loader-declared graph before any existing generation is signalled or a new
+    // emulator starts. A layout ID or descriptor-only hash cannot detect rebuilt media.
+    let content_identity = match super::media::approved_content_identity(a, adapter) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     if initial_admission == TransitionAdmission::AcquireLease {
         let Some(current) = previous.as_ref() else {
             return transition_rejection(EntryReason::ProcessIdentityUnknown, status, None);
@@ -451,6 +444,7 @@ pub(crate) fn make_launch(
     manifest.execution_profile = outcome
         .get("execution_profile")
         .and_then(|value| serde_json::from_value(value.clone()).ok());
+    manifest.content_identity = content_identity;
     manifest.start_frozen = a.start_frozen || repeatable;
     let emulator_state = manifest.process_state();
     let bridge_state = manifest.bridge_process_state();

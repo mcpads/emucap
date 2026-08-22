@@ -655,7 +655,7 @@ fn cd_rom_info_hashes_the_complete_cue_graph() {
     let cue = dir.path().join("disc.cue");
     let track = dir.path().join("track01.bin");
     std::fs::write(&track, b"track-one").unwrap();
-    std::fs::write(&cue, "FILE \"track01.bin\" BINARY\n").unwrap();
+    std::fs::write(&cue, "FILE \"track01.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
     let env = GdbBridgeEnv {
         content: Some(cue.clone()),
         ..GdbBridgeEnv::default()

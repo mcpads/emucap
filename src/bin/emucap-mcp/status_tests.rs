@@ -1521,9 +1521,9 @@ fn composite_admission_requires_a_validated_contract_generation() {
 
 #[test]
 fn normalize_rom_sha1_prefers_content_md5() {
-    // Mednafen: content_md5가 식별 기준이고 sha1은 보조 — content_md5를 rom_sha1로.
+    // Single-file legacy responses retain the adapter's preferred identifier.
     let mut v = serde_json::json!({"content_md5": "abc", "sha1": "def"});
-    normalize_rom_sha1(&mut v);
+    normalize_rom_sha1(&mut v, None);
     assert_eq!(v["rom_sha1"], "abc");
     // 기존 필드 보존.
     assert_eq!(v["content_md5"], "abc");
@@ -1531,10 +1531,107 @@ fn normalize_rom_sha1_prefers_content_md5() {
 }
 
 #[test]
+fn exact_cue_identity_replaces_layout_and_entry_file_identifiers() {
+    let directory = tempfile::tempdir().unwrap();
+    let cue = directory.path().join("disc.cue");
+    std::fs::write(directory.path().join("track.bin"), b"rebuilt-track").unwrap();
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
+    let mut value = serde_json::json!({
+        "path": cue,
+        "content_md5": "layout-only",
+        "sha1": "cue-only",
+        "rom_sha1": "legacy-adapter-value"
+    });
+
+    let identity = emucap::content_identity::identify_composite_content(&cue)
+        .unwrap()
+        .unwrap();
+    normalize_rom_sha1(&mut value, Some(&identity));
+
+    assert_eq!(value["content_identity"]["scope"], "cue_graph");
+    assert_eq!(value["content_identity"]["algorithm"], "sha256");
+    assert_eq!(value["content_identity_binding"], "prelaunch");
+    assert_eq!(
+        value["content_identity"]["members"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(value["rom_sha1"], identity.tracking_id());
+    assert_eq!(value["content_md5"], "layout-only");
+    assert_eq!(value["sha1"], "cue-only");
+}
+
+#[test]
+fn unmanaged_descriptor_rom_info_does_not_expand_adapter_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let cue = directory.path().join("disc.cue");
+    std::fs::write(directory.path().join("track.bin"), b"track").unwrap();
+    std::fs::write(directory.path().join("disc.sbi"), b"SBI\0").unwrap();
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
+    let value = serde_json::json!({"adapter": "mednafen", "path": cue});
+
+    let error = content_identity_for_rom_info(&value, None, None).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[test]
+fn managed_rom_info_reports_the_identity_bound_at_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let cue = directory.path().join("disc.cue");
+    let track = directory.path().join("track.bin");
+    std::fs::write(&track, b"launch-input").unwrap();
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
+    let launch_identity = emucap::content_identity::identify_composite_content(&cue)
+        .unwrap()
+        .unwrap();
+
+    let store = emucap::live::runtime::RuntimeStore::new(directory.path().join("sessions"));
+    let prepared = store.prepare(47991).unwrap();
+    let launch_id = prepared.launch_id().to_string();
+    let mut manifest = prepared.manifest(emucap::live::runtime::ManifestSpec {
+        adapter: "mednafen".into(),
+        system: "saturn".into(),
+        content: cue.display().to_string(),
+        emulator_pid: std::process::id(),
+        bridge_pid: None,
+        backend_endpoint: None,
+        build: Some("test-build".into()),
+    });
+    manifest.content_identity = Some(launch_identity.clone());
+    prepared.commit(&manifest).unwrap();
+
+    let value = serde_json::json!({"path": cue});
+    let unchanged =
+        content_identity_for_rom_info_with_store(&value, Some(47991), Some(&launch_id), &store)
+            .unwrap()
+            .unwrap();
+    assert_eq!(unchanged, launch_identity);
+
+    let without_adapter_path = content_identity_for_rom_info_with_store(
+        &serde_json::json!({}),
+        Some(47991),
+        Some(&launch_id),
+        &store,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(without_adapter_path, launch_identity);
+
+    std::fs::write(&track, b"changed-after-launch").unwrap();
+    let still_bound =
+        content_identity_for_rom_info_with_store(&value, Some(47991), Some(&launch_id), &store)
+            .unwrap()
+            .unwrap();
+    assert_eq!(still_bound, launch_identity);
+}
+
+#[test]
 fn normalize_rom_sha1_falls_back_to_sha1() {
     // Mesen/PC-98: content_md5 없음 → sha1로 폴백.
     let mut v = serde_json::json!({"sha1": "def"});
-    normalize_rom_sha1(&mut v);
+    normalize_rom_sha1(&mut v, None);
     assert_eq!(v["rom_sha1"], "def");
 }
 
@@ -1542,12 +1639,12 @@ fn normalize_rom_sha1_falls_back_to_sha1() {
 fn normalize_rom_sha1_skips_too_large_marker() {
     // 대용량 디스크: content_md5는 유효하면 그것을 쓴다(sha1=skipped 무관).
     let mut v = serde_json::json!({"content_md5": "abc", "sha1": "skipped:too_large"});
-    normalize_rom_sha1(&mut v);
+    normalize_rom_sha1(&mut v, None);
     assert_eq!(v["rom_sha1"], "abc");
     // content_md5도 무효(skipped/빈값)이고 sha1만 skipped면 폴백 대상 없음 → rom_sha1 미생성.
     let mut v2 =
         serde_json::json!({"content_md5": "skipped:too_large", "sha1": "skipped:too_large"});
-    normalize_rom_sha1(&mut v2);
+    normalize_rom_sha1(&mut v2, None);
     assert!(v2.get("rom_sha1").is_none());
 }
 
@@ -1555,7 +1652,7 @@ fn normalize_rom_sha1_skips_too_large_marker() {
 fn normalize_rom_sha1_absent_when_no_hash() {
     // Flycast(gameId만, 해시 미반환): rom_sha1 미생성 → 호출자 shasum 폴백.
     let mut v = serde_json::json!({"game_id": "T1234", "name": "GAME"});
-    normalize_rom_sha1(&mut v);
+    normalize_rom_sha1(&mut v, None);
     assert!(v.get("rom_sha1").is_none());
 }
 
@@ -1563,7 +1660,7 @@ fn normalize_rom_sha1_absent_when_no_hash() {
 fn normalize_rom_sha1_no_overwrite() {
     // 이미 rom_sha1이 있으면 덮어쓰지 않는다.
     let mut v = serde_json::json!({"rom_sha1": "preset", "content_md5": "abc"});
-    normalize_rom_sha1(&mut v);
+    normalize_rom_sha1(&mut v, None);
     assert_eq!(v["rom_sha1"], "preset");
 }
 

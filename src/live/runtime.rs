@@ -46,6 +46,9 @@ pub struct CurrentManifest {
     pub adapter: String,
     pub system: String,
     pub content: String,
+    /// Exact launch input identity when the entry file refers to other media files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_identity: Option<crate::content_identity::ContentIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
     pub emulator: ProcessIdentity,
@@ -543,6 +546,7 @@ impl PreparedGeneration {
             adapter: spec.adapter,
             system: spec.system,
             content: spec.content,
+            content_identity: None,
             build: spec.build,
             emulator: capture_process(spec.emulator_pid),
             bridge: spec.bridge_pid.map(capture_process),
@@ -629,7 +633,7 @@ impl CurrentManifest {
     pub fn public_value_with_lease(&self, lease: &LeaseView) -> serde_json::Value {
         let emulator_state = self.process_state();
         let bridge_state = self.bridge_process_state();
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "launch_id": self.launch_id,
             "port": self.port,
             "adapter": self.adapter,
@@ -645,7 +649,12 @@ impl CurrentManifest {
             "start_frozen": self.start_frozen,
             "lease": lease,
             "next_safe_action": next_safe_action(emulator_state, bridge_state, lease.state),
-        })
+        });
+        if let Some(identity) = &self.content_identity {
+            value["content_identity"] = identity.summary_value();
+            value["content_identity_binding"] = serde_json::json!("prelaunch");
+        }
+        value
     }
 }
 

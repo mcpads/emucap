@@ -236,7 +236,7 @@ fn track_err(error: impl Into<TrackReplyError>) -> CallToolResult {
 const SERVER_INSTRUCTIONS: &str = r#"emucap Tracking MCP stores experiment records under `.emucap/` so runs can be reproduced and compared. It does not control an emulator. Use Control MCP (`emucap-mcp`) for memory, execution, screenshots, and input; pass the required values between the two servers explicitly.
 
 [Identity from Control MCP]
-- Pass `get_rom_info.rom_sha1` unchanged to `run_start` and ROM-scoped queries. This server does not read the ROM. Use `shasum -a1 <content>` only when a backend cannot provide `rom_sha1`.
+- Pass `get_rom_info.rom_sha1` unchanged to `run_start` and ROM-scoped queries. Despite the legacy field name, treat it as an opaque Tracking identifier. When Control MCP returns `content_identity`, that identity covers the complete composite input. Never substitute a hash of only a CUE or another descriptor.
 - Treat `run_id`, `finding_id`, and ROM identifiers as opaque returned values. Do not invent paths or normalize them; stored identifiers use ASCII letters and digits separated only by single hyphens.
 - `connection_ref` is optional. Use `status.emulator_identity.name`, or `"port:" + status.listening_port`. It lets `run_start` resume the same unfinished run or supersede an older run for that connection.
 - Record Control MCP analysis results with `log_gate` or `log_metric`.
@@ -741,7 +741,7 @@ impl EmucapTrack {
             "running_runs": running,
             "assembly": {
                 "note": "This MCP has no emulator connection. Pass rom_sha1 and connection_ref from Control MCP (emucap-mcp).",
-                "rom_sha1": "Pass the normalized get_rom_info.rom_sha1 value to run_start. Use `shasum -a1 <content>` only for a backend that does not provide it.",
+                "rom_sha1": "Pass the normalized get_rom_info.rom_sha1 value unchanged to run_start. For composite media, require Control MCP content_identity and never hash only the descriptor.",
                 "connection_ref": "Optionally use the Control MCP status connection name or `port:N`. run_start resumes a stored running run for the same connection and ROM.",
                 "analysis_verbs": "Control MCP analysis operations regression_run and verify_determinism return results only. Record relevant results here with log_gate or log_metric.",
                 "interventions": "Control MCP does not automatically record write_memory, load_state, reset, or input. Record relevant mutations with log_intervention."

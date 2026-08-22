@@ -174,6 +174,29 @@ fn launch_and_recording_parse_explicit_repeatability_selection() {
 }
 
 #[test]
+fn launch_surfaces_accept_the_exact_indirect_media_approval_shape() {
+    let json = r#"{
+        "content_path":"/tmp/disc.cue",
+        "system":"saturn",
+        "indirect_media_approval":{
+            "entry_binding":"sha256:abc",
+            "adapter":"mednafen",
+            "members":["disc.sbi","track.bin"]
+        }
+    }"#;
+    let plan: LaunchPlanArgs = serde_json::from_str(json).unwrap();
+    let launch: LaunchArgs = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        plan.indirect_media_approval.as_ref().unwrap(),
+        launch.indirect_media_approval.as_ref().unwrap()
+    );
+    assert_eq!(
+        launch.indirect_media_approval.unwrap().members,
+        ["disc.sbi", "track.bin"]
+    );
+}
+
+#[test]
 fn launch_parses_only_supported_pc98_sound_boards() {
     let launch: LaunchArgs = serde_json::from_str(
         r#"{"content_path":"/tmp/game.hdi","system":"pc98","sound":true,"pc98_sound_board":"pc9801_86"}"#,

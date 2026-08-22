@@ -4,6 +4,21 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.6
+
+### Fixed
+- Managed CUE, GDI, CCD, TOC, and M3U launches now bind a SHA-256 identity over the entry and every
+  loader-declared member before starting the emulator. This includes Mednafen's implicit SBI
+  sidecar. `get_rom_info` reports the pre-launch identity bound to the managed generation instead of
+  treating a layout identifier, descriptor-only hash, or later mutable source read as that identity.
+- Composite-media admission now rejects path escape, symlinks in any member component, special or
+  empty files, self-reference, ambiguous CloneCD metadata, malformed track boundaries, oversized
+  graphs, and excessive playlist recursion before guest execution.
+- Selecting a descriptor no longer authorizes or probes every file under its directory. `launch_plan`
+  discloses an exact bounded member set for review before metadata, content, or hashes are read;
+  nested M3U descriptors reveal one approved frontier at a time, and direct launch without the
+  server-produced approval fails before changing a runtime generation.
+
 ## 0.14.5
 
 ### Added
