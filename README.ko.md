@@ -11,7 +11,7 @@ PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), 
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.14.4 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.14.5 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -127,6 +127,9 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
   `run_start(rom_sha1=…)`에 넘긴다(어댑터가 `get_rom_info` 미지원이면 `shasum -a1 <content>`).
   `connection_ref`(제어 MCP `status`의 연결 이름 또는 `"port:N"`)를 함께 넘기면 같은 연결의 직전
   미종료 run이 자동 마감된다.
+- **반환된 식별자는 그대로 사용**: `rom_sha1`, `run_id`, `finding_id`를 경로나 별도 이름으로
+  가공하지 않는다. 관리 식별자는 영문·숫자를 단일 하이픈으로만 연결하며 경로 문법, 점, underscore는
+  물론 플랫폼 예약 장치명도 파일시스템 접근 전에 거부한다.
 - **분석 verb는 반환만**: 필요할 때 `analysis(operation="describe")`를 호출하고 같은 도구로
   선택한 `regression_run`/`verify_determinism` operation을 실행한다. 제어 MCP가 에뮬을 구동해
   결과를 *반환*할 뿐 원장에 쓰지 않는다. 남기려면 그 결과를 추적 MCP의 `log_gate`(예:
@@ -148,6 +151,10 @@ stable host session ID가 없는 client도 반환된 lease의 exact `launch_id`�
 `launch_plan(content_path, system?)`이 검증된 MCP `launch` 도구 인자를 돌려준다.
 에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
 identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
+
+관리형 CUE는 닫힌 미디어 그래프다. 모든 `FILE` 참조는 이식 가능한 상대 경로여야 하고 CUE 디렉터리
+아래의 일반 파일을 가리켜야 하며 symlink를 허용하지 않는다. 이 경계를 어기면 에뮬레이터를 시작하기
+전에 계획과 실행이 실패한다.
 
 일반 launch는 guest가 이미 실행 중인 상태로 반환할 수 있다. 첫 후속 동작에 네트워크·에이전트 지연이
 guest time으로 섞이면 안 될 때는 `start_frozen: true`를 요청한다. 지원하는 launcher는 adapter가
