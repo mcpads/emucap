@@ -154,9 +154,11 @@ MLflow, ① Control MCP is TensorFlow):
 
 The two MCPs never call each other — **the agent composes them**:
 
-- **Pass rom_sha1**: read the ROM identifier via the Control MCP's `get_rom_info`
-  (`.rom_sha1`) and pass it to the Tracking MCP's `run_start(rom_sha1=…)` (if an
-  adapter lacks `get_rom_info`, fall back to `shasum -a1 <content>`). Passing
+- **Pass rom_sha1**: read the opaque Tracking identifier via the Control MCP's
+  `get_rom_info` (`.rom_sha1`) and pass it unchanged to the Tracking MCP's
+  `run_start(rom_sha1=…)`. Managed descriptor media bind a pre-launch `content_identity` to the
+  entry and every loader-declared member before execution; the compatibility `rom_sha1` slot carries
+  that SHA-256 identity. Never identify composite media by hashing only its descriptor. Passing
   `connection_ref` (the Control MCP `status` connection name, or `"port:N"`)
   auto-finalizes the previous unfinished run on that connection.
 - **Keep returned identities opaque**: pass `rom_sha1`, `run_id`, and `finding_id`
@@ -190,9 +192,14 @@ arguments. The agent calls `launch`, which waits for adapter readiness, and
 verifies the resulting live and runtime identities with `status`. Launcher
 scripts are developer entry points, not an alternative managed lifecycle.
 
-A managed CUE is a closed media graph: every `FILE` reference must be portable,
-relative, remain below the CUE directory, and resolve to a regular non-symlink file.
-Planning and launch fail before emulator startup when the graph violates that boundary.
+Managed CUE, GDI, CCD, TOC, and M3U entries are closed media graphs. Selecting a descriptor authorizes
+only that entry. `launch_plan` returns `review_input` with the exact relative member names before it
+reads their metadata, content, or hashes; review each name and echo only the server-produced
+`indirect_media_approval`. Nested M3U descriptors may require another review frontier. References
+must remain portable and below the entry directory and resolve to real regular files without
+symlinks. Planning and launch fail before emulator startup when review or graph validation fails.
+`content_identity_binding: "prelaunch"` describes the resulting identity; it is not a claim that a
+mutable source path was snapshotted or that the emulator consumed every byte.
 
 An ordinary launch can return while the guest is already running. If the first follow-up action
 must not inherit network or agent delay as guest time, request `start_frozen: true`; a supported

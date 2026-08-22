@@ -3,17 +3,17 @@ pub(crate) const SERVER_INSTRUCTIONS: &str = r#"Debug retro software through the
 
 ## Authority and routing
 
-Begin with `bootstrap()` and follow its structured primary action. Use only names and limits from full `status`; reuse its `capability_revision` and refresh after reconnect, generation change, or mismatch. Compose calls only with `contracts.state=validated` after reading constraints.
+Begin with `bootstrap()` and follow its primary action. Use names and limits from full `status`; refresh after reconnect, generation change, or mismatch. Compose calls only with `contracts.state=validated`.
 
-For `input_control` and `debug`, call `operation="describe"`, then execute one returned operation with its exact schema and `known_capability_revision`. Use `analysis(operation="describe")` before optional analysis.
+For `input_control` and `debug`, call `operation="describe"`, then use one returned schema and `known_capability_revision`. Describe optional analysis before use.
 
 ## Managed lifecycle
 
-Use the assigned `listener.port`, never `base_port`. Resolve media through `launch_plan`; do not guess an ambiguous system. Recheck `status`, launch with the planned arguments, then verify connection, identity, contracts, and runtime binding. End only the exact managed generation with `stop(status.runtime_instance.launch_id)`.
+Use `listener.port`, not `base_port`. Resolve media through `launch_plan`; never guess an ambiguous system. Follow `review_input`: verify each indirect member, then echo its exact approval. Never construct or bypass it. Recheck `status`, launch with the planned arguments, and verify connection, identity, contracts, and binding. Stop only `status.runtime_instance.launch_id`.
 
 To continue a generation not selected automatically, inspect `bootstrap(include=["runtimes"])` and call `reattach` only with an exact entry marked available. Never edit runtime files.
 
-The default launch may return with the guest running, so wall time before the next call becomes guest time. When the next action must target the launch entry, inspect `launch_plan.start_frozen_contract`, request `start_frozen:true`, and accept success only with `state=frozen`; do not substitute a sleep or a sampled frame number. A repeatable execution profile is a separate opt-in promise about advertised initial conditions. Require it again on recording only when the live recording capability offers the selected origin.
+Default launch may return running, so delay before the next call becomes guest time. To target launch entry, inspect `start_frozen_contract`, request `start_frozen:true`, and require `state=frozen`; never substitute sleep or a sampled frame. Repeatability is a separate advertised opt-in and must be required again for recording.
 
 The launcher owns isolated runtime directories. Do not construct detached commands. A listener collision does not prove ownership. `stop` verifies generation, lease, PID, and start identity; never terminate by executable name.
 
@@ -39,4 +39,4 @@ Memory addresses are offsets in the selected advertised region; cross-boundary r
 
 Breakpoint snapshots are hit-time evidence; later reads are not equivalent. A missing hit does not prove no access. Use debug `probe` when restore, advance, and read must be atomic.
 
-Only Tracking MCP writes experiment records. Pass the Control MCP ROM SHA-1 to `run_start`; log mutations as interventions and evidence as gates or metrics. Analysis never writes the ledger."#;
+Only Tracking MCP writes records. Pass `get_rom_info.rom_sha1` unchanged to `run_start`. For composite media, follow `launch_plan`; reject graph failures and descriptor-only hashes. A prelaunch content identity does not prove loader consumption. Log mutations as interventions and evidence as gates or metrics."#;

@@ -123,8 +123,11 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
 
 두 MCP는 서로를 호출하지 않는다 — **에이전트가 조립한다**:
 
-- **rom_sha1 전달**: 제어 MCP의 `get_rom_info`(`.rom_sha1`)로 ROM 식별자를 읽어 추적 MCP의
-  `run_start(rom_sha1=…)`에 넘긴다(어댑터가 `get_rom_info` 미지원이면 `shasum -a1 <content>`).
+- **rom_sha1 전달**: 제어 MCP의 `get_rom_info`(`.rom_sha1`)로 불투명한 추적 식별자를 읽어 추적
+  MCP의 `run_start(rom_sha1=…)`에 그대로 넘긴다. 관리형 descriptor media는 에뮬레이터 시작 전에
+  진입 파일과 loader가 선언한 모든 파일을 pre-launch `content_identity`로 묶으며, 호환용 `rom_sha1`에는
+  그 SHA-256 식별자를 담는다.
+  복합 미디어의 설명 파일만 따로 해시해서는 안 된다.
   `connection_ref`(제어 MCP `status`의 연결 이름 또는 `"port:N"`)를 함께 넘기면 같은 연결의 직전
   미종료 run이 자동 마감된다.
 - **반환된 식별자는 그대로 사용**: `rom_sha1`, `run_id`, `finding_id`를 경로나 별도 이름으로
@@ -152,9 +155,14 @@ stable host session ID가 없는 client도 반환된 lease의 exact `launch_id`�
 에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
 identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
 
-관리형 CUE는 닫힌 미디어 그래프다. 모든 `FILE` 참조는 이식 가능한 상대 경로여야 하고 CUE 디렉터리
-아래의 일반 파일을 가리켜야 하며 symlink를 허용하지 않는다. 이 경계를 어기면 에뮬레이터를 시작하기
-전에 계획과 실행이 실패한다.
+관리형 CUE·GDI·CCD·TOC·M3U는 닫힌 미디어 그래프다. Descriptor를 선택하면 그 진입 파일 하나만
+읽도록 허용된다. `launch_plan`은 간접 파일의 metadata·내용·해시를 읽기 전에 정확한 상대 경로를
+`review_input`으로 반환한다. 각 이름이 선택한 미디어에 속하는지 검토한 뒤 서버가 만든
+`indirect_media_approval`을 그대로 되돌려 보낸다. 중첩 M3U는 다음 descriptor frontier를 한 번 더
+검토할 수 있다. 참조는 이식 가능한 상대 경로이고 진입 파일 디렉터리 아래의 symlink가 아닌 실제
+일반 파일이어야 한다. 검토나 그래프 검증이 실패하면 에뮬레이터 시작 전에 거부된다.
+`content_identity_binding: "prelaunch"`는 이 identity가 mutable source의 snapshot이나 실제 loader
+소비 증명이 아님을 밝힌다.
 
 일반 launch는 guest가 이미 실행 중인 상태로 반환할 수 있다. 첫 후속 동작에 네트워크·에이전트 지연이
 guest time으로 섞이면 안 될 때는 `start_frozen: true`를 요청한다. 지원하는 launcher는 adapter가
