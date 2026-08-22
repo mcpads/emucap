@@ -164,12 +164,12 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
 
 fn make_analysis_case() -> (tempfile::TempDir, std::path::PathBuf) {
     let temporary = tempfile::tempdir().expect("temporary analysis case");
-    let directory = temporary.path().join("wire_case");
+    let directory = temporary.path().join("wire-case");
     std::fs::create_dir_all(&directory).expect("create analysis case");
     std::fs::write(directory.join("inputs.movie"), "0:enter\n").expect("write movie");
     let case = regression::Case {
         format_version: regression::CASE_FORMAT_VERSION,
-        id: "wire_case".into(),
+        id: "wire-case".into(),
         description: "wire analysis case".into(),
         rom: regression::RomRef {
             sha1: "unused".into(),

@@ -112,7 +112,10 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             self.control.command(&format!(
                 "set emucap_path {path_var}; screenshot -raw -size 320 $emucap_path"
             ))?;
-            let png = fs::read(&path)?;
+            let png = crate::path_safety::read_bounded_regular_file_no_follow(
+                &path,
+                crate::live::protocol::MAX_INLINE_SCREENSHOT_BYTES,
+            )?;
             if png.len() < 24 || &png[..8] != b"\x89PNG\r\n\x1a\n" || &png[12..16] != b"IHDR" {
                 return Err(OpenMsxBridgeError::Protocol(
                     "openMSX screenshot is not a complete PNG".into(),

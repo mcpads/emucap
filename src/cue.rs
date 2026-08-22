@@ -2,12 +2,12 @@
 
 use sha1::{Digest, Sha1};
 use std::collections::HashSet;
-use std::fs::File;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 const GRAPH_DOMAIN: &[u8] = b"emucap-cue-graph-v1\0";
 const MAX_REFERENCED_FILES: usize = 256;
+const MAX_CUE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CueReference {
@@ -31,15 +31,41 @@ pub struct CueGraphIdentity {
 }
 
 pub fn referenced_files(cue: &Path) -> io::Result<Vec<CueReference>> {
-    if !cue.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("CUE entry file not found: {}", cue.display()),
-        ));
-    }
-    let text = std::fs::read_to_string(cue).map_err(|error| {
+    let mut file = crate::path_safety::open_regular_file_no_follow(cue).map_err(|error| {
         io::Error::new(
             error.kind(),
+            format!(
+                "CUE entry file is missing or unsafe: {}: {error}",
+                cue.display()
+            ),
+        )
+    })?;
+    let metadata = file.metadata()?;
+    if metadata.len() > MAX_CUE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "CUE entry file exceeds {MAX_CUE_BYTES} bytes: {}",
+                cue.display()
+            ),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_CUE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_CUE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "CUE entry file exceeds {MAX_CUE_BYTES} bytes: {}",
+                cue.display()
+            ),
+        ));
+    }
+    let text = String::from_utf8(bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
             format!("read CUE entry file {}: {error}", cue.display()),
         )
     })?;
@@ -70,6 +96,17 @@ pub fn referenced_files(cue: &Path) -> io::Result<Vec<CueReference>> {
                 ),
             )
         })?;
+        if !crate::path_safety::is_portable_relative_member(declared_name) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "CUE FILE path escapes or is not portable at {}:{}: {:?}",
+                    cue.display(),
+                    line_index + 1,
+                    declared_name
+                ),
+            ));
+        }
         references.push(CueReference {
             declared_name: declared_name.to_string(),
             path: base.join(declared_name),
@@ -94,18 +131,25 @@ pub fn referenced_files(cue: &Path) -> io::Result<Vec<CueReference>> {
 }
 
 pub fn validate_graph(cue: &Path) -> io::Result<Vec<CueReference>> {
-    let references = referenced_files(cue)?;
-    for reference in &references {
-        if !reference.path.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "CUE referenced file not found: {} (declared as {:?})",
-                    reference.path.display(),
-                    reference.declared_name
-                ),
-            ));
-        }
+    let mut references = referenced_files(cue)?;
+    let base = cue.parent().unwrap_or_else(|| Path::new("."));
+    for reference in &mut references {
+        reference.path = crate::path_safety::regular_member_path(base, &reference.declared_name)
+            .map_err(|error| {
+                let kind = if error.kind() == io::ErrorKind::NotFound {
+                    io::ErrorKind::NotFound
+                } else {
+                    io::ErrorKind::InvalidData
+                };
+                io::Error::new(
+                    kind,
+                    format!(
+                        "CUE referenced file is missing or unsafe: {} (declared as {:?}): {error}",
+                        reference.path.display(),
+                        reference.declared_name
+                    ),
+                )
+            })?;
     }
     Ok(references)
 }
@@ -136,7 +180,8 @@ pub fn graph_identity(cue: &Path) -> io::Result<CueGraphIdentity> {
     let mut files = Vec::with_capacity(inputs.len());
     for input in inputs {
         let canonical = input.path.canonicalize()?;
-        let metadata = canonical.metadata()?;
+        let mut file = crate::path_safety::open_regular_file_no_follow(&canonical)?;
+        let metadata = file.metadata()?;
         let size = metadata.len();
         total_size = total_size
             .checked_add(size)
@@ -149,7 +194,6 @@ pub fn graph_identity(cue: &Path) -> io::Result<CueGraphIdentity> {
         graph_hasher.update(size.to_le_bytes());
 
         let mut file_hasher = Sha1::new();
-        let mut file = File::open(&canonical)?;
         let mut buffer = [0_u8; 64 * 1024];
         loop {
             let read = file.read(&mut buffer)?;

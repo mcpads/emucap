@@ -2,7 +2,7 @@
 //!
 //! 각 함수는 이미 해소된 값(rom_sha1·run_id·now·connection_ref·git_root 등)을 인자로 받아,
 //! `ops`/`store`/`compare`/`summary`/`index`/`query` 위에 얇은 어댑터를 얹고 응답 JSON(`Value`)을
-//! 조립한다. 에러는 `String`으로 평탄화한다(rmcp 타입 비의존). 호출부는 추적 MCP(`emucap-track-mcp`)
+//! 조립한다. 에러는 안정된 code와 message를 유지하되 rmcp 타입에는 의존하지 않는다. 호출부는 추적 MCP(`emucap-track-mcp`)
 //! 하나다 — lib로 추출한 목적은 로직을 rmcp·에뮬·바이너리 상태와 떼어 단위 테스트가 가능하게 하는 것
 //! (제어 MCP는 분리 후 추적 도구가 없어 호출하지 않는다). active_run(Mutex)·rom_sha1 해소(get_rom_info
 //! 추론) 같은 *바이너리 상태*는 여기 없다 — 호출부가 들고 인자로 넘긴다.
@@ -20,22 +20,115 @@ use crate::track::query::{self, RunFilter};
 use crate::track::store::{self, resolve_artifact_path};
 use crate::track::summary::{self, SummaryFilter};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackingToolError {
+    code: &'static str,
+    message: String,
+}
+
+impl TrackingToolError {
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+impl std::fmt::Display for TrackingToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for TrackingToolError {}
+
+impl From<store::TrackError> for TrackingToolError {
+    fn from(error: store::TrackError) -> Self {
+        let code = match &error {
+            store::TrackError::Invalid(_) => "invalid_identifier",
+            store::TrackError::Parse { .. }
+            | store::TrackError::Corrupt(_)
+            | store::TrackError::TooLarge { .. } => "ledger_corrupt",
+            store::TrackError::Conflict(_) => "tracking_conflict",
+            store::TrackError::Io(_) => "tracking_io_error",
+            store::TrackError::Serialize(_) => "tracking_error",
+        };
+        Self::new(code, error.to_string())
+    }
+}
+
+impl From<ops::OpsError> for TrackingToolError {
+    fn from(error: ops::OpsError) -> Self {
+        match error {
+            ops::OpsError::RunNotFound { rom_sha1, run_id } => Self::new(
+                "run_not_found",
+                format!("run not found: {rom_sha1}/{run_id}"),
+            ),
+            ops::OpsError::Track(error) => error.into(),
+        }
+    }
+}
+
+impl From<compare::CompareError> for TrackingToolError {
+    fn from(error: compare::CompareError) -> Self {
+        match error {
+            compare::CompareError::RunNotFound(run_id) => {
+                Self::new("run_not_found", format!("run not found: {run_id}"))
+            }
+            compare::CompareError::Store(error) => error.into(),
+        }
+    }
+}
+
+impl From<index::IndexError> for TrackingToolError {
+    fn from(error: index::IndexError) -> Self {
+        match error {
+            index::IndexError::Track(error) => error.into(),
+            index::IndexError::Sqlite(error) => Self::new(
+                "tracking_io_error",
+                format!("tracking index error: {error}"),
+            ),
+            index::IndexError::Json(error) => Self::new(
+                "ledger_corrupt",
+                format!("tracking index data is invalid: {error}"),
+            ),
+            index::IndexError::IntegerOutOfRange { field, value } => Self::new(
+                "ledger_corrupt",
+                format!("tracking value {field} is outside the supported range: {value}"),
+            ),
+        }
+    }
+}
+
+pub type TrackingResult<T> = Result<T, TrackingToolError>;
+
 /// run_finish의 status 문자열을 RunStatus로 파싱한다(done|aborted|error).
-pub fn parse_run_status(s: &str) -> Result<RunStatus, String> {
+pub fn parse_run_status(s: &str) -> TrackingResult<RunStatus> {
     match s {
         "done" => Ok(RunStatus::Done),
         "aborted" => Ok(RunStatus::Aborted),
         "error" => Ok(RunStatus::Error),
-        other => Err(format!("unknown run status: {other}")),
+        other => Err(TrackingToolError::new(
+            "invalid_argument",
+            format!("unknown run status: {other}"),
+        )),
     }
 }
 
 /// log_gate의 kind 문자열을 GateKind로 파싱한다(machine|judgment).
-pub fn parse_gate_kind(s: &str) -> Result<GateKind, String> {
+pub fn parse_gate_kind(s: &str) -> TrackingResult<GateKind> {
     match s {
         "machine" => Ok(GateKind::Machine),
         "judgment" => Ok(GateKind::Judgment),
-        other => Err(format!("unknown gate kind: {other}")),
+        other => Err(TrackingToolError::new(
+            "invalid_argument",
+            format!("unknown gate kind: {other}"),
+        )),
     }
 }
 
@@ -52,7 +145,9 @@ pub fn start_run(
     goal: Option<String>,
     description: Option<String>,
     tags: Vec<String>,
-) -> Result<Value, String> {
+) -> TrackingResult<Value> {
+    // Reject an unsafe identity before superseding any existing run.
+    store::validate_ledger_id("rom_sha1", rom_sha1)?;
     // 원장 위생(#56): 같은 connection의 디스크 고아 running을 aborted(superseded)로. best-effort —
     // 실패해도 새 run 진행(서버 재시작으로 in-memory가 사라져도 같은-connection 고아를 정리).
     if let Some(cref) = connection_ref.as_deref() {
@@ -68,7 +163,7 @@ pub fn start_run(
         tags,
         connection_ref,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({
         "run_id": run.id,
         "rom_sha1": run.rom_sha1,
@@ -94,8 +189,9 @@ pub fn find_resumable_run(
     root: &Path,
     connection_ref: &str,
     rom_sha1: &str,
-) -> Result<Option<ResumeBinding>, String> {
-    let (runs, _skipped) = store::walk_runs_lenient(root).map_err(|e| e.to_string())?;
+) -> TrackingResult<Option<ResumeBinding>> {
+    store::validate_ledger_id("rom_sha1", rom_sha1)?;
+    let (runs, _skipped) = store::walk_runs_lenient(root).map_err(TrackingToolError::from)?;
     let best = runs
         .into_iter()
         .filter(|r| {
@@ -114,14 +210,19 @@ pub fn find_resumable_run(
 /// 명시 재바인딩용: run_id(전역 유일)로 running run을 찾아 resume binding을 만든다.
 /// 미존재면 Err, status가 running이 아니면 Err(이미 종료된 run은 resume 불가 — 새 run_start로).
 /// 디스크 파일을 기준으로 삼아 in-memory active 상태와 무관하게 동작한다(서버 재시작/재연결 복구).
-pub fn resume_run_by_id(root: &Path, run_id: &str) -> Result<ResumeBinding, String> {
+pub fn resume_run_by_id(root: &Path, run_id: &str) -> TrackingResult<ResumeBinding> {
     let run = store::find_run_by_id(root, run_id)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("run_id not found: {run_id}"))?;
+        .map_err(TrackingToolError::from)?
+        .ok_or_else(|| {
+            TrackingToolError::new("run_not_found", format!("run not found: {run_id}"))
+        })?;
     if run.status != RunStatus::Running {
-        return Err(format!(
-            "run {run_id} has status {:?} and cannot be resumed; only a running run can be rebound. Call run_start after a finished run.",
-            run.status
+        return Err(TrackingToolError::new(
+            "run_not_resumable",
+            format!(
+                "run {run_id} has status {:?} and cannot be resumed; only a running run can be rebound. Call run_start after a finished run.",
+                run.status
+            ),
         ));
     }
     Ok(ResumeBinding {
@@ -138,10 +239,13 @@ pub fn finish_run_by_id(
     run_id: &str,
     status: RunStatus,
     now: &str,
-) -> Result<Value, String> {
-    match ops::finish_run_by_id(root, run_id, status, now).map_err(|e| e.to_string())? {
+) -> TrackingResult<Value> {
+    match ops::finish_run_by_id(root, run_id, status, now).map_err(TrackingToolError::from)? {
         Some(id) => Ok(serde_json::json!({ "finished": id })),
-        None => Err(format!("run_id not found: {run_id}")),
+        None => Err(TrackingToolError::new(
+            "run_not_found",
+            format!("run not found: {run_id}"),
+        )),
     }
 }
 
@@ -153,8 +257,8 @@ pub fn finish_active_run(
     run_id: &str,
     status: RunStatus,
     now: &str,
-) -> Result<Value, String> {
-    ops::finish_run(root, rom_sha1, run_id, status, now).map_err(|e| e.to_string())?;
+) -> TrackingResult<Value> {
+    ops::finish_run(root, rom_sha1, run_id, status, now).map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "finished": run_id }))
 }
 
@@ -168,8 +272,9 @@ pub fn log_metric(
     now: &str,
     key: &str,
     value: f64,
-) -> Result<Value, String> {
-    ops::log_metric(root, rom_sha1, run_id, gen, now, key, value).map_err(|e| e.to_string())?;
+) -> TrackingResult<Value> {
+    ops::log_metric(root, rom_sha1, run_id, gen, now, key, value)
+        .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -187,7 +292,7 @@ pub fn log_gate(
     evidence_ref: Option<String>,
     detail: Option<String>,
     case_ref: Option<String>,
-) -> Result<Value, String> {
+) -> TrackingResult<Value> {
     let kind = parse_gate_kind(kind)?;
     ops::log_gate(
         root,
@@ -202,7 +307,7 @@ pub fn log_gate(
         detail,
         case_ref,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -218,21 +323,24 @@ pub fn log_artifact(
     raw_path: &Path,
     git_root: Option<&Path>,
     meta: Option<Value>,
-) -> Result<Value, String> {
+) -> TrackingResult<Value> {
     // 상대경로는 MCP 서버 cwd가 아니라 *작업 repo* 루트 기준으로 해소(최소놀람·재현성).
     let resolved = resolve_artifact_path(raw_path, git_root);
     if !resolved.exists() {
         let base = git_root
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "current working directory".into());
-        return Err(format!(
-            "artifact path not found: {}. Relative paths are resolved from repository root ({}); provide an absolute path or a repository-relative path.",
-            resolved.display(),
-            base,
+        return Err(TrackingToolError::new(
+            "artifact_not_found",
+            format!(
+                "artifact path not found: {}. Relative paths are resolved from repository root ({}); provide an absolute path or a repository-relative path.",
+                resolved.display(),
+                base,
+            ),
         ));
     }
     let id = ops::log_artifact(root, rom_sha1, run_id, gen, kind, &resolved, meta)
-        .map_err(|e| e.to_string())?;
+        .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "artifact_id": id }))
 }
 
@@ -253,7 +361,7 @@ pub fn log_intervention(
     frozen_context: bool,
     op: &str,
     args: Value,
-) -> Result<Value, String> {
+) -> TrackingResult<Value> {
     ops::log_intervention(
         root,
         rom_sha1,
@@ -266,7 +374,7 @@ pub fn log_intervention(
         op,
         args,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -277,8 +385,9 @@ pub fn set_reproduction(
     run_id: &str,
     base: Option<String>,
     movie_ref: Option<String>,
-) -> Result<Value, String> {
-    ops::set_reproduction(root, rom_sha1, run_id, base, movie_ref).map_err(|e| e.to_string())?;
+) -> TrackingResult<Value> {
+    ops::set_reproduction(root, rom_sha1, run_id, base, movie_ref)
+        .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -294,7 +403,7 @@ pub fn log_finding(
     run_id: Option<String>,
     evidence_refs: Vec<String>,
     promoted: bool,
-) -> Result<Value, String> {
+) -> TrackingResult<Value> {
     let id = ops::log_finding(
         root,
         rom_sha1,
@@ -305,16 +414,20 @@ pub fn log_finding(
         evidence_refs,
         promoted,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(TrackingToolError::from)?;
     Ok(serde_json::json!({ "finding_id": id }))
 }
 
 /// 추적 원장에서 run을 질의한다(lenient reindex 후 SQLite 질의). 반환 `{runs:[...], skipped:n}`.
-pub fn query_runs(root: &Path, filter: RunFilter) -> Result<Value, String> {
-    let conn = index::open_index(&root.join("index.sqlite")).map_err(|e| e.to_string())?;
+pub fn query_runs(root: &Path, filter: RunFilter) -> TrackingResult<Value> {
+    if let Some(rom_sha1) = filter.rom_sha1.as_deref() {
+        store::validate_ledger_id("rom_sha1", rom_sha1)?;
+    }
+    let conn = index::open_index(&root.join("index.sqlite")).map_err(TrackingToolError::from)?;
     // fast-read는 lenient reindex: 손상/이질 JSON 하나가 query 전체를 죽이지 않게 skip하되 노출한다.
-    let (_, skipped) = index::reindex_lenient(root, &conn).map_err(|e| e.to_string())?;
-    let rows = query::query_runs(&conn, &filter).map_err(|e| e.to_string())?;
+    let (_, skipped) = index::reindex_lenient(root, &conn).map_err(TrackingToolError::from)?;
+    let rows = query::query_runs(&conn, &filter)
+        .map_err(|error| TrackingToolError::new("tracking_error", error.to_string()))?;
     let arr: Vec<Value> = rows
         .into_iter()
         .map(|r| {
@@ -331,9 +444,10 @@ pub fn query_runs(root: &Path, filter: RunFilter) -> Result<Value, String> {
 }
 
 /// 저장된 run.json 내용과 ledger_path를 반환한다.
-pub fn get_run(root: &Path, rom_sha1: &str, run_id: &str) -> Result<Value, String> {
-    let run = store::load_run(root, rom_sha1, run_id).map_err(|e| e.to_string())?;
-    let mut v = serde_json::to_value(&run).map_err(|e| e.to_string())?;
+pub fn get_run(root: &Path, rom_sha1: &str, run_id: &str) -> TrackingResult<Value> {
+    let run = ops::load(root, rom_sha1, run_id).map_err(TrackingToolError::from)?;
+    let mut v = serde_json::to_value(&run)
+        .map_err(|error| TrackingToolError::new("tracking_error", error.to_string()))?;
     // ledger_path 노출 — 기록이 실제로 어디(어느 repo) 사는지 에이전트가 확인하게.
     if let Some(obj) = v.as_object_mut() {
         obj.insert("ledger_path".into(), root.display().to_string().into());
@@ -342,13 +456,18 @@ pub fn get_run(root: &Path, rom_sha1: &str, run_id: &str) -> Result<Value, Strin
 }
 
 /// 두 run을 구조화 diff한다(순수 추적 읽기).
-pub fn compare_runs(root: &Path, id_a: &str, id_b: &str) -> Result<Value, String> {
-    let cmp = compare::compare_runs(root, id_a, id_b).map_err(|e| e.to_string())?;
-    serde_json::to_value(&cmp).map_err(|e| e.to_string())
+pub fn compare_runs(root: &Path, id_a: &str, id_b: &str) -> TrackingResult<Value> {
+    let cmp = compare::compare_runs(root, id_a, id_b).map_err(TrackingToolError::from)?;
+    serde_json::to_value(&cmp)
+        .map_err(|error| TrackingToolError::new("tracking_error", error.to_string()))
 }
 
 /// goal/tag/rom로 묶은 run들의 횡단 rollup을 낸다(순수 추적 읽기).
-pub fn summarize_runs(root: &Path, filter: SummaryFilter) -> Result<Value, String> {
-    let s = summary::summarize_runs(root, &filter).map_err(|e| e.to_string())?;
-    serde_json::to_value(&s).map_err(|e| e.to_string())
+pub fn summarize_runs(root: &Path, filter: SummaryFilter) -> TrackingResult<Value> {
+    if let Some(rom_sha1) = filter.rom_sha1.as_deref() {
+        store::validate_ledger_id("rom_sha1", rom_sha1)?;
+    }
+    let s = summary::summarize_runs(root, &filter).map_err(TrackingToolError::from)?;
+    serde_json::to_value(&s)
+        .map_err(|error| TrackingToolError::new("tracking_error", error.to_string()))
 }

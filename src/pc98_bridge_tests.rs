@@ -342,6 +342,30 @@ fn write_test_state(path: &Path, regs_hex: &str) {
 }
 
 #[test]
+fn state_region_reader_rejects_declared_sizes_outside_the_known_region() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    {
+        let mut zip = ZipWriter::new(file.reopen().unwrap());
+        zip.start_file("tvram.bin", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&[0]).unwrap();
+        zip.finish().unwrap();
+    }
+    let mut archive = ZipArchive::new(file.reopen().unwrap()).unwrap();
+    let manifest = json!({
+        "regions": [{
+            "memory_type": "tvram",
+            "size": memory_region("tvram").unwrap().size as u64 + 1,
+            "file": "tvram.bin"
+        }]
+    });
+    assert!(matches!(
+        read_state_regions(&mut archive, &manifest),
+        Err(BridgeError::BadParams(message)) if message.contains("size is invalid")
+    ));
+}
+
+#[test]
 fn hello_advertises_only_implemented_rust_methods() {
     let env = GdbBridgeEnv {
         name: Some("pc98".into()),

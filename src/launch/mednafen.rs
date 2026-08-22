@@ -41,7 +41,7 @@ fn metadata_path(binary: &Path) -> PathBuf {
 
 pub fn read_build_metadata(binary: &Path) -> std::io::Result<Option<BuildMetadata>> {
     let path = metadata_path(binary);
-    let bytes = match std::fs::read(&path) {
+    let bytes = match crate::path_safety::read_bounded_regular_file_no_follow(&path, 256 * 1024) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),

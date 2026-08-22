@@ -87,11 +87,7 @@ fn valid_hex_digest(value: &str, bytes: usize) -> bool {
 }
 
 fn valid_capture_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 96
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    crate::path_safety::is_hyphenated_ascii_id(value, 96)
 }
 
 fn ensure_identity(input: &RecordingBundleInput) -> Result<(), PublishError> {
@@ -721,9 +717,13 @@ fn build_manifest(
 }
 
 fn valid_snapshot_label(label: &str) -> bool {
-    !label.is_empty()
-        && label.len() <= 64
-        && label
+    crate::path_safety::is_hyphenated_ascii_id(label, 64)
+}
+
+fn valid_profile_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
@@ -912,8 +912,7 @@ fn validate_terminal_state_member(
         }
         return Ok(None);
     };
-    if !valid_snapshot_label(&identity.profile) || !valid_hex_digest(&identity.contract_sha256, 32)
-    {
+    if !valid_profile_id(&identity.profile) || !valid_hex_digest(&identity.contract_sha256, 32) {
         return Err(PublishError::InvalidIdentity(
             "terminal state request identity is invalid".into(),
         ));

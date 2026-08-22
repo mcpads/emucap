@@ -737,12 +737,7 @@ fn validate_digest(name: &str, value: &str) -> Result<(), CaptureCapsuleError> {
 }
 
 fn validate_capture_id(value: &str) -> Result<(), CaptureCapsuleError> {
-    if !value.is_empty()
-        && value.len() <= 96
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
+    if crate::path_safety::is_hyphenated_ascii_id(value, 96) {
         Ok(())
     } else {
         Err(CaptureCapsuleError::Invalid("invalid capture_id".into()))

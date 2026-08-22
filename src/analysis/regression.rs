@@ -53,6 +53,7 @@ pub struct Case {
 }
 
 pub const CASE_FORMAT_VERSION: u32 = 1;
+const MAX_CASE_JSON_BYTES: u64 = 1024 * 1024;
 
 /// 한 케이스의 판정 결과. 신호(pass/fail)와 무효(나머지)를 구분. 미래 무효 사유는 변형 추가.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,16 +170,43 @@ pub fn evaluate(read: &[u8], predicate: &Predicate, expect: Expect) -> Verdict {
 
 /// dir/case.json에 케이스를 직렬화한다.
 pub fn save_case(dir: &Path, case: &Case) -> std::io::Result<()> {
+    validate_case_file_references(case).map_err(std::io::Error::other)?;
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "regression case directory is not a regular directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     std::fs::create_dir_all(dir)?;
     let json = serde_json::to_string_pretty(case).map_err(std::io::Error::other)?;
-    std::fs::write(dir.join("case.json"), json)
+    let path = dir.join("case.json");
+    if std::fs::symlink_metadata(&path)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "regression case.json is a symlink",
+        ));
+    }
+    crate::path_safety::atomic_write_file(&path, json.as_bytes())
 }
 
 /// dir/case.json을 읽는다.
 pub fn load_case(dir: &Path) -> Result<Case, String> {
     let path = dir.join("case.json");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
+    let bytes =
+        crate::path_safety::read_bounded_regular_member(dir, "case.json", MAX_CASE_JSON_BYTES)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    let case: Case =
+        serde_json::from_slice(&bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+    validate_case_file_references(&case)?;
+    Ok(case)
 }
 
 /// 스위트 디렉토리의 하위 디렉토리마다 case.json을 로드한다(디렉토리명 = 케이스 폴더).
@@ -187,10 +215,26 @@ pub fn load_suite(suite_dir: &Path) -> Result<Vec<(PathBuf, Case)>, String> {
     let entries =
         std::fs::read_dir(suite_dir).map_err(|e| format!("{}: {e}", suite_dir.display()))?;
     let mut dirs: Vec<PathBuf> = Vec::new();
-    for e in entries {
-        let e = e.map_err(|e| e.to_string())?;
-        if e.path().join("case.json").is_file() {
-            dirs.push(e.path());
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_symlink() {
+            return Err(format!(
+                "regression suite entry is a symlink: {}",
+                entry.path().display()
+            ));
+        }
+        if !file_type.is_dir() {
+            continue;
+        }
+        let case_path = entry.path().join("case.json");
+        match std::fs::symlink_metadata(&case_path) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                dirs.push(entry.path())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{}: {error}", case_path.display())),
         }
     }
     dirs.sort();
@@ -199,4 +243,28 @@ pub fn load_suite(suite_dir: &Path) -> Result<Vec<(PathBuf, Case)>, String> {
         out.push((d, case));
     }
     Ok(out)
+}
+
+pub fn validate_case_file_references(case: &Case) -> Result<(), String> {
+    if !crate::path_safety::is_hyphenated_ascii_id(&case.id, 96) {
+        return Err(
+            "case id must use ASCII alphanumeric segments separated by single hyphens".into(),
+        );
+    }
+    match &case.repro {
+        Repro::Savestate { state_sha1, .. } => {
+            if !crate::path_safety::is_hyphenated_ascii_id(state_sha1, 128) {
+                return Err("savestate identity is not a safe identifier".into());
+            }
+        }
+        Repro::InputReplay { start, movie, .. } => {
+            if start != "reset" && !crate::path_safety::is_hyphenated_ascii_id(start, 128) {
+                return Err("input replay start identity is not a safe identifier".into());
+            }
+            if !crate::path_safety::is_portable_file_name(movie, 128) {
+                return Err("input replay movie must be a portable file name, not a path".into());
+            }
+        }
+    }
+    Ok(())
 }

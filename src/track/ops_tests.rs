@@ -21,23 +21,23 @@ fn create_run_writes_rom_and_run() {
         root,
         &gen,
         "2026-06-29T00:00:00Z",
-        "sha_a",
+        "sha-a",
         Some("font".into()),
         Some("first".into()),
         vec!["t1".into()],
         Some("g1".into()),
     )
     .unwrap();
-    assert_eq!(run.rom_sha1, "sha_a");
+    assert_eq!(run.rom_sha1, "sha-a");
     assert_eq!(run.status, RunStatus::Running);
     assert_eq!(
         run.repro_status,
         Some(ReproStatus::ReplayableWithInterventions)
     );
     // rom.json + run.json 존재
-    assert_eq!(store::load_rom(root, "sha_a").unwrap().sha1, "sha_a");
+    assert_eq!(store::load_rom(root, "sha-a").unwrap().sha1, "sha-a");
     assert_eq!(
-        store::load_run(root, "sha_a", &run.id)
+        store::load_run(root, "sha-a", &run.id)
             .unwrap()
             .goal
             .as_deref(),
@@ -50,9 +50,9 @@ fn finish_run_sets_status_and_ended_at() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t0", "sha_a", None, None, vec![], None).unwrap();
-    ops::finish_run(root, "sha_a", &run.id, RunStatus::Done, "t1").unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let run = ops::create_run(root, &gen, "t0", "sha-a", None, None, vec![], None).unwrap();
+    ops::finish_run(root, "sha-a", &run.id, RunStatus::Done, "t1").unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.status, RunStatus::Done);
     assert_eq!(back.ended_at.as_deref(), Some("t1"));
 }
@@ -60,7 +60,7 @@ fn finish_run_sets_status_and_ended_at() {
 #[test]
 fn finish_run_missing_errors() {
     let dir = TempDir::new().unwrap();
-    assert!(ops::finish_run(dir.path(), "sha_a", "nope", RunStatus::Done, "t").is_err());
+    assert!(ops::finish_run(dir.path(), "sha-a", "nope", RunStatus::Done, "t").is_err());
 }
 
 #[test]
@@ -68,10 +68,10 @@ fn finish_run_on_corrupt_json_is_not_reported_as_not_found() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     // write a corrupt run.json at the expected path
-    let p = root.join("roms/sha_a/runs/IDX");
+    let p = root.join("roms/sha-a/runs/IDX");
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(p.join("run.json"), b"{ not json").unwrap();
-    let err = ops::finish_run(root, "sha_a", "IDX", RunStatus::Done, "t").unwrap_err();
+    let err = ops::finish_run(root, "sha-a", "IDX", RunStatus::Done, "t").unwrap_err();
     // corrupt file must NOT be masked as RunNotFound
     assert!(!matches!(err, ops::OpsError::RunNotFound { .. }));
 }
@@ -81,9 +81,9 @@ fn log_metric_appends_to_run() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
-    ops::log_metric(root, "sha_a", &run.id, &gen, "t2", "diff_bytes", 12.0).unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
+    ops::log_metric(root, "sha-a", &run.id, &gen, "t2", "diff_bytes", 12.0).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.metrics.len(), 1);
     assert_eq!(back.metrics[0].key, "diff_bytes");
     assert_eq!(back.metrics[0].value, 12.0);
@@ -94,10 +94,10 @@ fn log_gate_appends_with_kind_and_passed() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
     ops::log_gate(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen,
         "t2",
@@ -109,7 +109,7 @@ fn log_gate_appends_with_kind_and_passed() {
         None,
     )
     .unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.gates.len(), 1);
     assert_eq!(back.gates[0].kind, GateKind::Machine);
     assert_eq!(back.gates[0].passed, Some(true));
@@ -120,13 +120,13 @@ fn log_artifact_computes_sha256_and_relpath() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
     // place file INSIDE the run directory so the relative-path branch is exercised
-    let run_dir = store::run_dir(root, "sha_a", &run.id);
+    let run_dir = store::run_dir(root, "sha-a", &run.id).unwrap();
     let f = run_dir.join("shot.png");
     std::fs::write(&f, b"PNGDATA").unwrap();
-    let id = ops::log_artifact(root, "sha_a", &run.id, &gen, "screenshot", &f, None).unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let id = ops::log_artifact(root, "sha-a", &run.id, &gen, "screenshot", &f, None).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.artifacts.len(), 1);
     assert_eq!(back.artifacts[0].id, id);
     // path stored as run-dir-relative
@@ -143,10 +143,10 @@ fn log_artifact_missing_file_errors() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
     assert!(ops::log_artifact(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen,
         "screenshot",
@@ -163,7 +163,7 @@ fn log_finding_writes_finding_file() {
     let gen = FixedGen(std::cell::Cell::new(0));
     let id = ops::log_finding(
         root,
-        "sha_a",
+        "sha-a",
         &gen,
         "t",
         "텍스트가 잘림",
@@ -182,11 +182,11 @@ fn log_intervention_appends_and_rederives_status() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
     // write_memory 개입 → replayable_with_interventions 유지
     ops::log_intervention(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen,
         "t2",
@@ -197,7 +197,7 @@ fn log_intervention_appends_and_rederives_status() {
         serde_json::json!({"space":"wram","address":256,"bytes":"00"}),
     )
     .unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.interventions.len(), 1);
     assert_eq!(back.interventions[0].seq, 0);
     assert_eq!(back.interventions[0].op, "write_memory");
@@ -212,10 +212,10 @@ fn log_intervention_load_state_downgrades_to_savestate_only() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
     ops::log_intervention(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen,
         "t2",
@@ -226,7 +226,7 @@ fn log_intervention_load_state_downgrades_to_savestate_only() {
         serde_json::json!({"path":"x.mss"}),
     )
     .unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.repro_status, Some(ReproStatus::SavestateOnly));
 }
 
@@ -235,10 +235,10 @@ fn log_intervention_assigns_sequential_seq() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
     ops::log_intervention(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen,
         "t",
@@ -251,7 +251,7 @@ fn log_intervention_assigns_sequential_seq() {
     .unwrap();
     ops::log_intervention(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen,
         "t",
@@ -262,7 +262,7 @@ fn log_intervention_assigns_sequential_seq() {
         serde_json::json!({}),
     )
     .unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(
         back.interventions.iter().map(|i| i.seq).collect::<Vec<_>>(),
         vec![0, 1]
@@ -274,9 +274,9 @@ fn mark_savestate_only_forces_status() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let gen = FixedGen(std::cell::Cell::new(0));
-    let run = ops::create_run(root, &gen, "t", "sha_a", None, None, vec![], None).unwrap();
-    ops::mark_savestate_only(root, "sha_a", &run.id).unwrap();
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let run = ops::create_run(root, &gen, "t", "sha-a", None, None, vec![], None).unwrap();
+    ops::mark_savestate_only(root, "sha-a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.repro_status, Some(ReproStatus::SavestateOnly));
 }
 
@@ -331,21 +331,21 @@ fn create_run_does_not_overwrite_rom_on_corruption() {
         root,
         &gen,
         "2026-06-30T00:00:00Z",
-        "sha_x",
+        "sha-x",
         None,
         None,
         vec![],
         None,
     )
     .unwrap();
-    let rom_json = root.join("roms").join("sha_x").join("rom.json");
+    let rom_json = root.join("roms").join("sha-x").join("rom.json");
     std::fs::write(&rom_json, b"{ not valid json").unwrap();
     // 손상 상태에서 다시 create_run → save_rom으로 조용히 덮지 말고 에러로 드러내야 한다.
     let err = ops::create_run(
         root,
         &gen,
         "2026-07-01T00:00:00Z",
-        "sha_x",
+        "sha-x",
         None,
         None,
         vec![],
@@ -369,7 +369,7 @@ fn finish_run_by_id_closes_orphan_without_active_state() {
         root,
         &gen,
         "2026-06-30T00:00:00Z",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
@@ -380,7 +380,7 @@ fn finish_run_by_id_closes_orphan_without_active_state() {
         ops::finish_run_by_id(root, &run.id, RunStatus::Aborted, "2026-06-30T01:00:00Z").unwrap();
     assert_eq!(closed.as_deref(), Some(run.id.as_str()));
     assert_eq!(
-        store::load_run(root, "sha_a", &run.id).unwrap().status,
+        store::load_run(root, "sha-a", &run.id).unwrap().status,
         RunStatus::Aborted
     );
     // 미존재 id는 Ok(None) — 호출부가 에러로 처리한다(조용히 성공시키지 않는다)
@@ -401,7 +401,7 @@ fn finish_stale_running_closes_only_same_connection() {
         root,
         &gen,
         "t",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
@@ -412,7 +412,7 @@ fn finish_stale_running_closes_only_same_connection() {
         root,
         &gen,
         "t",
-        "sha_b",
+        "sha-b",
         None,
         None,
         vec![],
@@ -422,11 +422,11 @@ fn finish_stale_running_closes_only_same_connection() {
     let closed = ops::finish_stale_running(root, "connA", RunStatus::Aborted, "t2").unwrap();
     assert_eq!(closed, vec![a1.id.clone()]);
     assert_eq!(
-        store::load_run(root, "sha_a", &a1.id).unwrap().status,
+        store::load_run(root, "sha-a", &a1.id).unwrap().status,
         RunStatus::Aborted
     );
     assert_eq!(
-        store::load_run(root, "sha_b", &b1.id).unwrap().status,
+        store::load_run(root, "sha-b", &b1.id).unwrap().status,
         RunStatus::Running
     );
 }

@@ -414,54 +414,7 @@ where
 }
 
 pub(crate) fn copy_file_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    if dst.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("destination is a directory: {}", dst.display()),
-        ));
-    }
-    let tmp = unique_sibling_path(dst, "tmp");
-    if let Err(e) = std::fs::copy(src, &tmp) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    if let Ok(perms) = std::fs::metadata(src).map(|m| m.permissions()) {
-        let _ = std::fs::set_permissions(&tmp, perms);
-    }
-    #[cfg(windows)]
-    {
-        if !path_exists_or_symlink(dst) {
-            return rename_file_tmp(&tmp, dst);
-        }
-        let backup = unique_sibling_path(dst, "old");
-        if let Err(e) = std::fs::rename(dst, &backup) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        match std::fs::rename(&tmp, dst) {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&backup);
-                Ok(())
-            }
-            Err(e) => {
-                let _ = std::fs::rename(&backup, dst);
-                let _ = std::fs::remove_file(&tmp);
-                Err(e)
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        rename_file_tmp(&tmp, dst)
-    }
-}
-
-#[cfg(windows)]
-fn path_exists_or_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
+    crate::path_safety::atomic_copy_file(src, dst).map(|_| ())
 }
 
 pub(crate) fn is_symlink(path: &Path) -> bool {
@@ -482,16 +435,6 @@ pub(crate) fn has_symlink_component_under(base: &Path, path: &Path) -> bool {
         }
     }
     false
-}
-
-fn rename_file_tmp(tmp: &Path, dst: &Path) -> std::io::Result<()> {
-    match std::fs::rename(tmp, dst) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(tmp);
-            Err(e)
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -545,11 +488,10 @@ fn unique_sibling_path(path: &Path, label: &str) -> PathBuf {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("runtime-dir");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    parent.join(format!(".{name}.{label}.{}.{}", std::process::id(), nanos))
+    parent.join(format!(
+        ".{name}.{label}.{}",
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    ))
 }
 
 pub(crate) fn copy_dir_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -586,6 +528,7 @@ pub(crate) fn copy_dir_replace_preserving_dirs(
 
     let tmp = unique_sibling_path(dst, "tmp");
     let backup = unique_sibling_path(dst, "old");
+    std::fs::create_dir(&tmp)?;
     if let Err(e) = copy_dir_contents(src, &tmp) {
         // A partial recursive copy can already have created the staging temp; remove it so a failed
         // initial copy does not leak it, matching every other error path in this function.

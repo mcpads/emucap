@@ -37,17 +37,16 @@ pub fn add(
     rom: &Path,
     expect: &str,
 ) -> anyhow::Result<()> {
-    // id는 스위트 내부의 단일 디렉토리명이어야 한다 — 슬래시·`..` 등으로 디렉토리를
-    // 탈출하면 거부한다.
-    let id_is_safe = {
-        use std::path::Component;
-        let mut comps = Path::new(id).components();
-        matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
-    };
-    if !id_is_safe {
-        anyhow::bail!("id는 경로를 벗어나지 않는 단일 이름이어야: {id}");
+    if !emucap::path_safety::is_hyphenated_ascii_id(id, 96) {
+        anyhow::bail!("id must use ASCII alphanumeric segments separated by single hyphens");
     }
     let dir = suite_dir.join(id);
+    if std::fs::symlink_metadata(&dir)
+        .ok()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        anyhow::bail!("case directory is a symlink: {}", dir.display());
+    }
     if dir.join("case.json").exists() {
         anyhow::bail!("id 충돌: {id} 이미 존재");
     }
@@ -63,21 +62,21 @@ pub fn add(
     let repro = match (from_savestate, from_input) {
         (Some(mss), None) => {
             let state_sha1 = emucap::rom::sha1_of_file(mss)?;
-            std::fs::copy(mss, dir.join(format!("{state_sha1}.mss")))?;
+            emucap::path_safety::atomic_copy_file(mss, &dir.join(format!("{state_sha1}.mss")))?;
             Repro::Savestate {
                 state_sha1,
                 advance_frames: advance,
             }
         }
         (None, Some(movie)) => {
-            std::fs::copy(movie, dir.join("inputs.movie"))?;
+            emucap::path_safety::atomic_copy_file(movie, &dir.join("inputs.movie"))?;
             let start = match start {
                 None => "reset".to_string(),
                 Some(s) => {
                     // savestate 케이스와 동일하게 start 베이스 .mss도 케이스 디렉토리로
                     // 복사한다 — 안 그러면 러너가 {sha1}.mss를 못 찾아 항상 MissingPayload.
                     let h = emucap::rom::sha1_of_file(s)?;
-                    std::fs::copy(s, dir.join(format!("{h}.mss")))?;
+                    emucap::path_safety::atomic_copy_file(s, &dir.join(format!("{h}.mss")))?;
                     h
                 }
             };

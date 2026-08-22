@@ -90,17 +90,17 @@ impl<G: GdbTransport> Bridge<G> {
         let count = optional_num(params, "count")?.unwrap_or(8).clamp(1, 256) as usize;
         let byte_len = (count * 16).max(16);
         let path = std::env::temp_dir().join(format!(
-            "emucap_pc98_dasm_{}_{}.txt",
+            "emucap-pc98-dasm-{}-{}.txt",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
         let result = {
             let spec = format!("{}|{address:x}|{byte_len:x}", path.to_string_lossy());
             match self.lua_cmd("dasm", Some(&spec)) {
-                Ok(_) => match fs::read(&path) {
+                Ok(_) => match crate::path_safety::read_bounded_regular_file_no_follow(
+                    &path,
+                    1024 * 1024,
+                ) {
                     Ok(bytes) => {
                         let text = String::from_utf8_lossy(&bytes);
                         let instructions = parse_dasm_lines(text.lines(), count);

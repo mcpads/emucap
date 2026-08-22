@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -17,6 +17,9 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 #[path = "neogeo_bridge/breakpoints.rs"]
 mod breakpoints;
 use breakpoints::{breakpoint_kinds, is_breakpoint_stop};
+#[path = "neogeo_bridge/file_io.rs"]
+mod file_io;
+use file_io::{absolute_path, default_adapter_home, sha256_regular_file, state_partial_sibling};
 
 const MVS_METHODS: &[&str] = &[
     "hello",
@@ -250,9 +253,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             next_reset_seq: 1,
             adapter_home: std::env::var_os("EMUCAP_ADAPTER_HOME")
                 .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    std::env::temp_dir().join(format!("emucap-neogeo-{}", std::process::id()))
-                }),
+                .unwrap_or_else(default_adapter_home),
         })
     }
 
@@ -612,16 +613,14 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             // on Windows without deleting the prior state before the new file is ready.
             crate::launch::copy_file_replace(&partial, &path)?;
             let _ = fs::remove_file(&partial);
-            let data = fs::read(&path)?;
-            let mut hasher = Sha256::new();
-            Sha2Digest::update(&mut hasher, &data);
+            let (bytes, sha256) = sha256_regular_file(&path)?;
             self.frozen = true;
             Ok(json!({
                 "status": "completed",
                 "path": path.display().to_string(),
                 "format": "mame-native",
-                "bytes": data.len(),
-                "sha256": hex::encode(hasher.finalize()),
+                "bytes": bytes,
+                "sha256": sha256,
                 "state": "frozen",
                 "frame": self.current_frame()?,
             }))
@@ -864,16 +863,16 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     fn screenshot(&mut self) -> BridgeResult<Value> {
         let frame_before = self.current_frame()?;
         let path = std::env::temp_dir().join(format!(
-            "emucap_neogeo_{}_{}.png",
+            "emucap-neogeo-{}-{}.png",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|v| v.as_nanos())
-                .unwrap_or_default()
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
         let result = (|| {
             self.lua_cmd("snapshot", Some(path.to_string_lossy().as_ref()))?;
-            let data = fs::read(&path)?;
+            let data = crate::path_safety::read_bounded_regular_file_no_follow(
+                &path,
+                crate::live::protocol::MAX_INLINE_SCREENSHOT_BYTES,
+            )?;
             if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
                 return Err(BridgeError::Emulator("MAME snapshot is not PNG".into()));
             }
@@ -1078,32 +1077,6 @@ fn required_path(params: &Value, key: &str) -> BridgeResult<PathBuf> {
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| BridgeError::BadParams(format!("missing or invalid param: {key}")))
-}
-
-fn absolute_path(path: &Path) -> BridgeResult<PathBuf> {
-    if path.is_absolute() {
-        Ok(path.to_path_buf())
-    } else {
-        Ok(std::env::current_dir()?.join(path))
-    }
-}
-
-fn state_partial_sibling(path: &Path) -> BridgeResult<PathBuf> {
-    let parent = path.parent().ok_or_else(|| {
-        BridgeError::BadParams(format!(
-            "save path has no parent directory: {}",
-            path.display()
-        ))
-    })?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("state");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    Ok(parent.join(format!(".{name}.partial.{}.{nanos}", std::process::id())))
 }
 
 fn error_kind(error: &BridgeError) -> &'static str {

@@ -112,6 +112,52 @@ fn case_roundtrips_through_disk() {
 }
 
 #[test]
+fn case_file_references_cannot_escape_the_case_directory() {
+    let mut case = Case {
+        format_version: CASE_FORMAT_VERSION,
+        id: "case-a".into(),
+        description: "path boundary".into(),
+        rom: RomRef {
+            sha1: "deadbeef".into(),
+            path_hint: "game.sfc".into(),
+        },
+        repro: Repro::InputReplay {
+            start: "reset".into(),
+            movie: "../outside.movie".into(),
+            anchor: None,
+        },
+        predicate: pred(1, CmpOp::Eq, 0),
+        expect: Expect::Absent,
+    };
+    assert!(validate_case_file_references(&case).is_err());
+
+    if let Repro::InputReplay { movie, .. } = &mut case.repro {
+        *movie = "subdir/input.movie".into();
+    }
+    assert!(validate_case_file_references(&case).is_err());
+
+    if let Repro::InputReplay { movie, .. } = &mut case.repro {
+        *movie = "input.movie".into();
+    }
+    case.id = "case_name".into();
+    assert!(validate_case_file_references(&case).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn load_case_rejects_a_symlink_case_record() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = root.path().join("outside.json");
+    std::fs::write(&outside, "{}").unwrap();
+    let case_dir = root.path().join("case-a");
+    std::fs::create_dir(&case_dir).unwrap();
+    symlink(&outside, case_dir.join("case.json")).unwrap();
+    assert!(load_case(&case_dir).unwrap_err().contains("symlink"));
+}
+
+#[test]
 fn summary_buckets_and_exit_rule() {
     let s = Summary::from_results(vec![
         res("a", Verdict::Pass),

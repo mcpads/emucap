@@ -31,11 +31,16 @@ fn main() -> anyhow::Result<()> {
         other => return Err(anyhow!("DISPLAY must be 0 or 1, got {other:?}")),
     };
     let pid_file = PathBuf::from(&args[6]);
-    let session: PreparedSession = serde_json::from_slice(
-        &fs::read(&session_manifest)
-            .with_context(|| format!("read {}", session_manifest.display()))?,
-    )
-    .context("parse openMSX session manifest")?;
+    let session_bytes =
+        emucap::path_safety::read_bounded_regular_file_no_follow(&session_manifest, 1024 * 1024)
+            .with_context(|| {
+                format!(
+                    "read bounded session manifest {}",
+                    session_manifest.display()
+                )
+            })?;
+    let session: PreparedSession =
+        serde_json::from_slice(&session_bytes).context("parse openMSX session manifest")?;
     session
         .verify()
         .context("verify openMSX session identity before process spawn")?;
@@ -70,10 +75,5 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn write_pid_file(path: &Path, pid: u32) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    fs::write(&temporary, pid.to_string())?;
-    fs::rename(temporary, path)
+    emucap::path_safety::atomic_write_file(path, pid.to_string().as_bytes())
 }

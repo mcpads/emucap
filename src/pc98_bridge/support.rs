@@ -479,7 +479,7 @@ pub(super) fn absolute_path(path: &Path) -> PathBuf {
 }
 
 /// A sibling `.partial` temp of `dst` (same parent → the later rename stays on one filesystem and is
-/// atomic), tagged with this process id and a nanosecond stamp. save_state stages the zip here and
+/// atomic), tagged with an unguessable identifier. save_state stages the zip here and
 /// renames over `dst` only when complete, so a mid-save failure never truncates a pre-existing save.
 pub(super) fn state_partial_sibling(dst: &Path) -> BridgeResult<PathBuf> {
     let parent = dst.parent().ok_or_else(|| {
@@ -492,23 +492,18 @@ pub(super) fn state_partial_sibling(dst: &Path) -> BridgeResult<PathBuf> {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("state.zip");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Ok(parent.join(format!(".{name}.partial.{}.{nanos}", std::process::id())))
+    Ok(parent.join(format!(
+        ".{name}.partial.{}",
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    )))
 }
 
 pub(super) fn unique_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
-    for attempt in 0..100u32 {
+    for _ in 0..100u32 {
         let path = std::env::temp_dir().join(format!(
-            "{prefix}{}_{}_{}",
+            "{prefix}{}_{}",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default(),
-            attempt
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
         match fs::create_dir(&path) {
             Ok(()) => return Ok(path),
@@ -575,8 +570,20 @@ pub(super) fn read_state_manifest<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
 ) -> BridgeResult<Value> {
     let mut file = archive.by_name("state.json")?;
+    if file.size() > MAX_STATE_MANIFEST_BYTES {
+        return Err(BridgeError::BadParams(format!(
+            "PC-98 state manifest exceeds {MAX_STATE_MANIFEST_BYTES} bytes"
+        )));
+    }
     let mut text = String::new();
-    file.read_to_string(&mut text)?;
+    Read::by_ref(&mut file)
+        .take(MAX_STATE_MANIFEST_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_STATE_MANIFEST_BYTES {
+        return Err(BridgeError::BadParams(format!(
+            "PC-98 state manifest exceeds {MAX_STATE_MANIFEST_BYTES} bytes"
+        )));
+    }
     Ok(serde_json::from_str(&text)?)
 }
 
@@ -652,12 +659,18 @@ pub(super) fn extract_save_items<R: Read + Seek>(
         .filter(|name| name.starts_with(&format!("{SAVE_ITEMS_DIR}/")))
         .map(str::to_string)
         .collect::<Vec<_>>();
+    if names.len() > MAX_SAVE_ITEM_MEMBERS {
+        return Err(BridgeError::BadParams(format!(
+            "PC-98 save item count exceeds {MAX_SAVE_ITEM_MEMBERS}"
+        )));
+    }
     if !names.iter().any(|name| name == SAVE_ITEMS_MANIFEST) {
         return Err(BridgeError::BadParams(
             "PC-98 save item manifest is missing".into(),
         ));
     }
     let out_dir = target_root.join(SAVE_ITEMS_DIR);
+    let mut total_bytes = 0u64;
     for name in names {
         let rel = &name[SAVE_ITEMS_DIR.len() + 1..];
         if rel.is_empty() || rel.ends_with('/') {
@@ -679,9 +692,30 @@ pub(super) fn extract_save_items<R: Read + Seek>(
             fs::create_dir_all(parent)?;
         }
         let mut src = archive.by_name(&name)?;
-        let mut bytes = Vec::new();
-        src.read_to_end(&mut bytes)?;
-        fs::write(dest, bytes)?;
+        if src.size() > MAX_SAVE_ITEM_MEMBER_BYTES {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 save item exceeds {MAX_SAVE_ITEM_MEMBER_BYTES} bytes: {name}"
+            )));
+        }
+        total_bytes = total_bytes
+            .checked_add(src.size())
+            .ok_or_else(|| BridgeError::BadParams("PC-98 save item byte count overflow".into()))?;
+        if total_bytes > MAX_SAVE_ITEM_TOTAL_BYTES {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 save item bytes exceed {MAX_SAVE_ITEM_TOTAL_BYTES}"
+            )));
+        }
+        let mut output = File::create(&dest)?;
+        let copied = std::io::copy(
+            &mut Read::by_ref(&mut src).take(MAX_SAVE_ITEM_MEMBER_BYTES + 1),
+            &mut output,
+        )?;
+        if copied != src.size() || copied > MAX_SAVE_ITEM_MEMBER_BYTES {
+            let _ = fs::remove_file(&dest);
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 save item size changed during extraction: {name}"
+            )));
+        }
     }
     Ok(Some(out_dir))
 }
@@ -762,7 +796,13 @@ pub(super) fn read_state_regions<R: Read + Seek>(
     let Some(regions) = manifest.get("regions").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
+    if regions.len() > MEMORY_REGIONS.len() {
+        return Err(BridgeError::BadParams(
+            "too many PC-98 state regions".into(),
+        ));
+    }
     let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
     for region in regions {
         let memory_type = region
             .get("memory_type")
@@ -770,13 +810,49 @@ pub(super) fn read_state_regions<R: Read + Seek>(
             .ok_or_else(|| {
                 BridgeError::BadParams("PC-98 state region missing memory_type".into())
             })?;
+        if !seen.insert(memory_type) {
+            return Err(BridgeError::BadParams(format!(
+                "duplicate PC-98 state region: {memory_type}"
+            )));
+        }
+        let declared = region
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| BridgeError::BadParams("PC-98 state region missing size".into()))?;
+        let known = memory_region(memory_type).ok_or_else(|| {
+            BridgeError::BadParams(format!("unsupported PC-98 state region: {memory_type}"))
+        })?;
+        if declared == 0 || declared > known.size as u64 {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 state region size is invalid: {memory_type}={declared}"
+            )));
+        }
         let file_name = region
             .get("file")
             .and_then(Value::as_str)
             .ok_or_else(|| BridgeError::BadParams("PC-98 state region missing file".into()))?;
+        let expected_name = format!("{memory_type}.bin");
+        if file_name != expected_name {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 state region member must be {expected_name}: {file_name}"
+            )));
+        }
         let mut file = archive.by_name(file_name)?;
+        if file.size() != declared {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 state region size differs: {memory_type} manifest={declared}, archive={}",
+                file.size()
+            )));
+        }
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        Read::by_ref(&mut file)
+            .take(declared + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != declared {
+            return Err(BridgeError::BadParams(format!(
+                "PC-98 state region read length differs: {memory_type}"
+            )));
+        }
         out.push((memory_type.into(), bytes));
     }
     Ok(out)

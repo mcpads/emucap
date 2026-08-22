@@ -1137,7 +1137,8 @@ fn owned_instance_json(emu_dir: &str, port: u16) -> serde_json::Value {
             if path.extension().and_then(|e| e.to_str()) != Some("pid") {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            let Ok(text) = emucap::path_safety::read_bounded_utf8_regular_file_no_follow(&path, 64)
+            else {
                 continue;
             };
             if let Ok(pid) = text.trim().parse::<u32>() {

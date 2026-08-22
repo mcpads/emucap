@@ -47,3 +47,17 @@ fn offload_no_array_no_count() {
     assert!(s.get("head").is_none());
     assert!(s["bytes"].as_u64().unwrap() > 0);
 }
+
+#[cfg(unix)]
+#[test]
+fn offload_rejects_a_destination_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let outside = dir.path().join("outside.json");
+    std::fs::write(&outside, "original").unwrap();
+    let output = dir.path().join("output.json");
+    symlink(&outside, &output).unwrap();
+    assert!(offload_result(&serde_json::json!({"x": 1}), &output).is_err());
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "original");
+}

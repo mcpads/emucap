@@ -18,9 +18,11 @@ pub fn reindex() -> anyhow::Result<()> {
 pub fn import(bundle: &Path) -> anyhow::Result<()> {
     let root = store::root_from_env();
     let gen = UlidGen;
-    let text = std::fs::read_to_string(bundle.join("manifest.json"))
-        .with_context(|| format!("manifest.json 읽기 실패: {}", bundle.display()))?;
-    let manifest = parse_manifest(&text).context("failed to parse manifest")?;
+    let bytes =
+        emucap::path_safety::read_bounded_regular_member(bundle, "manifest.json", 16 * 1024 * 1024)
+            .with_context(|| format!("manifest.json 읽기 실패: {}", bundle.display()))?;
+    let text = std::str::from_utf8(&bytes).context("manifest.json is not UTF-8")?;
+    let manifest = parse_manifest(text).context("failed to parse manifest")?;
     let (rom_sha1, platform) = match &manifest {
         BundleManifest::Legacy(manifest) => (manifest.rom.sha1.clone(), manifest.platform.clone()),
         BundleManifest::Recording(manifest) => (

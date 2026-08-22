@@ -115,6 +115,25 @@ fn copy_file_replace_refuses_directory_destination() {
     assert!(dst.is_dir());
 }
 
+#[cfg(unix)]
+#[test]
+fn copy_file_replace_refuses_symlink_destination() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    let target = tmp.path().join("target");
+    let dst = tmp.path().join("dst");
+    std::fs::write(&src, b"new").unwrap();
+    std::fs::write(&target, b"old").unwrap();
+    symlink(&target, &dst).unwrap();
+
+    let error = copy_file_replace(&src, &dst).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert_eq!(std::fs::read(target).unwrap(), b"old");
+}
+
 #[test]
 fn first_existing_file_skips_missing_candidates() {
     let dir = tempfile::tempdir().unwrap();

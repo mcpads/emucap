@@ -28,18 +28,7 @@ pub fn create_run(
     tags: Vec<String>,
     connection_ref: Option<String>,
 ) -> Result<Run, OpsError> {
-    // defense-in-depth(#43): rom_sha1은 run_dir의 디렉터리 컴포넌트가 된다. 구분자·'..'·절대경로가
-    // 섞이면 root.join("roms").join(rom_sha1)이 roms/ 서브트리를 탈출해(예: ".." → root/runs) walk_runs·
-    // 인덱스에서 안 보이는 고아가 되거나 'File exists'로 깨진다. *단일 Normal 컴포넌트*(진짜 sha1)만 허용.
-    let is_single_normal = {
-        let mut comps = std::path::Path::new(rom_sha1).components();
-        matches!(comps.next(), Some(std::path::Component::Normal(_))) && comps.next().is_none()
-    };
-    if rom_sha1.is_empty() || !is_single_normal {
-        return Err(OpsError::Track(TrackError::Invalid(format!(
-            "rom_sha1 is not a safe single path component: {rom_sha1:?}. Pass an actual SHA-1, for example from `shasum -a1 <content>`."
-        ))));
-    }
+    store::validate_ledger_id("rom_sha1", rom_sha1)?;
     // rom.json이 없으면 생성(있으면 first_seen 보존). '없음'(NotFound)만 생성 트리거로 좁힌다 —
     // 손상 JSON·IO 오류를 '없음'으로 오인해 기존 first_seen/platform/title을 조용히 덮어쓰지 않는다.
     match store::load_rom(root, rom_sha1) {
@@ -223,7 +212,7 @@ pub fn log_artifact(
     }
     let sha256 = hex::encode(hasher.finalize());
 
-    let run_dir = store::run_dir(root, rom_sha1, run_id);
+    let run_dir = store::run_dir(root, rom_sha1, run_id)?;
     // 저장 경로 우선순위: run_dir 상대 > repo(track root의 부모=git root) 상대 > 절대(repo 밖만).
     // repo 상대로 저장해야 ledger를 commit해 다른 머신/클론이 승계해도 참조가 유효하다(절대경로는 비이식).
     let stored = abs_path

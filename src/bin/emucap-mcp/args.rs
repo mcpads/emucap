@@ -239,7 +239,7 @@ pub(crate) struct RecordWindowArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordWindowTerminalSnapshotArgs {
-    /// Safe bundle member label.
+    /// Bundle member label: ASCII letters and digits separated by single hyphens.
     pub(crate) label: String,
     /// Live memory type.
     pub(crate) memory_type: String,
@@ -252,7 +252,7 @@ pub(crate) struct RecordWindowTerminalSnapshotArgs {
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RecordWindowInitialSnapshotArgs {
-    /// Safe bundle member label.
+    /// Bundle member label: ASCII letters and digits separated by single hyphens.
     pub(crate) label: String,
     /// Callback-safe memory type advertised by the recording capability.
     pub(crate) memory_type: String,

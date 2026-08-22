@@ -35,7 +35,8 @@ pub fn build_metadata_path(binary: &Path) -> PathBuf {
 
 pub fn read_build_metadata(binary: &Path) -> std::io::Result<BuildMetadata> {
     let path = build_metadata_path(binary);
-    let raw = std::fs::read_to_string(&path).map_err(|error| {
+    let raw = crate::path_safety::read_bounded_utf8_regular_file_no_follow(&path, 256 * 1024)
+        .map_err(|error| {
         patch_required(format!(
             "compatible build metadata is missing at {} ({error}); run adapters/dolphin/build.sh or build.ps1",
             path.display()

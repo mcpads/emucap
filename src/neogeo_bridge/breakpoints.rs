@@ -467,10 +467,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         let path = directory.join(format!(
             "dasm-{}-{}.txt",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|value| value.as_nanos())
-                .unwrap_or_default()
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
         let path_text = path.to_str().ok_or_else(|| {
             BridgeError::BadState(format!(
@@ -493,13 +490,20 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                     "MAME disassemble failed: {response}"
                 )));
             }
-            let output_len = fs::metadata(&path)?.len();
-            if output_len > MAX_DASM_OUTPUT_BYTES {
+            let mut output = crate::path_safety::open_regular_file_no_follow(&path)?;
+            let mut bytes = Vec::new();
+            output
+                .by_ref()
+                .take(MAX_DASM_OUTPUT_BYTES + 1)
+                .read_to_end(&mut bytes)?;
+            if bytes.len() as u64 > MAX_DASM_OUTPUT_BYTES {
                 return Err(BridgeError::Emulator(format!(
                     "MAME disassemble output exceeds {MAX_DASM_OUTPUT_BYTES} bytes"
                 )));
             }
-            let text = fs::read_to_string(&path)?;
+            let text = String::from_utf8(bytes).map_err(|error| {
+                BridgeError::Emulator(format!("MAME disassemble output is not UTF-8: {error}"))
+            })?;
             let instructions = parse_dasm_lines(text.lines(), count as usize);
             if instructions.is_empty() {
                 return Err(BridgeError::Emulator(

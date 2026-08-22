@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(super) fn ext_lower(path: &str) -> Option<String> {
     Path::new(path)
@@ -76,28 +76,6 @@ fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
     })
 }
 
-fn cue_file_refs(path: &Path) -> Vec<PathBuf> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            if !trimmed.to_ascii_uppercase().starts_with("FILE ") {
-                return None;
-            }
-            let rest = trimmed.get(5..)?.trim_start();
-            let file_name = if let Some(after_quote) = rest.strip_prefix('"') {
-                after_quote.split('"').next()
-            } else {
-                rest.split_whitespace().next()
-            }?;
-            Some(base.join(file_name))
-        })
-        .collect()
-}
-
 pub(super) fn content_markers(path: Option<&str>) -> serde_json::Value {
     let Some(path) = path else {
         return serde_json::json!({"available": false});
@@ -109,7 +87,9 @@ pub(super) fn content_markers(path: Option<&str>) -> serde_json::Value {
     let mut candidates = Vec::new();
 
     if ext_lower(path).as_deref() == Some("cue") {
-        candidates.extend(cue_file_refs(path_ref));
+        if let Ok(references) = emucap::cue::validate_graph(path_ref) {
+            candidates.extend(references.into_iter().map(|reference| reference.path));
+        }
     } else {
         candidates.push(path_ref.to_path_buf());
     }

@@ -475,7 +475,7 @@ pub(crate) fn prepare_media(
     if let Some(parent) = working.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(source, working)?;
+    crate::path_safety::atomic_copy_file(source, working)?;
     let (mounted_sha1, mounted_size) = hash_file(working, MAX_MEDIA_BYTES)?;
     if source_sha1 != mounted_sha1 || source_size != mounted_size {
         return Err(io::Error::other(
@@ -517,17 +517,30 @@ pub fn prepare_session(
     let key = hex::encode(Sha256::digest(generation_key.as_bytes()));
     let generations = runtime_home.join("generations");
     let root = generations.join(&key[..24]);
-    let temporary = generations.join(format!(".prepare-{}-{}", &key[..24], std::process::id()));
-    if root.exists() {
+    let temporary = generations.join(format!(
+        ".prepare-{}-{}",
+        &key[..24],
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    ));
+    match fs::symlink_metadata(&root) {
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("openMSX generation already exists: {}", root.display()),
+            ))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::create_dir_all(&generations)?;
+    let generations_metadata = fs::symlink_metadata(&generations)?;
+    if generations_metadata.file_type().is_symlink() || !generations_metadata.is_dir() {
         return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("openMSX generation already exists: {}", root.display()),
+            io::ErrorKind::InvalidInput,
+            "openMSX generations path is not a real directory",
         ));
     }
-    if temporary.exists() {
-        fs::remove_dir_all(&temporary)?;
-    }
-    fs::create_dir_all(&temporary)?;
+    fs::create_dir(&temporary)?;
 
     let result = (|| {
         let final_user_data = root.join("share");
@@ -550,7 +563,7 @@ pub fn prepare_session(
             let destination = temporary_user_data
                 .join("systemroms")
                 .join(&firmware.canonical_name);
-            fs::copy(&firmware.source, &destination)?;
+            crate::path_safety::atomic_copy_file(&firmware.source, &destination)?;
             let (sha1, size) = hash_file(&destination, MAX_FIRMWARE_FILE_BYTES)?;
             if sha1 != firmware.sha1 || size != firmware.size {
                 return Err(io::Error::other(format!(

@@ -2,6 +2,9 @@ use super::model::*;
 use super::{index, store};
 use tempfile::TempDir;
 
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+
 fn run(id: &str, rom: &str, goal: &str) -> Run {
     Run {
         format_version: RUN_FORMAT_VERSION,
@@ -30,8 +33,8 @@ fn run(id: &str, rom: &str, goal: &str) -> Run {
 fn reindex_counts_runs() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &run("01A", "sha_a", "g1")).unwrap();
-    store::save_run(root, &run("01B", "sha_a", "g1")).unwrap();
+    store::save_run(root, &run("01A", "sha-a", "g1")).unwrap();
+    store::save_run(root, &run("01B", "sha-a", "g1")).unwrap();
     let conn = index::open_index(&root.join("index.sqlite")).unwrap();
     let n = index::reindex(root, &conn).unwrap();
     assert_eq!(n, 2);
@@ -45,7 +48,7 @@ fn reindex_counts_runs() {
 fn reindex_is_idempotent() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &run("01A", "sha_a", "g1")).unwrap();
+    store::save_run(root, &run("01A", "sha-a", "g1")).unwrap();
     let conn = index::open_index(&root.join("index.sqlite")).unwrap();
     index::reindex(root, &conn).unwrap();
     index::reindex(root, &conn).unwrap(); // 두 번째도 안전
@@ -59,7 +62,7 @@ fn reindex_is_idempotent() {
 fn db_deletion_recovers_via_reindex() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &run("01A", "sha_a", "g1")).unwrap();
+    store::save_run(root, &run("01A", "sha-a", "g1")).unwrap();
     let dbp = root.join("index.sqlite");
     {
         let conn = index::open_index(&dbp).unwrap();
@@ -75,7 +78,7 @@ fn db_deletion_recovers_via_reindex() {
 fn intervention_rows_indexed() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let mut r = run("01A", "sha_a", "g1");
+    let mut r = run("01A", "sha-a", "g1");
     r.interventions.push(Intervention {
         id: "iv1".into(),
         seq: 0,
@@ -103,7 +106,7 @@ fn intervention_rows_indexed() {
 fn intervention_sequence_outside_sqlite_integer_range_is_rejected() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let mut r = run("01A", "sha_a", "g1");
+    let mut r = run("01A", "sha-a", "g1");
     r.interventions.push(Intervention {
         id: "iv1".into(),
         seq: u64::MAX,
@@ -130,7 +133,7 @@ fn intervention_sequence_outside_sqlite_integer_range_is_rejected() {
 fn intervention_frame_outside_sqlite_integer_range_is_rejected() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let mut r = run("01A", "sha_a", "g1");
+    let mut r = run("01A", "sha-a", "g1");
     r.interventions.push(Intervention {
         id: "iv1".into(),
         seq: 0,
@@ -157,8 +160,8 @@ fn intervention_frame_outside_sqlite_integer_range_is_rejected() {
 fn reindex_strict_errors_on_corrupt_run() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &run("01A", "sha_a", "g1")).unwrap();
-    let p = root.join("roms/sha_a/runs/01B");
+    store::save_run(root, &run("01A", "sha-a", "g1")).unwrap();
+    let p = root.join("roms/sha-a/runs/01B");
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(p.join("run.json"), b"{ broken").unwrap();
     let conn = index::open_index(&root.join("index.sqlite")).unwrap();
@@ -170,10 +173,10 @@ fn reindex_strict_errors_on_corrupt_run() {
 fn reindex_lenient_skips_corrupt_and_indexes_rest() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &run("01A", "sha_a", "g1")).unwrap();
-    store::save_run(root, &run("01B", "sha_a", "g1")).unwrap();
+    store::save_run(root, &run("01A", "sha-a", "g1")).unwrap();
+    store::save_run(root, &run("01B", "sha-a", "g1")).unwrap();
     // 손상 run + 이질 finding 하나씩
-    let p = root.join("roms/sha_a/runs/01C");
+    let p = root.join("roms/sha-a/runs/01C");
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(p.join("run.json"), b"{ broken").unwrap();
     std::fs::create_dir_all(root.join("findings")).unwrap();
@@ -187,4 +190,19 @@ fn reindex_lenient_skips_corrupt_and_indexes_rest() {
         .query_row("SELECT COUNT(*) FROM run", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn open_index_rejects_a_symlink_database_member() {
+    let dir = TempDir::new().unwrap();
+    let outside = dir.path().join("outside.sqlite");
+    std::fs::write(&outside, b"not a database").unwrap();
+    let root = dir.path().join("ledger");
+    std::fs::create_dir(&root).unwrap();
+    symlink(&outside, root.join("index.sqlite")).unwrap();
+    assert!(matches!(
+        index::open_index(&root.join("index.sqlite")),
+        Err(index::IndexError::Track(store::TrackError::Corrupt(_)))
+    ));
 }

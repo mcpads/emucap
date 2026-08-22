@@ -823,6 +823,24 @@ fn screenshot_saves_to_path_when_given() {
     assert_eq!(std::fs::read(&path).unwrap(), b"ABC");
 }
 
+#[cfg(unix)]
+#[test]
+fn screenshot_refuses_symlink_output_without_changing_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let target = tmp.path().join("outside.png");
+    let output = tmp.path().join("shot.png");
+    std::fs::write(&target, b"original").unwrap();
+    symlink(&target, &output).unwrap();
+    let mut link = FakeLink::ok(json!({ "png_base64": "QUJD" }));
+
+    let error = screenshot(&mut link, Some(&output)).unwrap_err();
+
+    assert!(error.to_string().contains("symbolic link"));
+    assert_eq!(std::fs::read(target).unwrap(), b"original");
+}
+
 /// A dump-capable fake link: `dump_memory` writes region files into the caller-provided directory
 /// (as a real bridge does), and can sabotage the host's follow-up `state.json` write by occupying
 /// that name with a directory — modelling a state-write failure after a successful bridge dump.

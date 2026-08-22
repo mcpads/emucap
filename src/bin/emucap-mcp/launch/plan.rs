@@ -995,6 +995,13 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         _ => serde_json::Value::Null,
     };
     let mut launch_blockers = launch_blockers(content_exists, &adapter_binary);
+    if content_exists && ext_lower(content_path).as_deref() == Some("cue") {
+        if let Err(error) = emucap::cue::validate_graph(Path::new(content_path)) {
+            launch_blockers.push(format!(
+                "CUE graph is missing, unsafe, or outside its directory: {error}"
+            ));
+        }
+    }
     let bridge_label = if adapter == "mame_neogeo" {
         "mame_neogeo bridge"
     } else {

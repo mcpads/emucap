@@ -122,3 +122,34 @@ fn finalize_does_not_overwrite_existing_note() {
     let note = fs::read_to_string(tmp.path().join("note.md")).unwrap();
     assert_eq!(note, "사람이 쓴 내용", "기존 note.md를 덮어쓰면 안 된다");
 }
+
+#[cfg(unix)]
+#[test]
+fn finalize_rejects_an_artifact_symlink_even_when_its_target_exists() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    make_valid_bundle(tmp.path());
+    let outside = tmp.path().join("outside.mss");
+    fs::write(&outside, b"outside").unwrap();
+    let state = tmp.path().join("slices/f01234/state.mss");
+    fs::remove_file(&state).unwrap();
+    symlink(&outside, &state).unwrap();
+    assert!(matches!(
+        finalize(tmp.path(), None),
+        Err(FinalizeError::UnsafeArtifact(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn finalize_does_not_follow_a_dangling_note_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    make_valid_bundle(tmp.path());
+    let outside = tmp.path().join("outside-note.md");
+    symlink(&outside, tmp.path().join("note.md")).unwrap();
+    assert!(finalize(tmp.path(), None).is_ok());
+    assert!(!outside.exists());
+}

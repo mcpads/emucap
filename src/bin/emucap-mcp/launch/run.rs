@@ -1,3 +1,4 @@
+use super::media::ext_lower;
 use super::plan::*;
 use super::*;
 use crate::args::LaunchExecutionProfileArgs;
@@ -135,6 +136,17 @@ pub(crate) fn make_launch(
             "content_path": &a.content_path,
             "next_action": "Verify content_path, then call launch_plan(content_path, system) again.",
         });
+    }
+    if ext_lower(&a.content_path).as_deref() == Some("cue") {
+        if let Err(error) = emucap::cue::validate_graph(Path::new(&a.content_path)) {
+            return serde_json::json!({
+                "launched": false,
+                "reason": "CUE graph is missing, unsafe, or outside its directory",
+                "error": error.to_string(),
+                "content_path": &a.content_path,
+                "next_action": "Keep every CUE track under the CUE directory, remove symlinks, and call launch_plan again.",
+            });
+        }
     }
 
     let inference = infer_system(Some(&a.content_path), a.system.as_deref());
