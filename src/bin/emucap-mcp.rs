@@ -52,7 +52,8 @@ use crate::regression::{
     verify_determinism_core, DetOutcome,
 };
 use crate::status::{
-    apply_capability_revision, make_bootstrap_value, normalize_rom_sha1, observe_control_state,
+    apply_capability_revision, content_identity_for_rom_info, make_bootstrap_value,
+    normalize_rom_sha1, observe_control_state,
 };
 use crate::stop::make_stop;
 
@@ -353,12 +354,28 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "Read the running content identity and normalized ROM SHA-1.")]
+    #[tool(
+        description = "Read the running content identity and its normalized Tracking identifier."
+    )]
     async fn get_rom_info(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
-        let mut link = self.link();
-        match tools::get_rom_info(&mut *link) {
+        let (result, endpoint_port, live_launch_id) = {
+            let mut link = self.link();
+            let result = tools::get_rom_info(&mut *link);
+            let endpoint_port = link.endpoint_port();
+            let live_launch_id = link.capabilities().identity.launch_id.clone();
+            (result, endpoint_port, live_launch_id)
+        };
+        match result {
             Ok(ToolOutput::Json(mut v)) => {
-                normalize_rom_sha1(&mut v);
+                let content_identity = match content_identity_for_rom_info(
+                    &v,
+                    endpoint_port,
+                    live_launch_id.as_deref(),
+                ) {
+                    Ok(identity) => identity,
+                    Err(error) => return error_result("content_identity_error", error),
+                };
+                normalize_rom_sha1(&mut v, content_identity.as_ref());
                 tool_output_result(ToolOutput::Json(v))
             }
             Ok(o) => tool_output_result(o),

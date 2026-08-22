@@ -78,15 +78,47 @@ pub(super) fn blocked_launch_action(
     content_path: &str,
     system: &str,
     blockers: &[String],
+    approval: Option<&emucap::content_identity::IndirectMediaApproval>,
 ) -> serde_json::Value {
+    let mut arguments = serde_json::json!({
+        "content_path": content_path,
+        "system": system
+    });
+    if let Some(approval) = approval {
+        arguments["indirect_media_approval"] =
+            serde_json::to_value(approval).expect("indirect media approval is serializable");
+    }
     serde_json::json!({
         "kind": "resolve_preconditions",
         "blockers": blockers,
         "then_call": {
             "tool": "launch_plan",
+            "arguments": arguments
+        }
+    })
+}
+
+pub(super) fn review_indirect_media_action(
+    content_path: &str,
+    system: &str,
+    approval: &emucap::content_identity::IndirectMediaApproval,
+    members: &[emucap::content_identity::IndirectMediaMember],
+    newly_declared: &[String],
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "review_input",
+        "review": {
+            "scope": "indirect_media_members",
+            "members": members,
+            "newly_declared": newly_declared,
+            "instruction": "Review every relative member name. Continue only when each file belongs to the selected media."
+        },
+        "then_call": {
+            "tool": "launch_plan",
             "arguments": {
                 "content_path": content_path,
-                "system": system
+                "system": system,
+                "indirect_media_approval": approval
             }
         }
     })
@@ -118,6 +150,12 @@ pub(crate) fn apply_task_entry_transition(
     }
     if let Some(system) = args.system.as_deref() {
         replan_arguments.insert("system".into(), serde_json::Value::String(system.into()));
+    }
+    if let Some(approval) = args.indirect_media_approval.as_ref() {
+        replan_arguments.insert(
+            "indirect_media_approval".into(),
+            serde_json::to_value(approval).expect("indirect media approval is serializable"),
+        );
     }
     let task_entry_action = bootstrap
         .pointer("/entry/primary_action")

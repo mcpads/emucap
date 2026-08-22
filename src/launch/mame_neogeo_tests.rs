@@ -69,7 +69,7 @@ fn sibling_cd_bios_is_discovered_for_cd_only() {
     let dir = tempfile::tempdir().unwrap();
     let cue = dir.path().join("disc.cue");
     let bios = dir.path().join("neocdz.zip");
-    std::fs::write(&cue, "FILE \"track.bin\" BINARY\n").unwrap();
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
     std::fs::write(&bios, b"bios").unwrap();
     assert!(default_bios_candidates(&cue, "neogeo_cd")
         .into_iter()
@@ -308,7 +308,7 @@ fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
     let cue = root.path().join("disc.cue");
     let track = root.path().join("track01.bin");
     let bios = root.path().join("neocdz.zip");
-    std::fs::write(&cue, "FILE \"track01.bin\" BINARY\n").unwrap();
+    std::fs::write(&cue, "FILE \"track01.bin\" BINARY\nTRACK 01 MODE1/2352\n").unwrap();
     std::fs::write(&track, b"track").unwrap();
     std::fs::write(&bios, b"bios").unwrap();
     let log = root.path().join("mame.log");

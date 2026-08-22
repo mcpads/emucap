@@ -2592,10 +2592,10 @@ void handle_set_layer_enable(long id, const std::string& line) {
 
 // get_rom_info: 콘텐츠 신원을 반환한다(PC-98 bridge get_rom_info 미러 + Mednafen 콘텐츠 해시).
 //  - name/path/size/media_type: EMUCAP_CONTENT 파일(launch.sh가 export, hello 신원과 동일 출처).
-//  - content_md5: MDFNGameInfo->MD5(16B) hex. Mednafen이 계산하는 경로 독립 콘텐츠 해시 —
+//  - content_md5: MDFNGameInfo->MD5(16B) hex. Mednafen이 계산하는 경로 독립 레이아웃 식별자 —
 //    CD는 CalcDiscsLayoutMD5(TOC·트랙·LBA 기반, *경로 독립·디스크 레이아웃 인지*), Saturn은
 //    CalcGameID, 카트리지는 로더가 ROM 데이터로 채운다. 같은 디스크/ROM은 경로·파일명과 무관하게
-//    같은 값 → 추적 MCP run_start의 rom_sha1 그룹핑 키로 사용한다.
+//    같은 값. CUE 트랙 바이트는 포함하지 않으므로 추적 입력 식별자로 사용하지 않는다.
 //  - sha1: sha1(EMUCAP_CONTENT 파일 바이트). 보조 — 단일파일 ROM/.chd엔 정확, .cue는 디스크립터-only
 //    (참조하는 .bin 미포함)라 충돌 가능. 컨트랙트 일관성(Mesen/PC-98이 sha1 반환) 위해 유지.
 // EMUCAP_CONTENT 미설정 → unsupported, MDFNGameInfo null(게임 미로드) → bad_state 에러.
@@ -2626,7 +2626,8 @@ void handle_get_rom_info(long id) {
   // size + sha1: EMUCAP_CONTENT 파일 바이트를 읽어 Mednafen sha1(one-shot). 파일 없음/IO 실패는 에러.
   // sha1 API가 one-shot(스트리밍은 상류 #if 0)이라 파일을 통째 읽으므로, 대형 단일파일 디스크
   // 이미지(.chd/.iso/.bin 직접 지정)의 메모리 스파이크를 막기 위해 64MB 초과면 sha1을 건너뛴다(보조
-  // 필드일 뿐 — 콘텐츠 식별 기준은 파일을 안 읽는 content_md5다). 건너뛰면 sha1="skipped:too_large".
+  // 필드일 뿐이다. CUE의 정확한 입력 그래프는 Control MCP가 launch 전에 별도로 결속한다.
+  // 건너뛰면 sha1="skipped:too_large".
   static const uint64 kSha1MaxBytes = 64ull * 1024 * 1024;
   uint64 size = 0;
   std::string sha1hex;
@@ -2634,7 +2635,7 @@ void handle_get_rom_info(long id) {
     FileStream fs(path, FileStream::MODE_READ);
     size = fs.size();
     if (size > kSha1MaxBytes) {
-      sha1hex = "skipped:too_large";  // content_md5(아래)가 식별 기준이므로 손실 없음
+      sha1hex = "skipped:too_large";
     } else {
       std::vector<uint8> buf(size);
       if (size) fs.read(buf.data(), size);

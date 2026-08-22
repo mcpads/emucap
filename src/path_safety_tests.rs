@@ -1,7 +1,8 @@
 use super::path_safety::{
     atomic_copy_file, atomic_write_file, is_hyphenated_ascii_id, is_portable_file_name,
-    is_portable_relative_member, read_bounded_regular_file_no_follow,
-    read_bounded_utf8_regular_file_no_follow, regular_member_path,
+    is_portable_relative_member, open_regular_member_no_follow,
+    read_bounded_regular_file_no_follow, read_bounded_utf8_regular_file_no_follow,
+    regular_member_path,
 };
 
 #[test]
@@ -93,6 +94,15 @@ fn regular_member_rejects_symlinks_in_owned_components() {
     let outside = tempfile::NamedTempFile::new().unwrap();
     symlink(outside.path(), root.path().join("member.bin")).unwrap();
     assert!(regular_member_path(root.path(), "member.bin").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn regular_member_rejects_a_unix_socket_without_connecting() {
+    let root = tempfile::tempdir().unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(root.path().join("member.bin")).unwrap();
+
+    assert!(open_regular_member_no_follow(root.path(), "member.bin").is_err());
 }
 
 #[cfg(unix)]

@@ -1,5 +1,6 @@
 use super::actions::{
-    blocked_launch_action, missing_content_action, ready_launch_action, unresolved_system_action,
+    blocked_launch_action, missing_content_action, ready_launch_action,
+    review_indirect_media_action, unresolved_system_action,
 };
 use super::media::{content_markers, ext_lower};
 use super::*;
@@ -995,11 +996,61 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         _ => serde_json::Value::Null,
     };
     let mut launch_blockers = launch_blockers(content_exists, &adapter_binary);
-    if content_exists && ext_lower(content_path).as_deref() == Some("cue") {
-        if let Err(error) = emucap::cue::validate_graph(Path::new(content_path)) {
-            launch_blockers.push(format!(
-                "CUE graph is missing, unsafe, or outside its directory: {error}"
-            ));
+    let mut indirect_media = serde_json::json!({"state": "not_required"});
+    let mut media_review_action = None;
+    if content_exists {
+        match emucap::content_identity::inspect_indirect_media(
+            Path::new(content_path),
+            adapter,
+            args.indirect_media_approval.as_ref(),
+        ) {
+            Ok(emucap::content_identity::IndirectMediaAdmission::NotRequired) => {}
+            Ok(emucap::content_identity::IndirectMediaAdmission::Review {
+                approval,
+                members,
+                newly_declared,
+            }) => {
+                indirect_media = serde_json::json!({
+                    "state": "review_required",
+                    "member_count": members.len(),
+                });
+                media_review_action = Some(review_indirect_media_action(
+                    content_path,
+                    system,
+                    &approval,
+                    &members,
+                    &newly_declared,
+                ));
+            }
+            Ok(emucap::content_identity::IndirectMediaAdmission::Approved {
+                approval,
+                members,
+            }) => {
+                indirect_media = serde_json::json!({
+                    "state": "approved",
+                    "member_count": members.len(),
+                });
+                preferred_launcher_args["indirect_media_approval"] =
+                    serde_json::to_value(&approval)
+                        .expect("indirect media approval is serializable");
+                if let Err(error) =
+                    emucap::content_identity::validate_approved_composite_content_for_adapter(
+                        Path::new(content_path),
+                        adapter,
+                        Some(&approval),
+                    )
+                {
+                    launch_blockers.push(format!(
+                        "approved composite media graph is malformed, missing, or unsafe: {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                indirect_media = serde_json::json!({"state": "rejected"});
+                launch_blockers.push(format!(
+                    "indirect media declaration or approval is invalid: {error}"
+                ));
+            }
         }
     }
     let bridge_label = if adapter == "mame_neogeo" {
@@ -1008,11 +1059,18 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "mame_pc98 bridge"
     };
     push_unavailable_precondition(&mut launch_blockers, bridge_label, &bridge);
-    let ready_to_launch = launch_blockers.is_empty();
-    let next_action = if ready_to_launch {
+    let ready_to_launch = launch_blockers.is_empty() && media_review_action.is_none();
+    let next_action = if let Some(action) = media_review_action {
+        action
+    } else if ready_to_launch {
         ready_launch_action()
     } else {
-        blocked_launch_action(content_path, system, &launch_blockers)
+        blocked_launch_action(
+            content_path,
+            system,
+            &launch_blockers,
+            args.indirect_media_approval.as_ref(),
+        )
     };
     let bios_required = match system {
         "saturn" => serde_json::json!("Place sega_101.bin for JP or mpr-17933.bin for NA/EU in the shared emucap firmware directory, or set EMUCAP_MEDNAFEN_FIRMWARE to an absolute inventory directory. The launcher copies it into an isolated profile."),
@@ -1044,6 +1102,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "force_module": force_module,
         "content_path": content_path,
         "content_exists": content_exists,
+        "indirect_media": indirect_media,
         "listening_port": p,
         "preferred_launcher": {
             "kind": "mcp_tool",

@@ -862,6 +862,10 @@ pub(crate) struct LaunchPlanArgs {
     /// CHD, or BIN. Use bootstrap(include=["systems"]) for the full catalog.
     #[serde(default)]
     pub(crate) system: Option<String>,
+    /// Exact server-produced review value for files named indirectly by a
+    /// descriptor. Echo the value returned by launch_plan; do not construct it.
+    #[serde(default)]
+    pub(crate) indirect_media_approval: Option<emucap::content_identity::IndirectMediaApproval>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -877,6 +881,10 @@ pub(crate) struct LaunchArgs {
     /// Explicit system identifier. Provide it when media type is ambiguous.
     #[serde(default)]
     pub(crate) system: Option<String>,
+    /// Exact server-produced review value for files named indirectly by a
+    /// descriptor. Obtain it from launch_plan before launching composite media.
+    #[serde(default)]
+    pub(crate) indirect_media_approval: Option<emucap::content_identity::IndirectMediaApproval>,
     /// Optional connection name exposed as `status.emulator_identity.name`.
     #[serde(default)]
     pub(crate) name: Option<String>,
