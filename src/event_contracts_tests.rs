@@ -35,6 +35,23 @@ fn semantic_contracts_are_platform_local_and_declaratively_typed() {
 }
 
 #[test]
+fn bg_chr_fetch_contract_names_the_producer_read_without_claiming_display_use() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let contract = registry.get("snes_ppu_bg_chr_fetch").unwrap();
+    assert_eq!(contract.clock_domain, "snes_master");
+    assert!(contract.contract.contains("vram-word-read"));
+    assert!(contract.contract.contains("final-compositing"));
+    assert!(contract
+        .payload_fields
+        .iter()
+        .any(|field| field.path == "address" && field.max == Some(0x7fff)));
+    assert!(contract
+        .payload_fields
+        .iter()
+        .any(|field| field.path == "layer" && field.max == Some(3)));
+}
+
+#[test]
 fn registry_rejects_a_tampered_contract() {
     let json = include_str!("../contracts/event-classes.json").replace(
         "frame_boundary/v1;clock=frame:strict;frame=tick;payload=empty-object",

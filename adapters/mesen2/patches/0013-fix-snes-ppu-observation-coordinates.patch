@@ -1,0 +1,43 @@
+diff --git a/Core/SNES/SnesPpu.cpp b/Core/SNES/SnesPpu.cpp
+index 5096c25..c167412 100644
+--- a/Core/SNES/SnesPpu.cpp
++++ b/Core/SNES/SnesPpu.cpp
+@@ -830,9 +830,9 @@ void SnesPpu::RecordObjConsumption(uint32_t address, uint8_t value, uint8_t memo
+ 	event.Address = address;
+ 	event.Value = value;
+ 	event.MemoryKind = memoryKind;
+-	event.Scanline = _state.Scanline;
+-	event.Dot = _state.Cycle;
+-	event.HClock = _state.HClock;
++	event.Scanline = _scanline;
++	event.Dot = GetCycle();
++	event.HClock = _memoryManager->GetHClock();
+ 	debugger->ProcessSnesObservationEvent(EventType::SnesPpuObjConsumptionRead, event);
+ }
+ 
+@@ -1163,9 +1163,9 @@ void SnesPpu::RecordCgramLookup(uint16_t address, uint16_t value, uint8_t layer,
+ 	event.Layer = layer;
+ 	event.RendererTarget = (uint8_t)target;
+ 	event.PixelX = pixelX;
+-	event.Scanline = _state.Scanline;
+-	event.Dot = _state.Cycle;
+-	event.HClock = _state.HClock;
++	event.Scanline = _scanline;
++	event.Dot = GetCycle();
++	event.HClock = _memoryManager->GetHClock();
+ 	_cgramLookupDebugger->ProcessSnesObservationEvent(EventType::SnesPpuCgramLookup, event);
+ }
+ 
+@@ -1186,9 +1186,9 @@ void SnesPpu::RecordBgChrFetch(uint16_t address, uint16_t value, uint8_t layer)
+ 	event.Address = address;
+ 	event.VramValue = value;
+ 	event.Layer = layer;
+-	event.Scanline = _state.Scanline;
+-	event.Dot = _state.Cycle;
+-	event.HClock = _state.HClock;
++	event.Scanline = _scanline;
++	event.Dot = GetCycle();
++	event.HClock = _memoryManager->GetHClock();
+ 	_bgChrFetchDebugger->ProcessSnesObservationEvent(EventType::SnesPpuBgChrFetch, event);
+ }
+ 

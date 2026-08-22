@@ -1,0 +1,127 @@
+diff --git a/Core/Debugger/Debugger.h b/Core/Debugger/Debugger.h
+index 5225a4b..2c3ccd6 100644
+--- a/Core/Debugger/Debugger.h
++++ b/Core/Debugger/Debugger.h
+@@ -64,6 +64,7 @@ struct SnesObservationEvent
+ 	uint32_t TransferSize = 0;
+ 	uint16_t TableAddress = 0;
+ 	uint16_t CgramValue = 0;
++	uint16_t VramValue = 0;
+ 	uint16_t PixelX = 0;
+ 	uint16_t A = 0;
+ 	uint16_t X = 0;
+diff --git a/Core/Debugger/LuaApi.cpp b/Core/Debugger/LuaApi.cpp
+index 7f4fe93..ddcf1bb 100644
+--- a/Core/Debugger/LuaApi.cpp
++++ b/Core/Debugger/LuaApi.cpp
+@@ -1142,7 +1142,8 @@ int LuaApi::GetSnesObservationEvent(lua_State* lua)
+ 	s.Stream(copy.Source, "source");
+ 	s.Stream(copy.Destination, "destination");
+ 	s.Stream(copy.TransferSize, "transferSize");
+-	s.Stream(copy.CgramValue, "cgramValue"); s.Stream(copy.PixelX, "pixelX");
++	s.Stream(copy.CgramValue, "cgramValue"); s.Stream(copy.VramValue, "vramValue");
++	s.Stream(copy.PixelX, "pixelX");
+ 	s.Stream(copy.A, "a"); s.Stream(copy.X, "x"); s.Stream(copy.Y, "y");
+ 	s.Stream(copy.SP, "sp"); s.Stream(copy.D, "d");
+ 	s.Stream(copy.Scanline, "scanline"); s.Stream(copy.Dot, "dot"); s.Stream(copy.HClock, "hClock");
+diff --git a/Core/SNES/SnesPpu.cpp b/Core/SNES/SnesPpu.cpp
+index 64cee4b..5096c25 100644
+--- a/Core/SNES/SnesPpu.cpp
++++ b/Core/SNES/SnesPpu.cpp
+@@ -252,7 +252,8 @@ void SnesPpu::GetChrData(uint8_t layerIndex, uint8_t column, uint8_t plane)
+ 
+ 	uint8_t yOffset = vMirror ? (7 - baseYOffset) : baseYOffset;
+ 	uint16_t pixelStart = tileStart + yOffset + (plane << 3);
+-	tileData.ChrData[plane + (secondTile ? bpp / 2 : 0)] = _vram[pixelStart & 0x7FFF];
++	tileData.ChrData[plane + (secondTile ? bpp / 2 : 0)] =
++		ReadBgChrWord(pixelStart & 0x7FFF, layerIndex);
+ }
+ 
+ uint16_t SnesPpu::GetHvOffsetByteAddress(uint8_t columnIndex, bool forVertOffset)
+@@ -505,8 +506,14 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
+ 			_rangeOver = false;
+ 			_timeOver = false;
+ 			_emu->ProcessEvent(EventType::StartFrame);
++			Debugger* debugger = _emu->InternalGetDebugger();
++			_bgChrFetchDebugger = debugger && debugger->HasEventCallback(EventType::SnesPpuBgChrFetch)
++				? debugger : nullptr;
++			bool preserveRendererObservation = _bgChrFetchDebugger
++				|| (debugger && debugger->HasEventCallback(EventType::SnesPpuCgramLookup));
+ 
+ 			_skipRender =
++				!preserveRendererObservation &&
+ 				!_settings->GetSnesConfig().DisableFrameSkipping &&
+ 				(!_interlacedFrame || (_frameCount & 0x02)) &&
+ 				!_emu->GetRewindManager()->IsRewinding() &&
+@@ -514,7 +521,7 @@ bool SnesPpu::ProcessEndOfScanline(uint16_t& hClock)
+ 				(_settings->GetEmulationSpeed() == 0 || _settings->GetEmulationSpeed() > 150) &&
+ 				_frameSkipTimer.GetElapsedMS() < 10;
+ 
+-			if(_emu->IsRunAheadFrame()) {
++			if(_emu->IsRunAheadFrame() && !preserveRendererObservation) {
+ 				_skipRender = true;
+ 			}
+ 
+@@ -1162,6 +1169,29 @@ void SnesPpu::RecordCgramLookup(uint16_t address, uint16_t value, uint8_t layer,
+ 	_cgramLookupDebugger->ProcessSnesObservationEvent(EventType::SnesPpuCgramLookup, event);
+ }
+ 
++uint16_t SnesPpu::ReadBgChrWord(uint16_t address, uint8_t layer)
++{
++	uint16_t value = _vram[address];
++	if(_bgChrFetchDebugger) {
++		RecordBgChrFetch(address, value, layer);
++	}
++	return value;
++}
++
++void SnesPpu::RecordBgChrFetch(uint16_t address, uint16_t value, uint8_t layer)
++{
++	SnesObservationEvent event;
++	event.Frame = _emu->GetFrameCount();
++	event.MasterClock = _memoryManager->GetMasterClock();
++	event.Address = address;
++	event.VramValue = value;
++	event.Layer = layer;
++	event.Scanline = _state.Scanline;
++	event.Dot = _state.Cycle;
++	event.HClock = _state.HClock;
++	_bgChrFetchDebugger->ProcessSnesObservationEvent(EventType::SnesPpuBgChrFetch, event);
++}
++
+ bool SnesPpu::IsRenderRequired(uint8_t layerIndex)
+ {
+ 	if(((_state.MainScreenLayers & _configVisibleLayers) >> layerIndex) & 0x01) {
+diff --git a/Core/SNES/SnesPpu.h b/Core/SNES/SnesPpu.h
+index 31bb17d..1f560b5 100644
+--- a/Core/SNES/SnesPpu.h
++++ b/Core/SNES/SnesPpu.h
+@@ -32,6 +32,7 @@ private:
+ 	Spc* _spc;
+ 	EmuSettings* _settings;
+ 	Debugger* _cgramLookupDebugger = nullptr;
++	Debugger* _bgChrFetchDebugger = nullptr;
+ 
+ 	//Temporary data used for the tilemap/tile fetching
+ 	LayerData _layerData[4] = {};
+@@ -170,6 +171,8 @@ private:
+ 
+ 	__forceinline uint16_t ReadCgramForRenderer(uint16_t address, uint8_t layer, uint16_t pixelX, CgramLookupTarget target);
+ 	void RecordCgramLookup(uint16_t address, uint16_t value, uint8_t layer, uint16_t pixelX, CgramLookupTarget target);
++	__forceinline uint16_t ReadBgChrWord(uint16_t address, uint8_t layer);
++	void RecordBgChrFetch(uint16_t address, uint16_t value, uint8_t layer);
+ 
+ 	__forceinline bool IsRenderRequired(uint8_t layerIndex);
+ 
+diff --git a/Core/Shared/EventType.h b/Core/Shared/EventType.h
+index 0db88f7..9e712d3 100644
+--- a/Core/Shared/EventType.h
++++ b/Core/Shared/EventType.h
+@@ -24,6 +24,7 @@ enum class EventType
+ 	SnesInterruptDelivery,
+ 	SnesPpuObjConsumptionRead,
+ 	SnesPpuCgramLookup,
++	SnesPpuBgChrFetch,
+ 
+ 	LastValue
+ };
