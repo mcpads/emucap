@@ -30,9 +30,9 @@ fn sample_run(id: &str, rom: &str) -> Run {
 fn save_then_load_run_round_trips() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = sample_run("01RUN", "sha_a");
+    let run = sample_run("01RUN", "sha-a");
     store::save_run(root, &run).unwrap();
-    let back = store::load_run(root, "sha_a", "01RUN").unwrap();
+    let back = store::load_run(root, "sha-a", "01RUN").unwrap();
     assert_eq!(run, back);
 }
 
@@ -40,9 +40,9 @@ fn save_then_load_run_round_trips() {
 fn walk_runs_finds_all_run_json() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &sample_run("01A", "sha_a")).unwrap();
-    store::save_run(root, &sample_run("01B", "sha_a")).unwrap();
-    store::save_run(root, &sample_run("01C", "sha_b")).unwrap();
+    store::save_run(root, &sample_run("01A", "sha-a")).unwrap();
+    store::save_run(root, &sample_run("01B", "sha-a")).unwrap();
+    store::save_run(root, &sample_run("01C", "sha-b")).unwrap();
     let mut ids: Vec<String> = store::walk_runs(root)
         .unwrap()
         .into_iter()
@@ -56,9 +56,9 @@ fn walk_runs_finds_all_run_json() {
 fn partial_tmp_file_is_ignored_by_walk() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    store::save_run(root, &sample_run("01A", "sha_a")).unwrap();
+    store::save_run(root, &sample_run("01A", "sha-a")).unwrap();
     // 부분 쓰기 흉내: .tmp 파일을 run 디렉토리에 둔다
-    let p = root.join("roms/sha_a/runs/01A/run.json.tmp");
+    let p = root.join("roms/sha-a/runs/01A/run.json.tmp");
     std::fs::write(p, b"{ broken").unwrap();
     assert_eq!(store::walk_runs(root).unwrap().len(), 1); // .tmp는 무시
 }
@@ -67,7 +67,7 @@ fn partial_tmp_file_is_ignored_by_walk() {
 fn corrupt_run_json_errors_not_skipped() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let p = root.join("roms/sha_a/runs/01A");
+    let p = root.join("roms/sha-a/runs/01A");
     std::fs::create_dir_all(&p).unwrap();
     std::fs::write(p.join("run.json"), b"{ not json").unwrap();
     assert!(store::walk_runs(root).is_err()); // 조용히 스킵 금지
@@ -160,7 +160,7 @@ fn walk_findings_lenient_skips_foreign_and_corrupt() {
     let root = dir.path();
     let f = Finding {
         id: "01F".into(),
-        rom_sha1: "sha_a".into(),
+        rom_sha1: "sha-a".into(),
         run_id: None,
         claim: "c".into(),
         evidence_refs: vec![],
@@ -187,7 +187,7 @@ fn walk_roms_lenient_skips_corrupt() {
     store::save_rom(
         root,
         &Rom {
-            sha1: "sha_a".into(),
+            sha1: "sha-a".into(),
             platform: "snes".into(),
             title: None,
             first_seen: "t".into(),
@@ -195,13 +195,116 @@ fn walk_roms_lenient_skips_corrupt() {
     )
     .unwrap();
     // 손상 rom.json
-    let bad = root.join("roms/sha_b");
+    let bad = root.join("roms/sha-b");
     std::fs::create_dir_all(&bad).unwrap();
     std::fs::write(bad.join("rom.json"), b"{ broken").unwrap();
     assert!(store::walk_roms(root).is_err());
     let (out, skipped) = store::walk_roms_lenient(root).unwrap();
     assert_eq!(out.len(), 1);
     assert_eq!(skipped.len(), 1);
+}
+
+#[test]
+fn run_paths_reject_punctuation_and_traversal_before_filesystem_access() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    for invalid in [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "a/b",
+        "a\\b",
+        "/tmp/outside",
+        "run_id",
+        "run.id",
+        "-run",
+        "run-",
+        "run--id",
+    ] {
+        assert!(matches!(
+            store::load_run(root, "rom-safe", invalid),
+            Err(store::TrackError::Invalid(_))
+        ));
+        assert!(matches!(
+            store::find_run_by_id(root, invalid),
+            Err(store::TrackError::Invalid(_))
+        ));
+    }
+    for invalid in ["..", "../outside", "rom_id", "rom.id", "/tmp/outside"] {
+        assert!(matches!(
+            store::load_run(root, invalid, "run-safe"),
+            Err(store::TrackError::Invalid(_))
+        ));
+    }
+}
+
+#[test]
+fn loaded_run_identity_must_match_its_ledger_path() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let path = root.join("roms/rom-safe/runs/run-safe");
+    std::fs::create_dir_all(&path).unwrap();
+    let mut run = sample_run("different-run", "rom-safe");
+    std::fs::write(
+        path.join("run.json"),
+        serde_json::to_vec_pretty(&run).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store::load_run(root, "rom-safe", "run-safe"),
+        Err(store::TrackError::Corrupt(_))
+    ));
+
+    run.id = "run-safe".into();
+    run.rom_sha1 = "different-rom".into();
+    std::fs::write(
+        path.join("run.json"),
+        serde_json::to_vec_pretty(&run).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        store::load_run(root, "rom-safe", "run-safe"),
+        Err(store::TrackError::Corrupt(_))
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_reader_refuses_symlink_members_and_directories() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path().join("ledger");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(
+        outside.join("run.json"),
+        serde_json::to_vec_pretty(&sample_run("run-safe", "rom-safe")).unwrap(),
+    )
+    .unwrap();
+
+    let runs = root.join("roms/rom-safe/runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    symlink(&outside, runs.join("run-safe")).unwrap();
+    assert!(matches!(
+        store::load_run(&root, "rom-safe", "run-safe"),
+        Err(store::TrackError::Corrupt(_))
+    ));
+}
+
+#[test]
+fn oversized_run_json_is_rejected_before_deserialization() {
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+    let path = root.join("roms/rom-safe/runs/run-safe");
+    std::fs::create_dir_all(&path).unwrap();
+    let file = std::fs::File::create(path.join("run.json")).unwrap();
+    file.set_len(16 * 1024 * 1024 + 1).unwrap();
+    assert!(matches!(
+        store::load_run(root, "rom-safe", "run-safe"),
+        Err(store::TrackError::TooLarge { .. })
+    ));
 }
 
 #[test]

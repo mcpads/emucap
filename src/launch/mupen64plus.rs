@@ -137,16 +137,17 @@ pub fn require_compatible_root(
     }
 
     let metadata_path = root.join("emucap-mupen64plus-build.json");
-    let metadata: BuildMetadata =
-        serde_json::from_slice(&std::fs::read(&metadata_path)?).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid Mupen64Plus build metadata at {}: {error}",
-                    metadata_path.display()
-                ),
-            )
-        })?;
+    let metadata_bytes =
+        crate::path_safety::read_bounded_regular_file_no_follow(&metadata_path, 256 * 1024)?;
+    let metadata: BuildMetadata = serde_json::from_slice(&metadata_bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid Mupen64Plus build metadata at {}: {error}",
+                metadata_path.display()
+            ),
+        )
+    })?;
     let lock = std::fs::read_to_string(repo_root.join("adapters/mupen64plus/upstream.lock"))?;
     let expected_api = required_lock_value(&lock, "M64P_HOST_API")?
         .parse::<u32>()

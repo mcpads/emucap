@@ -17,6 +17,7 @@ pub mod neogeo_bridge;
 pub mod numparse;
 pub mod offload;
 pub mod openmsx_bridge;
+pub mod path_safety;
 pub mod pc98_bridge;
 pub mod pcsx2_bridge;
 pub mod ppsspp_bridge;
@@ -31,6 +32,9 @@ mod event_contracts_tests;
 
 #[cfg(test)]
 mod input_movie_tests;
+
+#[cfg(test)]
+mod path_safety_tests;
 
 #[cfg(test)]
 #[path = "mcp_stdio_tests.rs"]

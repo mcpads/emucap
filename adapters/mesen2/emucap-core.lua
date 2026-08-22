@@ -25,6 +25,8 @@ local HAS_SNES_DEEP_EVENTS = SYS.system == "snes"
   and emu.eventType.snesDevicePortWrite ~= nil
   and emu.eventType.snesInterruptDelivery ~= nil
   and emu.eventType.snesPpuObjConsumptionRead ~= nil
+  and emu.eventType.snesPpuCgramLookup ~= nil
+  and emu.eventType.snesPpuBgChrFetch ~= nil
 
 -- emucap Mesen2 라이브 클라이언트 (능동 제어)
 -- 필요 옵션: "Allow network access" + "Allow access to I/O and OS functions".
@@ -1261,6 +1263,9 @@ local function deep_payload(event_id, event)
     return { address = event.address, value = event.cgramValue, layer = event.layer,
       target = event.rendererTarget, pixel_x = event.pixelX, scanline = event.scanline,
       dot = event.dot, hclock = event.hClock }
+  elseif event_id == "snes_ppu_bg_chr_fetch" then
+    return { address = event.address, value = event.vramValue, layer = event.layer,
+      scanline = event.scanline, dot = event.dot, hclock = event.hClock }
   end
   return nil
 end
@@ -1280,6 +1285,7 @@ local function install_recording_semantic_hooks(state)
     { id = "snes_ppu_obj_consumption_read", event_type = emu.eventType.snesPpuObjConsumptionRead,
       deep = true },
     { id = "snes_ppu_cgram_lookup", event_type = emu.eventType.snesPpuCgramLookup, deep = true },
+    { id = "snes_ppu_bg_chr_fetch", event_type = emu.eventType.snesPpuBgChrFetch, deep = true },
   }
   local requested = false
   for _, candidate in ipairs(candidates) do

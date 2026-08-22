@@ -4,6 +4,29 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.14.5
+
+### Added
+- Maintained Mesen SNES recordings can opt into exact modes 0–6 tiled-background character-data
+  VRAM-word fetches, with producer-declared address, layer, and scanline filters and exact
+  occurrence stops. The event does not claim final compositing or displayed-pixel contribution.
+
+### Fixed
+- SNES OBJ, CGRAM, and BG-fetch records now take scanline, dot, and horizontal-clock coordinates
+  from the live PPU counters instead of a debugger state snapshot that could be stale.
+- Tracking and regression identifiers now reject path syntax and punctuation before filesystem
+  access, missing runs return stable `run_not_found` errors, and stored record identities must
+  match their managed paths.
+- Managed ledger, dump, regression, recording, and legacy-bundle members reject symlink escapes,
+  oversized metadata, and identity or size mismatches. CUE launches require a closed regular-file
+  graph under the CUE directory, PC-98 state ZIP extraction is bounded, and explicit JSON offloads
+  replace their destination atomically without following a destination symlink.
+- Screenshot, state, runtime-copy, and regression payload writes now use collision-resistant
+  sibling staging and atomic replacement; file-backed screenshots and debugger output are bounded,
+  large state hashes are streamed, and PC-98 trace reads inspect only a bounded tail. Emulator build
+  sidecars, openMSX session manifests and screenshots, and diagnostic PID files are also read through
+  bounded regular-file paths; standalone Neo Geo scratch directories no longer reuse a PID-only name.
+
 ## 0.14.4
 
 ### Added

@@ -53,3 +53,27 @@ fn graph_identity_covers_the_entry_file_and_all_unique_referenced_files() {
     assert_ne!(before.sha1, after.sha1);
     assert_ne!(before.files[2].sha1, after.files[2].sha1);
 }
+
+#[test]
+fn rejects_references_that_escape_the_cue_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let cue = dir.path().join("disc.cue");
+    std::fs::write(&cue, "FILE \"../outside.bin\" BINARY\n").unwrap();
+    let error = referenced_files(&cue).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_a_symlinked_track_member() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let outside = dir.path().join("outside.bin");
+    std::fs::write(&outside, b"track").unwrap();
+    symlink(&outside, dir.path().join("track.bin")).unwrap();
+    let cue = dir.path().join("disc.cue");
+    std::fs::write(&cue, "FILE \"track.bin\" BINARY\n").unwrap();
+    let error = validate_graph(&cue).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+}

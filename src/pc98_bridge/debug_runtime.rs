@@ -16,10 +16,7 @@ impl<G: GdbTransport> Bridge<G> {
                     let path = std::env::temp_dir().join(format!(
                         "emucap_pc98_trace_{}_{}.log",
                         std::process::id(),
-                        SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .map(|d| d.as_nanos())
-                            .unwrap_or_default()
+                        ulid::Ulid::generate().to_string().to_ascii_lowercase()
                     ));
                     self.trace_path = Some(path.clone());
                     path
@@ -980,10 +977,25 @@ impl<G: GdbTransport> Bridge<G> {
         let Some(path) = &self.trace_path else {
             return Ok(Vec::new());
         };
-        if !path.exists() {
-            return Ok(Vec::new());
+        let mut file = match crate::path_safety::open_regular_file_no_follow(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let file_len = file.metadata()?.len();
+        let start_offset = file_len.saturating_sub(MAX_TRACE_READ_BYTES);
+        file.seek(std::io::SeekFrom::Start(start_offset))?;
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(file_len.saturating_sub(start_offset)).unwrap_or_default(),
+        );
+        file.take(MAX_TRACE_READ_BYTES).read_to_end(&mut bytes)?;
+        if start_offset > 0 {
+            if let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\n') {
+                bytes.drain(..=first_line_end);
+            } else {
+                bytes.clear();
+            }
         }
-        let bytes = fs::read(path)?;
         let text = String::from_utf8_lossy(&bytes);
         let lines: Vec<&str> = text.lines().collect();
         let start = lines.len().saturating_sub(TRACE_CAP * 4);

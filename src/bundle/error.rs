@@ -14,6 +14,8 @@ pub enum FinalizeError {
     ArtifactMissing(PathBuf),
     #[error("아티팩트 경로가 번들 디렉토리를 벗어남(비-자기완결): {0}")]
     ArtifactOutsideBundle(PathBuf),
+    #[error("아티팩트가 번들 소유의 일반 파일이 아님: {0}")]
+    UnsafeArtifact(PathBuf),
     #[error("번들에 슬라이스가 없음")]
     NoSlices,
     #[error("지원하지 않는 format_version: {0}")]

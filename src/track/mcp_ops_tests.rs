@@ -56,7 +56,7 @@ fn start_run_creates_run_and_returns_ids() {
         root,
         &gen(),
         "t0",
-        "sha_a",
+        "sha-a",
         Some("port:1".into()),
         Some("font".into()),
         Some("desc".into()),
@@ -64,10 +64,10 @@ fn start_run_creates_run_and_returns_ids() {
     )
     .unwrap();
     let run_id = v["run_id"].as_str().unwrap();
-    assert_eq!(v["rom_sha1"], "sha_a");
+    assert_eq!(v["rom_sha1"], "sha-a");
     assert_eq!(v["ledger_path"], root.display().to_string());
     // 원장에 실제 run.json이 생겼는지 확인
-    let run = store::load_run(root, "sha_a", run_id).unwrap();
+    let run = store::load_run(root, "sha-a", run_id).unwrap();
     assert_eq!(run.status, RunStatus::Running);
     assert_eq!(run.goal.as_deref(), Some("font"));
     assert_eq!(run.connection_ref.as_deref(), Some("port:1"));
@@ -83,7 +83,7 @@ fn start_run_aborts_same_connection_stale_running() {
         root,
         &g,
         "t0",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
@@ -95,7 +95,7 @@ fn start_run_aborts_same_connection_stale_running() {
         root,
         &g,
         "t1",
-        "sha_a",
+        "sha-a",
         Some("port:1".into()),
         None,
         None,
@@ -105,11 +105,11 @@ fn start_run_aborts_same_connection_stale_running() {
     let new_id = v["run_id"].as_str().unwrap();
     assert_ne!(new_id, prev.id);
     assert_eq!(
-        store::load_run(root, "sha_a", &prev.id).unwrap().status,
+        store::load_run(root, "sha-a", &prev.id).unwrap().status,
         RunStatus::Aborted
     );
     assert_eq!(
-        store::load_run(root, "sha_a", new_id).unwrap().status,
+        store::load_run(root, "sha-a", new_id).unwrap().status,
         RunStatus::Running
     );
 }
@@ -122,7 +122,7 @@ fn find_resumable_run_matches_same_connection_and_rom() {
         root,
         &gen(),
         "t0",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
@@ -130,10 +130,10 @@ fn find_resumable_run_matches_same_connection_and_rom() {
     )
     .unwrap();
     // 같은 connection_ref + 같은 rom의 running → resume 대상
-    let binding = mcp_ops::find_resumable_run(root, "port:1", "sha_a").unwrap();
+    let binding = mcp_ops::find_resumable_run(root, "port:1", "sha-a").unwrap();
     let binding = binding.expect("일치하는 running run을 찾아야 한다");
     assert_eq!(binding.run_id, run.id);
-    assert_eq!(binding.rom_sha1, "sha_a");
+    assert_eq!(binding.rom_sha1, "sha-a");
     assert_eq!(binding.connection_ref.as_deref(), Some("port:1"));
 }
 
@@ -146,14 +146,14 @@ fn find_resumable_run_none_on_rom_mismatch() {
         root,
         &gen(),
         "t0",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
         Some("port:1".into()),
     )
     .unwrap();
-    assert!(mcp_ops::find_resumable_run(root, "port:1", "sha_b")
+    assert!(mcp_ops::find_resumable_run(root, "port:1", "sha-b")
         .unwrap()
         .is_none());
 }
@@ -168,14 +168,14 @@ fn find_resumable_run_none_on_connection_mismatch_or_finished() {
         root,
         &g,
         "t0",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
         Some("port:2".into()),
     )
     .unwrap();
-    assert!(mcp_ops::find_resumable_run(root, "port:1", "sha_a")
+    assert!(mcp_ops::find_resumable_run(root, "port:1", "sha-a")
         .unwrap()
         .is_none());
     // 같은 connection이지만 이미 종료(done)된 run은 resume 대상 아님
@@ -183,15 +183,15 @@ fn find_resumable_run_none_on_connection_mismatch_or_finished() {
         root,
         &g,
         "t1",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
         Some("port:1".into()),
     )
     .unwrap();
-    ops::finish_run(root, "sha_a", &finished.id, RunStatus::Done, "t2").unwrap();
-    assert!(mcp_ops::find_resumable_run(root, "port:1", "sha_a")
+    ops::finish_run(root, "sha-a", &finished.id, RunStatus::Done, "t2").unwrap();
+    assert!(mcp_ops::find_resumable_run(root, "port:1", "sha-a")
         .unwrap()
         .is_none());
 }
@@ -205,7 +205,7 @@ fn resume_run_by_id_returns_binding_for_running_and_errors_otherwise() {
         root,
         &g,
         "t0",
-        "sha_a",
+        "sha-a",
         None,
         None,
         vec![],
@@ -215,12 +215,12 @@ fn resume_run_by_id_returns_binding_for_running_and_errors_otherwise() {
     // running → binding 반환
     let binding = mcp_ops::resume_run_by_id(root, &run.id).unwrap();
     assert_eq!(binding.run_id, run.id);
-    assert_eq!(binding.rom_sha1, "sha_a");
+    assert_eq!(binding.rom_sha1, "sha-a");
     assert_eq!(binding.connection_ref.as_deref(), Some("port:1"));
     // 미존재 run_id → 에러
     assert!(mcp_ops::resume_run_by_id(root, "nope").is_err());
     // 종료된 run은 resume 불가 → 에러
-    ops::finish_run(root, "sha_a", &run.id, RunStatus::Done, "t1").unwrap();
+    ops::finish_run(root, "sha-a", &run.id, RunStatus::Done, "t1").unwrap();
     assert!(mcp_ops::resume_run_by_id(root, &run.id).is_err());
 }
 
@@ -228,10 +228,10 @@ fn resume_run_by_id_returns_binding_for_running_and_errors_otherwise() {
 fn finish_active_run_sets_status() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
-    let v = mcp_ops::finish_active_run(root, "sha_a", &run.id, RunStatus::Done, "t1").unwrap();
+    let run = ops::create_run(root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
+    let v = mcp_ops::finish_active_run(root, "sha-a", &run.id, RunStatus::Done, "t1").unwrap();
     assert_eq!(v["finished"], run.id);
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.status, RunStatus::Done);
     assert_eq!(back.ended_at.as_deref(), Some("t1"));
 }
@@ -240,11 +240,11 @@ fn finish_active_run_sets_status() {
 fn finish_run_by_id_found_and_missing() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
     let v = mcp_ops::finish_run_by_id(root, &run.id, RunStatus::Error, "t1").unwrap();
     assert_eq!(v["finished"], run.id);
     assert_eq!(
-        store::load_run(root, "sha_a", &run.id).unwrap().status,
+        store::load_run(root, "sha-a", &run.id).unwrap().status,
         RunStatus::Error
     );
     // 미존재 run_id
@@ -255,10 +255,10 @@ fn finish_run_by_id_found_and_missing() {
 fn log_metric_appends() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
-    let v = mcp_ops::log_metric(root, "sha_a", &run.id, &gen(), "t1", "fps", 60.0).unwrap();
+    let run = ops::create_run(root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
+    let v = mcp_ops::log_metric(root, "sha-a", &run.id, &gen(), "t1", "fps", 60.0).unwrap();
     assert_eq!(v["ok"], true);
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.metrics.len(), 1);
     assert_eq!(back.metrics[0].key, "fps");
     assert_eq!(back.metrics[0].value, 60.0);
@@ -269,10 +269,10 @@ fn log_gate_parses_kind_and_appends() {
     use super::model::GateKind;
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
     let v = mcp_ops::log_gate(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen(),
         "t1",
@@ -285,7 +285,7 @@ fn log_gate_parses_kind_and_appends() {
     )
     .unwrap();
     assert_eq!(v["ok"], true);
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.gates.len(), 1);
     assert_eq!(back.gates[0].name, "boot");
     assert_eq!(back.gates[0].kind, GateKind::Machine);
@@ -293,7 +293,7 @@ fn log_gate_parses_kind_and_appends() {
     // 잘못된 kind는 에러(원장 변경 없음)
     assert!(mcp_ops::log_gate(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen(),
         "t2",
@@ -312,12 +312,12 @@ fn log_artifact_resolves_relative_against_git_root() {
     let dir = TempDir::new().unwrap();
     let root = dir.path().join(".emucap");
     let repo = dir.path(); // git_root 격
-    let run = ops::create_run(&root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(&root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
     // repo 루트 기준 상대경로 파일 생성
     std::fs::write(repo.join("shot.png"), b"PNGDATA").unwrap();
     let v = mcp_ops::log_artifact(
         &root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen(),
         "screenshot",
@@ -327,7 +327,7 @@ fn log_artifact_resolves_relative_against_git_root() {
     )
     .unwrap();
     let aid = v["artifact_id"].as_str().unwrap();
-    let back = store::load_run(&root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(&root, "sha-a", &run.id).unwrap();
     assert_eq!(back.artifacts.len(), 1);
     assert_eq!(back.artifacts[0].id, aid);
     assert_eq!(back.artifacts[0].kind, "screenshot");
@@ -339,10 +339,10 @@ fn log_artifact_resolves_relative_against_git_root() {
 fn log_artifact_reports_missing_path() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
     let err = mcp_ops::log_artifact(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         &gen(),
         "screenshot",
@@ -351,10 +351,10 @@ fn log_artifact_reports_missing_path() {
         None,
     )
     .unwrap_err();
-    assert!(err.contains("artifact path not found"));
+    assert!(err.to_string().contains("artifact path not found"));
     // 원장 미변경
     assert_eq!(
-        store::load_run(root, "sha_a", &run.id)
+        store::load_run(root, "sha-a", &run.id)
             .unwrap()
             .artifacts
             .len(),
@@ -366,17 +366,17 @@ fn log_artifact_reports_missing_path() {
 fn set_reproduction_updates_base_and_movie() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
-    let run = ops::create_run(root, &gen(), "t0", "sha_a", None, None, vec![], None).unwrap();
+    let run = ops::create_run(root, &gen(), "t0", "sha-a", None, None, vec![], None).unwrap();
     let v = mcp_ops::set_reproduction(
         root,
-        "sha_a",
+        "sha-a",
         &run.id,
         Some("savestate".into()),
         Some("m.movie".into()),
     )
     .unwrap();
     assert_eq!(v["ok"], true);
-    let back = store::load_run(root, "sha_a", &run.id).unwrap();
+    let back = store::load_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(back.repro_base.as_deref(), Some("savestate"));
     assert_eq!(back.repro_movie_ref.as_deref(), Some("m.movie"));
 }
@@ -387,7 +387,7 @@ fn log_finding_writes_finding() {
     let root = dir.path();
     let v = mcp_ops::log_finding(
         root,
-        "sha_a",
+        "sha-a",
         &gen(),
         "t0",
         "텍스트 엔진은 LZ77",
@@ -401,7 +401,7 @@ fn log_finding_writes_finding() {
     assert_eq!(findings.len(), 1);
     assert_eq!(findings[0].id, fid);
     assert_eq!(findings[0].claim, "텍스트 엔진은 LZ77");
-    assert_eq!(findings[0].rom_sha1, "sha_a");
+    assert_eq!(findings[0].rom_sha1, "sha-a");
     assert!(findings[0].promoted);
 }
 
@@ -414,7 +414,7 @@ fn query_runs_filters_and_lists() {
         root,
         &g,
         "t0",
-        "sha_a",
+        "sha-a",
         Some("font".into()),
         None,
         vec![],
@@ -425,7 +425,7 @@ fn query_runs_filters_and_lists() {
         root,
         &g,
         "t1",
-        "sha_b",
+        "sha-b",
         Some("text".into()),
         None,
         vec![],
@@ -440,7 +440,7 @@ fn query_runs_filters_and_lists() {
     let only_a = mcp_ops::query_runs(
         root,
         RunFilter {
-            rom_sha1: Some("sha_a".into()),
+            rom_sha1: Some("sha-a".into()),
             ..Default::default()
         },
     )
@@ -459,20 +459,24 @@ fn get_run_returns_detail_with_ledger_path() {
         root,
         &gen(),
         "t0",
-        "sha_a",
+        "sha-a",
         Some("font".into()),
         None,
         vec![],
         None,
     )
     .unwrap();
-    let v = mcp_ops::get_run(root, "sha_a", &run.id).unwrap();
+    let v = mcp_ops::get_run(root, "sha-a", &run.id).unwrap();
     assert_eq!(v["id"], run.id);
-    assert_eq!(v["rom_sha1"], "sha_a");
+    assert_eq!(v["rom_sha1"], "sha-a");
     assert_eq!(v["goal"], "font");
     assert_eq!(v["ledger_path"], root.display().to_string());
-    // 미존재는 에러
-    assert!(mcp_ops::get_run(root, "sha_a", "nope").is_err());
+    let missing = mcp_ops::get_run(root, "sha-a", "nope").unwrap_err();
+    assert_eq!(missing.code(), "run_not_found");
+    assert!(!missing.to_string().contains("os error"));
+
+    let invalid = mcp_ops::get_run(root, "sha-a", "../outside").unwrap_err();
+    assert_eq!(invalid.code(), "invalid_identifier");
 }
 
 #[test]
@@ -480,10 +484,10 @@ fn compare_runs_diffs_two_runs() {
     let dir = TempDir::new().unwrap();
     let root = dir.path();
     let g = gen();
-    let a = ops::create_run(root, &g, "t0", "sha_a", None, None, vec![], None).unwrap();
-    let b = ops::create_run(root, &g, "t1", "sha_a", None, None, vec![], None).unwrap();
-    ops::log_metric(root, "sha_a", &a.id, &g, "t2", "fps", 30.0).unwrap();
-    ops::log_metric(root, "sha_a", &b.id, &g, "t3", "fps", 60.0).unwrap();
+    let a = ops::create_run(root, &g, "t0", "sha-a", None, None, vec![], None).unwrap();
+    let b = ops::create_run(root, &g, "t1", "sha-a", None, None, vec![], None).unwrap();
+    ops::log_metric(root, "sha-a", &a.id, &g, "t2", "fps", 30.0).unwrap();
+    ops::log_metric(root, "sha-a", &b.id, &g, "t3", "fps", 60.0).unwrap();
     let v = mcp_ops::compare_runs(root, &a.id, &b.id).unwrap();
     // 구조화 diff가 양쪽 run 메타를 담는다
     assert_eq!(v["a"]["run_id"], a.id);
@@ -501,7 +505,7 @@ fn summarize_runs_rolls_up() {
         root,
         &g,
         "t0",
-        "sha_a",
+        "sha-a",
         Some("font".into()),
         None,
         vec![],
@@ -512,7 +516,7 @@ fn summarize_runs_rolls_up() {
         root,
         &g,
         "t1",
-        "sha_a",
+        "sha-a",
         Some("font".into()),
         None,
         vec![],
@@ -529,4 +533,19 @@ fn summarize_runs_rolls_up() {
     .unwrap();
     assert_eq!(v["total"], 2);
     assert_eq!(v["skipped"], 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn query_runs_classifies_an_unsafe_index_member_as_ledger_corruption() {
+    use std::os::unix::fs::symlink;
+
+    let dir = TempDir::new().unwrap();
+    let outside = dir.path().join("outside.sqlite");
+    std::fs::write(&outside, b"outside").unwrap();
+    let root = dir.path().join("ledger");
+    std::fs::create_dir(&root).unwrap();
+    symlink(&outside, root.join("index.sqlite")).unwrap();
+    let error = mcp_ops::query_runs(&root, RunFilter::default()).unwrap_err();
+    assert_eq!(error.code(), "ledger_corrupt");
 }

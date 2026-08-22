@@ -45,16 +45,16 @@ impl<G: GdbTransport> Bridge<G> {
         let state = if self.frozen { "frozen" } else { "running" };
         let frame_before = self.current_frame();
         let path = std::env::temp_dir().join(format!(
-            "emucap_pc98_{}_{}.png",
+            "emucap-pc98-{}-{}.png",
             std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
+            ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
         let result = (|| {
             self.lua_cmd("snapshot", Some(path.to_string_lossy().as_ref()))?;
-            let data = fs::read(&path)?;
+            let data = crate::path_safety::read_bounded_regular_file_no_follow(
+                &path,
+                crate::live::protocol::MAX_INLINE_SCREENSHOT_BYTES,
+            )?;
             if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
                 return Err(BridgeError::Emulator(
                     "MAME snapshot did not produce a PNG".into(),

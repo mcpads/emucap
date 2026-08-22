@@ -898,16 +898,24 @@ pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput,
 
     // 스테이징에 리전 파일 + state.json을 모은다. 실패하면 스테이징을 버리고 `dir`은 건드리지 않는다.
     let build = (|| -> Result<Value, LinkError> {
-        std::fs::create_dir_all(&staging)
+        let staging_parent = staging.parent().ok_or_else(|| {
+            LinkError::Protocol("dump staging path has no parent directory".into())
+        })?;
+        std::fs::create_dir_all(staging_parent).map_err(|e| {
+            LinkError::Protocol(format!("failed to create dump output parent: {e}"))
+        })?;
+        std::fs::create_dir(&staging)
             .map_err(|e| LinkError::Protocol(format!("failed to create staging directory: {e}")))?;
         let regions = link.call("dump_memory", json!({ "path": staging_str }))?;
         // 상태(레지스터/DMA/PPU) 스냅샷도 같은 디렉토리에 기록(교차-ROM 키-값 디프 입력).
         // 교차-ROM에서는 frozen 앵커 지점에서 덤프해야 두 호출이 일관된다.
         let state = link.call("get_state", json!({}))?;
         let state_map = state.get("state").cloned().unwrap_or(state.clone());
-        std::fs::write(
-            staging.join("state.json"),
-            serde_json::to_string(&state_map).unwrap_or_default(),
+        crate::path_safety::atomic_write_file(
+            &staging.join("state.json"),
+            serde_json::to_string(&state_map)
+                .unwrap_or_default()
+                .as_bytes(),
         )
         .map_err(|e| LinkError::Protocol(format!("failed to write state.json: {e}")))?;
         Ok(regions)
@@ -937,7 +945,7 @@ pub fn dump_memory(link: &mut dyn EmulatorLink, dir: &str) -> Result<ToolOutput,
     Ok(ToolOutput::Json(regions))
 }
 
-/// `dst`의 형제 경로(같은 부모라 이후 `rename`이 한 파일시스템 내라 원자적)를 `label`·PID·나노초로
+/// `dst`의 형제 경로(같은 부모라 이후 `rename`이 한 파일시스템 내라 원자적)를 `label`·ULID로
 /// 고유하게 만든다. 부모 디렉토리가 없으면 에러.
 fn dump_sibling(dst: &Path, label: &str) -> std::io::Result<PathBuf> {
     let parent = dst.parent().ok_or_else(|| {
@@ -947,11 +955,10 @@ fn dump_sibling(dst: &Path, label: &str) -> std::io::Result<PathBuf> {
         ))
     })?;
     let name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("dump");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    Ok(parent.join(format!(".{name}.{label}.{}.{nanos}", std::process::id())))
+    Ok(parent.join(format!(
+        ".{name}.{label}.{}",
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    )))
 }
 
 /// `dst`가 원자 스왑으로 안전히 교체 가능한 대상인지 확인한다 — 없으면(새로 생성) 또는 디렉토리면 OK,
@@ -1101,7 +1108,7 @@ pub fn screenshot(
     }
     let saved_path = match save_path {
         Some(p) => {
-            std::fs::write(p, &bytes)
+            crate::path_safety::atomic_write_file(p, &bytes)
                 .map_err(|e| LinkError::Protocol(format!("failed to save screenshot: {e}")))?;
             Some(p.to_string_lossy().to_string())
         }

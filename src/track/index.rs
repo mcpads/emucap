@@ -51,9 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_interv_run ON intervention(run_id, seq);
 
 /// 인덱스 연결을 열고(WAL) 스키마를 보장한다.
 pub fn open_index(path: &Path) -> Result<Connection, IndexError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(TrackError::Io)?;
-    }
+    store::prepare_index_path(path)?;
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     // 다중 세션이 같은 스토어를 동시에 ls/query하면 reindex 쓰기 트랜잭션이 겹친다.

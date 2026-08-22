@@ -6,7 +6,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -134,7 +133,10 @@ impl Mupen64PlusHost {
             )));
         }
         let path = &created[0];
-        let data = fs::read(path)?;
+        let data = crate::path_safety::read_bounded_regular_file_no_follow(
+            path,
+            crate::live::protocol::MAX_INLINE_SCREENSHOT_BYTES,
+        )?;
         let remove_result = fs::remove_file(path);
         let (width, height) = png_dimensions(&data)?;
         remove_result?;
@@ -189,13 +191,13 @@ impl Mupen64PlusHost {
             }
             crate::launch::copy_file_replace(&partial, &path)?;
             fs::remove_file(&partial)?;
-            let data = fs::read(&path)?;
+            let (bytes, sha256) = sha256_regular_file(&path)?;
             Ok(json!({
                 "status": "completed",
                 "path": path.display().to_string(),
                 "format": "mupen64plus-native",
-                "bytes": data.len(),
-                "sha256": hex::encode(Sha256::digest(&data)),
+                "bytes": bytes,
+                "sha256": sha256,
                 "state": "frozen",
                 "frame_before": frame_before,
                 "frame": stepped["frame"],
@@ -516,9 +518,26 @@ pub(super) fn state_partial_sibling(path: &Path) -> N64Result<PathBuf> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("state");
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_nanos())
-        .unwrap_or_default();
-    Ok(parent.join(format!(".{name}.partial.{}.{nanos}", std::process::id())))
+    Ok(parent.join(format!(
+        ".{name}.partial.{}",
+        ulid::Ulid::generate().to_string().to_ascii_lowercase()
+    )))
+}
+
+fn sha256_regular_file(path: &Path) -> N64Result<(u64, String)> {
+    let mut file = crate::path_safety::open_regular_file_no_follow(path)?;
+    let mut hasher = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = std::io::Read::read(&mut file, &mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| N64Error::BadState("save-state size overflow".into()))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((bytes, hex::encode(hasher.finalize())))
 }

@@ -53,7 +53,8 @@ pub fn build_metadata_path(binary: &Path) -> PathBuf {
 
 pub fn read_build_metadata(binary: &Path) -> std::io::Result<BuildMetadata> {
     let path = build_metadata_path(binary);
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
+    let raw = crate::path_safety::read_bounded_utf8_regular_file_no_follow(&path, 256 * 1024)
+        .map_err(|e| {
         patch_required(format!(
             "compatible build metadata is missing at {} ({e}); run adapters/mesen2/build.sh or build.ps1",
             path.display()
@@ -588,22 +589,8 @@ fn ensure_portable_settings(portable: &PreparedPortable, repeatable: bool) -> st
             ),
         ));
     }
-    if let Some(parent) = portable.settings.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = super::unique_sibling_path(&portable.settings, "tmp");
     let settings = portable_settings_bytes(repeatable)?;
-    if let Err(err) = std::fs::write(&tmp, settings) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(err);
-    }
-    if portable.settings.is_file() {
-        if let Err(err) = std::fs::remove_file(&portable.settings) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err);
-        }
-    }
-    super::rename_file_tmp(&tmp, &portable.settings)
+    crate::path_safety::atomic_write_file(&portable.settings, &settings)
 }
 
 fn clear_repeatable_persistence(portable: &PreparedPortable) -> std::io::Result<()> {

@@ -8,6 +8,9 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// their transmit buffers at 8 MiB; every Rust transport hop enforces the same bound before
 /// allocating further.
 pub const MAX_NDJSON_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Raw PNG bytes that still leave room for base64 expansion and response metadata
+/// inside one protocol frame.
+pub const MAX_INLINE_SCREENSHOT_BYTES: u64 = ((MAX_NDJSON_FRAME_BYTES - 64 * 1024) * 3 / 4) as u64;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {

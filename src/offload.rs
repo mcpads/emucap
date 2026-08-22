@@ -4,10 +4,7 @@ use std::path::Path;
 /// 큰 결과를 파일로 빼고 요약을 반환한다(context 위생). 도구가 output_path를 받았을 때 핸들러가 호출.
 pub fn offload_result(value: &Value, path: &Path) -> Result<Value, String> {
     let json = serde_json::to_string_pretty(value).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, &json).map_err(|e| e.to_string())?;
+    crate::path_safety::atomic_write_file(path, json.as_bytes()).map_err(|e| e.to_string())?;
     let mut summary = serde_json::json!({
         "output_path": path.display().to_string(),
         "bytes": json.len(),

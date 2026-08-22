@@ -164,16 +164,17 @@ pub fn require_compatible_build(repo_root: &Path, binary: &Path) -> io::Result<B
         .parent()
         .ok_or_else(|| io::Error::other("openMSX binary has no parent directory"))?
         .join("emucap-openmsx-build.json");
-    let metadata: BuildMetadata =
-        serde_json::from_slice(&std::fs::read(&metadata_path)?).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "invalid openMSX build metadata at {}: {error}",
-                    metadata_path.display()
-                ),
-            )
-        })?;
+    let metadata_bytes =
+        crate::path_safety::read_bounded_regular_file_no_follow(&metadata_path, 256 * 1024)?;
+    let metadata: BuildMetadata = serde_json::from_slice(&metadata_bytes).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid openMSX build metadata at {}: {error}",
+                metadata_path.display()
+            ),
+        )
+    })?;
     let lock = std::fs::read_to_string(repo_root.join("adapters/openmsx/upstream.lock"))?;
     let expected_api = required_lock_value(&lock, "OPENMSX_HOST_API")?
         .parse::<u32>()

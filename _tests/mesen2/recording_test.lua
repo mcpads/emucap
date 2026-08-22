@@ -8,6 +8,7 @@ local OBJ_HANDOFF_CONTRACT = "ad23c438ee6400f5f9cab84d877f490abe24670769e50efd2b
 local CPU_INSTRUCTION_CONTRACT = "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f2ae73ac4ba81c55af0"
 local OBJ_CONSUMPTION_CONTRACT = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local CGRAM_LOOKUP_CONTRACT = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
+local BG_CHR_FETCH_CONTRACT = "ee9aecc8a9aa130ee871e08785ea9f32de14172260c8993d0baa33f4f07fc68c"
 local REVISION = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
 local LAUNCH = "launch-01test"
 
@@ -82,6 +83,21 @@ local function params(frames, overrides)
   return p
 end
 
+do
+  Recording.capability(function(value) return value end, true, false, false, true)
+  local valid = params(1, { capture_id = "capture-test" })
+  local state, code, message = Recording.validate(valid, LAUNCH, 0, 0)
+  assert(state, tostring(code) .. ": " .. tostring(message))
+
+  for _, capture_id in ipairs({ "capture_test", "-capture", "capture-", "capture--test" }) do
+    local invalid = params(1, { capture_id = capture_id })
+    local rejected, rejected_code, rejected_message = Recording.validate(invalid, LAUNCH, 0, 0)
+    equal(rejected, nil, "unsafe capture ID rejection")
+    equal(rejected_code, "bad_params", "unsafe capture ID code")
+    equal(rejected_message, "capture_id is invalid", "unsafe capture ID message")
+  end
+end
+
 local function decode_buttons(buttons)
   local decoded = {}
   for _, button in ipairs(buttons) do
@@ -127,13 +143,26 @@ local function cgram_lookup_payload(overrides)
   return value
 end
 
+local function bg_chr_fetch_payload(overrides)
+  local value = {
+    address = 0x2400,
+    value = 0x1234,
+    layer = 1,
+    scanline = 40,
+    dot = 94,
+    hclock = 376,
+  }
+  for key, item in pairs(overrides or {}) do value[key] = item end
+  return value
+end
+
 do
   local capability = Recording.capability(function(value) return value end, true, false, true, true)
   equal(capability.revision,
-    "a37de2f20517d122a960f9ed98f243664ebce7eb15b693fc4ad5d6de1229e00c",
+    "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175",
     "deep capability revision")
   equal(capability.event_order, "guest_emission", "cross-class event order")
-  equal(#capability.event_classes, 12, "deep event class count")
+  equal(#capability.event_classes, 13, "deep event class count")
   equal(capability.event_classes[5].id, "snes_cpu_instruction", "first deep class")
   equal(capability.event_classes[5].contract_sha256, CPU_INSTRUCTION_CONTRACT,
     "instruction contract")
@@ -160,6 +189,16 @@ do
     "CGRAM layer filter")
   equal(capability.event_classes[12].filterable_fields[3].path, "target",
     "CGRAM renderer-target filter")
+  equal(capability.event_classes[13].id, "snes_ppu_bg_chr_fetch", "BG CHR fetch class")
+  equal(capability.event_classes[13].contract_sha256, BG_CHR_FETCH_CONTRACT,
+    "BG CHR fetch contract")
+  equal(capability.event_classes[13].stoppable, true, "BG CHR fetch stoppability")
+  equal(capability.event_classes[13].filterable_fields[1].path, "address",
+    "BG CHR VRAM-word filter")
+  equal(capability.event_classes[13].filterable_fields[2].path, "layer",
+    "BG CHR layer filter")
+  equal(capability.event_classes[13].filterable_fields[3].path, "scanline",
+    "BG CHR scanline filter")
   Recording.capability(function(value) return value end, true, false, false, true)
 end
 
@@ -168,7 +207,7 @@ do
   local capability = Recording.capability(
     function(value) return value end, true, true, true, true, conditions)
   equal(capability.revision,
-    "338356d4b8f9c7c02b7923f4429afcf3e7db0ed3c7c1ba6d4dad535fb8fe1b13",
+    "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d",
     "repeatable capability revision")
   equal(capability.repeatability.profile, "mesen_snes_repeatable",
     "repeatable profile identity")
@@ -222,6 +261,51 @@ do
   equal(result.stop_event.event_class, "snes_ppu_cgram_lookup", "CGRAM stop class")
   equal(result.stop_event.occurrence, 2, "CGRAM filtered occurrence")
   equal(result.event_classes[2].observed, 2, "CGRAM class accounting")
+  Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
+  local deep = Recording.capability(function(value) return value end, true, false, true, true)
+  local p = params(2, {
+    capability_revision = deep.revision,
+    event_classes = {
+      { id = "frame_boundary", contract_sha256 = CONTRACT },
+      { id = "snes_ppu_bg_chr_fetch", contract_sha256 = BG_CHR_FETCH_CONTRACT },
+    },
+    event_filters = { {
+      event_class = "snes_ppu_bg_chr_fetch",
+      terms = {
+        { kind = "u64_range", path = "address", start = 0x2400, length = 0x20 },
+        { kind = "u64_range", path = "layer", start = 1, length = 1 },
+        { kind = "u64_range", path = "scanline", start = 40, length = 1 },
+      },
+    } },
+    stop_on = { event_class = "snes_ppu_bg_chr_fetch", occurrence = 2 },
+  })
+  local sink = fake_sink()
+  local state = assert(Recording.start(
+    p, 43, LAUNCH, 100, 0, sink, nil, nil, nil, nil, function() return true end))
+  assert(Recording.attach_hooks(state))
+  state = select(1, Recording.semantic_event(
+    state, "snes_ppu_bg_chr_fetch", 100, 3000,
+    bg_chr_fetch_payload({ address = 0x23ff })))
+  local effect
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_bg_chr_fetch", 100, 3001, bg_chr_fetch_payload({ layer = 0 }))
+  equal(effect, nil, "other BG layer is outside the filter")
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_bg_chr_fetch", 100, 3002, bg_chr_fetch_payload())
+  equal(effect, nil, "first filtered BG fetch continues")
+  state, effect = Recording.semantic_event(
+    state, "snes_ppu_bg_chr_fetch", 100, 3003,
+    bg_chr_fetch_payload({ address = 0x241f }))
+  equal(effect.kind, "terminal", "second filtered BG fetch stops")
+  local result = Recording.result(state, 1)
+  equal(result.execution_outcome, "event_stop", "BG fetch event-stop outcome")
+  equal(result.integrity, "complete", "BG fetch event-stop integrity")
+  equal(result.stop_event.event_class, "snes_ppu_bg_chr_fetch", "BG fetch stop class")
+  equal(result.stop_event.occurrence, 2, "BG fetch filtered occurrence")
+  equal(result.event_classes[2].observed, 2, "BG fetch class accounting")
   Recording.capability(function(value) return value end, true, false, false, true)
 end
 

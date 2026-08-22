@@ -15,7 +15,7 @@ MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.14.4 — beta.** This repository remains under active development; interfaces and
+**v0.14.5 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -159,6 +159,10 @@ The two MCPs never call each other — **the agent composes them**:
   adapter lacks `get_rom_info`, fall back to `shasum -a1 <content>`). Passing
   `connection_ref` (the Control MCP `status` connection name, or `"port:N"`)
   auto-finalizes the previous unfinished run on that connection.
+- **Keep returned identities opaque**: pass `rom_sha1`, `run_id`, and `finding_id`
+  back unchanged. Managed identifiers contain only ASCII letters and digits joined by
+  single hyphens; path syntax, dots, underscores, and platform-reserved device names are
+  rejected before filesystem access.
 - **Analysis verbs only return**: call `analysis(operation="describe")` when
   `regression_run` / `verify_determinism` are needed, then execute the selected
   operation through that same tool. Analysis drives the emulator and *returns*
@@ -185,6 +189,10 @@ session ID can resume a returned lease without editing runtime files. Then
 arguments. The agent calls `launch`, which waits for adapter readiness, and
 verifies the resulting live and runtime identities with `status`. Launcher
 scripts are developer entry points, not an alternative managed lifecycle.
+
+A managed CUE is a closed media graph: every `FILE` reference must be portable,
+relative, remain below the CUE directory, and resolve to a regular non-symlink file.
+Planning and launch fail before emulator startup when the graph violates that boundary.
 
 An ordinary launch can return while the guest is already running. If the first follow-up action
 must not inherit network or agent delay as guest time, request `start_frozen: true`; a supported

@@ -1044,10 +1044,7 @@ fn reject_symlink(path: &Path) -> io::Result<()> {
 
 fn validate_launch_id(launch_id: &str) -> io::Result<()> {
     let valid = launch_id.starts_with("launch-")
-        && launch_id.len() <= 128
-        && launch_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        && crate::path_safety::is_hyphenated_ascii_id(launch_id, 128);
     if valid {
         Ok(())
     } else {

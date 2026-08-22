@@ -548,12 +548,7 @@ fn validate_snapshot_ranges<T: SnapshotRange>(
     let mut labels = BTreeSet::new();
     let mut total = 0u64;
     for snapshot in snapshots {
-        if snapshot.label().is_empty()
-            || snapshot.label().len() > 64
-            || !snapshot
-                .label()
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        if !crate::path_safety::is_hyphenated_ascii_id(snapshot.label(), 64)
             || !labels.insert(snapshot.label())
         {
             return Err(RecordingError::Invalid(format!(
@@ -780,7 +775,7 @@ pub(super) fn runtime_identity(
 }
 
 fn hash_content(path: &Path) -> io::Result<(String, String)> {
-    let mut file = fs::File::open(path)?;
+    let mut file = crate::path_safety::open_regular_file_no_follow(path)?;
     let mut sha1 = Sha1::new();
     let mut sha256 = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];

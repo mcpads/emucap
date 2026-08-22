@@ -12,6 +12,7 @@ local DEVICE_PORT_WRITE_SHA256 = "36ffca829da2ceb7f4b76f2d38b12331eade10014dd07e
 local INTERRUPT_DELIVERY_SHA256 = "c00494d891e76c380bd782d897c5f5ab4b59d918d49c3a64d78d9d4255c11e38"
 local OBJ_CONSUMPTION_SHA256 = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local CGRAM_LOOKUP_SHA256 = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
+local BG_CHR_FETCH_SHA256 = "ee9aecc8a9aa130ee871e08785ea9f32de14172260c8993d0baa33f4f07fc68c"
 local SNES_PPU_STATE_SHA256 = "21005a15437abd767cbeda5c7ede8741e2aeac4a006dafedede03a695377eaa2"
 local BASE_CAPABILITY_REVISION = "20520b327e06f8ed30387f20f8609b861ceb4306ac1d955f6fb7a38b7489e885"
 local SNES_STATE_CAPABILITY_REVISION = "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e"
@@ -19,9 +20,9 @@ local SNES_CAPABILITY_REVISION = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a6
 local BASE_SNAPSHOT_CAPABILITY_REVISION = "7d673b3f299c2f5f8ba91cf12475385581ec6f18ad38efa1b25a6a3ef7cde08d"
 local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "cb17d9a46ab4f50c18090efe88841d86eec924683089b451301e4cf209400702"
 local SNES_SNAPSHOT_CAPABILITY_REVISION = "c257a841cde44e9911d371a3e3521db1fe11e09dc5177075e76211605080fef2"
-local SNES_DEEP_CAPABILITY_REVISION = "a37de2f20517d122a960f9ed98f243664ebce7eb15b693fc4ad5d6de1229e00c"
-local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "302875a198ab9036285ee242245218132f1096d43aef1151d16cbfb307a637fd"
-local SNES_REPEATABLE_CAPABILITY_REVISION = "338356d4b8f9c7c02b7923f4429afcf3e7db0ed3c7c1ba6d4dad535fb8fe1b13"
+local SNES_DEEP_CAPABILITY_REVISION = "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175"
+local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "59e5b8f3c29fe258032eaadcca0ddea49fd47b23dd6a3d4c7e9d7311acd23787"
+local SNES_REPEATABLE_CAPABILITY_REVISION = "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d"
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -121,6 +122,11 @@ local CGRAM_LOOKUP_FIELDS = {
   int_field("dot", 0xffff), int_field("hclock", 0xffff),
 }
 
+local BG_CHR_FETCH_FIELDS = {
+  int_field("address", 0x7fff), int_field("value", 0xffff), int_field("layer", 3),
+  int_field("scanline", 0xffff), int_field("dot", 0xffff), int_field("hclock", 0xffff),
+}
+
 local FILTERABLE_FIELDS = {
   snes_ppu_obj_consumption_read = {
     memory_kind = { min = 0, max = 1 },
@@ -133,6 +139,17 @@ local FILTERABLE_FIELDS = {
     pixel_x = { min = 0, max = 0xff },
     scanline = { min = 0, max = 0xffff },
   },
+  snes_ppu_bg_chr_fetch = {
+    address = { min = 0, max = 0x7fff },
+    layer = { min = 0, max = 3 },
+    scanline = { min = 0, max = 0xffff },
+  },
+}
+
+local FILTERABLE_FIELD_ORDER = {
+  snes_ppu_obj_consumption_read = { "memory_kind", "address" },
+  snes_ppu_cgram_lookup = { "address", "layer", "target", "pixel_x", "scanline" },
+  snes_ppu_bg_chr_fetch = { "address", "layer", "scanline" },
 }
 
 local EVENT_CONTRACTS = {
@@ -170,6 +187,10 @@ local EVENT_CONTRACTS = {
     digest = CGRAM_LOOKUP_SHA256, clock = "snes_master", payload_fields = CGRAM_LOOKUP_FIELDS,
     stoppable = true,
   },
+  snes_ppu_bg_chr_fetch = {
+    digest = BG_CHR_FETCH_SHA256, clock = "snes_master", payload_fields = BG_CHR_FETCH_FIELDS,
+    stoppable = true,
+  },
 }
 
 local function integer(value)
@@ -182,7 +203,9 @@ end
 
 local function safe_id(value)
   return type(value) == "string" and #value >= 1 and #value <= 96
-    and not value:find("[^A-Za-z0-9_-]")
+    and not value:find("[^A-Za-z0-9-]")
+    and not value:find("^-") and not value:find("-$")
+    and not value:find("--", 1, true)
 end
 
 local function copy_limits(limits)
@@ -258,6 +281,7 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       { "snes_interrupt_delivery", INTERRUPT_DELIVERY_SHA256 },
       { "snes_ppu_obj_consumption_read", OBJ_CONSUMPTION_SHA256, true },
       { "snes_ppu_cgram_lookup", CGRAM_LOOKUP_SHA256, true },
+      { "snes_ppu_bg_chr_fetch", BG_CHR_FETCH_SHA256, true },
     }) do
       local event = {
         id = item[1], contract_sha256 = item[2],
@@ -267,9 +291,7 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       }
       if item[3] then
         local fields = {}
-        for _, path in ipairs(item[1] == "snes_ppu_obj_consumption_read"
-            and { "memory_kind", "address" }
-            or { "address", "layer", "target", "pixel_x", "scanline" }) do
+        for _, path in ipairs(FILTERABLE_FIELD_ORDER[item[1]]) do
           local bounds = FILTERABLE_FIELDS[item[1]][path]
           fields[#fields + 1] = { path = path, kind = "u64_range", min = bounds.min, max = bounds.max }
         end

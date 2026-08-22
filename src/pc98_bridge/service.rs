@@ -313,7 +313,8 @@ impl<G: GdbTransport> Bridge<G> {
             });
             zip.write_all(&serde_json::to_vec(&manifest)?)?;
             zip.finish()?;
-            fs::rename(&partial_path, &out_path)?;
+            crate::path_safety::atomic_copy_file(&partial_path, &out_path)?;
+            fs::remove_file(&partial_path)?;
             let bytes = out_path.metadata()?.len();
             Ok(json!({
                 "path": path.display().to_string(),

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -21,11 +21,16 @@ const MAX_FIND_LEN: usize = 128 * 1024;
 const MAX_SYNC_TIMED_INPUT_FRAMES: u64 = 120;
 const MAX_POINTER_DELTA: i64 = 127;
 const TRACE_CAP: usize = 4096;
+const MAX_TRACE_READ_BYTES: u64 = 16 * 1024 * 1024;
 const LEGACY_STATE_FORMAT: &str = "emucap-mame-pc98-state-v1";
 const STATE_FORMAT: &str = "emucap-mame-pc98-state-v2";
 const SAVE_ITEMS_DIR: &str = "saveitems";
 const SAVE_ITEMS_MANIFEST: &str = "saveitems/manifest.txt";
 const FRAMEBUFFER_MEMBER: &str = "screen/framebuffer.rgb32";
+const MAX_STATE_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_SAVE_ITEM_MEMBERS: usize = 4096;
+const MAX_SAVE_ITEM_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_SAVE_ITEM_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 const METHODS: &[&str] = &[
     "hello",
     "status",

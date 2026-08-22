@@ -31,6 +31,12 @@ EVENT_PROFILES = {
             ("target", 1, 1),
         ),
     },
+    "snes_ppu_bg_chr_fetch": {
+        "filters": (
+            ("address", 0, 32768),
+            ("layer", 0, 4),
+        ),
+    },
 }
 
 

@@ -155,6 +155,13 @@ exact filtered occurrence. This is a renderer lookup before final compositing, n
 color won priority or appeared in the displayed frame; direct-color paths do not emit it. The
 ordinary tool surface does not expose this adapter-specific class unless the caller opens the
 recording capability.
+The opt-in `snes_ppu_bg_chr_fetch` class records each 16-bit VRAM character-data word read by the
+tiled BG1-4 fetch scheduler in modes 0-6. Its address is a VRAM word index and it is filterable by
+address, layer, and scanline, including exact filtered occurrence stop. Tilemap and offset-map
+reads, Mode 7, compositing, screen routing, and displayed-pixel contribution are outside this
+class. While this or the renderer CGRAM class is armed, the fork prevents its own frame-skipping
+optimization from suppressing the selected callbacks; ordinary execution and recordings that do
+not select renderer-derived classes keep the existing frame-skip behavior.
 At a frozen position, `status.reason` reports the most recent halt cause independently of whether
 that position is a proven frame boundary. An exact frame `step` changes the reason to `step` and
 leaves the new boundary eligible for another recording. Breakpoints, instruction halts, transport

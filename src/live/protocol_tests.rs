@@ -80,7 +80,7 @@ fn bounded_reader_preserves_partial_frame_across_timeout() {
         steps: VecDeque::from([
             Ok(br#"{"id":1,"#.to_vec()),
             Err(io::Error::new(io::ErrorKind::TimedOut, "test timeout")),
-            Ok(br#""ok":true}"#.iter().copied().chain([b'\n']).collect()),
+            Ok(br#""ok":true}"#.iter().copied().chain(*b"\n").collect()),
         ]),
     };
     let mut reader = BufReader::new(source);

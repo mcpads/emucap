@@ -49,6 +49,36 @@ fn tracking_mcp_consumer_metadata_is_english() {
 }
 
 #[tokio::test]
+async fn get_run_classifies_missing_and_unsafe_identifiers() {
+    let (_dir, _guard) = temp_env();
+    let server = EmucapTrack::new();
+
+    let missing = server
+        .get_run(Parameters(GetRunArgs {
+            rom_sha1: "rom-safe".into(),
+            run_id: "run-missing".into(),
+        }))
+        .await;
+    assert_eq!(missing.is_error, Some(true));
+    let body: serde_json::Value = serde_json::from_str(&body_text(&missing)).unwrap();
+    assert_eq!(body["error"]["code"], "run_not_found");
+    assert!(!body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("os error"));
+
+    let invalid = server
+        .get_run(Parameters(GetRunArgs {
+            rom_sha1: "rom-safe".into(),
+            run_id: "../outside".into(),
+        }))
+        .await;
+    assert_eq!(invalid.is_error, Some(true));
+    let body: serde_json::Value = serde_json::from_str(&body_text(&invalid)).unwrap();
+    assert_eq!(body["error"]["code"], "invalid_identifier");
+}
+
+#[tokio::test]
 async fn run_start_binds_active_and_log_metric_round_trips() {
     let (dir, _g) = temp_env();
     let root = dir.path();
@@ -65,7 +95,7 @@ async fn run_start_binds_active_and_log_metric_round_trips() {
     // run_start binds active
     let r = s
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_a".into(),
+            rom_sha1: "sha-a".into(),
             connection_ref: Some("port:1".into()),
             goal: Some("font".into()),
             description: None,
@@ -75,7 +105,7 @@ async fn run_start_binds_active_and_log_metric_round_trips() {
     assert_ne!(r.is_error, Some(true));
     let v: serde_json::Value = serde_json::from_str(&body_text(&r)).unwrap();
     let run_id = v["run_id"].as_str().unwrap().to_string();
-    assert_eq!(v["rom_sha1"], "sha_a");
+    assert_eq!(v["rom_sha1"], "sha-a");
     // active 바인딩 확인
     assert_eq!(
         s.active_run.lock().unwrap().as_ref().unwrap().run_id,
@@ -92,7 +122,7 @@ async fn run_start_binds_active_and_log_metric_round_trips() {
     assert_ne!(r.is_error, Some(true));
 
     // 디스크에 기록된 값을 확인
-    let run = emucap::track::store::load_run(root, "sha_a", &run_id).unwrap();
+    let run = emucap::track::store::load_run(root, "sha-a", &run_id).unwrap();
     assert_eq!(run.status, emucap::track::model::RunStatus::Running);
     assert!(run
         .metrics
@@ -107,7 +137,7 @@ async fn run_finish_clears_active() {
     let s = EmucapTrack::new();
     let r = s
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_b".into(),
+            rom_sha1: "sha-b".into(),
             connection_ref: None,
             goal: None,
             description: None,
@@ -125,7 +155,7 @@ async fn run_finish_clears_active() {
         .await;
     assert_ne!(r.is_error, Some(true));
     assert!(s.active_run.lock().unwrap().is_none());
-    let run = emucap::track::store::load_run(root, "sha_b", &run_id).unwrap();
+    let run = emucap::track::store::load_run(root, "sha-b", &run_id).unwrap();
     assert_eq!(run.status, emucap::track::model::RunStatus::Done);
 }
 
@@ -139,7 +169,7 @@ async fn run_finish_by_id_recovers_orphan() {
         root,
         &emucap::track::id::UlidGen,
         &now,
-        "sha_c",
+        "sha-c",
         None,
         None,
         vec![],
@@ -154,7 +184,7 @@ async fn run_finish_by_id_recovers_orphan() {
         }))
         .await;
     assert_ne!(r.is_error, Some(true));
-    let loaded = emucap::track::store::load_run(root, "sha_c", &run.id).unwrap();
+    let loaded = emucap::track::store::load_run(root, "sha-c", &run.id).unwrap();
     assert_eq!(loaded.status, emucap::track::model::RunStatus::Aborted);
 }
 
@@ -165,7 +195,7 @@ async fn log_intervention_records_to_active_run() {
     let s = EmucapTrack::new();
     let r = s
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_d".into(),
+            rom_sha1: "sha-d".into(),
             connection_ref: None,
             goal: None,
             description: None,
@@ -185,7 +215,7 @@ async fn log_intervention_records_to_active_run() {
         }))
         .await;
     assert_ne!(r.is_error, Some(true));
-    let run = emucap::track::store::load_run(root, "sha_d", &run_id).unwrap();
+    let run = emucap::track::store::load_run(root, "sha-d", &run_id).unwrap();
     assert_eq!(run.interventions.len(), 1);
     assert_eq!(run.interventions[0].op, "write_memory");
     assert_eq!(run.interventions[0].at_frame, Some(7));
@@ -201,7 +231,7 @@ async fn bootstrap_reports_ledger_active_and_orphans() {
         root,
         &emucap::track::id::UlidGen,
         &now,
-        "sha_e",
+        "sha-e",
         None,
         None,
         vec![],
@@ -227,7 +257,7 @@ async fn run_start_resumes_same_connection_and_rom_without_new_run() {
     let s1 = EmucapTrack::new();
     let r = s1
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_a".into(),
+            rom_sha1: "sha-a".into(),
             connection_ref: Some("port:1".into()),
             goal: None,
             description: None,
@@ -242,7 +272,7 @@ async fn run_start_resumes_same_connection_and_rom_without_new_run() {
     let s2 = EmucapTrack::new();
     let r = s2
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_a".into(),
+            rom_sha1: "sha-a".into(),
             connection_ref: Some("port:1".into()),
             goal: None,
             description: None,
@@ -276,7 +306,7 @@ async fn run_start_supersedes_on_rom_mismatch_same_connection() {
     let s1 = EmucapTrack::new();
     let r = s1
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_a".into(),
+            rom_sha1: "sha-a".into(),
             connection_ref: Some("port:1".into()),
             goal: None,
             description: None,
@@ -290,7 +320,7 @@ async fn run_start_supersedes_on_rom_mismatch_same_connection() {
     let s2 = EmucapTrack::new();
     let r = s2
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_b".into(),
+            rom_sha1: "sha-b".into(),
             connection_ref: Some("port:1".into()),
             goal: None,
             description: None,
@@ -303,13 +333,13 @@ async fn run_start_supersedes_on_rom_mismatch_same_connection() {
     assert_ne!(r1, r2);
     // R1은 superseded(aborted), R2는 running
     assert_eq!(
-        emucap::track::store::load_run(root, "sha_a", &r1)
+        emucap::track::store::load_run(root, "sha-a", &r1)
             .unwrap()
             .status,
         emucap::track::model::RunStatus::Aborted
     );
     assert_eq!(
-        emucap::track::store::load_run(root, "sha_b", &r2)
+        emucap::track::store::load_run(root, "sha-b", &r2)
             .unwrap()
             .status,
         emucap::track::model::RunStatus::Running
@@ -323,7 +353,7 @@ async fn run_resume_rebinds_running_run_and_rejects_finished() {
     let s1 = EmucapTrack::new();
     let r = s1
         .run_start(Parameters(TrackRunStartArgs {
-            rom_sha1: "sha_a".into(),
+            rom_sha1: "sha-a".into(),
             connection_ref: Some("port:1".into()),
             goal: None,
             description: None,
@@ -358,7 +388,7 @@ async fn run_resume_rebinds_running_run_and_rejects_finished() {
         }))
         .await;
     assert_ne!(r.is_error, Some(true));
-    let run = emucap::track::store::load_run(root, "sha_a", &r1).unwrap();
+    let run = emucap::track::store::load_run(root, "sha-a", &r1).unwrap();
     assert!(run
         .metrics
         .iter()
@@ -404,7 +434,7 @@ async fn log_finding_requires_rom_or_active() {
     // 명시 rom_sha1이면 active 없어도 기록
     let r = s
         .log_finding(Parameters(LogFindingArgs {
-            rom_sha1: Some("sha_f".into()),
+            rom_sha1: Some("sha-f".into()),
             claim: "promoted claim".into(),
             evidence_refs: vec![],
             promoted: true,

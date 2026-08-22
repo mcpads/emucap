@@ -200,9 +200,36 @@ struct SummarizeRunsArgs {
 fn track_ok(v: serde_json::Value) -> CallToolResult {
     json_result(v)
 }
-/// 추적 도구 공통: 에러 텍스트
-fn track_err(msg: impl std::fmt::Display) -> CallToolResult {
-    error_result("tracking_error", msg)
+
+enum TrackReplyError {
+    Classified(emucap::track::mcp_ops::TrackingToolError),
+    Message(String),
+}
+
+impl From<emucap::track::mcp_ops::TrackingToolError> for TrackReplyError {
+    fn from(error: emucap::track::mcp_ops::TrackingToolError) -> Self {
+        Self::Classified(error)
+    }
+}
+
+impl From<String> for TrackReplyError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl From<&str> for TrackReplyError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_string())
+    }
+}
+
+/// Preserve classified tracking failures while keeping local lifecycle messages generic.
+fn track_err(error: impl Into<TrackReplyError>) -> CallToolResult {
+    match error.into() {
+        TrackReplyError::Classified(error) => error_result(error.code(), error),
+        TrackReplyError::Message(message) => error_result("tracking_error", message),
+    }
 }
 
 /// Self-contained guidance shown to every Tracking MCP consumer.
@@ -210,6 +237,7 @@ const SERVER_INSTRUCTIONS: &str = r#"emucap Tracking MCP stores experiment recor
 
 [Identity from Control MCP]
 - Pass `get_rom_info.rom_sha1` unchanged to `run_start` and ROM-scoped queries. This server does not read the ROM. Use `shasum -a1 <content>` only when a backend cannot provide `rom_sha1`.
+- Treat `run_id`, `finding_id`, and ROM identifiers as opaque returned values. Do not invent paths or normalize them; stored identifiers use ASCII letters and digits separated only by single hyphens.
 - `connection_ref` is optional. Use `status.emulator_identity.name`, or `"port:" + status.listening_port`. It lets `run_start` resume the same unfinished run or supersede an older run for that connection.
 - Record Control MCP analysis results with `log_gate` or `log_metric`.
 - Mutations such as `write_memory`, `load_state`, `reset`, and input are not recorded automatically. Call `log_intervention` when they matter to reproduction.
@@ -234,6 +262,7 @@ The ledger root is `EMUCAP_TRACK_ROOT`, otherwise the nearest Git repository's `
 [Queries]
 - `query_runs` lists filtered runs, newest first. Corrupt JSON is counted as skipped instead of aborting the query.
 - `get_run` returns a stored `run.json` and its ledger path.
+- Missing runs return `run_not_found`; malformed identifiers return `invalid_identifier`. Filesystem diagnostics are reserved for actual ledger failures.
 - `compare_runs` compares metrics, gates, reproduction, interventions, and files.
 - `summarize_runs` aggregates status, reproduction, gates, interventions, and per-run summaries.
 The server reports stored evidence; it does not decide whether an experiment succeeded.
@@ -264,7 +293,7 @@ impl EmucapTrack {
             &ActiveRun,
             &emucap::track::id::UlidGen,
             &str,
-        ) -> Result<serde_json::Value, String>,
+        ) -> Result<serde_json::Value, emucap::track::mcp_ops::TrackingToolError>,
     {
         let active = self
             .active_run

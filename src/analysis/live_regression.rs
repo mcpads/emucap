@@ -2,6 +2,7 @@ use crate::analysis::bisect::{self, CmpOp, Predicate};
 use crate::analysis::regression;
 use crate::live::link::{EmulatorLink, LinkError};
 use crate::live::tools;
+use std::path::{Path, PathBuf};
 
 pub use crate::analysis::regression::{load_case, load_suite, CaseResult, Summary};
 
@@ -43,6 +44,51 @@ pub struct DetResult {
     pub hashes: Vec<String>,
 }
 
+#[derive(Debug)]
+enum CaseMemberError {
+    Missing,
+    Unsafe(String),
+}
+
+fn case_member_path(dir: &Path, file_name: &str) -> Result<PathBuf, CaseMemberError> {
+    if !crate::path_safety::is_portable_file_name(file_name, 128) {
+        return Err(CaseMemberError::Unsafe(
+            "case member must be a portable file name".into(),
+        ));
+    }
+    let root = std::fs::canonicalize(dir)
+        .map_err(|error| CaseMemberError::Unsafe(format!("invalid case directory: {error}")))?;
+    let path = dir.join(file_name);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CaseMemberError::Missing)
+        }
+        Err(error) => {
+            return Err(CaseMemberError::Unsafe(format!(
+                "cannot inspect case member: {error}"
+            )))
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(CaseMemberError::Unsafe(
+            "case member is not a regular owned file".into(),
+        ));
+    }
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|error| CaseMemberError::Unsafe(format!("invalid case member: {error}")))?;
+    if !canonical.starts_with(&root) {
+        return Err(CaseMemberError::Unsafe(
+            "case member escapes the case directory".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn state_member_path(dir: &Path, state_id: &str) -> Result<PathBuf, CaseMemberError> {
+    case_member_path(dir, &format!("{state_id}.mss"))
+}
+
 /// 한 번의 재생 + 관측. InputReplay는 frozen observe_hash, Savestate+Memory는 원자 probe.
 fn run_repro_observe(
     link: &mut dyn EmulatorLink,
@@ -68,10 +114,17 @@ fn run_repro_observe(
             if !has_method(link, "probe") {
                 return Err(DetOutcome::Unsupported("probe".into()));
             }
-            let mss = dir.join(format!("{state_sha1}.mss"));
-            if !mss.is_file() {
-                return Err(DetOutcome::MeasurementInvalid("missing_payload".into()));
-            }
+            let mss = match state_member_path(dir, state_sha1) {
+                Ok(path) => path,
+                Err(CaseMemberError::Missing) => {
+                    return Err(DetOutcome::MeasurementInvalid("missing_payload".into()))
+                }
+                Err(CaseMemberError::Unsafe(reason)) => {
+                    return Err(DetOutcome::MeasurementInvalid(format!(
+                        "invalid_payload: {reason}"
+                    )))
+                }
+            };
             // probe_bytes는 length 1~8 제약 없음 — dummy op/value Predicate.
             let pred = Predicate {
                 memory_type: memory_type.clone(),
@@ -133,7 +186,17 @@ fn run_repro_observe(
                     }
                 }
             }
-            let movie_path = dir.join(movie);
+            let movie_path = match case_member_path(dir, movie) {
+                Ok(path) => path,
+                Err(CaseMemberError::Missing) => {
+                    return Err(DetOutcome::MeasurementInvalid("missing_payload".into()))
+                }
+                Err(CaseMemberError::Unsafe(reason)) => {
+                    return Err(DetOutcome::MeasurementInvalid(format!(
+                        "invalid_payload: {reason}"
+                    )))
+                }
+            };
             let text = match std::fs::read_to_string(&movie_path) {
                 Ok(t) => t,
                 Err(_) => return Err(DetOutcome::MeasurementInvalid("missing_payload".into())),
@@ -146,10 +209,17 @@ fn run_repro_observe(
             let start_res = if start == "reset" {
                 link.call("reset", serde_json::json!({})).map(|_| ())
             } else {
-                let mss = dir.join(format!("{start}.mss"));
-                if !mss.is_file() {
-                    return Err(DetOutcome::MeasurementInvalid("missing_payload".into()));
-                }
+                let mss = match state_member_path(dir, start) {
+                    Ok(path) => path,
+                    Err(CaseMemberError::Missing) => {
+                        return Err(DetOutcome::MeasurementInvalid("missing_payload".into()))
+                    }
+                    Err(CaseMemberError::Unsafe(reason)) => {
+                        return Err(DetOutcome::MeasurementInvalid(format!(
+                            "invalid_payload: {reason}"
+                        )))
+                    }
+                };
                 link.call(
                     "load_state",
                     serde_json::json!({"path": mss.to_string_lossy()}),
@@ -331,10 +401,13 @@ pub fn run_one_case(
             if !has_method(link, "probe") {
                 return regression::Verdict::Unsupported;
             }
-            let mss = dir.join(format!("{state_sha1}.mss"));
-            if !mss.is_file() {
-                return regression::Verdict::MissingPayload;
-            }
+            let mss = match state_member_path(dir, state_sha1) {
+                Ok(path) => path,
+                Err(CaseMemberError::Missing) => return regression::Verdict::MissingPayload,
+                Err(CaseMemberError::Unsafe(reason)) => {
+                    return regression::Verdict::Invalid(reason)
+                }
+            };
             // 원자적 probe(load→진행→읽기). 비결정론·네트워크 갭 없음. 바이트로 invalid_read 검증.
             match bisect::probe_bytes(
                 link,
@@ -377,7 +450,13 @@ pub fn run_one_case(
                     Err(e) => return regression::Verdict::ReproError(e),
                 }
             }
-            let movie_path = dir.join(movie);
+            let movie_path = match case_member_path(dir, movie) {
+                Ok(path) => path,
+                Err(CaseMemberError::Missing) => return regression::Verdict::MissingPayload,
+                Err(CaseMemberError::Unsafe(reason)) => {
+                    return regression::Verdict::Invalid(reason)
+                }
+            };
             let text = match std::fs::read_to_string(&movie_path) {
                 Ok(t) => t,
                 Err(_) => return regression::Verdict::MissingPayload,
@@ -390,10 +469,13 @@ pub fn run_one_case(
             let start_res = if start == "reset" {
                 link.call("reset", serde_json::json!({})).map(|_| ())
             } else {
-                let mss = dir.join(format!("{start}.mss"));
-                if !mss.is_file() {
-                    return regression::Verdict::MissingPayload;
-                }
+                let mss = match state_member_path(dir, start) {
+                    Ok(path) => path,
+                    Err(CaseMemberError::Missing) => return regression::Verdict::MissingPayload,
+                    Err(CaseMemberError::Unsafe(reason)) => {
+                        return regression::Verdict::Invalid(reason)
+                    }
+                };
                 link.call(
                     "load_state",
                     serde_json::json!({"path": mss.to_string_lossy()}),

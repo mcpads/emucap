@@ -34,3 +34,31 @@ fn load_errors_when_bin_missing() {
     .unwrap();
     assert!(matches!(load(tmp.path()), Err(DumpError::BinNotFound(_))));
 }
+
+#[test]
+fn load_rejects_a_region_name_that_becomes_a_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("regions.json"),
+        r#"[{ "name": "../outside", "memory_type": "ram", "base_address": 0, "size": 1 }]"#,
+    )
+    .unwrap();
+    assert!(matches!(load(tmp.path()), Err(DumpError::UnsafeMember(_))));
+}
+
+#[cfg(unix)]
+#[test]
+fn load_rejects_a_symlink_region_member() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tmp.path().join("outside.bin");
+    fs::write(&outside, [1u8]).unwrap();
+    symlink(&outside, tmp.path().join("wram.bin")).unwrap();
+    fs::write(
+        tmp.path().join("regions.json"),
+        r#"[{ "name": "wram", "memory_type": "ram", "base_address": 0, "size": 1 }]"#,
+    )
+    .unwrap();
+    assert!(matches!(load(tmp.path()), Err(DumpError::UnsafeMember(_))));
+}

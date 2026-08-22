@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
 
 pub use super::error::FinalizeError;
@@ -18,13 +19,22 @@ const NOTE_TEMPLATE: &str = "\
 
 ## 기대 동작
 ";
+const MAX_RAW_JSON_BYTES: u64 = 4 * 1024 * 1024;
 
 pub fn finalize(bundle_dir: &Path, rom_override: Option<&Path>) -> Result<Manifest, FinalizeError> {
     let raw_path = bundle_dir.join("_raw.json");
-    if !raw_path.exists() {
+    if fs::symlink_metadata(&raw_path).is_err() {
         return Err(FinalizeError::RawNotFound(raw_path));
     }
-    let raw = parse_raw(&fs::read_to_string(&raw_path)?)?;
+    let raw_bytes = crate::path_safety::read_bounded_regular_member(
+        bundle_dir,
+        "_raw.json",
+        MAX_RAW_JSON_BYTES,
+    )?;
+    let raw = parse_raw(
+        std::str::from_utf8(&raw_bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?,
+    )?;
 
     if raw.format_version != FORMAT_VERSION {
         return Err(FinalizeError::UnsupportedFormatVersion(raw.format_version));
@@ -58,10 +68,7 @@ pub fn finalize(bundle_dir: &Path, rom_override: Option<&Path>) -> Result<Manife
                     Path::new(rel).to_path_buf(),
                 ));
             }
-            let p = resolve(bundle_dir, rel);
-            if !p.exists() {
-                return Err(FinalizeError::ArtifactMissing(p));
-            }
+            validate_artifact(bundle_dir, rel)?;
         }
     }
     if let Some(movie) = &raw.input_movie {
@@ -70,10 +77,7 @@ pub fn finalize(bundle_dir: &Path, rom_override: Option<&Path>) -> Result<Manife
                 Path::new(movie).to_path_buf(),
             ));
         }
-        let p = resolve(bundle_dir, movie);
-        if !p.exists() {
-            return Err(FinalizeError::ArtifactMissing(p));
-        }
+        validate_artifact(bundle_dir, movie)?;
     }
 
     let manifest = Manifest {
@@ -93,12 +97,21 @@ pub fn finalize(bundle_dir: &Path, rom_override: Option<&Path>) -> Result<Manife
 
     // manifest.json 쓰기 (우리 타입 직렬화는 실패하지 않음)
     let json = serde_json::to_string_pretty(&manifest).expect("매니페스트 직렬화");
-    fs::write(bundle_dir.join("manifest.json"), json)?;
+    crate::path_safety::atomic_write_file(&bundle_dir.join("manifest.json"), json.as_bytes())?;
 
     // note.md 템플릿 — 이미 있으면 덮어쓰지 않음(사람 내용 보존)
     let note_path = bundle_dir.join("note.md");
-    if !note_path.exists() {
-        fs::write(&note_path, NOTE_TEMPLATE)?;
+    if fs::symlink_metadata(&note_path).is_err() {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut note = options.open(&note_path)?;
+        note.write_all(NOTE_TEMPLATE.as_bytes())?;
+        note.sync_all()?;
     }
 
     Ok(manifest)
@@ -120,6 +133,16 @@ fn resolve(base: &Path, p: &str) -> std::path::PathBuf {
         path.to_path_buf()
     } else {
         base.join(path)
+    }
+}
+
+fn validate_artifact(bundle_dir: &Path, relative: &str) -> Result<(), FinalizeError> {
+    match crate::path_safety::regular_member_path(bundle_dir, relative) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(
+            FinalizeError::ArtifactMissing(resolve(bundle_dir, relative)),
+        ),
+        Err(_) => Err(FinalizeError::UnsafeArtifact(resolve(bundle_dir, relative))),
     }
 }
 

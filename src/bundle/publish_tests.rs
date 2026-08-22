@@ -394,6 +394,10 @@ fn validates_output_root_capture_id_and_existing_destination_before_mutation() {
         RecordingStaging::prepare(root.path(), "../escape"),
         Err(super::error::PublishError::InvalidCaptureId(_))
     ));
+    assert!(matches!(
+        RecordingStaging::prepare(root.path(), "capture_escape"),
+        Err(super::error::PublishError::InvalidCaptureId(_))
+    ));
     fs::create_dir(root.path().join("capture-existing")).unwrap();
     assert!(matches!(
         RecordingStaging::prepare(root.path(), "capture-existing"),

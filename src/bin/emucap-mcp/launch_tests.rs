@@ -11,6 +11,21 @@ use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn cue_marker_scan_does_not_read_a_parent_reference() {
+    let root = tempfile::tempdir().unwrap();
+    let cue_dir = root.path().join("disc");
+    std::fs::create_dir(&cue_dir).unwrap();
+    std::fs::write(root.path().join("outside.bin"), b"PLAYSTATION").unwrap();
+    let cue = cue_dir.join("disc.cue");
+    std::fs::write(&cue, "FILE \"../outside.bin\" BINARY\n").unwrap();
+
+    let markers = content_markers(cue.to_str());
+
+    assert_eq!(markers["markers"], serde_json::json!([]));
+    assert_eq!(markers["scanned_files"], serde_json::json!([]));
+}
+
 #[cfg(unix)]
 fn test_runtime_binding(port: u16) -> RuntimeBinding {
     let current_launch_id = emucap::live::runtime::RuntimeStore::discover()
@@ -783,6 +798,31 @@ fn launch_plan_with_ambiguous_media_preserves_content_and_requests_system() {
         plan["next_action"]["then_call"]["arguments_from"],
         serde_json::json!(["system"])
     );
+}
+
+#[test]
+fn launch_plan_blocks_a_cue_graph_that_escapes_its_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let disc = root.path().join("disc");
+    std::fs::create_dir(&disc).unwrap();
+    std::fs::write(root.path().join("outside.bin"), b"track").unwrap();
+    let cue = disc.join("disc.cue");
+    std::fs::write(&cue, "FILE \"../outside.bin\" BINARY\n").unwrap();
+    let plan = make_launch_plan(
+        Some(47804),
+        &LaunchPlanArgs {
+            content_path: Some(cue.display().to_string()),
+            system: Some("saturn".into()),
+        },
+    );
+    assert_eq!(plan["ready_to_launch"], false);
+    assert!(plan["launch_blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker
+            .as_str()
+            .is_some_and(|text| text.contains("CUE graph"))));
 }
 
 #[test]

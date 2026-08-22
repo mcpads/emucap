@@ -445,11 +445,11 @@ impl EmulatorLink for LazyNoProbe {
 #[test]
 fn savestate_regression_without_probe_is_unsupported_after_capability_load() {
     let tmp = tempfile::tempdir().unwrap();
-    let case_dir = tmp.path().join("pc98_case");
+    let case_dir = tmp.path().join("pc98-case");
     std::fs::create_dir_all(&case_dir).unwrap();
     let case = regression::Case {
         format_version: regression::CASE_FORMAT_VERSION,
-        id: "pc98_case".into(),
+        id: "pc98-case".into(),
         description: "probe 없는 어댑터".into(),
         rom: regression::RomRef {
             sha1: "unused".into(),
@@ -579,12 +579,12 @@ impl EmulatorLink for Pc98InputReplayLink {
 
 fn input_replay_case() -> (tempfile::TempDir, std::path::PathBuf, regression::Case) {
     let tmp = tempfile::tempdir().unwrap();
-    let case_dir = tmp.path().join("pc98_input");
+    let case_dir = tmp.path().join("pc98-input");
     std::fs::create_dir_all(&case_dir).unwrap();
     std::fs::write(case_dir.join("inputs.movie"), "0:enter\n").unwrap();
     let case = regression::Case {
         format_version: regression::CASE_FORMAT_VERSION,
-        id: "pc98_input".into(),
+        id: "pc98-input".into(),
         description: "PC-98 reset input replay".into(),
         rom: regression::RomRef {
             sha1: "unused".into(),
@@ -636,6 +636,33 @@ fn pc98_input_replay_without_probe_can_pass_from_reset() {
             "pause"
         ]
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn input_replay_rejects_a_symlink_movie_member() {
+    use std::os::unix::fs::symlink;
+
+    let (tmp, case_dir, case) = input_replay_case();
+    let outside = tmp.path().join("outside.movie");
+    std::fs::write(&outside, "0:enter\n").unwrap();
+    std::fs::remove_file(case_dir.join("inputs.movie")).unwrap();
+    symlink(&outside, case_dir.join("inputs.movie")).unwrap();
+    let mut link = Pc98InputReplayLink::new(
+        &[
+            "reset",
+            "pause",
+            "set_input",
+            "step",
+            "read_memory",
+            "clear_all_breakpoints",
+        ],
+        "01",
+    );
+    assert!(matches!(
+        run_one_case(&mut link, &case_dir, &case),
+        regression::Verdict::Invalid(reason) if reason.contains("regular owned file")
+    ));
 }
 
 #[test]

@@ -378,12 +378,13 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         "snes_interrupt_delivery",
         "snes_ppu_obj_consumption_read",
         "snes_ppu_cgram_lookup",
+        "snes_ppu_bg_chr_fetch",
     ] {
         let identity = registry.identities([id]).unwrap().remove(0);
         let startable = identity.id == "snes_cpu_instruction";
         let stoppable = matches!(
             identity.id.as_str(),
-            "snes_ppu_obj_consumption_read" | "snes_ppu_cgram_lookup"
+            "snes_ppu_obj_consumption_read" | "snes_ppu_cgram_lookup" | "snes_ppu_bg_chr_fetch"
         );
         let filterable_fields = match identity.id.as_str() {
             "snes_ppu_obj_consumption_read" => vec![
@@ -432,6 +433,26 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
                     max: 0xffff,
                 },
             ],
+            "snes_ppu_bg_chr_fetch" => vec![
+                RecordingEventFilterField {
+                    path: "address".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 0x7fff,
+                },
+                RecordingEventFilterField {
+                    path: "layer".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 3,
+                },
+                RecordingEventFilterField {
+                    path: "scanline".into(),
+                    kind: RecordingEventFilterKind::U64Range,
+                    min: 0,
+                    max: 0xffff,
+                },
+            ],
             _ => vec![],
         };
         capability.event_classes.push(RecordingEventCapability {
@@ -457,12 +478,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         deep_without_snapshots.revision,
-        "a37de2f20517d122a960f9ed98f243664ebce7eb15b693fc4ad5d6de1229e00c"
+        "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "302875a198ab9036285ee242245218132f1096d43aef1151d16cbfb307a637fd"
+        "59e5b8f3c29fe258032eaadcca0ddea49fd47b23dd6a3d4c7e9d7311acd23787"
     );
     capability.repeatability = Some(RecordingRepeatabilityCapability {
         profile: "mesen_snes_repeatable".into(),
@@ -474,7 +495,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "338356d4b8f9c7c02b7923f4429afcf3e7db0ed3c7c1ba6d4dad535fb8fe1b13"
+        "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d"
     );
 }
 
