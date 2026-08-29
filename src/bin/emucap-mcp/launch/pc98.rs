@@ -1,3 +1,4 @@
+use super::plan::adapter_log_path;
 use super::*;
 
 pub(super) fn pc98_headless(a: &LaunchArgs) -> bool {

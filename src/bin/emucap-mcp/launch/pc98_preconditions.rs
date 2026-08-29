@@ -1,3 +1,4 @@
+use super::plan::{env_path_matches, path_matches_candidates, simple_binary_precondition};
 use super::*;
 
 pub(super) fn mame_binary_precondition_from(
