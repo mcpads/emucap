@@ -473,7 +473,7 @@ impl RuntimeStore {
         Ok(())
     }
 
-    fn create_managed_dir(&self, path: &Path) -> io::Result<()> {
+    pub(crate) fn create_managed_dir(&self, path: &Path) -> io::Result<()> {
         if !path.starts_with(&self.root) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -921,7 +921,7 @@ fn validate_existing_private_file(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn write_atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+pub(crate) fn write_atomic_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
     let bytes =
         serde_json::to_vec(value).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     write_atomic_bytes(path, &bytes)
@@ -1065,12 +1065,12 @@ fn validate_launch_id(launch_id: &str) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn sync_parent(parent: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(parent: &Path) -> io::Result<()> {
     File::open(parent)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_parent: &Path) -> io::Result<()> {
+pub(crate) fn sync_parent(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 

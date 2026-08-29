@@ -423,6 +423,11 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "mame_pc98": {
                 "build": abs_path_json(&root, &["adapters", "mame-pc98", "build.sh"]),
             },
+            "np2kai": {
+                "build": abs_path_json(&root, &["adapters", "np2kai", "build.sh"]),
+                "adapter_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-np2kai.exe" } else { "emucap-np2kai" }]),
+                "firmware_env": "EMUCAP_NP2KAI_FIRMWARE",
+            },
             "mame_neogeo": {
                 "build": abs_path_json(&root, &["adapters", "mame-neogeo", "build.sh"]),
                 "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-mame-neogeo-bridge.exe" } else { "emucap-mame-neogeo-bridge" }]),
@@ -586,7 +591,9 @@ fn build_supported_systems_value() -> serde_json::Value {
             "system": "pc98",
             "aliases": ["pc-98", "mame-pc98"],
             "adapter": "mame_pc98",
+            "selectable_backends": ["mame", "np2kai"],
             "content": ["hdi", "hdm", "d88"],
+            "notes": "MAME remains the default backend. Both backends expose the common PC-98 Control/Debug method set. Select pc98_backend=np2kai explicitly for validated HDI compatibility; launch_plan recommends it for consistent 256-byte-sector HDI geometry but never switches automatically.",
         },
         {
             "system": "neogeo_mvs",

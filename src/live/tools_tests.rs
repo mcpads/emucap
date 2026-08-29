@@ -976,3 +976,155 @@ fn dump_memory_state_write_failure_preserves_prior_dump() {
         staging_leftovers(tmp.path())
     );
 }
+
+struct SaveReceiptLink {
+    caps: Capabilities,
+    port: u16,
+    boundary: &'static str,
+}
+
+impl EmulatorLink for SaveReceiptLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        assert_eq!(method, "save_state");
+        let path = params["path"].as_str().unwrap();
+        std::fs::write(path, b"producer-state").unwrap();
+        Ok(json!({
+            "status": "completed",
+            "path": path,
+            "bytes": 14,
+            "state": "frozen",
+            "frame": 37,
+            "boundary": self.boundary,
+        }))
+    }
+
+    fn endpoint_port(&self) -> Option<u16> {
+        Some(self.port)
+    }
+}
+
+#[test]
+fn frozen_save_returns_a_producer_managed_receipt_instead_of_a_caller_digest() {
+    use super::recording_capability::*;
+    use super::runtime::{ManifestSpec, RuntimeStore};
+    use crate::bundle::recording_manifest::RecordingLimits;
+
+    let directory = tempfile::tempdir().unwrap();
+    let content = directory.path().join("game.sfc");
+    std::fs::write(&content, b"game").unwrap();
+    let state_path = directory.path().join("anchor.mss");
+    let store = RuntimeStore::new(directory.path().join("sessions"));
+    let prepared = store.prepare(47800).unwrap();
+    let launch_id = prepared.launch_id().to_string();
+    prepared
+        .commit(&prepared.manifest(ManifestSpec {
+            adapter: "mesen2".into(),
+            system: "snes".into(),
+            content: content.to_string_lossy().into_owned(),
+            emulator_pid: std::process::id(),
+            bridge_pid: None,
+            backend_endpoint: None,
+            build: Some("adapter-build".into()),
+        }))
+        .unwrap();
+    let capability = RecordingCapability {
+        revision: "aa".repeat(32),
+        origins: vec![
+            RecordingCapabilityOrigin::NextFrameBoundary,
+            RecordingCapabilityOrigin::StateLoad,
+        ],
+        units: vec![RecordingCapabilityUnit::Frames],
+        default_event_classes: vec!["frame_boundary".into()],
+        event_classes: vec![],
+        event_order: None,
+        class_accounting: false,
+        input_movie: Some(RecordingInputMovieCapability {
+            format: INPUT_MOVIE_FORMAT.into(),
+            port: 0,
+            max_frames: 10,
+            max_bytes: 1024,
+            max_buttons_per_frame: 32,
+        }),
+        state_load: Some(RecordingStateLoadCapability {
+            format: "mesen-savestate".into(),
+            max_bytes: 1024,
+            alignment: RecordingStateLoadAlignment::RestoredFrameBoundary,
+            requires_input_movie: true,
+        }),
+        initial_snapshots: None,
+        terminal_snapshots: None,
+        terminal_state: None,
+        warmup: None,
+        repeatability: None,
+        limits: RecordingLimits {
+            max_frames: 10,
+            max_events: 10,
+            max_bytes: 1024,
+            max_line_bytes: 512,
+            max_host_ms: 1000,
+            progress_interval_ms: 100,
+        },
+    };
+    let mut link = SaveReceiptLink {
+        caps: Capabilities {
+            protocol_version: 1,
+            methods: vec!["save_state".into(), "record_window".into()],
+            memory_types: vec![],
+            memory_regions: vec![],
+            breakpoint_kinds: vec![],
+            contracts: crate::contracts::ContractAdvertisement::Unreported,
+            recording: Some(capability),
+            identity: EmulatorIdentity {
+                system: Some("snes".into()),
+                adapter: Some("mesen2-live".into()),
+                build: Some("adapter-build".into()),
+                content: Some(content.to_string_lossy().into_owned()),
+                launch_id: Some(launch_id.clone()),
+                host_build: Some(json!({
+                    "upstream": "https://example.invalid/mesen",
+                    "commit": "upstream",
+                    "patchset_sha256": "bb".repeat(32),
+                    "binary_sha256": "cc".repeat(32),
+                })),
+                ..EmulatorIdentity::default()
+            },
+        },
+        port: 47800,
+        boundary: "frame_boundary",
+    };
+
+    let ordinary_path = directory.path().join("ordinary.mss");
+    let ToolOutput::Json(ordinary) =
+        save_state(&mut link, ordinary_path.to_str().unwrap()).unwrap()
+    else {
+        panic!("save_state must return JSON")
+    };
+    assert!(ordinary.get("snapshot_receipt").is_none());
+    assert!(!store
+        .generation_dir(47800, &launch_id)
+        .join("recording-snapshots")
+        .exists());
+
+    let ToolOutput::Json(result) =
+        save_state_in_store(&mut link, state_path.to_str().unwrap(), store.clone()).unwrap()
+    else {
+        panic!("save_state must return JSON")
+    };
+    let snapshot_id = result["snapshot_receipt"]["snapshot_id"].as_str().unwrap();
+    assert!(snapshot_id.starts_with("snapshot-"));
+    assert_eq!(
+        result["snapshot_receipt"]["frozen"]["boundary"],
+        "frame_boundary"
+    );
+    assert_ne!(snapshot_id, state_path.to_string_lossy());
+    assert!(store
+        .generation_dir(47800, &launch_id)
+        .join("recording-snapshots")
+        .join(snapshot_id)
+        .join("state.bin")
+        .is_file());
+}

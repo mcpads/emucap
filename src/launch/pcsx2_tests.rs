@@ -37,6 +37,7 @@ fn session_config_enables_pine_and_uses_bios_in_place() {
     assert!(ini.contains(&format!("Bios = {}", bios_directory.display())));
     assert!(ini.contains("BIOS = SCPH-10000.bin"));
     assert!(!prepared.data_root.join("bios/SCPH-10000.bin").exists());
+    assert!(prepared.data_root.join("memcards").is_dir());
 }
 
 #[test]
@@ -77,6 +78,14 @@ fn emulator_spec_isolates_data_and_places_flags_before_content() {
         bridge_spec
             .env
             .iter()
+            .find(|(key, _)| key == "EMUCAP_PCSX2_DATAROOT")
+            .map(|(_, value)| PathBuf::from(value)),
+        Some(prepared.data_root.clone())
+    );
+    assert_eq!(
+        bridge_spec
+            .env
+            .iter()
             .find(|(key, _)| key == "EMUCAP_PCSX2_CAPTURE_DIR")
             .map(|(_, value)| PathBuf::from(value)),
         Some(prepared.data_root.join("captures"))
@@ -98,7 +107,7 @@ fn build_sidecar_must_match_the_pinned_lock() {
          PCSX2_PATCHES_COMMIT=2222222222222222222222222222222222222222\n\
          PCSX2_PATCHES_TREE=3333333333333333333333333333333333333333\n\
          PCSX2_PATCHES_ARCHIVE_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
-         PCSX2_HOST_API=3\n\
+         PCSX2_HOST_API=4\n\
          PCSX2_PATCHSET_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
     )
     .unwrap();
@@ -132,5 +141,5 @@ fn build_sidecar_must_match_the_pinned_lock() {
     assert!(require_compatible_build(root.path(), &bin)
         .unwrap_err()
         .to_string()
-        .contains("host API 4 is incompatible"));
+        .contains("host API 5 is incompatible"));
 }

@@ -60,6 +60,27 @@ fn pine_string(value: &str) -> Vec<u8> {
     reply
 }
 
+fn pine_memory_card_status(
+    busy_remaining_frames: u32,
+    slots: [(bool, bool, u32, u32, &str); 2],
+) -> Vec<u8> {
+    let mut reply = Vec::new();
+    reply.extend_from_slice(&busy_remaining_frames.to_le_bytes());
+    reply.extend_from_slice(&2u32.to_le_bytes());
+    for (index, (enabled, present, card_type, eject_frames, filename)) in
+        slots.into_iter().enumerate()
+    {
+        reply.extend_from_slice(&(index as u32).to_le_bytes());
+        reply.extend_from_slice(&u32::from(enabled).to_le_bytes());
+        reply.extend_from_slice(&u32::from(present).to_le_bytes());
+        reply.extend_from_slice(&card_type.to_le_bytes());
+        reply.extend_from_slice(&eject_frames.to_le_bytes());
+        reply.extend_from_slice(&(filename.len() as u32).to_le_bytes());
+        reply.extend_from_slice(filename.as_bytes());
+    }
+    reply
+}
+
 #[test]
 fn reports_terminal_backend_state_from_transport() {
     let pine = FakePine {
@@ -116,7 +137,7 @@ fn rejects_stock_pine_without_the_host_api() {
 }
 
 #[test]
-fn hello_reports_the_host_api_three_surface() {
+fn hello_reports_the_managed_ps2_surface() {
     let mut bridge = bridge(vec![]);
     let response = bridge.handle_request(Request::new(1, "hello", json!({})));
     assert!(response.ok);
@@ -161,6 +182,12 @@ fn hello_reports_the_host_api_three_surface() {
         .unwrap()
         .iter()
         .any(|method| method == "set_breakpoint"));
+    assert!(result["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|method| method == "change_media"));
+    assert_eq!(result["media_devices"][1]["id"], "mcd2");
 }
 
 #[test]
@@ -401,12 +428,205 @@ fn status_reports_emulator_owned_persistent_input() {
         (vec![MSG_STATUS], Ok(0u32.to_le_bytes().to_vec())),
         (vec![MSG_VERSION], Ok(pine_string("v2.6.3"))),
         (vec![MSG_EMUCAP_INPUT_STATUS], Ok(input)),
+        (
+            vec![MSG_EMUCAP_MEMORY_CARD_STATUS],
+            Ok(pine_memory_card_status(
+                0,
+                [(true, true, 1, 0, "Mcd001.ps2"), (true, false, 0, 0, "")],
+            )),
+        ),
     ]);
     let response = bridge.handle_request(Request::new(24, "status", json!({})));
     let result = response.result.unwrap();
     assert_eq!(result["input_override"]["authority"], "emulator");
     assert_eq!(result["input_override"]["mode"], "persistent");
     assert_eq!(result["input_override"]["buttons"][0], "cross");
+    assert_eq!(result["mounted_media"][0]["guest_present"], true);
+    assert_eq!(result["mounted_media"][1]["mounted"], false);
+}
+
+#[test]
+fn memory_card_mount_is_frozen_and_reports_guest_reinsert_without_advancing_time() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cards = temporary.path().join("memcards");
+    std::fs::create_dir(&cards).unwrap();
+    let card = cards.join("slot-two.ps2");
+    std::fs::write(&card, b"test-card").unwrap();
+
+    let before = pine_memory_card_status(
+        0,
+        [(true, true, 1, 0, "Mcd001.ps2"), (true, false, 0, 0, "")],
+    );
+    let after = pine_memory_card_status(
+        0,
+        [
+            (true, true, 1, 0, "Mcd001.ps2"),
+            (true, true, 1, 60, "slot-two.ps2"),
+        ],
+    );
+    let mut native_change = vec![MSG_EMUCAP_CHANGE_MEMORY_CARD];
+    native_change.extend_from_slice(&1u32.to_le_bytes());
+    native_change.extend_from_slice(&1u32.to_le_bytes());
+    native_change.extend_from_slice(&12u32.to_le_bytes());
+    native_change.extend_from_slice(b"slot-two.ps2");
+    let mut change_reply = 0u32.to_le_bytes().to_vec();
+    change_reply.extend_from_slice(&after);
+
+    let mut bridge = bridge(vec![
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (vec![MSG_EMUCAP_MEMORY_CARD_STATUS], Ok(before)),
+        (native_change, Ok(change_reply)),
+    ]);
+    bridge.memory_card_dir = Some(cards);
+    let response = bridge.handle_request(Request::new(
+        30,
+        "change_media",
+        json!({"device":"mcd2", "path":card}),
+    ));
+    assert!(response.ok, "{response:?}");
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(result["guest_frames_advanced"], 0);
+    assert_eq!(result["current"]["mounted"], true);
+    assert_eq!(result["current"]["guest_present"], false);
+    assert_eq!(result["guest_transition"]["remaining_frames"], 60);
+    assert_eq!(
+        result["media"]["sha1_at_attach"].as_str().unwrap().len(),
+        40
+    );
+}
+
+#[test]
+fn memory_card_change_rejects_busy_backend_before_native_mutation() {
+    let mut bridge = bridge(vec![
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (
+            vec![MSG_EMUCAP_MEMORY_CARD_STATUS],
+            Ok(pine_memory_card_status(
+                300,
+                [
+                    (true, true, 1, 0, "Mcd001.ps2"),
+                    (true, true, 1, 0, "Mcd002.ps2"),
+                ],
+            )),
+        ),
+    ]);
+    let response = bridge.handle_request(Request::new(
+        31,
+        "change_media",
+        json!({"device":"mcd2", "eject":true}),
+    ));
+    assert!(!response.ok);
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, "bad_state");
+    assert!(error.message.contains("300 guest frames"));
+}
+
+#[test]
+fn memory_card_change_waits_for_every_existing_guest_transition_before_mutation() {
+    let mut bridge = bridge(vec![
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (
+            vec![MSG_EMUCAP_MEMORY_CARD_STATUS],
+            Ok(pine_memory_card_status(
+                0,
+                [
+                    (true, true, 1, 60, "Mcd001.ps2"),
+                    (true, true, 1, 0, "Mcd002.ps2"),
+                ],
+            )),
+        ),
+    ]);
+    let response = bridge.handle_request(Request::new(
+        34,
+        "change_media",
+        json!({"device":"mcd2", "eject":true}),
+    ));
+    assert!(!response.ok);
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, "bad_state");
+    assert!(error.message.contains("60 guest frames"));
+}
+
+#[test]
+fn memory_card_change_rejects_an_existing_folder_card_before_native_mutation() {
+    let mut bridge = bridge(vec![
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (
+            vec![MSG_EMUCAP_MEMORY_CARD_STATUS],
+            Ok(pine_memory_card_status(
+                0,
+                [
+                    (true, true, 1, 0, "Mcd001.ps2"),
+                    (true, true, 2, 0, "Shared Folder"),
+                ],
+            )),
+        ),
+    ]);
+    let response = bridge.handle_request(Request::new(
+        35,
+        "change_media",
+        json!({"device":"mcd2", "eject":true}),
+    ));
+    assert!(!response.ok);
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, "unsupported");
+    assert!(error.message.contains("folder card"));
+}
+
+#[test]
+fn memory_card_change_rejects_files_outside_the_managed_root_before_native_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cards = temporary.path().join("memcards");
+    std::fs::create_dir(&cards).unwrap();
+    let outside = temporary.path().join("outside.ps2");
+    std::fs::write(&outside, b"not managed").unwrap();
+
+    let mut bridge = bridge(vec![
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (
+            vec![MSG_EMUCAP_MEMORY_CARD_STATUS],
+            Ok(pine_memory_card_status(
+                0,
+                [(true, false, 0, 0, ""), (true, false, 0, 0, "")],
+            )),
+        ),
+    ]);
+    bridge.memory_card_dir = Some(cards);
+    let response = bridge.handle_request(Request::new(
+        32,
+        "change_media",
+        json!({"device":"mcd2", "path":outside}),
+    ));
+    assert!(!response.ok);
+    let error = response.error.unwrap();
+    assert_eq!(error.kind, "bad_params");
+    assert!(error.message.contains("direct member"));
+}
+
+#[test]
+fn status_observes_existing_folder_cards_without_advertising_runtime_replacement() {
+    let input = vec![0u8; 16];
+    let mut bridge = bridge(vec![
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (vec![MSG_VERSION], Ok(pine_string("v2.6.3"))),
+        (vec![MSG_EMUCAP_INPUT_STATUS], Ok(input)),
+        (
+            vec![MSG_EMUCAP_MEMORY_CARD_STATUS],
+            Ok(pine_memory_card_status(
+                0,
+                [(true, true, 2, 0, "Shared Folder"), (true, false, 0, 0, "")],
+            )),
+        ),
+    ]);
+    bridge.memory_card_dir = Some(tempfile::tempdir().unwrap().path().to_path_buf());
+    let response = bridge.handle_request(Request::new(33, "status", json!({})));
+    assert!(response.ok, "{response:?}");
+    let card = &response.result.unwrap()["mounted_media"][0];
+    assert_eq!(card["media_type"], "folder");
+    assert_eq!(card["runtime_change_supported"], false);
+    assert!(card.get("path").is_none());
 }
 
 #[test]

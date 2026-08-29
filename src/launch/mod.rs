@@ -19,6 +19,7 @@ pub mod mame_neogeo;
 pub mod mednafen;
 pub mod mesen;
 pub mod mupen64plus;
+pub mod np2kai;
 pub mod openmsx;
 pub mod pcsx2;
 pub mod ppsspp;

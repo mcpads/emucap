@@ -127,6 +127,15 @@ pub(crate) struct RecordWindowLimitsArgs {
 pub(crate) enum RecordWindowOriginArgs {
     NextFrameBoundary,
     ResetRelease,
+    StateLoad,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowInitialStateArgs {
+    /// Opaque producer-managed ID returned in save_state.snapshot_receipt. Caller-authored paths,
+    /// digests, and boundary claims are deliberately not accepted.
+    pub(crate) snapshot_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -211,6 +220,11 @@ pub(crate) struct RecordWindowArgs {
     /// Absolute dense movie path; check live capability.
     #[serde(default)]
     pub(crate) input_path: Option<String>,
+    /// Producer-managed frozen state to load before a state_load recording origin. The live
+    /// capability may require an explicit dense input movie, including an all-empty movie for
+    /// neutral input.
+    #[serde(default)]
+    pub(crate) initial_state: Option<RecordWindowInitialStateArgs>,
     /// Selected stoppable event occurrence.
     #[serde(default)]
     pub(crate) stop_on: Option<RecordWindowStopArgs>,
@@ -559,6 +573,16 @@ pub(crate) struct PathArgs {
 
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct SaveStateArgs {
+    pub(crate) path: String,
+    /// Preserve a producer-managed receipt for a later state-backed recording window.
+    /// This requires an absolute path and an advertised state_load capability.
+    #[serde(default)]
+    pub(crate) preserve_for_recording: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ChangeMediaArgs {
     /// Device identifier from status.media_devices, for example `flop1`.
     pub(crate) device: String,
@@ -862,6 +886,10 @@ pub(crate) struct LaunchPlanArgs {
     /// CHD, or BIN. Use bootstrap(include=["systems"]) for the full catalog.
     #[serde(default)]
     pub(crate) system: Option<String>,
+    /// PC-98 execution backend. Omit for the MAME debugger backend; select
+    /// np2kai explicitly for HDI compatibility when launch_plan recommends it.
+    #[serde(default)]
+    pub(crate) pc98_backend: Option<Pc98BackendArgs>,
     /// Exact server-produced review value for files named indirectly by a
     /// descriptor. Echo the value returned by launch_plan; do not construct it.
     #[serde(default)]
@@ -881,6 +909,10 @@ pub(crate) struct LaunchArgs {
     /// Explicit system identifier. Provide it when media type is ambiguous.
     #[serde(default)]
     pub(crate) system: Option<String>,
+    /// PC-98 execution backend. Omit for MAME. NP2kai is an explicit
+    /// compatibility choice and is never selected automatically.
+    #[serde(default)]
+    pub(crate) pc98_backend: Option<Pc98BackendArgs>,
     /// Exact server-produced review value for files named indirectly by a
     /// descriptor. Obtain it from launch_plan before launching composite media.
     #[serde(default)]
@@ -924,6 +956,13 @@ pub(crate) struct LaunchArgs {
 pub(crate) enum Pc98SoundBoardArgs {
     Pc9801_26,
     Pc9801_86,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Pc98BackendArgs {
+    Mame,
+    Np2kai,
 }
 
 impl Pc98SoundBoardArgs {

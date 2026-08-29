@@ -32,6 +32,8 @@ do
     "breakpoint halt does not inherit earlier recording eligibility")
   equal(FreezeState.can_start_recording(state, "reset_release"), true,
     "reset release establishes a new boundary instead of inheriting the breakpoint halt")
+  equal(FreezeState.can_start_recording(state, "state_load"), true,
+    "state load establishes its own next real frame boundary")
 end
 
 print("ALL EMUCAP FREEZE STATE TESTS PASSED")

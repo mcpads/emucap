@@ -19,6 +19,8 @@ pub mod media_graph;
 pub mod n64_adapter;
 pub mod nds_bridge;
 pub mod neogeo_bridge;
+#[cfg(unix)]
+pub mod np2kai_adapter;
 pub mod numparse;
 pub mod offload;
 pub mod openmsx_bridge;

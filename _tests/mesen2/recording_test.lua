@@ -9,7 +9,7 @@ local CPU_INSTRUCTION_CONTRACT = "f936fa1f0509851d3394edf3e3f7d6db0e40dd4310531f
 local OBJ_CONSUMPTION_CONTRACT = "8969bf826c9b56b41a52266e8ba8453868e48b5ac3486f8b0cf499eb90cf0e2d"
 local CGRAM_LOOKUP_CONTRACT = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aaeffe094960795"
 local BG_CHR_FETCH_CONTRACT = "ee9aecc8a9aa130ee871e08785ea9f32de14172260c8993d0baa33f4f07fc68c"
-local REVISION = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
+local REVISION = "c7bc749b13517456b049a73a868bc662c54cc98e580cc306b873328fd842dc22"
 local LAUNCH = "launch-01test"
 
 local function equal(actual, expected, label)
@@ -159,7 +159,7 @@ end
 do
   local capability = Recording.capability(function(value) return value end, true, false, true, true)
   equal(capability.revision,
-    "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175",
+    "9cb6540758c6f4a690371afc92c52803597183466ab0fc3486cbabc9e4287840",
     "deep capability revision")
   equal(capability.event_order, "guest_emission", "cross-class event order")
   equal(#capability.event_classes, 13, "deep event class count")
@@ -207,7 +207,7 @@ do
   local capability = Recording.capability(
     function(value) return value end, true, true, true, true, conditions)
   equal(capability.revision,
-    "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d",
+    "4436231189dd28b27f252d8c1241ccdfc04ead72aca5b1f675c53ad5a6377511",
     "repeatable capability revision")
   equal(capability.repeatability.profile, "mesen_snes_repeatable",
     "repeatable profile identity")
@@ -459,6 +459,10 @@ do
   equal(capability.input_movie.format, "frame-full-state-1", "movie format")
   equal(capability.origins[1], "next_frame_boundary", "Mesen origin")
   equal(capability.origins[2], "reset_release", "Mesen reset origin")
+  equal(capability.origins[3], "state_load", "Mesen state origin")
+  equal(capability.state_load.format, "mesen-savestate", "state format")
+  equal(capability.state_load.alignment, "restored_frame_boundary", "state alignment")
+  equal(capability.state_load.requires_input_movie, true, "state movie requirement")
   equal(capability.limits.max_frames, 5000, "capability frame bound")
   equal(capability.input_movie.max_frames, 5000, "movie frame bound")
   equal(capability.limits.max_host_ms, 250000, "capability host deadline")
@@ -483,11 +487,79 @@ end
 do
   local capability = Recording.capability(function(value) return value end, false, false, false, true)
   equal(capability.revision,
-    "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e",
+    "89000c4b91750e4ad8317eb234ccc3e75a6c304978feb74daaedda8f2aa3ba7e",
     "SNES state-only capability revision")
   equal(capability.terminal_state.profiles[1].id, "snes_ppu",
     "terminal state is independent of semantic hooks")
   Recording.capability(function(value) return value end, true, false, false, true)
+end
+
+do
+  local text = "0:\n1:\n"
+  local path = movie_file(text)
+  local p = params(2, {
+    origin = "state_load",
+    initial_state = {
+      path = "/managed/initial.state",
+      format = "mesen-savestate",
+      bytes = 11,
+      sha256 = string.rep("d", 64),
+      frame = 120,
+      boundary = "frame_boundary",
+    },
+    input_movie = {
+      path = path,
+      format = "frame-full-state-1",
+      port = 0,
+      frames = 2,
+      bytes = #text,
+      sha256 = string.rep("e", 64),
+    },
+  })
+  local installed, released = 0, false
+  local sink = fake_sink()
+  local state, effect = Recording.start(
+    p, 45, LAUNCH, 120, 0, sink, decode_buttons,
+    function() installed = installed + 1; return true end,
+    function() released = true; return true end)
+  equal(effect.kind, "arm_observation", "restored boundary arms atomically")
+  equal(state.start_frame, 120, "restored frame coordinate")
+  equal(sink.writes, 1, "restored boundary is the first event")
+  equal(installed, 1, "movie offset zero is owned before resume")
+  assert(Recording.attach_hooks(state, false))
+  state = select(1, Recording.tick(state, 121, 1))
+  equal(installed, 2, "second frame input is installed at its boundary")
+  state, effect = Recording.tick(state, 122, 2)
+  equal(effect.kind, "terminal", "state-backed window reaches exact end")
+  local result = Recording.result(state, 2)
+  equal(result.f_start, 120, "state-backed start")
+  equal(result.f_end, 122, "state-backed end")
+  equal(result.frames, 2, "state-backed frame count")
+  equal(result.events, 2, "state-backed boundary count")
+  equal(released, true, "state-backed input is released at terminal")
+
+  local second_sink = fake_sink()
+  local second = assert(Recording.start(
+    p, 46, LAUNCH, 120, 0, second_sink, decode_buttons,
+    function() return true end, function() return true end))
+  assert(Recording.attach_hooks(second, false))
+  second = select(1, Recording.tick(second, 121, 1))
+  second = select(1, Recording.tick(second, 122, 2))
+  equal(table.concat(second_sink.chunks), table.concat(sink.chunks),
+    "one producer receipt yields the same bounded boundary stream twice")
+
+  local failed_input_state, failed_input_effect = Recording.start(
+    p, 47, LAUNCH, 120, 0, fake_sink(), decode_buttons,
+    function() return false, "injected install failure" end,
+    function() return true end)
+  equal(failed_input_effect.kind, "terminal", "state input failure is terminal")
+  local failed_input_result = Recording.result(failed_input_state, 0)
+  equal(failed_input_result.status, "failed", "state input failure status")
+  equal(failed_input_result.integrity, "unverifiable", "state input failure integrity")
+  equal(failed_input_result.final_execution_state, "frozen", "state input failure freezes")
+  equal(failed_input_result.cleanup.transient_input, "not_acquired",
+    "state input failure reports no transient ownership")
+  os.remove(path)
 end
 
 local function obj_payload(overrides)

@@ -165,8 +165,20 @@ local function norm_key(str)
   if is_neogeo_profile and (s == "start" or s == "select") then
     return s
   end
+  if not is_neogeo_profile then
+    local digit = s:match("^([0-9]) %(pad%)$")
+      or s:match("^numpad([0-9])$")
+      or s:match("^kp_?([0-9])$")
+    if digit then
+      return "kp" .. digit
+    end
+  end
   return input_aliases[s] or s
 end
+
+-- Kept as a pure adapter boundary so the public PC-98 input namespace can be checked without
+-- starting MAME. Runtime field discovery below uses the same function.
+exports.canonical_input_name = norm_key
 
 local function neogeo_input_name(field)
   if field.player ~= 0 then

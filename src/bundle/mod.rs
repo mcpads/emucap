@@ -4,6 +4,8 @@ pub mod finalize;
 pub mod legacy_manifest;
 pub mod manifest;
 pub mod publish;
+mod publish_event_writer;
+mod publish_state;
 pub mod raw;
 pub mod recording;
 pub mod recording_manifest;

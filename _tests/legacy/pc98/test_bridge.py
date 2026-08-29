@@ -121,6 +121,14 @@ class BridgeTests(unittest.TestCase):
                 "pc98-legacy.input-pulse.constraints",
             ],
         )
+        self.assertIn("kp0", hello["input_buttons"]["buttons"])
+
+    def test_keypad_aliases_remain_distinct_from_ordinary_digits(self) -> None:
+        bridge = pc98_bridge.Bridge(FakeGdb({"?": ""}))
+        self.assertEqual(
+            bridge._normalize_buttons(["0", "kp0", "numpad0", "kp_0", "0 (pad)"]),
+            ["0", "kp0", "kp0", "kp0", "kp0"],
+        )
 
     def test_hello_advertises_memory_types_matching_read(self) -> None:
         # hello.memory_types는 read_memory가 받는 집합(MEM_BASE 키)과 정확히 일치해야 한다

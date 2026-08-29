@@ -5,7 +5,9 @@ use emucap::bundle::recording_manifest::{
     EventStopCondition, InitialSnapshotRequest, RecordingOrigin, TerminalSnapshotRequest,
 };
 use emucap::live::link::{RequestCancellation, WorkingProgress};
-use emucap::live::recording::{self, RecordWindowRequest, RequestedRecordingLimits};
+use emucap::live::recording::{
+    self, RecordWindowRequest, RecordingStateInput, RequestedRecordingLimits,
+};
 use emucap::live::runtime::RuntimeStore;
 use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken};
 use rmcp::service::{RequestContext, RoleServer};
@@ -106,8 +108,12 @@ pub(crate) async fn run_record_window(
         origin: args.origin.map(|origin| match origin {
             RecordWindowOriginArgs::NextFrameBoundary => RecordingOrigin::NextFrameBoundary,
             RecordWindowOriginArgs::ResetRelease => RecordingOrigin::ResetRelease,
+            RecordWindowOriginArgs::StateLoad => RecordingOrigin::StateLoad,
         }),
         input_path: args.input_path.map(PathBuf::from),
+        initial_state: args.initial_state.map(|state| RecordingStateInput {
+            snapshot_id: state.snapshot_id,
+        }),
         stop_on: args.stop_on.map(|stop| EventStopCondition {
             event_class: stop.event_class,
             occurrence: stop.occurrence,

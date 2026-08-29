@@ -4,6 +4,35 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.15.0
+
+### Added
+- Added an explicit NP2kai compatibility backend for PC-98 `.hdi` media that MAME cannot model
+  faithfully. It runs a pinned, license-audited libretro core in an emucap-owned headless profile
+  and exposes the standard PC-98 Control/Debug surface with capability-reported device limits,
+  identity-bound states, and verified `hdd0` replacement.
+- Mednafen Mega Drive sessions can opt into repeatable reset-origin recordings. A disposable home
+  captures a bounded pre-instruction guest state and restores it with declared non-savestate
+  controls before reset and dense movie input, without clearing ordinary Mednafen saves.
+- Maintained Mesen SNES sessions can explicitly preserve a frozen frame-boundary state as a
+  producer-managed receipt and use its opaque ID as the origin of an atomic bounded recording
+  window. The transaction requires a dense input movie, publishes the exact initial state in the
+  bundle, and leaves ordinary save/load and recording behavior unchanged.
+- PCSX2 managed sessions can now inspect and replace the two main `.ps2` memory-card slots through
+  the generic frozen-only `change_media` contract. Busy-card rejection, rollback status, writable
+  attach-time identity, target-slot isolation, and PCSX2's guest-visible reinsertion delay are
+  reported without hidden guest-time advancement.
+
+### Fixed
+- PC-98 now exposes numeric-keypad inputs as `kp0` through `kp9`, keeps them distinct from the
+  ordinary digit row, accepts common MAME/keypad aliases, and reports only callable canonical names
+  in the runtime `input_buttons.available` list.
+- Mesen frame steps now stop at a main-CPU opcode boundary suitable for native savestates, allowing
+  a frame-boundary receipt without serializing a half-executed instruction. Recording cleanup also
+  distinguishes input ownership that was never acquired from ownership whose release is unknown.
+- Generated Mesen work trees disable Git fsmonitor so a detached repository daemon cannot inherit
+  and indefinitely retain the adapter build lock.
+
 ## 0.14.6
 
 ### Fixed

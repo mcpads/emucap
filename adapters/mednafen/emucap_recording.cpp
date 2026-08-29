@@ -218,18 +218,24 @@ std::unique_ptr<EmucapRecordingSink> emucap_open_recording_sink(
   return sink;
 }
 
-const char* emucap_recording_capability_revision(bool reset_release) {
+const char* emucap_recording_capability_revision(bool reset_release, bool repeatable) {
+  if (reset_release && repeatable)
+    return EMUCAP_RECORDING_MD_REPEATABLE_CAPABILITY_REVISION;
   return reset_release
       ? EMUCAP_RECORDING_RESET_CAPABILITY_REVISION
       : EMUCAP_RECORDING_CAPABILITY_REVISION;
 }
 
-std::string emucap_recording_capability_json(bool reset_release) {
+std::string emucap_recording_capability_json(
+    bool reset_release,
+    const char* repeatability_conditions) {
+  const bool repeatable = reset_release && repeatability_conditions
+      && repeatability_conditions[0];
   const std::string origins = reset_release
       ? "[\"next_frame_boundary\",\"reset_release\"]"
       : "[\"next_frame_boundary\"]";
-  return std::string("{\"revision\":\"") +
-      emucap_recording_capability_revision(reset_release) +
+  std::string result = std::string("{\"revision\":\"") +
+      emucap_recording_capability_revision(reset_release, repeatable) +
       "\",\"origins\":" + origins + ",\"units\":[\"frames\"],"
       "\"default_event_classes\":[\"frame_boundary\"],\"event_classes\":[{\"id\":"
       "\"frame_boundary\",\"contract_sha256\":\"" +
@@ -240,10 +246,18 @@ std::string emucap_recording_capability_json(bool reset_release) {
       "\",\"clock_domains\":[\"frame\"],\"exact\":true,\"stoppable\":true}],"
       "\"input_movie\":{\"format\":\"" + EMUCAP_RECORDING_INPUT_MOVIE_FORMAT +
       "\",\"port\":0,\"max_frames\":300,\"max_bytes\":1048576,"
-      "\"max_buttons_per_frame\":32},\"limits\":{"
+      "\"max_buttons_per_frame\":32}";
+  if (repeatable) {
+    result += ",\"repeatability\":{\"profile\":\"" +
+        std::string(EMUCAP_RECORDING_MD_REPEATABLE_PROFILE) +
+        "\",\"conditions_sha256\":\"" + repeatability_conditions +
+        "\",\"origins\":[\"reset_release\"],\"requires_input_movie\":true}";
+  }
+  result += ",\"limits\":{"
       "\"max_frames\":300,\"max_events\":100000,\"max_bytes\":67108864,"
       "\"max_line_bytes\":65536,\"max_host_ms\":30000,"
       "\"progress_interval_ms\":250}}";
+  return result;
 }
 
 bool emucap_recording_exact_event_classes(

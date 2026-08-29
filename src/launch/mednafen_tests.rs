@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_env::{lock_env, EnvGuard};
+use serde_json::Value;
 
 #[cfg(unix)]
 fn make_executable(path: &Path) {
@@ -177,6 +178,51 @@ fn runtime_home_allows_an_absent_default_firmware_inventory() {
     let home = prepare_runtime_home(47801).unwrap();
 
     assert!(home.join("firmware").is_dir());
+}
+
+#[test]
+fn repeatable_md_home_is_separate_and_recreated_without_touching_ordinary_saves() {
+    let _lock = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME", "EMUCAP_MEDNAFEN_FIRMWARE"]);
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", dir.path().join("emucap"));
+    std::env::remove_var("EMUCAP_MEDNAFEN_FIRMWARE");
+
+    let ordinary = prepare_runtime_home(47804).unwrap();
+    std::fs::create_dir_all(ordinary.join("sav")).unwrap();
+    std::fs::write(ordinary.join("sav/ordinary.sav"), b"user progress").unwrap();
+    let repeatable = prepare_runtime_home_for(47804, true).unwrap();
+    std::fs::create_dir_all(repeatable.join("sav")).unwrap();
+    std::fs::write(repeatable.join("sav/prior.sav"), b"discardable").unwrap();
+
+    let refreshed = prepare_runtime_home_for(47804, true).unwrap();
+
+    assert_eq!(refreshed, ordinary.join("repeatable-md"));
+    assert!(!refreshed.join("sav/prior.sav").exists());
+    assert_eq!(
+        std::fs::read(ordinary.join("sav/ordinary.sav")).unwrap(),
+        b"user progress"
+    );
+}
+
+#[test]
+fn repeatable_md_profile_identity_matches_its_condition_record() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/adapters/mednafen/md-repeatable-profile.json"
+    ));
+    assert_eq!(
+        hex::encode(Sha256::digest(bytes)),
+        MD_REPEATABLE_CONDITIONS_SHA256
+    );
+    let profile: Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(profile["profile"], MD_REPEATABLE_PROFILE_ID);
+    assert_eq!(profile["system"], "md");
+    assert_eq!(
+        profile["recording"]["origins"],
+        serde_json::json!(["reset_release"])
+    );
+    assert_eq!(profile["recording"]["requires_input_movie"], true);
 }
 
 #[test]

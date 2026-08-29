@@ -1,0 +1,637 @@
+--- a/sdl/Makefile.libretro
++++ b/sdl/Makefile.libretro
+@@ -787,7 +787,8 @@
+ 	-I$(NP2_PATH)/sdl/libretro/libretro-common/include/vulkan
+ 
+ SOURCES_C += $(NP21_SOURCES_C) \
+-	$(NP2_PATH)/sdl/libretro/libretro.c
++	$(NP2_PATH)/sdl/libretro/libretro.c \
++	$(NP2_PATH)/sdl/libretro/emucap_debug.c
+ 
+ SOURCES_CXX += $(NP21_SOURCES_CXX)
+ 
+@@ -890,6 +891,7 @@
+ 	endif
+ endif
+ 
++NP2DEFINE += -DSUPPORT_EMUCAP_DEBUG
+ DEFINES += -D__LIBRETRO__ $(PLATFORM_DEFINES) $(GCC_WARNINGS) $(COMMONFLAGS) $(GCC_SECURITY_FLAGS) -DNST_NO_ZLIB $(INCFLAGS) $(INCFLAGS_PLATFORM) $(NP2DEFINE) $(NP21DEFINE)
+ 
+ CFLAGS += $(fpic) $(DEFINES) $(C_VER) $(ENDIANNESS_DEFINES)
+--- a/sdl/libretro/libretro.c
++++ b/sdl/libretro/libretro.c
+@@ -14,6 +14,7 @@
+ #include "libretro.h"
+ #include "libretro_params.h"
+ #include "libretro_core_options.h"
++#include "emucap_debug.h"
+ #include "file_stream.h"
+ 
+ #include <compiler.h>//required to prevent missing type errors
+@@ -553,7 +554,12 @@ void updateInput(){
+ 
+   // --- input NP2 menu
++#if defined(SUPPORT_EMUCAP_DEBUG)
++  int menu_key_f12 = 0;
++  int menu_mouse_m = 0;
++#else
+   int menu_key_f12 = input_cb(0, RETRO_DEVICE_KEYBOARD, 0, RETROK_F12);
+   int menu_mouse_m = input_cb(0, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_MIDDLE);
++#endif
+   int menu_joy_menu = input_cb(0, RETRO_DEVICE_JOYPAD, 0, joyNP2menubtn);
+ 
+   if((menu_key_f12 || menu_joy_menu || menu_mouse_m) && menukey == 0) {
+@@ -1710,6 +1716,7 @@ void retro_reset (void)
+    }
+    resetInput();
+    pccore_reset();
++   emucap_np2_reset_event();
+    did_reset = true;
+ }
+ extern  void playretro();
+--- /dev/null
++++ b/sdl/libretro/emucap_debug.h
+@@ -0,0 +1,96 @@
++#ifndef NP2KAI_EMUCAP_DEBUG_H
++#define NP2KAI_EMUCAP_DEBUG_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define EMUCAP_NP2_DEBUG_API_VERSION 1
++#define EMUCAP_NP2_BP_EXEC 0
++#define EMUCAP_NP2_BP_READ 1
++#define EMUCAP_NP2_BP_WRITE 2
++#define EMUCAP_NP2_BP_ACCESS 3
++#define EMUCAP_NP2_BP_REGISTER 4
++#define EMUCAP_NP2_BP_RESET 5
++#define EMUCAP_NP2_STEP_FAILED 0
++#define EMUCAP_NP2_STEP_EXECUTED 1
++#define EMUCAP_NP2_STEP_PREEMPTED 2
++
++struct emucap_np2_regs {
++  uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
++  uint32_t eip, eflags;
++  uint16_t cs, ss, ds, es, fs, gs;
++  uint32_t cs_base;
++  uint32_t cr0;
++};
++
++struct emucap_np2_breakpoint {
++  uint64_t id;
++  uint32_t kind;
++  uint32_t start;
++  uint32_t end;
++  uint32_t pause_on_hit;
++  uint32_t has_pc_min;
++  uint32_t pc_min;
++  uint32_t has_pc_max;
++  uint32_t pc_max;
++  uint32_t has_value;
++  uint32_t value;
++  uint32_t value_mask;
++  uint32_t value_len;
++  uint32_t register_index;
++  uint32_t register_min;
++  uint32_t register_max;
++};
++
++struct emucap_np2_event {
++  uint64_t sequence;
++  uint64_t breakpoint_id;
++  uint32_t kind;
++  uint32_t address;
++  uint32_t size;
++  uint32_t value;
++  uint32_t paused;
++  struct emucap_np2_regs regs;
++};
++
++struct emucap_np2_trace {
++  uint64_t sequence;
++  struct emucap_np2_regs regs;
++  char text[256];
++};
++
++uint32_t emucap_np2_debug_api_version(void);
++int emucap_np2_read_memory(uint32_t address, uint8_t *output, size_t length);
++int emucap_np2_write_memory(uint32_t address, const uint8_t *input, size_t length);
++int emucap_np2_get_regs(struct emucap_np2_regs *output);
++int emucap_np2_step_instruction(void);
++int emucap_np2_disassemble(uint32_t address, char *text, size_t text_size,
++                           uint32_t *next_address, uint8_t *bytes,
++                           size_t *byte_count);
++int emucap_np2_set_breakpoint(const struct emucap_np2_breakpoint *breakpoint);
++int emucap_np2_clear_breakpoint(uint64_t id);
++void emucap_np2_clear_all_breakpoints(void);
++int emucap_np2_poll_event(struct emucap_np2_event *event);
++uint64_t emucap_np2_take_dropped_events(void);
++void emucap_np2_set_trace(int enabled);
++int emucap_np2_poll_trace(struct emucap_np2_trace *trace);
++uint64_t emucap_np2_take_dropped_trace(void);
++int emucap_np2_stop_requested(void);
++void emucap_np2_clear_stop(void);
++void emucap_np2_reset_event(void);
++int emucap_np2_change_hdd(const char *path);
++const char *emucap_np2_current_hdd(void);
++
++int emucap_debug_instruction(void);
++void emucap_debug_memory(uint32_t address, uint32_t size, uint32_t value,
++                          int write);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+--- /dev/null
++++ b/sdl/libretro/emucap_debug.c
+@@ -0,0 +1,329 @@
++#include "emucap_debug.h"
++
++#include <limits.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <compiler.h>
++#include <cpucore.h>
++#include <fdd/diskdrv.h>
++#include <fdd/sxsi.h>
++#include <ia32/cpu.h>
++#include <i386c/cpumem.h>
++#include <np2.h>
++
++#define EMUCAP_MAX_BREAKPOINTS 64
++#define EMUCAP_EVENT_CAPACITY 256
++#define EMUCAP_TRACE_CAPACITY 4096
++#define EMUCAP_MEMORY_LIMIT 0x100000U
++
++struct breakpoint_slot {
++  int used;
++  uint64_t last_instruction;
++  int skip_exec_once;
++  struct emucap_np2_breakpoint value;
++};
++
++static struct breakpoint_slot breakpoints[EMUCAP_MAX_BREAKPOINTS];
++static struct emucap_np2_event events[EMUCAP_EVENT_CAPACITY];
++static struct emucap_np2_trace traces[EMUCAP_TRACE_CAPACITY];
++static size_t event_head, event_count, trace_head, trace_count;
++static uint64_t event_sequence, trace_sequence, instruction_sequence;
++static uint64_t dropped_events, dropped_trace;
++static int trace_enabled, stop_requested, suppress_memory, suppress_exec_once;
++
++static void capture_regs(struct emucap_np2_regs *out) {
++  memset(out, 0, sizeof(*out));
++  out->eax = CPU_EAX; out->ecx = CPU_ECX; out->edx = CPU_EDX; out->ebx = CPU_EBX;
++  out->esp = CPU_ESP; out->ebp = CPU_EBP; out->esi = CPU_ESI; out->edi = CPU_EDI;
++  out->eip = CPU_EIP; out->eflags = CPU_EFLAG;
++  out->cs = CPU_CS; out->ss = CPU_SS; out->ds = CPU_DS; out->es = CPU_ES;
++  out->fs = CPU_FS; out->gs = CPU_GS; out->cs_base = CPU_STAT_CS_BASE;
++  out->cr0 = CPU_CR0;
++}
++
++static uint32_t register_value(uint32_t index) {
++  switch (index) {
++  case 0: return CPU_EAX; case 1: return CPU_ECX; case 2: return CPU_EDX;
++  case 3: return CPU_EBX; case 4: return CPU_ESP; case 5: return CPU_EBP;
++  case 6: return CPU_ESI; case 7: return CPU_EDI; case 8: return CPU_EIP;
++  case 9: return CPU_EFLAG; case 10: return CPU_CS; case 11: return CPU_SS;
++  case 12: return CPU_DS; case 13: return CPU_ES; case 14: return CPU_FS;
++  case 15: return CPU_GS; default: return 0;
++  }
++}
++
++static int pc_matches(const struct emucap_np2_breakpoint *bp, uint32_t pc) {
++  return (!bp->has_pc_min || pc >= bp->pc_min) &&
++         (!bp->has_pc_max || pc <= bp->pc_max);
++}
++
++static void push_event(const struct emucap_np2_breakpoint *bp, uint32_t address,
++                       uint32_t size, uint32_t value) {
++  struct emucap_np2_event event;
++  size_t slot;
++  memset(&event, 0, sizeof(event));
++  event.sequence = ++event_sequence;
++  event.breakpoint_id = bp->id;
++  event.kind = bp->kind;
++  event.address = address;
++  event.size = size;
++  event.value = value;
++  event.paused = bp->pause_on_hit ? 1U : 0U;
++  capture_regs(&event.regs);
++  if (event_count == EMUCAP_EVENT_CAPACITY) {
++    event_head = (event_head + 1) % EMUCAP_EVENT_CAPACITY;
++    event_count--;
++    dropped_events++;
++  }
++  slot = (event_head + event_count) % EMUCAP_EVENT_CAPACITY;
++  events[slot] = event;
++  event_count++;
++  if (bp->pause_on_hit)
++    stop_requested = 1;
++}
++
++static void push_trace(void) {
++  struct emucap_np2_trace trace;
++  uint32_t next;
++  size_t bytes = 0;
++  size_t slot;
++  memset(&trace, 0, sizeof(trace));
++  trace.sequence = ++trace_sequence;
++  capture_regs(&trace.regs);
++  next = trace.regs.cs_base + trace.regs.eip;
++  emucap_np2_disassemble(next, trace.text, sizeof(trace.text), &next, NULL, &bytes);
++  if (trace_count == EMUCAP_TRACE_CAPACITY) {
++    trace_head = (trace_head + 1) % EMUCAP_TRACE_CAPACITY;
++    trace_count--;
++    dropped_trace++;
++  }
++  slot = (trace_head + trace_count) % EMUCAP_TRACE_CAPACITY;
++  traces[slot] = trace;
++  trace_count++;
++}
++
++uint32_t emucap_np2_debug_api_version(void) {
++  return EMUCAP_NP2_DEBUG_API_VERSION;
++}
++
++int emucap_np2_read_memory(uint32_t address, uint8_t *output, size_t length) {
++  size_t index;
++  if (!output || length == 0 || address >= EMUCAP_MEMORY_LIMIT ||
++      length > EMUCAP_MEMORY_LIMIT - address)
++    return 0;
++  suppress_memory++;
++  for (index = 0; index < length; index++)
++    output[index] = memp_read8(address + (uint32_t)index);
++  suppress_memory--;
++  return 1;
++}
++
++int emucap_np2_write_memory(uint32_t address, const uint8_t *input, size_t length) {
++  size_t index;
++  if (!input || length == 0 || address >= EMUCAP_MEMORY_LIMIT ||
++      length > EMUCAP_MEMORY_LIMIT - address)
++    return 0;
++  suppress_memory++;
++  for (index = 0; index < length; index++)
++    memp_write8(address + (uint32_t)index, input[index]);
++  suppress_memory--;
++  return 1;
++}
++
++int emucap_np2_get_regs(struct emucap_np2_regs *output) {
++  if (!output) return 0;
++  capture_regs(output);
++  return 1;
++}
++
++int emucap_np2_step_instruction(void) {
++  int jump;
++  SINT32 saved_clock = CPU_REMCLOCK;
++  if (emucap_debug_instruction())
++    return EMUCAP_NP2_STEP_PREEMPTED;
++  suppress_exec_once = 1;
++  jump = sigsetjmp(exec_1step_jmpbuf, 1);
++  if (jump == 0) {
++    CPU_REMCLOCK = INT_MAX / 4;
++    exec_1step();
++  }
++  CPU_REMCLOCK = saved_clock;
++  suppress_exec_once = 0;
++  return jump == 0 ? EMUCAP_NP2_STEP_EXECUTED : EMUCAP_NP2_STEP_FAILED;
++}
++
++int emucap_np2_disassemble(uint32_t address, char *text, size_t text_size,
++                           uint32_t *next_address, uint8_t *bytes,
++                           size_t *byte_count) {
++  disasm_context_t context;
++  uint32_t offset;
++  size_t count;
++  if (!text || text_size == 0 || !next_address || !byte_count ||
++      address < CPU_STAT_CS_BASE)
++    return 0;
++  offset = address - CPU_STAT_CS_BASE;
++  suppress_memory++;
++  if (disasm(&offset, &context) != 0) {
++    suppress_memory--;
++    return 0;
++  }
++  suppress_memory--;
++  snprintf(text, text_size, "%s", context.str);
++  *next_address = CPU_STAT_CS_BASE + offset;
++  count = context.nopbytes < 0 ? 0U : (size_t)context.nopbytes;
++  if (count > sizeof(context.opbyte)) count = sizeof(context.opbyte);
++  if (bytes && *byte_count >= count) memcpy(bytes, context.opbyte, count);
++  *byte_count = count;
++  return 1;
++}
++
++int emucap_np2_set_breakpoint(const struct emucap_np2_breakpoint *breakpoint) {
++  size_t index;
++  if (!breakpoint || breakpoint->id == 0 || breakpoint->kind > EMUCAP_NP2_BP_RESET)
++    return 0;
++  for (index = 0; index < EMUCAP_MAX_BREAKPOINTS; index++) {
++    if (breakpoints[index].used && breakpoints[index].value.id == breakpoint->id)
++      return 0;
++  }
++  for (index = 0; index < EMUCAP_MAX_BREAKPOINTS; index++) {
++    if (!breakpoints[index].used) {
++      breakpoints[index].used = 1;
++      breakpoints[index].last_instruction = 0;
++      breakpoints[index].value = *breakpoint;
++      return 1;
++    }
++  }
++  return 0;
++}
++
++int emucap_np2_clear_breakpoint(uint64_t id) {
++  size_t index;
++  for (index = 0; index < EMUCAP_MAX_BREAKPOINTS; index++) {
++    if (breakpoints[index].used && breakpoints[index].value.id == id) {
++      memset(&breakpoints[index], 0, sizeof(breakpoints[index]));
++      return 1;
++    }
++  }
++  return 0;
++}
++
++void emucap_np2_clear_all_breakpoints(void) {
++  memset(breakpoints, 0, sizeof(breakpoints));
++}
++
++int emucap_np2_poll_event(struct emucap_np2_event *event) {
++  if (!event || event_count == 0) return 0;
++  *event = events[event_head];
++  event_head = (event_head + 1) % EMUCAP_EVENT_CAPACITY;
++  event_count--;
++  return 1;
++}
++
++uint64_t emucap_np2_take_dropped_events(void) {
++  uint64_t result = dropped_events;
++  dropped_events = 0;
++  return result;
++}
++
++void emucap_np2_set_trace(int enabled) {
++  trace_enabled = enabled != 0;
++  if (!trace_enabled) {
++    trace_head = 0;
++    trace_count = 0;
++    dropped_trace = 0;
++  }
++}
++
++int emucap_np2_poll_trace(struct emucap_np2_trace *trace) {
++  if (!trace || trace_count == 0) return 0;
++  *trace = traces[trace_head];
++  trace_head = (trace_head + 1) % EMUCAP_TRACE_CAPACITY;
++  trace_count--;
++  return 1;
++}
++
++uint64_t emucap_np2_take_dropped_trace(void) {
++  uint64_t result = dropped_trace;
++  dropped_trace = 0;
++  return result;
++}
++
++int emucap_np2_stop_requested(void) { return stop_requested; }
++void emucap_np2_clear_stop(void) { stop_requested = 0; }
++
++void emucap_np2_reset_event(void) {
++  size_t index;
++  instruction_sequence++;
++  for (index = 0; index < EMUCAP_MAX_BREAKPOINTS; index++) {
++    struct emucap_np2_breakpoint *bp = &breakpoints[index].value;
++    breakpoints[index].skip_exec_once = 0;
++    if (breakpoints[index].used && bp->kind == EMUCAP_NP2_BP_RESET)
++      push_event(bp, 0, 0, 0);
++  }
++}
++
++int emucap_debug_instruction(void) {
++  size_t index;
++  uint32_t pc = CPU_STAT_CS_BASE + CPU_EIP;
++  if (suppress_exec_once) return 0;
++  instruction_sequence++;
++  if (trace_enabled) push_trace();
++  for (index = 0; index < EMUCAP_MAX_BREAKPOINTS; index++) {
++    struct breakpoint_slot *slot = &breakpoints[index];
++    struct emucap_np2_breakpoint *bp = &slot->value;
++    uint32_t value;
++    if (!slot->used || !pc_matches(bp, pc)) continue;
++    if (bp->kind == EMUCAP_NP2_BP_EXEC && pc >= bp->start && pc <= bp->end) {
++      if (slot->skip_exec_once) {
++        slot->skip_exec_once = 0;
++        continue;
++      }
++      slot->last_instruction = instruction_sequence;
++      if (bp->pause_on_hit) slot->skip_exec_once = 1;
++      push_event(bp, pc, 1, 0);
++    } else if (bp->kind == EMUCAP_NP2_BP_REGISTER) {
++      value = register_value(bp->register_index);
++      if (value < bp->register_min || value > bp->register_max) {
++        slot->last_instruction = instruction_sequence;
++        push_event(bp, pc, 0, value);
++      }
++    }
++  }
++  return stop_requested;
++}
++
++void emucap_debug_memory(uint32_t address, uint32_t size, uint32_t value, int write) {
++  size_t index;
++  uint32_t end;
++  uint32_t pc = CPU_STAT_CS_BASE + CPU_EIP;
++  if (suppress_memory || size == 0) return;
++  end = address + size - 1;
++  if (end < address) end = UINT32_MAX;
++  for (index = 0; index < EMUCAP_MAX_BREAKPOINTS; index++) {
++    struct breakpoint_slot *slot = &breakpoints[index];
++    struct emucap_np2_breakpoint *bp = &slot->value;
++    int kind_match;
++    if (!slot->used || slot->last_instruction == instruction_sequence ||
++        !pc_matches(bp, pc)) continue;
++    kind_match = bp->kind == EMUCAP_NP2_BP_ACCESS ||
++                 (write && bp->kind == EMUCAP_NP2_BP_WRITE) ||
++                 (!write && bp->kind == EMUCAP_NP2_BP_READ);
++    if (!kind_match || end < bp->start || address > bp->end) continue;
++    if (bp->has_value &&
++        (size != bp->value_len ||
++         (value & bp->value_mask) != (bp->value & bp->value_mask)))
++      continue;
++    slot->last_instruction = instruction_sequence;
++    push_event(bp, address, size, value);
++  }
++}
++
++int emucap_np2_change_hdd(const char *path) {
++  if (!path || !path[0] || strlen(path) >= MAX_PATH) return 0;
++  diskdrv_setsxsi(0, path);
++  diskdrv_hddbind();
++  return strcmp(diskdrv_getsxsi(0), path) == 0;
++}
++
++const char *emucap_np2_current_hdd(void) { return diskdrv_getsxsi(0); }
+--- a/i386c/ia32/cpu.c
++++ b/i386c/ia32/cpu.c
+@@ -27,6 +27,9 @@
+ #include <dosio.h>
+ #include "cpu.h"
+ #include "ia32.mcr"
++#if defined(__LIBRETRO__)
++#include <emucap_debug.h>
++#endif
+ 
+ #include "inst_table.h"
+ 
+@@ -79,6 +82,10 @@
+ 	int prefix;
+ 	UINT32 op;
+ 
++#if defined(__LIBRETRO__)
++	if (emucap_debug_instruction())
++		return;
++#endif
+ 	CPU_PREV_EIP = CPU_EIP;
+ 	CPU_STATSAVE.cpu_inst = CPU_STATSAVE.cpu_inst_default;
+ 
+@@ -281,6 +288,11 @@
+ 	void (*func)(void);
+ 	
+ 	do {
++
++#if defined(__LIBRETRO__)
++		if (emucap_debug_instruction())
++			return;
++#endif
+ 
+ 		CPU_PREV_EIP = CPU_EIP;
+ 		CPU_STATSAVE.cpu_inst = CPU_STATSAVE.cpu_inst_default;
+@@ -629,5 +641,9 @@
+ 				}
+ 			}
+ 		}
+-	} while (CPU_REMCLOCK > 0);
++	} while (CPU_REMCLOCK > 0
++#if defined(__LIBRETRO__)
++	    && !emucap_np2_stop_requested()
++#endif
++	);
+ }
+--- a/i386c/cpumem.c
++++ b/i386c/cpumem.c
+@@ -1,4 +1,7 @@
+ #include	<compiler.h>
++#if defined(__LIBRETRO__)
++#include <emucap_debug.h>
++#endif
+ 
+ #if 0
+ #undef	TRACEOUT
+@@ -515,6 +518,10 @@
+ 
+ // ----
+ REG8 MEMCALL memp_read8(UINT32 address) {
++
++#if defined(__LIBRETRO__)
++	emucap_debug_memory(address, 1, 0, 0);
++#endif
+ 	
+ #ifdef MEM_BDA_TRACEOUT
+ 	if(0x400 <= address && address < 0x600){
+@@ -634,6 +641,10 @@
+ REG16 MEMCALL memp_read16(UINT32 address) {
+ 
+ 	REG16	ret;
++
++#if defined(__LIBRETRO__)
++	emucap_debug_memory(address, 2, 0, 0);
++#endif
+ 	
+ #ifdef MEM_BDA_TRACEOUT
+ 	if(0x400 <= address && address < 0x600){
+@@ -756,6 +767,10 @@
+ 
+ UINT32 MEMCALL memp_read32(UINT32 address) {
+ 
++#if defined(__LIBRETRO__)
++	emucap_debug_memory(address, 4, 0, 0);
++#endif
++
+ 	//UINT32	pos;
+ 	UINT32	ret;
+ 	
+@@ -1038,6 +1053,10 @@
+ }
+ 
+ void MEMCALL memp_write8(UINT32 address, REG8 value) {
++
++#if defined(__LIBRETRO__)
++	emucap_debug_memory(address, 1, value, 1);
++#endif
+ 	
+ #ifdef MEM_BDA_TRACEOUT
+ 	if(0x400 <= address && address < 0x600){
+@@ -1181,6 +1200,10 @@
+ }
+ 
+ void MEMCALL memp_write16(UINT32 address, REG16 value) {
++
++#if defined(__LIBRETRO__)
++	emucap_debug_memory(address, 2, value, 1);
++#endif
+ 
+ 	
+ #ifdef MEM_BDA_TRACEOUT
+@@ -1340,6 +1363,10 @@
+ }
+ 
+ void MEMCALL memp_write32(UINT32 address, UINT32 value) {
++
++#if defined(__LIBRETRO__)
++	emucap_debug_memory(address, 4, value, 1);
++#endif
+ 
+ 	//UINT32	pos;
+ 	
+--- a/pccore.c
++++ b/pccore.c
+@@ -84,6 +84,9 @@
+ #if defined(CPUCORE_IA32)
+ #include <ia32/cpu.h>
+ #include <ia32/instructions/fpu/fp.h>
++#if defined(__LIBRETRO__)
++#include <emucap_debug.h>
++#endif
+ #else
+ #define CPU_VENDOR "GenuineIntel"
+ #define CPU_FAMILY 2
+@@ -1897,6 +1900,9 @@
+         (np2hax.emumode || !np2hax.enable || np2haxcore.ready_for_reset)) {
+ #else
+     if (CPU_RESETREQ) {
++#if defined(__LIBRETRO__)
++      emucap_np2_reset_event();
++#endif
+ #endif
+       CPU_RESETREQ = 0;
+ #if defined(SUPPORT_WAB)
+@@ -1961,6 +1967,10 @@
+       }
+ #endif
+     }
++#if defined(__LIBRETRO__)
++    if (emucap_np2_stop_requested())
++      break;
++#endif
+ #if defined(USE_TSC)
+     CPU_MSR_TSC = CPU_MSR_TSC - baseclk +
+                   CPU_BASECLOCK * pccore.maxmultiple / pccore.multiple;

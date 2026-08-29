@@ -203,6 +203,7 @@ fn recording_status_projects_only_the_negotiated_generic_capability() {
         event_order: None,
         class_accounting: false,
         input_movie: None,
+        state_load: None,
         initial_snapshots: None,
         terminal_snapshots: None,
         terminal_state: None,
@@ -292,6 +293,7 @@ fn connected_status_exposes_recording_only_for_a_bound_direct_generation() {
         event_order: None,
         class_accounting: false,
         input_movie: None,
+        state_load: None,
         initial_snapshots: None,
         terminal_snapshots: None,
         terminal_state: None,
@@ -685,6 +687,18 @@ fn snes_button_hint_exposes_common_aliases() {
         .unwrap()
         .iter()
         .any(|b| b.as_str() == Some("start")));
+}
+
+#[test]
+fn pc98_button_hint_keeps_digit_row_and_keypad_distinct() {
+    let hint = button_hint_for_system(Some("pc98")).unwrap();
+    let buttons = hint["buttons"].as_array().unwrap();
+    for button in ["0", "9", "kp0", "kp9"] {
+        assert!(
+            buttons.iter().any(|candidate| candidate == button),
+            "missing PC-98 input hint: {button}"
+        );
+    }
 }
 
 #[test]

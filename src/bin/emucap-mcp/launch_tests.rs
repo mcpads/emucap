@@ -1,5 +1,5 @@
 use super::*;
-use crate::args::{LaunchExecutionProfileArgs, Pc98SoundBoardArgs};
+use crate::args::{LaunchExecutionProfileArgs, Pc98BackendArgs, Pc98SoundBoardArgs};
 #[cfg(unix)]
 use emucap::live::continuity::{ContinuitySnapshot, RuntimeBinding, RuntimeBindingState};
 use emucap::live::link::{Capabilities, LinkError};
@@ -329,6 +329,7 @@ fn launch_plan_exposes_only_the_mcp_launcher() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.iso".into()),
             system: Some("ps2".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -562,6 +563,7 @@ fn launch_plan_for_neogeo_aes_requires_software_list_media_and_aes_bios() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/mslug2.zip".into()),
             system: Some("neogeo_aes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -586,6 +588,7 @@ fn launch_plan_for_neogeo_cd_requires_explicit_cue_and_cdz_bios() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/disc.cue".into()),
             system: Some("neogeo_cd".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -778,6 +781,7 @@ fn launch_plan_without_content_requests_only_the_content_path() {
         &LaunchPlanArgs {
             content_path: None,
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -802,6 +806,7 @@ fn launch_plan_with_ambiguous_media_preserves_content_and_requests_system() {
         &LaunchPlanArgs {
             content_path: Some(content_path.into()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -835,6 +840,7 @@ fn launch_plan_blocks_a_cue_graph_that_escapes_its_directory() {
         &LaunchPlanArgs {
             content_path: Some(cue.display().to_string()),
             system: Some("saturn".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -861,6 +867,7 @@ fn launch_plan_blocks_a_gdi_graph_that_escapes_its_directory() {
         &LaunchPlanArgs {
             content_path: Some(gdi.display().to_string()),
             system: Some("dc".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -878,6 +885,7 @@ fn launch_plan_reviews_indirect_members_before_checking_their_files() {
         &LaunchPlanArgs {
             content_path: Some(cue.display().to_string()),
             system: Some("saturn".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -900,6 +908,7 @@ fn launch_plan_reviews_indirect_members_before_checking_their_files() {
         &LaunchPlanArgs {
             content_path: Some(cue.display().to_string()),
             system: Some("saturn".into()),
+            pc98_backend: None,
             indirect_media_approval: Some(approval),
         },
     );
@@ -917,6 +926,7 @@ fn launch_plan_with_explicit_system_and_no_content_preserves_system() {
         &LaunchPlanArgs {
             content_path: None,
             system: Some("nes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -942,6 +952,7 @@ fn launch_plan_for_nes_uses_mesen2_and_nes_entry() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.nes".into()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -964,6 +975,7 @@ fn launch_plan_for_gameboy_family_uses_mesen2_and_gb_entry() {
             &LaunchPlanArgs {
                 content_path: Some(format!("/tmp/game.{ext}")),
                 system: None,
+                pc98_backend: None,
                 indirect_media_approval: None,
             },
         );
@@ -1002,6 +1014,7 @@ fn launch_plan_for_md_uses_mednafen_force_module() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.md".into()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1012,6 +1025,10 @@ fn launch_plan_for_md_uses_mednafen_force_module() {
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "md");
     assert_eq!(plan["button_hint"]["system"], "md");
+    assert_eq!(
+        plan["start_frozen_contract"]["repeatable_initial_conditions"],
+        true
+    );
 }
 
 #[test]
@@ -1033,6 +1050,7 @@ fn launch_plan_blocks_missing_content_even_with_binary() {
         &LaunchPlanArgs {
             content_path: Some(missing.display().to_string()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1081,6 +1099,7 @@ fn launch_plan_ready_when_content_and_binary_exist() {
         &LaunchPlanArgs {
             content_path: Some(rom.display().to_string()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1130,6 +1149,7 @@ fn launch_plan_task_entry_blocker_overrides_local_readiness_and_preserves_replan
     let args = LaunchPlanArgs {
         content_path: Some(rom.display().to_string()),
         system: None,
+        pc98_backend: None,
         indirect_media_approval: None,
     };
     let mut plan = make_launch_plan(Some(47804), &args);
@@ -1179,6 +1199,7 @@ fn launch_plan_preserved_failure_action_overrides_local_planning() {
     let args = LaunchPlanArgs {
         content_path: Some("/tmp/game.sfc".into()),
         system: Some("snes".into()),
+        pc98_backend: None,
         indirect_media_approval: None,
     };
     let mut plan = serde_json::json!({
@@ -1222,6 +1243,7 @@ fn launch_plan_for_explicit_md_accepts_ambiguous_bin() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.bin".into()),
             system: Some("genesis".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1246,6 +1268,7 @@ fn launch_plan_for_pc98_uses_repo_launcher_and_headless_contract() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.hdi".into()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1296,6 +1319,7 @@ fn launch_plan_for_neogeo_mvs_uses_dedicated_adapter_without_zip_inference() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/mslug.zip".into()),
             system: Some("neogeo_mvs".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1319,6 +1343,7 @@ fn launch_plan_for_n64_uses_native_mupen64plus_adapter() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/test.v64".into()),
             system: Some("n64".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1343,6 +1368,7 @@ fn launch_plan_for_saturn_declares_isolated_firmware_and_controlled_start() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/test.cue".into()),
             system: Some("saturn".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1380,6 +1406,7 @@ fn launch_plan_for_msx_uses_stock_openmsx_bridge() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/test.rom".into()),
             system: Some("msx".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1400,6 +1427,7 @@ fn launch_plan_for_real_msx_machine_requires_operator_firmware() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/test.dsk".into()),
             system: Some("msx2".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1417,6 +1445,7 @@ fn pc98_display_selects_visible_mame_launch() {
         content_path: "/tmp/game.hdi".into(),
         content_path2: None,
         system: Some("pc98".into()),
+        pc98_backend: None,
         indirect_media_approval: None,
         name: None,
         display: Some(true),
@@ -1445,6 +1474,7 @@ fn launch_plan_for_nds_uses_desmume_adapter_and_mcp_launcher() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.nds".into()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1504,6 +1534,7 @@ fn launch_plan_for_psp_uses_ppsspp_adapter_and_mcp_launcher() {
         &LaunchPlanArgs {
             content_path: Some("/tmp/game.cso".into()),
             system: None,
+            pc98_backend: None,
             indirect_media_approval: None,
         },
     );
@@ -1978,6 +2009,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: Some("after-orphan".into()),
             display: None,
@@ -2010,6 +2042,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: Some("after-unverifiable-lease".into()),
             display: None,
@@ -2035,6 +2068,7 @@ fn launch_recovers_retired_generation_and_cleans_exact_bridge_orphan() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: Some("after-retired-generation".into()),
             display: None,
@@ -2087,6 +2121,7 @@ fn successful_launch_publishes_generation_and_refuses_duplicate() {
         content_path: content.display().to_string(),
         content_path2: None,
         system: Some("snes".into()),
+        pc98_backend: None,
         indirect_media_approval: None,
         name: Some("capsule-test".into()),
         display: None,
@@ -2223,6 +2258,7 @@ fn controlled_launch_publishes_only_after_a_frozen_ready_boundary() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: Some("controlled-launch-test".into()),
             display: None,
@@ -2273,6 +2309,7 @@ fn controlled_launch_fails_closed_and_terminates_a_running_entry() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: Some("controlled-launch-failure-test".into()),
             display: None,
@@ -2378,6 +2415,53 @@ fn controlled_launch_contract_distinguishes_time_closure_from_repeatability() {
             .contains("exact selected recording conditions"),
         "a label and frozen state cannot replace the live recording capability"
     );
+
+    let md_profile = emucap::live::runtime::ExecutionProfileIdentity {
+        id: emucap::launch::mednafen::MD_REPEATABLE_PROFILE_ID.into(),
+        conditions_sha256: emucap::launch::mednafen::MD_REPEATABLE_CONDITIONS_SHA256.into(),
+    };
+    capabilities.recording = Some(
+        serde_json::from_value(serde_json::json!({
+            "revision": "test",
+            "origins": ["next_frame_boundary", "reset_release"],
+            "units": ["frames"],
+            "default_event_classes": ["frame_boundary"],
+            "event_classes": [],
+            "input_movie": {
+                "format": "frame-full-state-1",
+                "port": 0,
+                "max_frames": 300,
+                "max_bytes": 1048576,
+                "max_buttons_per_frame": 32
+            },
+            "repeatability": {
+                "profile": md_profile.id,
+                "conditions_sha256": md_profile.conditions_sha256,
+                "origins": ["reset_release"],
+                "requires_input_movie": true
+            },
+            "limits": {
+                "max_frames": 300,
+                "max_events": 100000,
+                "max_bytes": 67108864,
+                "max_line_bytes": 65536,
+                "max_host_ms": 30000,
+                "progress_interval_ms": 250
+            }
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        controlled_launch_contract_error(
+            true,
+            true,
+            &frozen,
+            Some(&md_profile),
+            &capabilities
+        ),
+        None,
+        "the controlled contract compares producer-advertised identity instead of a platform constant"
+    );
 }
 
 #[test]
@@ -2392,6 +2476,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
             content_path: missing.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2413,6 +2498,7 @@ fn launch_refuses_missing_content_before_binary_resolution() {
 
 #[test]
 fn launch_refuses_descriptor_members_without_plan_approval() {
+    let _guard = env_lock();
     let _env = EnvRestore::new(&["MEDNAFEN_BIN", "EMUCAP_EMU_HOME"]);
     let directory = tempfile::tempdir().unwrap();
     let cue = directory.path().join("disc.cue");
@@ -2427,6 +2513,7 @@ fn launch_refuses_descriptor_members_without_plan_approval() {
             content_path: cue.display().to_string(),
             content_path2: None,
             system: Some("saturn".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2459,6 +2546,7 @@ fn launch_rejects_sound_for_unsupported_adapter_before_binary_resolution() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2473,7 +2561,7 @@ fn launch_rejects_sound_for_unsupported_adapter_before_binary_resolution() {
     assert_eq!(out["launched"], false);
     assert_eq!(
         out["reason"],
-        "sound:true is supported only by Mednafen and PC-98 systems"
+        "sound:true is not supported by the selected adapter"
     );
     assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1);
@@ -2492,6 +2580,7 @@ fn launch_rejects_pc98_sound_board_for_other_systems_before_binary_resolution() 
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("snes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2506,7 +2595,7 @@ fn launch_rejects_pc98_sound_board_for_other_systems_before_binary_resolution() 
     assert_eq!(out["launched"], false);
     assert_eq!(
         out["reason"],
-        "pc98_sound_board is supported only for PC-98"
+        "pc98_sound_board is supported only by the PC-98 MAME backend"
     );
     assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1);
@@ -2520,6 +2609,7 @@ fn launch_sound_admission_matches_the_documented_adapters() {
         "mesen2",
         "mame_neogeo",
         "mupen64plus",
+        "np2kai",
         "openmsx",
         "flycast",
         "desmume_nds",
@@ -2544,6 +2634,7 @@ fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("n64".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2558,14 +2649,14 @@ fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
     assert_eq!(out["launched"], false, "{out}");
     assert_eq!(
         out["reason"],
-        "start_frozen is currently supported only by Mesen and Mednafen systems"
+        "start_frozen is not supported by the selected adapter"
     );
     assert_eq!(out["adapter"], "mupen64plus");
     assert_eq!(link.calls, 1, "only the preflight status call is allowed");
 }
 
 #[test]
-fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
+fn repeatable_profile_refuses_an_unadvertised_system_before_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let content = tmp.path().join("game.nes");
     std::fs::write(&content, b"rom").unwrap();
@@ -2577,6 +2668,7 @@ fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
             content_path: content.display().to_string(),
             content_path2: None,
             system: Some("nes".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2591,7 +2683,7 @@ fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
     assert_eq!(out["launched"], false, "{out}");
     assert_eq!(
         out["reason"],
-        "execution_profile=repeatable is currently supported only for SNES"
+        "execution_profile=repeatable is currently supported only for SNES and Mega Drive"
     );
     assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1, "only the preflight status call is allowed");
@@ -2629,6 +2721,7 @@ fn launch_refuses_missing_adapter_binary_with_precondition() {
             content_path: disc.display().to_string(),
             content_path2: None,
             system: Some("dc".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2705,6 +2798,7 @@ fn launch_refuses_missing_pc98_bridge_with_precondition() {
             content_path: disk.display().to_string(),
             content_path2: None,
             system: Some("pc98".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2757,6 +2851,7 @@ fn launch_refuses_occupied_port_before_spawn() {
             content_path: "/tmp/game.md".into(),
             content_path2: None,
             system: Some("md".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: None,
             display: None,
@@ -2833,6 +2928,7 @@ fn launch_refuses_when_this_session_already_connected() {
             content_path: "/tmp/second.hdm".into(),
             content_path2: None,
             system: Some("pc98".into()),
+            pc98_backend: None,
             indirect_media_approval: None,
             name: Some("dup-B".into()),
             display: None,
@@ -2855,4 +2951,105 @@ fn launch_refuses_when_this_session_already_connected() {
         serde_json::json!("existing-A")
     );
     assert_eq!(link.calls, 1);
+}
+
+fn write_consistent_hdi(path: &Path, sector_size: u32) {
+    let disk_size = sector_size * 2 * 2 * 2;
+    let mut bytes = vec![0_u8; 32 + disk_size as usize];
+    for (offset, value) in [
+        (8, 32_u32),
+        (12, disk_size),
+        (16, sector_size),
+        (20, 2),
+        (24, 2),
+        (28, 2),
+    ] {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+#[test]
+fn pc98_backend_defaults_to_mame_even_when_hdi_geometry_recommends_np2kai() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdi = dir.path().join("disk.hdi");
+    write_consistent_hdi(&hdi, 256);
+    let plan = make_launch_plan(
+        Some(47821),
+        &LaunchPlanArgs {
+            content_path: Some(hdi.display().to_string()),
+            system: Some("pc98".into()),
+            pc98_backend: None,
+            indirect_media_approval: None,
+        },
+    );
+    assert_eq!(plan["adapter"], "mame_pc98");
+    assert_eq!(plan["pc98_backend"]["selected"], "mame");
+    assert_eq!(plan["pc98_backend"]["recommendation"]["backend"], "np2kai");
+    assert_eq!(
+        plan["pc98_backend"]["recommendation"]["selection_is_automatic"],
+        false
+    );
+}
+
+#[test]
+fn explicit_np2kai_selection_changes_only_the_pc98_backend() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdi = dir.path().join("disk.hdi");
+    write_consistent_hdi(&hdi, 256);
+    let plan = make_launch_plan(
+        Some(47822),
+        &LaunchPlanArgs {
+            content_path: Some(hdi.display().to_string()),
+            system: Some("pc98".into()),
+            pc98_backend: Some(Pc98BackendArgs::Np2kai),
+            indirect_media_approval: None,
+        },
+    );
+    assert_eq!(plan["adapter"], "np2kai");
+    assert_eq!(plan["preferred_launcher"]["args"]["pc98_backend"], "np2kai");
+    assert_eq!(
+        plan["start_frozen_contract"]["boundary"],
+        "pre_first_instruction"
+    );
+
+    let rejected = make_launch_plan(
+        Some(47822),
+        &LaunchPlanArgs {
+            content_path: Some(hdi.display().to_string()),
+            system: Some("snes".into()),
+            pc98_backend: Some(Pc98BackendArgs::Np2kai),
+            indirect_media_approval: None,
+        },
+    );
+    assert_eq!(rejected["ready_to_launch"], false);
+    assert_eq!(
+        rejected["reason"],
+        "pc98_backend is supported only for PC-98"
+    );
+}
+
+#[test]
+fn explicit_np2kai_selection_rejects_non_hdi_media_during_planning() {
+    let dir = tempfile::tempdir().unwrap();
+    let hdm = dir.path().join("disk.hdm");
+    std::fs::write(&hdm, b"PC-98 floppy image").unwrap();
+    let plan = make_launch_plan(
+        Some(47823),
+        &LaunchPlanArgs {
+            content_path: Some(hdm.display().to_string()),
+            system: Some("pc98".into()),
+            pc98_backend: Some(Pc98BackendArgs::Np2kai),
+            indirect_media_approval: None,
+        },
+    );
+
+    assert_eq!(plan["ready_to_launch"], false);
+    assert!(plan["launch_blockers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|blocker| blocker
+            .as_str()
+            .is_some_and(|message| message.contains(".hdi"))));
 }

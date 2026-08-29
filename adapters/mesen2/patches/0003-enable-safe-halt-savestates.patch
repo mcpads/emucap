@@ -8,7 +8,7 @@ index e78a5be..084114c 100644
  			// while the guest remains stopped, without holding one Lua callback past the watchdog.
 -			ProcessEvent(EventType::CodeBreakIdle, sourceCpu);
 +			bool savestateSafe = sourceCpu == _mainCpuType
-+				&& (source == BreakSource::Pause || source == BreakSource::CpuStep)
++				&& (source == BreakSource::Pause || source == BreakSource::CpuStep || source == BreakSource::PpuStep)
 +				&& (!operation || operation->Type == MemoryOperationType::ExecOpCode);
 +			ProcessEvent(
 +				savestateSafe ? EventType::CodeBreakIdleSavestate : EventType::CodeBreakIdle,
@@ -17,6 +17,22 @@ index e78a5be..084114c 100644
  		}
  		if((!_waitForBreakResume || _suspendRequestCount) && !_breakRequestCount) {
  			break;
+@@ -560,7 +566,13 @@ void Debugger::ProcessBreakConditions(CpuType sourceCpu, StepRequest& step, Brea
+ {
+ 	int breakpointId = bpManager->CheckBreakpoint<accessWidth>(operation, addressInfo, true);
+-	if(_breakRequestCount || _waitForBreakResume || ((int)step.BreakNeeded && (!_debuggers[(int)sourceCpu].Debugger->IgnoreBreakpoints || step.Type == StepType::CpuCycleStep))) {
+-		SleepUntilResume(sourceCpu, step.GetBreakSource());
++	BreakSource stepSource = step.GetBreakSource();
++	// A PPU step can mature during any CPU memory operation. Delay only that step halt until the
++	// next main-CPU opcode fetch so a savestate never captures a half-executed instruction.
++	bool waitForMainCpuOpcode = !_breakRequestCount && !_waitForBreakResume
++		&& stepSource == BreakSource::PpuStep && sourceCpu == _mainCpuType
++		&& operation.Type != MemoryOperationType::ExecOpCode;
++	if(!waitForMainCpuOpcode && (_breakRequestCount || _waitForBreakResume || ((int)step.BreakNeeded && (!_debuggers[(int)sourceCpu].Debugger->IgnoreBreakpoints || step.Type == StepType::CpuCycleStep)))) {
++		SleepUntilResume(sourceCpu, stepSource, &operation);
+ 	} else {
+ 		if(breakpointId >= 0 && !_debuggers[(int)sourceCpu].Debugger->IgnoreBreakpoints) {
+ 			SleepUntilResume(sourceCpu, BreakSource::Breakpoint, &operation, breakpointId);
 diff --git i/Core/Debugger/ScriptingContext.cpp w/Core/Debugger/ScriptingContext.cpp
 index e8a6437..c2f7c7f 100644
 --- i/Core/Debugger/ScriptingContext.cpp

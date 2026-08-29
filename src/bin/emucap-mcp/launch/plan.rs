@@ -5,7 +5,11 @@ use super::actions::{
 use super::media::{content_markers, ext_lower};
 use super::*;
 
-pub(super) use super::system::{adapter_for_system, adapter_supports_sound, normalize_system};
+#[cfg(test)]
+pub(super) use super::system::adapter_for_system;
+pub(super) use super::system::{
+    adapter_for_system_and_pc98_backend, adapter_supports_sound, normalize_system,
+};
 
 pub(super) fn same_path(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
@@ -216,28 +220,6 @@ pub(super) fn dolphin_binary_precondition(root: &Path, display: bool) -> serde_j
     dolphin_binary_precondition_from(root, display, dolphin_launch::resolve_binary(root, display))
 }
 
-pub(super) fn mame_binary_precondition_from(
-    root: &Path,
-    resolved: Option<PathBuf>,
-) -> serde_json::Value {
-    let repo_work = root.join("adapters/mame-pc98/work");
-    simple_binary_precondition(resolved, |path| {
-        if env_path_matches("MAME_BIN", path) {
-            "MAME_BIN"
-        } else if path.starts_with(&repo_work) {
-            "repo_build"
-        } else if path_matches_candidates(path, mame_launch::default_install_candidates()) {
-            "default_install"
-        } else {
-            "PATH"
-        }
-    })
-}
-
-pub(super) fn mame_binary_precondition(root: &Path) -> serde_json::Value {
-    mame_binary_precondition_from(root, mame_launch::resolve_binary(root))
-}
-
 pub(super) fn mame_neogeo_binary_precondition(root: &Path) -> serde_json::Value {
     let repo_work = root.join("adapters/mame-neogeo/work");
     simple_binary_precondition(mame_neogeo_launch::resolve_binary(root), |path| {
@@ -374,21 +356,6 @@ pub(super) fn pcsx2_binary_precondition(root: &Path) -> serde_json::Value {
     )
 }
 
-pub(super) fn mame_bridge_precondition(root: &Path) -> serde_json::Value {
-    match mame_launch::resolve_bridge_runtime(root) {
-        Ok(runtime) => serde_json::json!({
-            "available": true,
-            "kind": runtime.kind,
-            "program": runtime.program.display().to_string(),
-        }),
-        Err(e) => serde_json::json!({
-            "available": false,
-            "error": e.to_string(),
-            "source": "EMUCAP_PC98_BRIDGE_BIN / installed emucap-mame-pc98-bridge",
-        }),
-    }
-}
-
 pub(super) fn neogeo_bridge_precondition(root: &Path) -> serde_json::Value {
     match mame_neogeo_launch::resolve_bridge(root) {
         Some(program) => serde_json::json!({
@@ -451,6 +418,7 @@ pub(super) fn adapter_binary_precondition_for(
         "mame_pc98" => mame_binary_precondition(root),
         "mame_neogeo" => mame_neogeo_binary_precondition(root),
         "mupen64plus" => mupen64plus_precondition(root, display),
+        "np2kai" => np2kai_precondition(root),
         "openmsx" => openmsx_precondition(root),
         "desmume_nds" => desmume_nds_binary_precondition(root),
         "ppsspp" => ppsspp_binary_precondition(root),
@@ -507,6 +475,12 @@ pub(super) fn build_required_precondition(
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/mupen64plus/build.sh")
+        )),
+        "np2kai" => serde_json::json!(format!(
+            "Build the pinned license-clean NP2kai core with {}, build emucap-np2kai, and provide operator firmware through EMUCAP_NP2KAI_FIRMWARE.",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/np2kai/build.sh")
         )),
         "openmsx" => serde_json::json!(format!(
             "Build the pinned openMSX host with {} and build emucap-openmsx-bridge with cargo build --release.",
@@ -932,7 +906,16 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         });
     };
 
-    let (adapter, force_module) = adapter_for_system(system);
+    if args.pc98_backend.is_some() && system != "pc98" {
+        return serde_json::json!({
+            "ok": false,
+            "ready_to_launch": false,
+            "inference": inference,
+            "reason": "pc98_backend is supported only for PC-98",
+            "listening_port": p,
+        });
+    }
+    let (adapter, force_module) = adapter_for_system_and_pc98_backend(system, args.pc98_backend);
     let mut preferred_launcher_args = serde_json::json!({
         "content_path": content_path,
         "system": system,
@@ -943,6 +926,11 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
     }
     if adapter == "mame_pc98" {
         preferred_launcher_args["pc98_sound_board"] = serde_json::Value::Null;
+        preferred_launcher_args["pc98_backend"] = serde_json::json!("mame");
+    } else if adapter == "np2kai" {
+        preferred_launcher_args["pc98_backend"] = serde_json::json!("np2kai");
+        preferred_launcher_args["display"] = serde_json::json!(false);
+        preferred_launcher_args["start_frozen"] = serde_json::json!(true);
     }
     let environment_defaults = if adapter == "mame_pc98" {
         serde_json::json!({
@@ -950,6 +938,14 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
                 "default": "",
                 "applies_when": "pc98_sound_board is omitted and the legacy environment variable is unset",
                 "reason": "legacy fallback only; prefer the validated pc98_sound_board launch argument"
+            }
+        })
+    } else if adapter == "np2kai" {
+        serde_json::json!({
+            "EMUCAP_NP2KAI_FIRMWARE": {
+                "default": emucap::launch::np2kai::default_firmware_root().display().to_string(),
+                "applies_when": "the np2kai backend is explicitly selected",
+                "reason": "only recognized PC-98 firmware files are copied into the emucap-owned per-port system directory"
             }
         })
     } else if adapter == "mednafen" {
@@ -996,6 +992,13 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         _ => serde_json::Value::Null,
     };
     let mut launch_blockers = launch_blockers(content_exists, &adapter_binary);
+    if adapter == "np2kai" && !emucap::launch::np2kai::accepts_content_path(Path::new(content_path))
+    {
+        launch_blockers.push(
+            "the NP2kai backend accepts .hdi hard-disk images only; select the MAME backend for other PC-98 media"
+                .into(),
+        );
+    }
     let mut indirect_media = serde_json::json!({"state": "not_required"});
     let mut media_review_action = None;
     if content_exists {
@@ -1077,6 +1080,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "psx" => serde_json::json!("Place scph5500.bin for JP, scph5501.bin for NA, or scph5502.bin for EU in the shared emucap firmware directory, or set EMUCAP_MEDNAFEN_FIRMWARE to an absolute inventory directory."),
         "pce" => serde_json::json!("CD-ROM content requires syscard3.pce in the shared emucap firmware directory or EMUCAP_MEDNAFEN_FIRMWARE inventory. HuCard ROMs do not."),
         "pcfx" => serde_json::json!("Requires the PC-FX BIOS version 1.00. Set EMUCAP_PCFX_BIOS to an absolute pcfx.rom path or place it under the emucap-owned firmware directory."),
+        "pc98" if adapter == "np2kai" => serde_json::json!("Requires operator-provided bios.rom and font.rom or font.bmp in EMUCAP_NP2KAI_FIRMWARE. Recognized optional firmware files are staged into the isolated runtime; no firmware is distributed."),
         "pc98" => serde_json::json!("Requires the MAME pc9801rs machine ROM set. The build script installs it; launch may otherwise fail before connection."),
         "neogeo_mvs" => serde_json::json!("Requires MAME neogeo.zip BIOS and a game-specific MVS .zip ROM set. Set EMUCAP_NEOGEO_BIOS or place neogeo.zip beside the game set."),
         "neogeo_aes" => serde_json::json!("Requires MAME aes.zip and an AES-compatible cartridge .zip whose stem matches the pinned Neo Geo software list. Set EMUCAP_NEOGEO_AES_BIOS or place aes.zip beside the cartridge set."),
@@ -1113,7 +1117,9 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "environment_defaults": environment_defaults,
         "inference": inference,
         "button_hint": button_hint_for_system(Some(system)),
-        "headless_contract": if adapter == "mame_pc98" {
+        "headless_contract": if adapter == "np2kai" {
+            "The NP2kai compatibility backend is headless-only and runs through the emucap-owned direct libretro host. It never reads RetroArch configuration."
+        } else if adapter == "mame_pc98" {
             "PC-98 Rust launch is headless by default; launch(display:true) explicitly authorizes the repo-local safe MAME wrapper to open a window. It keeps pc9801rs cbus:0 empty unless pc98_sound_board is selected; do not run work/mame.raw or system mame directly."
         } else if adapter == "mame_neogeo" {
             "Neo Geo MVS, AES, and CD launch headless by default and use profile-specific emucap-owned MAME homes. launch(display:true) opens a window without reading or changing the user's MAME configuration."
@@ -1153,11 +1159,25 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             serde_json::Value::Null
         },
         "start_frozen_contract": {
-            "supported": adapter == "mesen2" || adapter == "mednafen",
-            "boundary": if adapter == "mesen2" || adapter == "mednafen" { serde_json::json!("pre_first_instruction") } else { serde_json::Value::Null },
+            "supported": adapter == "mesen2" || adapter == "mednafen" || adapter == "np2kai",
+            "boundary": if adapter == "mesen2" || adapter == "mednafen" || adapter == "np2kai" { serde_json::json!("pre_first_instruction") } else { serde_json::Value::Null },
             "request_with": "launch(..., start_frozen:true)",
-            "repeatable_initial_conditions": system == "snes"
+            "repeatable_initial_conditions": system == "snes" || system == "md" || adapter == "np2kai"
         },
+        "pc98_backend": if system == "pc98" {
+            let geometry = emucap::launch::np2kai::inspect_hdi_geometry(Path::new(content_path)).ok().flatten();
+            serde_json::json!({
+                "selected": if adapter == "np2kai" {"np2kai"} else {"mame"},
+                "default": "mame",
+                "choices": ["mame", "np2kai"],
+                "recommendation": geometry.filter(|value| value.sector_size == 256).map(|value| serde_json::json!({
+                    "backend":"np2kai",
+                    "reason":"the validated HDI geometry uses 256-byte sectors, which the MAME PC-98 hard-disk path does not model faithfully",
+                    "geometry":value,
+                    "selection_is_automatic":false
+                }))
+            })
+        } else { serde_json::Value::Null },
         "next_action": next_action
     })
 }

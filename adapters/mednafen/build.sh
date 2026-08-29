@@ -147,7 +147,7 @@ cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
   emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
-  emucap_recording.cpp emucap_recording.h \
+  emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
@@ -156,7 +156,7 @@ PATCHSET_SHA256="$({
   for path in \
     build.sh emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
     emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
-    emucap_recording.cpp emucap_recording.h; do
+    emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
   done
   for path in \
@@ -165,6 +165,7 @@ PATCHSET_SHA256="$({
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
   done
 } | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print $1}')"
+MD_REPEATABLE_CONDITIONS_SHA256="$(sha256_path "$HERE/md-repeatable-profile.json")"
 [ "$PATCHSET_SHA256" = "$MEDNAFEN_PATCHSET_SHA256" ] || {
   echo "ERROR: Mednafen patch inputs do not match upstream.lock" >&2
   echo "  expected=$MEDNAFEN_PATCHSET_SHA256" >&2
@@ -176,6 +177,8 @@ PATCHSET_SHA256="$({
   printf '#define EMUCAP_MEDNAFEN_UPSTREAM "%s"\n' "$URL"
   printf '#define EMUCAP_MEDNAFEN_UPSTREAM_REVISION "%s@sha256:%s"\n' "$VER" "$MEDNAFEN_SHA256"
   printf '#define EMUCAP_MEDNAFEN_PATCHSET_SHA256 "%s"\n' "$PATCHSET_SHA256"
+  printf '#define EMUCAP_MEDNAFEN_MD_REPEATABLE_CONDITIONS_SHA256 "%s"\n' \
+    "$MD_REPEATABLE_CONDITIONS_SHA256"
 } > "$SRC/src/drivers/emucap_build.h"
 "$HERE/../_common/test-native-failure.sh"
 
@@ -192,7 +195,7 @@ perl -0777 -pi -e \
   's/(\n[ \t]*if\(MDFN_UNLIKELY\(StateFuzzTest\)\))/\n\t ::emucap_pre_first_frame();${1}/ unless m{emucap_pre_first_frame}' \
   "$SRC/src/drivers/main.cpp"
 perl -0777 -pi -e \
-  's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}{ static uint64_t emucap_frame = 0; ::emucap_service(emucap_frame++); ::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths); }\n${1}${2}/m unless m{emucap_service}' \
+  's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}{ static uint64_t emucap_frame = 0; ::emucap_service(++emucap_frame); ::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths); }\n${1}${2}/m unless m{emucap_service}' \
   "$SRC/src/drivers/main.cpp"
 inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp 훅 삽입 실패"
 inject_check emucap_pre_first_frame "$SRC/src/drivers/main.cpp" "main.cpp pre-first 훅 삽입 실패"

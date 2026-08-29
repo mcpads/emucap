@@ -23,6 +23,7 @@ fn saturn_spec_has_module_and_content_and_headless() {
             sound: false,
             pcfx_bios: None,
             start_frozen: true,
+            repeatable: false,
         },
         &opts("game.cue"),
     );
@@ -61,6 +62,7 @@ fn md_spec_forces_six_button_pad() {
             sound: false,
             pcfx_bios: None,
             start_frozen: false,
+            repeatable: false,
         },
         &opts("game.md"),
     );
@@ -86,6 +88,40 @@ fn md_spec_forces_six_button_pad() {
 }
 
 #[test]
+fn repeatable_md_spec_implies_controlled_start_and_exact_conditions() {
+    let spec = mednafen_spec(
+        Path::new("/run/mednafen"),
+        Path::new("/tmp/m.log"),
+        Path::new("/tmp/mednafen-home"),
+        &MednafenSpecOpts {
+            module: Some("md"),
+            sound: false,
+            pcfx_bios: None,
+            start_frozen: false,
+            repeatable: true,
+        },
+        &opts("game.md"),
+    );
+
+    for expected in [
+        ("EMUCAP_START_FROZEN", "1"),
+        ("EMUCAP_EXECUTION_PROFILE", "repeatable"),
+        (
+            "EMUCAP_REPEATABLE_PROFILE_ID",
+            crate::launch::mednafen::MD_REPEATABLE_PROFILE_ID,
+        ),
+        (
+            "EMUCAP_REPEATABLE_CONDITIONS_SHA256",
+            crate::launch::mednafen::MD_REPEATABLE_CONDITIONS_SHA256,
+        ),
+    ] {
+        assert!(spec
+            .env
+            .contains(&(expected.0.to_string(), expected.1.to_string())));
+    }
+}
+
+#[test]
 fn name_and_token_are_passed_when_present() {
     let mut o = opts("g.cue");
     o.name = Some("saturn_session");
@@ -99,6 +135,7 @@ fn name_and_token_are_passed_when_present() {
             sound: false,
             pcfx_bios: None,
             start_frozen: false,
+            repeatable: false,
         },
         &o,
     );
@@ -121,6 +158,7 @@ fn pce_spec_enables_sound_only_when_requested() {
             sound: true,
             pcfx_bios: None,
             start_frozen: false,
+            repeatable: false,
         },
         &opts("game.cue"),
     );
@@ -146,6 +184,7 @@ fn ngp_spec_preserves_explicit_module_with_isolated_profile() {
             sound: false,
             pcfx_bios: None,
             start_frozen: false,
+            repeatable: false,
         },
         &opts("game.ngc"),
     );
@@ -175,6 +214,7 @@ fn pcfx_spec_preserves_explicit_module_and_sound() {
             sound: true,
             pcfx_bios: Some(Path::new("/firmware/pcfx.rom")),
             start_frozen: false,
+            repeatable: false,
         },
         &opts("game.cue"),
     );

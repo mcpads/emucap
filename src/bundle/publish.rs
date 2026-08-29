@@ -13,7 +13,8 @@ use super::recording::{
 use super::recording_manifest::{
     EffectiveScope, EventOrder, InitialSnapshotRequest, InputMovieIdentity, MemberDescriptor,
     MemberRole, PublicationOutcome, RecordingCounters, RecordingManifest, RuntimeIdentity,
-    TerminalFacts, TerminalSnapshotRequest, TerminalStateRequest, RECORDING_FORMAT_VERSION,
+    StateArtifactIdentity, TerminalFacts, TerminalSnapshotRequest, TerminalStateRequest,
+    RECORDING_FORMAT_VERSION,
 };
 use crate::event_contracts::EventContractRegistry;
 use crate::input_movie::canonical_recording_movie;
@@ -67,6 +68,7 @@ pub struct RecordingStaging {
     capture_id: String,
     writer_opened: bool,
     input_movie_written: bool,
+    initial_state_written: bool,
     initial_snapshot_labels_written: BTreeSet<String>,
     snapshot_labels_written: BTreeSet<String>,
     terminal_state_written: bool,
@@ -74,15 +76,15 @@ pub struct RecordingStaging {
 
 #[derive(Debug)]
 pub struct BoundedEventWriter {
-    file: File,
-    max_events: u64,
-    max_bytes: u64,
-    max_line_bytes: u64,
-    events: u64,
-    bytes: u64,
+    pub(super) file: File,
+    pub(super) max_events: u64,
+    pub(super) max_bytes: u64,
+    pub(super) max_line_bytes: u64,
+    pub(super) events: u64,
+    pub(super) bytes: u64,
 }
 
-fn valid_hex_digest(value: &str, bytes: usize) -> bool {
+pub(super) fn valid_hex_digest(value: &str, bytes: usize) -> bool {
     value.len() == bytes * 2 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -161,7 +163,7 @@ fn create_private_dir(path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-fn regular_owned_member(path: &Path) -> Result<(), PublishError> {
+pub(super) fn regular_owned_member(path: &Path) -> Result<(), PublishError> {
     let metadata = fs::symlink_metadata(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             PublishError::MemberMissing(path.to_path_buf())
@@ -220,6 +222,7 @@ impl RecordingStaging {
             capture_id: capture_id.to_string(),
             writer_opened: false,
             input_movie_written: false,
+            initial_state_written: false,
             initial_snapshot_labels_written: BTreeSet::new(),
             snapshot_labels_written: BTreeSet::new(),
             terminal_state_written: false,
@@ -267,6 +270,21 @@ impl RecordingStaging {
         permissions.set_readonly(true);
         fs::set_permissions(&path, permissions)?;
         self.input_movie_written = true;
+        Ok(path)
+    }
+
+    pub fn write_initial_state(
+        &mut self,
+        bytes: &[u8],
+        identity: &StateArtifactIdentity,
+    ) -> Result<PathBuf, PublishError> {
+        let path = super::publish_state::write_initial_state(
+            &self.staging_path,
+            self.initial_state_written,
+            bytes,
+            identity,
+        )?;
+        self.initial_state_written = true;
         Ok(path)
     }
 
@@ -514,6 +532,11 @@ impl RecordingStaging {
         let events_path = self.events_path();
         regular_owned_member(&events_path)?;
         validate_input_movie_member(&self.staging_path, &input.validation.request)?;
+        super::publish_state::validate_initial_state_member(
+            &self.staging_path,
+            &input.validation.request,
+            &input.runtime,
+        )?;
         let mut snapshot_members =
             validate_initial_snapshot_members(&self.staging_path, &input.validation.request)?;
         snapshot_members.extend(validate_terminal_snapshot_members(
@@ -591,56 +614,6 @@ impl RecordingStaging {
     }
 }
 
-impl BoundedEventWriter {
-    pub fn write_record(&mut self, record: &[u8]) -> Result<(), PublishError> {
-        if record.is_empty()
-            || !record.ends_with(b"\n")
-            || record[..record.len() - 1].contains(&b'\n')
-        {
-            return Err(PublishError::InvalidRecord);
-        }
-        let record_bytes =
-            u64::try_from(record.len()).map_err(|_| PublishError::ByteLimit(self.max_bytes))?;
-        if record_bytes > self.max_line_bytes {
-            return Err(PublishError::LineLimit(self.max_line_bytes));
-        }
-        let next_events = self
-            .events
-            .checked_add(1)
-            .ok_or(PublishError::EventLimit(self.max_events))?;
-        if next_events > self.max_events {
-            return Err(PublishError::EventLimit(self.max_events));
-        }
-        let next_bytes = self
-            .bytes
-            .checked_add(record_bytes)
-            .ok_or(PublishError::ByteLimit(self.max_bytes))?;
-        if next_bytes > self.max_bytes {
-            return Err(PublishError::ByteLimit(self.max_bytes));
-        }
-        self.file.write_all(record)?;
-        self.events = next_events;
-        self.bytes = next_bytes;
-        Ok(())
-    }
-
-    pub fn events(&self) -> u64 {
-        self.events
-    }
-
-    pub fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    pub fn finish(self) -> Result<(), PublishError> {
-        // Publication and every in-process failure path finish at one durability boundary. An
-        // abandoned staging directory is quarantined rather than promoted from an unproven
-        // per-record prefix, so forcing every high-rate event to disk here is unnecessary.
-        self.file.sync_all()?;
-        Ok(())
-    }
-}
-
 fn build_manifest(
     input: &RecordingBundleInput,
     registry: &EventContractRegistry,
@@ -674,6 +647,9 @@ fn build_manifest(
             bytes: identity.bytes,
             records: Some(identity.frames),
         });
+    }
+    if let Some(receipt) = &input.validation.request.initial_state {
+        members.push(super::publish_state::member_descriptor(receipt));
     }
     members.extend(snapshot_members);
     Ok(RecordingManifest {
@@ -720,7 +696,7 @@ fn valid_snapshot_label(label: &str) -> bool {
     crate::path_safety::is_hyphenated_ascii_id(label, 64)
 }
 
-fn valid_profile_id(value: &str) -> bool {
+pub(super) fn valid_profile_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 64
         && value
@@ -1028,6 +1004,7 @@ pub fn verify_published_recording(
         || manifest.terminal.publication != PublicationOutcome::Published
         || manifest.members.len()
             != 1 + usize::from(manifest.request.input_movie.is_some())
+                + usize::from(manifest.request.initial_state.is_some())
                 + manifest.request.terminal_snapshots.len()
                 + manifest.request.initial_snapshots.len()
                 + usize::from(manifest.request.terminal_state.is_some())
@@ -1078,6 +1055,12 @@ pub fn verify_published_recording(
     let member = event_members[0];
     validate_input_movie_member(&bundle_path, &manifest.request)
         .map_err(|error| PublishedBundleError::Invalid(error.to_string()))?;
+    super::publish_state::validate_initial_state_member(
+        &bundle_path,
+        &manifest.request,
+        &manifest.runtime,
+    )
+    .map_err(|error| PublishedBundleError::Invalid(error.to_string()))?;
     let initial_snapshot_members =
         validate_initial_snapshot_members(&bundle_path, &manifest.request)
             .map_err(|error| PublishedBundleError::Invalid(error.to_string()))?;
@@ -1099,6 +1082,13 @@ pub fn verify_published_recording(
         {
             return Err(PublishedBundleError::Invalid(
                 "input movie member descriptor mismatch".into(),
+            ));
+        }
+    }
+    if let Some(receipt) = &manifest.request.initial_state {
+        if !super::publish_state::descriptor_matches(&manifest.members, receipt) {
+            return Err(PublishedBundleError::Invalid(
+                "initial state member descriptor mismatch".into(),
             ));
         }
     }

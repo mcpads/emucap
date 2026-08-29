@@ -1215,6 +1215,163 @@
       "constraints": {"state.load.execution_states.allowed": ["frozen"]},
       "public_behavior": {"invalid": "bad_state"},
       "verification": ["runtime-test:n64-load-frozen-restores-one-snapshot"]
+    },
+    {
+      "id": "np2kai.breakpoint.snapshot-pausing-only",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.ARMED.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"snapshot": "present", "pause_on_hit": false},
+      "constraints": {
+        "breakpoint.snapshot.supported": true,
+        "breakpoint.snapshot.pause_on_hit.required": true,
+        "breakpoint.snapshot.max_total_bytes": 16384
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:np2kai-nonpausing-snapshot-rejected"]
+    },
+    {
+      "id": "np2kai.breakpoint.read-value-unavailable",
+      "feature": "debug.breakpoint",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1", "BP.CAPABILITY.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"kind": "read", "value_filter": "present"},
+      "constraints": {
+        "breakpoint.read.value_filter.supported": false,
+        "breakpoint.read.event.value.authority": "unavailable",
+        "breakpoint.write.event.value.authority": "native_write_argument"
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:np2kai-read-value-filter-rejected"]
+    },
+    {
+      "id": "np2kai.call-stack.best-effort",
+      "feature": "debug.call-stack",
+      "kind": "variation_binding",
+      "targets": ["TRACE.AUTHORITY.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"method": "call_stack"},
+      "constraints": {},
+      "authority": {"debug.call-stack": "best_effort"},
+      "verification": ["contract-test:np2kai-call-stack-method-advertised"]
+    },
+    {
+      "id": "np2kai.disassembly.current-mode",
+      "feature": "debug.disassemble",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.REJECT.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"address": "outside_active_x86_code_mapping"},
+      "constraints": {"debug.disassemble.address_scope": "active_x86_code_mapping"},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:np2kai-disassembly-current-mode-rejection"]
+    },
+    {
+      "id": "np2kai.input-hold.port-zero-only",
+      "feature": "input.hold",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"port": "not_zero"},
+      "constraints": {"input.ports.allowed": [0]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:np2kai-set-input-port-rejected"]
+    },
+    {
+      "id": "np2kai.input-pulse.constraints",
+      "feature": "input.pulse",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"port": "not_zero", "frames": "above_120"},
+      "constraints": {"input.ports.allowed": [0], "input.pulse.max_frames": 120},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:np2kai-press-buttons-port-rejected",
+        "contract-test:np2kai-press-buttons-frame-cap"
+      ]
+    },
+    {
+      "id": "np2kai.media.hdd0-only",
+      "feature": "media.change",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "MEDIA.CHANGE.APPLY.1", "MEDIA.CHANGE.ISOLATION.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"device": "not_hdd0"},
+      "constraints": {"media.change.devices.allowed": ["hdd0"]},
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": ["contract-test:np2kai-non-hdd0-media-change-rejected"]
+    },
+    {
+      "id": "np2kai.media.hdd0-required",
+      "feature": "media.change",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.REJECT.1", "MEDIA.CHANGE.APPLY.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"device": "hdd0", "eject": true},
+      "constraints": {"media.change.hdd0.must_be_loaded": true, "media.change.hdd0.eject_supported": false},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:np2kai-hdd0-eject-rejected"]
+    },
+    {
+      "id": "np2kai.screenshot.frozen-only",
+      "feature": "video.capture",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "VIDEO.CURRENT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"video.capture.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["runtime-test:np2kai-screenshot-frozen-current"]
+    },
+    {
+      "id": "np2kai.pointer-relative.constraints",
+      "feature": "input.pointer-move",
+      "kind": "parameter_constraint",
+      "targets": ["CORE.PARAM.1", "CORE.UNIT.1", "CORE.BOUND.1", "INPUT.POINTER.MOVE.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"port": "not_zero", "delta": "outside_signed_8_bit", "frames": "above_120"},
+      "constraints": {
+        "input.pointer.ports.allowed": [0],
+        "input.pointer.coordinate_mode": "relative",
+        "input.pointer.delta.min": -127,
+        "input.pointer.delta.max": 127,
+        "input.pointer.zero_delta_allowed": false,
+        "input.pointer.move.max_frames": 120,
+        "input.pointer.absolute_supported": false,
+        "input.pointer.wheel_supported": false
+      },
+      "public_behavior": {"invalid": "bad_params"},
+      "verification": [
+        "contract-test:np2kai-pointer-port-rejected",
+        "contract-test:np2kai-pointer-delta-bounds",
+        "contract-test:np2kai-pointer-frame-cap",
+        "runtime-test:np2kai-relative-pointer-move-frozen"
+      ]
+    },
+    {
+      "id": "np2kai.state-save.frozen-only",
+      "feature": "state.save",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.save.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["runtime-test:np2kai-save-frozen-completes"]
+    },
+    {
+      "id": "np2kai.state-load.frozen-only",
+      "feature": "state.load",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "np2kai-libretro", "systems": ["pc98"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.load.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["runtime-test:np2kai-load-frozen-restores-one-snapshot"]
     }
   ]
 }

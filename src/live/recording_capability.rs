@@ -17,6 +17,7 @@ pub const CORE_MAX_RECORDING_LINE_BYTES: u64 = 64 * 1024;
 pub const CORE_MAX_RECORDING_HOST_MS: u64 = MAX_SYNC_OPERATION_MS;
 pub const CORE_MAX_INPUT_MOVIE_BYTES: u64 = 1024 * 1024;
 pub const CORE_MAX_INPUT_BUTTONS_PER_FRAME: u64 = 64;
+pub const CORE_MAX_RECORDING_STATE_BYTES: u64 = 64 * 1024 * 1024;
 pub const CORE_MAX_TERMINAL_SNAPSHOT_MEMBERS: u64 = 8;
 pub const CORE_MAX_TERMINAL_SNAPSHOT_MEMBER_BYTES: u64 = 128 * 1024;
 pub const CORE_MAX_TERMINAL_SNAPSHOT_TOTAL_BYTES: u64 = 1024 * 1024;
@@ -42,6 +43,8 @@ pub struct RecordingCapability {
     pub class_accounting: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_movie: Option<RecordingInputMovieCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_load: Option<RecordingStateLoadCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_snapshots: Option<RecordingInitialSnapshotCapability>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -70,6 +73,7 @@ pub struct RecordingRepeatabilityCapability {
 pub enum RecordingCapabilityOrigin {
     NextFrameBoundary,
     ResetRelease,
+    StateLoad,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +130,21 @@ pub struct RecordingInputMovieCapability {
     pub max_frames: u64,
     pub max_bytes: u64,
     pub max_buttons_per_frame: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordingStateLoadCapability {
+    pub format: String,
+    pub max_bytes: u64,
+    pub alignment: RecordingStateLoadAlignment,
+    pub requires_input_movie: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingStateLoadAlignment {
+    RestoredFrameBoundary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,6 +216,8 @@ struct RecordingCapabilityRevision<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     input_movie: &'a Option<RecordingInputMovieCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    state_load: &'a Option<RecordingStateLoadCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     initial_snapshots: &'a Option<RecordingInitialSnapshotCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_snapshots: &'a Option<RecordingTerminalSnapshotCapability>,
@@ -229,6 +250,7 @@ impl RecordingCapability {
             event_order: &self.event_order,
             class_accounting: self.class_accounting,
             input_movie: &self.input_movie,
+            state_load: &self.state_load,
             initial_snapshots: &self.initial_snapshots,
             terminal_snapshots: &self.terminal_snapshots,
             terminal_state: &self.terminal_state,
@@ -310,7 +332,7 @@ impl RecordingCapability {
             }
         }
         if self.origins.first() != Some(&RecordingCapabilityOrigin::NextFrameBoundary)
-            || self.origins.len() > 2
+            || self.origins.len() > 3
             || self.origins.iter().collect::<BTreeSet<_>>().len() != self.origins.len()
         {
             return Err(RecordingCapabilityError::Invalid(
@@ -407,6 +429,25 @@ impl RecordingCapability {
             {
                 return Err(RecordingCapabilityError::Invalid(
                     "input movie format, port, or bounds are invalid".into(),
+                ));
+            }
+        }
+
+        let state_load_origin = self.origins.contains(&RecordingCapabilityOrigin::StateLoad);
+        if state_load_origin != self.state_load.is_some() {
+            return Err(RecordingCapabilityError::Invalid(
+                "state_load origin and capability must be advertised together".into(),
+            ));
+        }
+        if let Some(state_load) = &self.state_load {
+            if !safe_profile_token(&state_load.format)
+                || state_load.max_bytes == 0
+                || state_load.max_bytes > CORE_MAX_RECORDING_STATE_BYTES
+                || state_load.alignment != RecordingStateLoadAlignment::RestoredFrameBoundary
+                || (state_load.requires_input_movie && self.input_movie.is_none())
+            {
+                return Err(RecordingCapabilityError::Invalid(
+                    "state-load format, alignment, or bounds are invalid".into(),
                 ));
             }
         }

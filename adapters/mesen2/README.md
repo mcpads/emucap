@@ -134,6 +134,17 @@ validates and decodes the movie and binds the sink before queueing reset, then e
 boundary in Mesen's native post-reset callback before the emulation loop releases a guest tick. This
 is a timed soft-reset origin, not a cold-power or equal-memory claim. Legacy/manual hosts and the
 other Mesen system entries keep their existing tools but do not advertise recording.
+The maintained SNES profile also advertises `state_load` with `restored_frame_boundary` alignment.
+`save_state(preserve_for_recording=true)` preserves its exact bytes and semantic receipt in the
+managed launch generation. The default save path performs no such preservation. A
+state-backed window accepts only the returned opaque snapshot ID and only when that receipt proves
+a frozen frame boundary. Core stages those producer-owned bytes; Mesen loads them while its native
+savestate-safe halt is still owned, restores the saved frame coordinate, applies movie offset zero,
+attaches selected hooks, and emits that restored boundary before resuming. There is no caller round
+trip or hidden alignment frame between load and recording. Instruction-boundary saves remain valid
+ordinary states but are not eligible for this frame-window origin. Load failure or arming failure
+does not publish a complete bundle and leaves Mesen frozen; it does not claim restoration of the
+pre-attempt state after a native load error.
 For warmup requests, `frame_boundary` and `frame_completed` also advertise selectable transaction
 or observation emission scopes. The default remains transaction scope. An observation override
 suppresses warmup records and their event, byte, and drop accounting while the dense input movie

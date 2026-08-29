@@ -65,6 +65,7 @@ fn capability() -> RecordingCapability {
         event_order: None,
         class_accounting: false,
         input_movie: None,
+        state_load: None,
         initial_snapshots: None,
         terminal_snapshots: None,
         terminal_state: None,
@@ -611,6 +612,7 @@ fn request(output: &std::path::Path, frames: u64) -> RecordWindowRequest {
         event_arming_overrides: vec![],
         origin: None,
         input_path: None,
+        initial_state: None,
         stop_on: None,
         start_on: None,
         initial_snapshots: vec![],
@@ -684,7 +686,7 @@ fn event_filters_are_capability_scoped_and_canonicalized_before_dispatch() {
         ],
     }];
 
-    let effective = effective_request(&capability, &[], &[], &request).unwrap();
+    let effective = effective_request(&capability, &[], &[], &request, None).unwrap();
     assert_eq!(
         effective.request.event_filters[0].terms[0].path(),
         "address"
@@ -700,7 +702,7 @@ fn event_filters_are_capability_scoped_and_canonicalized_before_dispatch() {
         length: 2,
     };
     assert!(matches!(
-        effective_request(&capability, &[], &[], &request),
+        effective_request(&capability, &[], &[], &request, None),
         Err(RecordingError::Invalid(_))
     ));
     request.event_filters[0].terms[0] = EventFilterTerm::U64Range {
@@ -709,7 +711,7 @@ fn event_filters_are_capability_scoped_and_canonicalized_before_dispatch() {
         length: 1,
     };
     assert!(matches!(
-        effective_request(&capability, &[], &[], &request),
+        effective_request(&capability, &[], &[], &request, None),
         Err(RecordingError::Unavailable(_))
     ));
     request.event_filters[0].terms[0] = EventFilterTerm::U64Range {
@@ -718,7 +720,7 @@ fn event_filters_are_capability_scoped_and_canonicalized_before_dispatch() {
         length: 2,
     };
     assert!(matches!(
-        effective_request(&capability, &[], &[], &request),
+        effective_request(&capability, &[], &[], &request, None),
         Err(RecordingError::Invalid(_))
     ));
 }
@@ -773,8 +775,14 @@ fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract
         size: 128 * 1024,
     }];
 
-    let effective =
-        effective_request(&capability, &["record_window".into()], &regions, &request).unwrap();
+    let effective = effective_request(
+        &capability,
+        &["record_window".into()],
+        &regions,
+        &request,
+        None,
+    )
+    .unwrap();
     assert_eq!(effective.request.event_arming.len(), 2);
     assert_eq!(
         effective.request.event_arming[0].scope,
@@ -786,12 +794,26 @@ fn event_aligned_start_and_initial_snapshot_are_admitted_as_one_bounded_contract
     );
 
     request.start_on = None;
-    assert!(effective_request(&capability, &["record_window".into()], &regions, &request).is_err());
+    assert!(effective_request(
+        &capability,
+        &["record_window".into()],
+        &regions,
+        &request,
+        None
+    )
+    .is_err());
     request.start_on = Some(EventStartCondition {
         event_class: "snes_cpu_instruction".into(),
     });
     request.initial_snapshots[0].address = 1;
-    assert!(effective_request(&capability, &["record_window".into()], &regions, &request).is_err());
+    assert!(effective_request(
+        &capability,
+        &["record_window".into()],
+        &regions,
+        &request,
+        None
+    )
+    .is_err());
 }
 
 #[test]
@@ -815,7 +837,7 @@ fn warmup_event_scope_overrides_require_live_advertisement_and_selected_classes(
         scope: EventArmingScope::Observation,
     }];
 
-    let effective = effective_request(&capability, &[], &[], &request).unwrap();
+    let effective = effective_request(&capability, &[], &[], &request, None).unwrap();
     assert_eq!(
         effective.request.event_arming,
         vec![EventClassArming {
@@ -829,7 +851,7 @@ fn warmup_event_scope_overrides_require_live_advertisement_and_selected_classes(
         scope: EventArmingScope::Transaction,
     });
     assert!(matches!(
-        effective_request(&capability, &[], &[], &request),
+        effective_request(&capability, &[], &[], &request, None),
         Err(RecordingError::Invalid(_))
     ));
     request.event_arming_overrides.truncate(1);
@@ -841,7 +863,7 @@ fn warmup_event_scope_overrides_require_live_advertisement_and_selected_classes(
         .clear();
     capability.revision = capability.computed_revision().unwrap();
     assert!(matches!(
-        effective_request(&capability, &[], &[], &request),
+        effective_request(&capability, &[], &[], &request, None),
         Err(RecordingError::Unavailable(_))
     ));
 }
@@ -855,7 +877,7 @@ fn repeatable_selection_refuses_unadvertised_or_ineligible_origins_before_execut
     let mut capability = capability();
 
     let error =
-        effective_request(&capability, &["record_window".into()], &[], &request).unwrap_err();
+        effective_request(&capability, &["record_window".into()], &[], &request, None).unwrap_err();
     assert!(error.to_string().contains("does not advertise repeatable"));
 
     capability
@@ -875,11 +897,11 @@ fn repeatable_selection_refuses_unadvertised_or_ineligible_origins_before_execut
         max_buttons_per_frame: 32,
     });
     capability.revision = capability.computed_revision().unwrap();
-    effective_request(&capability, &["record_window".into()], &[], &request).unwrap();
+    effective_request(&capability, &["record_window".into()], &[], &request, None).unwrap();
 
     request.origin = Some(RecordingOrigin::NextFrameBoundary);
     let error =
-        effective_request(&capability, &["record_window".into()], &[], &request).unwrap_err();
+        effective_request(&capability, &["record_window".into()], &[], &request, None).unwrap_err();
     assert!(error.to_string().contains("NextFrameBoundary"));
 
     request.origin = Some(RecordingOrigin::ResetRelease);
@@ -890,7 +912,7 @@ fn repeatable_selection_refuses_unadvertised_or_ineligible_origins_before_execut
         .requires_input_movie = true;
     capability.revision = capability.computed_revision().unwrap();
     let error =
-        effective_request(&capability, &["record_window".into()], &[], &request).unwrap_err();
+        effective_request(&capability, &["record_window".into()], &[], &request, None).unwrap_err();
     assert!(error
         .to_string()
         .contains("requires an explicit input movie"));
@@ -898,7 +920,93 @@ fn repeatable_selection_refuses_unadvertised_or_ineligible_origins_before_execut
     let movie = output.path().join("empty-input.movie");
     std::fs::write(&movie, b"0:\n").unwrap();
     request.input_path = Some(movie);
-    effective_request(&capability, &["record_window".into()], &[], &request).unwrap();
+    effective_request(&capability, &["record_window".into()], &[], &request, None).unwrap();
+}
+
+#[test]
+fn state_load_requires_a_resolved_producer_snapshot_and_refuses_ambiguous_composition() {
+    let output = tempfile::tempdir().unwrap();
+    let movie_path = output.path().join("neutral.movie");
+    std::fs::write(&movie_path, b"0:\n1:\n").unwrap();
+
+    let mut capability = capability();
+    capability
+        .origins
+        .push(RecordingCapabilityOrigin::StateLoad);
+    capability.input_movie = Some(RecordingInputMovieCapability {
+        format: INPUT_MOVIE_FORMAT.into(),
+        port: 0,
+        max_frames: capability.limits.max_frames,
+        max_bytes: CORE_MAX_INPUT_MOVIE_BYTES,
+        max_buttons_per_frame: 32,
+    });
+    capability.state_load = Some(RecordingStateLoadCapability {
+        format: "mesen-savestate".into(),
+        max_bytes: CORE_MAX_RECORDING_STATE_BYTES,
+        alignment: RecordingStateLoadAlignment::RestoredFrameBoundary,
+        requires_input_movie: true,
+    });
+    capability.revision = capability.computed_revision().unwrap();
+
+    let mut request = request(output.path(), 2);
+    request.origin = Some(RecordingOrigin::StateLoad);
+    request.input_path = Some(movie_path);
+    request.initial_state = Some(RecordingStateInput {
+        snapshot_id: "snapshot-01test".into(),
+    });
+    let acquired = || super::recording_state::AcquiredRecordingState {
+        bytes: b"exact-state".to_vec(),
+        receipt: StateSnapshotReceipt {
+            snapshot_id: "snapshot-01test".into(),
+            snapshot: StateArtifactIdentity {
+                format: "mesen-savestate".into(),
+                bytes: 11,
+                sha256: hex::encode(sha2::Sha256::digest(b"exact-state")),
+            },
+            source: RuntimeIdentity {
+                system: "snes".into(),
+                adapter_id: "mesen2".into(),
+                server_build: "server".into(),
+                adapter_build: "adapter".into(),
+                emulator_id: "mesen".into(),
+                emulator_build: "binary".into(),
+                emulator_upstream_revision: "upstream".into(),
+                emulator_patchset_sha256: "patchset".into(),
+                launch_id: "launch-test".into(),
+                capability_revision: capability.revision.clone(),
+                content: ContentIdentity {
+                    sha1: None,
+                    sha256: Some("content".into()),
+                    bytes: 1,
+                    path_hint: None,
+                },
+            },
+            frozen: StateSnapshotFrozenFacts {
+                state: FinalExecutionState::Frozen,
+                frame: 120,
+                boundary: StateSnapshotBoundary::FrameBoundary,
+            },
+        },
+    };
+    let effective = effective_request(&capability, &[], &[], &request, Some(acquired())).unwrap();
+    assert_eq!(effective.origin, RecordingOrigin::StateLoad);
+    assert_eq!(effective.state.as_ref().unwrap().bytes, b"exact-state");
+    assert_eq!(
+        effective.request.initial_state,
+        effective.state.map(|state| state.receipt)
+    );
+
+    request.input_path = None;
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request, Some(acquired())),
+        Err(RecordingError::Invalid(_))
+    ));
+    request.input_path = Some(output.path().join("neutral.movie"));
+    request.warmup_frames = 1;
+    assert!(matches!(
+        effective_request(&capability, &[], &[], &request, Some(acquired())),
+        Err(RecordingError::Invalid(_))
+    ));
 }
 
 fn run(harness: &Harness, mode: Mode, delay: Duration, frames: u64) -> RecordWindowResult {
@@ -1667,6 +1775,7 @@ fn producer_status_cannot_contradict_a_completed_operation() {
             ..capability().limits
         },
         input_movie: None,
+        initial_state: None,
         stop_on: None,
         start_on: None,
         initial_snapshots: vec![],
@@ -1789,6 +1898,7 @@ fn host_sink_failure_or_partial_record_downgrades_an_otherwise_complete_terminal
                 ..capability().limits
             },
             input_movie: None,
+            initial_state: None,
             stop_on: None,
             start_on: None,
             initial_snapshots: vec![],

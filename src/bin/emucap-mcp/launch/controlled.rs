@@ -48,13 +48,9 @@ pub(super) fn controlled_launch_contract_error(
         return None;
     }
 
-    let expected_profile = ExecutionProfileIdentity {
-        id: emucap::launch::mesen::REPEATABLE_PROFILE_ID.into(),
-        conditions_sha256: emucap::launch::mesen::REPEATABLE_CONDITIONS_SHA256.into(),
-    };
-    if execution_profile != Some(&expected_profile) {
+    let Some(expected_profile) = execution_profile else {
         return Some("repeatable launch outcome lacks the selected execution identity".into());
-    }
+    };
     let live = capabilities
         .recording
         .as_ref()

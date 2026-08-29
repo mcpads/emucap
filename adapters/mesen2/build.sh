@@ -68,8 +68,13 @@ if [ ! -d "$SRC/.git" ]; then
   fi
   mkdir -p "$SRC"
   git init -q "$SRC"
+  # A detached fsmonitor daemon can inherit the build-lock descriptor and keep the generated work
+  # tree locked after this build exits. Adapter work trees are reset on every build, so fsmonitor
+  # has no useful persistent state here.
+  git -C "$SRC" config --local core.fsmonitor false
   git -C "$SRC" remote add origin "$ORIGIN"
 else
+  git -C "$SRC" config --local core.fsmonitor false
   git -C "$SRC" remote set-url origin "$ORIGIN"
 fi
 

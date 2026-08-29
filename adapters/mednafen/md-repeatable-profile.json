@@ -1,0 +1,30 @@
+{
+  "profile": "mednafen_md_repeatable",
+  "system": "md",
+  "entry_boundary": "pre_first_instruction_frozen",
+  "runtime_home": {
+    "scope": "emucap_owned",
+    "lifecycle": "recreated_before_each_launch",
+    "inherits_user_profile": false
+  },
+  "power_on": {
+    "work_ram": "zero",
+    "z80_ram": "zero",
+    "host_time_sources": []
+  },
+  "controller": {
+    "port": 0,
+    "device": "gamepad6",
+    "auto_select": false
+  },
+  "recording": {
+    "origins": [
+      "reset_release"
+    ],
+    "restore_initial_state_before_each_window": true,
+    "initial_state_max_bytes": 16777216,
+    "non_savestate_layer_mask": "all_enabled",
+    "input_movie_port": 0,
+    "requires_input_movie": true
+  }
+}

@@ -229,6 +229,7 @@ PC98_INPUT_BUTTONS = [
     *[f"vf{i}" for i in range(1, 6)],
     *[chr(code) for code in range(ord("a"), ord("z") + 1)],
     *[str(i) for i in range(10)],
+    *[f"kp{i}" for i in range(10)],
 ]
 PC98_INPUT_ALIASES = {
     "return": "enter",
@@ -241,6 +242,17 @@ PC98_INPUT_ALIASES = {
     "bksp": "backspace",
     "bs": "backspace",
 }
+
+
+def canonical_input_name(raw: Any) -> str:
+    key = str(raw).strip().lower()
+    key = PC98_INPUT_ALIASES.get(key, key)
+    for prefix in ("numpad", "kp_", "kp"):
+        if key.startswith(prefix) and len(key) == len(prefix) + 1 and key[-1].isdigit():
+            return f"kp{key[-1]}"
+    if len(key) == len("0 (pad)") and key[0].isdigit() and key[1:] == " (pad)":
+        return f"kp{key[0]}"
+    return key
 
 LUA_BACKEND = "lua-gdbstub"
 METHODS = [
@@ -417,7 +429,7 @@ class Bridge:
                 "system": "pc98",
                 "buttons": PC98_INPUT_BUTTONS,
                 "aliases": PC98_INPUT_ALIASES,
-                "notes": "PC-98 uses keyboard inputs. Prefer enter/esc/space/up/down/left/right plus letter, digit, f1-f10, and vf1-vf5 keys.",
+                "notes": "PC-98 uses keyboard inputs. Ordinary digits and kp0-kp9 keypad inputs are distinct.",
             },
         }
         if name := os.environ.get("EMUCAP_NAME"):
@@ -1466,8 +1478,7 @@ class Bridge:
         out = []
         allowed = set(PC98_INPUT_BUTTONS)
         for raw in raw_buttons:
-            key = str(raw).strip().lower()
-            key = PC98_INPUT_ALIASES.get(key, key)
+            key = canonical_input_name(raw)
             if key not in allowed:
                 raise BridgeError(f"unsupported PC-98 key: {raw}")
             out.append(key)

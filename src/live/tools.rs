@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 
 use super::link::{EmulatorLink, LinkError};
 use super::temporal::finish_with_cleanup;
+#[cfg(test)]
+pub(crate) use super::tools_state::save_state_in_store;
+pub use super::tools_state::{save_state, save_state_for_recording};
 
 mod pointer;
 pub use pointer::{click_pointer, drag_pointer, move_pointer};
@@ -569,12 +572,6 @@ pub fn hold_until(
     Ok(ToolOutput::Json(json!({
         "changed": changed, "frames": frames, "before": before, "after": after, "state": "frozen"
     })))
-}
-
-pub fn save_state(link: &mut dyn EmulatorLink, path: &str) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(
-        link.call("save_state", json!({ "path": path }))?,
-    ))
 }
 
 pub fn load_state(link: &mut dyn EmulatorLink, path: &str) -> Result<ToolOutput, LinkError> {

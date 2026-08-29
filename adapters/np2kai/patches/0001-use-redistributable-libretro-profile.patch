@@ -1,0 +1,154 @@
+diff --git a/sdl/Makefile.common b/sdl/Makefile.common
+index 0376278..b1ed7c4 100644
+--- a/sdl/Makefile.common
++++ b/sdl/Makefile.common
+@@ -15,10 +15,9 @@ INCFLAGS :=	-I$(NP2_PATH) \
+ 	-I$(NP2_PATH)/generic \
+ 	-I$(NP2_PATH)/io \
+ 	-I$(NP2_PATH)/mem \
+-	-I$(NP2_PATH)/sound \
+-	-I$(NP2_PATH)/sound/vermouth \
+-	-I$(NP2_PATH)/sound/mame \
+-	-I$(NP2_PATH)/sound/fmgen \
++	-I$(NP2_PATH)/sound \
++	-I$(NP2_PATH)/sound/vermouth \
++	-I$(NP2_PATH)/sound/mamebsd \
+ 	-I$(NP2_PATH)/trap \
+ 	-I$(NP2_PATH)/vram \
+ 	-I$(NP2_PATH)/wab \
+@@ -101,11 +100,10 @@ SOURCES_C :=	$(NP2_PATH)/calendar.c \
+ 	$(NP2_PATH)/sound/tms3631c.c \
+ 	$(NP2_PATH)/sound/tms3631g.c \
+ 	$(wildcard $(NP2_PATH)/sound/getsnd/*.c) \
+-	$(wildcard $(NP2_PATH)/sound/mame/*.c) \
+ 	$(wildcard $(NP2_PATH)/sound/vermouth/*.c) \
+ 	$(wildcard $(NP2_PATH)/trap/*.c) \
+ 	$(wildcard $(NP2_PATH)/vram/*.c) \
+-	$(wildcard $(NP2_PATH)/wab/*.c)
++	$(filter-out $(NP2_PATH)/wab/tgui9680.c,$(wildcard $(NP2_PATH)/wab/*.c))
+ 
+ NP2_SOURCES_C := $(NP2_PATH)/debugsub.c \
+     $(NP2_PATH)/generic/hostdrv.c \
+@@ -117,10 +115,6 @@ NP21_SOURCES_C := $(NP2_PATH)/debugsub386.c \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/*.c) \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/*.c) \
+ 	$(NP2_PATH)/i386c/ia32/instructions/fpu/fpdummy.c \
+-	$(NP2_PATH)/i386c/ia32/instructions/fpu/fpemul_dosbox.c \
+-	$(NP2_PATH)/i386c/ia32/instructions/fpu/fpemul_dosbox2.c \
+-	$(NP2_PATH)/i386c/ia32/instructions/fpu/fpemul_softfloat.c \
+-	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/fpu/softfloat/*.c) \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/fpu/softfloat3/*.c) \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/mmx/*.c) \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/sse/*.c) \
+@@ -130,15 +124,14 @@ NP21_SOURCES_C := $(NP2_PATH)/debugsub386.c \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/sse4/*.c) \
+ 	$(wildcard $(NP2_PATH)/i386c/ia32/instructions/sse4a/*.c)
+ 
+-SOURCES_CXX := $(wildcard $(NP2_PATH)/sound/fmgen/*.cpp) \
+-	$(wildcard $(NP2_PATH)/sound/mamebsd/*.cpp)
++SOURCES_CXX := $(wildcard $(NP2_PATH)/sound/mamebsd/*.cpp)
+ 
+ NP21_SOURCES_CXX += $(NP2_PATH)/i386c/ia32/instructions/fpu/fpemul_softfloat3.cpp
+ 
+-NP2DEFINE := -DBIOS_IO_EMULATION -DOSLANG_UTF8 -DOSLINEBREAK_CRLF -DSUPPORT_8BPP -DSUPPORT_16BPP -DSUPPORT_24BPP -DSUPPORT_32BPP -DSUPPORT_CL_GD5430 -DSUPPORT_CRT15KHZ -DSUPPORT_FAST_MEMORYCHECK -DSUPPORT_FMGEN -DSUPPORT_GPIB -DSUPPORT_HRTIMER -DSUPPORT_KAI_IMAGES -DSUPPORT_LARGE_HDD -DSUPPORT_NORMALDISP -DSUPPORT_PC9861K -DSUPPORT_PX -DSUPPORT_RESUME -DSUPPORT_RS232C_FIFO -DSUPPORT_S98 -DSUPPORT_SCSI -DSUPPORT_SMPU98 -DSUPPORT_SOFTKBD=0 -DSUPPORT_SOUND_SB16 -DSUPPORT_STATSAVE=10 -DSUPPORT_UTF8 -DSUPPORT_V30EXT -DSUPPORT_V30ORIGINAL -DSUPPORT_VIDEOFILTER -DSUPPORT_VPCVHD -DSUPPORT_WAB -DUSE_MAME -DUSE_MAME_BSD -DVAEG_FIX -DVERMOUTH_LIB -DSUPPORT_DEBUGSS
++NP2DEFINE := -DBIOS_IO_EMULATION -DOSLANG_UTF8 -DOSLINEBREAK_CRLF -DSUPPORT_8BPP -DSUPPORT_16BPP -DSUPPORT_24BPP -DSUPPORT_32BPP -DSUPPORT_CL_GD5430 -DSUPPORT_CRT15KHZ -DSUPPORT_FAST_MEMORYCHECK -DSUPPORT_GPIB -DSUPPORT_HRTIMER -DSUPPORT_KAI_IMAGES -DSUPPORT_LARGE_HDD -DSUPPORT_NORMALDISP -DSUPPORT_PC9861K -DSUPPORT_PX -DSUPPORT_RESUME -DSUPPORT_RS232C_FIFO -DSUPPORT_S98 -DSUPPORT_SCSI -DSUPPORT_SMPU98 -DSUPPORT_SOFTKBD=0 -DSUPPORT_SOUND_SB16 -DSUPPORT_STATSAVE=10 -DSUPPORT_UTF8 -DSUPPORT_V30EXT -DSUPPORT_V30ORIGINAL -DSUPPORT_VIDEOFILTER -DSUPPORT_VPCVHD -DSUPPORT_WAB -DUSE_MAME -DUSE_MAME_BSD -DVAEG_FIX -DVERMOUTH_LIB -DSUPPORT_DEBUGSS
+ # -DSUPPORT_NVL_IMAGES
+ 
+-NP21DEFINE := -DCPUCORE_IA32 -DIA32_PAGING_EACHSIZE -DIA32_REBOOT_ON_PANIC -DSUPPORT_CRT31KHZ -DSUPPORT_PC9801_119 -DSUPPORT_PC9821 -DSUPPORT_IDEIO -DSUPPORT_LARGE_MEMORY -DSUPPORT_FPU_DOSBOX2_COMPATIBLE -DSUPPORT_PEGC -DSUPPORT_VGA_MODEX -DSUPPORT_GAMEPORT -DSUPPORT_IDEIO_48BIT -DSUPPORT_FPU_SOFTFLOAT3 -DSUPPORT_PCI -DUSE_FPU -DUSE_MMX -DUSE_3DNOW -DUSE_SSE -DUSE_SSE2 -DUSE_SSE3 -DUSE_SSSE3 -DUSE_SSE4_1 -DUSE_SSE4_2 -DUSE_SSE4A -DUSE_TSC -DUSE_FASTPAGING -DUSE_VME -DIA32_PAGING_EACHSIZE -DSUPPORT_MEMDBG32
++NP21DEFINE := -DCPUCORE_IA32 -DIA32_PAGING_EACHSIZE -DIA32_REBOOT_ON_PANIC -DSUPPORT_CRT31KHZ -DSUPPORT_PC9801_119 -DSUPPORT_PC9821 -DSUPPORT_IDEIO -DSUPPORT_LARGE_MEMORY -DSUPPORT_PEGC -DSUPPORT_VGA_MODEX -DSUPPORT_GAMEPORT -DSUPPORT_IDEIO_48BIT -DSUPPORT_FPU_SOFTFLOAT3 -DSUPPORT_PCI -DUSE_FPU -DUSE_MMX -DUSE_3DNOW -DUSE_SSE -DUSE_SSE2 -DUSE_SSE3 -DUSE_SSSE3 -DUSE_SSE4_1 -DUSE_SSE4_2 -DUSE_SSE4A -DUSE_TSC -DUSE_FASTPAGING -DUSE_VME -DIA32_PAGING_EACHSIZE -DSUPPORT_MEMDBG32
+ ifeq ($(_WIN32), 1)
+ 	NP21DEFINE +=  -DUSE_CPU_MODRMPREFETCH -DUSE_CPU_INLINEINST -DUSE_CPU_DIRECTREG -DUSE_CPU_EIPMASK -DSUPPORT_MEMDBG32
+ endif
+diff --git a/sdl/Makefile.libretro b/sdl/Makefile.libretro
+index 490bd8d..b78c123 100644
+--- a/sdl/Makefile.libretro
++++ b/sdl/Makefile.libretro
+@@ -141 +141 @@ else ifeq ($(platform), osx)
+-	CXX_VER = -std=c++11
++	CXX_VER = -std=c++14
+@@ -948,3 +948,9 @@ uninstall:
+ .PHONY: clean clean-objs
+ endif
+ 
++.PHONY: emucap-write-profile
++emucap-write-profile:
++	@test -n '$(EMUCAP_DEFINE_MANIFEST)'
++	@test -n '$(EMUCAP_SOURCE_MANIFEST)'
++	@printf '%s\n' '$(NP2DEFINE) $(NP21DEFINE)' >'$(EMUCAP_DEFINE_MANIFEST)'
++	@for source in $(sort $(SOURCES_C) $(SOURCES_CXX)); do printf '%s\n' "$$source"; done >'$(EMUCAP_SOURCE_MANIFEST)'
+diff --git a/pccore.c b/pccore.c
+index e26d340..2ce552f 100644
+--- a/pccore.c
++++ b/pccore.c
+@@ -207,6 +207,7 @@ NP2CFG np2cfg = {
+     64,
+     64,
+     64,
++    128,
+ #endif /* SUPPORT_FMGEN */
+     1,
+     0x82,
+@@ -678,6 +679,7 @@ void pccore_setdefault(void) {
+       64,
+       64,
+       64,
++      128,
+ #endif
+       1,
+       0x82,
+diff --git a/sdl/libretro/libretro.c b/sdl/libretro/libretro.c
+index 07fbd15..44eae9a 100644
+--- a/sdl/libretro/libretro.c
++++ b/sdl/libretro/libretro.c
+@@ -1192,6 +1192,7 @@ static void update_variables(void)
+          np2oscfg.jastsnd = 1;
+    }
+ 
++#if defined(SUPPORT_FMGEN)
+    var.key = "np2kai_usefmgen";
+    var.value = NULL;
+ 
+@@ -1202,6 +1203,7 @@ static void update_variables(void)
+       else if (strcmp(var.value, "fmgen") == 0)
+          np2cfg.usefmgen = 0x01;
+    }
++#endif
+ 
+    var.key = "np2kai_xroll";
+    var.value = NULL;
+diff --git a/sdl/libretro/libretro_core_options.h b/sdl/libretro/libretro_core_options.h
+index c904e32..4c5d69d 100644
+--- a/sdl/libretro/libretro_core_options.h
++++ b/sdl/libretro/libretro_core_options.h
+@@ -353,6 +353,7 @@ struct retro_core_option_definition option_defs_us[] = {
+       },
+       "ON"
+    },
++#if defined(SUPPORT_FMGEN)
+    {
+       "np2kai_usefmgen",
+       "Sound Generator",
+@@ -365,6 +366,7 @@ struct retro_core_option_definition option_defs_us[] = {
+       },
+       "fmgen"
+    },
++#endif
+    {
+       "np2kai_volume_M",
+       "Volume Master",
+@@ -1238,6 +1240,7 @@ struct retro_core_option_definition option_defs_ja[] = {
+       },
+       "ON"
+    },
++#if defined(SUPPORT_FMGEN)
+    {
+       "np2kai_usefmgen",
+       "音源ジェネレータ （要リスタート）",
+@@ -1250,6 +1253,7 @@ struct retro_core_option_definition option_defs_ja[] = {
+       },
+       "fmgen"
+    },
++#endif
+    {
+       "np2kai_volume_M",
+       "ボリューム： マスター",

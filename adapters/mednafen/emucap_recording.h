@@ -14,6 +14,10 @@ static const char* const EMUCAP_RECORDING_CAPABILITY_REVISION =
     "fb6acdcc8e5d8a9ff21f49f22c2d08425d414d5d39af52ee04553a578a0b1224";
 static const char* const EMUCAP_RECORDING_RESET_CAPABILITY_REVISION =
     "7daa3baefbe5f7b3455d52827349ff943841e6f5e3b572aacd1ef94245b85272";
+static const char* const EMUCAP_RECORDING_MD_REPEATABLE_CAPABILITY_REVISION =
+    "0e5ba98588edea193990a8059f5aaf1e613a12fa219fab24b0d68bf6caf69748";
+static const char* const EMUCAP_RECORDING_MD_REPEATABLE_PROFILE =
+    "mednafen_md_repeatable";
 static const char* const EMUCAP_RECORDING_INPUT_MOVIE_FORMAT = "frame-full-state-1";
 
 struct EmucapRecordingLimits {
@@ -57,8 +61,12 @@ std::unique_ptr<EmucapRecordingSink> emucap_open_recording_sink(
     const std::string& capture_id,
     std::string& error);
 
-std::string emucap_recording_capability_json(bool reset_release);
-const char* emucap_recording_capability_revision(bool reset_release);
+std::string emucap_recording_capability_json(
+    bool reset_release,
+    const char* repeatability_conditions = nullptr);
+const char* emucap_recording_capability_revision(
+    bool reset_release,
+    bool repeatable = false);
 bool emucap_recording_exact_event_classes(
     const std::string& line,
     bool& include_frame_completed);

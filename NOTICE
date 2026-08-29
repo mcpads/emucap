@@ -10,7 +10,8 @@ projects. Each project remains under its own copyright and license.
 Mednafen
   Upstream: https://mednafen.github.io/
   License:  GPL-2.0-or-later (per source-file headers)
-  Used by:  adapters/mednafen (emucap.cpp compiled in; also drives Saturn/PSX/PCE/MD)
+  Used by:  adapters/mednafen (emucap.cpp compiled in; drives Saturn, PSX, PCE,
+            PC-FX, Mega Drive, WonderSwan, and Neo Geo Pocket profiles)
   Bundles third-party code under GPL-2.0+/LGPL (e.g. hq2x/3x/4x = LGPL).
 
 Flycast
@@ -25,6 +26,16 @@ MAME
   Used by:  adapters/mame-pc98 and adapters/mame-neogeo
             (patches + Lua plugin + GDB bridges; PC-98 and Neo Geo MVS/AES/CD)
   Bundles BSD components (bgfx/bimg/bx, Zstandard, linenoise, ...).
+
+NP2kai
+  Upstream: https://github.com/AZO234/NP2kai
+  Pinned source: d1a40352e24f943a91966c48211c92e6eb07f3a5
+  License: mixed source tree. The supported profile excludes FMGEN, GPL MAME
+           sound, DOSBox FPU, legacy SoftFloat, and Trident TGUI; it retains
+           the root MIT code, BSD MAME sound, SoftFloat 3, and their notices.
+  Used by: adapters/np2kai and emucap-np2kai (direct libretro host; PC-98 HDI)
+  Distribution: emucap ships a pinned source-build recipe and host source, not
+                the generated core, firmware, rhythm samples, or game media.
 
 MesenCE
   Upstream: https://github.com/nesdev-org/MesenCE

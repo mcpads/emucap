@@ -116,7 +116,12 @@ services MCP control before the first guest instruction, and launch succeeds onl
 reports `state="frozen"` with `launch_start.boundary="pre_first_instruction"`. This closes agent and
 network delay after launch; it does not claim equal RTC, power-on state, saves, or other initial
 conditions across Saturn/PSX/PCE launches. The separate repeatable execution profile remains
-limited to the systems that advertise it live.
+limited to the systems that advertise it live. Mega Drive currently advertises
+`mednafen_md_repeatable`: the launcher creates a separate disposable home, the fork captures a
+bounded guest state before the first instruction, and every eligible `reset_release` recording
+restores that state and the declared non-savestate controls before reset and explicit movie input.
+Failure to capture or restore refuses repeatability or the transaction without guest advance.
+Ordinary Mednafen homes and saves are not cleared.
 
 The launcher passes `-sound 1` only when `sound:true` is requested and reports the effective `sound` value in
 its result. PC-98 also supports the common `sound` launch option; unsupported adapters reject `true` rather

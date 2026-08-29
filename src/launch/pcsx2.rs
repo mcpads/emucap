@@ -18,7 +18,7 @@ use super::{
     RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 3;
+pub const REQUIRED_HOST_API: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -304,9 +304,10 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
     let home = super::emu_home_dir("pcsx2", port);
     let data_root = home.join("data");
     let settings = data_root.join("inis");
+    let memory_cards = data_root.join("memcards");
     let pine_runtime = home.join("pine");
     let base = super::emu_home_base();
-    for path in [&home, &data_root, &settings, &pine_runtime] {
+    for path in [&home, &data_root, &settings, &memory_cards, &pine_runtime] {
         if super::has_symlink_component_under(&base, path) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -318,6 +319,7 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
         }
     }
     std::fs::create_dir_all(&settings)?;
+    std::fs::create_dir_all(&memory_cards)?;
     std::fs::create_dir_all(&pine_runtime)?;
     let bios_directory = bios.parent().ok_or_else(|| {
         io::Error::new(
@@ -412,6 +414,10 @@ fn bridge_spec(launch: &Launch<'_>, prepared: &PreparedSession, pine_slot: u16) 
         .arg(launch.port.to_string())
         .arg(pine_slot.to_string())
         .env("EMUCAP_CONTENT", launch.content)
+        .env(
+            "EMUCAP_PCSX2_DATAROOT",
+            prepared.data_root.to_string_lossy().into_owned(),
+        )
         .env(
             "EMUCAP_PCSX2_CAPTURE_DIR",
             prepared

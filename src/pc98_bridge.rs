@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ const MAX_STATE_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_SAVE_ITEM_MEMBERS: usize = 4096;
 const MAX_SAVE_ITEM_MEMBER_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SAVE_ITEM_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
-const METHODS: &[&str] = &[
+pub(crate) const METHODS: &[&str] = &[
     "hello",
     "status",
     "read_memory",
@@ -187,6 +187,16 @@ const PC98_INPUT_BUTTONS: &[&str] = &[
     "7",
     "8",
     "9",
+    "kp0",
+    "kp1",
+    "kp2",
+    "kp3",
+    "kp4",
+    "kp5",
+    "kp6",
+    "kp7",
+    "kp8",
+    "kp9",
     "mouse_left",
     "mouse_right",
     "mouse_middle",

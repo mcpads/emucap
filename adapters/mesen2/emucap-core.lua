@@ -997,7 +997,14 @@ local function frozen_state_io(method, id, p)
   end
 
   if method == "save_state" then
-    reply_ok(id, { status = "completed", path = path, bytes = bytes_or_err })
+    reply_ok(id, {
+      status = "completed",
+      path = path,
+      bytes = bytes_or_err,
+      state = "frozen",
+      frame = frame,
+      boundary = freeze_state.frame_boundary_proven and "frame_boundary" or "instruction_boundary",
+    })
     return nil
   end
 
@@ -1356,6 +1363,11 @@ local function start_recording(id, p)
     reply_err(id, "unsupported", "record_window is not supported for " .. SYS.system)
     return nil
   end
+  if p.origin == "state_load" and (STATE ~= "frozen" or not halt_savestate_safe) then
+    reply_err(id, "unsafe_halt",
+      "state_load recording requires a savestate-safe frozen main-CPU instruction boundary")
+    return nil
+  end
   local conflict = recording_conflict()
   if conflict then reply_err(id, "busy", conflict); return nil end
 
@@ -1367,6 +1379,24 @@ local function start_recording(id, p)
   prepared, kind, message = Recording.prepare(
     p, launch_id, frame, callback_start, buttons_to_table, validated)
   if not prepared then reply_err(id, kind, message); return nil end
+
+  if p.origin == "state_load" then
+    local ok, loaded_or_error = pcall(StateIo.load, emu, p.initial_state.path)
+    if not ok or loaded_or_error ~= p.initial_state.bytes then
+      freeze_snapshot = nil
+      freeze_state = FreezeState.halt("state_load_failed", false)
+      reply_err(id, "io_error", ok and "loaded state byte count mismatch" or loaded_or_error)
+      return nil
+    end
+    -- loadSavestate mutates the live CPU while the native halt remains owned. Core admitted only
+    -- its own receipt for a frame-boundary snapshot, so restore the producer frame coordinate.
+    -- Sink connection, movie ownership, hooks, and the restored boundary are all completed below
+    -- before this handler can return "resume"; every later setup failure remains frozen.
+    frame = p.initial_state.frame
+    freeze_snapshot = emu.getState()
+    freeze_state = FreezeState.halt("state_loaded", true)
+  end
+
   local sink, sink_err = open_recording_sink(p)
   if not sink then reply_err(id, "sink_unavailable", sink_err); return nil end
   local member_sink, member_sink_err = open_recording_member_sink(p)
@@ -2305,7 +2335,7 @@ local function handle_in_freeze(line)
   if method == "record_window" then
     if not FreezeState.can_start_recording(freeze_state, p.origin) then
       reply_err(id, "unsafe_halt",
-        "next-frame recording requires a current frozen position with a proven frame boundary")
+        "recording origin is not safe at the current frozen boundary")
     else
       local action = start_recording(id, p)
       if action == "started" then return "resume" end
