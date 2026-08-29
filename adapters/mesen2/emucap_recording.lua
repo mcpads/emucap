@@ -15,14 +15,14 @@ local CGRAM_LOOKUP_SHA256 = "f9f507926817ef3d14de8ca4cfbfd05364afd78842cca7b04aa
 local BG_CHR_FETCH_SHA256 = "ee9aecc8a9aa130ee871e08785ea9f32de14172260c8993d0baa33f4f07fc68c"
 local SNES_PPU_STATE_SHA256 = "21005a15437abd767cbeda5c7ede8741e2aeac4a006dafedede03a695377eaa2"
 local BASE_CAPABILITY_REVISION = "20520b327e06f8ed30387f20f8609b861ceb4306ac1d955f6fb7a38b7489e885"
-local SNES_STATE_CAPABILITY_REVISION = "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e"
-local SNES_CAPABILITY_REVISION = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
+local SNES_STATE_CAPABILITY_REVISION = "89000c4b91750e4ad8317eb234ccc3e75a6c304978feb74daaedda8f2aa3ba7e"
+local SNES_CAPABILITY_REVISION = "c7bc749b13517456b049a73a868bc662c54cc98e580cc306b873328fd842dc22"
 local BASE_SNAPSHOT_CAPABILITY_REVISION = "7d673b3f299c2f5f8ba91cf12475385581ec6f18ad38efa1b25a6a3ef7cde08d"
-local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "cb17d9a46ab4f50c18090efe88841d86eec924683089b451301e4cf209400702"
-local SNES_SNAPSHOT_CAPABILITY_REVISION = "c257a841cde44e9911d371a3e3521db1fe11e09dc5177075e76211605080fef2"
-local SNES_DEEP_CAPABILITY_REVISION = "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175"
-local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "59e5b8f3c29fe258032eaadcca0ddea49fd47b23dd6a3d4c7e9d7311acd23787"
-local SNES_REPEATABLE_CAPABILITY_REVISION = "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d"
+local SNES_STATE_SNAPSHOT_CAPABILITY_REVISION = "76f79723be824e502f5be0f0188c1494b249694c340bc8112a04872845ded730"
+local SNES_SNAPSHOT_CAPABILITY_REVISION = "151544f37bf2e72601429981e93fb8d45bd404a0e1501d26432b9cf29995e658"
+local SNES_DEEP_CAPABILITY_REVISION = "9cb6540758c6f4a690371afc92c52803597183466ab0fc3486cbabc9e4287840"
+local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "79af7faa13666068539eaa7749e021f2035cefca4e5f9c12548a70468abc92ee"
+local SNES_REPEATABLE_CAPABILITY_REVISION = "4436231189dd28b27f252d8c1241ccdfc04ead72aca5b1f675c53ad5a6377511"
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -34,6 +34,7 @@ local MAX_LINE_BYTES = 64 * 1024
 local MAX_HOST_MS = 250000
 local MAX_MOVIE_BYTES = 1024 * 1024
 local MAX_BUTTONS_PER_FRAME = 32
+local MAX_STATE_BYTES = 64 * 1024 * 1024
 local MAX_SNAPSHOT_MEMBERS = 8
 local MAX_SNAPSHOT_MEMBER_BYTES = 128 * 1024
 local MAX_SNAPSHOT_TOTAL_BYTES = 1024 * 1024
@@ -300,9 +301,11 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       event_classes[#event_classes + 1] = event
     end
   end
+  local origins = { "next_frame_boundary", "reset_release" }
+  if state_advertised then origins[#origins + 1] = "state_load" end
   local capability = {
     revision = capability_revision,
-    origins = as_array({ "next_frame_boundary", "reset_release" }),
+    origins = as_array(origins),
     units = as_array({ "frames" }),
     default_event_classes = as_array({ "frame_boundary" }),
     event_classes = as_array(event_classes),
@@ -350,6 +353,12 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
     }
   end
   if state_advertised then
+    capability.state_load = {
+      format = "mesen-savestate",
+      max_bytes = MAX_STATE_BYTES,
+      alignment = "restored_frame_boundary",
+      requires_input_movie = true,
+    }
     capability.terminal_state = {
       max_bytes = MAX_TERMINAL_STATE_BYTES,
       profiles = as_array({ {
@@ -577,7 +586,8 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
   if params.capability_revision ~= capability_revision then
     return nil, "unsupported", "capability revision mismatch"
   end
-  if params.origin ~= "next_frame_boundary" and params.origin ~= "reset_release" then
+  if params.origin ~= "next_frame_boundary" and params.origin ~= "reset_release"
+      and params.origin ~= "state_load" then
     return nil, "unsupported", "origin is not advertised by this runtime"
   end
   if not integer(params.frames) or params.frames < 1 or params.frames > MAX_FRAMES then
@@ -658,6 +668,26 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
   end
   local movie, movie_error = read_movie(params.input_movie, total_frames)
   if movie_error then return nil, "bad_params", movie_error end
+  local initial_state = params.initial_state
+  if params.origin == "state_load" then
+    if type(initial_state) ~= "table" or type(initial_state.path) ~= "string"
+        or initial_state.path == "" or initial_state.format ~= "mesen-savestate"
+        or not integer(initial_state.bytes) or initial_state.bytes < 1
+        or initial_state.bytes > MAX_STATE_BYTES or not digest(initial_state.sha256)
+        or not integer(initial_state.frame) or initial_state.frame < 0
+        or initial_state.boundary ~= "frame_boundary" then
+      return nil, "bad_params", "state_load requires one bounded mesen-savestate input"
+    end
+    if movie == nil then
+      return nil, "bad_params", "state_load requires an explicit dense input movie"
+    end
+    if warmup_frames > 0 or start_on ~= nil or #initial_snapshots > 0 then
+      return nil, "bad_params",
+        "state_load cannot be combined with warmup_frames, start_on, or initial_snapshots"
+    end
+  elseif initial_state ~= nil then
+    return nil, "bad_params", "initial_state requires the state_load origin"
+  end
 
   return {
     capture_id = params.capture_id,
@@ -672,6 +702,8 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
     start_on = start_on,
     initial_snapshots = initial_snapshots,
     movie = movie,
+    initial_state = initial_state,
+    origin = params.origin,
     warmup_frames = warmup_frames,
     total_frames = total_frames,
   }
@@ -1275,7 +1307,11 @@ end
 
 function M.result(state, now_ms)
   local input_cleanup = "not_acquired"
-  if state.movie then input_cleanup = state.input_released and "released" or "unverifiable" end
+  if state.input_released then
+    input_cleanup = "released"
+  elseif state.input_owned then
+    input_cleanup = "unverifiable"
+  end
   local class_facts = {}
   local scope_end = state.scope_end or math.max(state.actual_end, state.event_scope_end)
   for _, id in ipairs(state.selected_order) do

@@ -145,10 +145,36 @@ fn record_window_accepts_the_generic_negotiated_extension_shape() {
         terminal_state.terminal_state_profile.as_deref(),
         Some("snes_ppu")
     );
+    let state_backed: RecordWindowArgs = serde_json::from_str(
+        r#"{"output_root":"/tmp/evidence","frames":2,"origin":"state_load","input_path":"/tmp/neutral.movie","initial_state":{"snapshot_id":"snapshot-01test"}}"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        state_backed.origin,
+        Some(RecordWindowOriginArgs::StateLoad)
+    ));
+    assert_eq!(
+        state_backed.initial_state.unwrap().snapshot_id,
+        "snapshot-01test"
+    );
+    assert!(serde_json::from_str::<RecordWindowArgs>(
+        r#"{"output_root":"/tmp/evidence","frames":2,"origin":"state_load","initial_state":{"snapshot_id":"snapshot-01test","path":"/tmp/caller.mss"}}"#
+    )
+    .is_err());
     assert!(serde_json::from_str::<RecordWindowArgs>(
         r#"{"output_root":"/tmp/evidence","frames":1,"origin":"reset"}"#
     )
     .is_err());
+}
+
+#[test]
+fn save_state_receipt_is_explicit_opt_in() {
+    let ordinary: SaveStateArgs = serde_json::from_str(r#"{"path":"relative.mss"}"#).unwrap();
+    assert!(!ordinary.preserve_for_recording);
+    let recording: SaveStateArgs =
+        serde_json::from_str(r#"{"path":"/tmp/anchor.mss","preserve_for_recording":true}"#)
+            .unwrap();
+    assert!(recording.preserve_for_recording);
 }
 
 #[test]

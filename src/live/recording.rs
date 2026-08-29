@@ -20,13 +20,16 @@ use super::recording_progress::ProgressState;
 use super::recording_request::{
     canonical_output_root, effective_request, request_digest, runtime_identity,
 };
-pub use super::recording_request::{RecordWindowRequest, RequestedRecordingLimits};
+pub use super::recording_request::{
+    RecordWindowRequest, RecordingStateInput, RequestedRecordingLimits,
+};
 pub(super) use super::recording_sink::SinkOutcome;
 use super::recording_sink::SinkServer;
 use super::recording_snapshot::{
     capture_terminal_snapshots, capture_terminal_state, terminalize_snapshot_failure,
     TerminalSnapshotReadout,
 };
+use super::recording_state::RecordingStateError;
 pub(crate) use super::recording_terminal::terminal_validation;
 use super::runtime::{LeaseState, ProcessState, RuntimeStore};
 use crate::bundle::publish::{
@@ -77,6 +80,8 @@ pub enum RecordingError {
     Contract(#[from] crate::event_contracts::EventContractError),
     #[error("recording input failed: {0}")]
     Input(#[from] RecordingInputError),
+    #[error("recording initial state failed: {0}")]
+    State(#[from] RecordingStateError),
     #[error("recording I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("recording terminal response is invalid: {0}")]
@@ -113,12 +118,6 @@ pub fn record_window(
     }
     let registry = EventContractRegistry::builtin()?;
     capability.validate(&registry)?;
-    let effective = effective_request(
-        &capability,
-        &link.capabilities().methods,
-        &link.capabilities().memory_regions,
-        &request,
-    )?;
     let identity = link.capabilities().identity.clone();
     let launch_id = identity
         .launch_id
@@ -141,6 +140,45 @@ pub fn record_window(
             "live adapter and runtime generation are not exactly bound".into(),
         ));
     }
+    let runtime = runtime_identity(&identity, &current, &capability)?;
+    let requested_origin = request.origin.unwrap_or(RecordingOrigin::NextFrameBoundary);
+    match (requested_origin, request.initial_state.as_ref()) {
+        (RecordingOrigin::StateLoad, None) => {
+            return Err(RecordingError::Invalid(
+                "state_load origin requires initial_state".into(),
+            ));
+        }
+        (RecordingOrigin::StateLoad, Some(_)) | (_, None) => {}
+        (_, Some(_)) => {
+            return Err(RecordingError::Invalid(
+                "initial_state requires the state_load origin".into(),
+            ));
+        }
+    }
+    let acquired_state = if let Some(initial_state) = &request.initial_state {
+        let state_load = capability.state_load.as_ref().ok_or_else(|| {
+            RecordingError::Unavailable(
+                "the current runtime does not advertise state-backed recording".into(),
+            )
+        })?;
+        Some(super::recording_state::acquire_managed_recording_state(
+            &store,
+            port,
+            &launch_id,
+            &initial_state.snapshot_id,
+            &runtime,
+            state_load,
+        )?)
+    } else {
+        None
+    };
+    let effective = effective_request(
+        &capability,
+        &link.capabilities().methods,
+        &link.capabilities().memory_regions,
+        &request,
+        acquired_state,
+    )?;
     let lease = link.acquire_control_lease(&launch_id)?;
     if lease.state != LeaseState::Held {
         return Err(RecordingError::Unavailable(
@@ -165,8 +203,22 @@ pub fn record_window(
         ulid::Ulid::generate().to_string().to_ascii_lowercase()
     );
     let request_digest = request_digest(&output_root, effective.origin, &effective.request)?;
-    let runtime = runtime_identity(&identity, &current, &capability)?;
     let mut staging = Some(RecordingStaging::prepare(&output_root, &capture_id)?);
+    let staged_state_path = if let Some(state) = &effective.state {
+        match staging
+            .as_mut()
+            .expect("staging")
+            .write_initial_state(&state.bytes, &state.receipt.snapshot)
+        {
+            Ok(path) => Some(path),
+            Err(error) => {
+                let _ = staging.take().expect("staging").discard();
+                return Err(error.into());
+            }
+        }
+    } else {
+        None
+    };
     let staged_movie_path = if let Some(movie) = &effective.movie {
         match staging
             .as_mut()
@@ -349,6 +401,19 @@ pub fn record_window(
             "sha256": movie.identity.sha256,
         });
     }
+    if let (Some(state), Some(path)) = (&effective.state, &staged_state_path) {
+        let path = path.to_str().ok_or_else(|| {
+            RecordingError::Invalid("staged initial state path is not UTF-8".into())
+        })?;
+        params["initial_state"] = json!({
+            "path": path,
+            "format": state.receipt.snapshot.format,
+            "bytes": state.receipt.snapshot.bytes,
+            "sha256": state.receipt.snapshot.sha256,
+            "frame": state.receipt.frozen.frame,
+            "boundary": state.receipt.frozen.boundary,
+        });
+    }
     if let Some(stop_on) = &effective.request.stop_on {
         params["stop_on"] = serde_json::to_value(stop_on)
             .map_err(|error| RecordingError::Invalid(error.to_string()))?;
@@ -375,6 +440,7 @@ pub fn record_window(
         max_host_ms: Some(limits.max_host_ms),
     };
     let require_explicit_frames = effective.request.input_movie.is_some()
+        || effective.request.initial_state.is_some()
         || effective.request.stop_on.is_some()
         || effective.request.event_classes.len() > 1
         || effective.request.warmup_frames > 0

@@ -19,7 +19,8 @@ function M.can_start_recording(state, origin)
   -- boundary in the native reset callback before the first post-reset guest tick. It therefore
   -- does not inherit or read from the current halt position. Other origins advance from the
   -- current position and still require a proven frame boundary.
-  return origin == "reset_release" or state.frame_boundary_proven == true
+  return origin == "reset_release" or origin == "state_load"
+    or state.frame_boundary_proven == true
 end
 
 return M

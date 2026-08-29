@@ -13,12 +13,14 @@ mod recording_progress;
 mod recording_request;
 mod recording_sink;
 mod recording_snapshot;
+mod recording_state;
 mod recording_terminal;
 pub mod runtime;
 pub mod task_entry;
 pub mod tcp;
 pub mod temporal;
 pub mod tools;
+mod tools_state;
 
 #[cfg(test)]
 mod broker_link_tests;
@@ -38,6 +40,8 @@ mod recording_input_tests;
 mod recording_member_sink_tests;
 #[cfg(test)]
 mod recording_progress_tests;
+#[cfg(test)]
+mod recording_state_tests;
 #[cfg(test)]
 mod recording_tests;
 #[cfg(test)]

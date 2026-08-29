@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 
 pub const PCFX_BIOS_SHA256: &str =
     "4b44ccf5d84cc83daa2e6a2bee00fdafa14eb58bdf5859e96d8861a891675417";
+pub const MD_REPEATABLE_PROFILE_ID: &str = "mednafen_md_repeatable";
+pub const MD_REPEATABLE_CONDITIONS_SHA256: &str =
+    "c2e0f5529d92090521831109ff2e757f48140234c2f145651c790f0e41ef6d69";
 const PCFX_BIOS_SIZE: u64 = 1024 * 1024;
 const SHARED_FIRMWARE_NAMES: &[&str] = &[
     "sega_101.bin",
@@ -112,9 +115,18 @@ fn resolve_firmware_root() -> std::io::Result<(PathBuf, bool)> {
     Ok((root, explicit.is_some()))
 }
 
-fn prepare_runtime_home(port: u16) -> std::io::Result<PathBuf> {
-    let base = super::emu_home_base();
+pub fn runtime_home(port: u16, repeatable: bool) -> PathBuf {
     let home = super::emu_home_dir("mednafen", port);
+    if repeatable {
+        home.join("repeatable-md")
+    } else {
+        home
+    }
+}
+
+fn prepare_runtime_home_for(port: u16, repeatable: bool) -> std::io::Result<PathBuf> {
+    let base = super::emu_home_base();
+    let home = runtime_home(port, repeatable);
     if super::has_symlink_component_under(&base, &home) {
         return Err(Error::new(
             ErrorKind::InvalidInput,
@@ -123,6 +135,22 @@ fn prepare_runtime_home(port: u16) -> std::io::Result<PathBuf> {
                 home.display()
             ),
         ));
+    }
+    if repeatable {
+        match std::fs::symlink_metadata(&home) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "repeatable Mednafen home is not a private directory: {}",
+                        home.display()
+                    ),
+                ));
+            }
+            Ok(_) => std::fs::remove_dir_all(&home)?,
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
     std::fs::create_dir_all(&home)?;
     let firmware = home.join("firmware");
@@ -166,6 +194,11 @@ fn prepare_runtime_home(port: u16) -> std::io::Result<PathBuf> {
         }
     }
     Ok(home)
+}
+
+#[cfg(test)]
+fn prepare_runtime_home(port: u16) -> std::io::Result<PathBuf> {
+    prepare_runtime_home_for(port, false)
 }
 
 /// Resolve the operator-supplied PC-FX BIOS without touching Mednafen's user profile.
@@ -309,6 +342,8 @@ pub struct Launch<'a> {
     pub sound: bool,
     /// Halt before the first guest instruction and service control while halted.
     pub start_frozen: bool,
+    /// Select the advertised repeatable Mega Drive execution conditions.
+    pub repeatable: bool,
 }
 
 fn copy_run_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -325,8 +360,14 @@ fn copy_run_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// firmware files are copied from the shared emucap inventory, and PC-FX additionally receives its
 /// explicitly validated BIOS path. The user's Mednafen profile is never read or changed.
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
+    if l.repeatable && l.module != Some("md") {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "repeatable Mednafen execution is supported only for Mega Drive",
+        ));
+    }
     let build_metadata = read_build_metadata(l.binary)?;
-    let runtime_home = prepare_runtime_home(l.port)?;
+    let runtime_home = prepare_runtime_home_for(l.port, l.repeatable)?;
     let run_binary = if l.explicit_binary {
         l.binary.to_path_buf()
     } else {
@@ -356,6 +397,7 @@ pub fn launch(l: &Launch) -> std::io::Result<u32> {
             sound: l.sound,
             pcfx_bios: pcfx_bios.as_deref(),
             start_frozen: l.start_frozen,
+            repeatable: l.repeatable,
         },
         &opts,
     );

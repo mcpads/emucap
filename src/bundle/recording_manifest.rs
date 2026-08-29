@@ -67,6 +67,8 @@ pub struct RecordingRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_movie: Option<InputMovieIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_state: Option<StateSnapshotReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_on: Option<EventStopCondition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_on: Option<EventStartCondition>,
@@ -158,6 +160,38 @@ pub struct InputMovieIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct StateArtifactIdentity {
+    pub format: String,
+    pub bytes: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateSnapshotReceipt {
+    pub snapshot_id: String,
+    pub snapshot: StateArtifactIdentity,
+    pub source: RuntimeIdentity,
+    pub frozen: StateSnapshotFrozenFacts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateSnapshotFrozenFacts {
+    pub state: FinalExecutionState,
+    pub frame: u64,
+    pub boundary: StateSnapshotBoundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StateSnapshotBoundary {
+    FrameBoundary,
+    InstructionBoundary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EventStopCondition {
     pub event_class: String,
     pub occurrence: u64,
@@ -224,6 +258,7 @@ pub enum EventOrder {
 pub enum RecordingOrigin {
     NextFrameBoundary,
     ResetRelease,
+    StateLoad,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +398,7 @@ pub struct MemberDescriptor {
 pub enum MemberRole {
     Events,
     InputMovie,
+    InitialState,
     InitialSnapshot,
     TerminalSnapshot,
     TerminalState,

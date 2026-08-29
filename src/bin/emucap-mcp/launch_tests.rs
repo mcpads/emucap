@@ -1012,6 +1012,10 @@ fn launch_plan_for_md_uses_mednafen_force_module() {
     assert_eq!(plan["preferred_launcher"]["tool"], "launch");
     assert_eq!(plan["preferred_launcher"]["args"]["system"], "md");
     assert_eq!(plan["button_hint"]["system"], "md");
+    assert_eq!(
+        plan["start_frozen_contract"]["repeatable_initial_conditions"],
+        true
+    );
 }
 
 #[test]
@@ -2378,6 +2382,53 @@ fn controlled_launch_contract_distinguishes_time_closure_from_repeatability() {
             .contains("exact selected recording conditions"),
         "a label and frozen state cannot replace the live recording capability"
     );
+
+    let md_profile = emucap::live::runtime::ExecutionProfileIdentity {
+        id: emucap::launch::mednafen::MD_REPEATABLE_PROFILE_ID.into(),
+        conditions_sha256: emucap::launch::mednafen::MD_REPEATABLE_CONDITIONS_SHA256.into(),
+    };
+    capabilities.recording = Some(
+        serde_json::from_value(serde_json::json!({
+            "revision": "test",
+            "origins": ["next_frame_boundary", "reset_release"],
+            "units": ["frames"],
+            "default_event_classes": ["frame_boundary"],
+            "event_classes": [],
+            "input_movie": {
+                "format": "frame-full-state-1",
+                "port": 0,
+                "max_frames": 300,
+                "max_bytes": 1048576,
+                "max_buttons_per_frame": 32
+            },
+            "repeatability": {
+                "profile": md_profile.id,
+                "conditions_sha256": md_profile.conditions_sha256,
+                "origins": ["reset_release"],
+                "requires_input_movie": true
+            },
+            "limits": {
+                "max_frames": 300,
+                "max_events": 100000,
+                "max_bytes": 67108864,
+                "max_line_bytes": 65536,
+                "max_host_ms": 30000,
+                "progress_interval_ms": 250
+            }
+        }))
+        .unwrap(),
+    );
+    assert_eq!(
+        controlled_launch_contract_error(
+            true,
+            true,
+            &frozen,
+            Some(&md_profile),
+            &capabilities
+        ),
+        None,
+        "the controlled contract compares producer-advertised identity instead of a platform constant"
+    );
 }
 
 #[test]
@@ -2565,7 +2616,7 @@ fn controlled_launch_refuses_an_unsupported_adapter_before_spawn() {
 }
 
 #[test]
-fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
+fn repeatable_profile_refuses_an_unadvertised_system_before_spawn() {
     let tmp = tempfile::tempdir().unwrap();
     let content = tmp.path().join("game.nes");
     std::fs::write(&content, b"rom").unwrap();
@@ -2591,7 +2642,7 @@ fn repeatable_profile_refuses_a_non_snes_mesen_system_before_spawn() {
     assert_eq!(out["launched"], false, "{out}");
     assert_eq!(
         out["reason"],
-        "execution_profile=repeatable is currently supported only for SNES"
+        "execution_profile=repeatable is currently supported only for SNES and Mega Drive"
     );
     assert_eq!(out["adapter"], "mesen2");
     assert_eq!(link.calls, 1, "only the preflight status call is allowed");

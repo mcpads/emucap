@@ -1156,7 +1156,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "supported": adapter == "mesen2" || adapter == "mednafen",
             "boundary": if adapter == "mesen2" || adapter == "mednafen" { serde_json::json!("pre_first_instruction") } else { serde_json::Value::Null },
             "request_with": "launch(..., start_frozen:true)",
-            "repeatable_initial_conditions": system == "snes"
+            "repeatable_initial_conditions": system == "snes" || system == "md"
         },
         "next_action": next_action
     })

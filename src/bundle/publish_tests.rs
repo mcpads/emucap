@@ -30,6 +30,7 @@ fn request(frames: u64) -> RecordingRequest {
             progress_interval_ms: 100,
         },
         input_movie: None,
+        initial_state: None,
         stop_on: None,
         start_on: None,
         initial_snapshots: vec![],
@@ -165,6 +166,51 @@ fn publishes_and_reverifies_a_canonical_input_movie_member() {
         .members
         .iter()
         .any(|member| member.role == MemberRole::InputMovie));
+}
+
+#[test]
+fn publishes_and_reverifies_the_exact_initial_state_member() {
+    let root = tempfile::tempdir().unwrap();
+    let mut staging = RecordingStaging::prepare(root.path(), "capture-state").unwrap();
+    let state = b"opaque-saved-state";
+    let identity = StateArtifactIdentity {
+        format: "mesen-savestate".into(),
+        bytes: state.len() as u64,
+        sha256: hex::encode(Sha256::digest(state)),
+    };
+    staging.write_initial_state(state, &identity).unwrap();
+    let bytes = write_exact(&mut staging, 1);
+    let mut input = complete_input("capture-state", 1, bytes);
+    input.validation.origin = RecordingOrigin::StateLoad;
+    let receipt = StateSnapshotReceipt {
+        snapshot_id: "snapshot-01test".into(),
+        snapshot: identity.clone(),
+        source: input.runtime.clone(),
+        frozen: StateSnapshotFrozenFacts {
+            state: FinalExecutionState::Frozen,
+            frame: 12,
+            boundary: StateSnapshotBoundary::FrameBoundary,
+        },
+    };
+    input.validation.request.initial_state = Some(receipt.clone());
+    let published = staging
+        .publish(&EventContractRegistry::builtin().unwrap(), input)
+        .unwrap();
+    let verified = verify_published_recording(
+        &published.bundle_path,
+        &EventContractRegistry::builtin().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(verified.manifest.request.initial_state, Some(receipt));
+    assert_eq!(
+        fs::read(published.bundle_path.join("initial.state")).unwrap(),
+        state
+    );
+    assert!(verified
+        .manifest
+        .members
+        .iter()
+        .any(|member| member.role == MemberRole::InitialState));
 }
 
 fn publish_terminal_snapshot(root: &std::path::Path, capture_id: &str) -> PublishedRecording {

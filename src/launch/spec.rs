@@ -23,6 +23,7 @@ pub struct MednafenSpecOpts<'a> {
     pub sound: bool,
     pub pcfx_bios: Option<&'a Path>,
     pub start_frozen: bool,
+    pub repeatable: bool,
 }
 
 /// Mednafen (Saturn / PSX / PCE / PC-FX / MD / WonderSwan / Neo Geo Pocket). One binary handles every system; `module`
@@ -46,8 +47,20 @@ pub fn mednafen_spec(
     }
     spec = spec.args(["-sound", if mednafen.sound { "1" } else { "0" }]);
     spec = spec.env("MEDNAFEN_HOME", runtime_home.to_string_lossy().into_owned());
-    if mednafen.start_frozen {
+    if mednafen.start_frozen || mednafen.repeatable {
         spec = spec.env("EMUCAP_START_FROZEN", "1");
+    }
+    if mednafen.repeatable {
+        spec = spec
+            .env("EMUCAP_EXECUTION_PROFILE", "repeatable")
+            .env(
+                "EMUCAP_REPEATABLE_PROFILE_ID",
+                super::mednafen::MD_REPEATABLE_PROFILE_ID,
+            )
+            .env(
+                "EMUCAP_REPEATABLE_CONDITIONS_SHA256",
+                super::mednafen::MD_REPEATABLE_CONDITIONS_SHA256,
+            );
     }
     if mednafen.module == Some("md") {
         spec = spec.args(["-md.input.auto", "0", "-md.input.port1", "gamepad6"]);

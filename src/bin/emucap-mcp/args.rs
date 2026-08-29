@@ -127,6 +127,15 @@ pub(crate) struct RecordWindowLimitsArgs {
 pub(crate) enum RecordWindowOriginArgs {
     NextFrameBoundary,
     ResetRelease,
+    StateLoad,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecordWindowInitialStateArgs {
+    /// Opaque producer-managed ID returned in save_state.snapshot_receipt. Caller-authored paths,
+    /// digests, and boundary claims are deliberately not accepted.
+    pub(crate) snapshot_id: String,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -211,6 +220,11 @@ pub(crate) struct RecordWindowArgs {
     /// Absolute dense movie path; check live capability.
     #[serde(default)]
     pub(crate) input_path: Option<String>,
+    /// Producer-managed frozen state to load before a state_load recording origin. The live
+    /// capability may require an explicit dense input movie, including an all-empty movie for
+    /// neutral input.
+    #[serde(default)]
+    pub(crate) initial_state: Option<RecordWindowInitialStateArgs>,
     /// Selected stoppable event occurrence.
     #[serde(default)]
     pub(crate) stop_on: Option<RecordWindowStopArgs>,
@@ -555,6 +569,16 @@ fn three_hundred() -> u64 {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PathArgs {
     pub(crate) path: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SaveStateArgs {
+    pub(crate) path: String,
+    /// Preserve a producer-managed receipt for a later state-backed recording window.
+    /// This requires an absolute path and an advertised state_load capability.
+    #[serde(default)]
+    pub(crate) preserve_for_recording: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]

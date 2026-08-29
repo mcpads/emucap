@@ -171,6 +171,12 @@ int main() {
   assert(emucap_recording_capability_json(true).find("frame_completed") != std::string::npos);
   assert(emucap_recording_capability_json(true).find(EMUCAP_RECORDING_INPUT_MOVIE_FORMAT) !=
          std::string::npos);
+  const std::string repeatable = emucap_recording_capability_json(
+      true, "c2e0f5529d92090521831109ff2e757f48140234c2f145651c790f0e41ef6d69");
+  assert(repeatable.find(std::string("\"revision\":\"") +
+             EMUCAP_RECORDING_MD_REPEATABLE_CAPABILITY_REVISION) != std::string::npos);
+  assert(repeatable.find(EMUCAP_RECORDING_MD_REPEATABLE_PROFILE) != std::string::npos);
+  assert(repeatable.find("\"requires_input_movie\":true") != std::string::npos);
 
   bool completed = true;
   const std::string boundary =

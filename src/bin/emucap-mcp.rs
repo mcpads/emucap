@@ -599,10 +599,17 @@ impl Emucap {
         }
     }
 
-    #[tool(description = "Save emulator state to a file.")]
-    async fn save_state(&self, Parameters(a): Parameters<PathArgs>) -> CallToolResult {
+    #[tool(
+        description = "Save emulator state to a file. Set preserve_for_recording=true only when an advertised state-backed recording needs a producer-managed receipt; only a proven frame-boundary receipt can start that origin."
+    )]
+    async fn save_state(&self, Parameters(a): Parameters<SaveStateArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::save_state(&mut *l, &a.path) {
+        let result = if a.preserve_for_recording {
+            tools::save_state_for_recording(&mut *l, &a.path)
+        } else {
+            tools::save_state(&mut *l, &a.path)
+        };
+        match result {
             Ok(o) => tool_output_result(o),
             Err(e) => link_error_result(e),
         }

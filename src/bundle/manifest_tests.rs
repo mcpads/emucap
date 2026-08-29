@@ -105,6 +105,7 @@ fn recording_sample() -> RecordingManifest {
                 progress_interval_ms: 100,
             },
             input_movie: None,
+            initial_state: None,
             stop_on: None,
             start_on: None,
             initial_snapshots: vec![],

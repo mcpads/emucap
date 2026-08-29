@@ -170,10 +170,10 @@ pub(crate) fn make_launch(
             "adapter": adapter,
         });
     }
-    if repeatable && system != "snes" {
+    if repeatable && system != "snes" && system != "md" {
         return serde_json::json!({
             "launched": false,
-            "reason": "execution_profile=repeatable is currently supported only for SNES",
+            "reason": "execution_profile=repeatable is currently supported only for SNES and Mega Drive",
             "system": system,
             "adapter": adapter,
         });
@@ -1116,6 +1116,7 @@ pub(super) fn launch_mednafen(
         .flatten();
     let sound = a.sound.unwrap_or(false);
     let display = a.display.unwrap_or(false);
+    let repeatable = a.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
     let spec = emucap::launch::mednafen::Launch {
         binary: &binary,
         explicit_binary: explicit,
@@ -1129,6 +1130,7 @@ pub(super) fn launch_mednafen(
         headless: !display,
         sound,
         start_frozen: a.start_frozen,
+        repeatable,
     };
     match emucap::launch::mednafen::launch(&spec) {
         Ok(pid) => serde_json::json!({
@@ -1142,8 +1144,12 @@ pub(super) fn launch_mednafen(
             "binary": binary.display().to_string(),
             "host_build": host_build,
             "log": log.display().to_string(),
-            "emucap_home": emucap::launch::emu_home_dir("mednafen", port).display().to_string(),
+            "emucap_home": emucap::launch::mednafen::runtime_home(port, repeatable).display().to_string(),
             "isolation": "Mednafen uses an emucap-owned per-port home and copies known BIOS files from the shared emucap firmware inventory; the user's ~/.mednafen profile is not read or changed.",
+            "execution_profile": repeatable.then(|| emucap::live::runtime::ExecutionProfileIdentity {
+                id: emucap::launch::mednafen::MD_REPEATABLE_PROFILE_ID.into(),
+                conditions_sha256: emucap::launch::mednafen::MD_REPEATABLE_CONDITIONS_SHA256.into(),
+            }),
             "next_action": "launch returns after the adapter connects",
         }),
         Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),

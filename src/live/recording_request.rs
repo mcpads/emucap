@@ -14,6 +14,7 @@ use super::recording_capability::{
     RecordingCapability, RecordingCapabilityOrigin, RecordingEventFilterKind,
 };
 use super::recording_input::{acquire_recording_movie, AcquiredRecordingMovie};
+use super::recording_state::AcquiredRecordingState;
 use super::runtime::CurrentManifest;
 use crate::bundle::recording_manifest::{
     ContentIdentity, EventArmingScope, EventClassArming, EventClassFilter, EventFilterTerm,
@@ -42,6 +43,7 @@ pub struct RecordWindowRequest {
     pub event_arming_overrides: Vec<EventClassArming>,
     pub origin: Option<RecordingOrigin>,
     pub input_path: Option<PathBuf>,
+    pub initial_state: Option<RecordingStateInput>,
     pub stop_on: Option<EventStopCondition>,
     pub start_on: Option<EventStartCondition>,
     pub initial_snapshots: Vec<InitialSnapshotRequest>,
@@ -49,6 +51,11 @@ pub struct RecordWindowRequest {
     pub terminal_state_profile: Option<String>,
     pub require_repeatable: bool,
     pub limits: Option<RequestedRecordingLimits>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordingStateInput {
+    pub snapshot_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -71,6 +78,7 @@ pub(super) struct EffectiveRequest {
     pub(super) request: RecordingRequest,
     pub(super) origin: RecordingOrigin,
     pub(super) movie: Option<AcquiredRecordingMovie>,
+    pub(super) state: Option<AcquiredRecordingState>,
 }
 
 pub(super) fn effective_request(
@@ -78,6 +86,7 @@ pub(super) fn effective_request(
     methods: &[String],
     memory_regions: &[MemoryRegion],
     request: &RecordWindowRequest,
+    acquired_state: Option<AcquiredRecordingState>,
 ) -> Result<EffectiveRequest, RecordingError> {
     let total_frames = request
         .warmup_frames
@@ -88,6 +97,16 @@ pub(super) fn effective_request(
             "warmup_frames + frames must be in 1..={}",
             capability.limits.max_frames
         )));
+    }
+    let origin = request.origin.unwrap_or(RecordingOrigin::NextFrameBoundary);
+    if origin == RecordingOrigin::StateLoad
+        && (request.warmup_frames > 0
+            || request.start_on.is_some()
+            || !request.initial_snapshots.is_empty())
+    {
+        return Err(RecordingError::Invalid(
+            "state_load currently starts at its advertised frame alignment and cannot be combined with warmup_frames, start_on, or initial_snapshots".into(),
+        ));
     }
     if request.warmup_frames > 0 {
         let warmup = capability.warmup.as_ref().ok_or_else(|| {
@@ -102,10 +121,10 @@ pub(super) fn effective_request(
             )));
         }
     }
-    let origin = request.origin.unwrap_or(RecordingOrigin::NextFrameBoundary);
     let capability_origin = match origin {
         RecordingOrigin::NextFrameBoundary => RecordingCapabilityOrigin::NextFrameBoundary,
         RecordingOrigin::ResetRelease => RecordingCapabilityOrigin::ResetRelease,
+        RecordingOrigin::StateLoad => RecordingCapabilityOrigin::StateLoad,
     };
     if request.require_repeatable
         && capability
@@ -133,6 +152,47 @@ pub(super) fn effective_request(
             "the current runtime does not advertise origin {origin:?}"
         )));
     }
+    let state = match (origin, request.initial_state.as_ref(), acquired_state) {
+        (RecordingOrigin::StateLoad, Some(input), Some(state)) => {
+            let state_load = capability.state_load.as_ref().ok_or_else(|| {
+                RecordingError::Unavailable(
+                    "the current runtime does not advertise state-backed recording".into(),
+                )
+            })?;
+            if state_load.requires_input_movie && request.input_path.is_none() {
+                return Err(RecordingError::Invalid(
+                    "state-backed recording requires an explicit input movie; use an all-empty movie when no buttons should be pressed".into(),
+                ));
+            }
+            if input.snapshot_id != state.receipt.snapshot_id {
+                return Err(RecordingError::Invalid(
+                    "resolved snapshot does not match initial_state.snapshot_id".into(),
+                ));
+            }
+            Some(state)
+        }
+        (RecordingOrigin::StateLoad, None, _) => {
+            return Err(RecordingError::Invalid(
+                "state_load origin requires initial_state".into(),
+            ));
+        }
+        (RecordingOrigin::StateLoad, Some(_), None) => {
+            return Err(RecordingError::Unavailable(
+                "producer-managed initial state was not resolved".into(),
+            ));
+        }
+        (_, Some(_), _) => {
+            return Err(RecordingError::Invalid(
+                "initial_state requires the state_load origin".into(),
+            ));
+        }
+        (_, None, Some(_)) => {
+            return Err(RecordingError::Invalid(
+                "unexpected resolved state without initial_state".into(),
+            ));
+        }
+        (_, None, None) => None,
+    };
     let event_classes = capability.identities(&request.event_classes)?;
     let event_filters = validate_event_filters(capability, &event_classes, &request.event_filters)?;
     validate_start_request(capability, &event_classes, request)?;
@@ -250,6 +310,7 @@ pub(super) fn effective_request(
             event_arming,
             limits,
             input_movie: movie.as_ref().map(|movie| movie.identity.clone()),
+            initial_state: state.as_ref().map(|state| state.receipt.clone()),
             stop_on: request.stop_on.clone(),
             start_on: request.start_on.clone(),
             initial_snapshots: request.initial_snapshots.clone(),
@@ -258,6 +319,7 @@ pub(super) fn effective_request(
         },
         origin,
         movie,
+        state,
     })
 }
 

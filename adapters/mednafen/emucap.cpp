@@ -9,6 +9,7 @@
 #include <mednafen/movie.h>  // MDFNMOV_IsPlaying(reset-origin capability gate)
 #include <mednafen/netplay.h>  // MDFNnetplay(reset is remote-commanded, not immediate)
 #include <mednafen/state.h>  // MDFNSS_SaveSM / MDFNSS_LoadSM
+#include <mednafen/MemoryStream.h>
 #include <mednafen/FileStream.h>
 #include <mednafen/video/png.h>  // PNGWrite(screenshot)
 #include <mednafen/hash/sha1.h>  // sha1(EMUCAP_CONTENT 보조 해시 — get_rom_info)
@@ -40,6 +41,9 @@ extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 #endif
 #ifndef EMUCAP_MEDNAFEN_PATCHSET_SHA256
 #define EMUCAP_MEDNAFEN_PATCHSET_SHA256 ""
+#endif
+#ifndef EMUCAP_MEDNAFEN_MD_REPEATABLE_CONDITIONS_SHA256
+#define EMUCAP_MEDNAFEN_MD_REPEATABLE_CONDITIONS_SHA256 ""
 #endif
 
 #include <exception>
@@ -124,6 +128,7 @@ void serve_socket_once();
 void cancel_recording_for_disconnect();
 const char* system_shortname();
 bool is_ss();
+bool is_md();
 bool lookup_button_bit(const std::string& name, uint16_t& bit);
 struct BP { long id; int type; uint32 a1, a2; uint32 public_a1, public_a2;
             bool logical = true; bool pause_on_hit = true;
@@ -216,6 +221,12 @@ const int32* g_last_lw = nullptr;
 // 미호출임을 상류 코드에서 확인). ~0 리셋은 게임 (재)로드 전용(mednafen.cpp:995)이고, 그건 포크 재시작=이 섀도도
 // 재초기화다. 따라서 한 세션 안에서 섀도는 코어 실제 마스크와 정확히 일치한다.
 uint64_t g_layer_enable_mask = ~0ULL;
+
+// A repeatable MD launch captures the exact post-load, pre-first-instruction guest state once.
+// Every eligible recording restores this bounded producer state before reset and movie arming, so
+// prior debugging or guest execution in the same process cannot become an undeclared input.
+static const uint64_t REPEATABLE_INITIAL_STATE_MAX_BYTES = 16ULL * 1024 * 1024;
+std::unique_ptr<MemoryStream> g_repeatable_initial_state;
 
 // freeze 상태머신: frozen이면 emucap_service가 스핀하며 프레임 진행을 막는다(MDFNI_Emulate 차단).
 // step(N)은 g_step_remaining만큼 프레임을 진행시킨 뒤 재정지하며 g_step_id로 완료 응답.
@@ -548,6 +559,61 @@ bool recording_reset_release_available() {
   return !is_ss() && !MDFNnetplay && !MDFNMOV_IsPlaying();
 }
 
+bool repeatable_profile_requested() {
+  const char* execution = getenv("EMUCAP_EXECUTION_PROFILE");
+  const char* profile = getenv("EMUCAP_REPEATABLE_PROFILE_ID");
+  const char* conditions = getenv("EMUCAP_REPEATABLE_CONDITIONS_SHA256");
+  return start_frozen_requested() && is_md()
+      && execution && !strcmp(execution, "repeatable")
+      && profile && !strcmp(profile, EMUCAP_RECORDING_MD_REPEATABLE_PROFILE)
+      && conditions
+      && !strcmp(conditions, EMUCAP_MEDNAFEN_MD_REPEATABLE_CONDITIONS_SHA256);
+}
+
+const char* recording_repeatable_conditions() {
+  if (!g_launch_start_controlled || !recording_reset_release_available()
+      || !repeatable_profile_requested() || !g_repeatable_initial_state)
+    return nullptr;
+  return EMUCAP_MEDNAFEN_MD_REPEATABLE_CONDITIONS_SHA256;
+}
+
+bool capture_repeatable_initial_state(std::string& error) {
+  if (!repeatable_profile_requested()) return false;
+  try {
+    std::unique_ptr<MemoryStream> state(new MemoryStream(1024 * 1024));
+    MDFNSS_SaveSM(state.get(), false);
+    if (state->size() == 0 || state->size() > REPEATABLE_INITIAL_STATE_MAX_BYTES) {
+      error = "initial guest state exceeds the repeatable profile bound";
+      return false;
+    }
+    state->rewind();
+    g_repeatable_initial_state = std::move(state);
+    return true;
+  } catch (const std::exception& exception) {
+    error = exception.what();
+    return false;
+  }
+}
+
+bool restore_repeatable_initial_state(std::string& error) {
+  if (!g_repeatable_initial_state) {
+    error = "repeatable initial guest state is unavailable";
+    return false;
+  }
+  try {
+    g_repeatable_initial_state->rewind();
+    MDFNSS_LoadSM(g_repeatable_initial_state.get(), false);
+    g_repeatable_initial_state->rewind();
+    MDFNI_SetLayerEnableMask(~0ULL);
+    g_layer_enable_mask = ~0ULL;
+    return true;
+  } catch (const std::exception& exception) {
+    error = exception.what();
+    g_repeatable_initial_state.reset();
+    return false;
+  }
+}
+
 enum RecordingJsonObjectState {
   RECORDING_JSON_OBJECT_ABSENT,
   RECORDING_JSON_OBJECT_VALID,
@@ -636,7 +702,9 @@ bool recording_input_movie(
     const std::string& line,
     std::uint64_t frames,
     std::vector<std::uint16_t>& masks,
+    bool& present,
     std::string& error) {
+  present = false;
   std::string object;
   const RecordingJsonObjectState state =
       recording_json_object(line, "input_movie", object);
@@ -683,6 +751,7 @@ bool recording_input_movie(
     }
     return false;
   }
+  present = true;
   return true;
 }
 
@@ -864,13 +933,16 @@ void handle_record_window(long id, const std::string& line) {
   const std::string capability_revision = json_str(line, "capability_revision");
   const std::string origin = json_str(line, "origin");
   const bool reset_available = recording_reset_release_available();
+  const char* repeatability_conditions = recording_repeatable_conditions();
+  const bool repeatable = repeatability_conditions != nullptr;
   request.reset_release = origin == "reset_release";
   const char* expected_launch_id = getenv("EMUCAP_LAUNCH_ID");
   bool include_frame_completed = false;
   if (!recording_safe_id(request.capture_id)
       || !expected_launch_id || request.launch_id != expected_launch_id
       || !recording_hex_digest(request.request_digest_sha256)
-      || capability_revision != emucap_recording_capability_revision(reset_available)
+      || capability_revision != emucap_recording_capability_revision(
+          reset_available, repeatable)
       || (origin != "next_frame_boundary" && !request.reset_release)
       || (request.reset_release && !reset_available)
       || !emucap_recording_exact_event_classes(line, include_frame_completed)) {
@@ -902,10 +974,18 @@ void handle_record_window(long id, const std::string& line) {
     return;
   }
   std::string request_error;
+  bool input_movie_present = false;
   if (!recording_stop_condition(
           line, include_frame_completed, request.frames, request, request_error)
-      || !recording_input_movie(line, request.frames, request.input_masks, request_error)) {
+      || !recording_input_movie(
+          line, request.frames, request.input_masks, input_movie_present, request_error)) {
     reply_err(id, "bad_params", request_error.c_str());
+    return;
+  }
+  if (repeatable && (!request.reset_release || !input_movie_present)) {
+    reply_err(
+        id, "bad_params",
+        "the repeatable Mega Drive profile requires reset_release and an explicit input movie");
     return;
   }
   const std::string endpoint = json_str(line, "endpoint");
@@ -915,6 +995,11 @@ void handle_record_window(long id, const std::string& line) {
       endpoint, token, request.capture_id, sink_error);
   if (!sink) {
     reply_err(id, "sink_unavailable", sink_error.c_str());
+    return;
+  }
+  if (repeatable && !restore_repeatable_initial_state(request_error)) {
+    g_frozen = true;
+    reply_err(id, "initial_state_unavailable", request_error.c_str());
     return;
   }
   const std::uint64_t started_ms = monotonic_millis();
@@ -2883,6 +2968,7 @@ void handle(const std::string& line) {
     if (recording_identity_available()) {
       methods += ",\"record_window\"";
     }
+    const char* repeatability_conditions = recording_repeatable_conditions();
     // memory_types: 이 게임의 debugger address space 이름들(없으면 빈 배열). read/write_memory의
     // 유효한 memory_type 목록이며, MCP가 status.memory_types로 표면화한다. 정적 추측 아님.
     std::string mtypes;
@@ -2939,8 +3025,11 @@ void handle(const std::string& line) {
              "{\"protocol_version\":%d,\"system\":\"%s\",\"adapter\":\"mednafen\",\"build\":\"%s\","
              "\"debugger\":%s,",
              PROTOCOL_VERSION, sys, EMUCAP_BUILD_HASH, has_debugger ? "true" : "false");
+    std::string host_features = "[\"controlled_start\"";
+    if (repeatability_conditions) host_features += ",\"repeatable_recording\"";
+    host_features += "]";
     std::string hello_resp = std::string(head) +
-                             "\"host_features\":[\"controlled_start\"],\"methods\":[" + methods +
+                             "\"host_features\":" + host_features + ",\"methods\":[" + methods +
                              "],\"memory_types\":[" + mtypes + "],\"breakpoint_kinds\":" +
                              breakpoint_kinds + ",\"contracts\":" +
                              contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
@@ -2949,7 +3038,8 @@ void handle(const std::string& line) {
       const char* binary_sha256 = getenv("EMUCAP_MEDNAFEN_BINARY_SHA256");
       hello_resp.pop_back();
       hello_resp += ",\"recording\":" +
-          emucap_recording_capability_json(recording_reset_release_available()) +
+          emucap_recording_capability_json(
+              recording_reset_release_available(), repeatability_conditions) +
           ",\"host_build\":{\"upstream\":\"" +
           json_escape(EMUCAP_MEDNAFEN_UPSTREAM) + "\",\"commit\":\"" +
           json_escape(EMUCAP_MEDNAFEN_UPSTREAM_REVISION) +
@@ -3013,7 +3103,8 @@ void handle(const std::string& line) {
       resp.pop_back();
       resp += ",\"recording\":{\"capability_revision\":\"" +
           std::string(emucap_recording_capability_revision(
-              recording_reset_release_available())) +
+              recording_reset_release_available(),
+              recording_repeatable_conditions() != nullptr)) +
           "\",\"active\":" + (g_recording ? "true" : "false") +
           ",\"capture_id\":" +
           (g_recording ? "\"" + json_escape(g_recording->capture_id()) + "\"" : "null") +
@@ -4115,6 +4206,13 @@ void emucap_pre_first_frame() {
   if (!first) return;
   first = false;
   if (!start_frozen_requested()) return;
+
+  if (repeatable_profile_requested()) {
+    std::string error;
+    if (!capture_repeatable_initial_state(error)) {
+      fprintf(stderr, "emucap: repeatable initial state unavailable: %s\n", error.c_str());
+    }
+  }
 
   // This hook runs after the game is loaded but before the first MDFNI_Emulate call. Keep the
   // emulator on this stack frame until an explicit advancing command arrives. A missing or lost

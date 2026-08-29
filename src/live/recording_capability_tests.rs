@@ -23,6 +23,7 @@ fn capability() -> RecordingCapability {
         event_order: None,
         class_accounting: false,
         input_movie: None,
+        state_load: None,
         initial_snapshots: None,
         terminal_snapshots: None,
         terminal_state: None,
@@ -313,6 +314,15 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         capability.revision,
         "7d673b3f299c2f5f8ba91cf12475385581ec6f18ad38efa1b25a6a3ef7cde08d"
     );
+    capability
+        .origins
+        .push(RecordingCapabilityOrigin::StateLoad);
+    capability.state_load = Some(RecordingStateLoadCapability {
+        format: "mesen-savestate".into(),
+        max_bytes: 64 * 1024 * 1024,
+        alignment: RecordingStateLoadAlignment::RestoredFrameBoundary,
+        requires_input_movie: true,
+    });
     let state_groups = vec!["ppu".into()];
     let mut state_only = capability.clone();
     state_only.terminal_state = Some(RecordingTerminalStateCapability {
@@ -329,12 +339,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         state_only_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         state_only_without_snapshots.revision,
-        "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e"
+        "89000c4b91750e4ad8317eb234ccc3e75a6c304978feb74daaedda8f2aa3ba7e"
     );
     state_only.revision = state_only.computed_revision().unwrap();
     assert_eq!(
         state_only.revision,
-        "cb17d9a46ab4f50c18090efe88841d86eec924683089b451301e4cf209400702"
+        "76f79723be824e502f5be0f0188c1494b249694c340bc8112a04872845ded730"
     );
     for id in ["snes_ppu_obj_evaluation_start", "snes_ppu_obj_handoff"] {
         let identity = registry.identities([id]).unwrap().remove(0);
@@ -362,12 +372,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     semantic_without_snapshots.revision = semantic_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         semantic_without_snapshots.revision,
-        "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5"
+        "c7bc749b13517456b049a73a868bc662c54cc98e580cc306b873328fd842dc22"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "c257a841cde44e9911d371a3e3521db1fe11e09dc5177075e76211605080fef2"
+        "151544f37bf2e72601429981e93fb8d45bd404a0e1501d26432b9cf29995e658"
     );
     for id in [
         "snes_cpu_instruction",
@@ -478,12 +488,12 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
     assert_eq!(
         deep_without_snapshots.revision,
-        "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175"
+        "9cb6540758c6f4a690371afc92c52803597183466ab0fc3486cbabc9e4287840"
     );
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "59e5b8f3c29fe258032eaadcca0ddea49fd47b23dd6a3d4c7e9d7311acd23787"
+        "79af7faa13666068539eaa7749e021f2035cefca4e5f9c12548a70468abc92ee"
     );
     capability.repeatability = Some(RecordingRepeatabilityCapability {
         profile: "mesen_snes_repeatable".into(),
@@ -495,7 +505,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     capability.revision = capability.computed_revision().unwrap();
     assert_eq!(
         capability.revision,
-        "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d"
+        "4436231189dd28b27f252d8c1241ccdfc04ead72aca5b1f675c53ad5a6377511"
     );
 }
 
@@ -604,6 +614,38 @@ fn filterable_fields_are_contract_bound_and_revision_covered() {
     capability.validate(&registry).unwrap();
 
     capability.event_classes[1].filterable_fields[0].path = "unknown".into();
+    capability.revision = capability.computed_revision().unwrap();
+    assert!(capability.validate(&registry).is_err());
+}
+
+#[test]
+fn state_load_origin_requires_one_bounded_capability_and_explicit_input_support() {
+    let registry = EventContractRegistry::builtin().unwrap();
+    let mut capability = capability();
+    capability
+        .origins
+        .push(RecordingCapabilityOrigin::StateLoad);
+    capability.input_movie = Some(RecordingInputMovieCapability {
+        format: INPUT_MOVIE_FORMAT.into(),
+        port: 0,
+        max_frames: capability.limits.max_frames,
+        max_bytes: CORE_MAX_INPUT_MOVIE_BYTES,
+        max_buttons_per_frame: 32,
+    });
+    capability.state_load = Some(RecordingStateLoadCapability {
+        format: "mesen-savestate".into(),
+        max_bytes: CORE_MAX_RECORDING_STATE_BYTES,
+        alignment: RecordingStateLoadAlignment::RestoredFrameBoundary,
+        requires_input_movie: true,
+    });
+    capability.revision = capability.computed_revision().unwrap();
+    capability.validate(&registry).unwrap();
+
+    capability.input_movie = None;
+    capability.revision = capability.computed_revision().unwrap();
+    assert!(capability.validate(&registry).is_err());
+
+    capability.state_load = None;
     capability.revision = capability.computed_revision().unwrap();
     assert!(capability.validate(&registry).is_err());
 }
