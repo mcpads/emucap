@@ -3,13 +3,14 @@
 //! The supported backend is the pinned PCSX2 fork under `adapters/pcsx2`. Stock PINE provides
 //! process discovery and game metadata, while the fork adds terminally acknowledged operations for
 //! CPU-thread memory access, pause/resume, frame advance, EE registers, disassembly, and path-based
-//! savestates. Host API 3 also owns frame-counted controller input, synchronous GS capture,
-//! debugger stops, call-stack capture, and reset.
+//! savestates. The host extension also owns frame-counted controller input, synchronous GS capture,
+//! debugger stops, call-stack capture, reset, and runtime memory-card transitions.
 //! The bridge deliberately refuses a stock or older PINE server instead of advertising weaker
 //! timing semantics under the same method names.
 
 mod debug;
 mod input;
+mod media;
 mod memory;
 mod video;
 
@@ -31,7 +32,7 @@ const PINE_MAX_REPLY: usize = 450_000;
 const PCSX2_EE_RAM_SIZE: u64 = 0x0200_0000;
 const MAX_MEMORY_TRANSFER: usize = 0x2_0000;
 const MAX_INPUT_FRAMES: u64 = 240;
-pub const REQUIRED_HOST_API: u32 = 3;
+pub const REQUIRED_HOST_API: u32 = 4;
 
 const MSG_VERSION: u8 = 0x08;
 const MSG_TITLE: u8 = 0x0b;
@@ -59,11 +60,14 @@ const MSG_EMUCAP_CLEAR_BREAKPOINT: u8 = 0x8f;
 const MSG_EMUCAP_POLL_EVENTS: u8 = 0x90;
 const MSG_EMUCAP_CALL_STACK: u8 = 0x91;
 const MSG_EMUCAP_RESET: u8 = 0x92;
+const MSG_EMUCAP_MEMORY_CARD_STATUS: u8 = 0x93;
+const MSG_EMUCAP_CHANGE_MEMORY_CARD: u8 = 0x94;
 
 const METHODS: &[&str] = &[
     "hello",
     "status",
     "get_rom_info",
+    "change_media",
     "read_memory",
     "write_memory",
     "find_pattern",
@@ -275,6 +279,7 @@ pub struct Pcsx2Bridge<T> {
     name: Option<String>,
     session_token: Option<String>,
     launch_id: Option<String>,
+    memory_card_dir: Option<PathBuf>,
     host_api: u32,
     next_breakpoint_id: u64,
     breakpoints: BTreeMap<u64, Pcsx2Breakpoint>,
@@ -289,11 +294,24 @@ enum ContentSha1 {
 impl<T: PineTransport> Pcsx2Bridge<T> {
     pub fn new(pine: T) -> BridgeResult<Self> {
         let content = std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from);
-        let mut bridge = Self::with_identity(
+        let data_root = std::env::var_os("EMUCAP_PCSX2_DATAROOT")
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                Pcsx2BridgeError::BadParams(
+                    "EMUCAP_PCSX2_DATAROOT is required by the managed PCSX2 bridge".into(),
+                )
+            })?;
+        if !data_root.is_absolute() {
+            return Err(Pcsx2BridgeError::BadParams(
+                "EMUCAP_PCSX2_DATAROOT must be absolute".into(),
+            ));
+        }
+        let mut bridge = Self::with_identity_and_memory_cards(
             pine,
             content.clone(),
             std::env::var("EMUCAP_NAME").ok(),
             std::env::var("EMUCAP_SESSION_TOKEN").ok(),
+            Some(data_root.join("memcards")),
         )?;
         if let Some(path) = content {
             bridge.content_sha1 = ContentSha1::Pending(std::thread::spawn(move || {
@@ -310,6 +328,16 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         name: Option<String>,
         session_token: Option<String>,
     ) -> BridgeResult<Self> {
+        Self::with_identity_and_memory_cards(pine, content, name, session_token, None)
+    }
+
+    fn with_identity_and_memory_cards(
+        pine: T,
+        content: Option<PathBuf>,
+        name: Option<String>,
+        session_token: Option<String>,
+        memory_card_dir: Option<PathBuf>,
+    ) -> BridgeResult<Self> {
         let mut bridge = Self {
             pine,
             content,
@@ -317,6 +345,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             name,
             session_token,
             launch_id: None,
+            memory_card_dir,
             host_api: 0,
             next_breakpoint_id: 1,
             breakpoints: BTreeMap::new(),
@@ -341,6 +370,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "hello" => self.hello(),
             "status" => self.status(),
             "get_rom_info" => self.get_rom_info(),
+            "change_media" => self.change_media(&request.params),
             "read_memory" => self.read_memory(&request.params),
             "write_memory" => self.write_memory(&request.params),
             "find_pattern" => self.find_pattern(&request.params),
@@ -434,6 +464,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": ["ee"],
+            "media_devices": media::memory_card_devices_json(),
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
                 {"kind":"read", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":false},
@@ -466,6 +497,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         let state = self.emulator_state()?;
         let version = self.read_string_command(MSG_VERSION)?;
         let input_override = self.input_override_info()?;
+        let media = self.memory_card_status()?;
         Ok(json!({
             "connected": true,
             "system": "ps2",
@@ -475,6 +507,9 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "state": state,
             "methods": METHODS,
             "memory_types": ["ee"],
+            "media_devices": media::memory_card_devices_json(),
+            "mounted_media": media.mounted_media_json(self.memory_card_dir.as_deref())?,
+            "media_activity": media.activity_json(),
             "input_buttons": pcsx2_input_buttons_json(),
             "input_override": input_override,
             "pcsx2_host_api": self.host_api,
@@ -776,6 +811,7 @@ fn capability_notes() -> Value {
         "input": true,
         "screenshot": true,
         "call_stack": true,
+        "media_change": true,
     })
 }
 

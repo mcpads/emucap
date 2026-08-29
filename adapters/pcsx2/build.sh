@@ -43,6 +43,8 @@ git -C "$SRC" checkout -- \
   pcsx2/Interpreter.cpp \
   pcsx2/PINE.cpp \
   pcsx2/Pcsx2Config.cpp \
+  pcsx2/SIO/Sio.cpp \
+  pcsx2/SIO/Sio.h \
   pcsx2/SIO/Pad/Pad.cpp \
   pcsx2/SIO/Pad/Pad.h \
   pcsx2/VMManager.cpp \

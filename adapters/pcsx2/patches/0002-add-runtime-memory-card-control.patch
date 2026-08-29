@@ -1,0 +1,253 @@
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+index 925cf6297..92da4fb51 100644
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -13,6 +13,7 @@
+ #include "PerformanceMetrics.h"
+ #include "SaveState.h"
+ #include "SIO/Pad/Pad.h"
++#include "SIO/Sio.h"
+ #include "PINE.h"
+ #include "VMManager.h"
+ #include "common/Error.h"
+@@ -77,7 +78,7 @@
+ #endif
+ 
+ #define PINE_EMULATOR_NAME "pcsx2"
+-#define EMUCAP_HOST_API 3
++#define EMUCAP_HOST_API 4
+ #define EMUCAP_EE_RAM_SIZE 0x02000000
+ #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
+ #define EMUCAP_MAX_FRAME_ADVANCE 15
+@@ -202,6 +203,8 @@ namespace PINEServer
+ 		MsgEmuCapPollEvents = 0x90, /**< Drains breakpoint-hit snapshots. */
+ 		MsgEmuCapCallStack = 0x91, /**< Walks the frozen EE thread stack. */
+ 		MsgEmuCapReset = 0x92, /**< Resets synchronously and remains paused. */
++		MsgEmuCapMemoryCardStatus = 0x93, /**< Returns the two main memory-card slot states. */
++		MsgEmuCapChangeMemoryCard = 0x94, /**< Ejects or inserts one managed file memory card. */
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -322,6 +325,141 @@ namespace PINEServer
+ 			Pad::SetEmuCapInput(0, 0);
+ 		}, true);
+ 	}
++
++	enum class EmuCapMemoryCardChangeResult : u32
++	{
++		Completed = 0,
++		Busy = 1,
++		InvalidSlot = 2,
++		InvalidName = 3,
++		InvalidCard = 4,
++		FailedRolledBack = 5,
++		FailedRollbackFailed = 6,
++	};
++
++	static bool IsEmuCapMemoryCardName(const std::string& name)
++	{
++		return !name.empty() && name.size() <= 255 && name != "." && name != ".." &&
++			name.find('/') == std::string::npos && name.find('\\') == std::string::npos &&
++			Path::GetFileName(name) == name && StringUtil::EndsWithNoCase(name, ".ps2");
++	}
++
++	static bool HasEmuCapMemoryCardTransition()
++	{
++		for (u32 port = 0; port < 2; port++)
++		{
++			if (mcds[port][0].autoEjectTicks > 0)
++				return true;
++		}
++		return false;
++	}
++
++	static bool EmuCapMemoryCardMatches(u32 slot, bool mounted, const std::string& filename)
++	{
++		if (slot >= 2)
++			return false;
++		const bool present = FileMcd_IsPresent(slot, 0) != 0;
++		if (!mounted)
++			return EmuConfig.Mcd[slot].Filename.empty() && !present;
++		return EmuConfig.Mcd[slot].Enabled && EmuConfig.Mcd[slot].Type == MemoryCardType::File &&
++			EmuConfig.Mcd[slot].Filename == filename && present;
++	}
++
++	static void ApplyEmuCapMemoryCardSetting(u32 slot, bool enabled, const std::string& filename)
++	{
++		const std::string enable_key = fmt::format("Slot{}_Enable", slot + 1);
++		const std::string filename_key = fmt::format("Slot{}_Filename", slot + 1);
++		Host::SetBaseBoolSettingValue("MemoryCards", enable_key.c_str(), enabled);
++		Host::SetBaseStringSettingValue("MemoryCards", filename_key.c_str(), filename.c_str());
++		Host::CommitBaseSettingChanges();
++		VMManager::ApplySettings();
++
++		// Applying memory-card settings reopens every card and may arm auto-eject on sibling
++		// slots. The emucap operation owns one main slot, so discard those incidental
++		// transitions and retain only the requested insertion delay.
++		AutoEject::ClearAll();
++		if (enabled && !filename.empty())
++			AutoEject::Set(slot, 0);
++	}
++
++	static EmuCapMemoryCardChangeResult ChangeEmuCapMemoryCard(
++		u32 slot, bool mount, const std::string& filename)
++	{
++		if (slot >= 2)
++			return EmuCapMemoryCardChangeResult::InvalidSlot;
++		if (MemcardBusy::IsBusy() || HasEmuCapMemoryCardTransition())
++			return EmuCapMemoryCardChangeResult::Busy;
++		if (mount)
++		{
++			if (!IsEmuCapMemoryCardName(filename))
++				return EmuCapMemoryCardChangeResult::InvalidName;
++			const std::optional<AvailableMcdInfo> card = FileMcd_GetCardInfo(filename);
++			if (!card || card->type != MemoryCardType::File ||
++				card->file_type <= MemoryCardFileType::Unknown ||
++				card->file_type >= MemoryCardFileType::PS1)
++			{
++				return EmuCapMemoryCardChangeResult::InvalidCard;
++			}
++		}
++		else if (!filename.empty())
++		{
++			return EmuCapMemoryCardChangeResult::InvalidName;
++		}
++
++		const Pcsx2Config::McdOptions previous = EmuConfig.Mcd[slot];
++		const bool previous_present = FileMcd_IsPresent(slot, 0) != 0;
++		ApplyEmuCapMemoryCardSetting(slot, mount || previous.Enabled, mount ? filename : std::string());
++		if (EmuCapMemoryCardMatches(slot, mount, filename))
++			return EmuCapMemoryCardChangeResult::Completed;
++
++		ApplyEmuCapMemoryCardSetting(slot, previous.Enabled, previous.Filename);
++		const bool restored = EmuConfig.Mcd[slot].Enabled == previous.Enabled &&
++			EmuConfig.Mcd[slot].Filename == previous.Filename &&
++			(FileMcd_IsPresent(slot, 0) != 0) == previous_present;
++		return restored ? EmuCapMemoryCardChangeResult::FailedRolledBack :
++			EmuCapMemoryCardChangeResult::FailedRollbackFailed;
++	}
++
++	static bool WriteEmuCapMemoryCardStatus(std::vector<u8>& ret_buffer, u32& ret_cnt)
++	{
++		constexpr u32 slot_count = 2;
++		u32 required = 8;
++		for (u32 slot = 0; slot < slot_count; slot++)
++		{
++			if (EmuConfig.Mcd[slot].Filename.size() > 255)
++				return false;
++			required += 24 + static_cast<u32>(EmuConfig.Mcd[slot].Filename.size());
++		}
++		if (ret_cnt + required >= MAX_IPC_RETURN_SIZE)
++			return false;
++
++		ToResultVector(ret_buffer, MemcardBusy::RemainingFrames(), ret_cnt);
++		ret_cnt += 4;
++		ToResultVector(ret_buffer, slot_count, ret_cnt);
++		ret_cnt += 4;
++		for (u32 slot = 0; slot < slot_count; slot++)
++		{
++			const std::string& filename = EmuConfig.Mcd[slot].Filename;
++			ToResultVector(ret_buffer, slot, ret_cnt);
++			ret_cnt += 4;
++			ToResultVector(ret_buffer, static_cast<u32>(EmuConfig.Mcd[slot].Enabled), ret_cnt);
++			ret_cnt += 4;
++			ToResultVector(ret_buffer, static_cast<u32>(FileMcd_IsPresent(slot, 0) != 0), ret_cnt);
++			ret_cnt += 4;
++			ToResultVector(ret_buffer, static_cast<u32>(EmuConfig.Mcd[slot].Type), ret_cnt);
++			ret_cnt += 4;
++			ToResultVector(ret_buffer, static_cast<u32>(mcds[slot][0].autoEjectTicks), ret_cnt);
++			ret_cnt += 4;
++			ToResultVector(ret_buffer, static_cast<u32>(filename.size()), ret_cnt);
++			ret_cnt += 4;
++			if (!filename.empty())
++			{
++				memcpy(&ret_buffer[ret_cnt], filename.data(), filename.size());
++				ret_cnt += static_cast<u32>(filename.size());
++			}
++		}
++		return true;
++	}
+ } // namespace PINEServer
+ 
+ bool PINEServer::Initialize(int slot)
+@@ -1358,6 +1496,52 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 				ret_cnt += 4;
+ 				break;
+ 			}
++			case MsgEmuCapMemoryCardStatus:
++			{
++				if (!VMManager::HasValidVM() || !SafetyChecks(buf_cnt, 0, ret_cnt, 8, buf_size)) [[unlikely]]
++					goto error;
++				bool written = false;
++				Host::RunOnCPUThread([&ret_buffer, &ret_cnt, &written]() {
++					written = WriteEmuCapMemoryCardStatus(ret_buffer, ret_cnt);
++				}, true);
++				if (!written)
++					goto error;
++				break;
++			}
++			case MsgEmuCapChangeMemoryCard:
++			{
++				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Paused ||
++					!SafetyChecks(buf_cnt, 12, ret_cnt, 4, buf_size)) [[unlikely]]
++				{
++					goto error;
++				}
++				const u32 slot = FromSpan<u32>(buf, buf_cnt);
++				const u32 action = FromSpan<u32>(buf, buf_cnt + 4);
++				const u32 filename_length = FromSpan<u32>(buf, buf_cnt + 8);
++				buf_cnt += 12;
++				if (action > 1 || filename_length > 255 ||
++					!SafetyChecks(buf_cnt, filename_length, ret_cnt, 4, buf_size)) [[unlikely]]
++				{
++					goto error;
++				}
++				const std::string filename(
++					reinterpret_cast<const char*>(&buf[buf_cnt]), filename_length);
++				buf_cnt += filename_length;
++				if (filename.find('\0') != std::string::npos)
++					goto error;
++
++				bool written = false;
++				Host::RunOnCPUThread([slot, action, &filename, &ret_buffer, &ret_cnt, &written]() {
++					const EmuCapMemoryCardChangeResult outcome =
++						ChangeEmuCapMemoryCard(slot, action == 1, filename);
++					ToResultVector(ret_buffer, static_cast<u32>(outcome), ret_cnt);
++					ret_cnt += 4;
++					written = WriteEmuCapMemoryCardStatus(ret_buffer, ret_cnt);
++				}, true);
++				if (!written || VMManager::GetState() != VMState::Paused)
++					goto error;
++				break;
++			}
+ 			default:
+ 			{
+ 			error:
+diff --git a/pcsx2/SIO/Sio.cpp b/pcsx2/SIO/Sio.cpp
+index dad79a5c9..50ac58052 100644
+--- a/pcsx2/SIO/Sio.cpp
++++ b/pcsx2/SIO/Sio.cpp
+@@ -150,6 +150,11 @@ bool MemcardBusy::IsBusy()
+ 	return (currentBusyTicks.load(std::memory_order_acquire) > 0);
+ }
+ 
++u32 MemcardBusy::RemainingFrames()
++{
++	return currentBusyTicks.load(std::memory_order_acquire);
++}
++
+ void MemcardBusy::ClearBusy()
+ {
+ 	currentBusyTicks.store(0, std::memory_order_release);
+diff --git a/pcsx2/SIO/Sio.h b/pcsx2/SIO/Sio.h
+index 19d078109..ac473c21c 100644
+--- a/pcsx2/SIO/Sio.h
++++ b/pcsx2/SIO/Sio.h
+@@ -131,6 +131,7 @@ namespace MemcardBusy
+ 	extern void Decrement();
+ 	extern void SetBusy();
+ 	extern bool IsBusy();
++	extern u32 RemainingFrames();
+ 	extern void ClearBusy();
+ 	extern void CheckSaveStateDependency();
+ }

@@ -79,6 +79,7 @@ Follow the normal sequence:
 The adapter advertises:
 
 - `get_rom_info`, `status`;
+- frozen-only `change_media` for the two main memory-card slots;
 - `read_memory`, `write_memory`, `find_pattern`, `dump_memory`;
 - `get_state`;
 - `pause`, `resume`, and frame-unit `step`;
@@ -128,6 +129,27 @@ removes only the adapter-owned entries.
 outermost to innermost with `pc`, estimated function `entry`, `sp`, and `stack_size`. Optimized code,
 damaged stacks, and incomplete symbols can produce partial results, so the response marks this
 surface as best-effort.
+
+### Memory cards
+
+`status.media_devices` advertises the two main slots as `mcd1` and `mcd2`. Runtime replacement
+supports direct regular `.ps2` file cards in the session-owned `data/memcards` directory. Folder
+cards and multitap slots remain observable where PCSX2 reports them but are not runtime-change
+targets.
+
+Call `change_media` only while frozen and provide exactly one of `path` or `eject=true`. The bridge
+rejects cards outside the managed directory, symlinks, malformed files, and changes attempted while
+PCSX2 reports memory-card I/O in progress. A busy response reports how many guest frames must pass
+before a retry is safe. Release closes the writable card through PCSX2 before success; a failed
+change attempts to restore the prior slot and reports whether rollback succeeded.
+
+PCSX2 models insertion as an automatic eject window. A successful mount can therefore report the
+backend file as mounted while `guest_present=false`, together with a `guest_transition` containing
+the remaining emulated frames. `change_media` never advances those frames: choose an explicit
+`step` or `resume` according to the intended terminal state. Another change is rejected while any
+main slot still has such a transition, and changing one slot does not arm a transition on its
+sibling. `sha1_at_attach` describes the mutable file at attachment time and is not a persistent
+identity after the guest writes to it.
 
 ### Screenshot and input
 

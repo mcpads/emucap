@@ -169,6 +169,26 @@
       "expression": "change_media.failed_after_effect => restored(previous_media) or reports(current_media,rollback_failure)"
     },
     {
+      "id": "MEDIA.CHANGE.NO_TIME.1",
+      "category": "invariant",
+      "expression": "change_media.completed => frozen(after) and delta_guest_clock = 0"
+    },
+    {
+      "id": "MEDIA.CHANGE.WRITABLE_RELEASE.1",
+      "category": "postcondition",
+      "expression": "change_media.completed and releases(writable_media) => flushed(writable_media) and backend_handle_closed(writable_media)"
+    },
+    {
+      "id": "MEDIA.CHANGE.GUEST_TRANSITION.1",
+      "category": "postcondition",
+      "expression": "change_media.completed and guest_transition_pending(target,ticks) => ticks > 0 and reports(target,ticks) and delta_guest_clock = 0"
+    },
+    {
+      "id": "MEDIA.CHANGE.ISOLATION.1",
+      "category": "invariant",
+      "expression": "change_media.completed => forall d != requested_device: backend_state(d,after) = backend_state(d,before) and guest_state(d,after) = guest_state(d,before)"
+    },
+    {
       "id": "MEM.DUMP.PATH.1",
       "category": "postcondition",
       "expression": "dump.ok => writes_confined_to(request.path) and literal_path(request.path)"
@@ -474,9 +494,9 @@
       "id": "media.change",
       "surface": "public",
       "methods": ["change_media"],
-      "temporal_classes": ["T3"],
+      "temporal_classes": ["T1", "T4"],
       "disposition": "retain",
-      "expectations": ["MEDIA.CHANGE.APPLY.1", "MEDIA.CHANGE.ROLLBACK.1", "TIME.RESPONSE.1", "TIME.COMPLETE.1", "TIME.GENERATION.1"]
+      "expectations": ["MEDIA.CHANGE.APPLY.1", "MEDIA.CHANGE.ROLLBACK.1", "MEDIA.CHANGE.NO_TIME.1", "MEDIA.CHANGE.WRITABLE_RELEASE.1", "MEDIA.CHANGE.GUEST_TRANSITION.1", "MEDIA.CHANGE.ISOLATION.1", "TIME.RESPONSE.1", "TIME.COMPLETE.1", "TIME.GENERATION.1"]
     },
     {
       "id": "memory.read",
