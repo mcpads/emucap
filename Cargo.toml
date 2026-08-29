@@ -56,6 +56,10 @@ path = "src/bin/emucap-pcsx2-bridge.rs"
 name = "emucap-openmsx-bridge"
 path = "src/bin/emucap-openmsx-bridge.rs"
 
+[[bin]]
+name = "emucap-np2kai"
+path = "src/bin/emucap-np2kai.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -75,6 +79,8 @@ time = { version = "0.3", features = ["formatting"] }
 zip = { version = "8.4", default-features = false, features = ["deflate"] }
 tungstenite = "0.30"
 fs2 = "0.4"
+libloading = "0.8"
+png = "0.17"
 
 # setsid() for detached emulator launch; Unix only (Windows uses creation_flags).
 [target.'cfg(unix)'.dependencies]

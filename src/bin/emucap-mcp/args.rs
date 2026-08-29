@@ -886,6 +886,10 @@ pub(crate) struct LaunchPlanArgs {
     /// CHD, or BIN. Use bootstrap(include=["systems"]) for the full catalog.
     #[serde(default)]
     pub(crate) system: Option<String>,
+    /// PC-98 execution backend. Omit for the MAME debugger backend; select
+    /// np2kai explicitly for HDI compatibility when launch_plan recommends it.
+    #[serde(default)]
+    pub(crate) pc98_backend: Option<Pc98BackendArgs>,
     /// Exact server-produced review value for files named indirectly by a
     /// descriptor. Echo the value returned by launch_plan; do not construct it.
     #[serde(default)]
@@ -905,6 +909,10 @@ pub(crate) struct LaunchArgs {
     /// Explicit system identifier. Provide it when media type is ambiguous.
     #[serde(default)]
     pub(crate) system: Option<String>,
+    /// PC-98 execution backend. Omit for MAME. NP2kai is an explicit
+    /// compatibility choice and is never selected automatically.
+    #[serde(default)]
+    pub(crate) pc98_backend: Option<Pc98BackendArgs>,
     /// Exact server-produced review value for files named indirectly by a
     /// descriptor. Obtain it from launch_plan before launching composite media.
     #[serde(default)]
@@ -948,6 +956,13 @@ pub(crate) struct LaunchArgs {
 pub(crate) enum Pc98SoundBoardArgs {
     Pc9801_26,
     Pc9801_86,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Pc98BackendArgs {
+    Mame,
+    Np2kai,
 }
 
 impl Pc98SoundBoardArgs {

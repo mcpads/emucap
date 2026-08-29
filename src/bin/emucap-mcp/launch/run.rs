@@ -144,28 +144,43 @@ pub(crate) fn make_launch(
             "inference": inference,
         });
     };
-    let (adapter, module) = adapter_for_system(system);
-    if a.sound == Some(true) && !adapter_supports_sound(adapter) {
+    if a.pc98_backend.is_some() && system != "pc98" {
         return serde_json::json!({
             "launched": false,
-            "reason": "sound:true is supported only by Mednafen and PC-98 systems",
+            "reason": "pc98_backend is supported only for PC-98",
+            "system": system,
+        });
+    }
+    let (adapter, module) = adapter_for_system_and_pc98_backend(system, a.pc98_backend);
+    if adapter == "np2kai" && (a.display == Some(true) || a.content_path2.is_some()) {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "the NP2kai backend currently supports headless single-HDI launch only",
             "system": system,
             "adapter": adapter,
         });
     }
-    if a.pc98_sound_board.is_some() && system != "pc98" {
+    if a.sound == Some(true) && !adapter_supports_sound(adapter) {
         return serde_json::json!({
             "launched": false,
-            "reason": "pc98_sound_board is supported only for PC-98",
+            "reason": "sound:true is not supported by the selected adapter",
+            "system": system,
+            "adapter": adapter,
+        });
+    }
+    if a.pc98_sound_board.is_some() && adapter != "mame_pc98" {
+        return serde_json::json!({
+            "launched": false,
+            "reason": "pc98_sound_board is supported only by the PC-98 MAME backend",
             "system": system,
             "adapter": adapter,
         });
     }
     let repeatable = a.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
-    if a.start_frozen && adapter != "mesen2" && adapter != "mednafen" {
+    if a.start_frozen && adapter != "mesen2" && adapter != "mednafen" && adapter != "np2kai" {
         return serde_json::json!({
             "launched": false,
-            "reason": "start_frozen is currently supported only by Mesen and Mednafen systems",
+            "reason": "start_frozen is not supported by the selected adapter",
             "system": system,
             "adapter": adapter,
         });
@@ -383,6 +398,7 @@ pub(crate) fn make_launch(
         "mednafen" => launch_mednafen(port, direct_reclaim, runtime, module, a),
         "flycast" => launch_flycast(port, direct_reclaim, runtime, a),
         "mame_pc98" => launch_mame(port, direct_reclaim, runtime, a),
+        "np2kai" => launch_np2kai(port, direct_reclaim, runtime, a),
         "mame_neogeo" => {
             super::mame_neogeo::launch_mame_neogeo(port, direct_reclaim, runtime, system, a)
         }
@@ -666,63 +682,6 @@ pub(super) fn backend_endpoint_from_launch(outcome: &serde_json::Value) -> Optio
         }
     }
     None
-}
-
-pub(super) fn pc98_headless(a: &LaunchArgs) -> bool {
-    !a.display.unwrap_or(false)
-}
-
-/// MAME/PC-98 leg of `make_launch`: spawn MAME + the GDB bridge; defaults the machine to pc9801rs.
-pub(super) fn launch_mame(
-    port: u16,
-    token: Option<&str>,
-    runtime: RuntimeEnv<'_>,
-    a: &LaunchArgs,
-) -> serde_json::Value {
-    let Some(root) = find_repo_root() else {
-        return serde_json::json!({ "launched": false, "error": "emucap repository root was not found; set EMUCAP_REPO_ROOT" });
-    };
-    let Some(binary) = emucap::launch::mame::resolve_binary(&root) else {
-        return serde_json::json!({ "launched": false, "reason": "MAME binary was not found; build it with adapters/mame-pc98/build.sh or set MAME_BIN" });
-    };
-    let headless = pc98_headless(a);
-    let sound = a.sound.unwrap_or(false);
-    let log = adapter_log_path("mame-pc98", port, "mame-pc98.log");
-    let spec = emucap::launch::mame::Launch {
-        binary: &binary,
-        repo_root: &root,
-        content: &a.content_path,
-        flop2: a.content_path2.as_deref(),
-        machine: "pc9801rs",
-        log_path: &log,
-        port,
-        name: a.name.as_deref(),
-        session_token: token,
-        runtime: Some(runtime),
-        headless,
-        sound,
-        cbus0: a.pc98_sound_board.map(|board| board.mame_slot()),
-    };
-    match emucap::launch::mame::launch(&spec) {
-        Ok(launched) => serde_json::json!({
-            "launched": true,
-            "adapter": "mame_pc98",
-            "pid": launched.mame_pid,
-            "mame_pid": launched.mame_pid,
-            "bridge_pid": launched.bridge_pid,
-            "bridge": launched.bridge_kind,
-            "display": !headless,
-            "sound": sound,
-            "pc98_sound_board": a.pc98_sound_board.map(|board| board.mame_slot()),
-            "gdb_port": launched.gdb_port,
-            "port": port,
-            "binary": binary.display().to_string(),
-            "log": log.display().to_string(),
-            "note": "MAME + GDB bridge 2-process launch. If MAME spawn fails after bridge spawn, the Rust launcher terminates that bridge.",
-            "next_action": "launch returns after the adapter connects",
-        }),
-        Err(e) => serde_json::json!({ "launched": false, "error": e.to_string() }),
-    }
 }
 
 /// Nintendo 64 leg of `make_launch`: run the native adapter against the pinned debugger core.

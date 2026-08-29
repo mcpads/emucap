@@ -690,6 +690,18 @@ fn snes_button_hint_exposes_common_aliases() {
 }
 
 #[test]
+fn pc98_button_hint_keeps_digit_row_and_keypad_distinct() {
+    let hint = button_hint_for_system(Some("pc98")).unwrap();
+    let buttons = hint["buttons"].as_array().unwrap();
+    for button in ["0", "9", "kp0", "kp9"] {
+        assert!(
+            buttons.iter().any(|candidate| candidate == button),
+            "missing PC-98 input hint: {button}"
+        );
+    }
+}
+
+#[test]
 fn mednafen_button_hints_expose_common_aliases() {
     let saturn = button_hint_for_system(Some("saturn")).unwrap();
     assert_eq!(saturn["aliases"]["enter"], "start");

@@ -368,6 +368,9 @@ identity concerns: MCP replays frozen keyboard input with `set_input` plus frame
 PC-98 keyboard and mouse buttons.  Canonical key names include `enter`, `esc`, `space`, directions,
 `backspace`, `tab`, `del`, `ins`, `home`, `help`, `stop`, `copy`, `shift`,
 `ctrl`, `f1`..`f10`, `vf1`..`vf5`, letters `a`..`z`, and digits `0`..`9`.
+The numeric keypad is a separate device surface: use `kp0`..`kp9`. The aliases
+`numpadN`, `kp_N`, and MAME's display spelling `N (pad)` resolve to the same
+canonical keypad input without changing ordinary digit keys.
 Aliases include `start`/`return` -> `enter`, `escape` -> `esc`, and `select` ->
 `space`. Mouse buttons are `mouse_left`, `mouse_right`, and `mouse_middle`.
 `press_buttons(["enter"], frames=8)` was verified to advance the

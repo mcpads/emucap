@@ -806,6 +806,71 @@ fn input_methods_send_lua_commands_with_normalized_buttons() {
 }
 
 #[test]
+fn keypad_aliases_share_one_canonical_name_without_collapsing_digit_row() {
+    let raw = json!(["0", "kp0", "numpad0", "kp_0", "0 (pad)"]);
+    assert_eq!(
+        normalize_buttons(Some(&raw)).unwrap(),
+        ["0", "kp0", "kp0", "kp0", "kp0"]
+    );
+}
+
+#[test]
+fn every_advertised_pc98_button_is_accepted_by_input_normalization() {
+    let advertised = input_buttons_json()["buttons"].clone();
+    let normalized = normalize_buttons(Some(&advertised)).unwrap();
+    assert_eq!(normalized.len(), PC98_INPUT_BUTTONS.len());
+    assert_eq!(
+        normalized,
+        PC98_INPUT_BUTTONS
+            .iter()
+            .map(|button| (*button).to_string())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn ordinary_digit_and_keypad_digit_send_distinct_mame_inputs() {
+    let fake = FakeGdb::with(&[
+        ("?", "S05"),
+        ("qEmucap,setinput,30", "OK"),
+        ("qEmucap,setinput,6b7030", "OK"),
+    ]);
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+
+    let ordinary = bridge.handle_request(Request::new(81, "set_input", json!({"buttons": ["0"]})));
+    assert_eq!(ordinary.result.unwrap()["buttons"], json!(["0"]));
+
+    let keypad = bridge.handle_request(Request::new(
+        82,
+        "set_input",
+        json!({"buttons": ["0 (pad)"]}),
+    ));
+    assert_eq!(keypad.result.unwrap()["buttons"], json!(["kp0"]));
+}
+
+#[test]
+fn status_reports_only_callable_canonical_runtime_input_names() {
+    let fake = FakeGdb::with(&[
+        ("?", ""),
+        ("qEmucap,mediastatus", "MEDIA:"),
+        (
+            "qEmucap,inputfields",
+            "0,0 (pad),kp1,numpad2,backend diagnostic field",
+        ),
+        ("qEmucap,inputstatus", "0"),
+        ("qEmucap,pointerstatus", "NONE"),
+        ("qEmucap,frame", "12"),
+    ]);
+    let mut bridge = Bridge::new(fake, GdbBridgeEnv::default());
+    let response = bridge.handle_request(Request::new(83, "status", json!({})));
+    let available = response.result.unwrap()["input_buttons"]["available"].clone();
+    assert_eq!(available, json!(["0", "kp0", "kp1", "kp2"]));
+
+    let normalized = normalize_buttons(Some(&available)).unwrap();
+    assert_eq!(normalized, ["0", "kp0", "kp1", "kp2"]);
+}
+
+#[test]
 fn breakpoint_methods_set_list_clear_and_enrich_events() {
     let condition = "(pc >= 2000) && ((wpdata & FF) == 42)";
     let set_spec = format!("3|a0010|5|1|{condition}");
@@ -2013,15 +2078,15 @@ fn step_instruction_drains_pre_command_stale_stop() {
     let result = response.result.unwrap();
     assert_eq!(result["unit"], "instructions");
     assert_eq!(result["count"], 1);
-    // stale stop이 s의 응답 자리에 오배달되지 않고 이벤트 큐로 걷혔다.
+    // The stale stop is queued as an event instead of being mistaken for the step reply.
     assert_eq!(bridge.events.len(), 1);
     assert_eq!(bridge.events[0]["raw"], "T05hwbreak:00100000;idx:2");
-    // 스텝은 실제로 한 번 실행됐다(stale를 스텝 완료로 오인하지 않음).
+    // The bridge executed one real step instead of treating the stale stop as completion.
     assert_eq!(bridge.gdb.steps, 1);
 }
 
-// P2: 머신 ioport에 없는 버튼을 눌렀을 때, 어느 버튼이 없고 무엇이 가능한지 이름을 붙여
-// 반환하는지 검증한다(맨몸 E08 패스스루 금지).
+// An unavailable machine key must name both the rejected key and callable alternatives;
+// a bare backend E08 is not an actionable public error.
 #[test]
 fn set_input_names_unavailable_button_and_lists_machine_fields() {
     let fake = FakeGdb::from_pairs(vec![

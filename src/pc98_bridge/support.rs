@@ -138,8 +138,38 @@ pub(super) fn input_buttons_json() -> Value {
             "right_click": "mouse_right",
             "middle_click": "mouse_middle",
         },
-        "notes": "PC-98 accepts keyboard inputs and mouse_left/mouse_right/mouse_middle. Pointer position is relative hardware state; use move_pointer instead of absolute coordinates.",
+        "notes": "PC-98 accepts keyboard inputs, distinct kp0-kp9 keypad inputs, and mouse_left/mouse_right/mouse_middle. Keypad aliases numpadN, kp_N, and MAME N (pad) are accepted. Pointer position is relative hardware state; use move_pointer instead of absolute coordinates.",
     })
+}
+
+fn keypad_digit(key: &str) -> Option<char> {
+    let candidate = key
+        .strip_prefix("numpad")
+        .or_else(|| key.strip_prefix("kp_"))
+        .or_else(|| key.strip_prefix("kp"))
+        .or_else(|| key.strip_suffix(" (pad)"))?;
+    let mut chars = candidate.chars();
+    let digit = chars.next()?;
+    (digit.is_ascii_digit() && chars.next().is_none()).then_some(digit)
+}
+
+fn canonical_input_name(key: &str) -> String {
+    let normalized = key.trim().to_ascii_lowercase();
+    if let Some(alias) = input_alias(&normalized) {
+        return alias.to_string();
+    }
+    if let Some(digit) = keypad_digit(&normalized) {
+        return format!("kp{digit}");
+    }
+    normalized
+}
+
+pub(super) fn normalize_discovered_input_fields(raw: &str) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    raw.split(',')
+        .map(canonical_input_name)
+        .filter(|key| PC98_INPUT_BUTTONS.contains(&key.as_str()) && seen.insert(key.clone()))
+        .collect()
 }
 
 pub(super) fn normalize_buttons(raw: Option<&Value>) -> BridgeResult<Vec<String>> {
@@ -154,14 +184,15 @@ pub(super) fn normalize_buttons(raw: Option<&Value>) -> BridgeResult<Vec<String>
         .map(|value| {
             let key = value
                 .as_str()
-                .map(|s| s.trim().to_ascii_lowercase())
-                .unwrap_or_else(|| value.to_string().trim_matches('"').to_ascii_lowercase());
-            let normalized = input_alias(&key).unwrap_or(&key);
-            if PC98_INPUT_BUTTONS.contains(&normalized) {
-                Ok(normalized.to_string())
+                .map(str::to_string)
+                .unwrap_or_else(|| value.to_string().trim_matches('"').to_string());
+            let normalized = canonical_input_name(&key);
+            if PC98_INPUT_BUTTONS.contains(&normalized.as_str()) {
+                Ok(normalized)
             } else {
                 Err(BridgeError::BadParams(format!(
-                    "unsupported PC-98 key: {key}"
+                    "unsupported PC-98 key: {}",
+                    key.trim().to_ascii_lowercase()
                 )))
             }
         })

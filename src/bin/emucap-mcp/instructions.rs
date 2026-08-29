@@ -9,7 +9,7 @@ For `input_control` and `debug`, call `operation="describe"`, then use one retur
 
 ## Managed lifecycle
 
-Use `listener.port`, not `base_port`. Resolve media through `launch_plan`; never guess an ambiguous system. For `review_input`, verify each indirect member and echo its exact approval; never construct or bypass it. Launch with the planned arguments, then verify status identity and binding. Stop only `status.runtime_instance.launch_id`.
+Use `listener.port`, not `base_port`. Run `launch_plan`; never guess a system or accept a backend recommendation without copying its explicit argument. Verify each indirect member and echo its `review_input` approval exactly; never construct one. Launch as planned, then verify status identity and binding. Stop only `status.runtime_instance.launch_id`.
 
 To continue a generation not selected automatically, inspect `bootstrap(include=["runtimes"])` and call `reattach` only with an exact entry marked available. Never edit runtime files.
 
@@ -37,7 +37,7 @@ For advertised `state_load`, call `save_state(preserve_for_recording=true)`, the
 
 ## Evidence
 
-Memory addresses are offsets in the selected advertised region; cross-boundary requests must fail. For live media, pause before `change_media`, verify its returned identity, then resume if intended.
+Memory addresses are offsets in the selected advertised region; cross-boundary requests must fail. For live media, pause before `change_media` and verify its returned state. Writable slots may report busy frames or a guest-visible transition; `change_media` never advances those frames. An attach-time hash does not identify later guest writes. Step or resume explicitly if intended.
 
 Breakpoint snapshots are hit-time evidence; later reads are not equivalent. A missing hit does not prove no access. Use debug `probe` when restore, advance, and read must be atomic.
 

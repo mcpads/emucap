@@ -1,0 +1,21 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The emucap direct libretro host, build recipe, documentation, and original
+adapter glue are licensed GPL-2.0-or-later, the project default.
+
+The pinned NP2kai source is downloaded into the ignored work tree and retains
+its own file and component licenses. Its repository root is MIT licensed, but
+the full source tree contains additional BSD, zlib, GPL, and custom notices.
+The supported build profile excludes the components named in upstream.lock
+and records both its compiled-source manifest and the complete upstream notice
+inventory. Those upstream notices remain authoritative for upstream code and
+must accompany any redistribution of a built core or corresponding source.
+
+This repository does not distribute the NP2kai source archive, generated core,
+firmware, rhythm samples, or game media. See ../../NOTICE, upstream.lock, and
+README.md for the pinned source, supported build profile, and redistribution
+boundary.
+
+The full GPL-2.0 text is at ../../licenses/GPL-2.0.txt and online at
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.html.

@@ -66,6 +66,17 @@ pub(super) fn adapter_for_system(system: &str) -> (&'static str, Option<&'static
     }
 }
 
+pub(super) fn adapter_for_system_and_pc98_backend(
+    system: &str,
+    backend: Option<crate::args::Pc98BackendArgs>,
+) -> (&'static str, Option<&'static str>) {
+    if system == "pc98" && backend == Some(crate::args::Pc98BackendArgs::Np2kai) {
+        ("np2kai", None)
+    } else {
+        adapter_for_system(system)
+    }
+}
+
 pub(super) fn adapter_supports_sound(adapter: &str) -> bool {
     matches!(adapter, "mednafen" | "mame_pc98")
 }

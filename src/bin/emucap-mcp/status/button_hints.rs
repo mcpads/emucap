@@ -41,9 +41,9 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
         }),
         "pc98" => serde_json::json!({
             "system": "pc98",
-            "buttons": ["enter", "esc", "space", "up", "down", "left", "right", "backspace", "tab", "del", "ins", "home", "help", "stop", "copy", "shift", "ctrl", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "vf1", "vf2", "vf3", "vf4", "vf5", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+            "buttons": ["enter", "esc", "space", "up", "down", "left", "right", "backspace", "tab", "del", "ins", "home", "help", "stop", "copy", "shift", "ctrl", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "vf1", "vf2", "vf3", "vf4", "vf5", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "kp0", "kp1", "kp2", "kp3", "kp4", "kp5", "kp6", "kp7", "kp8", "kp9"],
             "aliases": {"start": "enter", "return": "enter", "escape": "esc", "select": "space"},
-            "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. step(frames) is frame-based, so tap can drive deterministic frozen input."
+            "notes": "PC-98 uses keyboard inputs through MAME ioport overrides. Ordinary digits and kp0-kp9 keypad inputs are distinct; numpadN, kp_N, and MAME N (pad) spellings are accepted aliases. step(frames) is frame-based, so tap can drive deterministic frozen input."
         }),
         "neogeo_mvs" => serde_json::json!({
             "system": "neogeo_mvs",
