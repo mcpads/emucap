@@ -486,7 +486,10 @@ pub(super) fn state_restore_info() -> Value {
     json!({
         "format": STATE_FORMAT,
         "scope": "cpu-register-packet-plus-ram-tvram-gvram-plus-mame-save-items-plus-presented-framebuffer",
-        "deterministic_replay": true,
+        "deterministic_replay": false,
+        "deterministic_replay_precondition": "mounted media topology and bytes must match the state-producing run",
+        "external_media_binding": "caller_managed_current_mounts",
+        "load_preserves_current_mounts": true,
         "hidden_device_state": true,
         "save_manager_items": true,
         "save_manager_restore": "best_effort_lua_item_write",

@@ -308,7 +308,10 @@ exposed through Lua, and the last raster image actually presented by MAME;
 legacy bundles remain readable.
 Loading restores save-manager items first, writes the memory regions back, and
 finishes MAME's post-load callbacks before restoring the saved presented raster,
-then restores registers through the Lua bridge's `regload` command.  Restoring
+then restores registers through the Lua bridge's `regload` command.  Before
+reporting success it rediscovers MAME input fields, reapplies any persistent
+input hold to the new field handles, and verifies a frozen backend round trip.
+Restoring
 the raster does not run a frame or otherwise advance guest time, so an immediate
 `screenshot` observes the image saved at that boundary instead of a stale or
 newly cleared render buffer.  Older bundles without a captured raster still load,
@@ -317,11 +320,15 @@ for memory-surface inspection and includes the registered MAME device items.
 After `regload`, the Lua plugin keeps servicing the GDB socket while the
 debugger is stopped, so MCP `read_memory` and `get_state` observe the restored
 instruction slot before it executes.  This is deterministic replay at the MCP
-surface, but it is still not a native C++ MAME machine-state load.
+surface only when the caller keeps the mounted media topology and bytes
+unchanged; the bundle does not contain or identify those external media.  It is
+still not a native C++ MAME machine-state load.
 `load_state` returns `restore_strategy`, `post_restore_instruction_exact`,
-`visual_refresh` (including `frames_advanced=0`), and
+`control_health`, `media_boundary`, `visual_refresh` (including
+`frames_advanced=0`), and
 the observed post-load `observed_pc`/`observed_eip`/`observed_cs` fields.  The
-adapter reports `state_restore.deterministic_replay=true`,
+adapter reports `state_restore.deterministic_replay=false` with a
+`deterministic_replay_precondition`,
 `state_restore.hidden_device_state=true`, and
 `state_restore.post_restore_instruction_exact=true` from `hello`, `status`,
 `save_state`, and `load_state`, while also reporting

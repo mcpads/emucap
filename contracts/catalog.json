@@ -284,6 +284,16 @@
       "expression": "load.ok => one_snapshot(cpu_state,device_state) and generation = current_generation"
     },
     {
+      "id": "STATE.LOAD.SERVICEABLE.1",
+      "category": "postcondition",
+      "expression": "load.ok => frozen(after) and backend_round_trip_verified(after) and control_serviceable(after)"
+    },
+    {
+      "id": "STATE.LOAD.MEDIA.1",
+      "category": "postcondition",
+      "expression": "load.ok => snapshot_binds(external_media) or (declared_external_media_boundary and current_media_preserved and replay_precondition_reported)"
+    },
+    {
       "id": "PROBE.ATOMIC.1",
       "category": "invariant",
       "expression": "probe.ok => no_external_mutation_between(load,advance,read)"
@@ -742,7 +752,7 @@
       "methods": ["load_state"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": ["STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"]
+      "expectations": ["STATE.LOAD.COHERENT.1", "STATE.LOAD.SERVICEABLE.1", "STATE.LOAD.MEDIA.1", "TIME.RESPONSE.1", "TIME.COMPLETE.1"]
     },
     {
       "id": "state.probe",
