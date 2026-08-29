@@ -209,8 +209,11 @@ local function split_csv(str)
   return out
 end
 
+local packet_sequence = 0
+
 local function packet(socket, payload)
   socket:write("$" .. payload .. "#" .. chksum(payload))
+  packet_sequence = packet_sequence + 1
 end
 
 local function ack_packet(socket, payload)
@@ -237,6 +240,7 @@ function emucap_gdbstub.startplugin()
   local pointer_fields = {}
   local pointer_relative_available = false
   local active_input_fields = {}
+  local active_input_keys = {}
   local release_input_frame
   local frame_wait_target
   local frame_wait_stop
@@ -244,6 +248,7 @@ function emucap_gdbstub.startplugin()
   local frame_wait_probe
   local frame_wait_release_input = false
   local clear_inputs
+  local refresh_input_bindings
   local break_on_reset_enabled = false
   local pending_reset
   local pending_save
@@ -342,6 +347,84 @@ function emucap_gdbstub.startplugin()
     return true
   end
 
+  refresh_input_bindings = function(preserve_active)
+    local discovered_inputs = {}
+    local discovered_pointers = {}
+    for tag, port in pairs(manager.machine.ioport.ports) do
+      for _, field in pairs(port.fields) do
+        if is_neogeo_profile then
+          local key = neogeo_input_name(field)
+          if key and not discovered_inputs[key] then
+            discovered_inputs[key] = field
+          end
+        else
+          local pointer_button = pc98_pointer_buttons[trim(field.name):lower()]
+          if pointer_button then
+            discovered_inputs[pointer_button] = field
+          end
+          local normalized_tag = tostring(tag or ""):gsub("^:", "")
+          if normalized_tag == "MOUSE_X" then
+            discovered_pointers.x = field
+          elseif normalized_tag == "MOUSE_Y" then
+            discovered_pointers.y = field
+          end
+          if field.type_class == "keyboard" then
+            local names = { field.name, field.default_name }
+            for _, name in ipairs(names) do
+              local n = norm_key(name)
+              if n ~= "" and not discovered_inputs[n] then
+                discovered_inputs[n] = field
+              end
+              for part in tostring(name):gmatch("([^/]+)") do
+                local p = norm_key(part)
+                if p ~= "" and not discovered_inputs[p] then
+                  discovered_inputs[p] = field
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+
+    local relative_available = false
+    if discovered_pointers.x and discovered_pointers.y then
+      local x_ok, x_method = pcall(function() return discovered_pointers.x.add_relative_value end)
+      local y_ok, y_method = pcall(function() return discovered_pointers.y.add_relative_value end)
+      relative_available = x_ok and y_ok and x_method ~= nil and y_method ~= nil
+    end
+
+    input_fields = discovered_inputs
+    pointer_fields = discovered_pointers
+    pointer_relative_available = relative_available
+    active_input_fields = {}
+
+    local field_count = 0
+    for _, _ in pairs(input_fields) do
+      field_count = field_count + 1
+    end
+    if not preserve_active then
+      active_input_keys = {}
+      return true, field_count, 0
+    end
+
+    local hold_count = 0
+    for key, _ in pairs(active_input_keys) do
+      local field = input_fields[key]
+      if not field then
+        return false, "held input field disappeared after state load: " .. tostring(key)
+      end
+      local set_ok, set_error = pcall(function() field:set_value(1) end)
+      if not set_ok then
+        active_input_fields = {}
+        return false, "held input field could not be rebound: " .. tostring(key) .. ": " .. tostring(set_error)
+      end
+      active_input_fields[field] = true
+      hold_count = hold_count + 1
+    end
+    return true, field_count, hold_count
+  end
+
   reset_subscription = emu.add_machine_reset_notifier(function()
     debugger = manager.machine.debugger
     if not debugger then
@@ -398,10 +481,6 @@ function emucap_gdbstub.startplugin()
     elseif clear_inputs then
       clear_inputs()
     end
-    input_fields = {}
-    pointer_fields = {}
-    pointer_relative_available = false
-    active_input_fields = {}
     release_input_frame = nil
     if break_on_reset_enabled and socket and debugger and cpu then
       local map = regmaps[cpu.shortname]
@@ -411,46 +490,10 @@ function emucap_gdbstub.startplugin()
         pending_reset = makele(cpu.state[map.pcreg].value, map.addrsize) .. "|" .. regs_payload(map)
       end
     end
-    for tag, port in pairs(manager.machine.ioport.ports) do
-      for _, field in pairs(port.fields) do
-        if is_neogeo_profile then
-          local key = neogeo_input_name(field)
-          if key and not input_fields[key] then
-            input_fields[key] = field
-          end
-        else
-          local pointer_button = pc98_pointer_buttons[trim(field.name):lower()]
-          if pointer_button then
-            input_fields[pointer_button] = field
-          end
-          local normalized_tag = tostring(tag or ""):gsub("^:", "")
-          if normalized_tag == "MOUSE_X" then
-            pointer_fields.x = field
-          elseif normalized_tag == "MOUSE_Y" then
-            pointer_fields.y = field
-          end
-          if field.type_class == "keyboard" then
-            local names = { field.name, field.default_name }
-            for _, name in ipairs(names) do
-              local n = norm_key(name)
-              if n ~= "" and not input_fields[n] then
-                input_fields[n] = field
-              end
-              for part in tostring(name):gmatch("([^/]+)") do
-                local p = norm_key(part)
-                if p ~= "" and not input_fields[p] then
-                  input_fields[p] = field
-                end
-              end
-            end
-          end
-        end
-      end
-    end
-    if pointer_fields.x and pointer_fields.y then
-      local x_ok, x_method = pcall(function() return pointer_fields.x.add_relative_value end)
-      local y_ok, y_method = pcall(function() return pointer_fields.y.add_relative_value end)
-      pointer_relative_available = x_ok and y_ok and x_method ~= nil and y_method ~= nil
+    local input_call_ok, input_ok, input_error = pcall(refresh_input_bindings, false)
+    if not input_call_ok or not input_ok then
+      print("emucap_gdbstub: input discovery after reset failed "
+        .. tostring(input_call_ok and input_error or input_ok))
     end
     -- A synchronous reset completes at this notifier, not when soft_reset merely
     -- accepts the request.
@@ -479,8 +522,13 @@ function emucap_gdbstub.startplugin()
   print("emucap_gdbstub: listening on 127.0.0.1:" .. port)
 
   local handle
+  local handle_payload_safely
   local service_frozen_socket
   local in_frozen_socket_service = false
+  -- Validation-only fault injection. It is neither advertised nor reachable unless the
+  -- process owner explicitly enables it before launch.
+  local injected_failure_request = trim(os.getenv("EMUCAP_GDBSTUB_TEST_FAIL_REQUEST_ONCE") or ""):lower()
+  local injected_failure_consumed = false
 
   local function finish_state_operation(payload)
     pending_save = nil
@@ -829,7 +877,8 @@ function emucap_gdbstub.startplugin()
       -- 소켓 read/handle 에러(bridge 끊김)가 스핀 밖으로 전파하면 아래 emu.unpause·가드 리셋을
       -- 우회해 머신을 영구 stuck-paused + in_frozen_socket_service를 래치시킨다(재접속해도 복구 불가). pcall로 감싸 에러 시 루프를 탈출해 cleanup이 항상 돌게 한다.
       local handled = false
-      local iter_ok = pcall(function()
+      local handler_transport_failed = false
+      local iter_ok, iter_error = pcall(function()
         read_socket()
         while true do
           local payload = next_packet()
@@ -837,13 +886,19 @@ function emucap_gdbstub.startplugin()
             break
           end
           handled = true
-          handle(payload)
+          if not handle_payload_safely(payload) then
+            handler_transport_failed = true
+            break
+          end
           if running or frame_wait_target or not debugger or not manager.machine.paused then
             break
           end
         end
       end)
-      if not iter_ok or running or frame_wait_target or not debugger or not manager.machine.paused then
+      if not iter_ok then
+        print("emucap_gdbstub: frozen socket service failed " .. tostring(iter_error))
+      end
+      if not iter_ok or handler_transport_failed or running or frame_wait_target or not debugger or not manager.machine.paused then
         break
       end
       if not handled then
@@ -981,24 +1036,50 @@ function emucap_gdbstub.startplugin()
   end)
 
   clear_inputs = function()
+    local first_error
     for field, _ in pairs(active_input_fields) do
-      field:clear_value()
+      local ok, err = pcall(function() field:clear_value() end)
+      if not ok and not first_error then
+        first_error = err
+      end
     end
     active_input_fields = {}
+    active_input_keys = {}
     release_input_frame = nil
+    if first_error then
+      return false, first_error
+    end
+    return true
   end
 
   local function set_inputs(keys)
-    clear_inputs()
+    local resolved = {}
     for _, key in ipairs(keys) do
-      local field = input_fields[norm_key(key)]
+      local normalized = norm_key(key)
+      local field = input_fields[normalized]
       if not field then
         -- 미해결 키를 호출자에 돌려줘 브리지가 어느 버튼이 없는지 이름을 붙일 수 있게 한다.
-        clear_inputs()
-        return false, norm_key(key)
+        return false, normalized, nil
       end
-      field:set_value(1)
+      resolved[#resolved + 1] = { key = normalized, field = field }
+    end
+    local cleared, clear_error = clear_inputs()
+    if not cleared then
+      return false, nil, "previous input fields could not be released: " .. tostring(clear_error)
+    end
+    for _, binding in ipairs(resolved) do
+      local field = binding.field
+      local set_ok, set_error = pcall(function() field:set_value(1) end)
+      if not set_ok then
+        for active, _ in pairs(active_input_fields) do
+          pcall(function() active:clear_value() end)
+        end
+        active_input_fields = {}
+        active_input_keys = {}
+        return false, nil, "input field could not be engaged: " .. tostring(binding.key) .. ": " .. tostring(set_error)
+      end
       active_input_fields[field] = true
+      active_input_keys[binding.key] = true
     end
     return true
   end
@@ -1554,6 +1635,21 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E17")
       end
       return true
+    elseif name == "postloadhealth" then
+      local ok, fields_or_error, holds = pcall(function()
+        local rebound, fields_or_reason, reapplied = refresh_input_bindings(true)
+        if not rebound then
+          error(fields_or_reason)
+        end
+        return fields_or_reason, reapplied
+      end)
+      if ok then
+        ack_packet(socket, "READY|" .. tostring(fields_or_error) .. "|" .. tostring(holds or 0))
+      else
+        print("emucap_gdbstub: post-load control health failed " .. tostring(fields_or_error))
+        ack_packet(socket, "E1B")
+      end
+      return true
     elseif name == "loadpixels" then
       local path = hex_to_string(rest or "")
       if not path or path == "" then
@@ -1629,9 +1725,12 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E00")
         return true
       end
-      local ok, unresolved = set_inputs(split_csv(buttons))
+      local ok, unresolved, input_error = set_inputs(split_csv(buttons))
       if ok then
         ack_packet(socket, "OK")
+      elseif input_error then
+        print("emucap_gdbstub: setinput failed " .. tostring(input_error))
+        ack_packet(socket, "E1B")
       else
         ack_packet(socket, "E08:" .. tostring(unresolved or ""))
       end
@@ -1648,7 +1747,7 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E00")
         return true
       end
-      local ok, unresolved = set_inputs(split_csv(buttons))
+      local ok, unresolved, input_error = set_inputs(split_csv(buttons))
       if ok then
         release_input_frame = current_frame() + frames
         if start_frame_wait(frames, false, true) then
@@ -1657,6 +1756,9 @@ function emucap_gdbstub.startplugin()
           clear_inputs()
           ack_packet(socket, "E09")
         end
+      elseif input_error then
+        print("emucap_gdbstub: press input failed " .. tostring(input_error))
+        ack_packet(socket, "E1B")
       else
         ack_packet(socket, "E08:" .. tostring(unresolved or ""))
       end
@@ -2020,6 +2122,56 @@ function emucap_gdbstub.startplugin()
     end
   end
 
+  local function request_operation(payload)
+    if payload == "\x03" then
+      return "pause"
+    end
+    local name = payload:match("^qEmucap,([^,]+)")
+    if name then
+      return name:lower()
+    end
+    return payload:sub(1, 1)
+  end
+
+  handle_payload_safely = function(payload)
+    local operation = request_operation(payload)
+    local response_before = packet_sequence
+    local ok, handler_error = pcall(function()
+      if injected_failure_request ~= ""
+          and not injected_failure_consumed
+          and operation == injected_failure_request then
+        injected_failure_consumed = true
+        error("validation-only injected request failure")
+      end
+      handle(payload)
+    end)
+    if ok then
+      return true
+    end
+
+    print("emucap_gdbstub: request handler failed operation=" .. tostring(operation)
+      .. " error=" .. tostring(handler_error))
+    running = false
+    hold_requested = true
+    pcall(clear_frame_wait)
+    if debugger then
+      debugger.execution_state = "stop"
+    end
+
+    -- Do not emit a second terminal packet if the handler failed after responding. If no
+    -- response was written, convert the exception into an explicit request-local failure so
+    -- the Rust bridge does not wait until its socket timeout and poison the backend stream.
+    if packet_sequence == response_before then
+      local response_ok, response_error = pcall(function() ack_packet(socket, "E1B") end)
+      if not response_ok then
+        print("emucap_gdbstub: request error response failed operation=" .. tostring(operation)
+          .. " error=" .. tostring(response_error))
+        return false
+      end
+    end
+    return true
+  end
+
   emu.register_periodic(function()
     if not cpu or not debugger then
       return
@@ -2044,7 +2196,9 @@ function emucap_gdbstub.startplugin()
       if not payload then
         break
       end
-      handle(payload)
+      if not handle_payload_safely(payload) then
+        return
+      end
     end
   end)
 end

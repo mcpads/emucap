@@ -228,12 +228,17 @@ struct StateLoadGdb {
     load_items_dirs: Vec<PathBuf>,
     loaded_framebuffers: Vec<PathBuf>,
     completed_state_loads: usize,
+    postload_health_checks: usize,
+    postload_health_reply: String,
+    media_status_replies: VecDeque<String>,
 }
 
 impl StateLoadGdb {
     fn new(regs_hex: String) -> Self {
         Self {
             regs_hex,
+            postload_health_reply: "READY|73|0".into(),
+            media_status_replies: VecDeque::from(["MEDIA:".into(), "MEDIA:".into()]),
             ..Default::default()
         }
     }
@@ -246,6 +251,12 @@ impl GdbTransport for StateLoadGdb {
         }
         if payload == "qEmucap,stop" {
             return Ok("OK".into());
+        }
+        if payload == "qEmucap,mediastatus" {
+            return Ok(self
+                .media_status_replies
+                .pop_front()
+                .unwrap_or_else(|| "MEDIA:".into()));
         }
         if let Some(hex_path) = payload.strip_prefix("qEmucap,loaditems,") {
             let bytes = hex::decode(hex_path)
@@ -263,6 +274,13 @@ impl GdbTransport for StateLoadGdb {
         if payload == "qEmucap,finishload" {
             self.completed_state_loads += 1;
             return Ok("OK".into());
+        }
+        if payload == "qEmucap,postloadhealth" {
+            self.postload_health_checks += 1;
+            return Ok(self.postload_health_reply.clone());
+        }
+        if payload == "qEmucap,inputstatus" {
+            return Ok("0".into());
         }
         if let Some(hex_path) = payload.strip_prefix("qEmucap,loadpixels,") {
             let bytes = hex::decode(hex_path)
@@ -1754,6 +1772,70 @@ fn load_state_restores_save_items_memory_and_registers() {
     assert_eq!(bridge.gdb.load_items_dirs.len(), 1);
     assert_eq!(bridge.gdb.loaded_framebuffers.len(), 1);
     assert_eq!(bridge.gdb.completed_state_loads, 1);
+    assert_eq!(bridge.gdb.postload_health_checks, 1);
+    assert_eq!(result["control_health"]["status"], "ready");
+    assert_eq!(result["control_health"]["input_fields_rebound"], 73);
+    assert_eq!(result["control_health"]["input_holds_reapplied"], 0);
+    assert_eq!(result["media_boundary"]["current_mounts_preserved"], true);
+    assert_eq!(result["media_boundary"]["snapshot_binds_media"], false);
+}
+
+#[test]
+fn load_state_does_not_report_success_when_postload_control_is_unhealthy() {
+    // A backend-local error after state callbacks must close load_state explicitly without
+    // poisoning the connection. Otherwise the next input request sees a transport timeout and
+    // turns one adapter exception into a lost control session.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state.zip");
+    let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
+    write_test_state(&state, &regs);
+    let mut gdb = StateLoadGdb::new(regs);
+    gdb.postload_health_reply = "E1B".into();
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
+
+    let response = bridge.handle_request(Request::new(
+        251,
+        "load_state",
+        json!({"path": state.display().to_string()}),
+    ));
+    let error = response.error.expect("load_state must fail explicitly");
+    assert_eq!(error.kind, "emulator_error");
+    assert!(error.message.contains("postloadhealth"), "{error:?}");
+    assert!(!bridge.backend_terminal());
+    assert_eq!(bridge.lua_cmd_reply("inputstatus", None).unwrap(), "0");
+}
+
+#[test]
+fn load_state_rejects_an_implicit_mounted_media_change() {
+    // External media is outside the PC-98 bundle. Loading may preserve the caller's current
+    // mounts, but an emulator-side topology change must never be reported as that policy.
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state.zip");
+    let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
+    write_test_state(&state, &regs);
+    let media = |path: &str| {
+        format!(
+            "MEDIA:{}|{}|0|0|1|0|{}",
+            hex::encode("flop1"),
+            hex::encode("floppydisk"),
+            hex::encode(path)
+        )
+    };
+    let mut gdb = StateLoadGdb::new(regs);
+    gdb.media_status_replies = VecDeque::from([media("/tmp/a.hdm"), media("/tmp/b.hdm")]);
+    let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
+
+    let response = bridge.handle_request(Request::new(
+        252,
+        "load_state",
+        json!({"path": state.display().to_string()}),
+    ));
+    let error = response
+        .error
+        .expect("implicit mounted-media change must fail");
+    assert_eq!(error.kind, "emulator_error");
+    assert!(error.message.contains("changed mounted media"), "{error:?}");
+    assert!(!bridge.backend_terminal());
 }
 
 #[test]

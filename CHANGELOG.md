@@ -4,6 +4,15 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.15.1
+
+### Fixed
+- PC-98 MAME state restore now refreshes discovered input fields, reapplies persistent holds, and
+  keeps request-local adapter failures from tearing down the bridge connection. A frozen
+  `change_media` → `load_state` → input or status sequence therefore remains serviceable.
+- PC-98 state-load responses now disclose that mounted media is external to the state bundle and
+  no longer claim deterministic replay unless the caller provides and verifies the media identity.
+
 ## 0.15.0
 
 ### Added

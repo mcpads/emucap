@@ -379,6 +379,45 @@ impl<G: GdbTransport> Bridge<G> {
         }))
     }
 
+    pub(super) fn post_load_control_health(&mut self) -> BridgeResult<Value> {
+        let frame_before = self.current_frame();
+        let response = self.lua_data_cmd_reply("postloadhealth", None)?;
+        let fields = response.split('|').collect::<Vec<_>>();
+        if fields.len() != 3 || fields[0] != "READY" {
+            return Err(BridgeError::Emulator(format!(
+                "invalid MAME post-load control health response: {response}"
+            )));
+        }
+        let input_fields_rebound = fields[1].parse::<u64>().map_err(|_| {
+            BridgeError::Emulator(format!(
+                "invalid input field count in MAME post-load control health response: {response}"
+            ))
+        })?;
+        let input_holds_reapplied = fields[2].parse::<u64>().map_err(|_| {
+            BridgeError::Emulator(format!(
+                "invalid input hold count in MAME post-load control health response: {response}"
+            ))
+        })?;
+        let frame_after = self.current_frame();
+        if let (Some(before), Some(after)) = (frame_before, frame_after) {
+            if before != after {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME post-load control health check advanced from frame {before} to {after}"
+                )));
+            }
+        }
+        Ok(json!({
+            "status": "ready",
+            "state": "frozen",
+            "backend_round_trip_verified": true,
+            "input_fields_rebound": input_fields_rebound,
+            "input_holds_reapplied": input_holds_reapplied,
+            "frames_advanced": 0,
+            "frame_before": frame_before,
+            "frame_after": frame_after,
+        }))
+    }
+
     pub(super) fn write_region_bytes(
         &mut self,
         memory_type: &str,

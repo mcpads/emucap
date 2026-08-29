@@ -345,6 +345,7 @@ impl<G: GdbTransport> Bridge<G> {
         self.stop_for_state_restore()?;
         let load_items_dir = unique_temp_dir("emucap_pc98_loaditems_")?;
         let result = (|| {
+            let media_before = self.media_status()?.mounted;
             let file = File::open(&path)?;
             let mut archive = ZipArchive::new(file)?;
             let manifest = read_state_manifest(&mut archive)?;
@@ -380,6 +381,13 @@ impl<G: GdbTransport> Bridge<G> {
             if !regs_hex.is_empty() {
                 restore_result = self.restore_regs_after_state_load(&regs_hex)?;
             }
+            let control_health = self.post_load_control_health()?;
+            let media_after = self.media_status()?.mounted;
+            if media_after != media_before {
+                return Err(BridgeError::Emulator(format!(
+                    "MAME state load changed mounted media outside the state bundle: before={media_before}, after={media_after}"
+                )));
+            }
             self.frozen = true;
             let mut out = serde_json::Map::new();
             out.insert("path".into(), json!(path.display().to_string()));
@@ -387,6 +395,16 @@ impl<G: GdbTransport> Bridge<G> {
             out.insert("regions".into(), json!(regions.len()));
             out.insert("state_restore".into(), state_restore_info());
             out.insert("postload".into(), postload);
+            out.insert("control_health".into(), control_health);
+            out.insert(
+                "media_boundary".into(),
+                json!({
+                    "snapshot_binds_media": false,
+                    "current_mounts_preserved": true,
+                    "mounted_media": media_after,
+                    "deterministic_replay_precondition": "mounted media topology and bytes must match the state-producing run",
+                }),
+            );
             out.insert("visual_refresh".into(), visual_refresh);
             out.extend(save_items_result);
             out.extend(restore_result);
