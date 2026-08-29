@@ -10,12 +10,13 @@ GBA · NES), a Mednafen fork
 (Saturn · PlayStation · PC Engine · PC-FX · Mega Drive/Genesis · WonderSwan/WSC ·
 Neo Geo Pocket/Color), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
-(PlayStation 2), a Dolphin fork (GameCube · Wii), MAME (PC-98 and experimental Neo Geo
+(PlayStation 2), a Dolphin fork (GameCube · Wii), MAME plus an optional direct
+NP2kai compatibility backend (PC-98), MAME (experimental Neo Geo
 MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.14.6 — beta.** This repository remains under active development; interfaces and
+**v0.15.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -68,7 +69,7 @@ cargo build --release \
   --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
   --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
   --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
-  --bin emucap-openmsx-bridge
+  --bin emucap-openmsx-bridge --bin emucap-np2kai
 ```
 
 Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
@@ -80,7 +81,8 @@ Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap-desmume-nds-bridge` (NDS launch helper),
 `emucap-ppsspp-bridge` (PSP launch helper),
 `emucap-pcsx2-bridge` (PS2 launch helper), and
-`emucap-openmsx-bridge` (stock openMSX XML-control helper). All dependencies come from
+`emucap-openmsx-bridge` (stock openMSX XML-control helper), and
+`emucap-np2kai` (direct PC-98 compatibility frontend). All dependencies come from
 crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
 required** for a source build. The first build is slower while dependencies
 download; later builds are fast.
@@ -208,9 +210,13 @@ post-launch guest time, not power-on RAM, RTC, saves, or other initial condition
 `execution_profile: "repeatable"` is the separate opt-in for those producer-owned conditions, and
 `record_window(require_repeatable: true)` fails before reset, input, or guest advance unless the
 selected recording origin is eligible.
-For Mesen, refreshing the isolated runtime preserves the ordinary profile's battery saves and other
-portable data. The repeatable profile uses a separate disposable portable root, so obtaining fresh
-initial conditions never deletes the ordinary profile's data or the user's standard Mesen files.
+For Mesen SNES, refreshing the isolated runtime preserves the ordinary profile's battery saves and
+other portable data. Its repeatable profile uses a separate disposable portable root, so obtaining
+fresh initial conditions never deletes the ordinary profile's data or the user's standard Mesen
+files. Mednafen Mega Drive provides the same opt-in negotiation with a separate disposable home. It
+captures a bounded guest state before the first instruction and restores it before each eligible
+`reset_release` recording, so earlier execution or debugger writes in that process do not become
+undeclared recording inputs. Ordinary Mednafen profiles and saves are not changed.
 
 `listener.base_port` is only where direct-mode port search begins. It may already
 belong to another live MCP session. Launchers use the assigned `listener.port`
@@ -230,6 +236,17 @@ frame count; it returns with the emulator frozen plus a validated bundle path an
 manifest hash. The live capability is the authority for event classes and limits.
 Optional origin, input movie, and event-stop arguments are valid only when that exact capability
 advertises them; omitting them retains the bounded next-frame behavior.
+When `recording_capability.state_load` is advertised, `save_state` with
+`preserve_for_recording=true` and an absolute path also carries a producer-managed
+`snapshot_receipt`. A later `record_window(origin="state_load")` accepts only that
+receipt's opaque `snapshot_id`, not a caller path, digest, or boundary assertion. Only a receipt
+created at a proven frame boundary is eligible. Core reopens the managed bytes, revalidates their
+runtime generation and hash, copies them into the bundle, and dispatches one load-and-window
+transaction. The adapter restores that exact frame coordinate, owns the dense input movie, hooks,
+and sink before releasing guest execution, and returns frozen. An instruction-boundary receipt
+still describes a successful save but is deliberately ineligible for a frame window. Omitting
+`preserve_for_recording` leaves ordinary save behavior unchanged when omitted or false, and omitting
+`state_load` leaves ordinary load and recording behavior unchanged.
 High-rate event classes may additionally advertise filterable integer payload fields. Optional
 per-class half-open ranges narrow only the declared observation scope; excluded callbacks are not
 reported as drops, while matching events retain the ordinary sequence, limit, and integrity rules.
@@ -330,6 +347,20 @@ debugger halt to service requests without advancing the guest.
   (slow, uses a lot of disk). The pinned build provides keyboard input plus
   relative pointer movement, frozen click, and drag operations without taking
   persistent ownership from a visible native mouse. → `adapters/mame-pc98/README.md`
+- **NP2kai (optional PC-98 HDI compatibility backend)** — run
+  `adapters/np2kai/build.sh`, build `emucap-np2kai`, and provide legally obtained
+  firmware through `EMUCAP_NP2KAI_FIRMWARE`. Select it explicitly with
+  `pc98_backend: "np2kai"`; omission keeps MAME. Its patched core and direct
+  host expose the complete MAME PC-98 Control/Debug method set: bounded memory
+  access and dumps, breakpoints and events, register state, instruction stepping,
+  disassembly, trace and best-effort call stacks, exact frames, input, screenshots,
+  native states, and verified `hdd0` replacement. Device semantics still differ:
+  NP2kai is headless, has no host-audio launch path, cannot eject `hdd0`, limits
+  disassembly to the current CPU mode, and captures breakpoint memory snapshots
+  only at pausing hits. This backend accepts `.hdi` only; read breakpoints do not
+  claim an authoritative access value, while write breakpoints support value
+  filters.
+  → `adapters/np2kai/README.md`
 - **MAME (Neo Geo MVS/AES/CD, experimental)** — build the dedicated pinned MAME subset with
   `adapters/mame-neogeo/build.sh`, then build `emucap-mame-neogeo-bridge`. Launch
   requires an explicit system ID. MVS uses a user-supplied `neogeo.zip` plus a matching
@@ -348,7 +379,7 @@ debugger halt to service requests without advancing the guest.
   RDRAM access. Both modes expose port-0 input holds with explicit native-ownership release.
   Both modes also expose synchronous reset, R4300 exec/read/write breakpoints with hit-time
   evidence, event polling, and disassembly. Visible launch additionally exposes exact
-  exact rendered-frame advance, bounded input pulses, current PNG capture, and
+  rendered-frame advance, bounded input pulses, current PNG capture, and
   completion-checked native save/load. Headless launch remains instruction-only and omits those
   rendered-frame operations. RSP state remains outside this profile.
   → `adapters/mupen64plus/README.md`

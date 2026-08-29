@@ -63,7 +63,7 @@ DeSmuME. Socket sends suppress `SIGPIPE`, so a peer reset also closes only the f
 
 ## memory_types
 
-`status.memory_types` is authoritative. v1:
+`status.memory_types` is authoritative. The current profile exposes:
 
 | memory_type | routed CPU | meaning |
 |---|---|---|

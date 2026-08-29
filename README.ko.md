@@ -6,12 +6,12 @@
 에이전트가 읽고 제어해, 사람이 설명한 문제를 분석하도록 돕는다. 공통 Core + 어댑터로 여러
 에뮬레이터를 지원한다 — Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·
 PlayStation·PC Engine·PC-FX·Mega Drive/Genesis·WonderSwan/WSC·Neo Geo Pocket/Color), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
-PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME
-(PC-98·실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
+PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME과 선택형
+NP2kai 호환 backend(PC-98), MAME(실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.14.6 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.15.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -56,7 +56,7 @@ cargo build --release \
   --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
   --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
   --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
-  --bin emucap-openmsx-bridge
+  --bin emucap-openmsx-bridge --bin emucap-np2kai
 ```
 
 산출물: `target/release/emucap-mcp`(**제어 MCP** — 에뮬레이터 조작), `emucap-track-mcp`(**추적
@@ -64,7 +64,7 @@ MCP** — 실험 원장, emulator-less), `emucap`(케이스 번들 CLI), `emucap
 `emucap-mame-pc98-bridge`(PC-98 launch helper), `emucap-mame-neogeo-bridge`(Neo Geo MVS/AES/CD launch helper),
 `emucap-mupen64plus`(N64 frontend·adapter), `emucap-desmume-nds-bridge`(NDS launch helper),
 `emucap-ppsspp-bridge`(PSP launch helper), `emucap-pcsx2-bridge`(PS2 launch helper),
-`emucap-openmsx-bridge`(stock openMSX XML-control helper).
+`emucap-openmsx-bridge`(stock openMSX XML-control helper), `emucap-np2kai`(PC-98 호환 frontend).
 Source build의 의존성은 전부 crates.io이고
 SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필요 없다**(깨끗한 체크아웃에서 그대로
 빌드된다). 첫 빌드는 의존성을 내려받느라 더 걸리고, 이후는 빠르다.
@@ -171,9 +171,12 @@ RTC, save 같은 초기 조건의 동일성을 뜻하지 않는다. 그러한 pr
 광고하는 `execution_profile: "repeatable"`을 별도로 선택하며,
 `record_window(require_repeatable: true)`는 선택한 recording origin이 해당 조건을 지원하지 않으면 reset,
 input, guest advance 전에 거부한다.
-Mesen의 격리 runtime을 갱신할 때는 일반 profile의 battery save와 portable data를 보존한다. Repeatable
-profile은 별도의 폐기 가능한 portable root를 사용하므로, 깨끗한 초기 조건을 만들기 위해 일반 profile이나
-사용자의 표준 Mesen 저장을 삭제하지 않는다.
+Mesen SNES의 격리 runtime을 갱신할 때는 일반 profile의 battery save와 portable data를 보존한다.
+Repeatable profile은 별도의 폐기 가능한 portable root를 사용하므로, 깨끗한 초기 조건을 만들기 위해
+일반 profile이나 사용자의 표준 Mesen 저장을 삭제하지 않는다. Mednafen Mega Drive도 별도의 폐기 가능한
+home과 같은 opt-in 협상 방식을 사용한다. 첫 guest 명령 전에 제한된 상태를 캡처하고, 허용된 각
+`reset_release` 기록 전에 복원하므로 같은 프로세스에서 앞서 수행한 실행이나 debugger 쓰기가 선언되지
+않은 기록 입력으로 섞이지 않는다. 일반 Mednafen profile과 저장 파일은 바뀌지 않는다.
 
 `listener.base_port`는 direct mode에서 빈 포트를 찾기 시작하는 값일 뿐이며 다른 살아 있는 MCP 세션이
 이미 사용 중일 수 있다. Launcher는 실제로 할당된 `listener.port` 또는 full `status`의
@@ -190,6 +193,15 @@ time에 섞지 않고 유한한 guest-frame 구간을 소유할 수 있다. 현�
 반환한다. event class와 limit의 권위는 live capability다. 지원하지 않는 adapter는 hook을 설치하거나
 guest를 진행하지 않고 거부한다. 선택적 origin·입력 무비·event stop도 그 exact capability가 광고할
 때만 쓸 수 있으며, 생략하면 기존 next-frame bounded 동작을 유지한다.
+`recording_capability.state_load`가 광고될 때 절대 경로와 `preserve_for_recording=true`를 준 frozen
+`save_state` 응답은 producer가 관리하는 `snapshot_receipt`도 반환한다. 이후
+`record_window(origin="state_load")`는 caller가 적은 path·digest·경계
+주장이 아니라 그 receipt의 불투명한 `snapshot_id`만 받는다. 증명된 frame boundary에서 만든 receipt만
+허용된다. Core는 관리 중인 byte와 runtime generation·hash를 다시 검증해 bundle에 복사하고, adapter에
+load와 window를 한 transaction으로 보낸다. Adapter는 정확한 frame 좌표를 복원하고 dense input movie,
+hook, sink를 모두 소유한 뒤에만 guest 실행을 풀며, 끝에는 다시 frozen을 반환한다. Instruction boundary
+receipt는 성공한 save 사실은 나타내지만 frame window에는 쓸 수 없다. `preserve_for_recording`을 생략하거나
+false로 두면 기존 save 동작은 바뀌지 않고, `state_load`를 사용하지 않는 load·recording 동작도 바뀌지 않는다.
 발생률이 높은 event class는 정수 payload field별 filter capability를 추가로 광고할 수 있다. 선택적
 class별 half-open range는 선언한 관측 범위만 좁히며, 제외된 callback은 drop으로 세지 않는다. 범위
 안의 event는 기존 sequence·limit·integrity 규칙을 그대로 따르고, 광고되지 않은 field와 잘못된
@@ -271,6 +283,18 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   걸리고 디스크를 많이 쓴다). 고정된 빌드는 키보드 입력과 상대 포인터 이동, frozen 클릭·드래그를
   제공하며 창에 연결된 네이티브 마우스 입력권을 지속적으로 차지하지 않는다.
   → `adapters/mame-pc98/README.md`
+- **NP2kai PC-98 HDI 호환 backend(선택형)** — `adapters/np2kai/build.sh`를 실행하고
+  `emucap-np2kai`를 빌드한 뒤 합법적으로 준비한 firmware 경로를
+  `EMUCAP_NP2KAI_FIRMWARE`로 지정한다. `pc98_backend: "np2kai"`를 명시해야 선택되며,
+  생략하면 계속 MAME을 사용한다. 패치된 core와 direct host는 MAME PC-98과 같은 Control/Debug
+  method 전체를 제공한다. 제한된 memory 접근·dump, breakpoint·event, register state,
+  instruction step, disassemble, trace·best-effort call stack, 정확한 frame, 입력, screenshot,
+  native state, 검증된 `hdd0` 교체가 포함된다. 단, 기기 의미는 동일하다고 가장하지 않는다.
+  NP2kai는 headless이며 host audio launch와 `hdd0` eject가 없고, disassemble은 현재 CPU mode로
+  제한되며 breakpoint memory snapshot은 일시정지되는 hit에서만 캡처한다. 이 backend는 `.hdi`만
+  받는다. read breakpoint는 권위 있는 접근 값을 제공하지 않으며, write breakpoint만 값 필터를
+  지원한다.
+  → `adapters/np2kai/README.md`
 - **MAME Neo Geo MVS/AES/CD (실험적)** — `adapters/mame-neogeo/build.sh`로 전용 고정 MAME subset을
   빌드하고 `emucap-mame-neogeo-bridge`를 빌드한다. MVS는 사용자가 준비한 `neogeo.zip` BIOS와
   해당 MAME 버전에 맞는 게임 ROM set을 사용한다. AES는 `aes.zip`과 ZIP stem이 고정된 MAME

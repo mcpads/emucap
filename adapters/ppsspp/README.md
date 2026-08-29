@@ -176,7 +176,7 @@ shares it. Keeping the debugger WebSocket answering read-only commands (`cpu.get
 
 ## memory_types
 
-`status.memory_types` is authoritative. v1:
+`status.memory_types` is authoritative. The current profile exposes:
 
 | memory_type | meaning |
 |---|---|
@@ -195,7 +195,7 @@ reads.
 button names. **Confirm/cancel is game-defined**: Japanese titles typically confirm with circle (`b`)
 and cancel with cross (`a`), the opposite of the common Western layout — so a menu may look
 unresponsive to `a` while `b` advances it. PPSSPP also has `home`/`screen`/`note`/`hold`/`wlan`/... and
-an analog stick, but those are outside the emucap common button surface for v1 (no uniform
+an analog stick, but those are outside the current emucap common button surface (no uniform
 analog-input tool yet).
 
 ## Tool availability — Tier 1 / Tier 2 / not yet supported
