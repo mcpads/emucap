@@ -4,7 +4,7 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
-## 0.16.0-alpha.1
+## 0.16.0
 
 ### Added
 - Added a managed original Xbox path based on a pinned xemu fork. It provides isolated machine
