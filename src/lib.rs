@@ -28,9 +28,11 @@ pub mod path_safety;
 pub mod pc98_bridge;
 pub mod pcsx2_bridge;
 pub mod ppsspp_bridge;
+pub mod qmp;
 pub mod rom;
 pub mod toc;
 pub mod track;
+pub mod xemu_bridge;
 
 #[cfg(test)]
 pub(crate) mod test_env;

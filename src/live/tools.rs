@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
@@ -266,7 +267,22 @@ pub fn set_input(
     port: u64,
     buttons: &[String],
 ) -> Result<ToolOutput, LinkError> {
-    let params = json!({ "port": port, "buttons": buttons });
+    set_controller_state(link, port, buttons, &BTreeMap::new())
+}
+
+pub fn set_controller_state(
+    link: &mut dyn EmulatorLink,
+    port: u64,
+    buttons: &[String],
+    axes: &BTreeMap<String, i64>,
+) -> Result<ToolOutput, LinkError> {
+    let mut params = json!({ "port": port, "buttons": buttons });
+    if !axes.is_empty() {
+        params
+            .as_object_mut()
+            .expect("controller state params are an object")
+            .insert("axes".into(), json!(axes));
+    }
     Ok(ToolOutput::Json(link.call("set_input", params)?))
 }
 

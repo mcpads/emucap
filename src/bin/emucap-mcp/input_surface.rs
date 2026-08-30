@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use serde_json::{Map, Value};
@@ -99,13 +101,67 @@ fn add<T: schemars::JsonSchema>(
     }
 }
 
+fn validate_controller_axes(
+    status: &Value,
+    port: u64,
+    axes: &BTreeMap<String, i64>,
+) -> Result<(), String> {
+    if axes.is_empty() {
+        return Ok(());
+    }
+    let ports = status
+        .pointer("/input_axes/ports")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "controller axes are not advertised by the current runtime; omit axes or call input_control(operation=describe) again".to_string()
+        })?;
+    let matching_ports = ports
+        .iter()
+        .filter(|entry| entry.get("port").and_then(Value::as_u64) == Some(port))
+        .collect::<Vec<_>>();
+    if matching_ports.len() != 1 {
+        return Err(format!(
+            "controller axes are not advertised for port {port}; use an advertised port"
+        ));
+    }
+    let advertised = matching_ports[0]
+        .get("axes")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "the current runtime advertised malformed controller axes".to_string())?;
+    for (name, value) in axes {
+        let specification = advertised
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("controller axis {name} is not advertised for port {port}"))?;
+        let minimum = specification
+            .get("minimum")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("controller axis {name} has no valid minimum"))?;
+        let maximum = specification
+            .get("maximum")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("controller axis {name} has no valid maximum"))?;
+        if minimum > maximum {
+            return Err(format!(
+                "controller axis {name} advertises an invalid range {minimum}..{maximum}"
+            ));
+        }
+        if *value < minimum || *value > maximum {
+            return Err(format!(
+                "controller axis {name} value {value} is outside the advertised range {minimum}..{maximum}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn describe(status: &Value) -> Value {
     let mut operations = Map::new();
     add::<InputArgs>(
         &mut operations,
         status,
         "set_input",
-        "Hold a persistent button or key override; an empty button list releases native ownership.",
+        "Hold a persistent button, key, or advertised controller-axis state; empty buttons and axes release native ownership.",
     );
     add::<HoldTouchArgs>(
         &mut operations,
@@ -179,6 +235,7 @@ pub(crate) fn describe(status: &Value) -> Value {
         "available": available,
         "capability_revision": status.get("capability_revision"),
         "input_buttons": status.get("input_buttons"),
+        "input_axes": status.get("input_axes"),
         "operations": operations,
         "next_action": next_action
     })
@@ -217,10 +274,15 @@ pub(crate) async fn execute(server: &Emucap, arguments: RoutedOperationArgs) -> 
     }
     let operation = arguments.operation;
     match operation.as_str() {
-        "set_input" => match analysis_surface::parse_arguments(&operation, arguments.arguments) {
-            Ok(values) => server.set_input(Parameters(values)).await,
-            Err(error) => invalid_request_result(error),
-        },
+        "set_input" => {
+            match analysis_surface::parse_arguments::<InputArgs>(&operation, arguments.arguments) {
+                Ok(values) => match validate_controller_axes(&status, values.port, &values.axes) {
+                    Ok(()) => server.set_input(Parameters(values)).await,
+                    Err(error) => invalid_request_result(error),
+                },
+                Err(error) => invalid_request_result(error),
+            }
+        }
         "hold_touch" => match analysis_surface::parse_arguments::<HoldTouchArgs>(
             &operation,
             arguments.arguments,
@@ -329,3 +391,7 @@ pub(crate) async fn execute(server: &Emucap, arguments: RoutedOperationArgs) -> 
         )),
     }
 }
+
+#[cfg(test)]
+#[path = "input_surface_tests.rs"]
+mod tests;

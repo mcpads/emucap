@@ -177,7 +177,12 @@ pub(crate) fn make_launch(
         });
     }
     let repeatable = a.execution_profile == Some(LaunchExecutionProfileArgs::Repeatable);
-    if a.start_frozen && adapter != "mesen2" && adapter != "mednafen" && adapter != "np2kai" {
+    if a.start_frozen
+        && adapter != "mesen2"
+        && adapter != "mednafen"
+        && adapter != "np2kai"
+        && adapter != "xemu"
+    {
         return serde_json::json!({
             "launched": false,
             "reason": "start_frozen is not supported by the selected adapter",
@@ -408,6 +413,7 @@ pub(crate) fn make_launch(
         "ppsspp" => launch_ppsspp(port, direct_reclaim, runtime, a),
         "pcsx2" => launch_pcsx2(port, direct_reclaim, runtime, a),
         "dolphin" => launch_dolphin(port, direct_reclaim, runtime, system, a),
+        "xemu" => super::xemu::launch_xemu(port, direct_reclaim, runtime, a),
         _ => serde_json::json!({
             "launched": false,
             "reason": format!("system {system} is not supported by the Rust launcher"),
@@ -626,7 +632,7 @@ pub(super) fn adapter_ready_timeout(adapter: &str) -> std::time::Duration {
     // display wake can make that path exceed the generic bridge budget even though the process is
     // healthy. Both built-in and fallback paths use the same bounded 30-second budget; the
     // built-in path additionally polls authenticated adapter readiness and process liveness.
-    if adapter == "mesen2" {
+    if adapter == "mesen2" || adapter == "xemu" {
         std::time::Duration::from_secs(30)
     } else {
         std::time::Duration::from_secs(15)

@@ -206,7 +206,7 @@
     {
       "id": "INPUT.HOLD.RELEASE.1",
       "category": "postcondition",
-      "expression": "set_input(empty).ok => override_engaged(after) = false"
+      "expression": "set_input(buttons=empty, axes=empty).ok => override_engaged(after) = false"
     },
     {
       "id": "INPUT.PULSE.SAME_WINDOW.1",

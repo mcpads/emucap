@@ -1,0 +1,30 @@
+diff --git i/accel/tcg/watchpoint.c w/accel/tcg/watchpoint.c
+--- i/accel/tcg/watchpoint.c
++++ w/accel/tcg/watchpoint.c
+@@ -142,15 +142,22 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
+                 return;
+             }
+ 
+-            /* This call also restores vCPU state */
+-            tb_check_watchpoint(cpu, ra);
+             if (wp->flags & BP_STOP_BEFORE_ACCESS) {
++                /* This call also restores vCPU state. */
++                tb_check_watchpoint(cpu, ra);
+                 cpu->exception_index = EXCP_DEBUG;
+                 cpu_loop_exit(cpu);
+             } else {
+-                /* Force execution of one insn next time.  */
++                /*
++                 * Re-enter the current instruction in a one-insn TB so the
++                 * matched access completes before CPU_INTERRUPT_DEBUG is
++                 * serviced. Invalidating the TB that is currently executing
++                 * can attempt to reacquire its own jump lock under MTTCG.
++                 * cpu_loop_exit_restore recovers the architectural PC from
++                 * ra without mutating that TB.
++                 */
+                 cpu->cflags_next_tb = 1 | CF_NOIRQ | curr_cflags(cpu);
+-                cpu_loop_exit_noexc(cpu);
++                cpu_loop_exit_restore(cpu, ra);
+             }
+         } else {
+             wp->flags &= ~BP_WATCHPOINT_HIT;

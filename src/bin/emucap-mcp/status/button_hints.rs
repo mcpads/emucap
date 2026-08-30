@@ -77,6 +77,12 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "buttons": ["a", "b", "one", "two", "minus", "plus", "home", "up", "down", "left", "right"],
             "notes": "Emulated Wii Remote 1 core buttons only. IR, motion, Nunchuk, Classic Controller, and other extension inputs are not injectable."
         }),
+        "xbox" | "original-xbox" | "ogxbox" => serde_json::json!({
+            "system": "xbox",
+            "buttons": ["a", "b", "x", "y", "white", "black", "start", "back", "up", "down", "left", "right", "l", "r", "lstick", "rstick"],
+            "aliases": {"select": "back", "lt": "l", "rt": "r", "l3": "lstick", "r3": "rstick", "enter": "start", "return": "start"},
+            "notes": "Original Xbox controller port 0. l/r are full-trigger aliases; input_control(operation=describe) reports live analog-stick and partial-trigger axes when available."
+        }),
         "snes" | "sfc" => serde_json::json!({
             "system": "snes",
             "buttons": ["a", "b", "x", "y", "l", "r", "start", "select", "up", "down", "left", "right"],

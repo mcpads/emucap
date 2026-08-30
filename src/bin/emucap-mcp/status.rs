@@ -455,6 +455,11 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             },
             "dolphin": {
                 "build": abs_path_json(&root, &["adapters", "dolphin", if cfg!(windows) { "build.ps1" } else { "build.sh" }]),
+            },
+            "xemu": {
+                "build": abs_path_json(&root, &["adapters", "xemu", "build.sh"]),
+                "bridge_binary": abs_path_json(&root, &["target", "release", if cfg!(windows) { "emucap-xemu-bridge.exe" } else { "emucap-xemu-bridge" }]),
+                "firmware_env": "EMUCAP_XEMU_FIRMWARE",
             }
         }
     })
@@ -660,6 +665,14 @@ fn build_supported_systems_value() -> serde_json::Value {
             "adapter": "dolphin",
             "content": ["wbfs", "iso", "rvz", "wia", "gcz"],
             "notes": ".wbfs and the Wii disc magic are inferred automatically; shared container extensions require system=wii."
+        },
+        {
+            "system": "xbox",
+            "aliases": ["original-xbox", "ogxbox"],
+            "adapter": "xemu",
+            "content": ["xiso", "iso"],
+            "required_firmware": ["mcpx_1.0.bin", "Complex_4627.bin", "xbox_hdd.qcow2"],
+            "notes": ".xiso is inferred automatically. Shared .iso content requires system=xbox. Managed launch uses the pinned xemu fork and generation-isolated machine storage. Frozen save/load binds VM/HDD, EEPROM, exact current disc, host build, and controller topology and remains valid only within that launch generation. Loose XBE and later Xbox platforms are not accepted."
         }
     ])
 }
@@ -731,6 +744,7 @@ const CAPABILITY_FIELDS: &[&str] = &[
     "media_devices",
     "breakpoint_kinds",
     "input_buttons",
+    "input_axes",
     "contracts",
     "capability_notes",
     "execution_limits",

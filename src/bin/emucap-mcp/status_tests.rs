@@ -702,6 +702,30 @@ fn pc98_button_hint_keeps_digit_row_and_keypad_distinct() {
 }
 
 #[test]
+fn original_xbox_catalog_and_button_hint_match_callable_names() {
+    let systems = supported_systems_value();
+    let xbox = systems
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["system"] == "xbox")
+        .expect("original Xbox catalog entry");
+    assert_eq!(xbox["adapter"], "xemu");
+    assert_eq!(xbox["content"], serde_json::json!(["xiso", "iso"]));
+
+    let hint = button_hint_for_system(Some("xbox")).unwrap();
+    assert_eq!(hint["aliases"]["lt"], "l");
+    assert_eq!(hint["aliases"]["select"], "back");
+    for button in ["a", "white", "black", "l", "r", "lstick", "rstick"] {
+        assert!(hint["buttons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate == button));
+    }
+}
+
+#[test]
 fn mednafen_button_hints_expose_common_aliases() {
     let saturn = button_hint_for_system(Some("saturn")).unwrap();
     assert_eq!(saturn["aliases"]["enter"], "start");
@@ -1133,6 +1157,7 @@ fn matching_capability_revision_omits_only_the_capability_snapshot() {
         "memory_types": ["workram"],
         "breakpoint_kinds": [{"kind": "exec"}],
         "input_buttons": {"buttons": ["a"]},
+        "input_axes": {"ports":[{"port":0,"axes":{"left_x":{"minimum":-32768,"neutral":0,"maximum":32767}}}]},
         "contracts": {"state": "validated"},
         "capability_notes": ["test"],
         "execution_limits": {"frame": {"max_count": 60}}
@@ -1150,6 +1175,7 @@ fn matching_capability_revision_omits_only_the_capability_snapshot() {
         "memory_types": ["workram"],
         "breakpoint_kinds": [{"kind": "exec"}],
         "input_buttons": {"buttons": ["a"]},
+        "input_axes": {"ports":[{"port":0,"axes":{"left_x":{"minimum":-32768,"neutral":0,"maximum":32767}}}]},
         "contracts": {"state": "validated"},
         "capability_notes": ["test"],
         "execution_limits": {"frame": {"max_count": 60}}
@@ -1172,12 +1198,15 @@ fn capability_revision_changes_with_catalog_or_generation() {
     let base = serde_json::json!({
         "emulator_identity": {"system": "snes", "adapter": "mesen2", "launch_id": "launch-a"},
         "methods": ["status"],
-        "memory_types": ["workram"]
+        "memory_types": ["workram"],
+        "input_axes": {"ports":[{"port":0,"axes":{"left_x":{"minimum":-32768,"neutral":0,"maximum":32767}}}]}
     });
     let mut changed_catalog = base.clone();
     changed_catalog["methods"] = serde_json::json!(["status", "read_memory"]);
     let mut changed_generation = base.clone();
     changed_generation["emulator_identity"]["launch_id"] = serde_json::json!("launch-b");
+    let mut changed_axes = base.clone();
+    changed_axes["input_axes"]["ports"][0]["axes"]["left_x"]["maximum"] = serde_json::json!(255);
 
     assert_ne!(
         capability_revision(&base),
@@ -1186,6 +1215,10 @@ fn capability_revision_changes_with_catalog_or_generation() {
     assert_ne!(
         capability_revision(&base),
         capability_revision(&changed_generation)
+    );
+    assert_ne!(
+        capability_revision(&base),
+        capability_revision(&changed_axes)
     );
 }
 

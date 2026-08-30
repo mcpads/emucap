@@ -302,6 +302,19 @@ fn input_hold_frame_cap_matches_sync_advance_cap() {
 }
 
 #[test]
+fn persistent_input_accepts_optional_integer_axes_without_changing_button_only_requests() {
+    let analog: InputArgs = serde_json::from_str(
+        r#"{"port":0,"buttons":["a"],"axes":{"left_x":-32768,"right_trigger":12345}}"#,
+    )
+    .unwrap();
+    assert_eq!(analog.axes["left_x"], -32768);
+    assert_eq!(analog.axes["right_trigger"], 12345);
+
+    let buttons: InputArgs = serde_json::from_str(r#"{"buttons":["a"]}"#).unwrap();
+    assert!(buttons.axes.is_empty());
+}
+
+#[test]
 fn watch_register_accepts_max_instructions() {
     let w: WatchRegisterArgs =
         serde_json::from_str(r#"{"register":"sp","max_instructions":5000000}"#).unwrap();

@@ -343,6 +343,39 @@ fn dolphin_wii_input_uses_the_scoped_port_zero_contract() {
 }
 
 #[test]
+fn xemu_state_advertisement_exposes_frozen_same_generation_loading() {
+    let value = advertisement_value(&[
+        "xemu.state-save.frozen-only",
+        "xemu.state-load.frozen-only",
+        "xemu.state-load.same-generation-only",
+    ]);
+    let ad = ContractAdvertisement::Reported(serde_json::from_value(value).unwrap());
+    let methods = ["status", "save_state", "load_state"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let status = validate_advertisement(&ad, Some("xemu-rust-qmp-gdb"), Some("xbox"), &methods);
+
+    assert_eq!(status.state, "validated", "{:?}", status.errors);
+    assert_eq!(
+        status.constraints["state.save.execution_states.allowed"],
+        json!(["frozen"])
+    );
+    assert_eq!(
+        status.constraints["state.load.execution_states.allowed"],
+        json!(["frozen"])
+    );
+    assert_eq!(
+        status.constraints["state.load.portability"],
+        json!("same_generation_only")
+    );
+    assert_eq!(
+        status.constraints["state.load.media_boundary"],
+        json!("exact_current_disc")
+    );
+}
+
+#[test]
 fn unknown_exception_is_unvalidated() {
     let ad = ContractAdvertisement::Reported(AdvertisedContracts {
         catalog: CATALOG_ID.to_string(),

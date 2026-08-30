@@ -1,0 +1,27 @@
+diff --git i/accel/tcg/watchpoint.c w/accel/tcg/watchpoint.c
+index 24f96636fb..e623152fc3 100644
+--- i/accel/tcg/watchpoint.c
++++ w/accel/tcg/watchpoint.c
+@@ -72,14 +72,20 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
+ 
+     assert(tcg_enabled());
+     if (cpu->watchpoint_hit) {
++        bool need_lock = !bql_locked();
++
+         /*
+          * We re-entered the check after replacing the TB.
+          * Now raise the debug interrupt so that it will
+          * trigger after the current instruction.
+          */
+-        bql_lock();
++        if (need_lock) {
++            bql_lock();
++        }
+         cpu_interrupt(cpu, CPU_INTERRUPT_DEBUG);
+-        bql_unlock();
++        if (need_lock) {
++            bql_unlock();
++        }
+         return;
+     }
+ 

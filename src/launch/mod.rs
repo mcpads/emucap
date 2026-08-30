@@ -24,6 +24,7 @@ pub mod openmsx;
 pub mod pcsx2;
 pub mod ppsspp;
 pub mod spec;
+pub mod xemu;
 
 #[cfg(test)]
 #[path = "mod_tests.rs"]

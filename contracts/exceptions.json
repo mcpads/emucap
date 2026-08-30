@@ -1372,6 +1372,48 @@
       "constraints": {"state.load.execution_states.allowed": ["frozen"]},
       "public_behavior": {"invalid": "bad_state"},
       "verification": ["runtime-test:np2kai-load-frozen-restores-one-snapshot"]
+    },
+    {
+      "id": "xemu.state-save.frozen-only",
+      "feature": "state.save",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "xemu-rust-qmp-gdb", "systems": ["xbox"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.save.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:xemu-save-running-rejected",
+        "runtime-test:xemu-save-frozen-completes"
+      ]
+    },
+    {
+      "id": "xemu.state-load.frozen-only",
+      "feature": "state.load",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.REJECT.1", "STATE.LOAD.COHERENT.1", "TIME.COMPLETE.1"],
+      "scope": {"adapter": "xemu-rust-qmp-gdb", "systems": ["xbox"]},
+      "activation": {"execution_state": "not_frozen"},
+      "constraints": {"state.load.execution_states.allowed": ["frozen"]},
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": [
+        "contract-test:xemu-load-running-rejected",
+        "runtime-test:xemu-load-frozen-restores-one-snapshot"
+      ]
+    },
+    {
+      "id": "xemu.state-load.same-generation-only",
+      "feature": "state.load",
+      "kind": "precondition_narrowing",
+      "targets": ["CORE.SESSION.1", "STATE.LOAD.COHERENT.1", "STATE.LOAD.MEDIA.1"],
+      "scope": {"adapter": "xemu-rust-qmp-gdb", "systems": ["xbox"]},
+      "activation": {"snapshot_generation": "not_current"},
+      "constraints": {
+        "state.load.portability": "same_generation_only",
+        "state.load.media_boundary": "exact_current_disc"
+      },
+      "public_behavior": {"invalid": "bad_state"},
+      "verification": ["contract-test:xemu-load-foreign-generation-rejected-before-mutation"]
     }
   ]
 }

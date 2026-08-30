@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -406,6 +408,11 @@ pub(crate) struct InputArgs {
     #[serde(default)]
     pub(crate) port: u64,
     pub(crate) buttons: Vec<String>,
+    /// Persistent values for axes advertised by the current input capability. Axis names and
+    /// integer bounds are runtime-defined; omitted axes are neutral because set_input replaces the
+    /// complete controller state.
+    #[serde(default)]
+    pub(crate) axes: BTreeMap<String, i64>,
 }
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
