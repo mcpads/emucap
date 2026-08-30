@@ -162,6 +162,27 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
     (handle, calls)
 }
 
+fn wait_for_connected_status(server: &mut McpProcess, timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
+    let mut request_id = 4_000;
+    loop {
+        let response = server.request(modern_request(
+            request_id,
+            "tools/call",
+            json!({"name": "status", "arguments": {}}),
+        ));
+        if response["result"]["structuredContent"]["connected"] == true {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Control MCP did not observe the adapter connection within {timeout:?}: {response}"
+        );
+        request_id += 1;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn make_analysis_case() -> (tempfile::TempDir, std::path::PathBuf) {
     let temporary = tempfile::tempdir().expect("temporary analysis case");
     let directory = temporary.path().join("wire-case");
@@ -644,11 +665,7 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
 
     let (_temporary, case_dir) = make_analysis_case();
     let (adapter, calls) = spawn_analysis_adapter(port);
-    let connected = server.request(modern_request(
-        40,
-        "tools/call",
-        json!({"name": "status", "arguments": {}}),
-    ));
+    let connected = wait_for_connected_status(&mut server, Duration::from_secs(5));
     assert_eq!(connected["result"]["structuredContent"]["connected"], true);
     let described_debug = server.request(modern_request(
         41,
