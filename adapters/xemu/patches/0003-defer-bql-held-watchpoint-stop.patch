@@ -1,0 +1,23 @@
+diff --git i/accel/tcg/watchpoint.c w/accel/tcg/watchpoint.c
+index e623152fc3..96acf80304 100644
+--- i/accel/tcg/watchpoint.c
++++ w/accel/tcg/watchpoint.c
+@@ -135,6 +135,18 @@ void cpu_check_watchpoint(CPUState *cpu, vaddr addr, vaddr len,
+             }
+             cpu->watchpoint_hit = wp;
+ 
++            /*
++             * Target interrupt helpers can perform guest memory accesses while
++             * already holding the BQL. Invalidating their current TB here can
++             * deadlock on its jump lock. Preserve post-access watchpoint
++             * semantics by letting the helper finish the access and servicing
++             * the debug interrupt at the next CPU interrupt check.
++             */
++            if (bql_locked()) {
++                cpu_interrupt(cpu, CPU_INTERRUPT_DEBUG);
++                return;
++            }
++
+             /* This call also restores vCPU state */
+             tb_check_watchpoint(cpu, ra);
+             if (wp->flags & BP_STOP_BEFORE_ACCESS) {

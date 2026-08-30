@@ -4,6 +4,43 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.16.0
+
+### Added
+- Added a managed original Xbox path based on a pinned xemu fork. It provides isolated machine
+  generations, controlled pre-first-instruction start, bounded QMP/GDB control, CPU memory and
+  debugging, exact frame and instruction stepping, explicit audio output with a silent default,
+  native-safe button and analog input, screenshots, reset, and optical-disc replacement. Analog
+  sticks and triggers are exposed only through live per-port axis capabilities; invalid ranges and
+  conflicting full-trigger aliases fail before mutation, while empty state returns native ownership.
+  A representative game XISO
+  reached game-visible menus and responded to injected confirm and directional input; audible output
+  was also observed with `sound:true`. Startup now retries a listener that has not emitted its QMP
+  greeting yet without accepting malformed protocol data. Frame stepping now consumes its terminal
+  GDB stop before any post-continue QMP query, preventing immediate watchpoints from poisoning the
+  control connection. The pinned host patch preserves existing QEMU big-lock ownership during TCG
+  watchpoint re-entry and defers BQL-held x86 interrupt-access stops until the matched access has
+  completed. Ordinary MTTCG watchpoints now retranslate one instruction without invalidating their
+  still-executing translation block, instead of aborting or stalling the host. Instruction stepping
+  reports watchpoint and exec-breakpoint preemption instead of consuming it. Disassembly uses the
+  absolute CPU address view, while controlled launch advertises the exact x86 reset linear address
+  separately from the segmented EIP register. Decoder lookahead is bounded at the selected address
+  space, so the valid `0xfffffff0` reset vector remains disassemblable. The `main` memory view now
+  uses xemu's physical-RAM mode for complete bounded reads, writes, searches, and dumps, restoring
+  virtual CPU addressing before every terminal response instead of failing on an unmapped
+  `0x80000000` page. Frozen state save/load now publishes a generation-bound container over the
+  internal VM/HDD snapshot, complete EEPROM bytes, exact current disc, host build, machine inputs,
+  and controller topology. Load verifies QMP/GDB serviceability and restores the prior frozen
+  snapshot on failure; foreign generations and changed media fail before snapshot mutation. A
+  negotiated debug probe composes one exact state load, bounded frame advance, and frozen memory
+  read without a caller-latency gap, preserving breakpoint preemption and identifying the exact
+  state-container bytes it consumed.
+
+### Changed
+- Original Xbox capability metadata no longer exposes obsolete duplicate controls or optional
+  instrumentation as `planned_methods`; the live method list and negotiated drawers are the whole
+  callable surface for that generation.
+
 ## 0.15.1
 
 ### Fixed

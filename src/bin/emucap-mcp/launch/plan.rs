@@ -386,25 +386,6 @@ pub(super) fn mupen64plus_precondition(root: &Path, display: bool) -> serde_json
     })
 }
 
-pub(super) fn openmsx_precondition(root: &Path) -> serde_json::Value {
-    let binary = openmsx_launch::resolve_binary(root);
-    let bridge = openmsx_launch::resolve_bridge(root);
-    let build = binary
-        .as_deref()
-        .map(|path| openmsx_launch::require_compatible_build(root, path));
-    serde_json::json!({
-        "available": binary.is_some()
-            && bridge.is_some()
-            && build.as_ref().is_some_and(Result::is_ok),
-        "path": binary.as_ref().map(|path| path.display().to_string()),
-        "bridge": bridge.as_ref().map(|path| path.display().to_string()),
-        "bridge_available": bridge.is_some(),
-        "host_build": build.as_ref().and_then(|result| result.as_ref().ok()),
-        "error": build.and_then(Result::err).map(|error| error.to_string()),
-        "source": "EMUCAP_OPENMSX_BIN / pinned repo build; EMUCAP_OPENMSX_BRIDGE_BIN / installed emucap-openmsx-bridge",
-    })
-}
-
 pub(super) fn adapter_binary_precondition_for(
     adapter: &str,
     root: &Path,
@@ -419,10 +400,11 @@ pub(super) fn adapter_binary_precondition_for(
         "mame_neogeo" => mame_neogeo_binary_precondition(root),
         "mupen64plus" => mupen64plus_precondition(root, display),
         "np2kai" => np2kai_precondition(root),
-        "openmsx" => openmsx_precondition(root),
+        "openmsx" => super::openmsx::precondition(root),
         "desmume_nds" => desmume_nds_binary_precondition(root),
         "ppsspp" => ppsspp_binary_precondition(root),
         "pcsx2" => pcsx2_binary_precondition(root),
+        "xemu" => super::xemu::precondition(root),
         _ => serde_json::Value::Null,
     }
 }
@@ -511,6 +493,12 @@ pub(super) fn build_required_precondition(
             paths["adapters"][adapter]["build"]
                 .as_str()
                 .unwrap_or("adapters/dolphin/build.sh")
+        )),
+        "xemu" => serde_json::json!(format!(
+            "Build the pinned xemu fork with {}, build emucap-xemu-bridge, and provide the operator-owned machine files through EMUCAP_XEMU_FIRMWARE or the managed firmware inventory.",
+            paths["adapters"][adapter]["build"]
+                .as_str()
+                .unwrap_or("adapters/xemu/build.sh")
         )),
         _ => serde_json::Value::Null,
     }
@@ -827,6 +815,13 @@ pub(super) fn infer_system(
             "needs_user_input": false,
             "markers": markers,
         }),
+        Some("xiso") => serde_json::json!({
+            "system": "xbox",
+            "confidence": "extension",
+            "reason": "original Xbox raw XISO extension",
+            "needs_user_input": false,
+            "markers": markers,
+        }),
         Some("cue" | "chd" | "bin" | "iso" | "img" | "ccd" | "rvz" | "wia" | "gcz") => {
             serde_json::json!({
                 "system": null,
@@ -834,7 +829,7 @@ pub(super) fn infer_system(
                 "reason": "disc/binary image extension can map to multiple systems; do not guess without header evidence",
                 "needs_user_input": true,
                 "required_user_input": "Specify the system for this image explicitly.",
-                "candidates": ["saturn", "psx", "ps2", "pce", "pcfx", "md", "psp", "dc", "gamecube", "wii"],
+                "candidates": ["saturn", "psx", "ps2", "pce", "pcfx", "md", "psp", "dc", "gamecube", "wii", "xbox"],
                 "markers": markers,
             })
         }
@@ -931,6 +926,9 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         preferred_launcher_args["pc98_backend"] = serde_json::json!("np2kai");
         preferred_launcher_args["display"] = serde_json::json!(false);
         preferred_launcher_args["start_frozen"] = serde_json::json!(true);
+    } else if adapter == "xemu" {
+        preferred_launcher_args["display"] = serde_json::json!(false);
+        preferred_launcher_args["start_frozen"] = serde_json::json!(true);
     }
     let environment_defaults = if adapter == "mame_pc98" {
         serde_json::json!({
@@ -970,6 +968,14 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
                 "default": null,
                 "applies_when": "explicitly set",
                 "reason": "optional per-system Lua entry override; otherwise the launcher uses the normalized system"
+            }
+        })
+    } else if adapter == "xemu" {
+        serde_json::json!({
+            "EMUCAP_XEMU_FIRMWARE": {
+                "default": null,
+                "applies_when": "an operator wants to override the managed firmware inventory",
+                "reason": "must name one absolute directory containing the required machine files; source files are copied into the launch generation and are never modified"
             }
         })
     } else {
@@ -1087,6 +1093,7 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
         "neogeo_cd" => serde_json::json!("Requires MAME neocdz.zip and a CUE whose referenced files all exist. Set EMUCAP_NEOGEO_CD_BIOS or place neocdz.zip beside the CUE."),
         "msx1" | "msx2" | "msx2p" => serde_json::json!("Requires the exact system ROMs for the pinned real-machine profile. Set EMUCAP_OPENMSX_FIRMWARE to an absolute directory, or place them under <emucap-data>/firmware/openmsx. The launcher verifies the pinned SHA-1 manifest before spawn."),
         "n64" => serde_json::Value::Null,
+        "xbox" => serde_json::json!("Requires operator-owned mcpx_1.0.bin, Complex_4627.bin, and xbox_hdd.qcow2. An optional xemu_eeprom.bin seeds each generation; otherwise xemu creates a generation-local EEPROM. No machine files are distributed."),
         _ => serde_json::Value::Null, // snes·md·dc는 BIOS 불요(DC는 Flycast HLE 부팅)
     };
 
@@ -1133,6 +1140,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             "Headless PPSSPP boots the content positionally (not -m/--mount, which only mounts a second image) and is never passed --timeout (that flag aborts the run on a wall-clock deadline regardless of debugger activity); the Rust launch path manages the process lifecycle instead."
         } else if adapter == "dolphin" {
             "Dolphin is headless by default. launch(display:true) selects the compatible DolphinQt build and opens its render window. Both modes use a per-port portable runtime and --user directory."
+        } else if adapter == "xemu" {
+            "xemu keeps its GPU path active in both modes. Headless launch uses the pinned hidden-window extension; visible launch opens an isolated native window. Neither mode reads or changes the user's xemu profile."
         } else {
             "Use the Rust launch tool from this plan."
         },
@@ -1159,8 +1168,8 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
             serde_json::Value::Null
         },
         "start_frozen_contract": {
-            "supported": adapter == "mesen2" || adapter == "mednafen" || adapter == "np2kai",
-            "boundary": if adapter == "mesen2" || adapter == "mednafen" || adapter == "np2kai" { serde_json::json!("pre_first_instruction") } else { serde_json::Value::Null },
+            "supported": adapter == "mesen2" || adapter == "mednafen" || adapter == "np2kai" || adapter == "xemu",
+            "boundary": if adapter == "mesen2" || adapter == "mednafen" || adapter == "np2kai" || adapter == "xemu" { serde_json::json!("pre_first_instruction") } else { serde_json::Value::Null },
             "request_with": "launch(..., start_frozen:true)",
             "repeatable_initial_conditions": system == "snes" || system == "md" || adapter == "np2kai"
         },

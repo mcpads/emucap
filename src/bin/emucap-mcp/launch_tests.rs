@@ -414,6 +414,51 @@ fn infer_system_does_not_guess_ambiguous_disc_media() {
         .unwrap()
         .iter()
         .any(|v| v.as_str() == Some("wii")));
+    assert!(inferred["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str() == Some("xbox")));
+}
+
+#[test]
+fn infer_system_maps_xiso_but_keeps_iso_explicit_for_original_xbox() {
+    let xiso = infer_system(Some("/tmp/game.xiso"), None);
+    assert_eq!(xiso["system"], "xbox");
+    assert_eq!(xiso["confidence"], "extension");
+    for alias in ["xbox", "original-xbox", "ogxbox"] {
+        let explicit = infer_system(None, Some(alias));
+        assert_eq!(explicit["system"], "xbox", "alias {alias}");
+        assert_eq!(explicit["confidence"], "explicit");
+    }
+    assert_eq!(adapter_for_system("xbox"), ("xemu", None));
+
+    let iso = infer_system(Some("/tmp/game.iso"), None);
+    assert_eq!(iso["system"], serde_json::Value::Null);
+    assert_eq!(iso["confidence"], "ambiguous_media");
+}
+
+#[test]
+fn launch_plan_for_xbox_makes_hidden_audio_an_explicit_choice() {
+    let plan = make_launch_plan(
+        Some(47800),
+        &LaunchPlanArgs {
+            content_path: Some("/tmp/game.iso".into()),
+            system: Some("xbox".into()),
+            pc98_backend: None,
+            indirect_media_approval: None,
+        },
+    );
+    assert_eq!(plan["adapter"], "xemu");
+    assert_eq!(plan["preferred_launcher"]["args"]["display"], false);
+    assert_eq!(plan["preferred_launcher"]["args"]["sound"], false);
+    assert_eq!(plan["sound_contract"]["supported"], true);
+    assert_eq!(plan["sound_contract"]["default"], false);
+    assert_eq!(plan["sound_contract"]["independent_of_display"], true);
+    assert_eq!(
+        plan["sound_contract"]["enable_with"],
+        "launch(..., sound:true)"
+    );
 }
 
 #[test]
@@ -2605,6 +2650,7 @@ fn launch_rejects_pc98_sound_board_for_other_systems_before_binary_resolution() 
 fn launch_sound_admission_matches_the_documented_adapters() {
     assert!(adapter_supports_sound("mednafen"));
     assert!(adapter_supports_sound("mame_pc98"));
+    assert!(adapter_supports_sound("xemu"));
     for adapter in [
         "mesen2",
         "mame_neogeo",

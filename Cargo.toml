@@ -1,6 +1,6 @@
 [package]
 name = "emucap"
-version = "0.15.1"
+version = "0.16.0"
 edition = "2021"
 rust-version = "1.88"
 authors = ["mcpads"]
@@ -60,6 +60,10 @@ path = "src/bin/emucap-openmsx-bridge.rs"
 name = "emucap-np2kai"
 path = "src/bin/emucap-np2kai.rs"
 
+[[bin]]
+name = "emucap-xemu-bridge"
+path = "src/bin/emucap-xemu-bridge.rs"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
@@ -81,6 +85,7 @@ tungstenite = "0.30"
 fs2 = "0.4"
 libloading = "0.8"
 png = "0.17"
+iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder", "intel"] }
 
 # setsid() for detached emulator launch; Unix only (Windows uses creation_flags).
 [target.'cfg(unix)'.dependencies]

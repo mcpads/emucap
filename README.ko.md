@@ -8,10 +8,11 @@
 PlayStation·PC Engine·PC-FX·Mega Drive/Genesis·WonderSwan/WSC·Neo Geo Pocket/Color), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME과 선택형
 NP2kai 호환 backend(PC-98), MAME(실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
+원본 Xbox는 고정된 xemu 포크로 실험 지원한다.
 Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
 MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 
-**v0.15.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.16.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -56,7 +57,8 @@ cargo build --release \
   --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
   --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
   --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
-  --bin emucap-openmsx-bridge --bin emucap-np2kai
+  --bin emucap-openmsx-bridge --bin emucap-np2kai \
+  --bin emucap-xemu-bridge
 ```
 
 산출물: `target/release/emucap-mcp`(**제어 MCP** — 에뮬레이터 조작), `emucap-track-mcp`(**추적
@@ -64,7 +66,8 @@ MCP** — 실험 원장, emulator-less), `emucap`(케이스 번들 CLI), `emucap
 `emucap-mame-pc98-bridge`(PC-98 launch helper), `emucap-mame-neogeo-bridge`(Neo Geo MVS/AES/CD launch helper),
 `emucap-mupen64plus`(N64 frontend·adapter), `emucap-desmume-nds-bridge`(NDS launch helper),
 `emucap-ppsspp-bridge`(PSP launch helper), `emucap-pcsx2-bridge`(PS2 launch helper),
-`emucap-openmsx-bridge`(stock openMSX XML-control helper), `emucap-np2kai`(PC-98 호환 frontend).
+`emucap-openmsx-bridge`(stock openMSX XML-control helper), `emucap-np2kai`(PC-98 호환 frontend),
+`emucap-xemu-bridge`(원본 Xbox QMP/GDB launch helper).
 Source build의 의존성은 전부 crates.io이고
 SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필요 없다**(깨끗한 체크아웃에서 그대로
 빌드된다). 첫 빌드는 의존성을 내려받느라 더 걸리고, 이후는 빠르다.
@@ -324,6 +327,20 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   exec/read/write breakpoint, event polling, disassemble을 제공한다. Screenshot은
   `display: true`에서만 제공한다. Disk/tape는 대표 runtime 증거가 없고 turboR/R800은 미구현이다.
   일반 `.rom` 파일은 MSX system ID를 명시한다. → `adapters/openmsx/README.md`
+- **xemu 원본 Xbox (실험적)** — `adapters/xemu/build.sh`로 고정된 GPLv2 포크를 빌드하고
+  `emucap-xemu-bridge`를 빌드한다. 사용자가 준비한 MCPX·flash ROM·HDD template 디렉터리를
+  `EMUCAP_XEMU_FIRMWARE`로 지정하며 EEPROM은 선택 사항이다. 관리형 실행은 기기 입력을 세대별
+  격리 디렉터리로 복사하고 사용자의 일반 xemu profile을 열지 않는다. 제어된 frozen 시작,
+  CPU 상태·메모리, 정확한 frame·instruction step, 기본 무음이며 display와 독립적인 sound 선택,
+  버튼·아날로그 입력과 native 입력권 반환, screenshot, reset,
+  disc 교체, breakpoint, disassemble, best-effort call stack과 frozen save/load를 지원한다. State
+  container는 내부 VM/HDD snapshot을 해당 generation의 EEPROM, exact disc, host build, controller
+  topology와 함께 묶으며 같은 관리형 launch generation 안에서만 유효하다. 협상형 debug 기능은 같은
+  generation 안에서 state load·정확한 frame 진행·frozen memory read를 한 요청으로 묶는 원자적 probe도
+  제공한다.
+  대표 game XISO smoke에서 실제 게임 메뉴 진입, confirm·방향 입력 소비와 `sound:true`의 가청
+  출력을 확인했다. 이는 전체 게임 호환성을 보장한다는 뜻은 아니다.
+  → `adapters/xemu/README.md`
 
 ## 더 보기
 
@@ -331,5 +348,5 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
 - 에뮬레이터별 메모리 타입·버튼 이름·브레이크포인트·실행 트러블슈팅 → 각 `adapters/*/README.md`
 - 바이너리: `emucap`(케이스 번들 `finalize`/`inspect`), `emucap-mcp`(제어 MCP — 실행 중 에뮬레이터
   조작, stdio), `emucap-track-mcp`(추적 MCP — 실험 원장, emulator-less, stdio),
-  `emucap-broker`(다중 세션 연결 공유), N64 frontend, 그리고 빌드 절에 적은 PC-98/Neo Geo/NDS/PSP/PS2/MSX
+  `emucap-broker`(다중 세션 연결 공유), N64 frontend, 그리고 빌드 절에 적은 PC-98/Neo Geo/NDS/PSP/PS2/MSX/Xbox
   launch bridge.

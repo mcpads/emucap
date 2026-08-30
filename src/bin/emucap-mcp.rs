@@ -502,7 +502,7 @@ impl Emucap {
 
     async fn set_input(&self, Parameters(a): Parameters<InputArgs>) -> CallToolResult {
         let mut l = self.link();
-        match tools::set_input(&mut *l, a.port, &a.buttons) {
+        match tools::set_controller_state(&mut *l, a.port, &a.buttons, &a.axes) {
             Ok(o) => tool_output_result(o),
             Err(e) => link_error_result(e),
         }

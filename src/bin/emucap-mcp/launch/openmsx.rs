@@ -1,6 +1,25 @@
 use super::plan::adapter_log_path;
 use super::*;
 
+pub(super) fn precondition(root: &Path) -> serde_json::Value {
+    let binary = openmsx_launch::resolve_binary(root);
+    let bridge = openmsx_launch::resolve_bridge(root);
+    let build = binary
+        .as_deref()
+        .map(|path| openmsx_launch::require_compatible_build(root, path));
+    serde_json::json!({
+        "available": binary.is_some()
+            && bridge.is_some()
+            && build.as_ref().is_some_and(Result::is_ok),
+        "path": binary.as_ref().map(|path| path.display().to_string()),
+        "bridge": bridge.as_ref().map(|path| path.display().to_string()),
+        "bridge_available": bridge.is_some(),
+        "host_build": build.as_ref().and_then(|result| result.as_ref().ok()),
+        "error": build.and_then(Result::err).map(|error| error.to_string()),
+        "source": "EMUCAP_OPENMSX_BIN / pinned repo build; EMUCAP_OPENMSX_BRIDGE_BIN / installed emucap-openmsx-bridge",
+    })
+}
+
 /// MSX leg of `make_launch`: run pinned stock openMSX behind the separate XML bridge.
 pub(super) fn launch_openmsx(
     port: u16,

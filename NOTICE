@@ -91,6 +91,18 @@ Mupen64Plus
                 binaries or game media. The upstream GPL test ROM remains in the
                 ignored local build tree.
 
+xemu
+  Upstream: https://github.com/xemu-project/xemu
+  Pinned source: v0.8.136 (fc24584ce88f0915ad7f04775bb7712c2e3f49ee)
+  License: GNU GPL version 2 as a whole; individual files and bundled
+           dependencies retain their compatible upstream notices.
+  Used by: adapters/xemu (source patch stack, QMP/GDB bridge, and build recipe;
+           original Xbox)
+  The Rust bridge uses iced-x86 under the MIT license for target-side i386
+  disassembly because xemu's host monitor has no target disassembler on every build.
+  Distribution: emucap ships source patches and a build recipe, not xemu
+                binaries, Xbox firmware, HDD or EEPROM images, or game media.
+
 openMSX
   Upstream: https://github.com/openMSX/openMSX
   Pinned source: 21.0

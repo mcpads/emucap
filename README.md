@@ -12,11 +12,12 @@ Neo Geo Pocket/Color), Flycast
 (Dreamcast), a DeSmuME fork (Nintendo DS), a PPSSPP fork (PSP), a PCSX2 fork
 (PlayStation 2), a Dolphin fork (GameCube · Wii), MAME plus an optional direct
 NP2kai compatibility backend (PC-98), MAME (experimental Neo Geo
-MVS/AES/CD), and an experimental Mupen64Plus frontend (Nintendo 64).
+MVS/AES/CD), an experimental Mupen64Plus frontend (Nintendo 64), and a pinned
+xemu fork (original Xbox, experimental).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.15.1 — beta.** This repository remains under active development; interfaces and
+**v0.16.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -69,7 +70,8 @@ cargo build --release \
   --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
   --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
   --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
-  --bin emucap-openmsx-bridge --bin emucap-np2kai
+  --bin emucap-openmsx-bridge --bin emucap-np2kai \
+  --bin emucap-xemu-bridge
 ```
 
 Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
@@ -82,7 +84,8 @@ Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap-ppsspp-bridge` (PSP launch helper),
 `emucap-pcsx2-bridge` (PS2 launch helper), and
 `emucap-openmsx-bridge` (stock openMSX XML-control helper), and
-`emucap-np2kai` (direct PC-98 compatibility frontend). All dependencies come from
+`emucap-np2kai` (direct PC-98 compatibility frontend), and
+`emucap-xemu-bridge` (original Xbox QMP/GDB launch helper). All dependencies come from
 crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
 required** for a source build. The first build is slower while dependencies
 download; later builds are fast.
@@ -396,6 +399,22 @@ debugger halt to service requests without advancing the guest.
   proof, and turboR/R800 is not implemented. Generic `.rom` files require an explicit
   MSX system ID.
   → `adapters/openmsx/README.md`
+- **xemu (original Xbox, experimental)** — build the pinned GPLv2 fork with
+  `adapters/xemu/build.sh`, then build `emucap-xemu-bridge`. Set
+  `EMUCAP_XEMU_FIRMWARE` to an operator-owned directory containing the required MCPX,
+  flash ROM, and HDD template; an EEPROM image is optional. Managed launch copies the
+  machine inputs into an isolated generation and never opens the user's normal xemu
+  profile. It supports controlled frozen start, CPU state and memory, exact frame and
+  instruction stepping, independently selected display and sound with a silent default,
+  button and analog input with native handback, screenshots, reset, disc replacement,
+  breakpoints, disassembly, a best-effort call stack, and frozen save/load. The state container
+  binds an internal VM/HDD snapshot to the generation EEPROM, exact current disc, host build, and
+  controller topology; it is intentionally valid only in the same managed launch generation.
+  Negotiated debug operations also include an atomic state-load, exact-frame, frozen-memory probe
+  for within-generation analysis. A representative
+  game XISO smoke test reached game-visible menus, consumed confirm and directional input, and
+  produced audible output with `sound:true`; this is not a broad game-compatibility claim.
+  → `adapters/xemu/README.md`
 
 ## Learn more
 
@@ -406,5 +425,5 @@ debugger halt to service requests without advancing the guest.
 Binaries: `emucap` (case bundles: `finalize` / `inspect`), `emucap-mcp` (Control
 MCP — live emulator control, stdio), `emucap-track-mcp` (Tracking MCP —
 experiment ledger, emulator-less, stdio), `emucap-broker` (multi-session
-connection sharing), the N64 frontend, and the PC-98/Neo Geo/NDS/PSP/PS2/MSX launch bridges
+connection sharing), the N64 frontend, and the PC-98/Neo Geo/NDS/PSP/PS2/MSX/Xbox launch bridges
 listed in the build section.

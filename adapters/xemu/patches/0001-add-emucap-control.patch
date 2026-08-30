@@ -1,0 +1,694 @@
+diff --git i/hw/xbox/nv2a/nv2a.c w/hw/xbox/nv2a/nv2a.c
+index 1d19afc..367acf0 100644
+--- i/hw/xbox/nv2a/nv2a.c
++++ w/hw/xbox/nv2a/nv2a.c
+@@ -21,6 +21,7 @@
+ 
+ #include "hw/xbox/nv2a/nv2a_int.h"
+ #include "qemu/main-loop.h"
++#include "ui/xemu-emucap.h"
+ 
+ void nv2a_update_irq(NV2AState *d)
+ {
+@@ -203,6 +204,7 @@ static void nv2a_vga_gfx_update(void *opaque)
+     d->pcrtc.raster = 0;
+ 
+     nv2a_update_irq(d);
++    xemu_emucap_frame_boundary();
+ }
+ 
+ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
+diff --git i/qapi/meson.build w/qapi/meson.build
+index a46269b..06b0e08 100644
+--- i/qapi/meson.build
++++ w/qapi/meson.build
+@@ -53,6 +53,7 @@ qapi_all_modules = [
+   'transaction',
+   'vfio',
+   'virtio',
++  'xemu-emucap',
+   'yank',
+ ]
+ if have_system
+diff --git i/qapi/qapi-schema.json w/qapi/qapi-schema.json
+index b93dd68..2508160 100644
+--- i/qapi/qapi-schema.json
++++ w/qapi/qapi-schema.json
+@@ -66,6 +66,7 @@
+ { 'include': 'misc.json' }
+ { 'include': 'misc-arm.json' }
+ { 'include': 'misc-i386.json' }
++{ 'include': 'xemu-emucap.json' }
+ { 'include': 'audio.json' }
+ { 'include': 'acpi.json' }
+ { 'include': 'acpi-hest.json' }
+diff --git i/qapi/xemu-emucap.json w/qapi/xemu-emucap.json
+new file mode 100644
+index 0000000..2420524
+--- /dev/null
++++ w/qapi/xemu-emucap.json
+@@ -0,0 +1,155 @@
++# -*- Mode: Python -*-
++# vim: filetype=python
++
++##
++# = xemu emucap control
++##
++
++##
++# @XemuEmucapStatus:
++#
++# @api: host extension API revision
++#
++# @frame-boundary: running-only NV2A frame boundary counter
++#
++# @frame-step-active: whether a bounded frame stop is armed
++#
++# @frame-step-remaining: boundaries remaining before the armed stop
++#
++# @input-engaged: whether port-zero emucap input owns the
++#     guest-visible state
++##
++{ 'struct': 'XemuEmucapStatus',
++  'data': { 'api': 'uint32',
++            'frame-boundary': 'uint64',
++            'frame-step-active': 'bool',
++            'frame-step-remaining': 'uint32',
++            'input-engaged': 'bool' } }
++
++##
++# @xemu-emucap-status:
++#
++# Return the live state of the xemu extension.
++##
++{ 'command': 'xemu-emucap-status',
++  'returns': 'XemuEmucapStatus' }
++
++##
++# @xemu-emucap-set-input:
++#
++# Replace or release the guest-visible controller state for port zero.
++#
++# @engaged: whether emucap owns the guest-visible state
++#
++# @buttons: Xbox digital-button bit mask
++#
++# @ltrigger: left-trigger value
++#
++# @rtrigger: right-trigger value
++#
++# @lstick-x: left-stick horizontal value
++#
++# @lstick-y: left-stick vertical value
++#
++# @rstick-x: right-stick horizontal value
++#
++# @rstick-y: right-stick vertical value
++##
++{ 'command': 'xemu-emucap-set-input',
++  'data': { 'engaged': 'bool',
++            'buttons': 'uint16',
++            'ltrigger': 'int16',
++            'rtrigger': 'int16',
++            'lstick-x': 'int16',
++            'lstick-y': 'int16',
++            'rstick-x': 'int16',
++            'rstick-y': 'int16' } }
++
++##
++# @xemu-emucap-arm-frame-step:
++#
++# Arm a stop after @count running NV2A frame boundaries.  The VM
++# must be stopped.  Continuing execution remains the debugger
++# client's responsibility.
++#
++# @count: number of running frame boundaries before the stop
++##
++{ 'command': 'xemu-emucap-arm-frame-step',
++  'data': { 'count': 'uint32' } }
++
++##
++# @xemu-emucap-cancel-frame-step:
++#
++# Cancel an armed frame stop without changing run state.
++##
++{ 'command': 'xemu-emucap-cancel-frame-step' }
++
++##
++# @XemuEmucapScreenshotState:
++#
++# @idle: no screenshot has been requested
++#
++# @pending: a screenshot is waiting for the display thread
++#
++# @completed: the screenshot was written successfully
++#
++# @failed: the screenshot could not be captured or written
++##
++{ 'enum': 'XemuEmucapScreenshotState',
++  'data': [ 'idle', 'pending', 'completed', 'failed' ] }
++
++##
++# @XemuEmucapScreenshotStatus:
++#
++# @request-id: caller-generated request identity
++#
++# @state: current request state
++#
++# @filename: generated basename under the managed screenshot directory
++#
++# @message: failure detail
++##
++{ 'struct': 'XemuEmucapScreenshotStatus',
++  'data': { 'request-id': 'uint64',
++            'state': 'XemuEmucapScreenshotState',
++            '*filename': 'str',
++            '*message': 'str' } }
++
++##
++# @xemu-emucap-request-screenshot:
++#
++# Queue a framebuffer capture for the display thread.
++# Output goes under the managed settings directory.
++#
++# @request-id: nonzero caller-generated request identity
++##
++{ 'command': 'xemu-emucap-request-screenshot',
++  'data': { 'request-id': 'uint64' } }
++
++##
++# @xemu-emucap-screenshot-status:
++#
++# Return the state of one screenshot request.
++#
++# @request-id: identity passed to @xemu-emucap-request-screenshot
++##
++{ 'command': 'xemu-emucap-screenshot-status',
++  'data': { 'request-id': 'uint64' },
++  'returns': 'XemuEmucapScreenshotStatus' }
++
++##
++# @xemu-emucap-eject-disc:
++#
++# Open the emulated Xbox DVD tray and remove the current disc.
++##
++{ 'command': 'xemu-emucap-eject-disc' }
++
++##
++# @xemu-emucap-load-disc:
++#
++# Open the emulated Xbox DVD tray and load a raw XISO image.
++#
++# @path: host path of the replacement disc image
++##
++{ 'command': 'xemu-emucap-load-disc',
++  'data': { 'path': 'str' } }
+diff --git i/ui/meson.build w/ui/meson.build
+index 86acebb..e9cfa81 100644
+--- i/ui/meson.build
++++ w/ui/meson.build
+@@ -21,6 +21,7 @@ subdir('thirdparty')
+ 
+ xemu_ss = ss.source_set()
+ xemu_ss.add(files(
++  'xemu-emucap.c',
+   'xemu-input.c',
+   'xemu-monitor.c',
+   'xemu-net.c',
+diff --git i/ui/xemu-emucap.c w/ui/xemu-emucap.c
+new file mode 100644
+index 0000000..ab47e0f
+--- /dev/null
++++ w/ui/xemu-emucap.c
+@@ -0,0 +1,262 @@
++/*
++ * xemu emucap control extension
++ *
++ * Copyright (C) 2026 emucap contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-xemu-emucap.h"
++#include "system/runstate.h"
++#include "xemu-emucap.h"
++#include "xemu-input.h"
++#include "xui/xemu-hud.h"
++
++#define XEMU_EMUCAP_API 1
++#define XEMU_EMUCAP_MAX_FRAME_STEP 5000
++
++typedef struct XemuEmucapInput {
++    bool engaged;
++    uint16_t buttons;
++    int16_t axes[CONTROLLER_AXIS__COUNT];
++} XemuEmucapInput;
++
++typedef enum XemuEmucapScreenshotResult {
++    XEMU_EMUCAP_SCREENSHOT_IDLE,
++    XEMU_EMUCAP_SCREENSHOT_PENDING,
++    XEMU_EMUCAP_SCREENSHOT_COMPLETED,
++    XEMU_EMUCAP_SCREENSHOT_FAILED,
++} XemuEmucapScreenshotResult;
++
++typedef struct XemuEmucapScreenshot {
++    uint64_t request_id;
++    XemuEmucapScreenshotResult state;
++    bool rendering;
++    char *filename;
++    char *message;
++} XemuEmucapScreenshot;
++
++static XemuEmucapInput input;
++static uint64_t frame_boundary;
++static bool frame_step_active;
++static uint32_t frame_step_remaining;
++static XemuEmucapScreenshot screenshot;
++G_LOCK_DEFINE_STATIC(xemu_emucap);
++
++XemuEmucapStatus *qmp_xemu_emucap_status(Error **errp)
++{
++    XemuEmucapStatus *status = g_new0(XemuEmucapStatus, 1);
++
++    G_LOCK(xemu_emucap);
++    status->api = XEMU_EMUCAP_API;
++    status->frame_boundary = frame_boundary;
++    status->frame_step_active = frame_step_active;
++    status->frame_step_remaining = frame_step_remaining;
++    status->input_engaged = input.engaged;
++    G_UNLOCK(xemu_emucap);
++    return status;
++}
++
++void qmp_xemu_emucap_set_input(bool engaged, uint16_t buttons,
++                               int16_t ltrigger, int16_t rtrigger,
++                               int16_t lstick_x, int16_t lstick_y,
++                               int16_t rstick_x, int16_t rstick_y,
++                               Error **errp)
++{
++    if (engaged && xemu_input_get_bound(0) == NULL) {
++        error_setg(errp, "emucap input requires a controller bound to port 1");
++        return;
++    }
++
++    G_LOCK(xemu_emucap);
++    input.buttons = buttons;
++    input.axes[CONTROLLER_AXIS_LTRIG] = ltrigger;
++    input.axes[CONTROLLER_AXIS_RTRIG] = rtrigger;
++    input.axes[CONTROLLER_AXIS_LSTICK_X] = lstick_x;
++    input.axes[CONTROLLER_AXIS_LSTICK_Y] = lstick_y;
++    input.axes[CONTROLLER_AXIS_RSTICK_X] = rstick_x;
++    input.axes[CONTROLLER_AXIS_RSTICK_Y] = rstick_y;
++    input.engaged = engaged;
++    G_UNLOCK(xemu_emucap);
++}
++
++void qmp_xemu_emucap_arm_frame_step(uint32_t count, Error **errp)
++{
++    if (count == 0 || count > XEMU_EMUCAP_MAX_FRAME_STEP) {
++        error_setg(errp, "frame step count must be in 1..%u",
++                   XEMU_EMUCAP_MAX_FRAME_STEP);
++        return;
++    }
++    if (runstate_is_running()) {
++        error_setg(errp, "frame step can only be armed while the VM is stopped");
++        return;
++    }
++    G_LOCK(xemu_emucap);
++    if (frame_step_active) {
++        G_UNLOCK(xemu_emucap);
++        error_setg(errp, "a frame step is already armed");
++        return;
++    }
++
++    frame_step_remaining = count;
++    frame_step_active = true;
++    G_UNLOCK(xemu_emucap);
++}
++
++void qmp_xemu_emucap_cancel_frame_step(Error **errp)
++{
++    G_LOCK(xemu_emucap);
++    frame_step_active = false;
++    frame_step_remaining = 0;
++    G_UNLOCK(xemu_emucap);
++}
++
++void xemu_emucap_apply_input(ControllerState *state)
++{
++    if (state != bound_controllers[0]) {
++        return;
++    }
++
++    G_LOCK(xemu_emucap);
++    if (input.engaged) {
++        state->buttons = input.buttons;
++        memcpy(state->axis, input.axes, sizeof(input.axes));
++    }
++    G_UNLOCK(xemu_emucap);
++}
++
++void xemu_emucap_frame_boundary(void)
++{
++    bool should_stop = false;
++
++    if (!runstate_is_running()) {
++        return;
++    }
++
++    G_LOCK(xemu_emucap);
++    frame_boundary++;
++    if (frame_step_active) {
++        assert(frame_step_remaining > 0);
++        frame_step_remaining--;
++        if (frame_step_remaining == 0) {
++            frame_step_active = false;
++            should_stop = true;
++        }
++    }
++    G_UNLOCK(xemu_emucap);
++
++    if (should_stop) {
++        vm_stop(RUN_STATE_PAUSED);
++    }
++}
++
++void qmp_xemu_emucap_request_screenshot(uint64_t request_id, Error **errp)
++{
++    if (request_id == 0) {
++        error_setg(errp, "screenshot request id must be nonzero");
++        return;
++    }
++
++    G_LOCK(xemu_emucap);
++    if (screenshot.state == XEMU_EMUCAP_SCREENSHOT_PENDING) {
++        G_UNLOCK(xemu_emucap);
++        error_setg(errp, "a screenshot request is already pending");
++        return;
++    }
++
++    g_clear_pointer(&screenshot.filename, g_free);
++    g_clear_pointer(&screenshot.message, g_free);
++    screenshot.request_id = request_id;
++    screenshot.state = XEMU_EMUCAP_SCREENSHOT_PENDING;
++    screenshot.rendering = false;
++    G_UNLOCK(xemu_emucap);
++}
++
++XemuEmucapScreenshotStatus *qmp_xemu_emucap_screenshot_status(
++    uint64_t request_id, Error **errp)
++{
++    XemuEmucapScreenshotStatus *status;
++
++    G_LOCK(xemu_emucap);
++    if (screenshot.state == XEMU_EMUCAP_SCREENSHOT_IDLE ||
++        screenshot.request_id != request_id) {
++        G_UNLOCK(xemu_emucap);
++        error_setg(errp, "unknown screenshot request id");
++        return NULL;
++    }
++
++    status = g_new0(XemuEmucapScreenshotStatus, 1);
++    status->request_id = request_id;
++    switch (screenshot.state) {
++    case XEMU_EMUCAP_SCREENSHOT_IDLE:
++        status->state = XEMU_EMUCAP_SCREENSHOT_STATE_IDLE;
++        break;
++    case XEMU_EMUCAP_SCREENSHOT_PENDING:
++        status->state = XEMU_EMUCAP_SCREENSHOT_STATE_PENDING;
++        break;
++    case XEMU_EMUCAP_SCREENSHOT_COMPLETED:
++        status->state = XEMU_EMUCAP_SCREENSHOT_STATE_COMPLETED;
++        break;
++    case XEMU_EMUCAP_SCREENSHOT_FAILED:
++        status->state = XEMU_EMUCAP_SCREENSHOT_STATE_FAILED;
++        break;
++    }
++    if (screenshot.filename) {
++        status->filename = g_strdup(screenshot.filename);
++    }
++    if (screenshot.message) {
++        status->message = g_strdup(screenshot.message);
++    }
++    G_UNLOCK(xemu_emucap);
++    return status;
++}
++
++bool xemu_emucap_take_screenshot_request(uint64_t *request_id)
++{
++    bool take = false;
++
++    G_LOCK(xemu_emucap);
++    if (screenshot.state == XEMU_EMUCAP_SCREENSHOT_PENDING &&
++        !screenshot.rendering) {
++        screenshot.rendering = true;
++        *request_id = screenshot.request_id;
++        take = true;
++    }
++    G_UNLOCK(xemu_emucap);
++    return take;
++}
++
++void xemu_emucap_complete_screenshot(uint64_t request_id,
++                                     const char *filename,
++                                     const char *message)
++{
++    G_LOCK(xemu_emucap);
++    if (screenshot.state == XEMU_EMUCAP_SCREENSHOT_PENDING &&
++        screenshot.request_id == request_id && screenshot.rendering) {
++        screenshot.rendering = false;
++        if (filename) {
++            screenshot.filename = g_strdup(filename);
++            screenshot.state = XEMU_EMUCAP_SCREENSHOT_COMPLETED;
++        } else {
++            screenshot.message = g_strdup(message ? message :
++                                          "screenshot failed");
++            screenshot.state = XEMU_EMUCAP_SCREENSHOT_FAILED;
++        }
++    }
++    G_UNLOCK(xemu_emucap);
++}
++
++void qmp_xemu_emucap_eject_disc(Error **errp)
++{
++    xemu_eject_disc(errp);
++}
++
++void qmp_xemu_emucap_load_disc(const char *path, Error **errp)
++{
++    xemu_load_disc(path, errp);
++}
+diff --git i/ui/xemu-emucap.h w/ui/xemu-emucap.h
+new file mode 100644
+index 0000000..a7589e5
+--- /dev/null
++++ w/ui/xemu-emucap.h
+@@ -0,0 +1,35 @@
++/*
++ * xemu emucap control extension
++ *
++ * Copyright (C) 2026 emucap contributors
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ */
++
++#ifndef XEMU_EMUCAP_H
++#define XEMU_EMUCAP_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++typedef struct ControllerState ControllerState;
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++void xemu_emucap_apply_input(ControllerState *state);
++void xemu_emucap_frame_boundary(void);
++bool xemu_emucap_take_screenshot_request(uint64_t *request_id);
++void xemu_emucap_complete_screenshot(uint64_t request_id,
++                                     const char *filename,
++                                     const char *message);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git i/ui/xemu-input.c w/ui/xemu-input.c
+index 13193f0..d3ef3e9 100644
+--- i/ui/xemu-input.c
++++ w/ui/xemu-input.c
+@@ -29,6 +29,7 @@
+ #include "qemu/config-file.h"
+ 
+ #include "xemu-input.h"
++#include "xemu-emucap.h"
+ #include "xemu-notifications.h"
+ #include "xemu-settings.h"
+ #include <stdio.h>
+@@ -492,6 +493,7 @@ void xemu_input_update_controller(ControllerState *state)
+     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+         xemu_input_update_sdl_controller_state(state);
+     }
++    xemu_emucap_apply_input(state);
+ 
+     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+ }
+diff --git i/ui/xemu-settings.cc w/ui/xemu-settings.cc
+index 5f9148a..994eb51 100644
+--- i/ui/xemu-settings.cc
++++ w/ui/xemu-settings.cc
+@@ -77,7 +77,11 @@ const char *xemu_settings_get_base_path(void)
+         return base_path;
+     }
+ 
+-    if (xemu_settings_detect_portable_mode()) {
++    if (settings_path != NULL) {
++        char *settings_dir = g_path_get_dirname(settings_path);
++        base_path = g_strdup_printf("%s%c", settings_dir, G_DIR_SEPARATOR);
++        g_free(settings_dir);
++    } else if (xemu_settings_detect_portable_mode()) {
+         const char *base = SDL_GetBasePath();
+         assert(base != NULL);
+         base_path = g_strdup(base);
+diff --git i/ui/xemu.c w/ui/xemu.c
+index 4a2f0ba..956f6a7 100644
+--- i/ui/xemu.c
++++ w/ui/xemu.c
+@@ -72,6 +72,7 @@
+ 
+ uint64_t vblank_interval_ns = 16666666LL;
+ bool use_vblank_timer_thread = true;
++static bool emucap_hidden_window;
+ 
+ struct xemu_console {
+     DisplayChangeListener dcl;
+@@ -1022,6 +1023,9 @@ static void display_very_early_init(DisplayOptions *o)
+     }
+ 
+     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
++    if (emucap_hidden_window) {
++        window_flags = (SDL_WindowFlags)(window_flags | SDL_WINDOW_HIDDEN);
++    }
+ 
+     // Create main window
+     m_window = SDL_CreateWindow(
+@@ -1318,7 +1322,9 @@ int main(int argc, char **argv)
+                 xemu_settings_set_path(argv[i+1]);
+                 argv[i+1] = NULL;
+             }
+-            break;
++        } else if (argv[i] && strcmp(argv[i], "-emucap-hidden") == 0) {
++            argv[i] = NULL;
++            emucap_hidden_window = true;
+         }
+     }
+ 
+diff --git i/ui/xui/main.cc w/ui/xui/main.cc
+index ace02bc..fcc4a7f 100644
+--- i/ui/xui/main.cc
++++ w/ui/xui/main.cc
+@@ -31,6 +31,8 @@
+ #include <string>
+ #include <memory>
+ 
++#include <glib/gstdio.h>
++
+ #include "actions.hh"
+ #include "common.hh"
+ #include "xemu-hud.h"
+@@ -50,6 +52,7 @@
+ #include "welcome.hh"
+ #include "menubar.hh"
+ #include "compat.hh"
++#include "ui/xemu-emucap.h"
+ #if defined(_WIN32)
+ #include "update.hh"
+ #endif
+@@ -65,6 +68,70 @@ static int g_vsync;
+ static GLuint g_tex;
+ static bool g_flip_req;
+ 
++static void RenderEmucapScreenshot()
++{
++    uint64_t request_id;
++    if (!xemu_emucap_take_screenshot_request(&request_id)) {
++        return;
++    }
++
++    std::vector<uint8_t> png;
++    if (!RenderFramebufferToPng(g_tex, g_flip_req, png)) {
++        xemu_emucap_complete_screenshot(request_id, nullptr,
++                                        "failed to encode PNG image");
++        return;
++    }
++
++    const char *screen_root = g_getenv("EMUCAP_XEMU_SCREEN_ROOT");
++    if (!screen_root || !g_path_is_absolute(screen_root)) {
++        xemu_emucap_complete_screenshot(request_id, nullptr,
++                                        "EMUCAP_XEMU_SCREEN_ROOT must be an absolute path");
++        return;
++    }
++
++    char *directory = g_strdup(screen_root);
++    if (g_mkdir_with_parents(directory, 0700) != 0) {
++        char *message = g_strdup_printf("failed to create screenshot directory: %s",
++                                        g_strerror(errno));
++        xemu_emucap_complete_screenshot(request_id, nullptr, message);
++        g_free(message);
++        g_free(directory);
++        return;
++    }
++
++    char *filename = g_strdup_printf("emucap-%020" G_GUINT64_FORMAT ".png",
++                                     static_cast<guint64>(request_id));
++    char *temporary = g_strdup_printf(".%s.tmp", filename);
++    char *path = g_build_filename(directory, filename, nullptr);
++    char *temporary_path = g_build_filename(directory, temporary, nullptr);
++    GError *error = nullptr;
++
++    bool written = g_file_set_contents(temporary_path,
++                                       reinterpret_cast<const char *>(png.data()),
++                                       png.size(), &error);
++    if (written && g_rename(temporary_path, path) != 0) {
++        g_set_error(&error, G_FILE_ERROR, g_file_error_from_errno(errno),
++                    "failed to publish screenshot: %s", g_strerror(errno));
++        written = false;
++    }
++
++    if (written) {
++        xemu_emucap_complete_screenshot(request_id, filename, nullptr);
++    } else {
++        xemu_emucap_complete_screenshot(request_id, nullptr,
++                                        error ? error->message :
++                                                "failed to write screenshot");
++        g_unlink(temporary_path);
++    }
++
++    g_clear_error(&error);
++    g_free(temporary_path);
++    g_free(path);
++    g_free(temporary);
++    g_free(filename);
++    g_free(directory);
++}
++
+ 
+ static void InitializeStyle()
+ {
+@@ -336,4 +403,5 @@ void xemu_hud_render()
+         SaveScreenshot(g_tex, g_flip_req);
+         g_screenshot_pending = false;
+     }
++    RenderEmucapScreenshot();
+ }

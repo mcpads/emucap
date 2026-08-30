@@ -1,0 +1,16 @@
+Copyright (C) 2026 emucap contributors
+SPDX-License-Identifier: GPL-2.0-or-later
+
+The emucap xemu patch, bridge, build recipe, and launcher integration are
+licensed GPL-2.0-or-later, the project default.
+
+The pinned xemu/QEMU emulator as a whole is licensed under GNU GPL version 2.
+Individual source files and bundled dependencies retain their own compatible
+license notices. Those upstream notices remain authoritative and must
+accompany any redistribution of upstream source or binaries.
+
+This repository distributes neither xemu binaries nor Xbox firmware, EEPROM,
+hard-disk images, or game media. Operators build the pinned source and provide
+their own legally obtained machine assets. See ../../NOTICE.
+
+Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

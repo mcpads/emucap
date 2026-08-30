@@ -683,6 +683,27 @@ fn press_buttons_forwards_list_and_frames() {
 }
 
 #[test]
+fn controller_state_forwards_axes_without_changing_button_only_wire_requests() {
+    let mut axis_link = FakeLink::ok(json!({"override_engaged":true}));
+    let axes = std::collections::BTreeMap::from([
+        ("left_x".to_string(), -32768),
+        ("right_trigger".to_string(), 12345),
+    ]);
+    set_controller_state(&mut axis_link, 0, &["a".into()], &axes).unwrap();
+    assert_eq!(
+        axis_link.last_params.unwrap(),
+        json!({"port":0, "buttons":["a"], "axes":{"left_x":-32768, "right_trigger":12345}})
+    );
+
+    let mut button_link = FakeLink::ok(json!({"override_engaged":true}));
+    set_input(&mut button_link, 0, &["a".into()]).unwrap();
+    assert_eq!(
+        button_link.last_params.unwrap(),
+        json!({"port":0, "buttons":["a"]})
+    );
+}
+
+#[test]
 fn run_frames_passes_interrupted_through() {
     let mut link = FakeLink::ok(json!({"status":"interrupted","reason":"breakpoint"}));
     let out = run_frames(&mut link, 100).unwrap();

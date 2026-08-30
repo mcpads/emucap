@@ -39,6 +39,7 @@ pub(super) fn normalize_system(system: &str) -> Option<&'static str> {
         "ps2" | "pcsx2" | "playstation2" | "playstation-2" => Some("ps2"),
         "gamecube" | "game-cube" | "gc" | "ngc" | "dolphin-gc" => Some("gamecube"),
         "wii" | "nintendo-wii" | "dolphin-wii" => Some("wii"),
+        "xbox" | "original-xbox" | "ogxbox" => Some("xbox"),
         _ => None,
     }
 }
@@ -62,6 +63,7 @@ pub(super) fn adapter_for_system(system: &str) -> (&'static str, Option<&'static
         "psp" => ("ppsspp", None),
         "ps2" => ("pcsx2", None),
         "gamecube" | "wii" => ("dolphin", None),
+        "xbox" => ("xemu", None),
         _ => ("", None),
     }
 }
@@ -78,5 +80,5 @@ pub(super) fn adapter_for_system_and_pc98_backend(
 }
 
 pub(super) fn adapter_supports_sound(adapter: &str) -> bool {
-    matches!(adapter, "mednafen" | "mame_pc98")
+    matches!(adapter, "mednafen" | "mame_pc98" | "xemu")
 }
