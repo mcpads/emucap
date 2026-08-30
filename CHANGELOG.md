@@ -4,6 +4,8 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.16.0-alpha.1
+
 ### Added
 - Added a managed original Xbox path based on a pinned xemu fork. It provides isolated machine
   generations, controlled pre-first-instruction start, bounded QMP/GDB control, CPU memory and
