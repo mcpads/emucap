@@ -733,7 +733,6 @@ pub(super) fn launch_mupen64plus(
         log_path: &log,
         port,
         name: a.name.as_deref(),
-        build: Some(BUILD_HASH),
         session_token: token,
         runtime: Some(runtime),
         display,

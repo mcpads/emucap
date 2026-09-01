@@ -16,6 +16,10 @@ pub use super::tools_state::{save_state, save_state_for_recording};
 mod pointer;
 pub use pointer::{click_pointer, drag_pointer, move_pointer};
 
+#[path = "tools/probe.rs"]
+mod probe_operation;
+pub use probe_operation::{probe, probe_available, probe_available_for_methods};
+
 #[derive(Debug, PartialEq)]
 pub enum ToolOutput {
     Json(Value),
@@ -60,24 +64,6 @@ pub fn read_memory(
     Ok(ToolOutput::Json(link.call("read_memory", params)?))
 }
 
-/// 세이브스테이트 복귀 → frame 진행 → 타깃 읽기를 adapter 안에서 한 단위로 수행한다.
-/// 프레임 경계 탐색과 regression뿐 아니라 에이전트가 직접 probe를 호출할 때도 같은 경로를 쓴다.
-pub fn probe(
-    link: &mut dyn EmulatorLink,
-    state: &str,
-    frame: u64,
-    memory_type: &str,
-    address: u64,
-    length: u64,
-) -> Result<ToolOutput, LinkError> {
-    validate_sync_advance("probe frame", frame)?;
-    let params = json!({
-        "state": state, "frame": frame,
-        "memory_type": memory_type, "address": address, "length": length,
-    });
-    Ok(ToolOutput::Json(link.call("probe", params)?))
-}
-
 /// 에뮬 메모리 영역을 어댑터 내부에서 스캔해 바이트열(hex) 패턴의 매칭 오프셋들만 회신한다.
 /// 128KB를 와이어로 안 보내고 오프셋만 돌려줘 토큰·지연을 최소화한다(런타임 문자열/버퍼/테이블 특정).
 pub fn find_pattern(
@@ -99,12 +85,20 @@ pub fn find_pattern(
     Ok(ToolOutput::Json(link.call("find_pattern", params)?))
 }
 
-/// Insert an optional `cpu` selector into a params object. Single-core adapters ignore it;
-/// the NDS bridge routes it to the ARM9/ARM7 connection (`arm9`/`arm7`, or `both` for resume).
-fn with_cpu(params: &mut serde_json::Value, cpu: Option<&str>) {
-    if let (Some(cpu), Some(obj)) = (cpu, params.as_object_mut()) {
+/// Resolve an optional CPU name against the generation-bound target catalog and put the canonical
+/// id on the wire. Legacy third-party adapters without a catalog retain pass-through behavior.
+fn with_cpu(
+    link: &dyn EmulatorLink,
+    params: &mut serde_json::Value,
+    cpu: Option<&str>,
+) -> Result<Option<String>, LinkError> {
+    let selected =
+        crate::debug_selection::resolve_cpu_target(&link.capabilities().identity.cpu_targets, cpu)
+            .map_err(bad_debug_parameter)?;
+    if let (Some(cpu), Some(obj)) = (selected.as_deref(), params.as_object_mut()) {
         obj.insert("cpu".into(), json!(cpu));
     }
+    Ok(selected)
 }
 
 pub fn get_state(
@@ -112,13 +106,39 @@ pub fn get_state(
     groups: &[String],
     cpu: Option<&str>,
 ) -> Result<ToolOutput, LinkError> {
-    let mut params = if groups.is_empty() {
+    let advertised_groups = link.capabilities().identity.state_groups.clone();
+    let resolved_groups = if groups.is_empty() || advertised_groups.is_empty() {
+        Vec::new()
+    } else {
+        crate::debug_selection::resolve_state_groups(groups, &advertised_groups)
+            .map_err(bad_debug_parameter)?
+    };
+    let mut params = if resolved_groups.is_empty() {
         json!({})
     } else {
-        json!({ "groups": groups })
+        json!({ "groups": resolved_groups })
     };
-    with_cpu(&mut params, cpu);
-    Ok(ToolOutput::Json(link.call("get_state", params)?))
+    with_cpu(link, &mut params, cpu)?;
+    let response = link.call("get_state", params)?;
+    let response =
+        crate::debug_selection::project_state_groups(response, groups, &advertised_groups)
+            .map_err(|message| {
+                if message.starts_with("unknown state group")
+                    || message.starts_with("groups entries")
+                {
+                    bad_debug_parameter(message)
+                } else {
+                    LinkError::Protocol(format!("invalid get_state projection: {message}"))
+                }
+            })?;
+    Ok(ToolOutput::Json(response))
+}
+
+fn bad_debug_parameter(message: String) -> LinkError {
+    LinkError::Emulator {
+        kind: "bad_params".into(),
+        message,
+    }
 }
 
 /// Saturn VDP2 비디오 상태를 per-NBG로 디코드해 반환한다(어댑터가 RawRegs를 렌더러 공식으로 디코드).
@@ -608,7 +628,7 @@ pub fn run_frames(link: &mut dyn EmulatorLink, n: u64) -> Result<ToolOutput, Lin
 
 pub fn pause(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {
     let mut params = json!({});
-    with_cpu(&mut params, cpu);
+    with_cpu(link, &mut params, cpu)?;
     Ok(ToolOutput::Json(link.call("pause", params)?))
 }
 
@@ -639,13 +659,13 @@ pub fn step(
         StepUnit::Frames => ("step", json!({ "frames": count })),
         StepUnit::Instructions => ("step_instructions", json!({ "count": count })),
     };
-    with_cpu(&mut params, cpu);
+    with_cpu(link, &mut params, cpu)?;
     Ok(ToolOutput::Json(link.call(method, params)?))
 }
 
 pub fn resume(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {
     let mut params = json!({});
-    with_cpu(&mut params, cpu);
+    with_cpu(link, &mut params, cpu)?;
     Ok(ToolOutput::Json(link.call("resume", params)?))
 }
 
@@ -797,8 +817,14 @@ pub fn disassemble(
     mode: Option<&str>,
 ) -> Result<ToolOutput, LinkError> {
     let mut params = json!({ "address": address, "count": count });
-    with_cpu(&mut params, cpu);
-    if let (Some(mode), Some(params)) = (mode, params.as_object_mut()) {
+    let selected_cpu = with_cpu(link, &mut params, cpu)?;
+    let selected_mode = crate::debug_selection::resolve_disassembly_mode(
+        &link.capabilities().identity.cpu_targets,
+        selected_cpu.as_deref(),
+        mode,
+    )
+    .map_err(bad_debug_parameter)?;
+    if let (Some(mode), Some(params)) = (selected_mode, params.as_object_mut()) {
         params.insert("mode".into(), json!(mode));
     }
     Ok(ToolOutput::Json(link.call("disassemble", params)?))
@@ -873,7 +899,7 @@ pub fn get_trace(link: &mut dyn EmulatorLink, count: u64) -> Result<ToolOutput, 
 /// 재구성하고, 다른 backend는 정지 시점의 프레임 포인터나 네이티브 unwinder를 사용한다.
 pub fn call_stack(link: &mut dyn EmulatorLink, cpu: Option<&str>) -> Result<ToolOutput, LinkError> {
     let mut params = json!({});
-    with_cpu(&mut params, cpu);
+    with_cpu(link, &mut params, cpu)?;
     Ok(ToolOutput::Json(link.call("call_stack", params)?))
 }
 

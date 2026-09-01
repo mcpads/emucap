@@ -5,6 +5,7 @@ pub mod ccd;
 pub mod content_identity;
 pub mod contracts;
 pub mod cue;
+pub mod debug_selection;
 pub mod event_contracts;
 pub mod gdb_rsp;
 pub mod gdi;

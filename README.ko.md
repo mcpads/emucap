@@ -16,6 +16,8 @@ MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
+GPL-2.0-or-later로 배포한다. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 참고한다.
+
 ## 플랫폼
 
 Rust Core(두 MCP)와 Rust `launch` 도구는 크로스플랫폼이다(macOS Apple Silicon+Intel, Linux,
@@ -142,6 +144,8 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
   `determinism_replay`의 `kind=machine` 판정)·`log_metric`으로 기록한다.
 - **프레임 경계 탐색은 debug `probe` operation을 조립**: 같은 베이스 상태에서 원자적 probe를 반복해 프레임
   범위를 이분한다. 각 호출이 상태 복원·진행·판정을 한 번에 수행하므로 호출 사이 지연은 결과를 바꾸지 않는다.
+  유지보수 어댑터가 native transaction을 제공하거나, Control이 generation link를 잡은 채 검증된
+  pause/resume/load/exact-step/read를 조합한다. 실제 호출 가능한 결과만 live `status.methods`에 나타난다.
 - **개입은 명시 기록**: `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동
   기록하지 않으므로, 재현 충실도(repro_status)를 위해 추적 MCP의 `log_intervention`으로 직접 남긴다.
 
@@ -273,7 +277,7 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   `EMUCAP_PCSX2_BIOS`에 사용자가 준비한 BIOS 덤프의 절대경로를 지정한다. 격리된 headless 실행에서
   EE 메모리·레지스터·패턴 검색·덤프, 프레임 스텝, 디스어셈블, frozen 세이브스테이트,
   스크린샷·컨트롤러 입력, 레지스터 스냅샷을 포함한 정지형 EE 브레이크포인트,
-  best-effort 콜스택과 동기식 리셋을 bounded PINE 브리지로 지원한다.
+  best-effort 콜스택, 원자적 state/frame/memory probe와 동기식 리셋을 bounded PINE 브리지로 지원한다.
   → `adapters/pcsx2/README.md`
 - **Dolphin (GameCube·Wii)** — `adapters/dolphin/build.sh`(Windows: `build.ps1`)로 고정된 native
   포크를 빌드한다. 기본 실행은 headless이고 GUI 빌드가 있으면 `display: true`로 DolphinQt 창을 연다.

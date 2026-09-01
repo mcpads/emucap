@@ -204,7 +204,8 @@ analog-input tool yet).
 (`memory.read`/`memory.write`, base64 on the wire), `dump_memory` (streams each region — today
 `main`, user RAM — via `memory.read` in 128 KiB chunks to `<name>.bin` + `regions.json`, plus a
 `state.json` register snapshot, the same `.bin`/`regions.json`/`state.json` bundle the cross-ROM
-diff loader consumes for every adapter), `get_state` (`cpu.getAllRegs`'s GPR category
+diff loader consumes for every adapter), `find_pattern` (a bounded `main`-memory scan returning
+region-relative offsets), `get_state` (`cpu.getAllRegs`'s GPR category
 flattened to `cpu.<name>`), `disassemble` (`memory.disasm`), `set_breakpoint`/`clear_breakpoint`/
 `list_breakpoints`/`clear_all_breakpoints` (`cpu.breakpoint.*` for exec, `memory.breakpoint.*` for
 read/write, both with an optional `condition` expression), `step(unit="instructions")` (the MCP
@@ -229,6 +230,10 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
   VBlank-start boundaries and returns frozen. A breakpoint or other native stop returns
   `interrupted` with the completed count. The MCP `tap`, `hold_until`, `regression_run`, and
   `verify_determinism` composites are admitted on top of this exact clock and native savestate.
+- `probe` — the Rust bridge halts first, then composes one native state load, exact frame advance,
+  and frozen memory read without another client request interleaving. Halting first prevents the
+  load acknowledgement from restoring a previously running CPU between restore and step. It uses
+  the same fork commands as the preceding two items and does not require another host hook.
 
 **Tier 3 (stock debugger data with an emucap contract)**:
 - `call_stack` — frozen-only `hle.backtrace`, bounded to 256 frames. PPSSPP derives the stack from
@@ -236,11 +241,10 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
   early, so `status.contracts` advertises `debug.call-stack="best_effort"` rather than an
   authoritative unwind.
 
-**Not yet supported (`status.capability_notes.planned_methods`/other gaps — `status.methods` is
-authoritative, not this list)**:
+**Profile boundaries (`status.methods` is authoritative)**:
 - raw wire `run_frames` — exact frozen-terminal frame `step` is the supported time primitive.
-- `probe`, `find_pattern`, `watch_register`, `set_trace`/`get_trace`,
-  `break_on_reset` — no bridge/fork hook yet.
+- `watch_register`, `set_trace`/`get_trace`, and `break_on_reset` have no native hook in this
+  profile. They are not advertised as future methods; callers discover only working operations.
 - Structured breakpoint value-conditions (`value`/`value_mask`/`value_len`) — unsupported; use a
   raw `condition` expression (PPSSPP's own expression language) instead, or
   `pc_min`/`pc_max`, which the bridge compiles into one automatically.

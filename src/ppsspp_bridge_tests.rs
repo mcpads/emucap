@@ -172,6 +172,8 @@ fn status_reports_connected_and_version() {
     assert!(resp.ok, "{:?}", resp.error);
     let result = resp.result.unwrap();
     assert_eq!(result["system"], "psp");
+    assert_eq!(result["state_groups"], json!(["cpu"]));
+    assert_eq!(result["cpu_targets"][0]["id"], "main");
     assert_eq!(
         result["execution_limits"]["max_sync_advance_count"],
         crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
@@ -337,6 +339,7 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
     assert_eq!(result["system"], "psp");
     assert_eq!(result["adapter"], "ppsspp-rust-ws");
     assert_eq!(result["backend"], "ppsspp-debugger-ws");
+    assert_eq!(result["build"], crate::build_identity::BUILD_HASH);
     assert_eq!(result["debugger"], true);
     assert_eq!(result["memory_types"], json!(["main"]));
     assert_eq!(result["breakpoint_kinds"][0]["kind"], "exec");
@@ -352,6 +355,11 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
     );
 
     let methods = result["methods"].as_array().unwrap();
+    assert_eq!(result["state_groups"], json!(["cpu"]));
+    assert_eq!(
+        result["cpu_targets"][0]["aliases"],
+        json!(["mips", "allegrex"])
+    );
     for wanted in [
         "hello",
         "status",
@@ -421,35 +429,13 @@ fn hello_advertises_psp_surface_and_truthful_methods() {
         contract_status.errors
     );
 
-    // Implemented frame `step` must never appear in the not-yet-callable list.
-    let planned = caps["planned_methods"].as_array().unwrap();
-    assert!(
-        !planned.iter().any(|m| m == "step"),
-        "frame `step` must not be advertised as a planned/not-yet-callable method"
-    );
-    for undispatched in [
-        "run_frames",
-        "probe",
-        "find_pattern",
-        "watch_register",
-        "set_trace",
-        "get_trace",
-        "break_on_reset",
-    ] {
+    assert!(caps.get("planned_methods").is_none());
+    for implemented in ["step", "dump_memory", "find_pattern", "probe"] {
         assert!(
-            planned.iter().any(|m| m == undispatched),
-            "planned_methods missing {undispatched}"
+            methods.iter().any(|method| method == implemented),
+            "working method missing from hello: {implemented}"
         );
     }
-    // dump_memory is implemented now — it must be a callable method, not advertised as planned.
-    assert!(
-        methods.iter().any(|m| m == "dump_memory"),
-        "dump_memory must be advertised as a callable method"
-    );
-    assert!(
-        !planned.iter().any(|m| m == "dump_memory"),
-        "dump_memory must not be advertised as planned/unsupported once implemented"
-    );
 }
 
 #[test]
@@ -460,7 +446,7 @@ fn hello_echoes_session_token_and_name_when_launcher_set_them() {
     // session_token. `with_identity` supplies both without mutating process env.
     let mut bridge = PpssppBridge::with_identity(
         FakeWs::with(&[]),
-        None,
+        Some(PathBuf::from("/tmp/managed-psp.iso")),
         Some("psp_session".to_string()),
         Some("tok-abc123".to_string()),
     );
@@ -469,6 +455,7 @@ fn hello_echoes_session_token_and_name_when_launcher_set_them() {
     let result = resp.result.unwrap();
     assert_eq!(result["name"], "psp_session");
     assert_eq!(result["session_token"], "tok-abc123");
+    assert_eq!(result["content"], "/tmp/managed-psp.iso");
 }
 
 #[test]
@@ -487,8 +474,6 @@ fn unsupported_whole_methods_return_unsupported_not_unknown_method() {
     // "unsupported" kind, not "unknown_method" (reserved for genuine typos).
     for name in [
         "run_frames",
-        "probe",
-        "find_pattern",
         "watch_register",
         "set_trace",
         "get_trace",
@@ -542,6 +527,107 @@ fn read_memory_defaults_memory_type_to_main() {
     ));
     assert!(resp.ok, "{:?}", resp.error);
     assert_eq!(bridge.ws.calls[0].1["address"], 0x0880_0000u64);
+}
+
+#[test]
+fn find_pattern_scans_a_frozen_window_and_returns_region_offsets() {
+    let b64 =
+        base64::engine::general_purpose::STANDARD.encode([0xaa_u8, 0xbb, 0x00, 0xaa, 0xbb, 0x00]);
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
+        ("memory.read", json!({"event":"memory.read", "base64":b64})),
+    ]));
+    let response = bridge.handle_request(Request::new(
+        2,
+        "find_pattern",
+        json!({
+            "memory_type":"main", "start":0x20, "length":6,
+            "hex":"aabb", "max_matches":4, "align":1
+        }),
+    ));
+    assert!(response.ok, "{response:?}");
+    let result = response.result.unwrap();
+    assert_eq!(result["matches"], json!([0x20, 0x23]));
+    assert_eq!(result["scanned"], 6);
+    assert_eq!(result["truncated"], false);
+    assert_eq!(bridge.ws.calls[1].1["address"], PSP_MAIN_RAM_BASE + 0x20);
+    assert_eq!(bridge.ws.calls[1].1["size"], 6);
+}
+
+#[test]
+fn probe_restores_advances_and_reads_before_returning() {
+    let b64 = base64::engine::general_purpose::STANDARD.encode([0x12_u8, 0x34]);
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
+        ("savestate.load", json!({"event":"savestate.load"})),
+        ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
+        (
+            "emucap.frameStep",
+            json!({
+                "event":"emucap.frameStep", "status":"completed", "count":2,
+                "completed":2, "state":"frozen"
+            }),
+        ),
+        ("memory.read", json!({"event":"memory.read", "base64":b64})),
+    ]));
+    let response = bridge.handle_request(Request::new(
+        3,
+        "probe",
+        json!({
+            "state":"/tmp/base.ppst", "frame":2,
+            "memory_type":"main", "address":0x40, "length":2
+        }),
+    ));
+    assert!(response.ok, "{response:?}");
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["completed_frames"], 2);
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(result["hex"], "1234");
+    assert_eq!(
+        bridge
+            .ws
+            .calls
+            .iter()
+            .map(|(event, _)| event.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "cpu.status",
+            "savestate.load",
+            "cpu.status",
+            "emucap.frameStep",
+            "memory.read"
+        ]
+    );
+}
+
+#[test]
+fn probe_rejects_invalid_inputs_before_loading_state() {
+    for params in [
+        json!({
+            "state":"/tmp/base.ppst",
+            "frame":crate::live::temporal::MAX_SYNC_ADVANCE_COUNT + 1,
+            "memory_type":"main", "address":0, "length":1
+        }),
+        json!({
+            "state":"/tmp/base.ppst", "frame":0,
+            "memory_type":"main", "address":PSP_MAIN_RAM_SIZE - 1, "length":2
+        }),
+        json!({
+            "state":"/tmp/base.ppst", "frame":0,
+            "memory_type":"vram", "address":0, "length":1
+        }),
+        json!({
+            "state":"/tmp/base.ppst", "frame":0,
+            "memory_type":"main", "address":0, "length":0
+        }),
+    ] {
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[]));
+        let response = bridge.handle_request(Request::new(4, "probe", params));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+        assert!(bridge.ws.calls.is_empty());
+    }
 }
 
 #[test]

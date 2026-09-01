@@ -1858,6 +1858,10 @@ fn probe_restores_state_and_uses_lua_register_probe() {
         }),
     ));
     let result = response.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["requested_frames"], 3);
+    assert_eq!(result["completed_frames"], 3);
+    assert_eq!(result["state"], "frozen");
     assert_eq!(result["hex"], "cafe");
     assert_eq!(result["frame"], 3);
     assert_eq!(result["save_items_restored"], 1);

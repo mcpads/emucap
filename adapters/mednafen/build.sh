@@ -137,7 +137,7 @@ tar xf "$TARBALL" -C "$SRC" --strip-components=1
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
   "$HERE/emucap_recording.cpp" "$HERE/emucap_recording.h" \
   "$HERE/emucap_ngp.h" \
-  "$HERE/emucap_json_num.h" "$SRC/src/drivers/"
+  "$HERE/emucap_json_num.h" "$HERE/emucap_json_strings.h" "$SRC/src/drivers/"
 cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
   "$SRC/src/ngp/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
@@ -148,14 +148,14 @@ BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 git -C "$HERE" diff --quiet HEAD -- \
   emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
   emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
-  emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
+  emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 PATCHSET_SHA256="$({
   for path in \
     build.sh emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
-    emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h \
+    emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
     emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
   done
@@ -298,6 +298,30 @@ perl -0777 -pi -e 's{if\(PC >= bpit->A\[0\] && PC <= bpit->A\[1\]\)}{if(emucap_e
   "$SRC/src/psx/debug.cpp"
 inject_check 'const uint32 emucap_exec_pc = EmuCapFoldExecAddress(PC);' "$SRC/src/psx/debug.cpp" "psx/debug.cpp exec PC fold 삽입 실패"
 inject_check 'if(emucap_exec_pc >= bpit->A[0] && emucap_exec_pc <= bpit->A[1])' "$SRC/src/psx/debug.cpp" "psx/debug.cpp mirrored exec BP 비교 삽입 실패"
+
+# A state load or reset from the debugger callback replaces PSX CPU state while RunReal still has
+# the old PC, pipeline, and timestamp in local variables. Upstream's post-load ForceEventUpdates(0)
+# then conflicts with that stale timestamp and can abort in PSX_EventHandler on the next advance.
+# Mark an in-run replacement in StateAction/Power, discard the old locals after the callback, and
+# continue from the restored backing state without executing an instruction in between.
+perl -0777 -pi -e 's{( void \(\*ADDBT\)\(uint32 from, uint32 to, bool exception\);\n)}{${1} bool RunActive;\n bool ActiveStateReplaced;\n} unless m{ActiveStateReplaced}' \
+  "$SRC/src/psx/cpu.h"
+perl -0777 -pi -e 's{( ADDBT = NULL;\n)}{${1}\n RunActive = false;\n ActiveStateReplaced = false;\n} unless m{RunActive = false}' \
+  "$SRC/src/psx/cpu.cpp"
+perl -0777 -pi -e 's{(void PS_CPU::Power\(void\)\n\{\n)}{${1} if(RunActive)\n  ActiveStateReplaced = true;\n} unless m{void PS_CPU::Power\(void\).*?ActiveStateReplaced}s' \
+  "$SRC/src/psx/cpu.cpp"
+perl -0777 -pi -e 's{(void PS_CPU::StateAction\(StateMem \*sm, const unsigned load, const bool data_only\).*?\n if\(load\)\n \{\n)(?!  // emucap: replace the active execution context after an in-callback state load\.\n)}{${1}  // emucap: replace the active execution context after an in-callback state load.\n  if(RunActive)\n   ActiveStateReplaced = true;\n}s' \
+  "$SRC/src/psx/cpu.cpp"
+perl -0777 -pi -e 's{(pscpu_timestamp_t PS_CPU::RunReal\(pscpu_timestamp_t timestamp_in\)\n\{\n pscpu_timestamp_t timestamp = timestamp_in;\n)}{${1}\n RunActive = true;\n ActiveStateReplaced = false;\n} unless m{RunActive = true}' \
+  "$SRC/src/psx/cpu.cpp"
+perl -0777 -pi -e 's{(    CPUHook\(timestamp, PC\);\n)(\n    // For save states in step mode\.)}{${1}\n    if(MDFN_UNLIKELY(ActiveStateReplaced))\n    {\n     ActiveStateReplaced = false;\n     timestamp = 0;\n     BACKING_TO_ACTIVE;\n     continue;\n    }\n${2}} unless m{MDFN_UNLIKELY\(ActiveStateReplaced\)}' \
+  "$SRC/src/psx/cpu.cpp"
+perl -0777 -pi -e 's{(\n ACTIVE_TO_BACKING;\n\n)( return\(timestamp\);)}{${1} RunActive = false;\n\n${2}} unless m{ACTIVE_TO_BACKING;\n\n RunActive = false;}' \
+  "$SRC/src/psx/cpu.cpp"
+inject_check 'bool ActiveStateReplaced;' "$SRC/src/psx/cpu.h" "psx/cpu.h active-state replacement flag insertion failed"
+inject_check '// emucap: replace the active execution context after an in-callback state load.' "$SRC/src/psx/cpu.cpp" "psx/cpu.cpp state-load replacement flag insertion failed"
+inject_check 'if(MDFN_UNLIKELY(ActiveStateReplaced))' "$SRC/src/psx/cpu.cpp" "psx/cpu.cpp stale callback context discard insertion failed"
+inject_check 'RunActive = false;' "$SRC/src/psx/cpu.cpp" "psx/cpu.cpp run boundary tracking insertion failed"
 
 # 4g. 입력 진단 — PSX(psx/input/gamepad.cpp): UpdateInput이 읽은 버튼 비트(d8[0..1]) 기록.
 perl -0777 -pi -e 's/(#include "gamepad\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \

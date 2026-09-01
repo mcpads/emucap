@@ -430,6 +430,23 @@ picojson::object Hello(Core::System&, const picojson::object&)
   if (gamecube || wii_input)
     methods.push_back(picojson::value(std::string("set_input")));
   r["methods"] = picojson::value(methods);
+  picojson::array state_groups;
+  state_groups.push_back(picojson::value(std::string("cpu")));
+  r["state_groups"] = picojson::value(state_groups);
+  picojson::object cpu_target;
+  cpu_target["id"] = picojson::value(std::string("main"));
+  picojson::array cpu_aliases;
+  cpu_aliases.push_back(picojson::value(std::string("ppc")));
+  cpu_aliases.push_back(picojson::value(std::string("powerpc")));
+  cpu_target["aliases"] = picojson::value(cpu_aliases);
+  cpu_target["default"] = picojson::value(true);
+  picojson::array disassembly_modes;
+  disassembly_modes.push_back(picojson::value(std::string("auto")));
+  disassembly_modes.push_back(picojson::value(std::string("ppc")));
+  cpu_target["disassembly_modes"] = picojson::value(disassembly_modes);
+  picojson::array cpu_targets;
+  cpu_targets.push_back(picojson::value(cpu_target));
+  r["cpu_targets"] = picojson::value(cpu_targets);
   picojson::array breakpoint_kinds;
   for (const auto [kind, range_mode, memory_type_used] :
        {std::tuple{"exec", "exact", false}, std::tuple{"read", "inclusive", true},

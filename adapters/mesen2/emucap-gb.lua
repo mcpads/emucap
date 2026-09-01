@@ -5,6 +5,8 @@
 SYS = {
   system = "gb",
   system_label = "Game Boy",
+  cpu_target = { id = "main", aliases = { "sm83" },
+    disassembly_modes = { "auto", "sm83" } },
   cpu_type = "gameboy",              -- emu.cpuType.gameboy (GB/GBC 공통, SM83)
   default_memtype = "gameboyMemory", -- emu.memType.gameboyMemory (SM83 CPU 버스 $0000-$FFFF)
   address_space_size = 0x10000,

@@ -156,17 +156,6 @@
       "verification": ["contract-test:mednafen-press-buttons-port-rejected"]
     },
     {
-      "id": "mednafen.state.groups-absent",
-      "feature": "state.read",
-      "kind": "parameter_constraint",
-      "targets": ["CORE.PARAM.1", "STATE.FILTER.1"],
-      "scope": {"adapter": "mednafen"},
-      "activation": {"groups": "non_empty"},
-      "constraints": {"state.groups.supported": false},
-      "public_behavior": {"invalid": "bad_params"},
-      "verification": ["contract-test:mednafen-state-groups-rejected"]
-    },
-    {
       "id": "flycast.execution.instruction-step-absent",
       "feature": "execution.step",
       "kind": "capability_absent",

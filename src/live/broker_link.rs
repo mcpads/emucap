@@ -143,6 +143,8 @@ fn connect_expected(
         &registry,
     )
     .map_err(|error| LinkError::Protocol(error.to_string()))?;
+    crate::debug_selection::parse_debug_capabilities(&res)
+        .map_err(|error| LinkError::Protocol(format!("invalid debug capabilities: {error}")))?;
     link.caps = Capabilities {
         protocol_version: PROTOCOL_VERSION,
         methods,

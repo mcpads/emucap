@@ -363,6 +363,7 @@ fn result(response: Response) -> Value {
 fn hello_advertises_only_the_display_proven_screenshot_surface() {
     let (mut visible, _, _) = fixture(true);
     let visible_hello = result(visible.handle_request(Request::new(1, "hello", json!({}))));
+    assert_eq!(visible_hello["build"], crate::build_identity::BUILD_HASH);
     assert_eq!(visible_hello["host_api"], 3);
     assert!(visible_hello["methods"]
         .as_array()

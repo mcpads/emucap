@@ -107,6 +107,9 @@ adapter's `step_instructions` wire method), `set_breakpoint`
   `savestate_save` / `savestate_load` (saves.cpp). The path is hex-encoded to be RSP-safe. Returns
   `{path, status}`. A savestate is global state (both cores + PPU/SPU), so it rides the ARM9
   connection — call it while stopped.
+- public `probe` — Control freezes the shared scheduler, loads the global state, advances the exact
+  ARM9 VBlank clock, and reads memory while holding one generation link. It is a real atomic
+  operation even though the RSP fork has no separate `probe` packet.
 - `disassemble` — the fork's `qEmucap,disasm:<addr>,<count>[,<mode>]` decodes instructions with
   DeSmuME's disassembler tables (`des_{arm,thumb}_instructions_set`) and returns `<addr>|<opcode>|<text>`
   lines base64-encoded. With no mode, ARM/Thumb is chosen from the CPU's CPSR T-bit (force with `arm` /
@@ -142,6 +145,8 @@ The fork keeps both stub states synchronized without sending duplicate stop pack
   independently running ARM7.
 - `resume(cpu:"both")` remains a compatibility alias. It sends one ARM9 continue packet, not one
   packet per endpoint.
+- Frame-unit `step` is initiated through ARM9 (`cpu:"arm9"`, the `both` alias, or omitted), but it
+  always advances the shared scheduler and observes breakpoint preemption from both endpoints.
 - A breakpoint or instruction step on either CPU stops the shared scheduler and leaves both
   endpoints available for inspection.
 

@@ -80,7 +80,7 @@ The adapter advertises:
 
 - `get_rom_info`, `status`;
 - frozen-only `change_media` for the two main memory-card slots;
-- `read_memory`, `write_memory`, `find_pattern`, `dump_memory`;
+- `read_memory`, `write_memory`, `find_pattern`, `dump_memory`, and atomic `probe`;
 - `get_state`;
 - `pause`, `resume`, and frame-unit `step`;
 - `disassemble`;
@@ -109,6 +109,10 @@ before returning. Large dumps are streamed in bounded chunks and committed by re
 `get_state` returns the EE PC, the low 64 bits of all 32 general-purpose registers, and HI/LO.
 `disassemble(address, count)` takes a four-byte-aligned EE absolute address and uses PCSX2's EE
 decoder.
+
+`probe(state, frame, memory_type="ee", address, length)` keeps one bridge transaction across a
+frozen state load, an exact bounded frame advance, and the final memory read. No caller-latency
+window can enter between those operations; the result remains frozen.
 
 ### Breakpoints and call stacks
 

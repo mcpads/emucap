@@ -75,7 +75,6 @@ pub(super) fn launch_openmsx(
         port,
         name: args.name.as_deref(),
         session_token: token,
-        build: Some(BUILD_HASH),
         runtime: Some(runtime),
         display,
     };

@@ -139,11 +139,14 @@ fn rejects_stock_pine_without_the_host_api() {
 #[test]
 fn hello_reports_the_managed_ps2_surface() {
     let mut bridge = bridge(vec![]);
+    bridge.content = Some(PathBuf::from("/tmp/managed-ps2.iso"));
     let response = bridge.handle_request(Request::new(1, "hello", json!({})));
     assert!(response.ok);
     let result = response.result.unwrap();
     assert_eq!(result["system"], "ps2");
     assert_eq!(result["adapter"], "pcsx2-rust-pine");
+    assert_eq!(result["build"], crate::build_identity::BUILD_HASH);
+    assert_eq!(result["content"], "/tmp/managed-ps2.iso");
     assert_eq!(result["name"], "ps2-test");
     assert_eq!(result["session_token"], "token");
     assert_eq!(result["breakpoint_kinds"][0]["range_mode"], "exact");
@@ -187,6 +190,13 @@ fn hello_reports_the_managed_ps2_surface() {
         .unwrap()
         .iter()
         .any(|method| method == "change_media"));
+    assert!(result["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|method| method == "probe"));
+    assert_eq!(result["state_groups"], json!(["cpu"]));
+    assert_eq!(result["cpu_targets"][0]["id"], "main");
     assert_eq!(result["media_devices"][1]["id"], "mcd2");
 }
 
@@ -328,6 +338,67 @@ fn savestate_paths_must_be_absolute_and_are_length_prefixed() {
         json!({"path":"relative.p2s"}),
     ));
     assert_eq!(response.error.unwrap().kind, "bad_params");
+}
+
+#[test]
+fn probe_restores_advances_and_reads_in_one_frozen_request() {
+    let path = "/tmp/ps2-probe.p2s";
+    let mut load = vec![MSG_EMUCAP_LOAD_STATE];
+    load.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    load.extend_from_slice(path.as_bytes());
+    let mut advance = vec![MSG_EMUCAP_FRAME_ADVANCE];
+    advance.extend_from_slice(&2u32.to_le_bytes());
+    let mut read = vec![MSG_EMUCAP_READ_BYTES];
+    read.extend_from_slice(&0x120u32.to_le_bytes());
+    read.extend_from_slice(&3u32.to_le_bytes());
+    let mut bridge = bridge(vec![
+        (vec![MSG_EMUCAP_PAUSE], Ok(vec![])),
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (load, Ok(vec![])),
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (advance, Ok(vec![])),
+        (read, Ok(vec![0xaa, 0xbb, 0xcc])),
+    ]);
+    let response = bridge.handle_request(Request::new(
+        11,
+        "probe",
+        json!({
+            "state":path, "frame":2, "memory_type":"ee", "address":0x120, "length":3
+        }),
+    ));
+    assert!(response.ok, "{response:?}");
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "completed");
+    assert_eq!(result["completed_frames"], 2);
+    assert_eq!(result["state"], "frozen");
+    assert_eq!(result["hex"], "aabbcc");
+}
+
+#[test]
+fn probe_rejects_invalid_inputs_before_pausing_or_loading() {
+    for params in [
+        json!({
+            "state":"relative.p2s", "frame":0,
+            "memory_type":"ee", "address":0, "length":1
+        }),
+        json!({
+            "state":"/tmp/base.p2s", "frame":16,
+            "memory_type":"ee", "address":0, "length":1
+        }),
+        json!({
+            "state":"/tmp/base.p2s", "frame":0,
+            "memory_type":"ee", "address":PCSX2_EE_RAM_SIZE - 1, "length":2
+        }),
+        json!({
+            "state":"/tmp/base.p2s", "frame":0,
+            "memory_type":"ee", "address":0, "length":0
+        }),
+    ] {
+        let mut bridge = bridge(vec![]);
+        let response = bridge.handle_request(Request::new(12, "probe", params));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+    }
 }
 
 #[test]

@@ -30,7 +30,8 @@ history. It reports completeness and dropped history explicitly; it never mixes 
 main-CPU result.
 
 Visible launch additionally advertises rendered-frame stepping, bounded `run_frames`,
-`press_buttons`, PNG screenshot, and native save/load. Its callback barrier freezes inside the
+`press_buttons`, PNG screenshot, native save/load, and Control-composed atomic state/frame/memory
+`probe`. Its callback barrier freezes inside the
 exact Mupen64Plus frame callback and rearms before releasing the preceding frame, so multiple
 display lists in one R4300 task cannot escape between requests. The adapter does not combine that
 barrier with the core's separate frame-advance pause. Visible readiness remains false until the

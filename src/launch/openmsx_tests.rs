@@ -107,7 +107,6 @@ fn launch_spec_isolates_and_passes_exact_process_identity_inputs() {
         port: 47901,
         name: Some("msx-test"),
         session_token: Some("token"),
-        build: Some("abc123"),
         runtime: None,
         display: false,
     };
@@ -127,9 +126,7 @@ fn launch_spec_isolates_and_passes_exact_process_identity_inputs() {
     assert!(spec
         .env
         .contains(&("EMUCAP_SESSION_TOKEN".into(), "token".into())));
-    assert!(spec
-        .env
-        .contains(&("EMUCAP_BUILD_HASH".into(), "abc123".into())));
+    assert!(!spec.env.iter().any(|(key, _)| key == "EMUCAP_BUILD_HASH"));
     assert!(spec.env.contains(&("EMUCAP_SYSTEM".into(), "msx".into())));
 }
 

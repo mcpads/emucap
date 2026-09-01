@@ -22,6 +22,31 @@ fn enriched_from(mut v: serde_json::Value, methods: &[&str]) -> serde_json::Valu
 fn enriched(methods: &[&str]) -> serde_json::Value {
     enriched_from(serde_json::json!({"connected": true}), methods)
 }
+
+#[test]
+fn connected_status_exposes_generation_bound_debug_selection() {
+    let identity = EmulatorIdentity::from_hello(&serde_json::json!({
+        "state_groups": ["cpu", "ppu"],
+        "cpu_targets": [{
+            "id": "arm9",
+            "aliases": ["main"],
+            "default": true,
+            "disassembly_modes": ["auto", "arm", "thumb"]
+        }]
+    }));
+    let mut value = serde_json::json!({
+        "connected": true,
+        "state_groups": ["stale"],
+        "cpu_targets": [{"id":"stale"}]
+    });
+    enrich_debug_selection(&mut value, &identity);
+    assert_eq!(value["state_groups"], serde_json::json!(["cpu", "ppu"]));
+    assert_eq!(value["cpu_targets"][0]["id"], "arm9");
+    assert_eq!(
+        value["cpu_targets"][0]["aliases"],
+        serde_json::json!(["main"])
+    );
+}
 fn has_method(v: &serde_json::Value, name: &str) -> bool {
     v["methods"]
         .as_array()
@@ -641,6 +666,7 @@ fn connected_status_reconciles_an_abandoned_exact_generation_capture() {
 fn composites_absent_without_deps_and_trace_note_present() {
     // MD류: set_input/step/pause 있으나 probe 없음 → tap O. trace 없음 → 콜체인 역추적 대체 note만.
     let v = enriched(&[
+        "status",
         "set_input",
         "step",
         "pause",
@@ -663,16 +689,27 @@ fn composites_absent_without_deps_and_trace_note_present() {
 
 #[test]
 fn replay_composites_accept_load_state_without_probe() {
-    // Flycast류: load_state 광고·probe 미광고여도 regression/verify는 가능하다.
+    // A validated frozen load + exact frame step + read surface is itself an atomic Control probe:
+    // the MCP holds the link lock and no guest time runs between its component requests.
     let v = enriched(&[
+        "status",
         "set_input",
         "step",
         "pause",
+        "resume",
         "load_state",
         "run_frames",
         "read_memory",
     ]);
+    assert!(has_method(&v, "probe"));
     assert!(has_method(&v, "regression_run") && has_method(&v, "verify_determinism"));
+
+    let without_frozen_entry = enriched(&["status", "step", "load_state", "read_memory"]);
+    assert!(!has_method(&without_frozen_entry, "probe"));
+
+    let without_running_cleanup =
+        enriched(&["status", "pause", "step", "load_state", "read_memory"]);
+    assert!(!has_method(&without_running_cleanup, "probe"));
 }
 
 #[test]
@@ -1302,6 +1339,53 @@ fn mismatched_live_identity_demotes_the_old_runtime_capsule() {
     assert!(value["next_safe_action"]
         .as_str()
         .is_some_and(|message| message.contains("do not treat the stale capsule")));
+}
+
+#[test]
+fn terminal_entry_replaces_stale_missing_lease_advice() {
+    let mut observation = RuntimeObservation::empty(ListenerState::Bound);
+    observation.termination_completed = true;
+    observation.current = Some(emucap::live::task_entry::RuntimeProcessObservation {
+        emulator: emucap::live::runtime::ProcessState::Exited,
+        bridge: Some(emucap::live::runtime::ProcessState::Exited),
+    });
+    let disposition = classify_entry(&observation);
+    assert_eq!(disposition.reason, EntryReason::TerminalHistory);
+
+    let mut value = serde_json::json!({
+        "runtime_instance": {
+            "next_safe_action": "inspect_lease_before_generation_transition"
+        }
+    });
+    reconcile_runtime_instance_entry(&mut value, disposition);
+
+    assert_eq!(
+        value["runtime_instance"]["next_safe_action"],
+        "launch_allowed"
+    );
+}
+
+#[test]
+fn owned_helper_cleanup_replaces_stale_missing_lease_advice() {
+    let mut observation = RuntimeObservation::empty(ListenerState::Bound);
+    observation.current = Some(emucap::live::task_entry::RuntimeProcessObservation {
+        emulator: emucap::live::runtime::ProcessState::Exited,
+        bridge: Some(emucap::live::runtime::ProcessState::Alive),
+    });
+    let disposition = classify_entry(&observation);
+    assert_eq!(disposition.reason, EntryReason::OwnedHelperCleanupPending);
+
+    let mut value = serde_json::json!({
+        "runtime_instance": {
+            "next_safe_action": "inspect_lease_before_generation_transition"
+        }
+    });
+    reconcile_runtime_instance_entry(&mut value, disposition);
+
+    assert_eq!(
+        value["runtime_instance"]["next_safe_action"],
+        "cleanup_owned_bridge_then_launch"
+    );
 }
 
 struct DiagnosticLink {

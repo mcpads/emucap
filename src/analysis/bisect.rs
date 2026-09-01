@@ -1,7 +1,6 @@
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-
 use crate::live::link::{EmulatorLink, LinkError};
+use crate::live::tools::{self, ToolOutput};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -138,13 +137,19 @@ pub fn probe_bytes(
     frame: u64,
     pred: &Predicate,
 ) -> Result<Vec<u8>, LinkError> {
-    let res = link.call(
-        "probe",
-        json!({
-            "state": base_state, "frame": frame,
-            "memory_type": pred.memory_type, "address": pred.address, "length": pred.length,
-        }),
-    )?;
+    let ToolOutput::Json(res) = tools::probe(
+        link,
+        base_state,
+        frame,
+        &pred.memory_type,
+        pred.address,
+        pred.length,
+    )?
+    else {
+        return Err(LinkError::Protocol(
+            "probe returned a non-JSON result".into(),
+        ));
+    };
     let hex = res
         .get("hex")
         .and_then(|v| v.as_str())

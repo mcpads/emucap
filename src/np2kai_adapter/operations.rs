@@ -27,6 +27,11 @@ impl Np2kaiHost {
             "host_features": HOST_FEATURES,
             "methods": METHODS,
             "memory_types": debug::memory_type_names(),
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id":"main", "aliases":["i386", "x86"], "default":true,
+                "disassembly_modes":["auto", "x86"]
+            }],
             "region_sizes": debug::region_sizes_value(),
             "media_devices": [{
                 "id": "hdd0", "kind": "hard_disk", "reset_on_load": false,

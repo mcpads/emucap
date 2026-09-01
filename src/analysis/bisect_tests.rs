@@ -1,6 +1,52 @@
 use super::bisect::*;
-use crate::live::link::FakeLink;
-use serde_json::json;
+use crate::live::link::{Capabilities, EmulatorIdentity, EmulatorLink, FakeLink, LinkError};
+use serde_json::{json, Value};
+
+struct AtomicProbeLink {
+    capabilities: Capabilities,
+    calls: Vec<String>,
+    hex: String,
+}
+
+impl AtomicProbeLink {
+    fn new(hex: &str) -> Self {
+        Self {
+            capabilities: Capabilities {
+                protocol_version: 1,
+                methods: vec!["probe".into(), "status".into()],
+                memory_types: vec![],
+                memory_regions: vec![],
+                breakpoint_kinds: vec![],
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
+                recording: None,
+                identity: EmulatorIdentity::default(),
+            },
+            calls: Vec::new(),
+            hex: hex.into(),
+        }
+    }
+}
+
+impl EmulatorLink for AtomicProbeLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.capabilities
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        self.calls.push(method.into());
+        match method {
+            "probe" => Ok(json!({
+                "status": "completed",
+                "state": "frozen",
+                "hex": self.hex,
+                "requested_frames": params["frame"],
+                "completed_frames": params["frame"]
+            })),
+            "status" => Ok(json!({"state": "frozen"})),
+            other => Err(LinkError::Protocol(format!("unexpected call: {other}"))),
+        }
+    }
+}
 
 // ── 순수 이분 ─────────────────────────────────────────────
 fn flips_at(k: u64) -> impl FnMut(u64) -> Result<bool, ()> {
@@ -87,16 +133,15 @@ fn parse_op() {
 #[test]
 fn probe_state_evaluates_read_through_link() {
     // 원자적 probe가 hex "00"을 돌려주면, "== 0" 술어는 bad(참).
-    let mut link = FakeLink::ok(json!({ "hex": "00" }));
+    let mut link = AtomicProbeLink::new("00");
     let p = pred(CmpOp::Eq, 0, 1);
     assert!(probe_state(&mut link, "/tmp/base.mss", 120, &p).unwrap());
-    // 단일 원자 명령 "probe"로 호출하는지(결정론 배선 확인)
-    assert_eq!(link.last_method.as_deref(), Some("probe"));
+    assert_eq!(link.calls, ["probe", "status"]);
 }
 
 #[test]
 fn probe_state_good_when_predicate_false() {
-    let mut link = FakeLink::ok(json!({ "hex": "ff" }));
+    let mut link = AtomicProbeLink::new("ff");
     let p = pred(CmpOp::Eq, 0, 1);
     assert!(!probe_state(&mut link, "/tmp/base.mss", 0, &p).unwrap());
 }
@@ -119,7 +164,7 @@ fn run_bisect_rejects_out_of_range_length() {
 #[test]
 fn probe_bytes_rejects_length_mismatch() {
     // length=4를 요청했는데 probe가 1바이트만 반환 → 묵시 제로패딩 대신 에러여야 한다.
-    let mut link = FakeLink::ok(json!({ "hex": "00" }));
+    let mut link = AtomicProbeLink::new("00");
     let p = pred(CmpOp::Eq, 0, 4);
     let r = probe_bytes(&mut link, "/tmp/base.mss", 0, &p);
     assert!(

@@ -503,7 +503,11 @@ pub fn ensure_capabilities_loaded(link: &mut dyn EmulatorLink) -> Result<(), Lin
 }
 
 fn has_method(link: &dyn EmulatorLink, method: &str) -> bool {
-    link.capabilities().methods.iter().any(|m| m == method)
+    if method == "probe" {
+        tools::probe_available(link)
+    } else {
+        link.capabilities().methods.iter().any(|m| m == method)
+    }
 }
 
 fn missing_methods(link: &dyn EmulatorLink, methods: &[&str]) -> Vec<String> {

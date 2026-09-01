@@ -3,6 +3,8 @@
 SYS = {
   system = "snes",
   system_label = "SNES",
+  cpu_target = { id = "main", aliases = { "65816", "wdc65816" },
+    disassembly_modes = { "auto", "65816" } },
   cpu_type = "snes",              -- emu.cpuType.snes
   default_memtype = "snesMemory", -- emu.memType.snesMemory
   address_space_size = 0x1000000,

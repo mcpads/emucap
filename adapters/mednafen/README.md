@@ -313,8 +313,11 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `break_on_reset` is advertised only for cartridge systems with a meaningful reset vector. Runtime
   `status.methods` is authoritative; `watch_register`, `set_trace`/`get_trace`, and `call_stack` are supported when
   the selected core exposes a debugger.
-  **Behavior differences**: `get_state`'s `groups` filter is ignored (always returns everything), input `port` is ignored (always port0), `save_state`/
-  `load_state` work both frozen and running (Mesen only running), `poll_events` returns at minimum `{pc}` and access
+  **Behavior differences**: `get_state(groups=[...])` applies a case-insensitive filter to the
+  runtime register groups listed by `status.state_groups`; omit `groups` or pass `[]` for all groups.
+  Unknown groups fail with `bad_params`. Input `port` is limited to port 0. `save_state`/`load_state`
+  work both frozen and running; a PlayStation load/reset issued from an instruction-bound halt is
+  acknowledged only after the restored CPU callback boundary is serviceable. `poll_events` returns at minimum `{pc}` and access
   BPs also carry `{kind,address,length,value}` where possible. MD VDP write BP events also carry `memory_type`,
   `source` (`data_port`/`dma_vbus`/`dma_fill`/`dma_copy`/`control_port`), and for the DMA family a `source_address`
   (no Mesen-style type/channels/dma snapshot, etc.).

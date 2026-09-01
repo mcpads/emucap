@@ -83,6 +83,7 @@ The native adapter currently advertises:
   for owned PowerPC exec/read/write breakpoints;
 - `disassemble`, `call_stack`;
 - frozen core only: `save_state`, `load_state`;
+- atomic `probe` through Control's link-locked pause/resume/load/exact-frame-step/read composition;
 - running core only: `screenshot`;
 - GameCube and Wii: `set_input`, with a system-specific port-0 button surface.
 

@@ -503,6 +503,64 @@ local function bounded_sync_count(value, default_value, allow_zero)
   return n
 end
 
+local function state_group_names(st)
+  local seen, names = {}, {}
+  for key, _ in pairs(st or {}) do
+    local group = tostring(key):match("^([^.%[]+)")
+    if group and not seen[group] then
+      seen[group] = true
+      names[#names + 1] = group
+    end
+  end
+  table.sort(names)
+  return names
+end
+
+local function current_state_group_names()
+  if not (emu and emu.getState) then return {} end
+  local ok, state = pcall(emu.getState)
+  if not ok or type(state) ~= "table" then return {} end
+  return state_group_names(state)
+end
+
+local DEBUG_CPU_METHODS = {
+  get_state = true, pause = true, resume = true, step = true, step_instructions = true,
+  disassemble = true, call_stack = true,
+}
+
+local function normalize_debug_selection(method, p)
+  local target = SYS.cpu_target
+  if target and DEBUG_CPU_METHODS[method] and p.cpu ~= nil then
+    if type(p.cpu) ~= "string" or p.cpu == "" then
+      return "cpu must be a non-empty string"
+    end
+    local requested = string.lower(p.cpu)
+    local found = string.lower(target.id) == requested
+    for _, alias in ipairs(target.aliases or {}) do
+      if string.lower(alias) == requested then found = true end
+    end
+    if not found then
+      return "unknown cpu target '" .. p.cpu .. "'; available: " .. target.id
+    end
+    p.cpu = target.id
+  end
+  if method == "disassemble" and p.mode ~= nil then
+    if type(p.mode) ~= "string" or p.mode == "" then
+      return "mode must be a non-empty string"
+    end
+    local requested, resolved = string.lower(p.mode), nil
+    for _, mode in ipairs((target and target.disassembly_modes) or {}) do
+      if string.lower(mode) == requested then resolved = mode end
+    end
+    if not resolved then
+      return "unknown disassembly mode '" .. p.mode .. "'; available: " ..
+        table.concat((target and target.disassembly_modes) or {}, ", ")
+    end
+    p.mode = resolved
+  end
+  return nil
+end
+
 function handlers.hello()
   local memory_regions = nil
   if emu and emu.memType then
@@ -562,6 +620,13 @@ function handlers.hello()
     mesen_host_api = MESEN_HOST_API,
     host_features = host_features,
     methods = method_list,
+    state_groups = as_array(current_state_group_names()),
+    cpu_targets = as_array({ {
+      id = SYS.cpu_target.id,
+      aliases = as_array(SYS.cpu_target.aliases),
+      default = true,
+      disassembly_modes = as_array(SYS.cpu_target.disassembly_modes),
+    } }),
     breakpoint_kinds = breakpoint_kinds,
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
@@ -686,14 +751,31 @@ function handlers.get_state(p)
   if not (p.groups and #p.groups > 0) then
     return true, { state = st }
   end
+  if type(p.groups) ~= "table" then
+    return false, "bad_params", "groups must be a list of non-empty strings"
+  end
+  local available, by_lower = state_group_names(st), {}
+  for _, group in ipairs(available) do by_lower[string.lower(group)] = group end
   local want = {}
-  for _, g in ipairs(p.groups) do want[g] = true end
+  local applied = {}
+  for _, group in ipairs(p.groups) do
+    if type(group) ~= "string" or group == "" then
+      return false, "bad_params", "groups must be a list of non-empty strings"
+    end
+    local canonical = by_lower[string.lower(group)]
+    if not canonical then
+      return false, "bad_params", "unknown state group '" .. group ..
+        "'; available: " .. table.concat(available, ", ")
+    end
+    if not want[canonical] then applied[#applied + 1] = canonical end
+    want[canonical] = true
+  end
   local out = {}
   for k, v in pairs(st) do
     local grp = k:match("^([^.%[]+)")   -- 첫 "." 또는 "[" 앞
     if grp and want[grp] then out[k] = v end
   end
-  return true, { state = out }
+  return true, { state = out, groups_applied = as_array(applied) }
 end
 
 function handlers.get_rom_info()
@@ -707,6 +789,13 @@ function handlers.status()
     connected = true,
     frame = frame,
     state = STATE,
+    state_groups = as_array(current_state_group_names()),
+    cpu_targets = as_array({ {
+      id = SYS.cpu_target.id,
+      aliases = as_array(SYS.cpu_target.aliases),
+      default = true,
+      disassembly_modes = as_array(SYS.cpu_target.disassembly_modes),
+    } }),
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
   if STATE == "frozen" then r.reason = freeze_state.reason end
@@ -828,6 +917,25 @@ local function read_target(pr)
   return table.concat(out)
 end
 
+-- A probe owns the guest until its terminal memory sample and always hands control back frozen.
+-- Completing the response without breaking execution lets host scheduling advance an arbitrary
+-- number of frames before the caller can inspect the result, defeating the atomic probe contract.
+local function complete_probe(id, pr)
+  STATE = "frozen"
+  freeze_state = FreezeState.halt("probe", pr.frame > 0)
+  freeze_start_ms = wall_ms()
+  freeze_disc_ms = nil
+  freeze_snapshot = emu.getState()
+  reply_ok(id, {
+    status = "completed",
+    requested_frames = pr.frame,
+    completed_frames = pr.frame,
+    state = "frozen",
+    hex = read_target(pr),
+    frame = frame,
+  })
+end
+
 -- ── 지연 명령 (run_frames / press_buttons / probe): 프레임마다 진행, 끝나면 응답 ──
 local function apply_deferred_effect(effect)
   Deferred.apply(effect, {
@@ -839,7 +947,8 @@ local function apply_deferred_effect(effect)
     end,
     terminal = function(value)
       if value.operation_kind == "probe" and value.status == "completed" then
-        reply_ok(value.id, { hex = read_target(value.probe), frame = value.frame })
+        complete_probe(value.id, value.probe)
+        emu.breakExecution()
         return
       end
       local result = { status = value.status, frame = value.frame }
@@ -910,7 +1019,8 @@ local function on_io_exec()
     end)
     if not ok then reply_err(op.id, "io_error", err); return end
     if op.probe.frame <= 0 then
-      reply_ok(op.id, { hex = read_target(op.probe), frame = frame })
+      complete_probe(op.id, op.probe)
+      emu.breakExecution()
     else
       deferred = Deferred.start(
         session_epoch, op.id, "probe", op.probe.frame, op.probe)
@@ -1017,7 +1127,7 @@ local function frozen_state_io(method, id, p)
   end
 
   if probe.frame <= 0 then
-    reply_ok(id, { hex = read_target(probe), frame = frame })
+    complete_probe(id, probe)
     return nil
   end
   deferred = Deferred.start(session_epoch, id, "probe", probe.frame, probe)
@@ -2280,7 +2390,7 @@ function handlers.disassemble(p)
   local count = math.max(1, math.min(p.count or 8, 256))
   local mt = emu.memType[p.memory_type] or emu.memType[SYS.default_memtype]
   local read_byte = function(x) return emu.read(x, mt, false) end
-  return true, as_array(SYS.disassemble(read_byte, addr, count))
+  return true, as_array(SYS.disassemble(read_byte, addr, count, p.mode))
 end
 
 -- ── 디스패치 ─────────────────────────────────────────────────
@@ -2288,6 +2398,8 @@ end
 local function dispatch(line)
   local id, method, p = parse_request(line)
   id = id or 0
+  local selection_error = normalize_debug_selection(method, p)
+  if selection_error then reply_err(id, "bad_params", selection_error); return end
   if method == "record_window" then
     return start_recording(id, p)
   end
@@ -2332,6 +2444,8 @@ end
 local function handle_in_freeze(line)
   local id, method, p = parse_request(line)
   id = id or 0
+  local selection_error = normalize_debug_selection(method, p)
+  if selection_error then reply_err(id, "bad_params", selection_error); return nil end
   if method == "record_window" then
     if not FreezeState.can_start_recording(freeze_state, p.origin) then
       reply_err(id, "unsafe_halt",

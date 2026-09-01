@@ -10,6 +10,8 @@
 SYS = {
   system = "gba",
   system_label = "Game Boy Advance",
+  cpu_target = { id = "arm7", aliases = { "main", "arm7tdmi" },
+    disassembly_modes = { "auto", "arm", "thumb" } },
   cpu_type = "gba",             -- emu.cpuType.gba (ARM7TDMI)
   default_memtype = "gbaMemory", -- emu.memType.gbaMemory (ARM CPU 버스, 32비트 주소공간)
   address_space_size = 0x10000000,
@@ -417,9 +419,9 @@ end
 
 -- disassemble(read_byte, start, count): start에서 count개 명령. 반환 [{addr,text,bytes}].
 -- 모드는 CPSR T비트로 판정한다(ARM=4바이트/Thumb=2바이트씩 전진). BL은 4바이트를 소비한다.
-SYS.disassemble = function(read_byte, start, count)
-  local thumb = false
-  if emu and emu.getState then
+SYS.disassemble = function(read_byte, start, count, mode)
+  local thumb = mode == "thumb"
+  if mode ~= "arm" and mode ~= "thumb" and emu and emu.getState then
     local ok, st = pcall(emu.getState)
     if ok and st then thumb = st["cpu.cpsr.thumb"] and true or false end
   end

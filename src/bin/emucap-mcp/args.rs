@@ -671,8 +671,8 @@ pub(crate) struct StepArgs {
     /// `status.contracts.constraints["execution.step.units"]`.
     #[serde(default)]
     pub(crate) unit: StepUnit,
-    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
-    /// Omit for the default core. Single-core backends ignore this field.
+    /// CPU target from `status.cpu_targets`, for example NDS `arm9` or `arm7`.
+    /// Omit for the advertised default target. Canonical ids and aliases are accepted.
     #[serde(default)]
     pub(crate) cpu: Option<String>,
 }
@@ -693,8 +693,8 @@ pub(crate) struct RoutedOperationArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CpuArgs {
-    /// Target CPU for a multi-core backend. NDS accepts `arm9` (default), `arm7`,
-    /// and `both` for resume. Single-core backends ignore this field.
+    /// CPU target from `status.cpu_targets`. Omit for the advertised default target.
+    /// NDS keeps `both` as a compatibility alias for its shared scheduler.
     #[serde(default)]
     pub(crate) cpu: Option<String>,
 }
@@ -824,8 +824,8 @@ pub(crate) struct StateArgs {
     /// internalRegisters, or memoryManager. Omit for all groups.
     #[serde(default)]
     pub(crate) groups: Vec<String>,
-    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
-    /// Omit for the default core. Single-core backends ignore this field.
+    /// CPU target from `status.cpu_targets`, for example NDS `arm9` or `arm7`.
+    /// Omit for the advertised default target. Canonical ids and aliases are accepted.
     #[serde(default)]
     pub(crate) cpu: Option<String>,
 }

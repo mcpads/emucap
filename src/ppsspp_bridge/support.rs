@@ -15,17 +15,10 @@ pub(super) fn is_timeout_error(err: &BridgeError) -> bool {
 }
 
 pub(super) fn capability_notes() -> Value {
-    // `planned_methods` discloses every real emucap tool name this bridge doesn't dispatch yet —
-    // both concretely planned (`PLANNED_METHODS`) and platform-gapped (`UNSUPPORTED_METHODS`, which
-    // resolve to an `unsupported` error rather than `unknown_method`) — so a caller can see the
-    // not-yet-here surface without a trial call.
-    let mut planned: Vec<&str> = PLANNED_METHODS.to_vec();
-    planned.extend_from_slice(UNSUPPORTED_METHODS);
     json!({
         "backend": "ppsspp-debugger-ws",
         "rust_bridge": true,
         "implemented_methods": METHODS,
-        "planned_methods": planned,
         "screenshot": true,
         "input": true,
         "frame_step": true,

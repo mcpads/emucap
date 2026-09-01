@@ -39,8 +39,9 @@ NDJSON from `vblank()`. Its advertised methods include status·read_memory·writ
 (SH-4 registers)·save_state·load_state·run_frames·screenshot (running or frozen)·set_input·pause·
 resume·step (frame)·reset·set_breakpoint·clear_breakpoint·clear_all_breakpoints·list_breakpoints·
 poll_events·find_pattern·disassemble·get_rom_info. Server-composed verbs such as `tap` are
-available when their primitive dependencies exist. `status.methods` is
-authoritative; atomic frame-boundary search is unavailable because the native adapter has no `probe`.
+available when their primitive dependencies exist. This includes atomic `probe`: Control holds the
+generation link while it pauses, restores state, advances exact frames, and reads frozen memory, so
+the native adapter does not need a duplicate wire verb. `status.methods` is authoritative.
 
 A replacement Control MCP can reconnect without restarting Flycast. Do not treat a disconnected
 socket as permission to relaunch: inspect `status.continuity`, `status.runtime_instance`, and

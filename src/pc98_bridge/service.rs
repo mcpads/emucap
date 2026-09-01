@@ -20,6 +20,11 @@ impl<G: GdbTransport> Bridge<G> {
             "debugger": true,
             "methods": methods,
             "memory_types": memory_type_names(),
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id":"main", "aliases":["i386", "x86"], "default":true,
+                "disassembly_modes":["auto", "x86"]
+            }],
             "media_devices": media.devices,
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"inclusive", "memory_type_used":true, "snapshot":true},
@@ -459,6 +464,10 @@ impl<G: GdbTransport> Bridge<G> {
             self.write_state_regions(&regions)?;
             let mut result = self.register_probe(&regs_hex, frame, address, length)?;
             if let Some(obj) = result.as_object_mut() {
+                obj.insert("status".into(), json!("completed"));
+                obj.insert("requested_frames".into(), json!(frame));
+                obj.insert("completed_frames".into(), json!(frame));
+                obj.insert("state".into(), json!("frozen"));
                 obj.extend(save_items_result);
             }
             self.frozen = true;
