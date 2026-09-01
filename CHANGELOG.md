@@ -7,6 +7,8 @@ Actively developed beta software — interfaces may still change.
 ## 0.16.1
 
 ### Fixed
+- The source lockfile now selects non-yanked `chacha20` 0.10.2, so packaging no longer warns about
+  the previously locked 0.10.1 release.
 - Repository-built Rust adapters now report the source revision embedded in their own binary
   instead of trusting a launch-time environment value. PPSSPP and PCSX2 also include the build and
   managed content path in their hello identity, so live status no longer degrades to an unknown or
