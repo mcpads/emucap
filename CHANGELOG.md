@@ -4,6 +4,45 @@ Actively developed beta software — interfaces may still change.
 
 ## Unreleased
 
+## 0.16.1
+
+### Fixed
+- Repository-built Rust adapters now report the source revision embedded in their own binary
+  instead of trusting a launch-time environment value. PPSSPP and PCSX2 also include the build and
+  managed content path in their hello identity, so live status no longer degrades to an unknown or
+  incomplete adapter identity.
+- Status now gives one lifecycle answer after an exact managed stop: completed terminal history
+  reports `launch_allowed` in both task entry and the retained runtime capsule instead of leaving
+  stale missing-lease advice that tells agents to inspect an already returned lease.
+- Native atomic probes now have their terminal runtime state and exact read length verified by
+  Control before success is returned. Mesen probes now stop at the sampled boundary instead of
+  resuming free-running execution after the response, and scalar Mesen state groups such as
+  `frameCount` remain projectable through the common group filter.
+- Native atomic probes now also require a defined terminal status and an exact completed-frame
+  count. The PC-98 MAME probe reports that evidence explicitly, and unavailable library-level probe
+  calls fail before an unadvertised wire request is sent.
+- PlayStation Mednafen state loads and resets issued from an instruction-bound halt now discard
+  the pre-replacement CPU timestamp and pipeline before resuming at the restored boundary. The
+  request completes only after that boundary is serviceable, preventing the next frame step from
+  aborting the emulator or dropping the control connection.
+- Mednafen `get_state` now applies case-insensitive runtime register-group filters, advertises the
+  available group names in `status.state_groups`, and rejects unknown names before returning state.
+- CPU-aware debug calls now resolve canonical targets and aliases from the connected generation's
+  `status.cpu_targets`; disassembly modes are validated per target, and `get_state` projections are
+  checked against `status.state_groups` before results are returned. Maintained single-CPU adapters
+  now advertise their real target instead of silently accepting arbitrary selectors.
+
+### Added
+- PPSSPP now provides bounded `find_pattern` and an atomic state-load, exact-frame, frozen-memory
+  `probe`. PCSX2 now provides the same atomic probe over its existing frozen state and native frame
+  operations. Both are advertised only as working methods; speculative `planned_methods` metadata
+  has been removed.
+- Control now supplies the same atomic `probe` on validated adapters that already provide pause and
+  resume, frozen state restore, exact frame step, and bounded memory read. The whole sequence holds one link
+  lock, preflights an otherwise unbounded memory range before state mutation, validates every frozen
+  boundary, and is removed from live status if any dependency is downgraded. Regression and
+  bisection use the same executor rather than bypassing it with a native-only wire call.
+
 ## 0.16.0
 
 ### Added
