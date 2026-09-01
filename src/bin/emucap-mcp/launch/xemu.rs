@@ -78,7 +78,6 @@ pub(super) fn launch_xemu(
         host_build: &host_build,
         port,
         name: args.name.as_deref(),
-        build: Some(BUILD_HASH),
         session_token: token,
         runtime: Some(runtime),
         display,

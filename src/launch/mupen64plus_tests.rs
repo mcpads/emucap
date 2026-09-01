@@ -83,7 +83,6 @@ fn launch_spec_isolated_and_headless_by_default() {
         port: 47890,
         name: Some("n64-test"),
         session_token: Some("token"),
-        build: Some("abc123"),
         runtime: None,
         display: false,
     };
@@ -103,9 +102,7 @@ fn launch_spec_isolated_and_headless_by_default() {
     assert!(spec
         .env
         .contains(&("EMUCAP_SESSION_TOKEN".into(), "token".into())));
-    assert!(spec
-        .env
-        .contains(&("EMUCAP_BUILD_HASH".into(), "abc123".into())));
+    assert!(!spec.env.iter().any(|(key, _)| key == "EMUCAP_BUILD_HASH"));
 }
 
 #[test]

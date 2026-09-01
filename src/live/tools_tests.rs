@@ -10,6 +10,7 @@ struct Rec {
     read_i: usize,
     fail_calls: Vec<usize>,
     interrupt_calls: Vec<usize>,
+    probe_result: Option<Value>,
     caps: Capabilities,
 }
 impl Rec {
@@ -21,6 +22,7 @@ impl Rec {
             read_i: 0,
             fail_calls: vec![],
             interrupt_calls: vec![],
+            probe_result: None,
             caps: Capabilities {
                 protocol_version: 1,
                 methods: vec![],
@@ -45,6 +47,10 @@ impl Rec {
         self.caps.methods = methods.iter().map(|method| method.to_string()).collect();
         self
     }
+    fn with_probe_result(mut self, result: Value) -> Self {
+        self.probe_result = Some(result);
+        self
+    }
     fn methods(&self) -> Vec<&str> {
         self.calls.iter().map(|(m, _)| m.as_str()).collect()
     }
@@ -54,7 +60,7 @@ impl EmulatorLink for Rec {
         &self.caps
     }
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
-        self.calls.push((method.to_string(), params));
+        self.calls.push((method.to_string(), params.clone()));
         if self.fail_calls.contains(&self.calls.len()) {
             return Err(LinkError::Timeout);
         }
@@ -74,6 +80,14 @@ impl EmulatorLink for Rec {
         }
         Ok(match method {
             "status" => json!({ "state": self.state, "frame": 0 }),
+            "pause" => {
+                self.state = "frozen".into();
+                json!({"state":"frozen", "status":"completed"})
+            }
+            "resume" => {
+                self.state = "running".into();
+                json!({"state":"running", "status":"completed"})
+            }
             "read_memory" => {
                 let h = self
                     .reads
@@ -83,6 +97,26 @@ impl EmulatorLink for Rec {
                     .unwrap_or_default();
                 self.read_i += 1;
                 json!({ "hex": h })
+            }
+            "probe" => {
+                if let Some(result) = &self.probe_result {
+                    return Ok(result.clone());
+                }
+                let h = self
+                    .reads
+                    .get(self.read_i)
+                    .or_else(|| self.reads.last())
+                    .cloned()
+                    .unwrap_or_default();
+                self.read_i += 1;
+                json!({
+                    "status": "completed",
+                    "state": self.state,
+                    "hex": h,
+                    "frame": params["frame"],
+                    "requested_frames": params["frame"],
+                    "completed_frames": params["frame"]
+                })
             }
             _ => json!({}),
         })
@@ -116,6 +150,97 @@ fn step_rejects_units_missing_from_adapter_capabilities() {
         LinkError::Emulator { ref kind, .. } if kind == "unsupported"
     ));
     assert!(link.calls.is_empty());
+}
+
+struct DebugSelectionLink {
+    caps: Capabilities,
+    calls: Vec<(String, Value)>,
+}
+
+impl DebugSelectionLink {
+    fn new() -> Self {
+        let hello = json!({
+            "state_groups": ["cpu", "ppu"],
+            "cpu_targets": [
+                {"id":"arm9", "aliases":["main"], "default":true, "disassembly_modes":["auto","arm","thumb"]},
+                {"id":"arm7", "aliases":[], "default":false, "disassembly_modes":["auto","arm","thumb"]}
+            ]
+        });
+        Self {
+            caps: Capabilities {
+                protocol_version: 1,
+                methods: vec!["get_state".into(), "disassemble".into()],
+                memory_types: vec![],
+                memory_regions: vec![],
+                breakpoint_kinds: vec![],
+                contracts: crate::contracts::ContractAdvertisement::Unreported,
+                recording: None,
+                identity: EmulatorIdentity::from_hello(&hello),
+            },
+            calls: Vec::new(),
+        }
+    }
+}
+
+impl EmulatorLink for DebugSelectionLink {
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        self.calls.push((method.into(), params));
+        Ok(match method {
+            "get_state" => json!({
+                "cpu":"arm9",
+                "state":{"cpu.pc":1, "ppu.scanline":2},
+                "frame":3
+            }),
+            "disassemble" => json!({"instructions":[]}),
+            other => return Err(LinkError::Protocol(format!("unexpected call: {other}"))),
+        })
+    }
+}
+
+#[test]
+fn get_state_resolves_cpu_and_applies_the_requested_group_projection() {
+    let mut link = DebugSelectionLink::new();
+    let output = get_state(&mut link, &["PPU".into()], Some("MAIN")).unwrap();
+    let ToolOutput::Json(output) = output else {
+        panic!("expected JSON state")
+    };
+
+    assert_eq!(
+        link.calls,
+        vec![("get_state".into(), json!({"groups":["ppu"], "cpu":"arm9"}))]
+    );
+    assert_eq!(output["state"], json!({"ppu.scanline":2}));
+    assert_eq!(output["groups_applied"], json!(["ppu"]));
+    assert_eq!(output["frame"], 3);
+}
+
+#[test]
+fn unknown_debug_selection_fails_before_transport() {
+    let mut link = DebugSelectionLink::new();
+    let error = get_state(&mut link, &[], Some("rsp")).unwrap_err();
+    assert!(matches!(error, LinkError::Emulator { ref kind, .. } if kind == "bad_params"));
+    assert!(link.calls.is_empty());
+
+    let error = disassemble(&mut link, 0, 1, Some("arm9"), Some("mips")).unwrap_err();
+    assert!(matches!(error, LinkError::Emulator { ref kind, .. } if kind == "bad_params"));
+    assert!(link.calls.is_empty());
+}
+
+#[test]
+fn disassembly_selection_reaches_the_wire_in_canonical_form() {
+    let mut link = DebugSelectionLink::new();
+    disassemble(&mut link, 0x2000000, 4, Some("MAIN"), Some("THUMB")).unwrap();
+    assert_eq!(
+        link.calls,
+        vec![(
+            "disassemble".into(),
+            json!({"address":0x2000000, "count":4, "cpu":"arm9", "mode":"thumb"})
+        )]
+    );
 }
 
 #[test]
@@ -625,22 +750,228 @@ fn read_memory_forwards_params_and_returns_json() {
 
 #[test]
 fn probe_forwards_params_and_returns_json() {
-    let mut link = FakeLink::ok(json!({ "hex": "11223344", "frame": 3 }));
+    let mut link = Rec::new("frozen", &["1122334455667788"]).with_methods(&["probe"]);
     let out = probe(&mut link, "/tmp/base.mst", 3, "vram", 0x4000, 8).unwrap();
     match out {
         ToolOutput::Json(v) => {
-            assert_eq!(v["hex"], "11223344");
+            assert_eq!(v["hex"], "1122334455667788");
             assert_eq!(v["frame"], 3);
+            assert_eq!(v["state"], "frozen");
         }
         _ => panic!("Json 기대"),
     }
-    assert_eq!(link.last_method.as_deref(), Some("probe"));
-    let p = link.last_params.unwrap();
+    assert_eq!(link.methods(), vec!["probe", "status"]);
+    let p = &link.calls[0].1;
     assert_eq!(p["state"], "/tmp/base.mst");
     assert_eq!(p["frame"], 3);
     assert_eq!(p["memory_type"], "vram");
     assert_eq!(p["address"], 0x4000);
     assert_eq!(p["length"], 8);
+}
+
+#[test]
+fn native_probe_rejects_a_success_response_that_left_the_guest_running() {
+    let mut link = Rec::new("running", &["11223344"]).with_methods(&["probe"]);
+
+    let error = probe(&mut link, "/tmp/base.mst", 3, "vram", 0x4000, 4).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::Protocol(ref message)
+            if message.contains("native probe") && message.contains("running")
+    ));
+}
+
+#[test]
+fn native_probe_rejects_an_unknown_terminal_status() {
+    // A transport-success response is not a completed probe unless its terminal status is one of
+    // the public operation's defined outcomes.
+    let mut link = Rec::new("frozen", &[])
+        .with_methods(&["probe"])
+        .with_probe_result(json!({
+            "status":"partial",
+            "state":"frozen",
+            "requested_frames":3,
+            "completed_frames":3,
+            "hex":"11223344"
+        }));
+
+    let error = probe(&mut link, "/tmp/base.mst", 3, "vram", 0x4000, 4).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::Protocol(ref message)
+            if message.contains("unknown terminal status") && message.contains("partial")
+    ));
+}
+
+#[test]
+fn native_probe_rejects_a_completed_response_with_inexact_frame_counts() {
+    // `completed` must mean the requested exact boundary was reached, not merely that the adapter
+    // returned a terminal JSON object.
+    let mut link = Rec::new("frozen", &[])
+        .with_methods(&["probe"])
+        .with_probe_result(json!({
+            "status":"completed",
+            "state":"frozen",
+            "requested_frames":3,
+            "completed_frames":2,
+            "hex":"11223344"
+        }));
+
+    let error = probe(&mut link, "/tmp/base.mst", 3, "vram", 0x4000, 4).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::Protocol(ref message)
+            if message.contains("reported 2 of 3 frames")
+    ));
+}
+
+#[test]
+fn probe_rejects_an_unadvertised_uncomposable_operation_before_transport() {
+    // Library consumers must receive the same capability failure as the routed MCP surface. They
+    // must not send a raw `probe` verb to an adapter that neither advertises it nor supplies every
+    // operation needed for the Control composition.
+    let mut link = Rec::new("frozen", &[]).with_methods(&["status", "read_memory"]);
+
+    let error = probe(&mut link, "/tmp/base.mst", 3, "vram", 0x4000, 4).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::Emulator { ref kind, .. } if kind == "unsupported"
+    ));
+    assert!(link.calls.is_empty());
+}
+
+#[test]
+fn probe_composes_frozen_load_step_and_exact_read_when_no_native_probe_exists() {
+    let mut link = Rec::new("frozen", &["11223344"]).with_methods(&[
+        "status",
+        "pause",
+        "resume",
+        "load_state",
+        "step",
+        "read_memory",
+    ]);
+
+    let out = probe(&mut link, "/tmp/base.state", 3, "ram", 0x4000, 4).unwrap();
+    let ToolOutput::Json(value) = out else {
+        panic!("expected JSON probe result")
+    };
+
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["requested_frames"], 3);
+    assert_eq!(value["completed_frames"], 3);
+    assert_eq!(value["state"], "frozen");
+    assert_eq!(value["hex"], "11223344");
+    assert_eq!(value["composition"], "load_state_step_read_memory");
+    assert_eq!(
+        link.calls,
+        vec![
+            ("status".into(), json!({})),
+            (
+                "read_memory".into(),
+                json!({"memory_type":"ram", "address":0x4000, "length":4})
+            ),
+            ("load_state".into(), json!({"path":"/tmp/base.state"})),
+            ("status".into(), json!({})),
+            ("step".into(), json!({"frames":3})),
+            ("status".into(), json!({})),
+            (
+                "read_memory".into(),
+                json!({"memory_type":"ram", "address":0x4000, "length":4})
+            ),
+        ]
+    );
+}
+
+#[test]
+fn composed_probe_freezes_a_running_generation_before_restore() {
+    let mut link = Rec::new("running", &["11223344"]).with_methods(&[
+        "status",
+        "pause",
+        "resume",
+        "load_state",
+        "step",
+        "read_memory",
+    ]);
+
+    let out = probe(&mut link, "/tmp/base.state", 3, "ram", 0x4000, 4).unwrap();
+    let ToolOutput::Json(value) = out else {
+        panic!("expected JSON probe result")
+    };
+
+    assert_eq!(value["status"], "completed");
+    assert_eq!(value["state"], "frozen");
+    assert_eq!(
+        link.methods(),
+        vec![
+            "status",
+            "pause",
+            "read_memory",
+            "load_state",
+            "status",
+            "step",
+            "status",
+            "read_memory"
+        ]
+    );
+}
+
+#[test]
+fn composed_probe_rejects_a_non_executable_generation_before_restore() {
+    let mut link = Rec::new("crashed", &["11223344"]).with_methods(&[
+        "status",
+        "pause",
+        "resume",
+        "load_state",
+        "step",
+        "read_memory",
+    ]);
+
+    let error = probe(&mut link, "/tmp/base.state", 3, "ram", 0x4000, 4).unwrap_err();
+
+    assert!(matches!(
+        error,
+        LinkError::Protocol(ref message) if message.contains("state crashed")
+    ));
+    assert_eq!(link.methods(), vec!["status"]);
+}
+
+#[test]
+fn composed_probe_rejects_an_invalid_span_without_loading_and_restores_running() {
+    let mut link = Rec::new("running", &["00"])
+        .with_methods(&[
+            "status",
+            "pause",
+            "load_state",
+            "step",
+            "read_memory",
+            "resume",
+        ])
+        .with_fail_calls(&[3]);
+
+    let error = probe(&mut link, "/tmp/base.state", 3, "ram", 0x4000, 4).unwrap_err();
+
+    assert!(matches!(error, LinkError::Timeout));
+    assert_eq!(
+        link.methods(),
+        vec!["status", "pause", "read_memory", "resume"]
+    );
+}
+
+#[test]
+fn probe_rejects_empty_or_overflowing_ranges_before_transport() {
+    for (address, length) in [(0, 0), (u64::MAX, 2)] {
+        let mut link = FakeLink::ok(json!({"hex":"00"}));
+        let error = probe(&mut link, "/tmp/base.state", 0, "ram", address, length).unwrap_err();
+        assert!(matches!(
+            error,
+            LinkError::Emulator { ref kind, .. } if kind == "bad_params"
+        ));
+        assert_eq!(link.last_method, None);
+    }
 }
 
 #[test]
@@ -717,7 +1048,9 @@ fn run_frames_passes_interrupted_through() {
 fn probe_passes_interrupted_through() {
     // 진행 중 pause_on_hit BP가 끼면 어댑터가 hex 대신 interrupted를 돌려준다 — 링크가 그대로 통과시켜
     // 에이전트가 받아야 한다(working만 건너뛰고 interrupted는 정상 result).
-    let mut link = FakeLink::ok(json!({"status":"interrupted","reason":"breakpoint","pc":196624}));
+    let mut link = Rec::new("frozen", &[])
+        .with_methods(&["probe"])
+        .with_interrupt_calls(&[1]);
     let out = probe(&mut link, "/tmp/s.mss", 60, "cpu", 0x1000, 4).unwrap();
     match out {
         ToolOutput::Json(v) => {

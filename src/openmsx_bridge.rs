@@ -300,6 +300,11 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "debugger": true,
             "methods": self.methods(),
             "memory_types": ["memory", "ram", "vram"],
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id":"main", "aliases":["z80"], "default":true,
+                "disassembly_modes":["auto", "z80"]
+            }],
             "region_sizes": self.region_sizes,
             "breakpoint_kinds": breakpoint_kinds(),
             "contracts": crate::contracts::advertisement_value(&self.active_exceptions()),
@@ -320,7 +325,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             },
             "content": self.session.media.source_path.display().to_string(),
             "content_sha1": self.session.media.source_sha1,
-            "build": std::env::var("EMUCAP_BUILD_HASH").unwrap_or_else(|_| "openmsx-21.0".into()),
+            "build": crate::build_identity::BUILD_HASH,
         });
         let object = value.as_object_mut().expect("openMSX hello is an object");
         if let Some(name) = &self.name {

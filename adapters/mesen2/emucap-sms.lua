@@ -4,6 +4,8 @@
 SYS = {
   system = "gamegear",
   system_label = "Game Gear",
+  cpu_target = { id = "main", aliases = { "z80" },
+    disassembly_modes = { "auto", "z80" } },
   cpu_type = "sms",               -- emu.cpuType.sms (SMS/GG 공통)
   default_memtype = "smsMemory",  -- emu.memType.smsMemory (Z80 버스)
   address_space_size = 0x10000,

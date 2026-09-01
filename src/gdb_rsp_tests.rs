@@ -2,6 +2,20 @@ use super::*;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 
+#[test]
+fn process_env_cannot_override_the_embedded_adapter_build() {
+    let _lock = crate::test_env::lock_env();
+    let _restore = crate::test_env::EnvGuard::new(&["EMUCAP_BUILD_HASH"]);
+    std::env::set_var("EMUCAP_BUILD_HASH", "forged-launch-build");
+
+    let env = GdbBridgeEnv::from_process_env();
+
+    assert_eq!(
+        env.build.as_deref(),
+        Some(crate::build_identity::BUILD_HASH)
+    );
+}
+
 fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     loop {

@@ -69,6 +69,36 @@ fn every_method_has_exactly_one_feature_owner() {
 }
 
 #[test]
+fn debug_selector_expectations_are_owned_by_the_public_features_that_accept_them() {
+    for (feature_id, expected) in [
+        ("state.read", &["STATE.FILTER.1", "DEBUG.CPU.SELECT.1"][..]),
+        ("execution.pause", &["DEBUG.CPU.SELECT.1"][..]),
+        ("execution.resume", &["DEBUG.CPU.SELECT.1"][..]),
+        ("execution.step", &["DEBUG.CPU.SELECT.1"][..]),
+        (
+            "debug.disassemble",
+            &["DEBUG.CPU.SELECT.1", "DEBUG.MODE.SELECT.1"][..],
+        ),
+        ("debug.call-stack", &["DEBUG.CPU.SELECT.1"][..]),
+    ] {
+        let feature = catalog()
+            .features
+            .iter()
+            .find(|feature| feature.id == feature_id)
+            .unwrap_or_else(|| panic!("missing feature {feature_id}"));
+        for expectation in expected {
+            assert!(
+                feature
+                    .expectations
+                    .iter()
+                    .any(|value| value == expectation),
+                "{feature_id} must own {expectation}"
+            );
+        }
+    }
+}
+
+#[test]
 fn unreported_adapter_is_not_promoted() {
     let status = validate_advertisement(
         &ContractAdvertisement::Unreported,

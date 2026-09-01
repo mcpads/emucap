@@ -44,7 +44,6 @@ fn launch_fixture<'a>(
         host_build: Box::leak(Box::new(host_build)),
         port: 47800,
         name: Some("xbox-test"),
-        build: Some("test-build"),
         session_token: Some("token"),
         runtime: Some(runtime),
         display: false,

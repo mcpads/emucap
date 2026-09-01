@@ -66,7 +66,7 @@ impl GdbBridgeEnv {
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
             content: std::env::var_os("EMUCAP_CONTENT").map(PathBuf::from),
-            build: std::env::var("EMUCAP_BUILD_HASH").ok(),
+            build: Some(crate::build_identity::BUILD_HASH.to_string()),
         }
     }
 }

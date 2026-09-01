@@ -1054,6 +1054,9 @@ void handle(const std::string& line) {
 			r += "],"
 			     // Advertise the memory types accepted by read_memory, write_memory, and find_pattern.
 			     "\"memory_types\":[\"ram\",\"vram\",\"aica\"],"
+			     "\"state_groups\":[\"cpu\"],"
+			     "\"cpu_targets\":[{\"id\":\"main\",\"aliases\":[\"sh4\"],\"default\":true,"
+			     "\"disassembly_modes\":[\"auto\",\"sh4\"]}],"
 			     "\"breakpoint_kinds\":[{\"kind\":\"exec\",\"range_unit\":\"address\","
 			     "\"range_mode\":\"exact\",\"memory_type_used\":false,\"snapshot\":false}],"
 			     "\"execution_limits\":{\"max_sync_advance_count\":";

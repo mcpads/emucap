@@ -5,6 +5,8 @@
 SYS = {
   system = "nes",
   system_label = "Nintendo Entertainment System",
+  cpu_target = { id = "main", aliases = { "6502", "2a03" },
+    disassembly_modes = { "auto", "6502" } },
   cpu_type = "nes",              -- emu.cpuType.nes (NES/Famicom 공통, 6502/2A03)
   default_memtype = "nesMemory", -- emu.memType.nesMemory (6502 CPU 버스 $0000-$FFFF)
   address_space_size = 0x10000,

@@ -83,10 +83,19 @@ pub struct EmulatorIdentity {
     pub mesen_host_api: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_build: Option<Value>,
+    /// Generation-bound debugger selection metadata from hello. These fields are carried beside
+    /// the legacy identity payload for compatibility, but status exposes them as top-level
+    /// capabilities rather than serializing them inside emulator_identity.
+    #[serde(skip)]
+    pub state_groups: Vec<String>,
+    #[serde(skip)]
+    pub cpu_targets: Vec<crate::debug_selection::CpuTarget>,
 }
 
 impl EmulatorIdentity {
     pub fn from_hello(v: &Value) -> Self {
+        let (state_groups, cpu_targets) =
+            crate::debug_selection::parse_debug_capabilities(v).unwrap_or_default();
         Self {
             system: v.get("system").and_then(Value::as_str).map(String::from),
             adapter: v.get("adapter").and_then(Value::as_str).map(String::from),
@@ -114,6 +123,8 @@ impl EmulatorIdentity {
                 .and_then(Value::as_u64)
                 .and_then(|n| u32::try_from(n).ok()),
             host_build: v.get("host_build").cloned(),
+            state_groups,
+            cpu_targets,
         }
     }
 

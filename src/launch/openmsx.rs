@@ -53,7 +53,6 @@ pub struct Launch<'a> {
     pub port: u16,
     pub name: Option<&'a str>,
     pub session_token: Option<&'a str>,
-    pub build: Option<&'a str>,
     pub runtime: Option<RuntimeEnv<'a>>,
     pub display: bool,
 }
@@ -237,9 +236,6 @@ pub fn launch_spec(
     }
     if let Some(token) = launch.session_token {
         spec = spec.env("EMUCAP_SESSION_TOKEN", token);
-    }
-    if let Some(build) = launch.build {
-        spec = spec.env("EMUCAP_BUILD_HASH", build);
     }
     spec.runtime_env(launch.runtime)
 }

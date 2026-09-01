@@ -200,7 +200,7 @@ impl Mupen64PlusHost {
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
-            build: std::env::var("EMUCAP_BUILD_HASH").unwrap_or_else(|_| "unknown".into()),
+            build: crate::build_identity::BUILD_HASH.to_string(),
             runtime_home: runtime_home.to_path_buf(),
             display,
             frozen: false,

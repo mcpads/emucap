@@ -56,6 +56,8 @@ The canonical pinned build and representative cartridge have passed:
   cleanup;
 - out-of-range and cross-boundary memory requests fail loudly;
 - frozen save/load restores a mutated RAM byte;
+- public atomic `probe` composes frozen load, exact VDP frame step, and bounded memory read under
+  one Control link lock;
 - visible `SDLGL-PP` mode produces a 320x240 PNG with stable frozen-frame provenance.
 
 The Homebrew bottle returned `Failed to take screenshot: TODO`, but the canonical source build did

@@ -59,6 +59,11 @@
       "expression": "effect_terminal(feature) => released(transient_resources(feature))"
     },
     {
+      "id": "BUILD.IDENTITY.1",
+      "category": "invariant",
+      "expression": "repository_compiled_adapter(a) => reported_build(a) = embedded_source_revision(binary(a)) and (known_managed_content(a) => reported_content(a) = managed_content(a))"
+    },
+    {
       "id": "TIME.RESPONSE.1",
       "category": "temporal",
       "expression": "G(accepted(q) => F<=D_h response_terminal(q))"
@@ -139,6 +144,11 @@
       "expression": "G((not current(g) or requested_launch_id != current_launch_id or not lease_held(g)) => stop_rejected(g) and not signal_sent_for(g)) and G(stop_completed(g) => current = g and all_recorded_generation_processes_exited(g) and requested_stop_recorded(g))"
     },
     {
+      "id": "LIFE.REENTRY.1",
+      "category": "temporal",
+      "expression": "G(control_observation_uncertain(g) and not completed_stop_proof(g) => launch_blocked(g)) and G(completed_stop_proof(g) and no_other_transition_blocker(g) => F<=D_h (ready_for_content and runtime_advice(g) = launch_allowed))"
+    },
+    {
       "id": "LIFE.HANDOFF.1",
       "category": "temporal",
       "expression": "G(reattach_completed(g,c) => requested_generation(c) = g and current(g) and execution_alive(g) and required_backend_usable(g) and lease_held(g,c) and live_identity(c) = g) and G(reattach_rejected(g,c) => not transfer_lease(g,c))"
@@ -196,7 +206,17 @@
     {
       "id": "STATE.FILTER.1",
       "category": "postcondition",
-      "expression": "get_state.ok and groups not empty => returned_groups subset_of groups and groups_applied"
+      "expression": "get_state.ok and groups not empty => requested_groups resolve_in advertised_state_groups and returned_groups subset_of resolved_groups and groups_applied = resolved_groups"
+    },
+    {
+      "id": "DEBUG.CPU.SELECT.1",
+      "category": "postcondition",
+      "expression": "debug_operation.ok and cpu provided => cpu resolves_in advertised_cpu_targets and operation_target = resolved_cpu"
+    },
+    {
+      "id": "DEBUG.MODE.SELECT.1",
+      "category": "postcondition",
+      "expression": "disassemble.ok and mode provided => mode resolves_in modes(operation_target) and decode_mode = resolved_mode"
     },
     {
       "id": "VIDEO.CURRENT.1",
@@ -296,7 +316,7 @@
     {
       "id": "PROBE.ATOMIC.1",
       "category": "invariant",
-      "expression": "probe.ok => no_external_mutation_between(load,advance,read)"
+      "expression": "probe.ok => no_external_mutation_between(load,advance,read) and exact_requested_advance and exact_read_length and frozen(after)"
     },
     {
       "id": "BP.ARMED.1",
@@ -426,9 +446,11 @@
       "expectations": [
         "TIME.RESPONSE.1",
         "TIME.GENERATION.1",
+        "BUILD.IDENTITY.1",
         "LIFE.LEASE.1",
         "LIFE.PUBLISH.1",
-        "LIFE.TERMINATE.1"
+        "LIFE.TERMINATE.1",
+        "LIFE.REENTRY.1"
       ]
     },
     {
@@ -465,7 +487,7 @@
       "methods": ["status"],
       "temporal_classes": ["T0"],
       "disposition": "retain",
-      "expectations": ["FAIL.TIMEOUT.NONCRASH.1"]
+      "expectations": ["BUILD.IDENTITY.1", "LIFE.REENTRY.1", "FAIL.TIMEOUT.NONCRASH.1"]
     },
     {
       "id": "failure.context",
@@ -548,7 +570,7 @@
       "methods": ["get_state"],
       "temporal_classes": ["T0"],
       "disposition": "retain",
-      "expectations": ["STATE.FILTER.1"]
+      "expectations": ["STATE.FILTER.1", "DEBUG.CPU.SELECT.1"]
     },
     {
       "id": "video.capture",
@@ -687,7 +709,7 @@
       "methods": ["pause"],
       "temporal_classes": ["T2"],
       "disposition": "retain",
-      "expectations": ["EXEC.PAUSE.HALT.1", "EXEC.PAUSE.PERSIST.1", "TIME.RESPONSE.1"]
+      "expectations": ["EXEC.PAUSE.HALT.1", "EXEC.PAUSE.PERSIST.1", "TIME.RESPONSE.1", "DEBUG.CPU.SELECT.1"]
     },
     {
       "id": "execution.resume",
@@ -695,7 +717,7 @@
       "methods": ["resume"],
       "temporal_classes": ["T0"],
       "disposition": "retain",
-      "expectations": []
+      "expectations": ["DEBUG.CPU.SELECT.1"]
     },
     {
       "id": "execution.run-frames-wire",
@@ -711,7 +733,7 @@
       "methods": ["step"],
       "temporal_classes": ["T1"],
       "disposition": "retain",
-      "expectations": ["EXEC.STEP.FRAME.1", "EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.STOP.1", "TIME.GAP.1"]
+      "expectations": ["EXEC.STEP.FRAME.1", "EXEC.STEP.INSTR.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.EXACT.1", "TIME.STOP.1", "TIME.GAP.1", "DEBUG.CPU.SELECT.1"]
     },
     {
       "id": "execution.step-instructions-wire",
@@ -761,7 +783,7 @@
       "route": "debug",
       "temporal_classes": ["T2"],
       "disposition": "retain",
-      "expectations": ["PROBE.ATOMIC.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
+      "expectations": ["PROBE.ATOMIC.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.EXACT.1", "TIME.GAP.1"]
     },
     {
       "id": "debug.breakpoint",
@@ -794,7 +816,7 @@
       "methods": ["disassemble"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": []
+      "expectations": ["DEBUG.CPU.SELECT.1", "DEBUG.MODE.SELECT.1"]
     },
     {
       "id": "debug.register-watch",
@@ -820,7 +842,7 @@
       "methods": ["call_stack"],
       "temporal_classes": ["T4"],
       "disposition": "retain",
-      "expectations": ["TRACE.AUTHORITY.1"]
+      "expectations": ["TRACE.AUTHORITY.1", "DEBUG.CPU.SELECT.1"]
     },
     {
       "id": "debug.break-on-reset",

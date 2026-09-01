@@ -17,7 +17,7 @@ xemu fork (original Xbox, experimental).
 Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
 MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
 
-**v0.16.0 — beta.** This repository remains under active development; interfaces and
+**v0.16.1 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -177,7 +177,9 @@ The two MCPs never call each other — **the agent composes them**:
   Tracking MCP's `log_gate` / `log_metric`.
 - **Frame-boundary search composes the debug `probe` operation**: binary-search
   the frame range with repeated atomic probes. Each call restores the same base state,
-  advances, and reads the predicate without an externally visible gap.
+  advances, and reads the predicate without an externally visible gap. A maintained adapter may
+  provide one native transaction, or Control may hold the generation link and compose validated
+  pause/resume/load/exact-step/read operations; live `status.methods` exposes only the callable result.
 - **Interventions are logged explicitly**: state changes like `write_memory` /
   `load_state` / `reset` / input are not recorded automatically, so log them via
   the Tracking MCP's `log_intervention` to preserve reproduction fidelity.
@@ -336,7 +338,8 @@ debugger halt to service requests without advancing the guest.
   an operator-supplied BIOS dump. The isolated headless path supports EE memory
   and registers, pattern search and dumps, frame stepping, disassembly, frozen
   savestates, screenshots, controller input, pausing EE breakpoints with register
-  snapshots, best-effort call stacks, and synchronous reset through a bounded PINE bridge.
+  snapshots, best-effort call stacks, atomic state/frame/memory probes, and synchronous reset
+  through a bounded PINE bridge.
   → `adapters/pcsx2/README.md`
 - **Dolphin (GameCube · Wii)** — build the pinned native fork with
   `adapters/dolphin/build.sh` (Windows: `build.ps1`). The default launch is

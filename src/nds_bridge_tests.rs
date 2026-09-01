@@ -218,7 +218,8 @@ fn frame_step_completes_on_exact_shared_vblank_count_without_queuing_its_own_sto
     let arm7 = FakeGdb::with(&[("?", "S05")]);
     let mut bridge = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
 
-    let response = bridge.handle_request(Request::new(1, "step", json!({"frames": 3})));
+    let response =
+        bridge.handle_request(Request::new(1, "step", json!({"frames": 3, "cpu": "arm9"})));
     assert!(response.ok, "{:?}", response.error);
     let result = response.result.unwrap();
     assert_eq!(result["status"], "completed");
@@ -267,7 +268,7 @@ fn arm7_breakpoint_preempts_shared_frame_step_and_remains_reportable() {
 }
 
 #[test]
-fn frame_step_requires_both_stop_channels_and_shared_cpu_scope() {
+fn frame_step_requires_both_stop_channels_and_rejects_secondary_cpu_scope() {
     let mut bridge = bridge_arm9_only(&[("?", "S05")]);
     let missing_arm7 =
         bridge.handle_request(Request::new(1, "step", json!({"unit":"frames", "count":1})));
@@ -286,7 +287,7 @@ fn frame_step_requires_both_stop_channels_and_shared_cpu_scope() {
     let per_cpu = bridge.handle_request(Request::new(
         2,
         "step",
-        json!({"unit":"frames", "count":1, "cpu":"arm9"}),
+        json!({"unit":"frames", "count":1, "cpu":"arm7"}),
     ));
     assert!(!per_cpu.ok);
     assert_eq!(per_cpu.error.unwrap().kind, "bad_params");

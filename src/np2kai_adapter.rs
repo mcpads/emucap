@@ -326,7 +326,7 @@ impl Np2kaiHost {
             upstream_commit: upstream_commit.to_string(),
             patchset_sha256: patchset_sha256.to_string(),
             build_profile: build_profile.to_string(),
-            frontend_build: std::env::var("EMUCAP_BUILD_HASH").unwrap_or_else(|_| "unknown".into()),
+            frontend_build: crate::build_identity::BUILD_HASH.to_string(),
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),

@@ -17,6 +17,7 @@
 #include "emucap.h"
 #include "emucap_input.h"
 #include "emucap_json_num.h"
+#include "emucap_json_strings.h"
 #include "emucap_ngp.h"
 #include "emucap_pcfx.h"
 #include "emucap_recording.h"
@@ -236,6 +237,13 @@ long g_step_id = -1;
 long g_step_remaining = 0;
 uint64_t g_step_progress_ms = 0;
 
+// PSX can replace CPU and device state while the game thread is parked in a debugger callback.
+// The patched CPU loop discards that callback's stale local execution state and invokes a fresh
+// callback at the restored PC. Keep the request open until that fresh instruction boundary exists.
+enum CoreRefreshReply { CORE_REFRESH_NONE, CORE_REFRESH_LOAD_STATE, CORE_REFRESH_RESET };
+long g_core_refresh_id = -1;
+CoreRefreshReply g_core_refresh_reply = CORE_REFRESH_NONE;
+
 // 명령 단위 step(step_instructions): continuous CPU 콜백을 무장해 g_insn_remaining개 CPU 명령을
 // 진행한 뒤 emucap_cpu_cb 안에서 재정지한다(기존 BP freeze 경로 freeze_spin_until_resume 재사용 —
 // 새 동기화 없음). g_insn_step_id로 완료 응답. g_insn_armed: 마지막 rearm이 continuous를 무장했는지
@@ -282,18 +290,16 @@ uint32 g_reset_entry = 0;  // 리셋 진입 PC(enable 시 벡터에서 읽음)
 // 진입명령의 cb가 이미 일어난 상태라 resume이 그 명령을 '공짜로' 실행시킨다 → step(N)=정확히 N.
 // 그러나 pause/프레임-step로 *cold* frozen이면 진입명령 cb가 아직 안 일어났다 → 첫 continuous cb를
 // 1회 흡수(g_insn_skip_first)해야 cold도 공짜 진입명령을 갖고 정확히 N이 된다(안 그러면 N-1).
-// g_frozen_via_cb: "진입명령의 cb가 이미 발화했나(=resume이 공짜 실행하나)". 권위는 *오직 게임스레드가
-// 어디서 park했나*에 있다(핸들러 래치·op별 무효화 금지 — fragile): cb 안 park(freeze_spin_until_resume)
-// =true, 프레임경계 park(emucap_service frozen spin)=false. 두 park가 진입 시 각자 설정하는 게 전부다.
-// load_state/reset도 park를 옮기지 않으므로 손대지 않는다 — freeze_spin park 중 load/reset이면 resume 시
-// 코어가 복원/리셋 진입명령을 cb 없이 공짜 실행해(4코어 공통 hook→exec 순) BP 진입과 동형이라 그대로
-// true가 정답(무효화하면 N+1). pause/frame-step 핸들러도 via_cb를 정하지 않는다(park 위치가 정함).
+// g_frozen_via_cb: "현재 진입명령의 cb가 이미 발화했나(=resume이 그 명령을 실행하나)". 일반적으로
+// park 위치가 정하지만 PSX load/reset은 예외다. 그 코어는 복원 전 callback의 로컬 timestamp와 pipeline을
+// 폐기한 뒤 복원된 PC에서 새 callback을 발화하므로, load/reset 응답도 그 새 boundary에서 완료한다.
 bool g_frozen_via_cb = false;
 bool g_insn_skip_first = false;
 
 // 원자적 probe: 세이브스테이트 복귀 → N프레임 진행 → 타깃 읽기를 한 단위로(그 사이 새 명령 차단).
 // 별도 load+run_frames 호출 사이의 자유 실행 누수를 없애 bisect를 결정론적으로 만든다.
 long g_probe_id = -1;
+long g_probe_requested = 0;
 long g_probe_remaining = 0;
 uint64_t g_probe_progress_ms = 0;
 std::string g_probe_mt;
@@ -320,7 +326,8 @@ void rearm_breakpoints();
 
 void cancel_session_requests() {
   const bool had_request = g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
-      || g_insn_step_id >= 0 || g_test_adapter_exception_id >= 0 || g_recording.get();
+      || g_insn_step_id >= 0 || g_core_refresh_id >= 0
+      || g_test_adapter_exception_id >= 0 || g_recording.get();
   cancel_recording_for_disconnect();
   if (g_def_is_press) g_input_override.release();
   g_def_id = -1;
@@ -328,6 +335,7 @@ void cancel_session_requests() {
   g_def_progress_ms = 0;
   g_def_is_press = false;
   g_probe_id = -1;
+  g_probe_requested = 0;
   g_probe_remaining = 0;
   g_probe_progress_ms = 0;
   g_probe_mt.clear();
@@ -340,6 +348,8 @@ void cancel_session_requests() {
   g_insn_remaining = 0;
   g_insn_progress_ms = 0;
   g_insn_skip_first = false;
+  g_core_refresh_id = -1;
+  g_core_refresh_reply = CORE_REFRESH_NONE;
   g_test_adapter_exception_id = -1;
   if (g_insn_armed) rearm_breakpoints();
   if (had_request)
@@ -460,23 +470,6 @@ bool json_bool(const std::string& s, const char* key, bool& out) {
   if (!strncmp(p, "true", 4) || *p == '1') { out = true; return true; }
   if (!strncmp(p, "false", 5) || *p == '0') { out = false; return true; }
   return false;
-}
-
-enum JsonArrayState { JSON_ARRAY_ABSENT, JSON_ARRAY_EMPTY, JSON_ARRAY_NONEMPTY, JSON_ARRAY_INVALID };
-
-JsonArrayState json_array_state(const std::string& s, const char* key) {
-  std::string pat = std::string("\"") + key + "\"";
-  size_t k = s.find(pat);
-  if (k == std::string::npos) return JSON_ARRAY_ABSENT;
-  size_t c = s.find(':', k + pat.size());
-  if (c == std::string::npos) return JSON_ARRAY_INVALID;
-  size_t p = c + 1;
-  while (p < s.size() && isspace((unsigned char)s[p])) p++;
-  if (p >= s.size() || s[p] != '[') return JSON_ARRAY_INVALID;
-  p++;
-  while (p < s.size() && isspace((unsigned char)s[p])) p++;
-  if (p >= s.size()) return JSON_ARRAY_INVALID;
-  return s[p] == ']' ? JSON_ARRAY_EMPTY : JSON_ARRAY_NONEMPTY;
 }
 
 // JSON 문자열 값 이스케이프(따옴표·역슬래시·제어문자). EMUCAP_NAME 등 외부 입력을 JSON에
@@ -895,7 +888,8 @@ void cancel_recording_for_disconnect() {
 
 bool recording_conflict() {
   return g_recording.get() || g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
-      || g_insn_step_id >= 0 || g_input_override.engaged() || !g_bps.empty()
+      || g_insn_step_id >= 0 || g_core_refresh_id >= 0
+      || g_input_override.engaged() || !g_bps.empty()
       || g_trace_enabled || g_watch_enabled || g_break_on_reset;
 }
 
@@ -1135,7 +1129,8 @@ void flush_pending_internal_error(long id, const char* reason) noexcept {
 
 void contain_service_exception(const char* operation, const char* reason) noexcept {
   const long pending_ids[] = {
-      g_def_id, g_probe_id, g_step_id, g_insn_step_id, g_test_adapter_exception_id};
+      g_def_id, g_probe_id, g_step_id, g_insn_step_id, g_core_refresh_id,
+      g_test_adapter_exception_id};
   g_frozen = true;
   g_frozen_via_cb = false;
   for (size_t i = 0; i < sizeof(pending_ids) / sizeof(pending_ids[0]); i++) {
@@ -1215,6 +1210,22 @@ bool is_ws() {
 
 bool is_ngp() {
   return !strcmp(system_shortname(), "ngp");
+}
+
+std::string cpu_targets_json() {
+  const char* alias = "cpu";
+  const char* mode = "auto";
+  if (is_ss()) { alias = "sh2"; mode = "sh2"; }
+  else if (is_psx()) { alias = "r3000a"; mode = "mips"; }
+  else if (is_pce()) { alias = "huc6280"; mode = "huc6280"; }
+  else if (is_pcfx()) { alias = "v810"; mode = "v810"; }
+  else if (is_md()) { alias = "m68000"; mode = "m68k"; }
+  else if (is_ws()) { alias = "v30mz"; mode = "x86"; }
+  else if (is_ngp()) { alias = "tlcs900h"; mode = "tlcs900h"; }
+  std::string modes = "[\"auto\"]";
+  if (strcmp(mode, "auto")) modes = "[\"auto\",\"" + std::string(mode) + "\"]";
+  return "[{\"id\":\"main\",\"aliases\":[\"" + std::string(alias) +
+      "\"],\"default\":true,\"disassembly_modes\":" + modes + "}]";
 }
 
 std::string hex_bytes(const uint8* data, size_t len) {
@@ -1515,8 +1526,16 @@ void flush_deferred_on_freeze(uint32 pc) {
     g_def_progress_ms = 0;
   }
   if (g_probe_id >= 0) {            // probe 중 BP 끼면 결정론 측정 무효 → interrupted로 닫는다(hang 대신)
-    reply_ok(g_probe_id, buf);
+    const long completed = g_probe_requested > g_probe_remaining
+        ? g_probe_requested - g_probe_remaining : 0;
+    char probe_buf[256];
+    snprintf(probe_buf, sizeof(probe_buf),
+             "{\"status\":\"interrupted\",\"reason\":\"breakpoint\",\"pc\":%u,"
+             "\"frame\":%llu,\"requested_frames\":%ld,\"completed_frames\":%ld}",
+             (unsigned)pc, (unsigned long long)g_frame, g_probe_requested, completed);
+    reply_ok(g_probe_id, probe_buf);
     g_probe_id = -1;
+    g_probe_requested = 0;
     g_probe_remaining = 0;
     g_probe_progress_ms = 0;
   }
@@ -1596,9 +1615,35 @@ void rearm_breakpoints() {
   // 비용이라 도구 활성 구간만 무장한다(resume이 즉시 해제).
   // continuous(매 명령 cb) = 명령단위 step 또는 실행추적 또는 레지스터워치 중 하나라도 활성.
   // rearm은 flag에서 매번 재계산하므로 resume이 trace/watch를 끄지 않는다(set_trace(false)/clear까지 유지).
-  bool continuous = g_insn_remaining > 0 || g_trace_enabled || g_watch_enabled || g_break_on_reset;
+  bool continuous = g_insn_remaining > 0 || g_core_refresh_id >= 0
+      || g_trace_enabled || g_watch_enabled || g_break_on_reset;
   g_insn_armed = continuous;
   CurGame->Debugger->SetCPUCallback((has_core_bp || continuous) ? emucap_cpu_cb : nullptr, continuous);
+}
+
+bool defer_psx_core_refresh(long id, CoreRefreshReply reply) {
+  if (!is_psx() || !g_frozen_via_cb) return false;
+  g_core_refresh_id = id;
+  g_core_refresh_reply = reply;
+  g_frozen = false;
+  rearm_breakpoints();
+  return true;
+}
+
+bool complete_psx_core_refresh() {
+  if (g_core_refresh_id < 0) return false;
+  const long id = g_core_refresh_id;
+  const CoreRefreshReply reply = g_core_refresh_reply;
+  g_core_refresh_id = -1;
+  g_core_refresh_reply = CORE_REFRESH_NONE;
+  g_frozen = true;
+  rearm_breakpoints();
+  if (reply == CORE_REFRESH_LOAD_STATE)
+    reply_ok(id, "{\"status\":\"completed\"}");
+  else
+    reply_ok(id, "{\"reset\":true}");
+  freeze_spin_until_resume();
+  return true;
 }
 
 // read_memory·probe가 한 번에 읽을 수 있는 최대 바이트(거대 length로 인한 과대 할당 방지).
@@ -1611,14 +1656,19 @@ static const long MAX_FIND_LEN = 16L * 1024 * 1024;  // 16MB — 벌크 read라 
 static const uint64 DUMP_MAX_REGION_BYTES = 64ULL * 1024 * 1024;  // 64MB
 
 // 주소공간 [addr, addr+len)을 hex 문자열로. aspace 없거나 범위 위반이면 false. read_memory·probe 공용.
-bool read_aspace_hex(const std::string& mt, uint32 addr, long len, std::string& hex_out) {
+bool validate_aspace_range(const std::string& mt, uint32 addr, long len) {
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) return false;
+  if (len <= 0 || len > MAX_READ_LEN) return false;
+  uint64 end = (uint64)addr + (uint64)len;
+  return end <= 0x100000000ULL && (!sp->size || end <= sp->size);
+}
+
+bool read_aspace_hex(const std::string& mt, uint32 addr, long len, std::string& hex_out) {
+  AddressSpaceType* sp = find_aspace(mt);
   // 주소·길이 범위 검증 — 거대 length는 reserve에서 std::bad_alloc을 던져 핸들러 밖으로
   // 탈출시켜 에뮬레이터를 죽인다. 이 검증으로 uint32 캐스팅(off/chunk)도 잘림 없이 안전해진다.
-  if (len < 0 || len > MAX_READ_LEN) return false;
-  uint64 end = (uint64)addr + (uint64)len;
-  if (end > 0x100000000ULL || (sp->size && end > sp->size)) return false;
+  if (!sp || !validate_aspace_range(mt, addr, len)) return false;
   hex_out.clear();
   hex_out.reserve((size_t)len * 2);
   static uint8 buf[0x10000];
@@ -1945,41 +1995,106 @@ bool read_sp(uint32& out) {
   return read_register_by_name(g_sp_reg_name, out);
 }
 
+std::vector<std::string> register_group_names() {
+  std::vector<std::string> names;
+  if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->RegGroups) return names;
+  int index = 0;
+  for (auto* group : *CurGame->Debugger->RegGroups) {
+    names.push_back(group->name && group->name[0]
+                        ? std::string(group->name)
+                        : "g" + std::to_string(index));
+    index++;
+  }
+  return names;
+}
+
+std::string register_group_names_json() {
+  const std::vector<std::string> names = register_group_names();
+  std::string output = "[";
+  for (std::size_t index = 0; index < names.size(); index++) {
+    if (index) output += ",";
+    output += "\"" + json_escape(names[index]) + "\"";
+  }
+  output += "]";
+  return output;
+}
+
+bool register_group_name_equal(const std::string& left, const std::string& right) {
+  return left.size() == right.size() && !strcasecmp(left.c_str(), right.c_str());
+}
+
+bool register_group_requested(
+    const std::vector<std::string>& requested,
+    const std::string& available) {
+  if (requested.empty()) return true;
+  for (const std::string& value : requested)
+    if (register_group_name_equal(value, available)) return true;
+  return false;
+}
+
 // 레지스터 그룹(SH-2/SCU/VDP 등)을 평탄한 "그룹.레지스터": 값 맵으로. 구분자(bsize 0xFFFF) 제외.
 void handle_get_state(long id, const std::string& line) {
-  const JsonArrayState groups = json_array_state(line, "groups");
-  if (groups == JSON_ARRAY_INVALID) {
-    reply_err(id, "bad_params", "groups must be a list");
-    return;
-  }
-  if (groups == JSON_ARRAY_NONEMPTY) {
-    reply_err(id, "bad_params",
-              "Mednafen get_state does not support group filtering; omit groups or pass []");
+  std::vector<std::string> requested;
+  const EmucapJsonStringArrayStatus groups =
+      emucap_json_string_array(line, "groups", requested);
+  if (groups == EmucapJsonStringArrayStatus::invalid) {
+    reply_err(id, "bad_params", "groups must be a list of non-empty strings");
     return;
   }
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->RegGroups) {
     reply_err(id, "no_debugger", "debugger is not initialized");
     return;
   }
+  const std::vector<std::string> available = register_group_names();
+  for (const std::string& wanted : requested) {
+    bool found = false;
+    for (const std::string& name : available)
+      found = found || register_group_name_equal(wanted, name);
+    if (!found) {
+      const std::string message = "unknown state group '" + wanted
+          + "'; available: " + register_group_names_json();
+      reply_err(id, "bad_params", message.c_str());
+      return;
+    }
+  }
   std::string out = "{\"state\":{";
   bool first = true;
-  int gi = 0;
+  std::size_t group_index = 0;
   for (auto* rg : *CurGame->Debugger->RegGroups) {
-    char gname[32];
-    if (rg->name && rg->name[0]) snprintf(gname, sizeof(gname), "%s", rg->name);
-    else snprintf(gname, sizeof(gname), "g%d", gi);  // 그룹명 null 폴백
+    const std::string& group_name = available[group_index++];
+    if (!register_group_requested(requested, group_name)) continue;
     for (int x = 0; rg->Regs[x].bsize; x++) {
       if (rg->Regs[x].bsize == 0xFFFF) continue;
       uint32 val = rg->GetRegister(rg->Regs[x].id, nullptr, 0);
-      char kv[256];
-      snprintf(kv, sizeof(kv), "%s\"%s.%s\":%u", first ? "" : ",", gname,
-               rg->Regs[x].name, (unsigned)val);
-      out += kv;
+      if (!first) out += ",";
+      out += "\"" + json_escape(group_name) + "."
+          + json_escape(rg->Regs[x].name) + "\":" + std::to_string((unsigned)val);
       first = false;
     }
-    gi++;
   }
-  out += "}}";
+  out += "}";
+  if (!requested.empty()) {
+    out += ",\"groups_applied\":[";
+    bool first_group = true;
+    for (std::size_t wanted_index = 0; wanted_index < requested.size(); wanted_index++) {
+      const std::string& wanted = requested[wanted_index];
+      for (const std::string& name : available) {
+        if (!register_group_name_equal(wanted, name)) continue;
+        bool already_added = false;
+        for (std::size_t index = 0; index < wanted_index; index++) {
+          if (register_group_name_equal(requested[index], name)) already_added = true;
+        }
+        if (!already_added) {
+          if (!first_group) out += ",";
+          out += "\"" + json_escape(name) + "\"";
+          first_group = false;
+        }
+        break;
+      }
+    }
+    out += "]";
+  }
+  out += "}";
   reply_ok(id, out);
 }
 
@@ -2002,10 +2117,10 @@ void handle_load_state(long id, const std::string& line) {
     MDFNSS_LoadSM(&fs);
     fs.close();
   } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
-  // via_cb는 손대지 않는다 — 권위는 오직 park 위치(freeze_spin=true / emucap_service frozen=false).
-  // freeze_spin park 중 load면 resume 시 코어가 복원된 진입명령(Pipe_ID/PC)을 cb 없이 공짜 실행한다
-  // (4코어 공통: 디스패치가 hook(PC)→명령 실행 순 — ss.cpp/md system.cpp/psx·pce cpu loop) → BP 진입과
-  // 동형이라 skip 불요.
+  // PSX의 StateAction은 event scheduler를 timestamp 0으로 다시 맞춘다. BP callback의 복원 전
+  // timestamp/pipeline으로 돌아가면 다음 advance에서 PSX_EventHandler assertion이 난다. 패치된 CPU가
+  // 그 로컬 문맥을 버리고 복원 PC의 새 callback을 만든 뒤 이 요청을 완료한다.
+  if (defer_psx_core_refresh(id, CORE_REFRESH_LOAD_STATE)) return;
   reply_ok(id, "{\"status\":\"completed\"}");
 }
 
@@ -2987,7 +3102,6 @@ void handle(const std::string& line) {
     add_exception("mednafen.input-pulse.port-zero-only");
     if (has_debugger) {
       if (!is_ngp()) add_exception("mednafen.call-stack.best-effort");
-      add_exception("mednafen.state.groups-absent");
       if (is_md()) {
         add_exception("mednafen.md.cpu-write-absent");
       }
@@ -3030,7 +3144,10 @@ void handle(const std::string& line) {
     host_features += "]";
     std::string hello_resp = std::string(head) +
                              "\"host_features\":" + host_features + ",\"methods\":[" + methods +
-                             "],\"memory_types\":[" + mtypes + "],\"breakpoint_kinds\":" +
+                             "],\"memory_types\":[" + mtypes + "],\"state_groups\":" +
+                             (has_debugger ? register_group_names_json() : "[]") +
+                             ",\"cpu_targets\":" + (has_debugger ? cpu_targets_json() : "[]") +
+                             ",\"breakpoint_kinds\":" +
                              breakpoint_kinds + ",\"contracts\":" +
                              contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
                              std::to_string(MAX_SYNC_ADVANCE) + "}}";
@@ -3099,6 +3216,11 @@ void handle(const std::string& line) {
              g_def_is_press ? "timed" : (g_input_override.engaged() ? "persistent" : "native"),
              (unsigned)g_input_override.mask(), MAX_SYNC_ADVANCE);
     std::string resp(buf);
+    if (has_debugger) {
+      resp.pop_back();
+      resp += ",\"state_groups\":" + register_group_names_json() +
+              ",\"cpu_targets\":" + cpu_targets_json() + "}";
+    }
     if (recording_identity_available()) {
       resp.pop_back();
       resp += ",\"recording\":{\"capability_revision\":\"" +
@@ -3282,8 +3404,12 @@ void handle(const std::string& line) {
     g_step_progress_ms = monotonic_millis();
   } else if (method == "probe") {
     // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
-    // 중에는 거부한다 — Mesen 어댑터와 동일하게 freeze 상태머신과 섞이지 않게 한다.
-    if (g_frozen) { reply_err(id, "frozen", "probe requires running state; call resume first"); return; }
+    // frame-boundary park에서는 그대로 수행할 수 있다. CPU callback 안의 instruction-boundary
+    // park만 host callback stack과 restored CPU state를 섞을 수 있어 상태를 건드리기 전에 거부한다.
+    if (g_frozen && g_frozen_via_cb) {
+      reply_err(id, "unsafe_halt", "probe requires a frame-boundary halt; call resume, then pause");
+      return;
+    }
     std::string probe_mt = json_str(line, "memory_type");
     // Saturn "physical"은 미구현(read=0)이라 타깃 읽기가 조용히 all-zeros를 줘 거짓 probe 결과를 낸다 —
     // read_memory와 동일하게 거부한다(상태-파괴적 savestate 로드/프레임 진행 전에).
@@ -3296,12 +3422,26 @@ void handle(const std::string& line) {
     if (!json_u32_arg(id, line, "address", probe_addr, true)) return;
     long probe_len = 0;
     json_num(line, "length", probe_len);
+    if (!validate_aspace_range(probe_mt, probe_addr, probe_len)) {
+      reply_err(id, "bad_params", "unknown memory_type or address/length exceeds the region");
+      return;
+    }
     try {                              // 즉시 복귀(원자적 진입)
       FileStream fs(path, FileStream::MODE_READ);
       MDFNSS_LoadSM(&fs);
       fs.close();
     } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
+    if (frames == 0) {
+      std::string hex;
+      if (!read_aspace_hex(probe_mt, probe_addr, probe_len, hex)) {
+        reply_err(id, "bad_params", "memory range became unavailable after state restore");
+      } else {
+        reply_ok(id, "{\"status\":\"completed\",\"requested_frames\":0,\"completed_frames\":0,\"hex\":\"" + hex + "\"}");
+      }
+      return;
+    }
     g_probe_id = id;                   // 진행·읽기·응답은 emucap_service가(그 사이 새 명령 차단)
+    g_probe_requested = frames;
     g_probe_remaining = frames;
     g_probe_progress_ms = monotonic_millis();
     g_probe_mt = probe_mt;
@@ -3802,8 +3942,7 @@ void handle(const std::string& line) {
     reply_ok(id, "{\"events\":" + arr + tail);
   } else if (method == "reset") {
     MDFNI_Reset();
-    // via_cb 미변경 — load_state와 동일 근거: freeze_spin park 중 reset이면 resume 시 리셋벡터 진입명령이
-    // cb 없이 공짜 실행되므로(park 위치만 권위) skip 불요. 무효화하면 N+1.
+    if (defer_psx_core_refresh(id, CORE_REFRESH_RESET)) return;
     reply_ok(id, "{\"reset\":true}");
   } else if (method == "screenshot") {
     if (!g_last_surface) {
@@ -3863,6 +4002,10 @@ void serve_socket_once() {
 // CPU 콜백(BP 히트 시 코어가 호출, MDFNI_Emulate 내부). 히트 명령에서 정지해 소켓을 스핀
 // 서비스 → 에이전트가 정확히 그 명령 지점의 메모리·상태를 읽는다. resume(g_frozen=false)에서 복귀.
 void emucap_cpu_cb(uint32 PC, bool bpoint) {
+  // load_state/reset from a PSX debugger halt completes only after the patched CPU has discarded
+  // the pre-replacement timestamp/pipeline and called us again at the restored instruction.
+  // This callback is the new linearization point; no guest instruction has executed in between.
+  if (complete_psx_core_refresh()) return;
   if (!bpoint) {
     // 실행추적 + 콜스택: 매 명령 PC를 원형버퍼에 기록하고, call/return을 분류해 shadow stack을 유지.
     if (g_trace_enabled) {
@@ -4283,15 +4426,19 @@ void emucap_service(uint64_t frame) {
           && emucap_progress_due(
               g_probe_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS))
         reply_ok(g_probe_id, "{\"status\":\"working\"}");  // 긴 진행도 타임아웃 안 나게
-      return;  // 프레임 진행만(serve_socket_once 미호출 → 네트워크 갭 없음 → 결정론)
+      if (g_probe_remaining > 0)
+        return;  // 프레임 진행만(serve_socket_once 미호출 → 네트워크 갭 없음 → 결정론)
     }
     std::string hex;
     if (!read_aspace_hex(g_probe_mt, g_probe_addr, g_probe_len, hex)) {
       reply_err(g_probe_id, "bad_params", "unknown memory_type or address/length exceeds the region");
     } else {
-      reply_ok(g_probe_id, "{\"hex\":\"" + hex + "\"}");
+      reply_ok(g_probe_id, "{\"status\":\"completed\",\"requested_frames\":"
+          + std::to_string(g_probe_requested) + ",\"completed_frames\":"
+          + std::to_string(g_probe_requested) + ",\"hex\":\"" + hex + "\"}");
     }
     g_probe_id = -1;
+    g_probe_requested = 0;
     g_probe_progress_ms = 0;
     return;
   }

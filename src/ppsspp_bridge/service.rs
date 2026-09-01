@@ -1,6 +1,159 @@
 use super::*;
 
 impl<T: WsTransport> PpssppBridge<T> {
+    pub(super) fn find_pattern(&mut self, params: &Value) -> BridgeResult<Value> {
+        let encoded_pattern = required_str(params, "hex")?;
+        if encoded_pattern.is_empty()
+            || encoded_pattern.len() % 2 != 0
+            || encoded_pattern.len() / 2 > MAX_READ_LEN
+        {
+            return Err(BridgeError::BadParams(format!(
+                "find_pattern hex must contain 1..={MAX_READ_LEN:#x} whole bytes"
+            )));
+        }
+        let pattern = hex::decode(encoded_pattern)
+            .map_err(|_| BridgeError::BadParams("find_pattern hex decode failed".into()))?;
+        let memory_type = params
+            .get("memory_type")
+            .and_then(Value::as_str)
+            .unwrap_or("main");
+        if !MEMORY_TYPES.contains(&memory_type) {
+            return Err(BridgeError::BadParams(format!(
+                "unsupported memory_type: {memory_type}; valid: {}",
+                MEMORY_TYPES.join(", ")
+            )));
+        }
+        let start = optional_num(params, "start")?.unwrap_or(0);
+        if start > PSP_MAIN_RAM_SIZE {
+            return Err(BridgeError::BadParams(format!(
+                "find_pattern start {start:#x} exceeds main memory size {PSP_MAIN_RAM_SIZE:#x}"
+            )));
+        }
+        let available = PSP_MAIN_RAM_SIZE - start;
+        let requested = optional_num(params, "length")?.unwrap_or(available);
+        let length = requested.min(available);
+        let max_matches = optional_num(params, "max_matches")?
+            .unwrap_or(256)
+            .clamp(1, 4096) as usize;
+        let align =
+            usize::try_from(optional_num(params, "align")?.unwrap_or(1).max(1)).map_err(|_| {
+                BridgeError::BadParams("find_pattern align does not fit this host".into())
+            })?;
+
+        let was_running = !self.cpu_is_stepping()?;
+        if was_running {
+            self.ws.call("cpu.stepping", json!({}))?;
+        }
+        let scan = (|| {
+            let mut bytes = Vec::with_capacity(length as usize);
+            let mut offset = 0u64;
+            while offset < length {
+                let chunk = (length - offset).min(MAX_READ_LEN as u64);
+                let value = self.read_memory(&json!({
+                    "memory_type":"main", "address":start + offset, "length":chunk
+                }))?;
+                let encoded = value["hex"].as_str().ok_or_else(|| {
+                    BridgeError::Emulator("read_memory response had no hex payload".into())
+                })?;
+                bytes.extend(hex::decode(encoded).map_err(|_| {
+                    BridgeError::Emulator("read_memory returned invalid hex".into())
+                })?);
+                offset += chunk;
+            }
+            Ok::<_, BridgeError>(bytes)
+        })();
+        let cleanup = if was_running {
+            self.ws.call("cpu.resume", json!({})).map(|_| ())
+        } else {
+            Ok(())
+        };
+        let bytes =
+            crate::live::temporal::finish_with_cleanup(scan, cleanup, |primary, cleanup| {
+                match primary {
+                    Some(primary) => BridgeError::Emulator(format!(
+                        "{primary}; find_pattern resume also failed: {cleanup}"
+                    )),
+                    None => BridgeError::Emulator(format!(
+                        "find_pattern completed but resume failed: {cleanup}"
+                    )),
+                }
+            })?;
+
+        let mut matches = Vec::new();
+        let mut search_start = 0usize;
+        let mut truncated_matches = false;
+        while search_start <= bytes.len().saturating_sub(pattern.len()) {
+            let Some(relative) = bytes[search_start..]
+                .windows(pattern.len())
+                .position(|window| window == pattern)
+            else {
+                break;
+            };
+            let offset = search_start + relative;
+            if offset.is_multiple_of(align) {
+                if matches.len() == max_matches {
+                    truncated_matches = true;
+                    break;
+                }
+                matches.push(start + offset as u64);
+            }
+            search_start = offset + 1;
+        }
+        Ok(json!({
+            "memory_type":"main",
+            "start":start,
+            "scanned":bytes.len(),
+            "matches":matches,
+            "count":matches.len(),
+            "truncated":requested > available || truncated_matches,
+            "truncated_scan":requested > available,
+            "truncated_matches":truncated_matches,
+        }))
+    }
+
+    pub(super) fn probe(&mut self, params: &Value) -> BridgeResult<Value> {
+        let path = required_str(params, "state")?.to_string();
+        let frames = optional_num(params, "frame")?
+            .or(optional_num(params, "frames")?)
+            .unwrap_or(0);
+        if frames > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(BridgeError::BadParams(format!(
+                "probe frame count exceeds the synchronous cap {}",
+                crate::live::temporal::MAX_SYNC_ADVANCE_COUNT
+            )));
+        }
+        let length = required_num(params, "length")?;
+        if length == 0 || length > MAX_READ_LEN as u64 {
+            return Err(BridgeError::BadParams(format!(
+                "probe read length must be in 1..={MAX_READ_LEN:#x}, got {length:#x}"
+            )));
+        }
+        route_main_address(params, length)?;
+
+        // savestate.load restores the run state that existed when the request began. Halt first so
+        // its acknowledgement cannot reopen free-running guest time between restore and frame step.
+        self.pause(&json!({}))?;
+        self.load_state(&json!({"path":path}))?;
+        let advance = if frames == 0 {
+            json!({"status":"completed", "count":0})
+        } else {
+            self.step_frames(&json!({"count":frames}))?
+        };
+        let memory = self.read_memory(params)?;
+        let status = advance["status"].as_str().unwrap_or("completed");
+        let completed = advance["count"]
+            .as_u64()
+            .or_else(|| advance["completed_frames"].as_u64())
+            .unwrap_or(if status == "completed" { frames } else { 0 });
+        Ok(json!({
+            "status":status,
+            "requested_frames":frames,
+            "completed_frames":completed,
+            "state":"frozen",
+            "hex":memory["hex"],
+        }))
+    }
+
     pub(super) fn status(&mut self) -> BridgeResult<Value> {
         let version = self.ws.call("version", json!({}))?;
         let game_status = self.ws.call("game.status", json!({}))?;
@@ -23,6 +176,11 @@ impl<T: WsTransport> PpssppBridge<T> {
             "state": if stepping { "frozen" } else { "running" },
             "methods": METHODS,
             "memory_types": MEMORY_TYPES,
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id": "main", "aliases": ["mips", "allegrex"], "default": true,
+                "disassembly_modes": ["auto", "mips"]
+            }],
             "contracts": crate::contracts::advertisement_value(&[
                 "ppsspp.execution.frame-step-vblank",
                 "ppsspp.call-stack.frozen-best-effort",
@@ -66,9 +224,15 @@ impl<T: WsTransport> PpssppBridge<T> {
             "system": "psp",
             "adapter": "ppsspp-rust-ws",
             "backend": "ppsspp-debugger-ws",
+            "build": crate::build_identity::BUILD_HASH,
             "debugger": true,
             "methods": METHODS,
             "memory_types": MEMORY_TYPES,
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id": "main", "aliases": ["mips", "allegrex"], "default": true,
+                "disassembly_modes": ["auto", "mips"]
+            }],
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":false, "snapshot":false},
                 {"kind":"read", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
@@ -96,6 +260,9 @@ impl<T: WsTransport> PpssppBridge<T> {
         }
         if let Some(launch_id) = &self.launch_id {
             obj.insert("launch_id".into(), json!(launch_id));
+        }
+        if let Some(content) = &self.content {
+            obj.insert("content".into(), json!(content.display().to_string()));
         }
         Ok(result)
     }
@@ -125,6 +292,12 @@ impl<T: WsTransport> PpssppBridge<T> {
             .map_err(|err| {
                 BridgeError::Emulator(format!("memory.read: base64 decode failed: {err}"))
             })?;
+        if bytes.len() != length {
+            return Err(BridgeError::Emulator(format!(
+                "memory.read at {addr:#x}: requested {length} bytes but PPSSPP returned {} (short read)",
+                bytes.len()
+            )));
+        }
         Ok(json!({ "hex": hex::encode(bytes) }))
     }
 

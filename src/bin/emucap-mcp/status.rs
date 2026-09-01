@@ -36,6 +36,10 @@ pub(crate) use continuity::enrich_continuity;
 #[cfg(test)]
 use continuity::{enrich_runtime_instance, recording_capture_projection};
 
+#[path = "status/debug_capabilities.rs"]
+mod debug_capabilities;
+use debug_capabilities::enrich_debug_selection;
+
 pub(crate) fn enrich_status_value(
     v: &mut serde_json::Value,
     methods: &[String],
@@ -313,7 +317,12 @@ fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contract
     let hold_until_ready = tap_ready && raw_has("read_memory");
     let click_pointer_ready = tap_ready && pointer_button_available;
     let drag_pointer_ready = click_pointer_ready && raw_has("move_pointer");
-    let probe_ready = raw_has("probe");
+    let raw_method_names = methods
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(String::from)
+        .collect::<Vec<_>>();
+    let probe_ready = tools::probe_available_for_methods(&raw_method_names, frame_step_available);
     let replay_ready = probe_ready || raw_has("load_state");
 
     for (ready, method) in [
@@ -321,6 +330,7 @@ fn add_composite_methods(v: &mut serde_json::Value, contracts: &emucap::contract
         (hold_until_ready, "hold_until"),
         (click_pointer_ready, "click_pointer"),
         (drag_pointer_ready, "drag_pointer"),
+        (probe_ready, "probe"),
         (replay_ready, "regression_run"),
         (replay_ready, "verify_determinism"),
     ] {
@@ -741,6 +751,8 @@ const CAPABILITY_FIELDS: &[&str] = &[
     "methods",
     "memory_types",
     "memory_regions",
+    "state_groups",
+    "cpu_targets",
     "media_devices",
     "breakpoint_kinds",
     "input_buttons",
@@ -815,6 +827,7 @@ pub(crate) fn enrich_connected_status(value: &mut serde_json::Value, link: &dyn 
     enrich_status_value(value, &methods, &memory_types, identity.system.as_deref());
     enrich_memory_regions(value, &memory_regions);
     enrich_breakpoint_kinds(value, &breakpoint_kinds);
+    enrich_debug_selection(value, &identity);
     enrich_contract_status(value, &identity, &contracts);
     enrich_recording_capability(value, recording);
     enrich_link_status(value, port, token.as_deref(), Some(&identity));
@@ -832,6 +845,22 @@ pub(crate) struct ControlObservation {
     pub(crate) status: serde_json::Value,
     pub(crate) runtime: RuntimeObservation,
     pub(crate) disposition: EntryDisposition,
+}
+
+fn reconcile_runtime_instance_entry(status: &mut serde_json::Value, disposition: EntryDisposition) {
+    let action = match disposition.reason {
+        EntryReason::TerminalHistory if disposition.accepts_new_content() => "launch_allowed",
+        EntryReason::OwnedHelperCleanupPending if disposition.accepts_new_content() => {
+            "cleanup_owned_bridge_then_launch"
+        }
+        _ => return,
+    };
+    if let Some(runtime) = status
+        .get_mut("runtime_instance")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        runtime.insert("next_safe_action".into(), serde_json::json!(action));
+    }
 }
 
 /// Reconcile an unfinished host-owned recording only after the live adapter identity proves that
@@ -946,6 +975,7 @@ pub(crate) fn observe_control_state(
             }),
         );
     }
+    reconcile_runtime_instance_entry(&mut status, disposition);
     Ok(ControlObservation {
         status,
         runtime,

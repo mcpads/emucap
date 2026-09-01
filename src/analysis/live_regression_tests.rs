@@ -54,7 +54,7 @@ impl EmulatorLink for DetReplayLink {
     fn call(
         &mut self,
         method: &str,
-        _p: serde_json::Value,
+        params: serde_json::Value,
     ) -> Result<serde_json::Value, LinkError> {
         match method {
             "reset"
@@ -86,7 +86,13 @@ impl EmulatorLink for DetReplayLink {
             }
             "probe" => {
                 let hex = self.probe_queue.pop_front().unwrap_or("00");
-                Ok(serde_json::json!({ "hex": hex }))
+                Ok(serde_json::json!({
+                    "status":"completed",
+                    "state":"frozen",
+                    "requested_frames":params["frame"],
+                    "completed_frames":params["frame"],
+                    "hex":hex
+                }))
             }
             other => Err(LinkError::Protocol(format!("unexpected: {other}"))),
         }
@@ -334,6 +340,59 @@ fn savestate_memory_uses_atomic_probe() {
         2,
     );
     assert_eq!(r.outcome, DetOutcome::Reproducible);
+}
+
+#[test]
+fn savestate_memory_uses_the_control_composed_probe_when_native_probe_is_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("s");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("deadbeef.mss"), b"x").unwrap();
+    let case = regression::Case {
+        format_version: regression::CASE_FORMAT_VERSION,
+        id: "s".into(),
+        description: "s".into(),
+        rom: regression::RomRef {
+            sha1: "unused".into(),
+            path_hint: "x".into(),
+        },
+        repro: regression::Repro::Savestate {
+            state_sha1: "deadbeef".into(),
+            advance_frames: 1,
+        },
+        predicate: Predicate {
+            memory_type: "w".into(),
+            address: 0,
+            length: 2,
+            op: CmpOp::Eq,
+            value: 0,
+        },
+        expect: regression::Expect::Absent,
+    };
+    let mut link = DetReplayLink::new(&[
+        "status",
+        "pause",
+        "resume",
+        "load_state",
+        "step",
+        "read_memory",
+    ])
+    // Each composed probe performs one non-mutating range preflight and one terminal read.
+    .obs(&["1234", "1234", "1234", "1234"]);
+
+    let result = verify_determinism_core(
+        &mut link,
+        &dir,
+        &case,
+        &ObserveSpec::Memory {
+            memory_type: "w".into(),
+            address: 0,
+            length: 2,
+        },
+        2,
+    );
+
+    assert_eq!(result.outcome, DetOutcome::Reproducible);
 }
 
 #[test]

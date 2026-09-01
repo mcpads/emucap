@@ -355,6 +355,11 @@ impl Mupen64PlusHost {
             "debugger": true,
             "methods": methods,
             "memory_types": ["rdram"],
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id":"main", "aliases":["r4300", "maincpu", "mips"], "default":true,
+                "disassembly_modes":["auto", "mips"]
+            }],
             "region_sizes": {"rdram": RDRAM_SIZE},
             "breakpoint_kinds": debug::breakpoint_kinds(),
             "input_buttons": INPUT_BUTTONS,
@@ -1182,7 +1187,7 @@ fn rdram_address(params: &Value, length: u64) -> N64Result<u64> {
 
 fn require_r4300(params: &Value) -> N64Result<()> {
     match params.get("cpu").and_then(Value::as_str) {
-        None | Some("r4300" | "maincpu") => Ok(()),
+        None | Some("main" | "r4300" | "maincpu") => Ok(()),
         Some(cpu) => Err(N64Error::BadParams(format!(
             "N64 execution control currently supports the R4300 CPU only, got {cpu}"
         ))),

@@ -72,6 +72,7 @@ const METHODS: &[&str] = &[
     "write_memory",
     "find_pattern",
     "dump_memory",
+    "probe",
     "get_state",
     "pause",
     "resume",
@@ -107,7 +108,6 @@ const UNSUPPORTED_METHODS: &[&str] = &[
     "set_trace",
     "get_trace",
     "break_on_reset",
-    "probe",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -375,6 +375,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "write_memory" => self.write_memory(&request.params),
             "find_pattern" => self.find_pattern(&request.params),
             "dump_memory" => self.dump_memory(&request.params),
+            "probe" => self.probe(&request.params),
             "get_state" => self.get_state(),
             "pause" => self.pause(),
             "resume" => self.resume(),
@@ -461,9 +462,15 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "system": "ps2",
             "adapter": "pcsx2-rust-pine",
             "backend": "pcsx2-pine-fork",
+            "build": crate::build_identity::BUILD_HASH,
             "debugger": true,
             "methods": METHODS,
             "memory_types": ["ee"],
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id": "main", "aliases": ["ee", "r5900"], "default": true,
+                "disassembly_modes": ["auto", "mips"]
+            }],
             "media_devices": media::memory_card_devices_json(),
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
@@ -490,6 +497,9 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         if let Some(launch_id) = &self.launch_id {
             object.insert("launch_id".into(), json!(launch_id));
         }
+        if let Some(content) = &self.content {
+            object.insert("content".into(), json!(content.display().to_string()));
+        }
         Ok(value)
     }
 
@@ -507,6 +517,11 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "state": state,
             "methods": METHODS,
             "memory_types": ["ee"],
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id": "main", "aliases": ["ee", "r5900"], "default": true,
+                "disassembly_modes": ["auto", "mips"]
+            }],
             "media_devices": media::memory_card_devices_json(),
             "mounted_media": media.mounted_media_json(self.memory_card_dir.as_deref())?,
             "media_activity": media.activity_json(),
@@ -758,21 +773,52 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         )
     }
 
+    /// Restore one frozen base state, advance an exact bounded frame count, and read memory before
+    /// any other client action can interleave. This is a transaction-level composition of the
+    /// already native load/step/read operations; no new emulator hook is needed.
+    fn probe(&mut self, params: &Value) -> BridgeResult<Value> {
+        let state = required_str(params, "state")?;
+        let frames = optional_num(params, "frame")?
+            .or(optional_num(params, "frames")?)
+            .unwrap_or(0);
+        if frames > 15 {
+            return Err(Pcsx2BridgeError::BadParams(format!(
+                "probe frame count must be in 0..=15, got {frames}"
+            )));
+        }
+        let length = required_num(params, "length")?;
+        if length == 0 || length > MAX_MEMORY_TRANSFER as u64 {
+            return Err(Pcsx2BridgeError::BadParams(format!(
+                "probe read length must be in 1..={MAX_MEMORY_TRANSFER:#x}, got {length:#x}"
+            )));
+        }
+        routed_ee_address(params, length)?;
+        validate_state_path(state)?;
+
+        // Probe owns its entry transition: callers may invoke it while the guest is running, while
+        // the load/step/read portion still executes at one frozen boundary in this bridge request.
+        self.pause()?;
+        self.load_state(&json!({"path":state}))?;
+        let advance = if frames == 0 {
+            json!({"advanced":0, "unit":"frames", "state":"frozen", "status":"completed"})
+        } else {
+            self.step(&json!({"count":frames, "unit":"frames"}))?
+        };
+        let memory = self.read_memory(params)?;
+        Ok(json!({
+            "status": advance["status"].as_str().unwrap_or("completed"),
+            "requested_frames": frames,
+            "completed_frames": advance["advanced"].as_u64().unwrap_or(0),
+            "state": "frozen",
+            "hex": memory["hex"],
+        }))
+    }
+
     fn path_state_command(&mut self, opcode: u8, params: &Value) -> BridgeResult<()> {
-        let path = Path::new(required_str(params, "path")?);
-        if !path.is_absolute() {
-            return Err(Pcsx2BridgeError::BadParams(
-                "savestate path must be absolute".into(),
-            ));
-        }
-        let raw = path.to_str().ok_or_else(|| {
-            Pcsx2BridgeError::BadParams("savestate path must be valid UTF-8".into())
-        })?;
-        if raw.is_empty() || raw.len() > 4096 {
-            return Err(Pcsx2BridgeError::BadParams(
-                "savestate path length must be in 1..=4096 bytes".into(),
-            ));
-        }
+        let raw = required_str(params, "path")?;
+        validate_state_path(raw)?;
+        let path = Path::new(raw);
+        let raw = path.to_str().expect("validated UTF-8 state path");
         let mut body = Vec::with_capacity(4 + raw.len());
         body.extend_from_slice(&(raw.len() as u32).to_le_bytes());
         body.extend_from_slice(raw.as_bytes());
@@ -796,12 +842,29 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
     }
 }
 
+fn validate_state_path(raw: &str) -> BridgeResult<()> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(Pcsx2BridgeError::BadParams(
+            "savestate path must be absolute".into(),
+        ));
+    }
+    let raw = path
+        .to_str()
+        .ok_or_else(|| Pcsx2BridgeError::BadParams("savestate path must be valid UTF-8".into()))?;
+    if raw.is_empty() || raw.len() > 4096 {
+        return Err(Pcsx2BridgeError::BadParams(
+            "savestate path length must be in 1..=4096 bytes".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn capability_notes() -> Value {
     json!({
         "backend": "pcsx2-pine-fork",
         "rust_bridge": true,
         "implemented_methods": METHODS,
-        "planned_methods": UNSUPPORTED_METHODS,
         "cpu": ["ee"],
         "step_units": ["frames"],
         "frame_step": true,

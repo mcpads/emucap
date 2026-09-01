@@ -118,7 +118,9 @@ const METHODS: &[&str] = &[
     "get_rom_info",
     "read_memory",
     "write_memory",
+    "find_pattern",
     "dump_memory",
+    "probe",
     "get_state",
     "disassemble",
     "call_stack",
@@ -139,21 +141,12 @@ const METHODS: &[&str] = &[
     "reset",
 ];
 
-/// PSP surface concretely planned for later tasks — none right now. Frame and instruction stepping
-/// are both implemented and advertised, then normalized by the MCP to one public `step` tool.
-/// Surfaced under `capability_notes.planned_methods` (alongside `UNSUPPORTED_METHODS`, below) so a
-/// caller can see the target shape while `methods` reflects what works right now.
-const PLANNED_METHODS: &[&str] = &[];
-
-/// Real emucap tool names this bridge does not (yet) implement — mirrors the NDS bridge's
-/// `UNSUPPORTED_METHODS` list verbatim (no PPSSPP WS/fork primitive backs any of these today).
+/// Known internal wire names that have no meaningful PPSSPP implementation.
 /// Dispatching one of these returns a clear `unsupported` error instead of `unknown_method`,
-/// reserving `unknown_method` for genuine typos/garbage method names. Also folded into
-/// `capability_notes.planned_methods` so a caller can discover the gap without a trial call.
+/// reserving `unknown_method` for genuine typos/garbage method names. These internal wire names are
+/// not capability metadata; public callers discover only working methods through status.
 const UNSUPPORTED_METHODS: &[&str] = &[
     "run_frames",
-    "probe",
-    "find_pattern",
     "watch_register",
     "set_trace",
     "get_trace",
@@ -237,7 +230,7 @@ pub enum BridgeError {
     BadState(String),
     #[error("unknown method: {0}")]
     UnknownMethod(String),
-    #[error("unsupported on psp (planned): {0}")]
+    #[error("unsupported on psp: {0}")]
     Unsupported(String),
     #[error("{0}")]
     Emulator(String),
@@ -357,7 +350,9 @@ impl<T: WsTransport> PpssppBridge<T> {
             "get_rom_info" => self.get_rom_info(),
             "read_memory" => self.read_memory(&req.params),
             "write_memory" => self.write_memory(&req.params),
+            "find_pattern" => self.find_pattern(&req.params),
             "dump_memory" => self.dump_memory(&req.params),
+            "probe" => self.probe(&req.params),
             "get_state" => self.get_state(&req.params),
             "disassemble" => self.disassemble(&req.params),
             "call_stack" => self.call_stack(&req.params),

@@ -40,7 +40,9 @@ remains headless. The supported surface includes:
 - native MAME save/load while frozen for MVS and AES. Save returns only after the pre-save notifier
   has fired and a non-empty staged file is complete; load returns only after the post-load
   notifier and freezes the restored machine. Step one frozen frame before judging the restored
-  screen. CD omits save/load because MAME 0.288 marks CDZ save states unsupported.
+  screen. Control composes these operations with exact frame step and bounded RAM read into an
+  atomic public `probe`. CD omits save/load and therefore probe because MAME 0.288 marks CDZ save
+  states unsupported.
 
 CD content identity uses the CUE entry file plus every unique referenced file. It includes the
 declared filename, size, and bytes of each file, and reports per-file SHA-1 values so changing an

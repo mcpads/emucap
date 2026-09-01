@@ -383,6 +383,8 @@ fn handshake_stream(
             "protocol version mismatch: server {PROTOCOL_VERSION}, client {protocol_version}"
         )));
     }
+    crate::debug_selection::parse_debug_capabilities(&caps_val)
+        .map_err(|error| LinkError::Protocol(format!("invalid debug capabilities: {error}")))?;
     let identity = super::link::EmulatorIdentity::from_hello(&caps_val);
     let registry = crate::event_contracts::EventContractRegistry::builtin()
         .map_err(|error| LinkError::Protocol(error.to_string()))?;

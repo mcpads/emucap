@@ -21,6 +21,11 @@ impl<G: GdbTransport> NdsBridge<G> {
             "debugger": true,
             "methods": METHODS,
             "memory_types": self.memory_type_names(),
+            "state_groups": ["cpu"],
+            "cpu_targets": [
+                {"id":"arm9", "aliases":["main","both"], "default":true, "disassembly_modes":["auto","arm","thumb"]},
+                {"id":"arm7", "aliases":[], "default":false, "disassembly_modes":["auto","arm","thumb"]}
+            ],
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
             ],
@@ -76,6 +81,11 @@ impl<G: GdbTransport> NdsBridge<G> {
             "debugger": true,
             "state": if self.primary_frozen() { "frozen" } else { "running" },
             "memory_types": self.memory_type_names(),
+            "state_groups": ["cpu"],
+            "cpu_targets": [
+                {"id":"arm9", "aliases":["main","both"], "default":true, "disassembly_modes":["auto","arm","thumb"]},
+                {"id":"arm7", "aliases":[], "default":false, "disassembly_modes":["auto","arm","thumb"]}
+            ],
             "contracts": crate::contracts::advertisement_value(&[
                 "nds.execution.frame-step-vblank",
                 "nds.call-stack.best-effort",
@@ -407,9 +417,9 @@ impl<G: GdbTransport> NdsBridge<G> {
     /// then classifies the stop using fork-owned status instead of guessing from the terminal PC.
     pub(super) fn step_frames(&mut self, params: &Value) -> NdsResult<Value> {
         if let Some(cpu) = params.get("cpu").and_then(Value::as_str) {
-            if cpu != "both" {
+            if !matches!(cpu, "arm9" | "both" | "all") {
                 return Err(NdsBridgeError::BadParams(format!(
-                    "NDS frame stepping advances the shared scheduler; omit cpu or use cpu=both (got {cpu})"
+                    "NDS frame stepping is initiated by ARM9 and advances the shared scheduler; omit cpu or use cpu=arm9/both (got {cpu})"
                 )));
             }
         }

@@ -29,6 +29,11 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             "host_features": HOST_FEATURES,
             "methods": METHODS,
             "memory_types": ["main", "cpu"],
+            "state_groups": ["cpu"],
+            "cpu_targets": [{
+                "id":"main", "aliases":["i386", "x86"], "default":true,
+                "disassembly_modes":["auto", "x86"]
+            }],
             "region_sizes": {"main": XBOX_RAM_SIZE, "cpu": 0x1_0000_0000u64},
             "breakpoint_kinds": [
                 {"kind":"exec", "range_unit":"address", "range_mode":"exact", "memory_type_used":true, "snapshot":false},
