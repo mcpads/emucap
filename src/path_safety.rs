@@ -146,7 +146,9 @@ pub fn open_regular_file_no_follow(path: &Path) -> io::Result<fs::File> {
     }
     let file = options.open(path)?;
     let handle_metadata = file.metadata()?;
-    if !handle_metadata.is_file() || !same_opened_file(&path_metadata, &handle_metadata) {
+    if !handle_metadata.is_file()
+        || !opened_file_is_safe_regular(&path_metadata, &file, &handle_metadata)?
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "opened path is not the validated regular file",
@@ -156,15 +158,54 @@ pub fn open_regular_file_no_follow(path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(unix)]
-fn same_opened_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+fn opened_file_is_safe_regular(
+    path_metadata: &fs::Metadata,
+    _file: &fs::File,
+    handle_metadata: &fs::Metadata,
+) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
-    left.dev() == right.dev() && left.ino() == right.ino()
+    Ok(
+        path_metadata.dev() == handle_metadata.dev()
+            && path_metadata.ino() == handle_metadata.ino(),
+    )
 }
 
-#[cfg(not(unix))]
-fn same_opened_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
+#[cfg(windows)]
+fn opened_file_is_safe_regular(
+    _path_metadata: &fs::Metadata,
+    file: &fs::File,
+    _handle_metadata: &fs::Metadata,
+) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_TYPE_DISK,
+    };
+
+    let handle = file.as_raw_handle();
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `handle` belongs to the live `File`, and `information` is writable for the call.
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut information) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // FILE_FLAG_OPEN_REPARSE_POINT makes the handle describe the final reparse point itself.
+    // Reject it explicitly, along with directories and non-disk handles, instead of inferring
+    // identity from a replaceable path's length and timestamp.
+    let unsafe_attributes = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
+    Ok(unsafe { GetFileType(handle) } == FILE_TYPE_DISK
+        && information.dwFileAttributes & unsafe_attributes == 0)
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn opened_file_is_safe_regular(
+    path_metadata: &fs::Metadata,
+    _file: &fs::File,
+    handle_metadata: &fs::Metadata,
+) -> io::Result<bool> {
+    Ok(path_metadata.len() == handle_metadata.len()
+        && path_metadata.modified().ok() == handle_metadata.modified().ok())
 }
 
 /// Open a regular member relative to an already selected real directory without following any
@@ -318,7 +359,7 @@ pub fn atomic_write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         parent
     };
     fs::create_dir_all(parent)?;
-    let destination_exists = validate_file_destination(path)?;
+    validate_file_destination(path)?;
     let file_name = output_file_name(path)?;
     let temp = unique_output_sibling(parent, file_name, "tmp");
     let result = (|| {
@@ -334,7 +375,7 @@ pub fn atomic_write_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
-        publish_prepared_file(&temp, path, parent, file_name, destination_exists)
+        replace_file_atomically(&temp, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp);
@@ -355,7 +396,7 @@ pub fn atomic_copy_file(source: &Path, path: &Path) -> io::Result<u64> {
         parent
     };
     fs::create_dir_all(parent)?;
-    let destination_exists = validate_file_destination(path)?;
+    validate_file_destination(path)?;
     let file_name = output_file_name(path)?;
     let temp = unique_output_sibling(parent, file_name, "copy");
     let result = (|| {
@@ -381,7 +422,7 @@ pub fn atomic_copy_file(source: &Path, path: &Path) -> io::Result<u64> {
         if let Ok(permissions) = input.metadata().map(|metadata| metadata.permissions()) {
             fs::set_permissions(&temp, permissions)?;
         }
-        publish_prepared_file(&temp, path, parent, file_name, destination_exists)?;
+        replace_file_atomically(&temp, path)?;
         Ok(copied)
     })();
     if result.is_err() {
@@ -390,7 +431,7 @@ pub fn atomic_copy_file(source: &Path, path: &Path) -> io::Result<u64> {
     result
 }
 
-fn validate_file_destination(path: &Path) -> io::Result<bool> {
+fn validate_file_destination(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -404,8 +445,8 @@ fn validate_file_destination(path: &Path) -> io::Result<bool> {
             io::ErrorKind::InvalidInput,
             "output path is not a regular file",
         )),
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -423,34 +464,35 @@ fn unique_output_sibling(parent: &Path, file_name: &str, label: &str) -> PathBuf
     ))
 }
 
-fn publish_prepared_file(
-    temp: &Path,
-    path: &Path,
-    parent: &Path,
-    file_name: &str,
-    destination_exists: bool,
-) -> io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        let _ = (parent, file_name, destination_exists);
-        fs::rename(temp, path)
-    }
-    #[cfg(windows)]
-    {
-        if !destination_exists {
-            return fs::rename(temp, path);
-        }
-        let backup = unique_output_sibling(parent, file_name, "old");
-        fs::rename(path, &backup)?;
-        match fs::rename(temp, path) {
-            Ok(()) => {
-                let _ = fs::remove_file(backup);
-                Ok(())
-            }
-            Err(error) => {
-                let _ = fs::rename(backup, path);
-                Err(error)
-            }
-        }
+#[cfg(not(windows))]
+pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: both buffers are NUL-terminated and remain alive for the duration of the call.
+    let ok = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }

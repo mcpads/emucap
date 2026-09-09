@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the pinned stock openMSX used by the separate XML-control bridge.
+# Build pinned openMSX with the recorded compatibility and emucap host patches.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

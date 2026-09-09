@@ -956,7 +956,7 @@ fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = options.open(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
-        atomic_replace(&tmp, path)?;
+        crate::path_safety::replace_file_atomically(&tmp, path)?;
         sync_parent(parent)
     })();
     if result.is_err() {
@@ -1083,34 +1083,6 @@ fn remove_path(path: &Path) -> io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
-fn atomic_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    fs::rename(src, dst)
-}
-
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
-
-#[cfg(windows)]
-fn atomic_replace(src: &Path, dst: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let src: Vec<u16> = src.as_os_str().encode_wide().chain(Some(0)).collect();
-    let dst: Vec<u16> = dst.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe {
-        MoveFileExW(
-            src.as_ptr(),
-            dst.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}

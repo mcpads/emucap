@@ -1,0 +1,10 @@
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -1492,6 +1492,7 @@
+ 	machine_type["vector_devices"] = sol::property([] (running_machine &m) { return devenum<vector_device_enumerator>(m.root_device()); });
+ 	machine_type["palettes"] = sol::property([] (running_machine &m) { return devenum<palette_interface_enumerator>(m.root_device()); });
+ 	machine_type["screens"] = sol::property([] (running_machine &m) { return devenum<screen_device_enumerator>(m.root_device()); });
++	machine_type.set_function("prepare_state_save", [] (running_machine &m) { m.save().dispatch_presave(); });
+ 	machine_type.set_function("finish_state_load", [] (running_machine &m) { m.save().dispatch_postload(); });
+ 	machine_type["cassettes"] = sol::property([] (running_machine &m) { return devenum<cassette_device_enumerator>(m.root_device()); });
+ 	machine_type["images"] = sol::property([] (running_machine &m) { return devenum<image_interface_enumerator>(m.root_device()); });

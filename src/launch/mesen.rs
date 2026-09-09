@@ -350,6 +350,9 @@ fn prepare_portable_binary_in_home(
     home: PathBuf,
     preserve_data: bool,
 ) -> std::io::Result<PreparedPortable> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = port;
+
     std::fs::create_dir_all(&home)?;
 
     let (binary, settings) = if source_binary.starts_with(&home) {

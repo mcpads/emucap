@@ -6,7 +6,9 @@ use emucap::live::link::{Capabilities, LinkError};
 #[cfg(unix)]
 use emucap::live::runtime::LeaseView;
 use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::sync::Mutex;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -65,10 +67,8 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-#[cfg(unix)]
 struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
-#[cfg(unix)]
 impl EnvRestore {
     fn new(keys: &[&'static str]) -> Self {
         Self(
@@ -79,7 +79,6 @@ impl EnvRestore {
     }
 }
 
-#[cfg(unix)]
 impl Drop for EnvRestore {
     fn drop(&mut self) {
         for (key, value) in &self.0 {

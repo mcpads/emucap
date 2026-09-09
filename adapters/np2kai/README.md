@@ -8,7 +8,7 @@ Build the core and the direct emucap frontend:
 
 ```sh
 ./adapters/np2kai/build.sh
-cargo build --release --bin emucap-np2kai
+cargo build --locked --release --bin emucap-np2kai
 ```
 
 The supported build profile deliberately excludes FMGEN, GPL MAME sound,

@@ -1,9 +1,12 @@
 Copyright (C) 2026 emucap contributors
 SPDX-License-Identifier: GPL-2.0-or-later
 
-The patch stack in patches/ (0001-0005) is applied to the DeSmuME source tree by
-build.sh and modifies DeSmuME's own files (headless CLI, GDB-stub hooks for
-screenshot/input/touch, savestate/disassemble). It is therefore a derivative work
-of DeSmuME (GPL-2.0-or-later) and is licensed GPL-2.0-or-later. See ../../NOTICE.
+The numbered patch stack in patches/ is applied to the DeSmuME source tree by
+build.sh and modifies DeSmuME's own files. It covers the headless CLI, GDB-stub
+control for screenshots, input, touch, savestates and disassembly, transport
+hardening, shared scheduler state, and exact VBlank frame stepping. It is
+therefore a derivative work of DeSmuME (GPL-2.0-or-later) and is licensed
+GPL-2.0-or-later. The adapter README is the current patch inventory. See
+../../NOTICE.
 
 Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

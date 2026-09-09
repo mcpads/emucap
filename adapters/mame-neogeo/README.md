@@ -8,7 +8,7 @@ Build the dedicated pinned MAME subset and the Rust bridge:
 
 ```sh
 adapters/mame-neogeo/build.sh
-cargo build --release --bin emucap-mame-neogeo-bridge
+cargo build --locked --release --bin emucap-mame-neogeo-bridge
 ```
 
 The Neo Geo build has its own `adapters/mame-neogeo/work` tree. It does not reuse or replace the
@@ -54,7 +54,7 @@ transition to the `HOW TO PLAY` screen after start input. Runtime media is not s
 repository:
 
 ```sh
-cargo run --release --example mame_neogeo_smoke -- \
+cargo run --locked --release --example mame_neogeo_smoke -- \
   /path/to/mslug2.zip /path/to/neogeo.zip --display
 ```
 
@@ -62,7 +62,7 @@ The same smoke validates AES software-list launch, the 64 KiB RAM boundary, nati
 frozen screenshots, select ownership release, and the start transition:
 
 ```sh
-cargo run --release --example mame_neogeo_smoke -- \
+cargo run --locked --release --example mame_neogeo_smoke -- \
   /path/to/mslug2.zip /path/to/aes.zip --aes
 ```
 
@@ -74,7 +74,7 @@ class, a bounded released action, a recognizable destination, and two independen
 because the CD profile has no native savestate:
 
 ```sh
-cargo run --release --example mame_neogeo_cd_smoke -- \
+cargo run --locked --release --example mame_neogeo_cd_smoke -- \
   /path/to/disc.cue /path/to/neocdz.zip
 ```
 

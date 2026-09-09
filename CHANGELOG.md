@@ -2,7 +2,37 @@
 
 Actively developed beta software — interfaces may still change.
 
-## Unreleased
+## 0.16.2
+
+### Fixed
+- Git checkouts preserve native patch bytes, including DeSmuME hunks with upstream CRLF endings,
+  so the committed patch stacks continue to match their pinned SHA-256 values.
+- Mesen native-halt state I/O now requires a proven main-CPU instruction boundary. PPU/frame,
+  cycle, idle, and breakpoint halts reject save/load before file access or guest mutation instead
+  of restoring a machine under an unfinished native instruction. Explicitly step one instruction
+  and verify the safe halt before retrying. Exact frame stepping keeps its original terminal point.
+- MAME PC-98 saves now prepare device buffers and preserve items after empty arrays. Load and probe
+  share postload handling: callbacks run only when device data was restored, including correct
+  handling of empty legacy items. Memory-only loads leave unrelated device callbacks untouched;
+  failed output writes close staged files before cleanup. Rebuild the maintained MAME host.
+- Pinned MAME sources include their directly used standard-library declarations for current
+  compilers instead of relying on transitive includes.
+- Windows all-target builds include the environment-restoration helper used by composite media
+  launch tests; platform-only helpers and Mesen parameters no longer produce Windows warnings.
+- Managed file publication uses one replace-existing, write-through Windows operation instead of
+  temporarily removing the destination. No-follow reads validate the opened Windows disk handle
+  and reject reparse points rather than treating matching length and modification time as identity.
+- Licensing and adapter documentation describe the maintained openMSX native patches and evolving
+  DeSmuME patch stack. Operational guidance reflects DeSmuME's shared ARM9/ARM7 scheduler and exact
+  VBlank frame step, and directs surviving managed bridges through reattachment after a Control drop.
+
+### Changed
+- Maintained Mesen SNES no longer advertises frame-state recording until its native format can
+  preserve PPU-frame continuations. Next-frame and repeatable reset-release recording and terminal
+  PPU observations remain available independently. Rebuild the maintained Mesen host.
+- The maintained Linux and Windows Zig cross-check uses the locked release dependency graph and
+  rejects compiler warnings; its explicit `all-targets` mode also covers tests and examples.
+- Rust build instructions use the locked Cargo manifest's complete binary inventory.
 
 ## 0.16.1
 

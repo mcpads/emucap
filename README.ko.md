@@ -8,15 +8,16 @@
 PlayStation·PC Engine·PC-FX·Mega Drive/Genesis·WonderSwan/WSC·Neo Geo Pocket/Color), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME과 선택형
 NP2kai 호환 backend(PC-98), MAME(실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
-원본 Xbox는 고정된 xemu 포크로 실험 지원한다.
-Stock openMSX 21.0과 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware
-MSX1/MSX2/MSX2+ 카트리지 profile도 제공한다.
+원본 Xbox는 고정된 xemu 포크로 실험 지원한다. 고정된 openMSX 21.0 source에 emucap host patch
+두 개를 적용한 build와 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware MSX1/MSX2/MSX2+
+카트리지 profile도 제공한다.
 
-**v0.16.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.16.2 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
-GPL-2.0-or-later로 배포한다. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 참고한다.
+Core와 별도 표시가 없는 프로젝트 source는 GPL-2.0-or-later다. 에뮬레이터 native patch stack은
+adapter별 upstream license 경계를 따른다. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 참고한다.
 
 ## 플랫폼
 
@@ -54,13 +55,7 @@ override를 우선한다.
 저장소 루트에서:
 
 ```sh
-cargo build --release \
-  --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
-  --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
-  --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
-  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
-  --bin emucap-openmsx-bridge --bin emucap-np2kai \
-  --bin emucap-xemu-bridge
+cargo build --locked --release --bins
 ```
 
 산출물: `target/release/emucap-mcp`(**제어 MCP** — 에뮬레이터 조작), `emucap-track-mcp`(**추적
@@ -68,7 +63,7 @@ MCP** — 실험 원장, emulator-less), `emucap`(케이스 번들 CLI), `emucap
 `emucap-mame-pc98-bridge`(PC-98 launch helper), `emucap-mame-neogeo-bridge`(Neo Geo MVS/AES/CD launch helper),
 `emucap-mupen64plus`(N64 frontend·adapter), `emucap-desmume-nds-bridge`(NDS launch helper),
 `emucap-ppsspp-bridge`(PSP launch helper), `emucap-pcsx2-bridge`(PS2 launch helper),
-`emucap-openmsx-bridge`(stock openMSX XML-control helper), `emucap-np2kai`(PC-98 호환 frontend),
+`emucap-openmsx-bridge`(patch된 openMSX XML-control helper), `emucap-np2kai`(PC-98 호환 frontend),
 `emucap-xemu-bridge`(원본 Xbox QMP/GDB launch helper).
 Source build의 의존성은 전부 crates.io이고
 SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필요 없다**(깨끗한 체크아웃에서 그대로
@@ -200,6 +195,9 @@ time에 섞지 않고 유한한 guest-frame 구간을 소유할 수 있다. 현�
 반환한다. event class와 limit의 권위는 live capability다. 지원하지 않는 adapter는 hook을 설치하거나
 guest를 진행하지 않고 거부한다. 선택적 origin·입력 무비·event stop도 그 exact capability가 광고할
 때만 쓸 수 있으며, 생략하면 기존 next-frame bounded 동작을 유지한다.
+현재 유지보수 Mesen SNES는 PPU 프레임 정지의 CPU 실행 중간 상태를 직렬화할 수 없어 `state_load` origin을
+광고하지 않는다. 프레임 정지 뒤 일반 save/load를 하려면 명시적으로 한 명령어를 step하고 안전한
+halt인지 확인한다. 안전하지 않은 상태 I/O는 파일 접근이나 guest 변경 전에 거부한다.
 `recording_capability.state_load`가 광고될 때 절대 경로와 `preserve_for_recording=true`를 준 frozen
 `save_state` 응답은 producer가 관리하는 `snapshot_receipt`도 반환한다. 이후
 `record_window(origin="state_load")`는 caller가 적은 path·digest·경계
@@ -323,9 +321,10 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   RSP 상태는 이 profile의 범위가 아니다.
   → `adapters/mupen64plus/README.md`
 - **openMSX MSX 카트리지 profile (실험적)** — `adapters/openmsx/build.sh`를 실행하고
-  `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 sidecar가 맞는 stock openMSX 21.0만
-  받아 emucap 소유 per-port `HOME`에서 실행하며 openMSX를 patch하거나 사용자의 emulator profile을
-  읽지 않는다. `msx`는 C-BIOS MSX2+, `msx1`·`msx2`·`msx2p`는 사용자가 제공한 실제 firmware
+  `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 기록된 upstream compatibility backport와
+  emucap host patch 두 개를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 per-port
+  `HOME`에서 실행하며 사용자의 emulator profile을 읽지 않는다. `msx`는 C-BIOS MSX2+,
+  `msx1`·`msx2`·`msx2p`는 사용자가 제공한 실제 firmware
   profile이다. 카트리지 범위는 Z80 상태·명령 step, headless/visible exact frame step, 제한된
   CPU memory/main RAM/VRAM 접근, frozen save/load, keyboard-matrix와 2-port joystick 입력,
   exec/read/write breakpoint, event polling, disassemble을 제공한다. Screenshot은

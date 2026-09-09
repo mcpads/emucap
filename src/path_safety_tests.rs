@@ -4,6 +4,7 @@ use super::path_safety::{
     read_bounded_regular_file_no_follow, read_bounded_utf8_regular_file_no_follow,
     regular_member_path,
 };
+use std::io::Read;
 
 #[test]
 fn path_derived_identifiers_allow_only_alphanumeric_hyphen_segments() {
@@ -83,6 +84,45 @@ fn bounded_regular_reads_reject_oversize_and_invalid_utf8() {
 
     assert!(read_bounded_regular_file_no_follow(&oversized, 4).is_err());
     assert!(read_bounded_utf8_regular_file_no_follow(&invalid_utf8, 4).is_err());
+}
+
+#[test]
+fn regular_member_open_reads_the_selected_file() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("member.bin"), b"selected bytes").unwrap();
+
+    let resolved = regular_member_path(root.path(), "nested/member.bin").unwrap();
+    assert_eq!(std::fs::read(resolved).unwrap(), b"selected bytes");
+
+    let mut file = open_regular_member_no_follow(root.path(), "nested/member.bin").unwrap();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).unwrap();
+
+    assert_eq!(bytes, b"selected bytes");
+}
+
+#[test]
+fn atomic_file_publication_replaces_existing_content_without_staging_files() {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source.bin");
+    let output = root.path().join("output.bin");
+    std::fs::write(&source, b"copied content").unwrap();
+    std::fs::write(&output, b"old content").unwrap();
+
+    atomic_write_file(&output, b"written content").unwrap();
+    assert_eq!(std::fs::read(&output).unwrap(), b"written content");
+
+    assert_eq!(atomic_copy_file(&source, &output).unwrap(), 14);
+    assert_eq!(std::fs::read(&output).unwrap(), b"copied content");
+
+    let staging_files = std::fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".output.bin."))
+        .collect::<Vec<_>>();
+    assert!(staging_files.is_empty(), "staging files: {staging_files:?}");
 }
 
 #[cfg(unix)]

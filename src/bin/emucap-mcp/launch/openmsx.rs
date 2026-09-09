@@ -20,7 +20,7 @@ pub(super) fn precondition(root: &Path) -> serde_json::Value {
     })
 }
 
-/// MSX leg of `make_launch`: run pinned stock openMSX behind the separate XML bridge.
+/// MSX leg of `make_launch`: run the pinned patched openMSX host behind the XML bridge.
 pub(super) fn launch_openmsx(
     port: u16,
     token: Option<&str>,
@@ -56,7 +56,7 @@ pub(super) fn launch_openmsx(
         Err(error) => {
             return serde_json::json!({
                 "launched": false,
-                "reason": "compatible pinned stock openMSX build not found",
+                "reason": "compatible pinned patched openMSX build not found",
                 "error": error.to_string(),
                 "next_action": "run adapters/openmsx/build.sh",
             })

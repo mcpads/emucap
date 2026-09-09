@@ -23,6 +23,17 @@ local SNES_SNAPSHOT_CAPABILITY_REVISION = "151544f37bf2e72601429981e93fb8d45bd40
 local SNES_DEEP_CAPABILITY_REVISION = "9cb6540758c6f4a690371afc92c52803597183466ab0fc3486cbabc9e4287840"
 local SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION = "79af7faa13666068539eaa7749e021f2035cefca4e5f9c12548a70468abc92ee"
 local SNES_REPEATABLE_CAPABILITY_REVISION = "4436231189dd28b27f252d8c1241ccdfc04ead72aca5b1f675c53ad5a6377511"
+-- Core RecordingCapability::computed_revision covers the complete advertised surface.
+local FRAME_ONLY_REVISIONS = {
+  [SNES_STATE_CAPABILITY_REVISION] = "9d395efa47a8fd9aa233354cf843cddb26321e52d7f113124b9acacd9d17f07e",
+  [SNES_CAPABILITY_REVISION] = "96dfe7c6fdc702dcb650d2e1251a20e2f9aca9a4c674a61bbaa42546d1f623c5",
+  [SNES_STATE_SNAPSHOT_CAPABILITY_REVISION] = "cb17d9a46ab4f50c18090efe88841d86eec924683089b451301e4cf209400702",
+  [SNES_SNAPSHOT_CAPABILITY_REVISION] = "c257a841cde44e9911d371a3e3521db1fe11e09dc5177075e76211605080fef2",
+  [SNES_DEEP_CAPABILITY_REVISION] = "937dd07c8ee03de5a4e7bf5c4b0e243355bf7bc33404327b2f53180d8339a175",
+  [SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION] = "59e5b8f3c29fe258032eaadcca0ddea49fd47b23dd6a3d4c7e9d7311acd23787",
+  [SNES_REPEATABLE_CAPABILITY_REVISION] = "d9d435fb15f480b20e84317d498a2e4011d22951d5f477613f1b6dabd28b0b5d",
+}
+local state_load_advertised = false
 local capability_revision = BASE_CAPABILITY_REVISION
 local semantic_advertised = false
 local deep_advertised = false
@@ -221,10 +232,11 @@ local function copy_limits(limits)
 end
 
 function M.capability(as_array, include_snes_semantic, include_terminal_snapshots, include_snes_deep,
-    include_snes_state, repeatability_conditions)
+    include_snes_state, repeatability_conditions, include_state_load)
   semantic_advertised = include_snes_semantic == true
   deep_advertised = include_snes_deep == true
   local state_advertised = include_snes_state == true
+  state_load_advertised = state_advertised and include_state_load ~= false
   if deep_advertised then
     capability_revision = include_terminal_snapshots and SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION
       or SNES_DEEP_CAPABILITY_REVISION
@@ -242,6 +254,9 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
     assert(deep_advertised and include_terminal_snapshots and state_advertised,
       "repeatable recording requires the complete canonical SNES observation surface")
     capability_revision = SNES_REPEATABLE_CAPABILITY_REVISION
+  end
+  if state_advertised and not state_load_advertised then
+    capability_revision = FRAME_ONLY_REVISIONS[capability_revision]
   end
   local event_classes = {
     {
@@ -302,7 +317,7 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
     end
   end
   local origins = { "next_frame_boundary", "reset_release" }
-  if state_advertised then origins[#origins + 1] = "state_load" end
+  if state_load_advertised then origins[#origins + 1] = "state_load" end
   local capability = {
     revision = capability_revision,
     origins = as_array(origins),
@@ -352,13 +367,15 @@ function M.capability(as_array, include_snes_semantic, include_terminal_snapshot
       max_callback_ms = MAX_INITIAL_SNAPSHOT_CALLBACK_MS,
     }
   end
-  if state_advertised then
+  if state_load_advertised then
     capability.state_load = {
       format = "mesen-savestate",
       max_bytes = MAX_STATE_BYTES,
       alignment = "restored_frame_boundary",
       requires_input_movie = true,
     }
+  end
+  if state_advertised then
     capability.terminal_state = {
       max_bytes = MAX_TERMINAL_STATE_BYTES,
       profiles = as_array({ {
@@ -587,7 +604,8 @@ function M.validate(params, expected_launch_id, start_frame, now_ms)
     return nil, "unsupported", "capability revision mismatch"
   end
   if params.origin ~= "next_frame_boundary" and params.origin ~= "reset_release"
-      and params.origin ~= "state_load" then
+      and params.origin ~= "state_load"
+      or params.origin == "state_load" and not state_load_advertised then
     return nil, "unsupported", "origin is not advertised by this runtime"
   end
   if not integer(params.frames) or params.frames < 1 or params.frames > MAX_FRAMES then

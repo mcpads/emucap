@@ -365,12 +365,7 @@ impl<G: GdbTransport> Bridge<G> {
                 .unwrap_or("")
                 .to_string();
             drop(archive);
-            let save_items_result = match save_items_dir {
-                Some(dir) => self.load_lua_save_items(&dir)?,
-                None => serde_json::Map::new(),
-            };
-            self.write_state_regions(&regions)?;
-            let postload = self.finish_state_load()?;
+            let save_items_result = self.restore_state_data(save_items_dir.as_deref(), &regions)?;
             let visual_refresh = match framebuffer_path {
                 Some(path) => self.restore_presented_framebuffer(&path)?,
                 None => json!({
@@ -399,7 +394,6 @@ impl<G: GdbTransport> Bridge<G> {
             out.insert("format".into(), json!(state_format));
             out.insert("regions".into(), json!(regions.len()));
             out.insert("state_restore".into(), state_restore_info());
-            out.insert("postload".into(), postload);
             out.insert("control_health".into(), control_health);
             out.insert(
                 "media_boundary".into(),
@@ -457,11 +451,7 @@ impl<G: GdbTransport> Bridge<G> {
                 })?
                 .to_string();
             drop(archive);
-            let save_items_result = match save_items_dir {
-                Some(dir) => self.load_lua_save_items(&dir)?,
-                None => serde_json::Map::new(),
-            };
-            self.write_state_regions(&regions)?;
+            let save_items_result = self.restore_state_data(save_items_dir.as_deref(), &regions)?;
             let mut result = self.register_probe(&regs_hex, frame, address, length)?;
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("status".into(), json!("completed"));

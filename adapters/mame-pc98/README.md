@@ -36,6 +36,31 @@ bootstrap smoke fallback.
   in the headless debugger setup, so the bridge implements emucap-owned PC-98
   state bundles instead.
 
+## State-bundle lifecycle
+
+The frozen bridge owns guest execution. Native MAME hooks own device serialization callbacks;
+Lua owns save-item enumeration and bytes. `load_state` and `probe` share the same restoration
+sequence: write available device items, write memory regions, then run postload **only if at least one
+device item was restored**, before restoring CPU registers or executing a probe. A memory/register
+bundle does not restore devices and reports `postload.status="skipped"`; running their callbacks
+would apply unrelated, possibly stale serialization buffers to current devices.
+
+Before enumerating save items, the maintained host dispatches presave to refresh device buffers
+(such as palette pens). Empty arrays are valid entries: do not read them, retain subsequent native
+item indices, and stop only at MAME's invalid-item sentinel. Read/length/write failures abort the
+save; the bridge publishes its staged bundle only on success. Hosts without `prepare_state_save`
+must be rebuilt; saving must not silently fall back to stale buffers.
+
+These bundles remain `best_effort_lua_item_write`, not atomic native machine snapshots or guaranteed
+deterministic replay. Existing unsupported item widths remain counted as skipped; media topology
+and bytes remain caller-owned. An error after device/memory mutation does not imply rollback.
+Old truncated saves cannot recover omitted bytes, and old saves cannot prove that presave buffers
+were fresh. This correction does not promote those artifacts or expand cross-generation guarantees.
+
+The behavior tests are `_tests/adapters/pc98/state_items_test.lua` and the PC-98 bridge Rust tests.
+They cover enumeration, presave freshness, memory-only admission, shared load/probe lifecycle,
+and failure termination. A passing mock test is not proof of a game's post-restore screen.
+
 ## What the user must provide
 
 The agent runs the build and launch itself (`build.sh`, then `launch.sh`).  Two

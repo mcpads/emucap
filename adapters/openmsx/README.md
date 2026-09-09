@@ -10,7 +10,7 @@ Build the pinned source and the bridge:
 
 ```sh
 ./adapters/openmsx/build.sh
-cargo build --release --bin emucap-openmsx-bridge --bin emucap-mcp
+cargo build --locked --release --bin emucap-openmsx-bridge --bin emucap-mcp
 ```
 
 The script downloads the exact release archive, applies the pinned upstream SDL2 compatibility
@@ -80,10 +80,10 @@ runtime-unproven until representative media reaches a declared boot anchor.
 Run the maintained runtime smoke:
 
 ```sh
-cargo run --release --example openmsx_adapter_smoke -- "<path-to-msx-cartridge>"
-cargo run --release --example openmsx_adapter_smoke -- "<path-to-msx-cartridge>" --display
+cargo run --locked --release --example openmsx_adapter_smoke -- "<path-to-msx-cartridge>"
+cargo run --locked --release --example openmsx_adapter_smoke -- "<path-to-msx-cartridge>" --display
 EMUCAP_OPENMSX_FIRMWARE=/absolute/firmware/root \
-  cargo run --release --example openmsx_adapter_smoke -- "<path-to-msx-cartridge>" --system=msx2
+  cargo run --locked --release --example openmsx_adapter_smoke -- "<path-to-msx-cartridge>" --system=msx2
 ```
 
 The smoke owns and terminates only the exact bridge and emulator processes it launched. The older
