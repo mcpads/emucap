@@ -31,7 +31,9 @@ bash -c '
   sleep 2
 ' bash "$helper" "$lock" "$log" &
 holder_pid=$!
-wait_for_path "$lock"
+# The lock file exists before its owner metadata is written. The holder's log is
+# published after acquisition, so it is the synchronization point for inspection.
+wait_for_path "$log"
 grep -Eq '^pid=[0-9]+$' "$lock"
 grep -Eq '^start=.+$' "$lock"
 
