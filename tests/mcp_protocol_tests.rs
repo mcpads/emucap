@@ -25,14 +25,18 @@ struct McpProcess {
 impl McpProcess {
     fn spawn(binary: &str, envs: &[(&str, String)]) -> Self {
         let mut command = Command::new(binary);
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
         for (key, value) in envs {
             command.env(key, value);
         }
 
+        Self::spawn_command(command)
+    }
+
+    fn spawn_command(mut command: Command) -> Self {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
         let mut child = command.spawn().expect("spawn MCP server");
         let stdin = child.stdin.take().expect("MCP stdin");
         let stdout = child.stdout.take().expect("MCP stdout");
@@ -877,4 +881,61 @@ fn malformed_first_modern_request_is_rejected_without_terminating_servers() {
     assert_eq!(malformed["error"]["code"], -32600);
     let discover = track.request(modern_request(2, "server/discover", json!({})));
     assert_eq!(discover["result"]["resultType"], "complete");
+}
+
+#[test]
+fn relocated_control_discovers_only_runtime_repository_paths() {
+    let temp = tempfile::tempdir().unwrap();
+    let install = temp.path().join("installed");
+    let cwd = temp.path().join("working");
+    let explicit = temp.path().join("configured");
+    std::fs::create_dir_all(install.join("bin")).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    let binary = install
+        .join("bin")
+        .join(format!("emucap-mcp{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(control_binary(), &binary).unwrap();
+    let inspect = |configured: Option<&std::path::Path>| {
+        let mut command = Command::new(&binary);
+        command
+            .current_dir(&cwd)
+            .env_remove("EMUCAP_REPO_ROOT")
+            .env("EMUCAP_EMU_HOME", temp.path().join("data"))
+            .env("EMUCAP_PORT", free_port().to_string());
+        if let Some(path) = configured {
+            command.env("EMUCAP_REPO_ROOT", path);
+        }
+        let mut server = McpProcess::spawn_command(command);
+        let response = server.request(modern_request(
+            1,
+            "tools/call",
+            json!({
+                "name": "bootstrap", "arguments": {"include": ["installation"]}
+            }),
+        ));
+        response["result"]["structuredContent"]["runtime_paths"].clone()
+    };
+    let missing = inspect(None);
+    assert!(missing["repo_root"].is_null(), "{missing}");
+    assert!(missing["error"].is_string(), "{missing}");
+    let mark = |root: &std::path::Path| {
+        for adapter in ["mesen2", "mednafen", "mame-pc98"] {
+            let dir = root.join("adapters").join(adapter);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("launch.sh"), "").unwrap();
+        }
+    };
+    let assert_root = |paths: Value, expected: &std::path::Path| {
+        let actual = std::path::Path::new(paths["repo_root"].as_str().unwrap());
+        assert_eq!(
+            actual.canonicalize().unwrap(),
+            expected.canonicalize().unwrap()
+        );
+    };
+    mark(&cwd);
+    assert_root(inspect(None), &cwd);
+    mark(&install);
+    assert_root(inspect(None), &install);
+    mark(&explicit);
+    assert_root(inspect(Some(&explicit)), &explicit);
 }

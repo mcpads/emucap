@@ -5,6 +5,8 @@ Actively developed beta software — interfaces may still change.
 ## 0.16.2
 
 ### Fixed
+- Relocated Control binaries discover adapter repositories from runtime configuration and location,
+  never from the build machine's embedded checkout path.
 - Git checkouts preserve native patch bytes, including DeSmuME hunks with upstream CRLF endings,
   so the committed patch stacks continue to match their pinned SHA-256 values.
 - Mesen native-halt state I/O now requires a proven main-CPU instruction boundary. PPU/frame,
