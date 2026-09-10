@@ -337,11 +337,16 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     state_only_without_snapshots.terminal_snapshots = None;
     state_only_without_snapshots.revision =
         state_only_without_snapshots.computed_revision().unwrap();
+    assert_frame_revision(
+        &state_only_without_snapshots,
+        "SNES_STATE_CAPABILITY_REVISION",
+    );
     assert_eq!(
         state_only_without_snapshots.revision,
         "89000c4b91750e4ad8317eb234ccc3e75a6c304978feb74daaedda8f2aa3ba7e"
     );
     state_only.revision = state_only.computed_revision().unwrap();
+    assert_frame_revision(&state_only, "SNES_STATE_SNAPSHOT_CAPABILITY_REVISION");
     assert_eq!(
         state_only.revision,
         "76f79723be824e502f5be0f0188c1494b249694c340bc8112a04872845ded730"
@@ -370,6 +375,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     let mut semantic_without_snapshots = capability.clone();
     semantic_without_snapshots.terminal_snapshots = None;
     semantic_without_snapshots.revision = semantic_without_snapshots.computed_revision().unwrap();
+    assert_frame_revision(&semantic_without_snapshots, "SNES_CAPABILITY_REVISION");
     assert_eq!(
         semantic_without_snapshots.revision,
         "c7bc749b13517456b049a73a868bc662c54cc98e580cc306b873328fd842dc22"
@@ -379,6 +385,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         capability.revision,
         "151544f37bf2e72601429981e93fb8d45bd404a0e1501d26432b9cf29995e658"
     );
+    assert_frame_revision(&capability, "SNES_SNAPSHOT_CAPABILITY_REVISION");
     for id in [
         "snes_cpu_instruction",
         "snes_content_read",
@@ -486,6 +493,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
     let mut deep_without_snapshots = capability.clone();
     deep_without_snapshots.terminal_snapshots = None;
     deep_without_snapshots.revision = deep_without_snapshots.computed_revision().unwrap();
+    assert_frame_revision(&deep_without_snapshots, "SNES_DEEP_CAPABILITY_REVISION");
     assert_eq!(
         deep_without_snapshots.revision,
         "9cb6540758c6f4a690371afc92c52803597183466ab0fc3486cbabc9e4287840"
@@ -495,6 +503,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         capability.revision,
         "79af7faa13666068539eaa7749e021f2035cefca4e5f9c12548a70468abc92ee"
     );
+    assert_frame_revision(&capability, "SNES_DEEP_SNAPSHOT_CAPABILITY_REVISION");
     capability.repeatability = Some(RecordingRepeatabilityCapability {
         profile: "mesen_snes_repeatable".into(),
         conditions_sha256: "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b"
@@ -507,6 +516,7 @@ fn mesen_terminal_snapshot_capability_revisions_cover_base_and_semantic_classes(
         capability.revision,
         "4436231189dd28b27f252d8c1241ccdfc04ead72aca5b1f675c53ad5a6377511"
     );
+    assert_frame_revision(&capability, "SNES_REPEATABLE_CAPABILITY_REVISION");
 }
 
 #[test]
@@ -648,4 +658,21 @@ fn state_load_origin_requires_one_bounded_capability_and_explicit_input_support(
     capability.state_load = None;
     capability.revision = capability.computed_revision().unwrap();
     assert!(capability.validate(&registry).is_err());
+}
+
+fn assert_frame_revision(original: &RecordingCapability, lua_key: &str) {
+    let mut frame = original.clone();
+    frame
+        .origins
+        .retain(|origin| *origin != RecordingCapabilityOrigin::StateLoad);
+    frame.state_load = None;
+    frame.revision = frame.computed_revision().unwrap();
+    frame
+        .validate(&EventContractRegistry::builtin().unwrap())
+        .unwrap();
+    let producer = include_str!("../../adapters/mesen2/emucap_recording.lua");
+    assert!(
+        producer.contains(&format!("[{lua_key}] = \"{}\"", frame.revision)),
+        "Lua origin-removal revision must match Core validation: {lua_key}"
+    );
 }

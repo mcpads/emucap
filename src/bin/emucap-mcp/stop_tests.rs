@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 
 use emucap::live::continuity::ContinuitySnapshot;
 use emucap::live::link::{Capabilities, LinkError};
-use emucap::live::runtime::{LeaseView, ManifestSpec, PreparedGeneration};
+#[cfg(unix)]
+use emucap::live::runtime::ManifestSpec;
+use emucap::live::runtime::{LeaseView, PreparedGeneration};
 
 struct StopLink {
     caps: Capabilities,
@@ -84,6 +86,7 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+#[cfg(unix)]
 fn commit_manifest(
     store: &RuntimeStore,
     port: u16,

@@ -631,10 +631,12 @@ function handlers.hello()
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
   if RECORDING_SUPPORTED then
+    -- Native frame halts can suspend unfinished CPU instructions. Keep frame-state restoration
+    -- unadvertised until the host can serialize those continuations; PPU readout is independent.
     result.recording = Recording.capability(
       as_array, HAS_SNES_PPU_OBJ_EVENTS, memory_regions ~= nil and #memory_regions > 0,
       HAS_SNES_DEEP_EVENTS, SYS.system == "snes",
-      repeatable_recording and REPEATABLE_CONDITIONS_SHA256 or nil)
+      repeatable_recording and REPEATABLE_CONDITIONS_SHA256 or nil, false)
   end
   local active_exceptions = { "mesen.execution.instruction-step-main-cpu" }
   if HAS_CALLSTACK then
@@ -1069,7 +1071,7 @@ end
 local function frozen_state_io(method, id, p)
   if not halt_savestate_safe then
     reply_err(id, "unsafe_halt",
-      method .. " requires a main-CPU instruction-boundary halt; frame/PPU step and breakpoint halts are not savestate-safe")
+      method .. " requires a proven main-CPU instruction-boundary halt. Explicitly call step(count=1, unit='instructions'), verify the new halt, then retry; frame/PPU, cycle, idle, and breakpoint halts are not savestate-safe.")
     return nil
   end
 

@@ -14,14 +14,17 @@ Neo Geo Pocket/Color), Flycast
 NP2kai compatibility backend (PC-98), MAME (experimental Neo Geo
 MVS/AES/CD), an experimental Mupen64Plus frontend (Nintendo 64), and a pinned
 xemu fork (original Xbox, experimental).
-Stock openMSX 21.0 provides experimental C-BIOS MSX2+ and real-firmware
-MSX1/MSX2/MSX2+ cartridge profiles through a separate Rust XML-control bridge.
+A pinned openMSX 21.0 source build with two emucap host patches provides
+experimental C-BIOS MSX2+ and real-firmware MSX1/MSX2/MSX2+ cartridge profiles
+through a separate Rust XML-control bridge.
 
-**v0.16.1 — beta.** This repository remains under active development; interfaces and
+**v0.16.2 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
-Licensed under GPL-2.0-or-later. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+The Core and otherwise unmarked project source are GPL-2.0-or-later. Native emulator
+patch stacks follow their adapter-specific upstream license boundary. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## Platforms
 
@@ -65,13 +68,7 @@ use the equivalents (and see the Platforms note above).
 From the repo root:
 
 ```sh
-cargo build --release \
-  --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker \
-  --bin emucap-mame-pc98-bridge --bin emucap-mame-neogeo-bridge \
-  --bin emucap-mupen64plus --bin emucap-desmume-nds-bridge \
-  --bin emucap-ppsspp-bridge --bin emucap-pcsx2-bridge \
-  --bin emucap-openmsx-bridge --bin emucap-np2kai \
-  --bin emucap-xemu-bridge
+cargo build --locked --release --bins
 ```
 
 Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
@@ -82,8 +79,8 @@ Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
 `emucap-mupen64plus` (N64 frontend and adapter),
 `emucap-desmume-nds-bridge` (NDS launch helper),
 `emucap-ppsspp-bridge` (PSP launch helper),
-`emucap-pcsx2-bridge` (PS2 launch helper), and
-`emucap-openmsx-bridge` (stock openMSX XML-control helper), and
+`emucap-pcsx2-bridge` (PS2 launch helper),
+`emucap-openmsx-bridge` (patched openMSX XML-control helper),
 `emucap-np2kai` (direct PC-98 compatibility frontend), and
 `emucap-xemu-bridge` (original Xbox QMP/GDB launch helper). All dependencies come from
 crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
@@ -241,6 +238,9 @@ frame count; it returns with the emulator frozen plus a validated bundle path an
 manifest hash. The live capability is the authority for event classes and limits.
 Optional origin, input movie, and event-stop arguments are valid only when that exact capability
 advertises them; omitting them retains the bounded next-frame behavior.
+The maintained Mesen SNES host currently omits the `state_load` origin: arbitrary PPU-frame CPU continuations
+are not serializable. After a frame halt, explicitly step one instruction and verify the safe halt
+before ordinary save/load; unsafe state I/O is rejected before file access or guest mutation.
 When `recording_capability.state_load` is advertised, `save_state` with
 `preserve_for_recording=true` and an absolute path also carries a producer-managed
 `snapshot_receipt`. A later `record_window(origin="state_load")` accepts only that
@@ -391,9 +391,10 @@ debugger halt to service requests without advancing the guest.
   → `adapters/mupen64plus/README.md`
 - **openMSX (MSX cartridge profiles, experimental)** — run
   `adapters/openmsx/build.sh`, then build `emucap-openmsx-bridge`. The official
-  launcher accepts a pinned stock openMSX 21.0 sidecar and runs it with an
-  emucap-owned per-port `HOME`; it does not patch openMSX or read the user's
-  emulator profile. `msx` is C-BIOS MSX2+; `msx1`, `msx2`, and `msx2p` select
+  launcher accepts only the pinned openMSX 21.0 sidecar built with the recorded
+  upstream compatibility backport and two emucap host patches. It runs that host
+  with an emucap-owned per-port `HOME` and does not read the user's emulator
+  profile. `msx` is C-BIOS MSX2+; `msx1`, `msx2`, and `msx2p` select
   explicit user-supplied real-firmware profiles. The cartridge surface includes Z80
   state and instruction step, exact headless or visible frame step, bounded CPU
   memory/main RAM/VRAM access, frozen save/load, keyboard-matrix and two-port

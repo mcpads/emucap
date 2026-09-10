@@ -1276,4 +1276,23 @@ do
   equal(kind, "unsupported", "unadvertised origin kind")
 end
 
+do
+  local identity = function(value) return value end
+  local previous = Recording.capability(identity, true, true, true, true)
+  local current = Recording.capability(identity, true, true, true, true, nil, false)
+  assert(current.revision ~= previous.revision, "origin removal must invalidate stale requests")
+  equal(current.state_load, nil, "unserializable frame origin is absent")
+  equal(#current.origins, 2, "only the two supported recording origins remain")
+  equal(current.origins[1], "next_frame_boundary", "ordinary frame recording remains")
+  equal(current.origins[2], "reset_release", "reset recording remains")
+  assert(current.terminal_state, "terminal PPU observation does not require frame state loading")
+  local forbidden = params(1, { origin = "state_load", capability_revision = current.revision })
+  local valid, code = Recording.validate(forbidden, LAUNCH, 0, 0)
+  equal(valid, nil, "unadvertised state origin is rejected before input preparation")
+  equal(code, "unsupported", "unadvertised state origin code")
+  local repeatable = Recording.capability(identity, true, true, true, true, string.rep("a", 64), false)
+  equal(repeatable.repeatability.origins[1], "reset_release", "repeatability stays reset-scoped")
+  equal(repeatable.state_load, nil, "repeatability does not reenable unsafe state loading")
+end
+
 print("recording_test: ok")

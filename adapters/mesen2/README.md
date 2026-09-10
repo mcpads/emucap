@@ -134,17 +134,12 @@ validates and decodes the movie and binds the sink before queueing reset, then e
 boundary in Mesen's native post-reset callback before the emulation loop releases a guest tick. This
 is a timed soft-reset origin, not a cold-power or equal-memory claim. Legacy/manual hosts and the
 other Mesen system entries keep their existing tools but do not advertise recording.
-The maintained SNES profile also advertises `state_load` with `restored_frame_boundary` alignment.
-`save_state(preserve_for_recording=true)` preserves its exact bytes and semantic receipt in the
-managed launch generation. The default save path performs no such preservation. A
-state-backed window accepts only the returned opaque snapshot ID and only when that receipt proves
-a frozen frame boundary. Core stages those producer-owned bytes; Mesen loads them while its native
-savestate-safe halt is still owned, restores the saved frame coordinate, applies movie offset zero,
-attaches selected hooks, and emits that restored boundary before resuming. There is no caller round
-trip or hidden alignment frame between load and recording. Instruction-boundary saves remain valid
-ordinary states but are not eligible for this frame-window origin. Load failure or arming failure
-does not publish a complete bundle and leaves Mesen frozen; it does not claim restoration of the
-pre-attempt state after a native load error.
+The maintained SNES profile does not advertise the `state_load` recording origin. Exact PPU-frame
+halts can suspend unfinished CPU instructions, which the native savestate format cannot preserve.
+Ordinary saves and loads require a proven main-CPU instruction-boundary halt. After a frame step,
+explicitly call `step(count=1, unit="instructions")`, verify `status.freeze_policy.savestate_safe`,
+then save or load. State I/O never silently advances guest time. Terminal memory and PPU observations,
+next-frame recording, and repeatable reset-release recording remain available independently.
 For warmup requests, `frame_boundary` and `frame_completed` also advertise selectable transaction
 or observation emission scopes. The default remains transaction scope. An observation override
 suppresses warmup records and their event, byte, and drop accounting while the dense input movie
@@ -191,7 +186,7 @@ cleanup, and mid-frame recording failures do not inherit that eligibility.
   not a second public control.
   (`save_state`/`load_state` also work while frozen at a main-CPU instruction boundary created by
   explicit `pause` or an instruction step. They preserve the native halt, and a load refreshes the
-  frozen CPU projection before replying. Frame/PPU-step and breakpoint halts return `unsafe_halt`
+  frozen CPU projection before replying. Frame/PPU-step, CPU-cycle, idle, and breakpoint halts return `unsafe_halt`
   because they may be between instructions. Use breakpoint `snapshot` for exact hit-time memory. A
   `set_input` hold persists until explicitly released with an empty set_input; resume/step do not
   release it.)

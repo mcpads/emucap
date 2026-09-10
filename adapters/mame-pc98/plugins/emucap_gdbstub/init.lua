@@ -1233,10 +1233,6 @@ function emucap_gdbstub.startplugin()
     ack_packet(socket, "OK")
   end
 
-  local function save_item_supported(size)
-    return size == 1 or size == 2 or size == 4 or size == 8
-  end
-
   local function save_presented_framebuffer(path)
     local screen = manager.machine.screens:at(1)
     if not screen then
@@ -1278,106 +1274,7 @@ function emucap_gdbstub.startplugin()
     return width, height, expected
   end
 
-  local function save_items_to_dir(path)
-    local manifest_path = path .. "/manifest.txt"
-    local manifest, manifest_err = io.open(manifest_path, "wb")
-    if not manifest then
-      return nil, "manifest open failed: " .. tostring(manifest_err)
-    end
-
-    local saved = 0
-    local skipped = 0
-    local idx = 0
-    while true do
-      local item = emu.item(idx)
-      if not item or item.size == 0 or item.count == 0 then
-        break
-      end
-
-      local filename = string.format("item_%06d.bin", idx)
-      local bytes_len = item.size * item.count
-      local ok, data_or_err = pcall(function() return item:read_block(0, bytes_len) end)
-      if not ok then
-        manifest:close()
-        return nil, "item read failed at " .. tostring(idx) .. ": " .. tostring(data_or_err)
-      end
-      local f, file_err = io.open(path .. "/" .. filename, "wb")
-      if not f then
-        manifest:close()
-        return nil, "item file open failed: " .. tostring(file_err)
-      end
-      f:write(data_or_err)
-      f:close()
-      manifest:write(string.format("%d|%d|%d|%d|%s\n", idx, item.size, item.count, bytes_len, filename))
-      saved = saved + 1
-      if not save_item_supported(item.size) then
-        skipped = skipped + 1
-      end
-      idx = idx + 1
-    end
-
-    manifest:close()
-    return saved, skipped
-  end
-
-  local function value_from_bytes(data, pos, size)
-    local value = 0
-    for offset = 0, size - 1 do
-      value = value | ((data:byte(pos + offset) or 0) << (offset * 8))
-    end
-    return value
-  end
-
-  local function load_items_from_dir(path)
-    local manifest, manifest_err = io.open(path .. "/manifest.txt", "rb")
-    if not manifest then
-      return nil, "manifest open failed: " .. tostring(manifest_err)
-    end
-
-    local restored = 0
-    local skipped = 0
-    for line in manifest:lines() do
-      local idx_s, size_s, count_s, bytes_s, filename = line:match("^(%d+)|(%d+)|(%d+)|(%d+)|([^|]+)$")
-      local idx = tonumber(idx_s or "")
-      local size = tonumber(size_s or "")
-      local count = tonumber(count_s or "")
-      local bytes_len = tonumber(bytes_s or "")
-      if not idx or not size or not count or not bytes_len or not filename then
-        manifest:close()
-        return nil, "bad manifest line: " .. tostring(line)
-      end
-
-      local item = emu.item(idx)
-      if not item or item.size ~= size or item.count ~= count then
-        manifest:close()
-        return nil, "save item mismatch at " .. tostring(idx)
-      end
-
-      local f, file_err = io.open(path .. "/" .. filename, "rb")
-      if not f then
-        manifest:close()
-        return nil, "item file open failed: " .. tostring(file_err)
-      end
-      local data = f:read("*a")
-      f:close()
-      if #data ~= bytes_len then
-        manifest:close()
-        return nil, "item data length mismatch at " .. tostring(idx)
-      end
-
-      if save_item_supported(size) then
-        for entry = 0, count - 1 do
-          item:write(entry, value_from_bytes(data, (entry * size) + 1, size))
-        end
-        restored = restored + 1
-      else
-        skipped = skipped + 1
-      end
-    end
-
-    manifest:close()
-    return restored, skipped
-  end
+  local StateItems = require("emucap_gdbstub.state_items")
 
   local function handle_emucap(payload)
     local name, rest = payload:match("^qEmucap,([^,]*),?(.*)$")
@@ -1590,7 +1487,7 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E00")
         return true
       end
-      local ok, saved_or_err, skipped_or_err = pcall(function() return save_items_to_dir(path) end)
+      local ok, saved_or_err, skipped_or_err = pcall(function() return StateItems.save(path) end)
       if ok and saved_or_err then
         ack_packet(socket, "OK|" .. tostring(saved_or_err) .. "|" .. tostring(skipped_or_err or 0))
       else
@@ -1604,7 +1501,7 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E00")
         return true
       end
-      local ok, restored_or_err, skipped_or_err = pcall(function() return load_items_from_dir(path) end)
+      local ok, restored_or_err, skipped_or_err = pcall(function() return StateItems.load(path) end)
       if ok and restored_or_err then
         ack_packet(socket, "OK|" .. tostring(restored_or_err) .. "|" .. tostring(skipped_or_err or 0))
       else

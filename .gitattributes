@@ -1,1 +1,2 @@
-adapters/*/patches/*.patch text eol=lf -whitespace
+# Patch bytes are pinned by upstream.lock; never normalize embedded upstream line endings.
+adapters/*/patches/*.patch -text -whitespace

@@ -13,5 +13,7 @@ PARTICULAR PURPOSE. See the GNU General Public License for more details.
 
 Full license text: licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)
 Upstream emulator attributions: NOTICE
-The emulator adapters under adapters/ are GPL derivatives/plugins of their
-upstreams and carry the same license; see each adapters/*/LICENSE.
+Original adapter code uses the project default unless its notice says otherwise.
+Native patches and code combined with emulator source follow the exact upstream
+grant, which may use a different GPL version; see each adapters/*/LICENSE and
+NOTICE.

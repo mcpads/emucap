@@ -1,21 +1,24 @@
 Copyright (C) 2026 emucap contributors
-SPDX-License-Identifier: GPL-2.0-or-later
 
-The emucap openMSX build recipe, documentation, and separate Rust control
-bridge are licensed GPL-2.0-or-later, the project default.
+The separate Rust control bridge, build recipe, and original documentation are
+licensed GPL-2.0-or-later, the project default.
 
-The pinned openMSX 21.0 source is downloaded into the ignored work tree and
-retains its own copyright and license notices. Its README points to the GNU
-GPL version 2 text but does not give every default source file an unambiguous
-"only" or "or later" grant. The supported adapter therefore does not modify openMSX
-source. If a native patch is introduced later, its exact upstream file
-licenses must be reviewed before distribution.
+The supported build applies patches/0001-add-emucap-joystick-override.patch and
+patches/0002-add-emucap-vdp-frame-probe.patch to openMSX 21.0. The modified
+MSXMotherBoard, JoystickPort, and VDP source/header files carry no separate
+license notice. The openMSX release README assigns such files to the GNU GPL
+text in doc/GPL.txt, which is version 2, but does not state an unambiguous
+"or later" permission in the project grant. emucap therefore handles the patch
+files and a combined patched host conservatively at the GPL-2.0-only upstream
+boundary. Separately authored bridge and build code remains
+GPL-2.0-or-later; both grants can be satisfied under GPLv2 when used together.
 
 The openMSX source package includes C-BIOS machine ROMs under the BSD
 2-Clause license. Their original copyright, license, and disclaimer remain
 authoritative and must accompany any redistribution.
 
-This repository does not distribute openMSX source or binaries, C-BIOS
-binaries, proprietary MSX system ROMs, or game media. See ../../NOTICE.
+This repository distributes the two patch files and a source-build recipe, but
+not the openMSX source tree or binaries, C-BIOS binaries, proprietary MSX system
+ROMs, or game media. See ../../NOTICE.
 
 Full GPL-2.0 text: ../../licenses/GPL-2.0.txt (https://www.gnu.org/licenses/gpl-2.0.txt)

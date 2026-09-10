@@ -322,15 +322,15 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `source` (`data_port`/`dma_vbus`/`dma_fill`/`dma_copy`/`control_port`), and for the DMA family a `source_address`
   (no Mesen-style type/channels/dma snapshot, etc.).
 - **PCE status**: added the `pce` core build/branch/button/value-conditioned BP recording paths. The synthetic HuCard smoke is
-  verified with `cargo run --example mednafen_pce_smoke`. Real-game input is checked with
-  `cargo run --example mednafen_pce_input_visual -- <game.cue|game.pce>`. Default verification order:
+  verified with `cargo run --locked --example mednafen_pce_smoke`. Real-game input is checked with
+  `cargo run --locked --example mednafen_pce_input_visual -- <game.cue|game.pce>`. Default verification order:
   `status.system=="pce"` → HuC6280/VDC groups exposed in `get_state` → `read_memory("cpu", 0xE060, ...)`
   → `disassemble(0xE060)` → `tap(["run"])` or `tap(["start"])`.
 - **PC-FX status**: the representative-disc smoke verifies exact `pcfx` identity, V810 state and
   disassembly, one-instruction stepping with trace, exec BP freeze/event, BIOS offset↔CPU physical
   agreement, protected-space write rejection, frozen RAM save/load restoration, gamepad delivery
   and ownership release, and PNG screenshot:
-  `cargo run --example mednafen_pcfx_smoke -- <game.cue> <pcfx.rom> [mednafen]`.
+  `cargo run --locked --example mednafen_pcfx_smoke -- <game.cue> <pcfx.rom> [mednafen]`.
   This is runtime proof for the common surface, not proof that every game-specific CD timing path
   or every auxiliary breakpoint has been exercised.
 - **Neo Geo Pocket/Color status**: the representative `.ngc` smoke verifies exact `ngp`
@@ -338,7 +338,7 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   state, side-effect-free disassembly, exact TLCS instruction step, pre-instruction exec
   evidence, stable breakpoint identity across load/reset, A+OPTION delivery and release,
   save/load completion, and a PNG screenshot:
-  `cargo run --release --example mednafen_ngp_smoke -- <game.ngp|game.ngc> [mednafen]`.
+  `cargo run --locked --release --example mednafen_ngp_smoke -- <game.ngp|game.ngc> [mednafen]`.
 - **MD status**: added the `md` core build/branch/button/value-conditioned BP recording paths. Default verification order:
   `status.system=="md"` → check the SEGA header with `read_memory("cpu", 0x100, ...)` →
   read the reset vector and `disassemble(reset_pc)` → `write_memory("ram", ...)` round-trip →
@@ -355,7 +355,7 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   the exact child processes it launched:
 
   ```sh
-  cargo run --release --example mednafen_debug_boundaries_smoke -- \
+  cargo run --locked --release --example mednafen_debug_boundaries_smoke -- \
     <psx.cue> <ws.rom> <scph5500.bin>
   ```
 - **Input injection point**: injected not at the driver's `Input_Update` but in the core-agnostic `mednafen.cpp`, right

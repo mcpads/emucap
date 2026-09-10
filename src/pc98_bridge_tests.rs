@@ -222,6 +222,8 @@ impl GdbTransport for StateSaveGdb {
 
 #[derive(Default)]
 struct StateLoadGdb {
+    fail_at: Option<&'static str>,
+    restored_item_count: usize,
     regs_hex: String,
     writes: Vec<String>,
     regprobe_specs: Vec<String>,
@@ -238,6 +240,7 @@ impl StateLoadGdb {
         Self {
             regs_hex,
             postload_health_reply: "READY|73|0".into(),
+            restored_item_count: 1,
             media_status_replies: VecDeque::from(["MEDIA:".into(), "MEDIA:".into()]),
             ..Default::default()
         }
@@ -246,6 +249,12 @@ impl StateLoadGdb {
 
 impl GdbTransport for StateLoadGdb {
     fn send(&mut self, payload: &str) -> GdbResult<String> {
+        if self
+            .fail_at
+            .is_some_and(|prefix| payload.starts_with(prefix))
+        {
+            return Err(GdbError::Emulator("injected restore failure".into()));
+        }
         if payload == "?" {
             return Ok("S05".into());
         }
@@ -265,13 +274,21 @@ impl GdbTransport for StateLoadGdb {
                 .push(PathBuf::from(String::from_utf8(bytes).map_err(|_| {
                     GdbError::Emulator("bad loaditems path utf8".into())
                 })?));
-            return Ok("OK|1|0".into());
+            return Ok(format!("OK|{}|0", self.restored_item_count));
         }
         if payload.starts_with('M') {
             self.writes.push(payload.into());
             return Ok("OK".into());
         }
         if payload == "qEmucap,finishload" {
+            assert!(
+                !self.load_items_dirs.is_empty(),
+                "postload without device restoration"
+            );
+            assert!(
+                !self.writes.is_empty(),
+                "postload preceded memory restoration"
+            );
             self.completed_state_loads += 1;
             return Ok("OK".into());
         }
@@ -302,6 +319,11 @@ impl GdbTransport for StateLoadGdb {
             return Ok(format!("OK|{}", self.regs_hex));
         }
         if let Some(hex_spec) = payload.strip_prefix("qEmucap,regprobe,") {
+            assert_eq!(
+                self.completed_state_loads,
+                usize::from(!self.load_items_dirs.is_empty() && self.restored_item_count > 0),
+                "probe resumed before device restoration finished"
+            );
             let bytes =
                 hex::decode(hex_spec).map_err(|_| GdbError::Emulator("bad regprobe hex".into()))?;
             let spec = String::from_utf8(bytes)
@@ -322,6 +344,10 @@ impl GdbTransport for StateLoadGdb {
 }
 
 fn write_test_state(path: &Path, regs_hex: &str) {
+    write_test_state_with_items(path, regs_hex, true);
+}
+
+fn write_test_state_with_items(path: &Path, regs_hex: &str, include_items: bool) {
     let file = File::create(path).unwrap();
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -332,7 +358,7 @@ fn write_test_state(path: &Path, regs_hex: &str) {
     zip.start_file(FRAMEBUFFER_MEMBER, options).unwrap();
     zip.write_all(&[1_u8, 2, 3, 4, 5, 6, 7, 8]).unwrap();
     zip.start_file("state.json", options).unwrap();
-    let manifest = json!({
+    let mut manifest = json!({
         "format": STATE_FORMAT,
         "system": "pc98",
         "adapter": "mame-pc98-gdb",
@@ -354,6 +380,9 @@ fn write_test_state(path: &Path, regs_hex: &str) {
         },
         "state_restore": state_restore_info(),
     });
+    if !include_items {
+        manifest.as_object_mut().unwrap().remove("save_items");
+    }
     zip.write_all(&serde_json::to_vec(&manifest).unwrap())
         .unwrap();
     zip.finish().unwrap();
@@ -1867,6 +1896,8 @@ fn probe_restores_state_and_uses_lua_register_probe() {
     assert_eq!(result["save_items_restored"], 1);
     assert_eq!(bridge.gdb.writes, vec!["Ma0000,2:aabb"]);
     assert_eq!(bridge.gdb.regprobe_specs, vec![format!("{regs}|3|a0000|2")]);
+    assert_eq!(bridge.gdb.completed_state_loads, 1);
+    assert_eq!(result["postload"]["status"], "completed");
 }
 
 #[test]
@@ -2269,4 +2300,82 @@ fn gdb_backend_and_stream_errors_keep_distinct_protocol_kinds() {
         "fake reset",
     )));
     assert_eq!(error_kind(&stream_error), "bridge_error");
+}
+
+#[test]
+fn memory_only_load_and_probe_do_not_finalize_unrestored_devices() {
+    for method in ["load_state", "probe"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("memory-only.zip");
+        let regs = i386_regs_hex(&[("eip", 0x8000), ("cs", 0x1234)]);
+        write_test_state_with_items(&state, &regs, false);
+        let mut bridge = Bridge::new(StateLoadGdb::new(regs), GdbBridgeEnv::default());
+        let params = if method == "load_state" {
+            json!({"path": state})
+        } else {
+            json!({"state": state, "frame": 3, "memory_type": "tvram", "address": 0, "length": 2})
+        };
+        let response = bridge.handle_request(Request::new(1, method, params));
+        let result = response
+            .result
+            .expect("memory/register restoration succeeds");
+        assert_eq!(
+            bridge.gdb.completed_state_loads, 0,
+            "{method} changed unrestored devices"
+        );
+        assert!(bridge.gdb.load_items_dirs.is_empty());
+        assert_eq!(bridge.gdb.writes, vec!["Ma0000,2:aabb"]);
+        assert_eq!(result["postload"]["status"], "skipped");
+        assert!(bridge.frozen);
+    }
+}
+
+#[test]
+fn failed_restore_phase_never_reaches_register_restore_or_probe_execution() {
+    for method in ["load_state", "probe"] {
+        for phase in ["qEmucap,loaditems,", "M", "qEmucap,finishload"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let state = tmp.path().join("state.zip");
+            let regs = i386_regs_hex(&[("eip", 0x8000)]);
+            write_test_state(&state, &regs);
+            let mut gdb = StateLoadGdb::new(regs);
+            gdb.fail_at = Some(phase);
+            let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
+            let params = if method == "load_state" {
+                json!({"path": state})
+            } else {
+                json!({"state": state, "frame": 3, "memory_type": "tvram", "address": 0, "length": 2})
+            };
+            let response = bridge.handle_request(Request::new(1, method, params));
+            assert!(response.error.is_some(), "{method} hid failure in {phase}");
+            assert_eq!(bridge.gdb.completed_state_loads, 0);
+            assert!(bridge.gdb.loaded_framebuffers.is_empty());
+            assert!(bridge.gdb.regprobe_specs.is_empty());
+            assert!(bridge.frozen);
+        }
+    }
+}
+
+#[test]
+fn empty_device_payload_does_not_finalize_unrestored_devices() {
+    for method in ["load_state", "probe"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state.zip");
+        let regs = i386_regs_hex(&[("eip", 0x8000)]);
+        write_test_state(&state, &regs);
+        let mut gdb = StateLoadGdb::new(regs);
+        gdb.restored_item_count = 0;
+        let mut bridge = Bridge::new(gdb, GdbBridgeEnv::default());
+        let params = if method == "load_state" {
+            json!({"path": state})
+        } else {
+            json!({"state": state, "frame": 3, "memory_type": "tvram", "address": 0, "length": 2})
+        };
+        let result = bridge
+            .handle_request(Request::new(1, method, params))
+            .result
+            .unwrap();
+        assert_eq!(bridge.gdb.completed_state_loads, 0);
+        assert_eq!(result["postload"]["status"], "skipped");
+    }
 }

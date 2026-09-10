@@ -354,6 +354,34 @@ impl<G: GdbTransport> Bridge<G> {
         Ok(())
     }
 
+    // Both load_state and probe own the same device/memory restoration lifecycle.
+    pub(super) fn restore_state_data(
+        &mut self,
+        items: Option<&Path>,
+        regions: &[(String, Vec<u8>)],
+    ) -> BridgeResult<serde_json::Map<String, Value>> {
+        let mut result = match items {
+            Some(dir) => self.load_lua_save_items(dir)?,
+            None => serde_json::Map::new(),
+        };
+        self.write_state_regions(regions)?;
+        let restored_devices = result
+            .get("save_items_restored")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let postload = if restored_devices > 0 {
+            self.finish_state_load()?
+        } else {
+            json!({
+                "status": "skipped",
+                "reason": "no device save items were restored",
+                "frames_advanced": 0,
+            })
+        };
+        result.insert("postload".into(), postload);
+        Ok(result)
+    }
+
     pub(super) fn finish_state_load(&mut self) -> BridgeResult<Value> {
         let frame_before = self.current_frame();
         let response = self.lua_cmd_reply("finishload", None)?;

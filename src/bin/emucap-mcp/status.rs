@@ -384,7 +384,6 @@ pub(crate) fn find_repo_root() -> Option<PathBuf> {
             candidates.push(ancestor.to_path_buf());
         }
     }
-    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
 
     candidates
         .into_iter()
@@ -414,7 +413,7 @@ pub(crate) fn runtime_paths(port: Option<u16>) -> serde_json::Value {
             "repo_root": null,
             "repo_root_env": "EMUCAP_REPO_ROOT",
             "runtime_capsule": capsule_paths,
-            "error": "emucap repo root not found from EMUCAP_REPO_ROOT, current_exe, cwd, or CARGO_MANIFEST_DIR",
+            "error": "emucap repo root not found from EMUCAP_REPO_ROOT, current_exe, or cwd",
         });
     };
     let token_file = port.map(tcp::session_token_path);
