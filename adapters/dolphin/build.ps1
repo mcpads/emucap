@@ -51,13 +51,16 @@ $owned = @(
   "Source/Core/Core/State.h",
   "Source/Core/VideoCommon/FrameDumper.cpp",
   "Source/Core/VideoCommon/FrameDumper.h",
+  "Source/Core/DolphinNoGUI/Platform.h",
+  "Source/Core/DolphinNoGUI/PlatformHeadless.cpp",
+  "Source/Core/DolphinNoGUI/MainNoGUI.cpp",
   "Source/Core/DolphinQt/Settings.cpp",
   "Source/Core/DolphinLib.props"
 )
 git -C $Src checkout -- $owned
 if ($LASTEXITCODE -ne 0) { throw "failed to restore files owned by the patch stack" }
 git -C $Src clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h `
-  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h
+  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h Source/Core/Core/EmuCapTemporal.h
 if ($LASTEXITCODE -ne 0) { throw "failed to clean stale adapter sources" }
 
 Copy-Item -LiteralPath (Join-Path $here "EmuCap.cpp") `
@@ -68,6 +71,8 @@ Copy-Item -LiteralPath (Join-Path $here "EmuCapInput.cpp") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapInput.cpp") -Force
 Copy-Item -LiteralPath (Join-Path $here "EmuCapInput.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapInput.h") -Force
+Copy-Item -LiteralPath (Join-Path $here "EmuCapTemporal.h") `
+  -Destination (Join-Path $Src "Source\Core\Core\EmuCapTemporal.h") -Force
 
 foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
     Sort-Object Name) {
@@ -108,7 +113,7 @@ function Get-LowerSha256([string]$Path) {
   (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h")
+$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h")
 $digestInputs += Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
   Sort-Object Name |
   ForEach-Object { "patches/$($_.Name)" }

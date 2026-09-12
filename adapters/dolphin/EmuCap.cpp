@@ -6,6 +6,7 @@
 
 #include "Core/EmuCap.h"
 #include "Core/EmuCapInput.h"
+#include "Core/EmuCapTemporal.h"
 
 #include <algorithm>
 #include <atomic>
@@ -74,6 +75,7 @@ namespace
 std::thread s_thread;
 std::atomic<bool> s_stop{false};
 std::atomic<bool> s_started{false};
+std::atomic<bool> s_request_cancelled{false};
 
 std::mutex s_socket_mutex;
 SOCKET s_active_socket = INVALID_SOCKET;
@@ -102,14 +104,14 @@ std::atomic<u64> s_file_sequence{0};
 std::string s_handler_error_kind;
 std::string s_handler_error;
 
-constexpr uint64_t MAX_SYNC_ADVANCE_COUNT = 15;
+constexpr uint64_t MAX_SYNC_ADVANCE_COUNT = Temporal::MAX_ADVANCE_COUNT;
 constexpr uint64_t MAX_MEMORY_READ_BYTES = 16 * 1024 * 1024;
 constexpr uint64_t MAX_MEMORY_WRITE_BYTES = 16 * 1024;
 constexpr size_t MAX_BREAKPOINTS = 128;
 constexpr u64 MAX_BREAKPOINT_SPAN = 64 * 1024;
 constexpr u64 MAX_POWERPC_ACCESS_WIDTH = 8;
-constexpr auto SYNC_RESPONSE_BUDGET = std::chrono::seconds(4);
-constexpr auto FRAME_STEP_WORK_BUDGET = std::chrono::seconds(3);
+constexpr auto SYNC_RESPONSE_BUDGET = Temporal::OPERATION_BUDGET;
+constexpr auto FRAME_STEP_WORK_BUDGET = Temporal::OPERATION_BUDGET;
 constexpr auto RESET_WORK_BUDGET = std::chrono::seconds(3);
 constexpr auto STEP_WAIT_SLICE = std::chrono::seconds(1);
 
@@ -793,52 +795,90 @@ picojson::object Reset(Core::System& system, const picojson::object& p)
   return Fail("timeout", "reset button did not reach its native release boundary");
 }
 
+picojson::object AdvanceOutcome(uint64_t completed, uint64_t requested, const char *reason)
+{
+  picojson::object result;
+  result["status"] = picojson::value(std::string(reason ? "interrupted" : "completed"));
+  result["count"] = picojson::value(static_cast<double>(completed));
+  result["requested"] = picojson::value(static_cast<double>(requested));
+  result["state"] = picojson::value(std::string("frozen"));
+  if (reason)
+    result["reason"] = picojson::value(std::string(reason));
+  return result;
+}
+
+bool WaitForAdvanceEvent(Common::Event& event,
+                         std::chrono::steady_clock::time_point deadline)
+{
+  while (!s_stop.load() && !s_request_cancelled.load())
+  {
+    const auto remaining = deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero())
+      return false;
+    if (event.WaitFor(std::min(remaining, std::chrono::steady_clock::duration(
+                                            std::chrono::milliseconds(100)))))
+      return true;
+  }
+  return false;
+}
+
 picojson::object StepInstructions(Core::System& system, const picojson::object& p)
 {
   uint64_t count = 1;
   if (p.count("count") && !GetU64(p, "count", count))
     return Fail("bad_params", "count must be an integer");
-  if (count == 0 || count > MAX_SYNC_ADVANCE_COUNT)
-    return Fail("bad_params", "instruction count must be in 1..15");
+  if (!Temporal::ValidAdvanceCount(count))
+    return Fail("bad_params", "instruction count must be in 1..5000");
 
   auto& cpu = system.GetCPU();
   cpu.SetStepping(true);
   auto& power_pc = system.GetPowerPC();
   const PowerPC::CoreMode old_mode = power_pc.GetMode();
   power_pc.SetMode(PowerPC::CoreMode::Interpreter);
+  uint64_t completed_count = 0;
+  const char *interrupted_reason = nullptr;
   bool completed_all = true;
   bool can_restore_mode = true;
   const auto operation_deadline = std::chrono::steady_clock::now() + SYNC_RESPONSE_BUDGET;
   for (uint64_t i = 0; i < count; ++i)
   {
     const auto remaining = operation_deadline - std::chrono::steady_clock::now();
-    if (remaining <= std::chrono::steady_clock::duration::zero())
+    if (s_stop.load() || s_request_cancelled.load() ||
+        remaining <= std::chrono::steady_clock::duration::zero())
     {
-      completed_all = false;
+      interrupted_reason = s_stop.load()                ? "shutdown"
+                           : s_request_cancelled.load() ? "disconnected"
+                                                        : "deadline";
       break;
+    }
+    u64 interruption_before;
+    {
+      std::lock_guard lock(s_frame_step_mutex);
+      interruption_before = s_breakpoint_interruptions;
     }
     Common::Event completed;
     cpu.StepOpcode(&completed);
-    const auto wait_budget =
-        std::max(std::chrono::milliseconds(1),
-                 std::min(std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
-                          std::chrono::duration_cast<std::chrono::milliseconds>(STEP_WAIT_SLICE)));
-    if (!completed.WaitFor(wait_budget))
+    if (!WaitForAdvanceEvent(completed, operation_deadline))
     {
       can_restore_mode = cpu.CancelStepOpcode(&completed);
       completed_all = false;
       break;
+    }
+    ++completed_count;
+    {
+      std::lock_guard lock(s_frame_step_mutex);
+      if (s_breakpoint_interruptions != interruption_before)
+      {
+        interrupted_reason = "breakpoint";
+        break;
+      }
     }
   }
   if (can_restore_mode)
     power_pc.SetMode(old_mode);
   if (!completed_all)
     return Fail("timeout", "instruction step did not complete within the operation deadline");
-  picojson::object r;
-  r["status"] = picojson::value(std::string("completed"));
-  r["count"] = picojson::value(static_cast<double>(count));
-  r["state"] = picojson::value(std::string("frozen"));
-  return r;
+  return AdvanceOutcome(completed_count, count, interrupted_reason);
 }
 
 picojson::object StepFrames(Core::System& system, const picojson::object& p)
@@ -853,8 +893,8 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
   {
     return Fail("bad_params", "count must be an integer");
   }
-  if (count == 0 || count > MAX_SYNC_ADVANCE_COUNT)
-    return Fail("bad_params", "frame count must be in 1..15");
+  if (!Temporal::ValidAdvanceCount(count))
+    return Fail("bad_params", "frame count must be in 1..5000");
   if (Core::GetState(system) != Core::State::Paused)
     return Fail("bad_state", "frame step requires a frozen core");
 
@@ -864,21 +904,42 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
     std::atomic<bool> cancelled{false};
     std::atomic<bool> accepted{false};
   };
-  const auto cancel_frame_step = [] {
-    auto cancelled = std::make_shared<Common::Event>();
-    Core::QueueHostJob([cancelled](Core::System& host_system) {
-      Core::CancelFrameStep(host_system);
-      cancelled->Set();
-    });
-    return cancelled->WaitFor(STEP_WAIT_SLICE);
+  const auto cancel_frame_step = []
+  {
+    struct Cleanup
+    {
+      Common::Event done;
+      std::atomic<bool> frozen{false};
+    };
+    auto cleanup = std::make_shared<Cleanup>();
+    Core::QueueHostJob(
+        [cleanup](Core::System &host_system)
+        {
+          Core::CancelFrameStep(host_system);
+          if (Core::IsRunning(host_system))
+            Core::SetState(host_system, Core::State::Paused);
+          cleanup->frozen.store(Core::GetState(host_system) == Core::State::Paused);
+          cleanup->done.Set();
+        });
+    return cleanup->done.WaitFor(STEP_WAIT_SLICE) && cleanup->frozen.load();
   };
 
-  // Leave one cleanup slice and one second of transport margin inside the MCP's five-second idle
-  // timeout. A terminal adapter error must arrive before the front side can mistake it for silence.
+  // The session writer emits working responses independently while this worker owns the advance.
+  // Leave terminal cleanup below the outer link's 300-second deferred deadline.
   const auto operation_deadline = std::chrono::steady_clock::now() + FRAME_STEP_WORK_BUDGET;
   uint64_t completed = 0;
   for (; completed < count; ++completed)
   {
+    if (s_stop.load() || s_request_cancelled.load() ||
+        std::chrono::steady_clock::now() >= operation_deadline)
+    {
+      if (!cancel_frame_step())
+        return Fail("timeout", "frame advance terminal cleanup did not complete");
+      return AdvanceOutcome(completed, count,
+                            s_stop.load()                ? "shutdown"
+                            : s_request_cancelled.load() ? "disconnected"
+                                                         : "deadline");
+    }
     u64 completion_before = 0;
     u64 interruption_before = 0;
     {
@@ -894,11 +955,7 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
       start->dispatched.Set();
     });
 
-    const auto dispatch_remaining = operation_deadline - std::chrono::steady_clock::now();
-    if (dispatch_remaining <= std::chrono::steady_clock::duration::zero() ||
-        !start->dispatched.WaitFor(
-            std::min(std::chrono::duration_cast<std::chrono::milliseconds>(dispatch_remaining),
-                     std::chrono::duration_cast<std::chrono::milliseconds>(STEP_WAIT_SLICE))))
+    if (!WaitForAdvanceEvent(start->dispatched, operation_deadline))
     {
       start->cancelled.store(true);
       if (!cancel_frame_step())
@@ -906,38 +963,49 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
         return Fail("timeout",
                     "frame step dispatch timed out and cleanup did not complete on the host thread");
       }
-      return Fail("timeout", "frame step was not dispatched before the operation deadline");
+      {
+        std::lock_guard lock(s_frame_step_mutex);
+        if (s_frame_step_completions != completion_before)
+          ++completed;
+      }
+      return AdvanceOutcome(completed, count,
+                            s_stop.load() ? "shutdown"
+                            : s_request_cancelled.load() ? "disconnected" : "dispatch_deadline");
     }
     if (!start->accepted.load())
       return Fail("bad_state", "Dolphin did not accept frame step from the frozen state");
 
     std::unique_lock<std::mutex> lock(s_frame_step_mutex);
-    const auto completion_deadline =
-        std::min(operation_deadline, std::chrono::steady_clock::now() + STEP_WAIT_SLICE * 2);
-    const bool signaled = s_frame_step_cv.wait_until(lock, completion_deadline, [&] {
-      return s_frame_step_completions != completion_before ||
-             s_breakpoint_interruptions != interruption_before || s_stop.load();
-    });
+    const bool signaled =
+        s_frame_step_cv.wait_until(lock, operation_deadline,
+                                   [&]
+                                   {
+                                     return s_frame_step_completions != completion_before ||
+                                            s_breakpoint_interruptions != interruption_before ||
+                                            s_stop.load() || s_request_cancelled.load();
+                                   });
     const bool frame_completed = s_frame_step_completions != completion_before;
     const bool interrupted = s_breakpoint_interruptions != interruption_before;
     lock.unlock();
 
-    if (frame_completed)
+    if (frame_completed && !interrupted && !s_request_cancelled.load() && !s_stop.load())
       continue;
-
     if (!cancel_frame_step())
       return Fail("timeout", "frame step stopped but cleanup did not complete on the host thread");
-    if (interrupted)
+    // A frame may finish between the wakeup and host-thread cancellation. Count it only after
+    // cleanup has made the completion counter stable.
     {
-      picojson::object r;
-      r["status"] = picojson::value(std::string("interrupted"));
-      r["count"] = picojson::value(static_cast<double>(completed));
-      r["requested"] = picojson::value(static_cast<double>(count));
-      r["state"] = picojson::value(std::string("frozen"));
-      return r;
+      std::lock_guard counter_lock(s_frame_step_mutex);
+      if (s_frame_step_completions != completion_before)
+        ++completed;
     }
+    if (interrupted || s_request_cancelled.load() || s_stop.load())
+      return AdvanceOutcome(completed, count,
+                            interrupted                  ? "breakpoint"
+                            : s_request_cancelled.load() ? "disconnected"
+                                                         : "shutdown");
     if (!signaled || std::chrono::steady_clock::now() >= operation_deadline)
-      return Fail("timeout", "frame step did not reach a new presented frame");
+      return AdvanceOutcome(completed, count, "deadline");
     return Fail("not_connected", "Dolphin stopped while frame step was in progress");
   }
 
@@ -1498,7 +1566,27 @@ void ServeSession(Core::System& system, SOCKET sock)
       {
         s_handler_error_kind.clear();
         s_handler_error.clear();
-        picojson::object result = h(system, params);
+        s_request_cancelled.store(false);
+        const bool advance = h == StepFrames || h == StepInstructions;
+        picojson::object result =
+            advance ? Temporal::RunWithProgress(
+                          [&] { return h(system, params); },
+                          [&]
+                          {
+                            picojson::object progress;
+                            progress["id"] = picojson::value(id);
+                            progress["ok"] = picojson::value(true);
+                            picojson::object state;
+                            state["status"] = picojson::value(std::string("working"));
+                            progress["result"] = picojson::value(state);
+                            return SendLine(sock, picojson::value(progress).serialize());
+                          },
+                          []
+                          {
+                            s_request_cancelled.store(true);
+                            s_frame_step_cv.notify_all();
+                          })
+                    : h(system, params);
         if (s_handler_error.empty())
         {
           resp["ok"] = picojson::value(true);
@@ -1537,6 +1625,14 @@ void ThreadMain(Core::System& system, unsigned short port)
 #ifdef __APPLE__
     int no_sigpipe = 1;
     setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
+#endif
+#ifdef _WIN32
+    DWORD send_timeout = 1000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char *>(&send_timeout),
+               sizeof(send_timeout));
+#else
+    timeval send_timeout{1, 0};
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
 #endif
     sockaddr_in addr{};
     addr.sin_family = AF_INET;

@@ -166,6 +166,18 @@ fn hello_reports_the_managed_ps2_surface() {
     );
     assert_eq!(contract_status.state, "validated");
     assert_eq!(
+        contract_status.constraints["execution.step.max_count"],
+        MAX_SYNC_ADVANCE_COUNT
+    );
+    assert_eq!(
+        result["execution_limits"]["max_sync_advance_count"],
+        MAX_SYNC_ADVANCE_COUNT
+    );
+    assert_eq!(
+        result["execution_limits"]["max_sync_operation_ms"],
+        MAX_SYNC_OPERATION_MS
+    );
+    assert_eq!(
         contract_status.constraints["breakpoint.memory.same_kind_min_separation"],
         16
     );
@@ -243,7 +255,7 @@ fn frame_step_accepts_only_bounded_frame_units() {
     request.extend_from_slice(&2u32.to_le_bytes());
     let mut bridge = bridge(vec![
         (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
-        (request, Ok(vec![])),
+        (request, Ok(frame_advance_reply(2, 0))),
     ]);
     let response =
         bridge.handle_request(Request::new(5, "step", json!({"count":2, "unit":"frames"})));
@@ -356,7 +368,7 @@ fn probe_restores_advances_and_reads_in_one_frozen_request() {
         (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
         (load, Ok(vec![])),
         (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
-        (advance, Ok(vec![])),
+        (advance, Ok(frame_advance_reply(2, 0))),
         (read, Ok(vec![0xaa, 0xbb, 0xcc])),
     ]);
     let response = bridge.handle_request(Request::new(
@@ -382,7 +394,7 @@ fn probe_rejects_invalid_inputs_before_pausing_or_loading() {
             "memory_type":"ee", "address":0, "length":1
         }),
         json!({
-            "state":"/tmp/base.p2s", "frame":16,
+            "state":"/tmp/base.p2s", "frame":MAX_SYNC_ADVANCE_COUNT + 1,
             "memory_type":"ee", "address":0, "length":1
         }),
         json!({
@@ -1064,4 +1076,112 @@ fn reset_is_one_terminal_native_command_and_leaves_ps2_frozen() {
             "post_reset_pc":0xbfc0_0000u32,
         })
     );
+}
+
+fn frame_advance_reply(advanced: u32, reason: u32) -> Vec<u8> {
+    [advanced.to_le_bytes(), reason.to_le_bytes()].concat()
+}
+
+#[test]
+fn frame_step_accepts_shared_limit_and_preserves_partial_outcomes() {
+    for (advanced, reason, status) in [
+        (5000, 0, "completed"),
+        (17, 1, "interrupted"),
+        (31, 2, "interrupted"),
+    ] {
+        let mut request = vec![MSG_EMUCAP_FRAME_ADVANCE];
+        request.extend_from_slice(&(MAX_SYNC_ADVANCE_COUNT as u32).to_le_bytes());
+        let mut bridge = bridge(vec![
+            (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+            (request, Ok(frame_advance_reply(advanced, reason))),
+        ]);
+        let response = bridge.handle_request(Request::new(
+            1,
+            "step",
+            json!({"count": MAX_SYNC_ADVANCE_COUNT}),
+        ));
+        assert!(response.ok, "{response:?}");
+        let result = response.result.unwrap();
+        assert_eq!(result["advanced"], advanced);
+        assert_eq!(result["status"], status);
+        assert_eq!(result["state"], "frozen");
+    }
+    for count in [0, MAX_SYNC_ADVANCE_COUNT + 1] {
+        let mut bridge = bridge(vec![]);
+        let response = bridge.handle_request(Request::new(1, "step", json!({"count": count})));
+        assert_eq!(response.error.unwrap().kind, "bad_params");
+    }
+}
+
+#[test]
+fn interrupted_probe_does_not_read_memory_or_claim_completion() {
+    let path = "/tmp/base.p2s";
+    let mut load = vec![MSG_EMUCAP_LOAD_STATE];
+    load.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    load.extend_from_slice(path.as_bytes());
+    let mut request = vec![MSG_EMUCAP_FRAME_ADVANCE];
+    request.extend_from_slice(&120u32.to_le_bytes());
+    let mut bridge = bridge(vec![
+        (vec![MSG_EMUCAP_PAUSE], Ok(vec![])),
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (load, Ok(vec![])),
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+        (request, Ok(frame_advance_reply(17, 1))),
+    ]);
+    let response = bridge.handle_request(Request::new(
+        1,
+        "probe",
+        json!({"state":path,
+        "frame":120,"memory_type":"ee","address":0,"length":1}),
+    ));
+    assert!(response.ok, "{response:?}");
+    let result = response.result.unwrap();
+    assert_eq!(result["status"], "interrupted");
+    assert_eq!(result["completed_frames"], 17);
+    assert!(result.get("hex").is_none());
+}
+
+#[test]
+fn frame_step_rejects_inconsistent_native_completion() {
+    for payload in [
+        vec![],
+        frame_advance_reply(2, 0),
+        frame_advance_reply(5001, 0),
+        frame_advance_reply(5000, 1),
+        frame_advance_reply(2, 3),
+    ] {
+        let mut request = vec![MSG_EMUCAP_FRAME_ADVANCE];
+        request.extend_from_slice(&5000u32.to_le_bytes());
+        let mut bridge = bridge(vec![
+            (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+            (request, Ok(payload)),
+        ]);
+        let response = bridge.handle_request(Request::new(1, "step", json!({"count":5000})));
+        assert_eq!(response.error.unwrap().kind, "bridge_error");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn long_pine_exchange_uses_its_budget_then_restores_normal_timeout() {
+    use std::os::unix::net::UnixListener;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("pine.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let host = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 5];
+        stream.read_exact(&mut request).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        stream.write_all(&[5, 0, 0, 0, 0]).unwrap();
+        stream.read_exact(&mut request).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    });
+    let mut pine = PineSocket::connect(1, Some(&path), Duration::from_millis(20)).unwrap();
+    assert!(pine
+        .transact_with_timeout(&[MSG_STATUS], Duration::from_secs(2))
+        .is_ok());
+    assert!(pine.transact(&[MSG_STATUS]).is_err());
+    assert!(pine.is_terminal());
+    host.join().unwrap();
 }

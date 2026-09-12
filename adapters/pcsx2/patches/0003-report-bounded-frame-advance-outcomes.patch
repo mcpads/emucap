@@ -1,0 +1,93 @@
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -78,10 +78,10 @@
+ #endif
+ 
+ #define PINE_EMULATOR_NAME "pcsx2"
+-#define EMUCAP_HOST_API 4
++#define EMUCAP_HOST_API 5
+ #define EMUCAP_EE_RAM_SIZE 0x02000000
+ #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
+-#define EMUCAP_MAX_FRAME_ADVANCE 15
++#define EMUCAP_MAX_FRAME_ADVANCE 5000
+ #define EMUCAP_MAX_INPUT_FRAMES 240
+ #define EMUCAP_MAX_STATE_PATH 4096
+ #define EMUCAP_MAX_CAPTURE_PATH 4096
+@@ -981,23 +981,41 @@
+ 			{
+ 				if (!VMManager::HasValidVM() || VMManager::GetState() != VMState::Paused)
+ 					goto error;
+-				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 8, buf_size)) [[unlikely]]
+ 					goto error;
+ 				const u32 count = FromSpan<u32>(buf, buf_cnt);
+ 				buf_cnt += 4;
+ 				if (count == 0 || count > EMUCAP_MAX_FRAME_ADVANCE)
+ 					goto error;
+ 
+-				Host::RunOnCPUThread([count]() { VMManager::FrameAdvance(count); }, true);
+-				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
++				bool started = false;
++				Host::RunOnCPUThread([count, &started]() {
++					VMManager::CancelFrameAdvance();
++					VMManager::FrameAdvance(count);
++					started = VMManager::GetState() == VMState::Running;
++				}, true);
++				if (!started)
++					goto error;
++				const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(250);
+ 				while (VMManager::GetState() == VMState::Running && std::chrono::steady_clock::now() < deadline)
+ 					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-				if (VMManager::GetState() != VMState::Paused)
+-				{
+-					if (VMManager::HasValidVM())
+-						Host::RunOnCPUThread([]() { VMManager::SetPaused(true); }, true);
+-					goto error;
+-				}
++				u32 remaining = count;
++				u32 reason = 1; // external pause/debugger stop
++				bool frozen = false;
++				Host::RunOnCPUThread([&remaining, &reason, &frozen]() {
++					if (VMManager::GetState() == VMState::Running)
++					{
++						reason = 2; // operation deadline
++						VMManager::SetPaused(true);
++					}
++					remaining = VMManager::CancelFrameAdvance();
++					frozen = VMManager::GetState() == VMState::Paused;
++				}, true);
++				if (!frozen || remaining > count)
++					goto error;
++				ToResultVector(ret_buffer, count - remaining, ret_cnt);
++				ToResultVector(ret_buffer, remaining == 0 ? 0u : reason, ret_cnt + 4);
++				ret_cnt += 8;
+ 				break;
+ 			}
+ 			case MsgEmuCapEEState:
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -2250,6 +2250,13 @@
+ 	UpdateTargetSpeed();
+ }
+ 
++u32 VMManager::CancelFrameAdvance()
++{
++	const u32 remaining = s_frame_advance_count;
++	s_frame_advance_count = 0;
++	return remaining;
++}
++
+ void VMManager::FrameAdvance(u32 num_frames /*= 1*/)
+ {
+ 	if (!HasValidVM())
+--- a/pcsx2/VMManager.h
++++ b/pcsx2/VMManager.h
+@@ -203,6 +203,8 @@
+ 	bool ShouldAllowPresentThrottle();
+ 
+ 	/// Runs the virtual machine for the specified number of video frames, and then automatically pauses.
++	// CPU-thread only. Discard pending advance so later resume cannot consume stale work.
++	u32 CancelFrameAdvance();
+ 	void FrameAdvance(u32 num_frames = 1);
+ 
+ 	/// Changes the disc in the virtual CD/DVD drive. Passing an empty will remove any current disc.

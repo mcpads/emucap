@@ -2,6 +2,16 @@
 
 Actively developed beta software — interfaces may still change.
 
+## Unreleased
+
+### Fixed
+- Dolphin frame and instruction stepping follow the shared 5,000-count, 250-second operation
+  limits. Long requests emit progress; disconnection cancels the advance and joins cleanup before
+  another session starts. Rebuild the maintained native adapter (host API 5).
+- PCSX2 frame stepping and probes follow the shared 5,000-frame request limit and 250-second
+  operation budget. Native replies report actual progress and interruption; pending frame work is
+  discarded before returning frozen. Rebuild the maintained PCSX2 host (host API 5).
+
 ## 0.16.2
 
 ### Fixed

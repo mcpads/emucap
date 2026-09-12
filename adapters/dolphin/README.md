@@ -112,7 +112,11 @@ returns `pc`, all 32 general-purpose registers, `lr`, `ctr`, `xer`, `msr`, and `
 state and returns frozen. Frame stepping waits for Dolphin to present a non-duplicate frame, drains
 the GPU queue at the next emulated field boundary, and returns only after the CPU is frozen again.
 An emucap breakpoint hit interrupts the operation and leaves the core frozen. Both units accept at
-most 15 steps per request so the synchronous operation remains inside the control-link deadline.
+most 5,000 steps per request, with a 250-second operation budget. Long advances emit `working`
+responses with the original request ID. A debugger stop, deadline or lost connection stops further
+work and joins native cleanup before another session can take ownership. Interrupted replies carry
+the actual completed `count`; failure to confirm cleanup is an error, not a frozen success.
+Rebuild the maintained native adapter (host API 5).
 Split longer advances into checked calls.
 
 `reset` owns an isolated native reset-button press and release, resumes only for that guest-time

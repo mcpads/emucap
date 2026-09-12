@@ -26,13 +26,14 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
+use crate::live::temporal::{MAX_SYNC_ADVANCE_COUNT, MAX_SYNC_OPERATION_MS};
 use debug::Pcsx2Breakpoint;
 
 const PINE_MAX_REPLY: usize = 450_000;
 const PCSX2_EE_RAM_SIZE: u64 = 0x0200_0000;
 const MAX_MEMORY_TRANSFER: usize = 0x2_0000;
 const MAX_INPUT_FRAMES: u64 = 240;
-pub const REQUIRED_HOST_API: u32 = 4;
+pub const REQUIRED_HOST_API: u32 = 5;
 
 const MSG_VERSION: u8 = 0x08;
 const MSG_TITLE: u8 = 0x0b;
@@ -134,6 +135,14 @@ type BridgeResult<T> = Result<T, Pcsx2BridgeError>;
 
 pub trait PineTransport {
     fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>>;
+
+    fn transact_with_timeout(
+        &mut self,
+        request: &[u8],
+        _timeout: Duration,
+    ) -> BridgeResult<Vec<u8>> {
+        self.transact(request)
+    }
 
     /// True once the current PINE stream can no longer preserve frame boundaries. A caller must
     /// replace the bridge/backend generation rather than retrying on the same stream.
@@ -263,6 +272,39 @@ impl PineTransport for PineSocket {
             )
         }) {
             self.terminal = true;
+        }
+        outcome
+    }
+
+    fn transact_with_timeout(
+        &mut self,
+        request: &[u8],
+        timeout: Duration,
+    ) -> BridgeResult<Vec<u8>> {
+        let previous = match &self.stream {
+            #[cfg(windows)]
+            PineStream::Tcp(stream) => {
+                let previous = stream.read_timeout()?;
+                stream.set_read_timeout(Some(timeout))?;
+                previous
+            }
+            #[cfg(unix)]
+            PineStream::Unix(stream) => {
+                let previous = stream.read_timeout()?;
+                stream.set_read_timeout(Some(timeout))?;
+                previous
+            }
+        };
+        let outcome = self.transact(request);
+        let restored = match &self.stream {
+            #[cfg(windows)]
+            PineStream::Tcp(stream) => stream.set_read_timeout(previous),
+            #[cfg(unix)]
+            PineStream::Unix(stream) => stream.set_read_timeout(previous),
+        };
+        if let Err(error) = restored {
+            self.terminal = true;
+            return Err(error.into());
         }
         outcome
     }
@@ -481,8 +523,8 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "pcsx2_host_api": self.host_api,
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
             "execution_limits": {
-                "max_sync_advance_count": 15,
-                "max_sync_operation_ms": 10000,
+                "max_sync_advance_count": MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": MAX_SYNC_OPERATION_MS,
                 "input_pulse_max_frames": MAX_INPUT_FRAMES,
             },
             "capability_notes": capability_notes(),
@@ -531,8 +573,8 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "pcsx2_version": version,
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
             "execution_limits": {
-                "max_sync_advance_count": 15,
-                "max_sync_operation_ms": 10000,
+                "max_sync_advance_count": MAX_SYNC_ADVANCE_COUNT,
+                "max_sync_operation_ms": MAX_SYNC_OPERATION_MS,
                 "input_pulse_max_frames": MAX_INPUT_FRAMES,
             },
             "capability_notes": capability_notes(),
@@ -667,18 +709,39 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             .or(optional_num(params, "n")?)
             .or(optional_num(params, "frames")?)
             .unwrap_or(1);
-        if !(1..=15).contains(&count) {
+        if !(1..=MAX_SYNC_ADVANCE_COUNT).contains(&count) {
             return Err(Pcsx2BridgeError::BadParams(format!(
-                "frame step count must be in 1..=15, got {count}"
+                "frame step count must be in 1..={MAX_SYNC_ADVANCE_COUNT}, got {count}"
             )));
         }
         self.require_frozen("step")?;
-        self.command(MSG_EMUCAP_FRAME_ADVANCE, &(count as u32).to_le_bytes())?;
+        let mut request = vec![MSG_EMUCAP_FRAME_ADVANCE];
+        request.extend_from_slice(&(count as u32).to_le_bytes());
+        // The reconnect server emits working responses while the native operation owns execution.
+        // Leave cleanup margin above the host's 250s budget, below the outer 300s deadline.
+        let payload = self.pine.transact_with_timeout(
+            &request,
+            Duration::from_millis(MAX_SYNC_OPERATION_MS + 10_000),
+        )?;
+        if payload.len() != 8 {
+            return Err(Pcsx2BridgeError::Protocol(
+                "invalid frame advance reply length".into(),
+            ));
+        }
+        let advanced = u32::from_le_bytes(payload[..4].try_into().unwrap()) as u64;
+        let reason = u32::from_le_bytes(payload[4..].try_into().unwrap());
+        if advanced > count || reason > 2 || (reason == 0) != (advanced == count) {
+            return Err(Pcsx2BridgeError::Protocol(
+                "inconsistent frame advance outcome".into(),
+            ));
+        }
         Ok(json!({
-            "advanced": count,
+            "advanced": advanced,
+            "requested": count,
             "unit": "frames",
             "state": "frozen",
-            "status": "completed",
+            "status": if reason == 0 { "completed" } else { "interrupted" },
+            "reason": match reason { 0 => "requested_count", 1 => "external_pause_or_debugger_stop", _ => "deadline" },
         }))
     }
 
@@ -781,9 +844,9 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         let frames = optional_num(params, "frame")?
             .or(optional_num(params, "frames")?)
             .unwrap_or(0);
-        if frames > 15 {
+        if frames > MAX_SYNC_ADVANCE_COUNT {
             return Err(Pcsx2BridgeError::BadParams(format!(
-                "probe frame count must be in 0..=15, got {frames}"
+                "probe frame count must be in 0..={MAX_SYNC_ADVANCE_COUNT}, got {frames}"
             )));
         }
         let length = required_num(params, "length")?;
@@ -804,6 +867,12 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         } else {
             self.step(&json!({"count":frames, "unit":"frames"}))?
         };
+        if advance["status"] != "completed" {
+            return Ok(
+                json!({"frame": frames, "completed_frames": advance["advanced"],
+                "state": "frozen", "status": "interrupted", "advance": advance}),
+            );
+        }
         let memory = self.read_memory(params)?;
         Ok(json!({
             "status": advance["status"].as_str().unwrap_or("completed"),
