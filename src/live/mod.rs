@@ -2,6 +2,7 @@ pub mod broker;
 pub mod broker_link;
 pub mod capture_capsule;
 pub mod continuity;
+mod evidence_identity;
 pub mod link;
 pub mod protocol;
 pub mod reconnect;
@@ -16,6 +17,8 @@ mod recording_snapshot;
 mod recording_state;
 mod recording_terminal;
 pub mod runtime;
+pub mod snapshot;
+mod snapshot_store;
 pub mod task_entry;
 pub mod tcp;
 pub mod temporal;
@@ -52,3 +55,6 @@ mod tcp_tests;
 mod tools_socket_tests;
 #[cfg(test)]
 mod tools_tests;
+
+#[cfg(test)]
+mod snapshot_tests;

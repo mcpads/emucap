@@ -1,0 +1,54 @@
+--- a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+@@ -22,7 +22,8 @@
+ // which the EmuThread only runs while stepping (Core_ProcessStepping) or, in the GUI,
+ // once per frame. Headless never pumps Process() while CORE_RUNNING_CPU, so this
+ // handler breaks the CPU into stepping (if running), lets the EmuThread service the
+-// operation, waits for the completion callback, then restores the prior run state.
++// operation and waits for completion. Loads leave the CPU frozen; only completed
++// saves restore the prior run state.
+ 
+ #include <chrono>
+ #include <condition_variable>
+@@ -65,8 +66,20 @@
+ 	if (!req.ParamString("path", &path))
+ 		return;
+ 
++	if (coreState != CORE_RUNNING_CPU && coreState != CORE_STEPPING_CPU)
++		return req.Fail("Save state requires a running or CPU-stepping machine");
++
+ 	auto wait = std::make_shared<SaveStateWait>();
+-	SaveState::Callback cb = [wait](SaveState::Status status, std::string_view message, std::string_view metadata) {
++	SaveState::Callback cb = [wait, isSave](SaveState::Status status, std::string_view message, std::string_view metadata) {
++		// This callback runs on the EmuThread after deserialization, outside the JIT.
++		// A load must never advertise completion while guest execution is running.
++		if (!isSave) {
++			Core_Break(BreakReason::SavestateLoad, 0);
++			if (coreState != CORE_STEPPING_CPU) {
++				status = SaveState::Status::FAILURE;
++				message = "Loaded state did not reach CPU stepping";
++			}
++		}
+ 		std::lock_guard<std::mutex> guard(wait->m);
+ 		wait->status = status;
+ 		wait->message = std::string(message);
+@@ -94,7 +107,9 @@
+ 		completed = wait->cv.wait_for(guard, std::chrono::seconds(15), [&] { return wait->done; });
+ 	}
+ 
+-	if (resumeAfter)
++	// A timeout does not cancel the queued native operation. Keep the machine
++	// stopped rather than resuming an operation whose outcome is still unknown.
++	if (isSave && resumeAfter && completed)
+ 		Core_Resume();
+ 
+ 	if (!completed)
+@@ -104,6 +119,8 @@
+ 
+ 	JsonWriter &json = req.Respond();
+ 	json.writeString("path", path);
++	if (!isSave)
++		json.writeString("state", "frozen");
+ 	if (!wait->message.empty())
+ 		json.writeString("message", wait->message);
+ }

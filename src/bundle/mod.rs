@@ -9,6 +9,7 @@ mod publish_state;
 pub mod raw;
 pub mod recording;
 pub mod recording_manifest;
+pub mod snapshot;
 pub mod summary;
 
 #[cfg(test)]

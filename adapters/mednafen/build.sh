@@ -132,6 +132,7 @@ GOT_MEDNAFEN_SHA256="$(sha256_path "$TARBALL")"
 echo "→ 추출"
 safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
+patch -d "$SRC" -p1 < "$HERE/patches/0001-restore-md-clock-origins.patch"
 
 # 3. emucap 소켓 클라이언트
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
@@ -146,6 +147,7 @@ cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
+  build.sh upstream.lock patches/0001-restore-md-clock-origins.patch \
   emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
   emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
@@ -154,7 +156,7 @@ git -C "$HERE" diff --quiet HEAD -- \
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 PATCHSET_SHA256="$({
   for path in \
-    build.sh emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+    build.sh patches/0001-restore-md-clock-origins.patch emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
     emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
     emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
@@ -322,6 +324,21 @@ inject_check 'bool ActiveStateReplaced;' "$SRC/src/psx/cpu.h" "psx/cpu.h active-
 inject_check '// emucap: replace the active execution context after an in-callback state load.' "$SRC/src/psx/cpu.cpp" "psx/cpu.cpp state-load replacement flag insertion failed"
 inject_check 'if(MDFN_UNLIKELY(ActiveStateReplaced))' "$SRC/src/psx/cpu.cpp" "psx/cpu.cpp stale callback context discard insertion failed"
 inject_check 'RunActive = false;' "$SRC/src/psx/cpu.cpp" "psx/cpu.cpp run boundary tracking insertion failed"
+
+# The savestate's clock origin is zero, but the destination can be parked inside RunReal.
+# Device lastts fields are not serialized. Reset the OLD domain before deserialization:
+# FIO_ResetTS also rebases absolute pulse timestamps, so doing this after loading would corrupt
+# the restored pulse deadlines. The existing post-load ForceEventUpdates(0) can then rebuild
+# the queue without applying a negative elapsed interval to the newly loaded devices.
+perl -0777 -pi -e 's{(\n MDFNSS_StateAction\(sm, load, data_only, StateRegs, "MAIN"\);)}{\n // emucap: discard the destination device clock domain before restoring state.\n if(load)\n {\n  CDC->ResetTS();\n  TIMER_ResetTS();\n  DMA_ResetTS();\n  GPU_ResetTS();\n  FIO->ResetTS();\n }\n${1}}' \
+  "$SRC/src/psx/psx.cpp"
+inject_check '// emucap: discard the destination device clock domain before restoring state.' "$SRC/src/psx/psx.cpp" "psx/psx.cpp destination clock reset insertion failed"
+
+# This flag belongs to the suspended host presentation interval, not the saved GPU. A restored
+# scanline must be allowed to cross zero even if the destination frame already crossed it.
+perl -0777 -pi -e 's{( if\(load\)\n \{\n)(  for\(unsigned i = 0; i < 256; i\+\+\))}{${1}  // emucap: start a fresh presentation interval for the restored GPU.\n  sl_zero_reached = false;\n${2}}' \
+  "$SRC/src/psx/gpu.cpp"
+inject_check '// emucap: start a fresh presentation interval for the restored GPU.' "$SRC/src/psx/gpu.cpp" "psx/gpu.cpp restored presentation interval insertion failed"
 
 # 4g. 입력 진단 — PSX(psx/input/gamepad.cpp): UpdateInput이 읽은 버튼 비트(d8[0..1]) 기록.
 perl -0777 -pi -e 's/(#include "gamepad\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \

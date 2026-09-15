@@ -8,6 +8,23 @@ use super::tools::ToolOutput;
 use crate::bundle::recording_manifest::StateSnapshotBoundary;
 
 pub fn save_state(link: &mut dyn EmulatorLink, path: &str) -> Result<ToolOutput, LinkError> {
+    save_state_with_key(link, path, None)
+}
+
+pub fn save_state_with_key(
+    link: &mut dyn EmulatorLink,
+    path: &str,
+    key: Option<&str>,
+) -> Result<ToolOutput, LinkError> {
+    if super::snapshot::supported(link) {
+        let key = key.ok_or_else(|| LinkError::Protocol("snapshot_key is required for a producer instruction receipt; select a fresh key before saving".into()))?;
+        return super::snapshot::save(link, path, key);
+    }
+    if key.is_some() {
+        return Err(LinkError::Protocol(
+            "instruction snapshot capture is not advertised".into(),
+        ));
+    }
     Ok(ToolOutput::Json(
         link.call("save_state", json!({ "path": path }))?,
     ))

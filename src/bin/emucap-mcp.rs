@@ -34,6 +34,8 @@ mod reattach;
 mod recording;
 #[path = "emucap-mcp/regression.rs"]
 mod regression;
+#[path = "emucap-mcp/state_snapshot.rs"]
+mod state_snapshot;
 #[path = "emucap-mcp/status.rs"]
 mod status;
 #[path = "emucap-mcp/stop.rs"]
@@ -600,16 +602,28 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Save emulator state to a file. Set preserve_for_recording=true only when an advertised state-backed recording needs a producer-managed receipt; only a proven frame-boundary receipt can start that origin."
+        description = "Save emulator state. Profiles advertising instruction_snapshot_capture require snapshot_key and issue a retained instruction receipt without recording. Reusing a key observes the original attempt. preserve_for_recording is separate and requires advertised state_load."
     )]
-    async fn save_state(&self, Parameters(a): Parameters<SaveStateArgs>) -> CallToolResult {
-        let mut l = self.link();
-        let result = if a.preserve_for_recording {
-            tools::save_state_for_recording(&mut *l, &a.path)
-        } else {
-            tools::save_state(&mut *l, &a.path)
-        };
-        match result {
+    async fn save_state(
+        &self,
+        Parameters(a): Parameters<SaveStateArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        state_snapshot::save(self.link.clone(), a, context).await
+    }
+
+    #[tool(
+        description = "Reverify a producer-retained instruction snapshot receipt and optional copy. Works after emulator shutdown without a live lease. This verifies producer issuance and bytes, not decoded-state semantics or consumer claims."
+    )]
+    async fn snapshot_receipt(
+        &self,
+        Parameters(a): Parameters<SnapshotReceiptArgs>,
+    ) -> CallToolResult {
+        match emucap::live::snapshot::verify(
+            &a.snapshot_key,
+            a.path.as_deref(),
+            a.expected_launch_id.as_deref(),
+        ) {
             Ok(o) => tool_output_result(o),
             Err(e) => link_error_result(e),
         }

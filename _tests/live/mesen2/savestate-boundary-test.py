@@ -103,7 +103,7 @@ def main() -> None:
         protected = output / "protected.mss"
         protected.write_bytes(b"existing destination must survive unsafe save")
         protected_bytes = protected.read_bytes()
-        call("save_state", {"path": str(protected)}, error="unsafe_halt")
+        call("save_state", {"path": str(protected), "snapshot_key": "unsafe-save"}, error="unsafe_halt")
         assert protected.read_bytes() == protected_bytes
         call("load_state", {"path": str(checkpoint)}, error="unsafe_halt")
         assert cpu() == before, "rejected frame-halt state I/O changed the CPU"
@@ -119,7 +119,7 @@ def main() -> None:
         load()
         assert cpu() == restored
         saved = output / "instruction.mss"
-        saved_result = call("save_state", {"path": str(saved)})
+        saved_result = call("save_state", {"path": str(saved), "snapshot_key": "instruction-save"})
         assert saved_result["boundary"] == "instruction_boundary", saved_result
         assert cpu() == restored, "saving an instruction boundary advanced the CPU"
         step(1)

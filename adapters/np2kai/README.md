@@ -58,3 +58,11 @@ path. Those are presentation capabilities rather than missing Control/Debug
 methods. Use the default MAME backend when a visible window, host audio,
 multiple PC-98 media devices, or MAME-specific machine configuration is
 required.
+
+State serialization checks temporary-file handles, complete reads/writes, close results, and
+native deserialization success. Failure returns an error and leaves the machine frozen; a
+native load may already have mutated devices, so failure does not promise rollback. Previous
+presentation is invalidated before entering the native loader.
+The high-resolution timer event, callback, and divider phases are part of native
+state. An unmapped active event or callback rejects serialization instead of
+creating a state that silently loses the scheduled device event on restore.

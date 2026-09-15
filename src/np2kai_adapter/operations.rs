@@ -350,8 +350,14 @@ impl Np2kaiHost {
         if identity != expected {
             return Err(Np2kaiError::BadParams("save state identity does not match this exact PC-98 media, firmware, core, patch, profile, frontend build, OS, and architecture".into()));
         }
+        // A native failure may occur after partial mutation. The prior capture
+        // cannot remain advertised as current even when the load fails.
+        self.video_fresh = false;
         if !unsafe { (self.api.unserialize)(data.as_ptr().cast(), data.len()) } {
-            return Err(Np2kaiError::Core("retro_unserialize failed".into()));
+            return Err(Np2kaiError::Core(
+                "retro_unserialize failed; machine remains frozen but restored state is unverified"
+                    .into(),
+            ));
         }
         self.video_fresh = false;
         self.frozen = true;

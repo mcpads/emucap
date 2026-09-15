@@ -52,6 +52,9 @@ fi
 PATCHES=(
   "$HERE/patches/0001-use-redistributable-libretro-profile.patch"
   "$HERE/patches/0002-add-emucap-debug-api.patch"
+  "$HERE/patches/0003-propagate-savestate-errors.patch"
+  "$HERE/patches/0004-include-integer-abs-declaration.patch"
+  "$HERE/patches/0005-preserve-high-resolution-timer-state.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256_path /dev/stdin)"
 if [ "$ACTUAL_PATCHSET_SHA256" != "$NP2KAI_PATCHSET_SHA256" ]; then
@@ -80,7 +83,9 @@ perl -pi -e 's/\r$//' \
   "$SRC/i386c/cpumem.c" \
   "$SRC/pccore.c" \
   "$SRC/sdl/libretro/libretro.c" \
-  "$SRC/sdl/libretro/libretro_core_options.h"
+  "$SRC/sdl/libretro/libretro_core_options.h" \
+  "$SRC/statsave.c" "$SRC/statsave.tbl" \
+  "$SRC/io/upd4990.c" "$SRC/io/upd4990.h"
 for source_patch in "${PATCHES[@]}"; do
   patch -d "$SRC" -p1 <"$source_patch"
 done

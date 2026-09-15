@@ -2,9 +2,29 @@
 
 Actively developed beta software — interfaces may still change.
 
-## Unreleased
+## 0.16.3
+
+### Added
+- Mesen SNES can issue retained instruction-halt snapshot receipts independently of recording.
+  Receipts bind exact artifact, launch/generation, saved-byte digest, CPU halt and clock domains;
+  `snapshot_receipt` revalidates the retained snapshot after reconnect or producer restart.
+  Snapshot export and interrupted outcome recovery preserve the producer-owned evidence.
 
 ### Fixed
+- Mednafen PSX restoration discards stale destination device clocks and GPU presentation state
+  before execution continues from a debugger halt, preventing post-load assertion failures.
+- Mednafen Mega Drive states preserve CPU, scheduler, VDP, sound and controller clock origins.
+  PSG restoration no longer advances the abandoned timeline. Rebuild the maintained Mednafen host.
+  Legacy frame states remain supported; old instruction snapshots lack the omitted timing data.
+- NP2kai propagates state-file I/O and native restoration errors, preserves high-resolution timer
+  events and divider phases, and rejects unmapped events during serialization. Failed loads
+  invalidate old presentation without promising rollback. Rebuild the maintained NP2kai core;
+  its exact-core state identity rejects incompatible older snapshots.
+- PPSSPP state loads acknowledge completion only after the native CPU is frozen and no longer
+  resume a previously running caller. Unresolved state operations do not automatically resume;
+  timeout does not imply cancellation. Rebuild the maintained PPSSPP host.
+- Snapshot capability changes participate in the status capability revision.
+
 - Dolphin frame and instruction stepping follow the shared 5,000-count, 250-second operation
   limits. Long requests emit progress; disconnection cancels the advance and joins cleanup before
   another session starts. Rebuild the maintained native adapter (host API 5).

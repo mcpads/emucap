@@ -1,0 +1,102 @@
+--- a/sdl/libretro/libretro.c
++++ b/sdl/libretro/libretro.c
+@@ -1855,7 +1855,7 @@
+ {
+    int ret;
+    char	*path;
+-   size_t size;
++   size_t size = 0;
+    FILEH fh;
+ 
+    path = file_getcd(RETRO_NP2_TEMPSTATE);
+@@ -1864,8 +1864,11 @@
+       size = 0;
+    } else {
+       fh = file_open_rb(path);
+-      size = file_getsize(fh);
+-      file_close(fh);
++      if (fh != FILEH_INVALID) {
++         FILELEN length = file_getsize(fh);
++         if (length > 0) size = (size_t)length;
++         if (file_close(fh) != 0) size = 0;
++      }
+    }
+    file_delete(path);
+ 
+@@ -1874,38 +1877,41 @@
+ 
+ bool retro_serialize(void *data, size_t size)
+ {
+-   int ret;
+-   char	*path;
++   char *path;
+    FILEH fh;
+-
++   bool ok;
++
++   if (!data || !size || size > (UINT)-1) return false;
+    path = file_getcd(RETRO_NP2_TEMPSTATE);
+-   ret = statsave_save_d(path);
+-   if(ret) {
++   if (statsave_save_d(path)) {
+       file_delete(path);
+       return false;
+    }
+    fh = file_open_rb(path);
+-   file_read(fh, data, size);
+-   file_close(fh);
++   if (fh == FILEH_INVALID) {
++      file_delete(path);
++      return false;
++   }
++   ok = file_read(fh, data, (UINT)size) == size;
++   if (file_close(fh) != 0) ok = false;
+    file_delete(path);
+-   return true;
++   return ok;
+ }
+ 
+ bool retro_unserialize(const void *data, size_t size)
+ {
+-   int ret;
+-   char	*path;
++   char *path;
+    FILEH fh;
+-
+-   if(size <= 0) {
+-      return false;
+-   }
++   bool ok;
++
++   if (!data || !size || size > (UINT)-1) return false;
+    path = file_getcd(RETRO_NP2_TEMPSTATE);
+    fh = file_create(path);
+-   file_write(fh, data, size);
+-   file_close(fh);
+-   statsave_load_d(path);
++   if (fh == FILEH_INVALID) return false;
++   ok = file_write(fh, data, (UINT)size) == size;
++   if (file_close(fh) != 0) ok = false;
++   /* Do not pass an incomplete temporary file to the destructive loader. */
++   if (ok) ok = statsave_load_d(path) == 0;
+    file_delete(path);
+-   return true;
+-}
+-
++   return ok;
++}
+--- a/sdl/dosio.c
++++ b/sdl/dosio.c
+@@ -170,9 +170,9 @@
+ short file_close(FILEH handle) {
+ 
+ #if defined(__LIBRETRO__)
+-	filestream_close(handle);
+-#else
+-	fclose(handle);
++	return (short)filestream_close(handle);
++#else
++	return (short)fclose(handle);
+ #endif
+ 	return(0);
+ }

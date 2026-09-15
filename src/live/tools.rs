@@ -11,7 +11,7 @@ use super::link::{EmulatorLink, LinkError};
 use super::temporal::finish_with_cleanup;
 #[cfg(test)]
 pub(crate) use super::tools_state::save_state_in_store;
-pub use super::tools_state::{save_state, save_state_for_recording};
+pub use super::tools_state::{save_state, save_state_for_recording, save_state_with_key};
 
 mod pointer;
 pub use pointer::{click_pointer, drag_pointer, move_pointer};
@@ -203,7 +203,17 @@ pub fn change_media(
 }
 
 pub fn status(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {
-    Ok(ToolOutput::Json(link.call("status", json!({}))?))
+    let mut value = link.call("status", json!({}))?;
+    if super::snapshot::supported(link)
+        && link.endpoint_port().is_some()
+        && link.continuity().runtime_binding.state == super::continuity::RuntimeBindingState::Bound
+    {
+        value["snapshot_capability"] = json!({"kind":"instruction_snapshot", "snapshot_key_required":true,
+            "max_snapshot_bytes":crate::bundle::snapshot::MAX_SNAPSHOT_BYTES,
+            "max_host_ms":super::snapshot::MAX_HOST_MS, "boundary":"instruction_boundary",
+            "verify_tool":"snapshot_receipt", "recording_required":false});
+    }
+    Ok(ToolOutput::Json(value))
 }
 
 pub fn dismiss_failure(link: &mut dyn EmulatorLink) -> Result<ToolOutput, LinkError> {

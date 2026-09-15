@@ -18,7 +18,7 @@ A pinned openMSX 21.0 source build with two emucap host patches provides
 experimental C-BIOS MSX2+ and real-firmware MSX1/MSX2/MSX2+ cartridge profiles
 through a separate Rust XML-control bridge.
 
-**v0.16.2 — beta.** This repository remains under active development; interfaces and
+**v0.16.3 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -241,6 +241,18 @@ advertises them; omitting them retains the bounded next-frame behavior.
 The maintained Mesen SNES host currently omits the `state_load` origin: arbitrary PPU-frame CPU continuations
 are not serializable. After a frame halt, explicitly step one instruction and verify the safe halt
 before ordinary save/load; unsafe state I/O is rejected before file access or guest mutation.
+For managed direct profiles advertising `instruction_snapshot_capture`, ordinary `save_state`
+requires an absolute `path` and a caller-chosen `snapshot_key` (1–64 lowercase ASCII letters,
+digits or hyphens). It returns `snapshot_receipt` with the exact source/build/launch identity,
+snapshot SHA-256 and length, PC/program bank, halt classification and domain-labelled clocks.
+No recording is needed. Reusing a key observes the original attempt; it never saves again.
+`snapshot_receipt(snapshot_key, path?, expected_launch_id?)` revalidates the producer's retained
+bytes and optional consumer copy, even after the emulator and Control server restart. Retention
+uses the same `EMUCAP_EMU_HOME`; keep that storage while retaining snapshots. A failed export can
+still have `receipt_issued=true`. Inspect the key after any failure or lost response.
+See the [Mesen instruction receipt interface](adapters/mesen2/README.md#instruction-snapshot-receipts)
+for boundaries, bounds, representation and consumer verification responsibilities.
+
 When `recording_capability.state_load` is advertised, `save_state` with
 `preserve_for_recording=true` and an absolute path also carries a producer-managed
 `snapshot_receipt`. A later `record_window(origin="state_load")` accepts only that

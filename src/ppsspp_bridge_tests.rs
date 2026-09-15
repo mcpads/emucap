@@ -559,7 +559,10 @@ fn probe_restores_advances_and_reads_before_returning() {
     let b64 = base64::engine::general_purpose::STANDARD.encode([0x12_u8, 0x34]);
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
-        ("savestate.load", json!({"event":"savestate.load"})),
+        (
+            "savestate.load",
+            json!({"event":"savestate.load","state":"frozen"}),
+        ),
         ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
         (
             "emucap.frameStep",
@@ -2578,7 +2581,7 @@ fn save_state_threads_a_read_budget_above_the_forks_15s_wait() {
 fn load_state_threads_a_read_budget_above_the_forks_15s_wait() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
         "savestate.load",
-        json!({"event":"savestate.load","path":"/tmp/x.ppst","message":"Loaded State"}),
+        json!({"event":"savestate.load","path":"/tmp/x.ppst","state":"frozen","message":"Loaded State"}),
     )]));
     bridge
         .ws
@@ -2599,7 +2602,7 @@ fn load_state_threads_a_read_budget_above_the_forks_15s_wait() {
 fn load_state_calls_savestate_load_with_path() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
         "savestate.load",
-        json!({"event":"savestate.load","path":"/tmp/x.ppst"}),
+        json!({"event":"savestate.load","path":"/tmp/x.ppst","state":"frozen"}),
     )]));
     let resp = bridge.handle_request(Request::new(
         1,
@@ -2610,6 +2613,20 @@ fn load_state_calls_savestate_load_with_path() {
     assert_eq!(resp.result.unwrap()["status"], "completed");
     assert_eq!(bridge.ws.calls[0].0, "savestate.load");
     assert_eq!(bridge.ws.calls[0].1["path"], "/tmp/x.ppst");
+}
+
+#[test]
+fn load_state_rejects_missing_or_running_native_completion() {
+    for state in [Value::Null, json!("running")] {
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+            "savestate.load",
+            json!({"event":"savestate.load", "state": state}),
+        )]));
+        let response =
+            bridge.handle_request(Request::new(1, "load_state", json!({"path":"/tmp/x.ppst"})));
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().kind, "bad_state");
+    }
 }
 
 #[test]

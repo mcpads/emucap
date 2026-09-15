@@ -448,3 +448,54 @@ Find what the patch broke — drive both ROMs to the same logical moment and com
 ## Caveat
 The call context of `createSavestate` and the return keys of `getInput` may differ by Mesen2
 version. On first use, confirm the behavior empirically before relying on it.
+
+## Instruction snapshot receipts
+
+The managed direct SNES profile advertises `instruction_snapshot_capture`; `status.snapshot_capability`
+describes the Core receipt interface. Saving still requires the native proven main-CPU instruction
+halt (`codeBreakIdleSavestate`). A frame halt, arbitrary breakpoint or other unsafe halt is rejected
+before serialization. The caller may explicitly `step(count=1, unit="instructions")` to reach an
+admitted boundary; saving never advances the guest to manufacture one.
+
+```
+save_state(path="/absolute/private/checkpoint.mss", snapshot_key="checkpoint-a")
+snapshot_receipt(snapshot_key="checkpoint-a", path="/absolute/private/checkpoint.mss",
+                 expected_launch_id="<the saved launch_id>")
+```
+
+The first call returns a receipt envelope `{sha256, body}` and the producer-owned `receipt_path` and
+`snapshot_path`. The body kind is `instruction_snapshot`; `source` binds exact artifact hashes,
+byte count, Core/adapter/host build identities and `launch_id` (the runtime generation identity).
+`snapshot_id` identifies the save event. `snapshot` contains opaque format `mesen-savestate`, byte
+length and SHA-256. `halt` contains `cpu="main"`, `kind="main_cpu_instruction"`,
+`boundary="instruction_boundary"`, unsigned `pc` and `program_bank`, and `frame`/`cycle` objects.
+Each clock is `{value: "<exact unsigned decimal>", domain: "<domain>"}`: `snes_ppu_frame` uses
+`ppu.frameCount`; `snes_master_clock` uses `emu.getMasterClock()`. Reset/restore can rewind these
+clocks. The producer classification does not invent a finer debugger stop reason.
+
+The address hashes UTF-8 `emucap-instruction-snapshot\n` (a final newline), followed by the body as
+compact JSON with recursively sorted keys, UTF-8 strings and no whitespace. The envelope address
+is excluded. Check both this address and `snapshot.sha256`/`snapshot.bytes`. Address integrity is
+not an issuer signature: authenticate the actual receipt through the trusted producer API/store.
+The verifier accepts a producer request key, never caller-written receipt metadata. An optional
+expected launch checks applicability; historical verification alone does not make an old receipt
+applicable to a new launch or consumer attempt. Consumers own decoded-state PC/bank comparison,
+format admission, artifact/context admission, and any application claim.
+
+Native capture returns facts and the actual serialized bytes together in a bounded response.
+Snapshot bytes are limited to 1 MiB (2 MiB as wire hex), receipt metadata to 128 KiB and source
+acquisition to 64 MiB; the Core host deadline is 30 seconds under the normal I/O-return assumption.
+MCP cancellation or uncertain boundary checks cannot produce a completed save. A private retained
+pair is published together before exporting the requested destination. Export or response failure
+never deletes a published pair. Query the same key after interruption; an indeterminate key must
+not serialize again. A new key means a distinct user-requested save, not an automatic retry.
+
+The pair lives under the runtime store's `state-snapshots` directory, outside launch-generation
+cleanup. It survives `stop`, replacement launches and server restart with the same `EMUCAP_EMU_HOME`.
+There is no automatic pruning. Reverification is offline with respect to the emulator and never
+loads a state. `preserve_for_recording` remains a separate receipt class requiring advertised
+`state_load`; this feature does not enable that origin or change recording boundaries.
+
+Development validation: `_tests/live/mesen2/instruction-snapshot-test.py CONTENT --output PRIVATE_DIR`
+issues and revalidates real evidence using the current release binaries, including after shutdown.
+Runtime evidence and snapshots are private and are not included in this repository.
