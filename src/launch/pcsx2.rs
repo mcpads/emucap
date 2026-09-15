@@ -18,7 +18,7 @@ use super::{
     RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 4;
+pub const REQUIRED_HOST_API: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {

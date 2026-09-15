@@ -358,6 +358,22 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   cargo run --locked --release --example mednafen_debug_boundaries_smoke -- \
     <psx.cue> <ws.rom> <scph5500.bin>
   ```
+- **PSX restore from debugger halts**: the native loader discards destination device clocks before
+  restoring state, rebuilds events at timestamp zero, and refreshes the suspended CPU continuation
+  before completing the load. Restored GPU presentation starts a fresh host interval. This prevents
+  stale destination time from being applied to restored devices; it does not certify every
+  peripheral's instruction-time serialization. Run the isolated regression with caller-owned inputs:
+
+  ```sh
+  python3 _tests/live/mednafen/psx-state-restore-test.py <disc.cue> <checkpoint.mcs> \
+    --output <new-evidence-directory> --firmware <firmware-directory> \
+    --write-address <watched-address> --mode instruction --instruction-count 50000 \
+    --media-member <reviewed-disc-member.bin>
+  ```
+
+  Repeat `--media-member` for each member in the launch-plan review, including optional sidecars.
+  Use `--mode frame` or `--mode breakpoint` to exercise other destination parks, and `--repeats`
+  for repeated restore/resume. The test never stops another managed launch.
 - **Input injection point**: injected not at the driver's `Input_Update` but in the core-agnostic `mednafen.cpp`, right
   before Emulate (same phase as movie/netplay) and at MidSync. An Input_Update injection can be out of phase with when
   the game reads the input snapshot (the Saturn SMPC INTBACK path). PSX has no SMPC, so the game reads PortData directly
@@ -383,3 +399,12 @@ launch.sh path; the below is for running `<fork>` directly. Distinguish sessions
 MEDNAFEN_ALLOWMULTI=1 EMUCAP_PORT=47800 EMUCAP_NAME=g1 <fork> -sound 0 <game>
 MEDNAFEN_ALLOWMULTI=1 EMUCAP_PORT=47800 EMUCAP_NAME=g2 <fork> -sound 0 <game>
 ```
+
+### Mega Drive restore clocks
+
+The pinned MD patch saves the 68K, Z80 scheduler, VDP, FM, PSG, and six-button-pad time origins
+alongside their device state. Loading restores those origins before resuming a halted CPU;
+PSG routing restoration does not execute the abandoned oscillator timeline. Queued host audio
+is discarded, so continuity of already buffered sound across a load is not promised.
+Legacy frame-boundary states use zero for the previously omitted clocks. Legacy instruction
+snapshots did not contain enough timing information to reconstruct their exact saved execution.

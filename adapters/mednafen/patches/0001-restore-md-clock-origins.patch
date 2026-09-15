@@ -1,0 +1,147 @@
+--- a/src/md/system.cpp
++++ b/src/md/system.cpp
+@@ -666,6 +666,11 @@
+ {
+  uint8 c68k_state[M68K::OldStateLen];
+ 
++ // Legacy frame-boundary states omit these clocks. Never inherit the abandoned
++ // execution timeline when loading one of them.
++ if(load)
++  md_timestamp = z80_last_ts = Main68K.timestamp = 0;
++
+  SFORMAT StateRegs[] =
+  {
+   SFPTR8(work_ram, 65536),
+@@ -678,6 +683,9 @@
+ 
+   SFVAR(suspend68k),
+   SFVAR(z80_cycle_counter),
++  SFVAR(md_timestamp),
++  SFVAR(z80_last_ts),
++  SFVARN(Main68K.timestamp, "m68k_timestamp"),
+ 
+   SFVAR(obsim),
+ 
+--- a/src/md/vdp.cpp
++++ b/src/md/vdp.cpp
+@@ -812,6 +812,7 @@
+ 
+ void MDVDP::StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++ if(load) vdp_last_ts = 0;
+  SFORMAT StateRegs[] =
+  {
+   SFPTR8(sat, 0x400),
+@@ -841,6 +842,7 @@
+   SFVAR(vdp_cycle_counter),
+   SFVAR(vdp_line_phase),
+   SFVAR(vdp_hcounter_start_ts),
++  SFVAR(vdp_last_ts),
+   SFVAR(scanline),
+ 
+   SFVAR(fifo_simu_count),
+--- a/src/md/input/gamepad.cpp
++++ b/src/md/input/gamepad.cpp
+@@ -243,6 +243,7 @@
+ 
+ void Gamepad6::StateAction(StateMem *sm, const unsigned load, const bool data_only, const char *section_prefix)
+ {
++ if(load) prev_timestamp = 0;
+  SFORMAT StateRegs[] =
+  {
+   SFVAR(old_select),
+@@ -250,6 +251,7 @@
+   SFVAR(count),
+   SFVAR(timeout),
+   SFVAR(compat_mode),
++  SFVAR(prev_timestamp),
+   SFEND
+  };
+  char sname[64];
+--- a/src/hw_sound/sms_apu/Sms_Apu.h
++++ b/src/hw_sound/sms_apu/Sms_Apu.h
+@@ -58,7 +58,8 @@
+ 	void end_frame( blip_time_t );
+ 
+         void save_state(Sms_ApuState *);
+-        void load_state(const Sms_ApuState *);
++        void load_state(const Sms_ApuState *, blip_time_t timestamp = 0);
++        blip_time_t state_time() const { return last_time; }
+ 
+ public:
+ 	Sms_Apu();
+--- a/src/hw_sound/sms_apu/Sms_Apu.cpp
++++ b/src/hw_sound/sms_apu/Sms_Apu.cpp
+@@ -362,12 +362,15 @@
+  else ret->noise_period = 3;
+ }
+ 
+-void Sms_Apu::load_state(const Sms_ApuState *state)
+-{
++void Sms_Apu::load_state(const Sms_ApuState *state, blip_time_t timestamp)
++{
++ // Restoring routing must not run the old oscillator timeline.
++ last_time = timestamp;
+  latch = state->latch;
+ 
+  for(int x = 0; x < 4; x++)
+  {
++  oscs[x]->last_amp = 0;
+   oscs[x]->volume = state->volume[x];
+   oscs[x]->delay = state->delay[x] & ((x == 3) ? 0x7FFF : 0x3FFF);
+  }
+@@ -387,6 +390,6 @@
+  else 
+   noise.period = &squares [2].period;
+ 
+- write_ggstereo(0, state->ggstereo);
+-}
+-
++ write_ggstereo(timestamp, state->ggstereo);
++}
++
+--- a/src/md/sound.cpp
++++ b/src/md/sound.cpp
+@@ -164,6 +164,8 @@
+ {
+  Sms_ApuState sn_state;
+  LEPacker fm_slizer;
++ int32 sn_timestamp = load ? 0 : apu.state_time();
++ if(load) fm_last_timestamp = 0;
+ 
+  apu.save_state(&sn_state);
+  FMUnit.serialize(fm_slizer, false);
+@@ -173,6 +175,9 @@
+   SFVAR(FMReset),
+   SFVAR(fm_div),
+   SFVAR(fm_latch),
++  SFVAR(fm_last_timestamp),
++  SFVAR(sn_timestamp),
++  SFVARN(sn_state.ggstereo, "GGStereo"),
+ 
+   SFPTR8N(&fm_slizer[0], fm_slizer.size(), "FMState"),
+ 
+@@ -196,7 +201,10 @@
+ 
+   //
+   FMUnit.serialize(fm_slizer, true);
+-  apu.load_state(&sn_state);
++  // Presentation samples from the abandoned timeline are not guest state.
++  zebuf.clear();
++  fm_last_values[0] = fm_last_values[1] = 0;
++  apu.load_state(&sn_state, sn_timestamp);
+  }
+ }
+ 
+--- a/src/md/system.cpp
++++ b/src/md/system.cpp
+@@ -219,6 +219,9 @@
+ #endif
+ 
+  MDIO_EndTimePeriod(md_timestamp);
++ // Keep input-device origins on the same rebased frame timeline, including
++ // snapshots taken before the next Emulate() calls BeginTimePeriod().
++ MDIO_BeginTimePeriod(0);
+ 
+  md_timestamp = 0;
+  z80_last_ts = 0;

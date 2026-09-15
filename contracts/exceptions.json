@@ -345,7 +345,7 @@
       "activation": {"native_instruction_step": false},
       "constraints": {
         "execution.step.units": ["frames"],
-        "execution.step.max_count": 15,
+        "execution.step.max_count": 5000,
         "execution.step.execution_states.allowed": ["frozen"]
       },
       "public_behavior": {"invalid": "unsupported"},

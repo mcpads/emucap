@@ -224,8 +224,10 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
   stepping, so the fork's own 5s wait times out and this fails loudly (`emulator_error`), not a
   hang — resume first.
 - `save_state`/`load_state` — `savestate.save`/`savestate.load`. The fork's handler breaks the CPU
-  into stepping if it's running, waits for the save/load to complete, then restores the prior
-  run/halt state — so this works regardless of whether the CPU is running or halted.
+  into stepping if it is running and waits for native completion. A completed save restores
+  the prior run/halt state; a load returns `state: frozen` from the EmuThread and stays stopped.
+  GPU-stepping entry is rejected before enqueueing. A timed-out operation is not cancelled and
+  does not automatically resume; its eventual effect remains unresolved until native completion.
 - `step(unit="frames")` — `emucap.frameStep` advances exactly the requested number of emulated PSP
   VBlank-start boundaries and returns frozen. A breakpoint or other native stop returns
   `interrupted` with the completed count. The MCP `tap`, `hold_until`, `regression_run`, and

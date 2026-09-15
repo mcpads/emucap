@@ -14,6 +14,21 @@
   ],
   "expectations": [
     {
+      "id": "STATE.SNAPSHOT.ADMISSION.1",
+      "category": "invariant",
+      "expression": "serialize(snapshot) => owned(proven_main_cpu_instruction_halt)"
+    },
+    {
+      "id": "STATE.SNAPSHOT.ATOMIC.1",
+      "category": "observation",
+      "expression": "capture.ok => same_owned_halt(bytes, pc, program_bank, classified_boundary, domain_clocks, loaded_artifact)"
+    },
+    {
+      "id": "STATE.SNAPSHOT.VERIFY.1",
+      "category": "invariant",
+      "expression": "verified(receipt, bytes) => retained_issuance(receipt) and integrity(receipt, bytes); applicability => matches_explicit_expected_context"
+    },
+    {
       "id": "CORE.AVAIL.1",
       "category": "invariant",
       "expression": "f in methods => callable(f)"
@@ -767,6 +782,22 @@
       "temporal_classes": ["T4"],
       "disposition": "retain",
       "expectations": []
+    },
+    {
+      "id": "state.snapshot-capture",
+      "surface": "wire",
+      "methods": ["capture_snapshot", "observe_snapshot_halt"],
+      "temporal_classes": ["T4"],
+      "disposition": "retain",
+      "expectations": ["STATE.SNAPSHOT.ADMISSION.1", "STATE.SNAPSHOT.ATOMIC.1"]
+    },
+    {
+      "id": "state.snapshot-receipt",
+      "surface": "public",
+      "methods": ["snapshot_receipt"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["STATE.SNAPSHOT.VERIFY.1"]
     },
     {
       "id": "state.load",

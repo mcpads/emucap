@@ -1,0 +1,63 @@
+diff --git a/Source/Core/DolphinNoGUI/MainNoGUI.cpp b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
+index 3bf40ea..ce6f967 100644
+--- a/Source/Core/DolphinNoGUI/MainNoGUI.cpp
++++ b/Source/Core/DolphinNoGUI/MainNoGUI.cpp
+@@ -67,6 +67,8 @@ void Host_Message(const HostMessageID id)
+ {
+   if (id == HostMessageID::WMUserStop)
+     s_platform->Stop();
++  else if (id == HostMessageID::WMUserJobDispatch)
++    s_platform->WakeHostJobs();
+ }
+ 
+ void Host_UpdateTitle(const std::string& title)
+diff --git a/Source/Core/DolphinNoGUI/Platform.h b/Source/Core/DolphinNoGUI/Platform.h
+index f4dc8a9..9f14410 100644
+--- a/Source/Core/DolphinNoGUI/Platform.h
++++ b/Source/Core/DolphinNoGUI/Platform.h
+@@ -21,6 +21,7 @@ public:
+   virtual bool Init();
+   virtual void SetTitle(const std::string& title);
+   virtual void MainLoop() = 0;
++  virtual void WakeHostJobs() {}
+ 
+   virtual WindowSystemInfo GetWindowSystemInfo() const = 0;
+ 
+diff --git a/Source/Core/DolphinNoGUI/PlatformHeadless.cpp b/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+index 9bf3383..bd242d1 100644
+--- a/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
++++ b/Source/Core/DolphinNoGUI/PlatformHeadless.cpp
+@@ -2,8 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <cstdio>
+-#include <thread>
++#include <chrono>
+ 
++#include "Common/Event.h"
+ #include "Core/Core.h"
+ #include "Core/System.h"
+ #include "DolphinNoGUI/Platform.h"
+@@ -15,8 +16,12 @@ class PlatformHeadless final : public Platform
+ public:
+   void SetTitle(const std::string& title) override;
+   void MainLoop() override;
++  void WakeHostJobs() override { m_host_jobs.Set(); }
+ 
+   WindowSystemInfo GetWindowSystemInfo() const override;
++
++private:
++  Common::Event m_host_jobs;
+ };
+ 
+ void PlatformHeadless::SetTitle(const std::string& title)
+@@ -30,7 +35,8 @@ void PlatformHeadless::MainLoop()
+   {
+     UpdateRunningFlag();
+     Core::HostDispatchJobs(Core::System::GetInstance());
+-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
++    // Preserve shutdown polling while dispatching queued work without a per-job sleep.
++    m_host_jobs.WaitFor(std::chrono::milliseconds(100));
+   }
+ }
+ 

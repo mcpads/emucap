@@ -586,6 +586,10 @@ pub(crate) struct SaveStateArgs {
     /// This requires an absolute path and an advertised state_load capability.
     #[serde(default)]
     pub(crate) preserve_for_recording: bool,
+    /// Required by instruction_snapshot_capture profiles. Select a fresh 1..64 character
+    /// lowercase ASCII key before saving; repeating it never serializes again.
+    #[serde(default)]
+    pub(crate) snapshot_key: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1025,4 +1029,16 @@ pub(crate) struct VerifyDeterminismArgs {
     /// Replay count from 2 through 5. Default: 2.
     #[serde(default)]
     pub(crate) replays: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SnapshotReceiptArgs {
+    pub(crate) snapshot_key: String,
+    /// Optional absolute snapshot copy to compare with the producer's retained receipt.
+    #[serde(default)]
+    pub(crate) path: Option<String>,
+    /// Optional expected source launch. Omission verifies historical integrity only.
+    #[serde(default)]
+    pub(crate) expected_launch_id: Option<String>,
 }

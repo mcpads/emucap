@@ -1909,3 +1909,23 @@ fn button_hint_none_for_unknown_or_absent_system() {
     assert!(button_hint_for_system(Some("snes")).is_some());
     assert!(button_hint_for_system(Some("dreamcast")).is_some());
 }
+
+#[test]
+fn changed_snapshot_limits_invalidate_the_consumers_cached_capability() {
+    let original = serde_json::json!({"snapshot_capability":{"max_snapshot_bytes":1048576}});
+    let mut first = original.clone();
+    let revision = apply_capability_revision(&mut first, None);
+    let mut same = original.clone();
+    assert_eq!(
+        apply_capability_revision(&mut same, Some(&revision)),
+        revision
+    );
+    assert!(same.get("snapshot_capability").is_none());
+    let mut changed = original;
+    changed["snapshot_capability"]["max_snapshot_bytes"] = serde_json::json!(2097152);
+    assert_ne!(
+        apply_capability_revision(&mut changed, Some(&revision)),
+        revision
+    );
+    assert!(changed.get("snapshot_capability").is_some());
+}

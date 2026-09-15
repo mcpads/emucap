@@ -174,9 +174,14 @@ ends.
 `pause` returns only after PCSX2 reaches a frozen state. That state persists until an explicit
 resume, frame step, state load, or process exit; host wall-clock time does not advance the guest.
 
-`step(count, unit="frames")` requires frozen state, accepts 1–15 frames, and returns frozen after
-the requested frames complete. Instruction-unit stepping is not supported. Split longer movement
-into calls and wait for each terminal response before issuing the next dependent request.
+`step(count, unit="frames")` requires frozen state, accepts 1–5,000 frames, and returns frozen after
+the requested frames complete. Native execution has a 250-second budget; the bridge emits `working`
+responses while waiting. A debugger stop, external pause or exhausted budget returns `interrupted`
+with the actual `advanced` count, and discards remaining native frame work before returning frozen.
+`probe` accepts 0–5,000 frames and does not read memory after an interrupted advance.
+Instruction-unit stepping is not supported. Split requests larger than 5,000 frames and wait for each
+terminal response before issuing the next dependent request. Rebuild the maintained host: host API 5
+adds frame-counted terminal replies, and older hosts are rejected.
 
 `save_state` and `load_state` require frozen state and preserve it on return. Their paths must be
 absolute. A running-state call fails before starting a save or load.

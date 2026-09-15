@@ -1,11 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use super::link::{EmulatorIdentity, MemoryRegion};
@@ -17,10 +14,9 @@ use super::recording_input::{acquire_recording_movie, AcquiredRecordingMovie};
 use super::recording_state::AcquiredRecordingState;
 use super::runtime::CurrentManifest;
 use crate::bundle::recording_manifest::{
-    ContentIdentity, EventArmingScope, EventClassArming, EventClassFilter, EventFilterTerm,
-    EventStartCondition, EventStopCondition, InitialSnapshotRequest, RecordingOrigin,
-    RecordingRequest, RuntimeIdentity, TerminalSnapshotRequest, TerminalStateRequest,
-    MAX_EVENT_FILTER_TERMS,
+    EventArmingScope, EventClassArming, EventClassFilter, EventFilterTerm, EventStartCondition,
+    EventStopCondition, InitialSnapshotRequest, RecordingOrigin, RecordingRequest, RuntimeIdentity,
+    TerminalSnapshotRequest, TerminalStateRequest, MAX_EVENT_FILTER_TERMS,
 };
 
 const DEFAULT_RECORDING_HOST_MS_MIN: u64 = 30_000;
@@ -778,76 +774,6 @@ pub(super) fn runtime_identity(
     current: &CurrentManifest,
     capability: &RecordingCapability,
 ) -> Result<RuntimeIdentity, RecordingError> {
-    let content_path = Path::new(&current.content);
-    let metadata = fs::symlink_metadata(content_path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(RecordingError::Unavailable(
-            "recording content must be a regular file".into(),
-        ));
-    }
-    let (sha1, sha256) = hash_content(content_path)?;
-    let host = identity
-        .host_build
-        .as_ref()
-        .and_then(Value::as_object)
-        .ok_or_else(|| RecordingError::Unavailable("emulator host identity is missing".into()))?;
-    let field = |name: &str| {
-        host.get(name)
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .map(String::from)
-            .ok_or_else(|| {
-                RecordingError::Unavailable(format!("emulator host identity lacks {name}"))
-            })
-    };
-    let upstream = field("commit")?;
-    let patchset = field("patchset_sha256")?;
-    let binary = field("binary_sha256")?;
-    Ok(RuntimeIdentity {
-        system: current.system.clone(),
-        adapter_id: identity
-            .adapter
-            .clone()
-            .ok_or_else(|| RecordingError::Unavailable("adapter identity is missing".into()))?,
-        server_build: crate::build_identity::BUILD_HASH.into(),
-        adapter_build: identity
-            .build
-            .clone()
-            .ok_or_else(|| RecordingError::Unavailable("adapter build is missing".into()))?,
-        emulator_id: host
-            .get("upstream")
-            .and_then(Value::as_str)
-            .unwrap_or("emulator-host")
-            .to_string(),
-        emulator_build: binary,
-        emulator_upstream_revision: upstream,
-        emulator_patchset_sha256: patchset,
-        launch_id: current.launch_id.clone(),
-        capability_revision: capability.revision.clone(),
-        content: ContentIdentity {
-            sha1: Some(sha1),
-            sha256: Some(sha256),
-            bytes: metadata.len(),
-            path_hint: content_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(String::from),
-        },
-    })
-}
-
-fn hash_content(path: &Path) -> io::Result<(String, String)> {
-    let mut file = crate::path_safety::open_regular_file_no_follow(path)?;
-    let mut sha1 = Sha1::new();
-    let mut sha256 = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        sha1.update(&buffer[..read]);
-        sha256.update(&buffer[..read]);
-    }
-    Ok((hex::encode(sha1.finalize()), hex::encode(sha256.finalize())))
+    super::evidence_identity::runtime_identity(identity, current, &capability.revision, u64::MAX)
+        .map_err(|error| RecordingError::Unavailable(error.to_string()))
 }

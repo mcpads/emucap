@@ -762,6 +762,7 @@ const CAPABILITY_FIELDS: &[&str] = &[
     "freeze_policy",
     "bank_tagging",
     "recording_capability",
+    "snapshot_capability",
 ];
 
 fn capability_revision(value: &serde_json::Value) -> String {

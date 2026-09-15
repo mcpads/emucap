@@ -1,0 +1,102 @@
+--- a/statsave.tbl
++++ b/statsave.tbl
+@@ -7,6 +7,9 @@
+ 						NP2STATUS_VERSION};
+ 
+ static const PROCTBL evtproc[] = {
++#if defined(SUPPORT_HRTIMER)
++            {PROCID('e','h','r','t'), upd4990_hrtimer_proc},
++#endif
+ 			{PROCID('e','s','c','0'), screendisp},
+ 			{PROCID('e','s','c','1'), screenvsync},
+ 			{PROCID('e','p','i','t'), systimer},
+@@ -44,6 +47,9 @@
+ };
+ 
+ static const ENUMTBL evtnum[] = {
++#if defined(SUPPORT_HRTIMER)
++            {PROCID('h','r','t','m'), NEVENT_HRTIMER},
++#endif
+ 			{PROCID('m','a','i','n'), NEVENT_FLAMES},
+ 			{PROCID('p','i','t',' '), NEVENT_ITIMER},
+ 			{PROCID('b','e','e','p'), NEVENT_BEEP},
+--- a/io/upd4990.h
++++ b/io/upd4990.h
+@@ -21,6 +21,8 @@
+ 	
+ 	UINT32 clockcounter;
+ 	UINT32 clockcounter32;
++	UINT32 divcounter;
++	UINT32 divcounter32;
+ } _UPD4990HRT, *UPD4990HRT;
+ 
+ 
+@@ -29,6 +31,8 @@
+ #endif
+ 	
+ #if defined(SUPPORT_HRTIMER)
++struct _neventitem;
++void upd4990_hrtimer_proc(struct _neventitem *item);
+ void upd4990_hrtimer_count(void);
+ #endif
+ 
+--- a/io/upd4990.c
++++ b/io/upd4990.c
+@@ -99,16 +99,14 @@
+ static void upd4990_hrtimer_setinterval(int absolute);
+ 
+ void upd4990_hrtimer_proc(NEVENTITEM item) {
+-	static UINT32 divcounter = 0;
+-	static UINT32 divcounter32 = 0;
+-	divcounter++;
+-	if(divcounter >= 64 / uPD4990HRT.hrtimerdiv){ // 64 -> hrtimerdiv
++	uPD4990HRT.divcounter++;
++	if(uPD4990HRT.divcounter >= 64 / uPD4990HRT.hrtimerdiv){ // 64 -> hrtimerdiv
+ 		pic_setirq(15);
+-		divcounter = 0;
++		uPD4990HRT.divcounter = 0;
+ 	}
+ 	if(uPD4990HRT.hrtimerclock32){
+-		divcounter32++;
+-		if(divcounter32 >= 2){ // 64 -> 32
++		uPD4990HRT.divcounter32++;
++		if(uPD4990HRT.divcounter32 >= 2){ // 64 -> 32
+ 			UINT32 hrtimertimeuint;
+ 			
+ 			hrtimertimeuint = LOADINTELDWORD(mem+0x04F1);
+@@ -117,7 +115,7 @@
+ 				hrtimertimeuint = ((hrtimertimeuint & ~0x3fffff) + 0x400000) & 0xffffff; // 日付変わった
+ 			}
+ 			STOREINTELDWORD(mem+0x04F1, hrtimertimeuint); // XXX: 04F4にも書いちゃってるけど差し当たっては問題なさそうなので･･･
+-			divcounter32 = 0;
++			uPD4990HRT.divcounter32 = 0;
+ 		}
+ 	}
+ 	upd4990_hrtimer_setinterval(0);
+@@ -132,6 +130,8 @@
+ 	uPD4990HRT.hrtimerclock32 = pccore.baseclock / 32;
+ 	uPD4990HRT.clockcounter = 0;
+ 	uPD4990HRT.clockcounter32 = 0;
++	uPD4990HRT.divcounter = 0;
++	uPD4990HRT.divcounter32 = 0;
+ }
+ void upd4990_hrtimer_count(void) {
+ 	//if(uPD4990HRT.hrtimerclock){
+--- a/statsave.c
++++ b/statsave.c
+@@ -665,11 +665,14 @@
+       break;
+     }
+   }
++  // An unmapped event cannot be reconstructed. Reject the save instead of
++  // writing ID zero and silently discarding the event during restoration.
++  if (i == NELEMENTS(evtnum)) return STATFLAG_FAILURE;
+   nit.clock = g_nevent.item[num].clock;
+   nit.flag = g_nevent.item[num].flag;
+   nit.proc = g_nevent.item[num].proc;
+   if (PROC2NUM(nit.proc, evtproc)) {
+-    nit.proc = NULL;
++    return STATFLAG_FAILURE;
+   }
+   return (statflag_write(sfh, &nit, sizeof(nit)));
+ }

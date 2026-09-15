@@ -40,6 +40,7 @@ local HAS_SNES_DEEP_EVENTS = SYS.system == "snes"
 local socket = require("socket.core")
 local Tx = require("emucap_tx")
 local StateIo = require("emucap_state_io")
+local Snapshot = require("emucap_snapshot")
 local Dump = require("emucap_dump")
 local Deferred = require("emucap_deferred")
 local Step = require("emucap_step")
@@ -574,6 +575,10 @@ function handlers.hello()
                 "set_breakpoint", "watch_register", "clear_breakpoint", "list_breakpoints",
                 "clear_all_breakpoints", "poll_events", "set_trace", "get_trace",
                 "break_on_reset", "dump_memory", "find_pattern", "probe", "reset" }
+  if SYS.system == "snes" then
+    method_list[#method_list + 1] = "capture_snapshot"
+    method_list[#method_list + 1] = "observe_snapshot_halt"
+  end
   if HAS_POWER_CYCLE then method_list[#method_list + 1] = "power_cycle" end
   if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
   if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
@@ -588,6 +593,7 @@ function handlers.hello()
     "controlled_start",
     "native_instruction_step",
   }
+  if SYS.system == "snes" then host_features[#host_features + 1] = "instruction_snapshot_capture" end
   if HAS_POWER_CYCLE then host_features[#host_features + 1] = "native_power_cycle" end
   if HAS_HOST_NATIVE_CALLSTACK then host_features[#host_features + 1] = "native_call_stack" end
   local repeatable_recording = REPEATABLE_PROFILE and RECORDING_SUPPORTED
@@ -778,6 +784,14 @@ function handlers.get_state(p)
     if grp and want[grp] then out[k] = v end
   end
   return true, { state = out, groups_applied = as_array(applied) }
+end
+
+function handlers.observe_snapshot_halt()
+  return Snapshot.observe(emu, halt_savestate_safe, SYS.system)
+end
+
+function handlers.capture_snapshot()
+  return Snapshot.capture(emu, halt_savestate_safe, SYS.system)
 end
 
 function handlers.get_rom_info()

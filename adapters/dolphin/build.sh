@@ -54,17 +54,22 @@ git -C "$SRC" checkout -- \
   Source/Core/Core/State.h \
   Source/Core/VideoCommon/FrameDumper.cpp \
   Source/Core/VideoCommon/FrameDumper.h \
+  Source/Core/DolphinNoGUI/Platform.h \
+  Source/Core/DolphinNoGUI/PlatformHeadless.cpp \
+  Source/Core/DolphinNoGUI/MainNoGUI.cpp \
   Source/Core/DolphinQt/Settings.cpp \
   Source/Core/DolphinLib.props
 git -C "$SRC" clean -fdq -- \
   Source/Core/Core/EmuCap.cpp \
   Source/Core/Core/EmuCap.h \
   Source/Core/Core/EmuCapInput.cpp \
-  Source/Core/Core/EmuCapInput.h
+  Source/Core/Core/EmuCapInput.h \
+  Source/Core/Core/EmuCapTemporal.h
 cp "$HERE/EmuCap.cpp" "$SRC/Source/Core/Core/EmuCap.cpp"
 cp "$HERE/EmuCap.h" "$SRC/Source/Core/Core/EmuCap.h"
 cp "$HERE/EmuCapInput.cpp" "$SRC/Source/Core/Core/EmuCapInput.cpp"
 cp "$HERE/EmuCapInput.h" "$SRC/Source/Core/Core/EmuCapInput.h"
+cp "$HERE/EmuCapTemporal.h" "$SRC/Source/Core/Core/EmuCapTemporal.h"
 for patch in "$HERE"/patches/*.patch; do
   echo "applying $(basename "$patch")"
   git -C "$SRC" apply --check "$patch"
@@ -92,7 +97,7 @@ cmake --build "$HEADLESS_BUILD" --target dolphin-nogui -j "$JOBS"
 PATCHSET_SHA256="$(
   cd "$HERE"
   {
-    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h
+    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h
     find patches -type f -name '*.patch' -print0 |
       sort -z |
       xargs -0 shasum -a 256
