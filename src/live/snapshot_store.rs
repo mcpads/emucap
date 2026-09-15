@@ -45,7 +45,7 @@ impl Store {
         }
         let directory = root.join(key);
         let fresh = if create {
-            let mut builder = fs::DirBuilder::new();
+            let builder = &mut fs::DirBuilder::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt;
