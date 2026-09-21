@@ -2,6 +2,18 @@
 
 Actively developed beta software — interfaces may still change.
 
+## 0.16.4
+
+### Fixed
+- PPSSPP screenshots preserve an existing CPU halt and read the PSP display framebuffer at
+  480×272, excluding host UI and postprocessing. Native readback owns each result through PNG
+  encoding; failed, cancelled, timed-out, or replaced-stop requests cannot return stale images.
+  Rebuild both the maintained PPSSPP host and Rust bridge. Unbuffered hardware rendering that
+  exposes only a host backbuffer is rejected instead of returning a misleading capture.
+- Mednafen frame steps and probes remain frozen at the completed frame boundary instead of
+  executing an additional frame. Screen capture occurs before the boundary is serviced, so
+  observations refer to the frame just completed. Rebuild the maintained Mednafen host.
+
 ## 0.16.3
 
 ### Added
