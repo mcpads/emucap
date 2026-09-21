@@ -3,8 +3,8 @@
 The adapter that gives emucap PlayStation Portable support. Headless PPSSPP already exposes an
 external debugger over its own JSON WebSocket (`debugger.ppsspp.org`); the emucap **PSP bridge**
 (`emucap-ppsspp-bridge`) is a pure WebSocket client that relays it to the emucap wire protocol. A
-small repo-owned fork adds missing lifecycle and exact-time hooks: savestate, a screenshot variant
-that works while the game is running, exact VBlank frame stepping, and trustworthy stop provenance.
+small repo-owned patch stack adds missing lifecycle and exact-time hooks: savestate, screenshots
+while running or CPU-halted, exact VBlank frame stepping, and trustworthy stop provenance.
 
 ## Architecture
 
@@ -217,12 +217,17 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
 — PPSSPP's WS API never exposes a content path or hash itself).
 
 **Tier 2 (the fork's two added commands, `patches/0001-emucap-savestate-screenshot-ws.patch`)**:
-- `screenshot` — `emucap.screenshot`, a `gpu.buffer.screenshot` variant that forces GE stepping
-  itself, so it works while the game is **running** (stock `gpu.buffer.screenshot` fails unless the
-  caller happens to already be GE-stepping, which never naturally overlaps with a CPU-debugger
-  halt). If the CPU is halted for the debugger, the EmuThread never reaches a vsync to enter GE
-  stepping, so the fork's own 5s wait times out and this fails loudly (`emulator_error`), not a
-  hang — resume first.
+- `screenshot` — `emucap.screenshot`. Patch `0012-halted-output-readback.patch` reads existing
+  the PSP display framebuffer on the emulation thread while preserving a CPU halt.
+  Like upstream game screenshots, it crops to 480×272 at native scale, excluding host UI and
+  postprocessing. Reading the host swapchain here could instead return a newly cleared UI frame. It does not resume, step, or schedule
+  a VSYNC for a halted CPU. Running captures retain the next-VSYNC GPU halt path. Each read owns
+  its copied buffer through encoding, including memory-backed display buffers; busy requests, changed stops, unavailable output, and timed-out
+  reads fail rather than returning a previous result. GPU teardown/recreation invalidates pending reads. Queued timeout work is discarded; an
+  already-started host read may finish into its private buffer, which is not returned or reused.
+  Readback waits at most 5s; running capture may first wait another 5s for GE halt. The bridge
+  uses a 12s response budget. The image is existing display-buffer content, not a newly presented frame at the stopped
+  CPU instruction. Unbuffered hardware rendering that exposes only a host backbuffer is rejected.
 - `save_state`/`load_state` — `savestate.save`/`savestate.load`. The fork's handler breaks the CPU
   into stepping if it is running and waits for native completion. A completed save restores
   the prior run/halt state; a load returns `state: frozen` from the EmuThread and stays stopped.

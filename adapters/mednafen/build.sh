@@ -197,7 +197,7 @@ perl -0777 -pi -e \
   's/(\n[ \t]*if\(MDFN_UNLIKELY\(StateFuzzTest\)\))/\n\t ::emucap_pre_first_frame();${1}/ unless m{emucap_pre_first_frame}' \
   "$SRC/src/drivers/main.cpp"
 perl -0777 -pi -e \
-  's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}{ static uint64_t emucap_frame = 0; ::emucap_service(++emucap_frame); ::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths); }\n${1}${2}/m unless m{emucap_service}' \
+  's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}{ static uint64_t emucap_frame = 0; ::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths); ::emucap_service(++emucap_frame); }\n${1}${2}/m unless m{emucap_service}' \
   "$SRC/src/drivers/main.cpp"
 inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp 훅 삽입 실패"
 inject_check emucap_pre_first_frame "$SRC/src/drivers/main.cpp" "main.cpp pre-first 훅 삽입 실패"

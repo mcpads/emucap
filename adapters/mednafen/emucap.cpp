@@ -4440,9 +4440,10 @@ void emucap_service(uint64_t frame) {
     g_probe_id = -1;
     g_probe_requested = 0;
     g_probe_progress_ms = 0;
-    return;
+    // A frozen probe must park at the boundary it just measured. Returning
+    // here would execute another frame before the next service invocation.
   }
-  // step(N) 진행: 매 프레임 1씩 줄이고, 0에서 완료 응답 후 frozen 유지(다음 호출이 스핀).
+  // Complete and park in this invocation; the next invocation is another frame.
   if (g_step_remaining > 0) {
     if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return;
     if (g_step_id < 0) return;
@@ -4459,7 +4460,7 @@ void emucap_service(uint64_t frame) {
                    g_step_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS)) {
       reply_ok(g_step_id, "{\"status\":\"working\"}");
     }
-    return;  // 반환해 프레임 1개 진행
+    if (g_step_remaining > 0) return;
   }
   // frozen: 반환하면 게임루프가 MDFNI_Emulate를 또 부르므로, 여기서 스핀해 프레임을 막는다.
   // step(remaining>0) 또는 resume(frozen=false)이 오면 빠져나가 프레임을 진행시킨다.

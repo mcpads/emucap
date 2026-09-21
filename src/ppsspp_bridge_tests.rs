@@ -2075,16 +2075,10 @@ fn screenshot_decodes_data_uri_into_uniform_png_base64() {
     ];
     let b64 = base64::engine::general_purpose::STANDARD.encode(png_bytes);
     let uri = format!("data:image/png;base64,{b64}");
-    let mut bridge = PpssppBridge::new(FakeWs::with(&[
-        (
-            "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
-        ),
-        (
-            "emucap.screenshot",
-            json!({"event":"emucap.screenshot","width":480,"height":272,"uri":uri}),
-        ),
-    ]));
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+        "emucap.screenshot",
+        json!({"event":"emucap.screenshot","width":480,"height":272,"uri":uri}),
+    )]));
     let resp = bridge.handle_request(Request::new(1, "screenshot", json!({})));
     assert!(resp.ok, "{:?}", resp.error);
     let result = resp.result.unwrap();
@@ -2097,16 +2091,10 @@ fn screenshot_decodes_data_uri_into_uniform_png_base64() {
 fn screenshot_defaults_dimensions_when_reply_omits_them() {
     let b64 = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
     let uri = format!("data:image/png;base64,{b64}");
-    let mut bridge = PpssppBridge::new(FakeWs::with(&[
-        (
-            "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
-        ),
-        (
-            "emucap.screenshot",
-            json!({"event":"emucap.screenshot","uri":uri}),
-        ),
-    ]));
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+        "emucap.screenshot",
+        json!({"event":"emucap.screenshot","uri":uri}),
+    )]));
     let resp = bridge.handle_request(Request::new(1, "screenshot", json!({})));
     assert!(resp.ok, "{:?}", resp.error);
     let result = resp.result.unwrap();
@@ -2116,36 +2104,29 @@ fn screenshot_defaults_dimensions_when_reply_omits_them() {
 
 #[test]
 fn screenshot_rejects_reply_missing_uri_field() {
-    let mut bridge = PpssppBridge::new(FakeWs::with(&[
-        (
-            "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
-        ),
-        ("emucap.screenshot", json!({"event":"emucap.screenshot"})),
-    ]));
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[(
+        "emucap.screenshot",
+        json!({"event":"emucap.screenshot"}),
+    )]));
     let resp = bridge.handle_request(Request::new(1, "screenshot", json!({})));
     assert!(!resp.ok);
     assert_eq!(resp.error.unwrap().kind, "emulator_error");
 }
 
 #[test]
-fn screenshot_rejects_while_cpu_halted() {
-    // emucap.screenshot drives GE stepping, which only progresses while the CPU is running —
-    // a halted core must fail fast (bad_params) instead of riding PPSSPP's own ~5s wait to an
-    // emulator_error. The FakeWs has no "emucap.screenshot" reply queued, so this test would
-    // fail loudly (unexpected fake WS call) if the proactive guard were missing.
+fn screenshot_only_observes_native_output() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
-        "cpu.status",
-        json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+        "emucap.screenshot",
+        json!({"uri":"data:image/png;base64,AQID","width":480,"height":272}),
     )]));
     let resp = bridge.handle_request(Request::new(1, "screenshot", json!({})));
-    assert!(!resp.ok);
-    assert_eq!(resp.error.unwrap().kind, "bad_params");
+    assert!(resp.ok, "{:?}", resp.error);
     assert_eq!(
         bridge.ws.calls.len(),
         1,
-        "must not call emucap.screenshot while the CPU is halted"
+        "capture must not resume or step the guest"
     );
+    assert_eq!(bridge.ws.calls[0].0, "emucap.screenshot");
 }
 
 // --- set_input / press_buttons ---

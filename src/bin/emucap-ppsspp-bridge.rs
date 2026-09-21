@@ -30,7 +30,8 @@ fn main() -> anyhow::Result<()> {
     // 8s does NOT cover savestate: the fork's `SaveStateSubscriber.cpp` waits up to 15s for the save/
     // load to complete before replying, so `save_state`/`load_state` get a dedicated per-call read
     // budget above 15s (`SAVESTATE_READ_TIMEOUT`, threaded via `call_with_timeout`) instead of raising
-    // this default — every other read keeps the fast 8s so ordinary failures still surface quickly.
+    // this default. Screenshot also uses a dedicated budget for GE entry plus readback;
+    // other ordinary reads keep the fast 8s so failures still surface quickly.
     let ws = TungsteniteWs::connect(ppsspp_port, Duration::from_secs(8))
         .with_context(|| format!("connect PPSSPP debugger websocket at 127.0.0.1:{ppsspp_port}"))?;
     let mut bridge = PpssppBridge::new(ws);

@@ -12,8 +12,8 @@
 //! category flattened to `cpu.<name>`), `disassemble` (via `memory.disasm`), breakpoints
 //! (`cpu.breakpoint.*`/`memory.breakpoint.*`), stepping (`cpu.stepInto`), pause/resume
 //! (`cpu.stepping`/`cpu.resume`), `poll_events` (draining PPSSPP's spontaneous `cpu.stepping`
-//! events), `screenshot` (the emucap fork's `emucap.screenshot`, a GE-stepping-driving variant of
-//! stock `gpu.buffer.screenshot` that also works while the game is running), `set_input`/
+//! events), `screenshot` (the patched native `emucap.screenshot`, which reads existing output
+//! while CPU-halted and uses a GPU boundary while running), `set_input`/
 //! `press_buttons` (`input.buttons.send`/`input.buttons.press`, both stock PPSSPP WS commands —
 //! no fork hook needed), `save_state`/`load_state` (the emucap fork's `savestate.save`/
 //! `savestate.load`, stock PPSSPP exposes no WS savestate command), `reset` (stock `game.reset`),
@@ -93,6 +93,9 @@ const MAX_PRESS_FRAMES: u64 = 240;
 /// dedicated budget avoids the false timeout in the first place. It remains bounded so a genuinely
 /// wedged save still surfaces an error rather than hanging forever.
 const SAVESTATE_READ_TIMEOUT: Duration = Duration::from_secs(20);
+
+// A running screenshot may wait 5s for GE halt, then 5s for native readback.
+const SCREENSHOT_READ_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// Dedicated WS read budget for `reset`. The emucap fork's headless build performs a *real* reboot
 /// (`PSP_Shutdown` + re-init) on its run loop and blocks the `game.reset` ack until that reboot

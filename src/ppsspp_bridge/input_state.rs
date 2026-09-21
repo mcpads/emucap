@@ -1,29 +1,12 @@
 use super::*;
 
 impl<T: WsTransport> PpssppBridge<T> {
-    /// `emucap.screenshot` — the fork's GE-stepping-driving variant of stock
-    /// `gpu.buffer.screenshot`; unlike the stock command (which fails with "Neither CPU or GPU is
-    /// stepping" unless a screenshot request happens to land while already GE-stepping),
-    /// `emucap.screenshot` forces GE stepping itself so a capture works while the game is
-    /// running. Known v1 limitation: this only works while the CPU is actually *running* — if the
-    /// CPU is halted for the debugger (`cpu.stepping`/breakpoint stop), the EmuThread never
-    /// reaches a vsync to enter GE stepping, so the fork's own 5s wait would time out and the
-    /// underlying `emucap.screenshot` request would fail loudly ~5s later. A halted core is
-    /// rejected up front instead (mirroring `press_buttons`' halted-CPU guard) so a caller gets a
-    /// fast, clear error instead of a multi-second stall — resume first, or use `get_state`/
-    /// `poll_events` while frozen. Requests the default `type:"uri"` reply (a
-    /// `data:image/png;base64,...` URI, same shape as `gpu.buffer.screenshot`) and decodes it to
-    /// the uniform `{png_base64, width, height}`.
+    /// Native output readback preserves an existing CPU/debugger halt. Running capture
+    /// still uses the native GPU boundary; the bridge never resumes a halted guest.
     pub(super) fn screenshot(&mut self) -> BridgeResult<Value> {
-        if self.cpu_is_stepping()? {
-            return Err(BridgeError::BadParams(
-                "screenshot needs a running emulator — emucap.screenshot drives GE stepping, \
-                 which only progresses while the CPU is running; while halted for the debugger \
-                 it would stall for PPSSPP's own ~5s wait then fail (resume first)."
-                    .into(),
-            ));
-        }
-        let result = self.ws.call("emucap.screenshot", json!({}))?;
+        let result =
+            self.ws
+                .call_with_timeout("emucap.screenshot", json!({}), SCREENSHOT_READ_TIMEOUT)?;
         let uri = result.get("uri").and_then(Value::as_str).ok_or_else(|| {
             BridgeError::Emulator("emucap.screenshot: reply had no uri field".into())
         })?;
