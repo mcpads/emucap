@@ -18,7 +18,7 @@ CORE = ("emucap", "emucap-mcp", "emucap-track-mcp", "emucap-broker")
 
 
 def run(*args, **kwargs):
-    return subprocess.check_output(args, text=True, **kwargs).strip()
+    return subprocess.check_output(args, text=True, encoding="utf-8", **kwargs).strip()
 
 
 def smoke(root, version, revision, scratch):
@@ -40,10 +40,10 @@ def smoke(root, version, revision, scratch):
     assert "Usage:" in run(str(bindir / ("emucap" + suffix)), "--help", env=env)
     evidence = {"emucap": {"help": "passed"}}
     for name in CORE[1:3]:
-        with tempfile.TemporaryFile(mode="w+") as errors:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as errors:
             process = subprocess.Popen([str(bindir / (name + suffix))], cwd=scratch,
                                        env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                       stderr=errors, text=True)
+                                       stderr=errors, text=True, encoding="utf-8")
             responses = queue.Queue()
 
             def read_lines():
