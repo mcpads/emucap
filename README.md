@@ -56,6 +56,12 @@ use the equivalents (and see the Platforms note above).
 
 ### 1. Prerequisites (the agent checks, and installs if missing)
 
+Prebuilt core packages are available on the [GitHub Releases page](https://github.com/mcpads/emucap/releases)
+for Windows x86-64, Linux x86-64 and Apple Silicon. Extract the entire archive and follow
+`PREBUILT-CORE.md`: the four core executables are already in `target/release/`, so skip their
+source build. Adapter bridges and emulator hosts still follow their own build instructions;
+their compiler requirements remain applicable. The macOS package is not notarized.
+
 - **Rust 1.88 or newer** — check with `command -v cargo` and `rustc --version`. If missing:
   `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
 - **C compiler** (to build the bundled SQLite) — macOS: `xcode-select -p || xcode-select --install`.

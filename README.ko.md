@@ -50,6 +50,13 @@ override를 우선한다.
   설치한다(Rust installer가 설치를 제안하면 진행). 이후 일반 PowerShell에서 빌드한다.
 - **git**.
 
+사전 빌드 코어는 [GitHub Releases](https://github.com/mcpads/emucap/releases)에서
+Windows x86-64, Linux x86-64, Apple Silicon용으로 제공합니다. 압축을 전체 해제하고
+`PREBUILT-CORE.md`를 따르면 됩니다. 코어 실행 파일 네 개는 `target/release/`에 있으므로
+코어 소스 빌드는 생략할 수 있습니다. 어댑터 브리지와 에뮬레이터 호스트는 각 어댑터의
+설치 지침에 따라 별도로 빌드하며, 해당 컴파일러 요구사항은 그대로 적용됩니다.
+macOS 패키지는 공증되지 않았습니다.
+
 ### 2. Core 빌드
 
 저장소 루트에서:

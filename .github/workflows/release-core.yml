@@ -1,0 +1,103 @@
+name: Release core binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (the corresponding release must be a draft)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-core-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    runs-on: ubuntu-22.04
+    outputs:
+      revision: ${{ steps.tag.outputs.revision }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: tag
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          revision=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: packaging
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.revision }}
+          path: source
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Build only the four core executables
+        working-directory: source
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
+      - name: Package and validate on the target OS
+        run: python packaging/_tests/release/package_core.py --source source --target ${{ matrix.target }} --version ${{ inputs.tag }} --revision ${{ needs.resolve.outputs.revision }} --output artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-${{ matrix.target }}
+          path: artifacts/*
+          if-no-files-found: error
+
+  publish:
+    needs: [resolve, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-*
+          merge-multiple: true
+          path: artifacts
+      - name: Publish the prepared draft after all native checks pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_REVISION: ${{ needs.resolve.outputs.revision }}
+        shell: bash
+        run: |
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          actual=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.sha)
+          type=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq .object.type)
+          if [ "$type" = tag ]; then
+            actual=$(gh api "repos/$GH_REPO/git/tags/$actual" --jq .object.sha)
+          fi
+          test "$actual" = "$SOURCE_REVISION"
+          cd artifacts
+          cat *.sha256 > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          gh release upload "$RELEASE_TAG" *.tar.gz *.zip *.json SHA256SUMS
+          gh release edit "$RELEASE_TAG" --draft=false --latest
