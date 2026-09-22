@@ -31,8 +31,12 @@ def smoke(root, version, revision, scratch):
     script = root / "tools" / ("register-codex-mcp.ps1" if suffix else "register-codex-mcp.sh")
     command = ["pwsh", "-NoProfile", "-File"] if suffix else ["sh"]
     output = run(*command, str(script), env=env)
-    for name in CORE[1:3]:
-        assert str(bindir / (name + suffix)) in output, output
+    registered = [Path(line.split("->", 1)[1].strip())
+                  for line in output.splitlines() if "->" in line]
+    assert len(registered) == 2, output
+    for name, actual in zip(CORE[1:3], registered):
+        # PowerShell resolves Windows short names and case; compare file identity.
+        assert (bindir / (name + suffix)).samefile(actual), output
     assert "Usage:" in run(str(bindir / ("emucap" + suffix)), "--help", env=env)
     evidence = {"emucap": {"help": "passed"}}
     for name in CORE[1:3]:
