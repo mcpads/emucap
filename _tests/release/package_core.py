@@ -157,7 +157,8 @@ def main():
         manifest["validation"] = smoke(extracted / name, args.version, short, temporary)
         (output / (name + ".json")).write_text(json.dumps(manifest, indent=2) + "\n")
         digest = hashlib.sha256(package.read_bytes()).hexdigest()
-        (output / (name + ".sha256")).write_text(f"{digest}  {package.name}\n")
+        # sha256sum treats a CR from Windows text translation as part of the filename.
+        (output / (name + ".sha256")).write_bytes(f"{digest}  {package.name}\n".encode("ascii"))
         print(json.dumps(manifest, indent=2))
 
 
