@@ -2,6 +2,37 @@
 
 Actively developed beta software — interfaces may still change.
 
+## 0.17.0
+
+### Changed
+- Ordinary button/key input uses `tap`. Mouse movement, clicking and dragging now use the
+  `pointer` drawer; persistent input, touch, running-time pulses and `hold_until` use `debug`.
+  The `input_control` MCP tool is removed. Refresh the Control connection and discover the new
+  routes; operation arguments, capability checks and execution/cleanup contracts are unchanged.
+
+### Fixed
+- openMSX disk snapshots include native machine state and snapshot-time disk bytes in one
+  atomically published file. Restore uses a current-generation disk copy, verifies the native
+  checksum and retains the original frozen machine until the candidate passes validation.
+  Rejected candidates preserve the original session. Legacy disk states restore only when the
+  unchanged admitted source matches the saved disk checksum; historical media paths are not used.
+  DSK checksums include buffered guest writes, and command timeouts close the XML channel so a
+  late reply cannot be mistaken for a rollback response. Rebuild the maintained openMSX host
+  (API 5), bridge and Control, then reconnect Control before planning a new launch.
+- openMSX frozen screenshots retain the latest completed VDP raster during unthrottled execution.
+  Capture reports native raster identity separately from the halted PC and frame/cycle; stale or
+  unavailable rasters, including immediately after restore, are rejected without advancing the guest.
+  Rebuild the maintained openMSX host (API 5), bridge and Control together.
+- openMSX breakpoint events preserve multiple ordered snapshot ranges, and the contract registry
+  covers the supported MSX, MSX1, MSX2 and MSX2+ profiles. Button metadata reports the actual system.
+  Managed debugger integrity failures retain their original reason before generation shutdown.
+  Rebuild Control and the openMSX bridge.
+- macOS managed stop recognizes the OS-reported exit of an unreaped child instead of reporting
+  an unknown process identity. Other process-observation failures remain fail-closed.
+- PPSSPP revalidates the primary texture after selecting a matching secondary-cache entry.
+  Repeated draws in the same texture sync domain no longer fall back to stale primary pixels,
+  fixing menu-return glyph corruption. Rebuild the maintained PPSSPP host.
+
 ## 0.16.4
 
 ### Fixed

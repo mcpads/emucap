@@ -34,7 +34,7 @@ The generation-local settings also bind xemu's keyboard controller to physical p
 port 0. This creates the guest-visible XID device without depending on a user's profile and keeps
 native keyboard input available whenever emucap does not own the input override. The fork rejects
 an engaged override if that controller is not bound instead of reporting a false success.
-`input_control(operation="describe")` reports the callable analog axes and their exact integer
+`debug(operation="describe")` reports the callable analog axes and their exact integer
 ranges. `set_input` replaces the complete port-0 state: omitted axes are neutral, an explicitly
 neutral axis still owns the controller, and empty buttons plus axes return ownership to native
 input. The `l` and `r` button names remain full-trigger aliases; combining one with an explicit

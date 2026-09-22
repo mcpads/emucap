@@ -81,7 +81,7 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "system": "xbox",
             "buttons": ["a", "b", "x", "y", "white", "black", "start", "back", "up", "down", "left", "right", "l", "r", "lstick", "rstick"],
             "aliases": {"select": "back", "lt": "l", "rt": "r", "l3": "lstick", "r3": "rstick", "enter": "start", "return": "start"},
-            "notes": "Original Xbox controller port 0. l/r are full-trigger aliases; input_control(operation=describe) reports live analog-stick and partial-trigger axes when available."
+            "notes": "Original Xbox controller port 0. l/r are full-trigger aliases; debug(operation=describe) reports live analog-stick and partial-trigger axes when available."
         }),
         "snes" | "sfc" => serde_json::json!({
             "system": "snes",

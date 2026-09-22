@@ -298,13 +298,14 @@ fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
         "pause",
         "step",
         "resume",
-        "input_control",
+        "pointer",
         "debug",
         "analysis",
     ] {
         assert!(visible.contains(name), "missing front-panel tool: {name}");
     }
     for name in [
+        "input_control",
         "run_frames",
         "wait_for_running_frames",
         "advance_and_freeze",
@@ -327,7 +328,7 @@ fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
 fn drawer_operation_registries_match_the_contract_catalog() {
     for (route, implementation) in [
         ("debug", debug_surface::operation_ids()),
-        ("input_control", input_surface::operation_ids()),
+        ("pointer", pointer_surface::operation_ids()),
     ] {
         let expected: std::collections::BTreeSet<_> = emucap::contracts::catalog()
             .features
@@ -364,15 +365,30 @@ fn drawers_publish_only_current_operations_and_bind_execution_to_the_revision() 
     assert_eq!(debug["capability_revision"], "revision-a");
     assert!(!serde_json::to_string(&debug).unwrap().contains("snes_"));
 
-    let input = input_surface::describe(&status);
-    assert!(input["operations"]["set_input"].is_object());
-    assert!(input["operations"].get("touch").is_none());
-    assert!(input["operations"]["hold_touch"]["arguments_schema"].is_object());
-    assert!(input["operations"]["release_touch"]["arguments_schema"].is_object());
-    assert!(input["operations"]["pulse_touch_while_running"]["arguments_schema"].is_object());
-    assert!(input["operations"].get("tap").is_none());
-    assert!(input["operations"].get("pulse_while_running").is_none());
-    assert_eq!(input["input_buttons"], serde_json::json!(["a", "b"]));
+    for operation in [
+        "set_input",
+        "hold_touch",
+        "release_touch",
+        "pulse_touch_while_running",
+    ] {
+        assert!(debug["operations"][operation]["arguments_schema"].is_object());
+    }
+    assert_eq!(debug["input_buttons"], serde_json::json!(["a", "b"]));
+    let pointer = pointer_surface::describe(&status);
+    assert_eq!(pointer["available"], false);
+    assert_eq!(pointer["operations"], serde_json::json!({}));
+    assert_ne!(pointer["next_action"]["tool"], "pointer");
+    assert!(pointer.get("input_buttons").is_none());
+    let mut pointer_status = status.clone();
+    pointer_status["methods"] =
+        serde_json::json!(["move_pointer", "click_pointer", "drag_pointer", "set_input"]);
+    let pointer = pointer_surface::describe(&pointer_status);
+    assert_eq!(pointer["available"], true);
+    assert_eq!(pointer["operations"].as_object().unwrap().len(), 3);
+    assert!(pointer["operations"].get("set_input").is_none());
+    assert!(debug_surface::describe(&pointer_status)["operations"]
+        .get("move_pointer")
+        .is_none());
 
     let shared: SharedLink = Arc::new(Mutex::new(tcp::lazy(
         "127.0.0.1:0",
@@ -468,13 +484,21 @@ async fn named_touch_operations_preserve_the_single_wire_contract() {
             serde_json::json!({"x": 30, "y": 40, "frames": 5}),
         ),
     ] {
-        let result = input_surface::execute(
+        assert!(server
+            .validate_routed_operation(
+                &status,
+                "debug",
+                operation,
+                Some(&revision),
+                debug_surface::supports(operation),
+                debug_surface::advertised(&status, operation)
+            )
+            .is_ok());
+        let result = debug_surface::input::execute(
             &server,
-            RoutedOperationArgs {
-                operation: operation.into(),
-                arguments: Some(arguments.as_object().unwrap().clone()),
-                known_capability_revision: Some(revision.clone()),
-            },
+            &status,
+            operation,
+            Some(arguments.as_object().unwrap().clone()),
         )
         .await;
         assert_ne!(result.is_error, Some(true), "{operation}");

@@ -3,10 +3,13 @@ Copyright (C) 2026 emucap contributors
 The separate Rust control bridge, build recipe, and original documentation are
 licensed GPL-2.0-or-later, the project default.
 
-The supported build applies patches/0001-add-emucap-joystick-override.patch and
-patches/0002-add-emucap-vdp-frame-probe.patch to openMSX 21.0. The modified
-MSXMotherBoard, JoystickPort, and VDP source/header files carry no separate
-license notice. The openMSX release README assigns such files to the GNU GPL
+The supported build applies these patches to openMSX 21.0:
+- patches/0001-add-emucap-joystick-override.patch
+- patches/0002-add-emucap-vdp-frame-probe.patch
+- patches/0003-retain-completed-raster-boundary.patch
+- patches/0004-relocate-managed-disk-state.patch
+The modified motherboard, input, video, reactor and disk source/header files
+carry no separate license notice. The openMSX release README assigns such files to the GNU GPL
 text in doc/GPL.txt, which is version 2, but does not state an unambiguous
 "or later" permission in the project grant. emucap therefore handles the patch
 files and a combined patched host conservatively at the GPL-2.0-only upstream
@@ -17,7 +20,7 @@ The openMSX source package includes C-BIOS machine ROMs under the BSD
 2-Clause license. Their original copyright, license, and disclaimer remain
 authoritative and must accompany any redistribution.
 
-This repository distributes the two patch files and a source-build recipe, but
+This repository distributes the four patch files and a source-build recipe, but
 not the openMSX source tree or binaries, C-BIOS binaries, proprietary MSX system
 ROMs, or game media. See ../../NOTICE.
 

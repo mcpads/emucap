@@ -185,6 +185,36 @@ impl XmlControl {
     pub fn terminal_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.terminal)
     }
+
+    fn command_reply(&mut self, command: &str, deadline: Instant) -> BridgeResult<String> {
+        loop {
+            let event = match self.recv_until(deadline) {
+                Ok(event) => event,
+                Err(error) => {
+                    // XML replies have no request ID. Once a reply is missing, a
+                    // late reply cannot safely be assigned to a rollback command.
+                    self.terminal.store(true, Ordering::Release);
+                    self.shutdown();
+                    return Err(error);
+                }
+            };
+            match event {
+                XmlEvent::Reply { ok: true, text } => return Ok(text),
+                XmlEvent::Reply { ok: false, text } => {
+                    return Err(OpenMsxBridgeError::Emulator(format!(
+                        "openMSX rejected `{command}`: {text}"
+                    )))
+                }
+                XmlEvent::Pause(value) => self.pause = Some(value),
+                XmlEvent::Terminal(message) => {
+                    self.terminal.store(true, Ordering::Release);
+                    self.shutdown();
+                    return Err(OpenMsxBridgeError::Emulator(message));
+                }
+                XmlEvent::Ready => {}
+            }
+        }
+    }
 }
 
 impl OpenMsxControl for XmlControl {
@@ -195,25 +225,16 @@ impl OpenMsxControl for XmlControl {
             ));
         }
         let wire = format!("<command>{}</command>\n", xml_escape(command));
-        self.stdin.write_all(wire.as_bytes())?;
-        self.stdin.flush()?;
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
-        loop {
-            match self.recv_until(deadline)? {
-                XmlEvent::Reply { ok: true, text } => return Ok(text),
-                XmlEvent::Reply { ok: false, text } => {
-                    return Err(OpenMsxBridgeError::Emulator(format!(
-                        "openMSX rejected `{command}`: {text}"
-                    )))
-                }
-                XmlEvent::Pause(value) => self.pause = Some(value),
-                XmlEvent::Terminal(message) => {
-                    self.terminal.store(true, Ordering::Release);
-                    return Err(OpenMsxBridgeError::Emulator(message));
-                }
-                XmlEvent::Ready => {}
-            }
+        if let Err(error) = self
+            .stdin
+            .write_all(wire.as_bytes())
+            .and_then(|_| self.stdin.flush())
+        {
+            self.terminal.store(true, Ordering::Release);
+            self.shutdown();
+            return Err(error.into());
         }
+        self.command_reply(command, Instant::now() + COMMAND_TIMEOUT)
     }
 
     fn advance_frames(&mut self, count: u64) -> BridgeResult<()> {
@@ -258,6 +279,10 @@ impl OpenMsxControl for XmlControl {
         self.child.id()
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "xml_tests.rs"]
+mod tests;
 
 impl Drop for XmlControl {
     fn drop(&mut self) {

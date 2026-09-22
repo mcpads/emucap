@@ -21,7 +21,7 @@ fn xbox_axis_status() -> Value {
 #[test]
 fn describe_projects_live_axis_capability_next_to_the_set_input_schema() {
     let status = xbox_axis_status();
-    let description = describe(&status);
+    let description = crate::debug_surface::describe(&status);
     assert_eq!(description["input_axes"], status["input_axes"]);
     assert!(description["operations"]["set_input"]["arguments_schema"]
         .to_string()

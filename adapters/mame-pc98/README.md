@@ -424,7 +424,7 @@ to -127..127 and a maximum 120-frame movement window. Split larger travel into
 acknowledged moves. Absolute coordinates and wheel input are not advertised
 because the PC-98 mouse port does not provide those controls.
 
-At the Control MCP surface, call `input_control(operation="describe")` and use
+At the Control MCP surface, call `pointer(operation="describe")` and use
 the returned capability revision. A capable session exposes `move_pointer`,
 `click_pointer`, and `drag_pointer`: a movement delta enters MAME's device state
 before an exact frame advance, while the visible cursor follows the guest's own

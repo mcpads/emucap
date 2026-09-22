@@ -233,45 +233,29 @@ fn track_err(error: impl Into<TrackReplyError>) -> CallToolResult {
 }
 
 /// Self-contained guidance shown to every Tracking MCP consumer.
-const SERVER_INSTRUCTIONS: &str = r#"emucap Tracking MCP stores experiment records under `.emucap/` so runs can be reproduced and compared. It does not control an emulator. Use Control MCP (`emucap-mcp`) for memory, execution, screenshots, and input; pass the required values between the two servers explicitly.
+const SERVER_INSTRUCTIONS: &str = r#"emucap Tracking MCP stores experiment records under `.emucap/` for reproduction and comparison. Use Control MCP for emulator observation and control, and pass values between the servers explicitly.
 
-[Identity from Control MCP]
-- Pass `get_rom_info.rom_sha1` unchanged to `run_start` and ROM-scoped queries. Despite the legacy field name, treat it as an opaque Tracking identifier. When Control MCP returns `content_identity`, that identity covers the complete composite input. Never substitute a hash of only a CUE or another descriptor.
-- Treat `run_id`, `finding_id`, and ROM identifiers as opaque returned values. Do not invent paths or normalize them; stored identifiers use ASCII letters and digits separated only by single hyphens.
-- `connection_ref` is optional. Use `status.emulator_identity.name`, or `"port:" + status.listening_port`. It lets `run_start` resume the same unfinished run or supersede an older run for that connection.
-- Record Control MCP analysis results with `log_gate` or `log_metric`.
-- Mutations such as `write_memory`, `load_state`, `reset`, and input are not recorded automatically. Call `log_intervention` when they matter to reproduction.
+## Identity and ownership
 
-[Storage and ownership]
-The ledger root is `EMUCAP_TRACK_ROOT`, otherwise the nearest Git repository's `.emucap`, otherwise the current directory's `.emucap`. `bootstrap` returns `ledger_path`, `ledger_path_source`, and a warning for the current-directory fallback. Keep a single writer for `run.json`: do not run a separate writer such as `emucap track import` against the same live ledger. Give concurrent broker sessions separate ledger roots.
+Pass `get_rom_info.rom_sha1` unchanged from Control to `run_start` and ROM-scoped queries. Treat this legacy field as an opaque identifier; Control's `content_identity` covers the complete composite input. Reuse returned run, finding and ROM identifiers exactly.
 
-[Run lifecycle]
-- `run_start(rom_sha1, connection_ref?, goal?, description?, tags?)` selects a new active run. With the same `connection_ref` and ROM, it resumes an unfinished run and returns `resumed:true`. With a different ROM, it supersedes the previous unfinished run for that connection.
-- `run_resume(run_id)` reselects a stored running run after an MCP reconnect. It never creates a new run. A finished run cannot be resumed.
-- `log_metric`, `log_gate`, `log_artifact`, `set_reproduction`, and `log_intervention` require an active run. `log_finding` accepts either an active run or an explicit `rom_sha1`.
-- `run_finish(status=done|aborted|error, run_id?)` finishes the selected run or a run named by ID. Resume a run that will continue; finish only a run that will not.
+An optional `connection_ref` associates a run with `status.emulator_identity.name` or `"port:" + status.listening_port`.
 
-[Records]
-- `log_metric` stores a numeric observation.
-- `log_gate` stores machine or judgment evidence; omitted `passed` means pending.
-- `log_artifact` registers an existing file and computes its SHA-256. It does not capture a new artifact.
-- `set_reproduction` sets the base and movie reference; reproduction status is derived.
-- `log_finding` stores a ROM-scoped claim. `promoted:true` marks a confirmed finding.
-- `log_intervention` stores a state-changing operation and its context.
+Start with `bootstrap` to inspect `ledger_path`, its source and any fallback warning. Storage uses `EMUCAP_TRACK_ROOT`, otherwise the nearest Git repository's `.emucap`, otherwise the current directory's `.emucap`. Keep one writer per live ledger and give concurrent broker sessions separate roots. Transfer writer ownership before using another writer on that ledger.
 
-[Queries]
-- `query_runs` lists filtered runs, newest first. Corrupt JSON is counted as skipped instead of aborting the query.
-- `get_run` returns a stored `run.json` and its ledger path.
-- Missing runs return `run_not_found`; malformed identifiers return `invalid_identifier`. Filesystem diagnostics are reserved for actual ledger failures.
-- `compare_runs` compares metrics, gates, reproduction, interventions, and files.
-- `summarize_runs` aggregates status, reproduction, gates, interventions, and per-run summaries.
-The server reports stored evidence; it does not decide whether an experiment succeeded.
+## Run lifecycle
 
-[Large results]
-Use `output_path` with `query_runs` or `summarize_runs` to write JSON to a file and receive a compact summary. Full memory dumps belong to Control MCP `dump_memory`; Tracking MCP has no memory-dump tool.
+`run_start` selects an active run. For the same connection and ROM it resumes an unfinished run with `resumed:true`; a different ROM supersedes that connection's unfinished run. After reconnect, use `run_resume(run_id)` to reselect a stored running run.
 
-[CLI]
-`emucap track ls|show|compare|summarize|reindex|import` reads the same ledger."#;
+Logging and reproduction updates require an active run; `log_finding` also accepts an explicit ROM identifier. Use `run_finish` when work on that run has ended, and resume work that will continue.
+
+## Evidence and queries
+
+Record relevant Control mutations explicitly with `log_intervention`. Use `log_metric` for numeric observations and `log_gate` for machine or judgment evidence; an omitted `passed` means pending. `log_artifact` registers an existing file and computes its SHA-256. `set_reproduction` sets the base and movie reference from which reproduction status is derived. Promote a finding after its claim is confirmed.
+
+Use run queries, comparisons and summaries to inspect stored evidence, then assess the outcome against the experiment's criteria. Query results report skipped corrupt records. Missing runs and malformed identifiers have distinct structured errors.
+
+For large query or summary results, use `output_path` to receive a compact summary and a JSON file. Produce emulator artifacts through Control and register the resulting files here."#;
 
 // ── 도구 구현 ────────────────────────────────────────────────────────────────
 

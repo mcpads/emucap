@@ -17,7 +17,7 @@ const REGISTER_NAMES: [&str; 16] = [
 
 pub(super) const DEBUGGER_EXCEPTION: &str = "openmsx.breakpoint.pausing-subset";
 
-const DEBUGGER_TCL: &str = r#"namespace eval ::emucap {
+pub(super) const DEBUGGER_TCL: &str = r#"namespace eval ::emucap {
     variable seq 0
     variable queue {}
     variable queue_bytes 0
@@ -80,7 +80,7 @@ const DEBUGGER_TCL: &str = r#"namespace eval ::emucap {
                 [encoding convertto utf-8 $capture_error]]
         }
 
-        set record "$seq|$id|$kind|$pc|$address|$value|[join $registers ,]|[join $snapshots ;]|$capture_error"
+        set record "$seq|$id|$kind|$pc|$address|$value|[join $registers ,]|[join $snapshots {;}]|$capture_error"
         if {[catch {
             set record_bytes [expr {[string length $record] + 1}]
             while {[llength $queue] >= 64 || ($queue_bytes + $record_bytes) > 1048576} {

@@ -309,7 +309,7 @@ fn assert_modern_server(binary: &str, expected_name: &str, envs: &[(&str, String
             "list_breakpoints",
             "clear_all_breakpoints",
             "poll_events",
-            "input_control",
+            "pointer",
             "debug",
             "analysis",
         ] {
@@ -589,14 +589,14 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
         .collect();
     assert!(initial_names.contains(&"analysis"));
     assert!(initial_names.contains(&"debug"));
-    assert!(initial_names.contains(&"input_control"));
+    assert!(initial_names.contains(&"pointer"));
     assert!(initial_names.contains(&"step"));
     assert!(!initial_names.contains(&"regression_run"));
     assert!(!initial_names.contains(&"verify_determinism"));
     assert_eq!(initial["result"]["ttlMs"], STATIC_MCP_METADATA_TTL_MS);
     assert_eq!(initial["result"]["cacheScope"], "public");
 
-    for (id, name) in [(30, "debug"), (31, "input_control")] {
+    for (id, name) in [(30, "debug"), (31, "pointer")] {
         let described = server.request(modern_request(
             id,
             "tools/call",
@@ -687,6 +687,104 @@ fn control_analysis_dispatcher_loads_schemas_and_executes_in_the_same_session() 
     let revision = debug_description["capability_revision"]
         .as_str()
         .expect("debug capability revision");
+    assert!(debug_description["operations"]["set_input"].is_object());
+    let pointer = server.request(modern_request(
+        43,
+        "tools/call",
+        json!({
+            "name":"pointer", "arguments":{"operation":"describe"}
+        }),
+    ));
+    assert_eq!(pointer["result"]["structuredContent"]["available"], false);
+    assert_eq!(
+        pointer["result"]["structuredContent"]["operations"],
+        json!({})
+    );
+    let set_input_calls = || {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|method| *method == "set_input")
+            .count()
+    };
+    let before = set_input_calls();
+    for (route, operation, known_revision, arguments) in [
+        (
+            "pointer",
+            "set_input",
+            Some(revision),
+            json!({"buttons":["a"]}),
+        ),
+        (
+            "debug",
+            "move_pointer",
+            Some(revision),
+            json!({"dx":1,"dy":0,"frames":1}),
+        ),
+        ("debug", "set_input", None, json!({"buttons":["a"]})),
+        (
+            "debug",
+            "set_input",
+            Some("stale"),
+            json!({"buttons":["a"]}),
+        ),
+        (
+            "debug",
+            "set_input",
+            Some(revision),
+            json!({"buttons":[],"bogus":true}),
+        ),
+        (
+            "debug",
+            "set_input",
+            Some(revision),
+            json!({"buttons":[],"axes":{"unknown":1}}),
+        ),
+    ] {
+        let result = server.request(modern_request(
+            44,
+            "tools/call",
+            json!({
+                "name":route,"arguments":{"operation":operation,"arguments":arguments,
+                    "known_capability_revision":known_revision}
+            }),
+        ));
+        assert_eq!(result["result"]["isError"], true, "{result}");
+    }
+    let removed = server.request(modern_request(
+        45,
+        "tools/call",
+        json!({
+            "name":"input_control", "arguments":{"operation":"describe"}
+        }),
+    ));
+    assert!(removed["error"].is_object());
+    assert_eq!(
+        set_input_calls(),
+        before,
+        "rejected routes must not mutate input"
+    );
+    let held = server.request(modern_request(
+        46,
+        "tools/call",
+        json!({
+            "name":"debug", "arguments":{"operation":"set_input",
+                "known_capability_revision":revision,"arguments":{"buttons":["a"]}}
+        }),
+    ));
+    assert_ne!(held["result"]["isError"], true, "{held}");
+    let released = server.request(modern_request(
+        47,
+        "tools/call",
+        json!({
+            "name":"debug", "arguments":{"operation":"set_input",
+                "known_capability_revision":revision,"arguments":{"buttons":[]}}
+        }),
+    ));
+    assert_ne!(released["result"]["isError"], true, "{released}");
+    assert_eq!(set_input_calls(), before + 2);
+
     let searched = server.request(modern_request(
         42,
         "tools/call",

@@ -126,6 +126,30 @@ elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$FRAME_PROBE_PATCH" >/dev/null 
   exit 1
 fi
 
+RASTER_PATCH="$HERE/patches/0003-retain-completed-raster-boundary.patch"
+[ "$(sha256_path "$RASTER_PATCH")" = "$OPENMSX_RASTER_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX raster patch digest does not match upstream.lock" >&2
+  exit 1
+}
+if patch -d "$SRC" -p1 --forward --dry-run <"$RASTER_PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward <"$RASTER_PATCH"
+elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$RASTER_PATCH" >/dev/null 2>&1; then
+  echo "ERROR: openMSX raster patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+
+DISK_STATE_PATCH="$HERE/patches/0004-relocate-managed-disk-state.patch"
+[ "$(sha256_path "$DISK_STATE_PATCH")" = "$OPENMSX_DISK_STATE_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX disk state patch digest does not match upstream.lock" >&2
+  exit 1
+}
+if patch -d "$SRC" -p1 --forward --dry-run <"$DISK_STATE_PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward <"$DISK_STATE_PATCH"
+elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$DISK_STATE_PATCH" >/dev/null 2>&1; then
+  echo "ERROR: openMSX disk state patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+
 INSTALL_BASE="$SRC/install"
 perl -0pi -e "s{^INSTALL_BASE\\s*[:?+]?=.*\$}{INSTALL_BASE:=$INSTALL_BASE}m" \
   "$SRC/build/custom.mk"
@@ -177,6 +201,8 @@ SIDECAR="$BUILD_DIR/emucap-openmsx-build.json"
   printf '  "sdl2_compat_patch_sha256": "%s",\n' "$OPENMSX_SDL2_COMPAT_PATCH_SHA256"
   printf '  "emucap_patch_sha256": "%s",\n' "$OPENMSX_EMUCAP_PATCH_SHA256"
   printf '  "frame_probe_patch_sha256": "%s",\n' "$OPENMSX_FRAME_PROBE_PATCH_SHA256"
+  printf '  "raster_patch_sha256": "%s",\n' "$OPENMSX_RASTER_PATCH_SHA256"
+  printf '  "disk_state_patch_sha256": "%s",\n' "$OPENMSX_DISK_STATE_PATCH_SHA256"
   printf '  "native_patch": true\n'
   printf '}\n'
 } >"$SIDECAR"

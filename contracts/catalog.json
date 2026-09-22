@@ -617,7 +617,7 @@
       "id": "input.hold",
       "surface": "public",
       "methods": ["set_input"],
-      "route": "input_control",
+      "route": "debug",
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
       "expectations": ["INPUT.HOLD.RELEASE.1", "TIME.PERSISTENT.1"]
@@ -634,7 +634,7 @@
       "id": "input.running-pulse",
       "surface": "public",
       "methods": ["pulse_while_running"],
-      "route": "input_control",
+      "route": "debug",
       "temporal_classes": ["T2"],
       "disposition": "retain",
       "expectations": ["INPUT.PULSE.SAME_WINDOW.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
@@ -651,7 +651,7 @@
       "id": "input.touch-hold",
       "surface": "public",
       "methods": ["hold_touch"],
-      "route": "input_control",
+      "route": "debug",
       "temporal_classes": ["T0/P"],
       "disposition": "retain",
       "expectations": ["INPUT.TOUCH.HOLD.1", "TIME.PERSISTENT.1"]
@@ -660,7 +660,7 @@
       "id": "input.touch-release",
       "surface": "public",
       "methods": ["release_touch"],
-      "route": "input_control",
+      "route": "debug",
       "temporal_classes": ["T0"],
       "disposition": "retain",
       "expectations": ["INPUT.TOUCH.RELEASE.1"]
@@ -669,7 +669,7 @@
       "id": "input.touch-running-pulse",
       "surface": "public",
       "methods": ["pulse_touch_while_running"],
-      "route": "input_control",
+      "route": "debug",
       "temporal_classes": ["T2"],
       "disposition": "retain",
       "expectations": ["INPUT.TOUCH.PULSE.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1"]
@@ -686,7 +686,7 @@
       "id": "input.hold-until",
       "surface": "public",
       "methods": ["hold_until"],
-      "route": "input_control",
+      "route": "debug",
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["INPUT.PULSE.CLEANUP.1", "TIME.GAP.1"]
@@ -695,7 +695,7 @@
       "id": "input.pointer-move",
       "surface": "public",
       "methods": ["move_pointer"],
-      "route": "input_control",
+      "route": "pointer",
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["INPUT.POINTER.MOVE.1", "INPUT.POINTER.HANDOFF.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1", "TIME.GAP.1"]
@@ -704,7 +704,7 @@
       "id": "input.pointer-click",
       "surface": "public",
       "methods": ["click_pointer"],
-      "route": "input_control",
+      "route": "pointer",
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["INPUT.POINTER.CLICK.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1", "TIME.GAP.1"]
@@ -713,7 +713,7 @@
       "id": "input.pointer-drag",
       "surface": "public",
       "methods": ["drag_pointer"],
-      "route": "input_control",
+      "route": "pointer",
       "temporal_classes": ["T1"],
       "disposition": "retain",
       "expectations": ["INPUT.POINTER.DRAG.1", "INPUT.POINTER.HANDOFF.1", "INPUT.PULSE.CLEANUP.1", "TIME.RESPONSE.1", "TIME.PROGRESS.1", "TIME.COMPLETE.1", "TIME.STOP.1", "TIME.GAP.1"]

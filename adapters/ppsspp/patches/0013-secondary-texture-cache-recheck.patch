@@ -1,0 +1,14 @@
+diff --git a/GPU/Common/TextureCacheCommon.cpp b/GPU/Common/TextureCacheCommon.cpp
+--- a/GPU/Common/TextureCacheCommon.cpp
++++ b/GPU/Common/TextureCacheCommon.cpp
+@@ -2674,6 +2674,10 @@
+ 						--entry->numInvalidated;
+ 					}
+ 
++					// A secondary hit validates the archived texture, not the primary.
++					// Recheck the primary on the next draw, even in this sync domain.
++					entry->status |= TexStatus::HASH_RECHECK;
++
+ 					// Now just use our archived texture, instead of entry.
+ 					nextTexture_ = secondEntry;
+ 					return true;

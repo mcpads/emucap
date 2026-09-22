@@ -70,6 +70,11 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
   - `patches/0010-emucap-stepping-reason.patch` preserves the native stop reason and related
     address after PPSSPP clears the pending step command, so breakpoint events no longer need to
     infer every stop from PC or hit-count deltas.
+  - `patches/0013-secondary-texture-cache-recheck.patch` keeps the primary texture subject to
+    hash validation after a secondary-cache hit. An archived texture matching RAM does not
+    validate the primary texture: another draw in the same sync domain must still select the
+    matching archive instead of binding stale primary pixels. This fixes menu-return glyph
+    corruption in the common hardware-renderer cache without changing game data or control APIs.
 - `cpu.stepInto`/`stepOver`/`stepOut`/`runUntil`/`nextHLE` ack via a *differently named* spontaneous
   `cpu.stepping` event rather than a reply of their own name (`SteppingSubscriber.cpp`) — the bridge
   handles this with a send-then-wait-for-a-different-event primitive, not a naive call/reply demux.
@@ -259,6 +264,11 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
   `auto_savestate`/`snapshot` breakpoint options.
 
 ## Operational notes
+
+- **Texture-cache regression check**: after applying the patch stack, run
+  `python3 _tests/native/ppsspp-texture-cache-test.py adapters/ppsspp/work/ppsspp/GPU/Common/TextureCacheCommon.cpp`
+  from the repository root. It compiles the actual hash-admission and secondary-selection branches
+  with symbolic GPU objects under ASan/UBSan. Renderer and game-route validation remain separate.
 
 - **Halt-on-start**: `--debugger` forces `startBreak=true` — `resume` to run after the bridge
   attaches.

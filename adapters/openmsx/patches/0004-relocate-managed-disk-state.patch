@@ -1,0 +1,136 @@
+--- a/src/MSXMotherBoard.hh
++++ b/src/MSXMotherBoard.hh
+@@ -9,6 +9,7 @@
+ #include "serialize_meta.hh"
+ #include "xxhash.hh"
+ 
++#include <optional>
+ #include <array>
+ #include <cassert>
+ #include <cstdint>
+@@ -270,6 +271,13 @@
+ 		return keyboards.empty() ? nullptr : keyboards.front();
+ 	}
+ 
++	// Candidate-local relocation context, never serialized or shared with a live board.
++	struct RestoreDiskImage {
++		std::string path;
++		bool consumed = false;
++	};
++	std::optional<RestoreDiskImage> restoreDiskImage;
++
+ 	template<typename Archive>
+ 	void serialize(Archive& ar, unsigned version);
+ 
+--- a/src/Reactor.cc
++++ b/src/Reactor.cc
+@@ -1,4 +1,5 @@
+ #include "Reactor.hh"
++#include "Debugger.hh"
+ 
+ #include "AfterCommand.hh"
+ #include "AviRecorder.hh"
+@@ -1063,14 +1064,25 @@
+ void RestoreMachineCommand::execute(std::span<const TclObject> tokens,
+                                     TclObject& result)
+ {
+-	checkNumArgs(tokens, 2, Prefix{1}, "filename");
++	checkNumArgs(tokens, Between{2, 4}, Prefix{1}, "filename ?-emucap ?disk-image??");
++	const bool managed = tokens.size() >= 3;
++	if (managed && tokens[2] != "-emucap") throw CommandException("Expected -emucap");
++	if (managed && !reactor.getMotherBoard()) throw CommandException("No active machine");
+ 	auto newBoard = reactor.createEmptyMotherBoard();
++	if (tokens.size() == 4) {
++		newBoard->restoreDiskImage.emplace(std::string(tokens[3].getString()));
++	}
+ 
+ 	const auto filename = FileOperations::expandTilde(std::string(tokens[1].getString()));
+ 
+ 	try {
+ 		XmlInputArchive in(filename);
+ 		in.serialize("machine", *newBoard);
++		if (newBoard->restoreDiskImage && !newBoard->restoreDiskImage->consumed) {
++			throw MSXException("Managed disk snapshot has no populated drive A");
++		}
++		newBoard->restoreDiskImage.reset();
++		if (managed) newBoard->getDebugger().transfer(reactor.getMotherBoard()->getDebugger());
+ 	} catch (XMLException& e) {
+ 		throw CommandException("Cannot load state, bad file format: ",
+ 		                       e.getMessage());
+--- a/src/fdc/DiskChanger.hh
++++ b/src/fdc/DiskChanger.hh
+@@ -86,6 +86,7 @@
+ 	void stopReplay(EmuTime time) noexcept override;
+ 
+ private:
++	MSXMotherBoard* motherBoard = nullptr;
+ 	Reactor& reactor;
+ 	CommandController& controller;
+ 	StateChangeDistributor* stateChangeDistributor;
+--- a/src/fdc/DiskChanger.cc
++++ b/src/fdc/DiskChanger.cc
+@@ -39,7 +39,8 @@
+                          bool createCmd,
+                          bool doubleSidedDrive_,
+                          std::function<void()> preChangeCallback_)
+-	: reactor(board.getReactor())
++	: motherBoard(&board)
++	, reactor(board.getReactor())
+ 	, controller(board.getCommandController())
+ 	, stateChangeDistributor(&board.getStateChangeDistributor())
+ 	, scheduler(&board.getScheduler())
+@@ -329,7 +330,17 @@
+ 	ar.serialize("checksum", oldChecksum);
+ 
+ 	if constexpr (Archive::IS_LOADER) {
+-		diskName.updateAfterLoadState();
++		auto* relocation = motherBoard && motherBoard->restoreDiskImage
++		                 ? &*motherBoard->restoreDiskImage : nullptr;
++		if (relocation && !diskName.getResolved().empty()) {
++			if (driveName != "diska" || relocation->consumed || !patches.empty()) {
++				throw MSXException("Managed disk snapshot requires one unpatched drive A");
++			}
++			diskName = DiskName(Filename(relocation->path), {});
++			relocation->consumed = true;
++		} else {
++			diskName.updateAfterLoadState();
++		}
+ 		if (std::string name = diskName.getResolved(); // TODO use Filename
+ 		    !name.empty()) {
+ 			// Only when the original file doesn't exist on this
+@@ -338,7 +349,7 @@
+ 			// sha1sum (the original file may have changed). An
+ 			// alternative is to prefer the exact sha1sum match.
+ 			// I'm not sure which alternative is better.
+-			if (!FileOperations::exists(name)) {
++			if (!relocation && !FileOperations::exists(name)) {
+ 				assert(!oldChecksum.empty());
+ 				auto file = filePool.getFile(
+ 					FileType::DISK, Sha1Sum(oldChecksum));
+@@ -365,6 +376,9 @@
+ 		}
+ 
+ 		std::string newChecksum = calcSha1(getSectorAccessibleDisk(), filePool);
++		if (relocation && oldChecksum != newChecksum) {
++			throw MSXException("Managed disk snapshot checksum mismatch");
++		}
+ 		if (oldChecksum != newChecksum && scheduler && scheduler->getCurrentTime() != EmuTime::zero()) {
+ 			controller.getCliComm().printWarning(
+ 				"The content of the disk image ",
+--- a/src/fdc/DSKDiskImage.cc
++++ b/src/fdc/DSKDiskImage.cc
+@@ -39,10 +39,10 @@
+ 
+ Sha1Sum DSKDiskImage::getSha1SumImpl(FilePool& filePool)
+ {
+-	if (hasPatches()) {
+-		return SectorAccessibleDisk::getSha1SumImpl(filePool);
+-	}
+-	return filePool.getSha1Sum(*file);
++	// Writable DSKs can have buffered writes and multiple writes within one
++	// file-pool timestamp tick. Hash the device bytes; the sector-level cache
++	// is already invalidated by every guest write.
++	return SectorAccessibleDisk::getSha1SumImpl(filePool);
+ }
+ 
+ } // namespace openmsx

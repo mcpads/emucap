@@ -107,12 +107,12 @@ openMSX
   Upstream: https://github.com/openMSX/openMSX
   Pinned source: 21.0
   License: GNU GPL version 2 for the modified host boundary. The supported build
-           applies a pinned upstream SDL2 compatibility backport plus two emucap
+           applies a pinned upstream SDL2 compatibility backport plus four emucap
            patches to source files that carry no separate license notice and
            therefore use the release README's default GPL.txt (version 2).
   Used by: adapters/openmsx and emucap-openmsx-bridge (source-build recipe and
-           external XML control; joystick ownership and VDP frame probe patches;
-           C-BIOS MSX2+ cartridge profile)
+           external XML control; joystick ownership, VDP frame probe, completed raster
+           and disk-state relocation patches; experimental MSX profiles)
   Bundled C-BIOS machine ROMs are BSD 2-Clause and retain their upstream notices.
   Distribution: emucap ships the patch sources and build recipe, not emulator
                 binaries, proprietary system ROMs, or game media.

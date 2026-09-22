@@ -1,0 +1,157 @@
+--- a/src/video/Renderer.hh
++++ b/src/video/Renderer.hh
+@@ -25,6 +25,10 @@
+ public:
+ 	virtual ~Renderer() = default;
+ 
++	// Native frame whose completed pixels have reached the raw screenshot buffer.
++	// -1 means no complete frame is available after renderer initialization.
++	[[nodiscard]] virtual int getEmucapRasterFrame() const { return -1; }
++
+ 	/** See VDP::getPostProcessor. */
+ 	[[nodiscard]] virtual PostProcessor* getPostProcessor() const = 0;
+ 
+--- a/src/video/PixelRenderer.hh
++++ b/src/video/PixelRenderer.hh
+@@ -32,6 +32,8 @@
+ 	PixelRenderer(VDP& vdp, Display& display);
+ 	~PixelRenderer() override;
+ 
++	[[nodiscard]] int getEmucapRasterFrame() const override { return emucapRasterFrame; }
++
+ 	// Renderer interface:
+ 	[[nodiscard]] PostProcessor* getPostProcessor() const override;
+ 	void reInit() override;
+@@ -61,6 +63,8 @@
+ 	void updateWindow(bool enabled, EmuTime time) override;
+ 
+ private:
++	int emucapCompletedFrame = -1;
++	int emucapRasterFrame = -1;
+ 	/** Indicates whether the area to be drawn is border or display. */
+ 	enum DrawType : uint8_t { DRAW_BORDER, DRAW_DISPLAY };
+ 
+--- a/src/video/PixelRenderer.cc
++++ b/src/video/PixelRenderer.cc
+@@ -146,6 +146,8 @@
+ 
+ void PixelRenderer::reInit()
+ {
++	emucapCompletedFrame = -1;
++	emucapRasterFrame = -1;
+ 	// Don't draw before frameStart() is called.
+ 	// This for example can happen after a loadstate or after switching
+ 	// renderer in the middle of a frame.
+@@ -199,13 +201,18 @@
+ 
+ 	if (paintFrame) {
+ 		frameSkipCounter = std::remainder(frameSkipCounter, 1.0f);
+-	} else if (!rasterizer->isRecording()) {
++	} else if (!rasterizer->isRecording() && !renderSettings.getEmucapRasterCapture()) {
+ 		renderFrame = false;
+ 		return;
+ 	}
+ 	renderFrame = true;
+ 
+ 	rasterizer->frameStart(time);
++	// SDLRasterizer rotates the completed buffer in frameStart(), not frameEnd().
++	emucapRasterFrame = (renderSettings.getEmucapRasterCapture() &&
++	                     !renderSettings.getDeinterlace() && !renderSettings.getDeflicker())
++	                   ? emucapCompletedFrame : -1;
++	emucapCompletedFrame = -1;
+ 
+ 	accuracy = renderSettings.getAccuracy();
+ 
+@@ -225,6 +232,7 @@
+ 		// Let underlying graphics system finish rendering this frame.
+ 		auto time1 = Timer::getTime();
+ 		rasterizer->frameEnd();
++		emucapCompletedFrame = vdp.getEmucapFrameCount();
+ 		auto time2 = Timer::getTime();
+ 		auto current = narrow_cast<float>(time2 - time1);
+ 		const float ALPHA = 0.2f;
+--- a/src/video/RenderSettings.hh
++++ b/src/video/RenderSettings.hh
+@@ -25,6 +25,7 @@
+ class RenderSettings final : private Observer<Setting>
+ {
+ public:
++	[[nodiscard]] bool getEmucapRasterCapture() const { return emucapRasterCaptureSetting.getBoolean(); }
+ 	/** Enumeration of Renderers known to openMSX.
+ 	  * This is the full list, the list of available renderers may be smaller.
+ 	  */
+@@ -219,6 +220,7 @@
+ 	void parseColorMatrix(Interpreter& interp, const TclObject& value);
+ 
+ private:
++	BooleanSetting emucapRasterCaptureSetting;
+ 	EnumSetting<Accuracy> accuracySetting;
+ 	BooleanSetting deinterlaceSetting;
+ 	BooleanSetting deflickerSetting;
+--- a/src/video/RenderSettings.cc
++++ b/src/video/RenderSettings.cc
+@@ -42,7 +42,11 @@
+ }
+ 
+ RenderSettings::RenderSettings(CommandController& commandController)
+-	: accuracySetting(commandController,
++	: emucapRasterCaptureSetting(commandController,
++		"emucap_raster_capture", "retain each completed VDP raster for bounded capture",
++		false, Setting::Save::NO)
++
++	, accuracySetting(commandController,
+ 		"accuracy", "rendering accuracy", Accuracy::PIXEL,
+ 		EnumSetting<Accuracy>::Map{
+ 			{"screen", Accuracy::SCREEN},
+--- a/src/video/VDP.hh
++++ b/src/video/VDP.hh
+@@ -67,6 +67,7 @@
+                 , private Observer<Setting>
+ {
+ public:
++	[[nodiscard]] int getEmucapFrameCount() const { return frameCount; }
+ 	/** Number of VDP clock ticks per second.
+ 	  */
+ 	static constexpr int TICKS_PER_SECOND = 3579545 * 6; // 21.5MHz;
+@@ -1112,6 +1113,11 @@
+ 		[[nodiscard]] int calc(const EmuTime& time) const override;
+ 	} cycleInLineInfo;
+ 
++	struct EmucapRasterFrameInfo final : Info {
++		explicit EmucapRasterFrameInfo(VDP& vdp);
++		[[nodiscard]] int calc(const EmuTime& time) const override;
++	} emucapRasterFrameInfo;
++
+ 	struct MsxYPosInfo final : Info {
+ 		explicit MsxYPosInfo(VDP& vdp);
+ 		[[nodiscard]] int calc(const EmuTime& time) const override;
+--- a/src/video/VDP.cc
++++ b/src/video/VDP.cc
+@@ -92,6 +92,7 @@
+ 	, cycleInFrameInfo (*this)
+ 	, lineInFrameInfo  (*this)
+ 	, cycleInLineInfo  (*this)
++	, emucapRasterFrameInfo(*this)
+ 	, msxYPosInfo      (*this)
+ 	, msxX256PosInfo   (*this)
+ 	, msxX512PosInfo   (*this)
+@@ -1784,6 +1785,19 @@
+ }
+ 
+ 
++// Completed raw raster provenance is renderer-owned and is never serialized.
++VDP::EmucapRasterFrameInfo::EmucapRasterFrameInfo(VDP& vdp_)
++	: Info(vdp_, "emucap_raster_frame",
++	       "Native VDP frame in the retained completed raster, or -1 if unavailable.")
++{
++}
++
++int VDP::EmucapRasterFrameInfo::calc(const EmuTime& /*time*/) const
++{
++	return vdp.renderer->getEmucapRasterFrame();
++}
++
++
+ // class FrameCountInfo
+ 
+ VDP::FrameCountInfo::FrameCountInfo(VDP& vdp_)

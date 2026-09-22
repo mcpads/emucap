@@ -210,6 +210,32 @@ fn process_state_requires_matching_start_identity() {
         start_identity: Some("different-start".into()),
     };
     assert_eq!(process_state(&reused), ProcessState::Exited);
+    let unknown = ProcessIdentity {
+        pid: captured.pid,
+        start_identity: None,
+    };
+    assert_eq!(process_state(&unknown), ProcessState::Unknown);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn exited_unreaped_child_is_not_an_unknown_termination_target() {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let identity = capture_process(child.id());
+    assert!(identity.start_identity.is_some());
+    child.kill().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while process_start_identity(child.id()).is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Intentionally observe before wait/reap: macOS kill(0) still finds this PID,
+    // but PROC_PIDTBSDINFO reports ESRCH. It must not become an unsafe live target.
+    let observed = process_state(&identity);
+    child.wait().unwrap();
+    assert_eq!(observed, ProcessState::Exited);
 }
 
 #[test]

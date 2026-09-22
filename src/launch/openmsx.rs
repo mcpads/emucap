@@ -29,7 +29,7 @@ use super::{
     terminate_detached, LaunchSpec, RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 3;
+pub const REQUIRED_HOST_API: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -40,6 +40,8 @@ pub struct BuildMetadata {
     pub sdl2_compat_patch_sha256: String,
     pub emucap_patch_sha256: String,
     pub frame_probe_patch_sha256: String,
+    pub raster_patch_sha256: String,
+    pub disk_state_patch_sha256: String,
     pub native_patch: bool,
 }
 
@@ -189,6 +191,10 @@ pub fn require_compatible_build(repo_root: &Path, binary: &Path) -> io::Result<B
             == required_lock_value(&lock, "OPENMSX_EMUCAP_PATCH_SHA256")?
         && metadata.frame_probe_patch_sha256
             == required_lock_value(&lock, "OPENMSX_FRAME_PROBE_PATCH_SHA256")?
+        && metadata.raster_patch_sha256
+            == required_lock_value(&lock, "OPENMSX_RASTER_PATCH_SHA256")?
+        && metadata.disk_state_patch_sha256
+            == required_lock_value(&lock, "OPENMSX_DISK_STATE_PATCH_SHA256")?
         && metadata.native_patch;
     if !matches_lock {
         return Err(io::Error::new(

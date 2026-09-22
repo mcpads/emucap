@@ -707,9 +707,19 @@ pub fn process_state(process: &ProcessIdentity) -> ProcessState {
 
 fn process_start_identity_matches(pid: u32, expected: &str) -> Option<bool> {
     #[cfg(target_os = "macos")]
-    if !expected.starts_with("macos-bsdinfo:") {
-        return legacy_macos_process_start_identity(pid).map(|actual| actual == expected);
+    {
+        if !expected.starts_with("macos-bsdinfo:") {
+            return legacy_macos_process_start_identity(pid).map(|actual| actual == expected);
+        }
+        // ESRCH also identifies an exited, unreaped child on macOS, even while
+        // kill(pid, 0) succeeds. Other observation failures remain unknown.
+        match macos_process_start_identity(pid) {
+            Ok(Some(actual)) => Some(actual == expected),
+            Ok(None) => Some(false),
+            Err(_) => None,
+        }
     }
+    #[cfg(not(target_os = "macos"))]
     process_start_identity(pid).map(|actual| actual == expected)
 }
 
@@ -724,9 +734,15 @@ fn process_start_identity(pid: u32) -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn process_start_identity(pid: u32) -> Option<String> {
-    let pid = libc::pid_t::try_from(pid).ok()?;
+    macos_process_start_identity(pid).ok().flatten()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_start_identity(pid: u32) -> io::Result<Option<String>> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid outside platform range"))?;
     let size = std::mem::size_of::<libc::proc_bsdinfo>();
-    let buffer_size = libc::c_int::try_from(size).ok()?;
+    let buffer_size = libc::c_int::try_from(size).expect("proc_bsdinfo fits c_int");
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     let read = unsafe {
         libc::proc_pidinfo(
@@ -738,17 +754,30 @@ fn process_start_identity(pid: u32) -> Option<String> {
         )
     };
     if read != buffer_size {
-        return None;
+        let error = io::Error::last_os_error();
+        return if read == 0 && error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else if read == 0 {
+            Err(error)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "incomplete proc_bsdinfo",
+            ))
+        };
     }
     let info = unsafe { info.assume_init() };
     if info.pbi_pid != pid as u32 || info.pbi_start_tvsec == 0 || info.pbi_start_tvusec >= 1_000_000
     {
-        return None;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid process start identity",
+        ));
     }
-    Some(format!(
+    Ok(Some(format!(
         "macos-bsdinfo:{}:{:06}",
         info.pbi_start_tvsec, info.pbi_start_tvusec
-    ))
+    )))
 }
 
 #[cfg(target_os = "macos")]

@@ -1,3 +1,6 @@
+#[path = "debug_input.rs"]
+pub(crate) mod input;
+
 use std::sync::Arc;
 
 use rmcp::handler::server::wrapper::Parameters;
@@ -15,6 +18,12 @@ use crate::args::{
 use crate::{analysis_surface, invalid_request_result, recording, tool_output_result, Emucap};
 
 const OPERATIONS: &[&str] = &[
+    "set_input",
+    "hold_touch",
+    "release_touch",
+    "pulse_touch_while_running",
+    "pulse_while_running",
+    "hold_until",
     "dismiss_failure",
     "find_pattern",
     "dump_memory",
@@ -66,6 +75,7 @@ fn add<T: schemars::JsonSchema>(
 
 pub(crate) fn describe(status: &Value) -> Value {
     let mut operations = Map::new();
+    input::describe(status, &mut operations);
     add::<EmptyArgs>(
         &mut operations,
         status,
@@ -167,6 +177,8 @@ pub(crate) fn describe(status: &Value) -> Value {
         "surface": "debug",
         "available": available,
         "capability_revision": status.get("capability_revision"),
+        "input_buttons": status.get("input_buttons"),
+        "input_axes": status.get("input_axes"),
         "operations": operations,
         "next_action": next_action
     })
@@ -209,6 +221,12 @@ pub(crate) async fn execute(
     }
     let operation = arguments.operation;
     match operation.as_str() {
+        "set_input"
+        | "hold_touch"
+        | "release_touch"
+        | "pulse_touch_while_running"
+        | "pulse_while_running"
+        | "hold_until" => input::execute(server, &status, &operation, arguments.arguments).await,
         "dismiss_failure" => {
             match analysis_surface::parse_arguments(&operation, arguments.arguments) {
                 Ok(values) => server.dismiss_failure(Parameters(values)).await,

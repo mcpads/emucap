@@ -9,6 +9,7 @@ struct FakeControl {
     commands: Arc<Mutex<Vec<String>>>,
     frame: u64,
     backend_frame: u64,
+    raster_info: String,
     pc: u64,
     paused: bool,
     breaked: bool,
@@ -38,6 +39,7 @@ impl FakeControl {
             commands,
             frame: 10,
             backend_frame: 10,
+            raster_info: "10 0 -1 6d616368696e6531 1 16384".into(),
             pc: 0x4000,
             paused: true,
             breaked: false,
@@ -80,6 +82,7 @@ impl OpenMsxControl for FakeControl {
             | "set power on"
             | "set renderer SDLGL-PP"
             | "set renderer none"
+            | "set emucap_raster_capture true; set deinterlace false; set deflicker false; set videosource MSX"
             | "set mute on"
             | "debug step" => {
                 if command == "debug step" {
@@ -123,6 +126,7 @@ impl OpenMsxControl for FakeControl {
             "debug size {Main RAM}" => "524288".into(),
             "debug size emucap_joystick_override" => "2".into(),
             "machine_info VDP_frame_count" => self.backend_frame.to_string(),
+            command if command.contains("[machine_info VDP_emucap_raster_frame]") => self.raster_info.clone(),
             "::emucap::frame_seq" => self.frame.to_string(),
             "::emucap::cancel_frame" => String::new(),
             "::emucap::frame_debug" => format!(
@@ -256,9 +260,11 @@ impl OpenMsxControl for FakeControl {
             }
             command if command.contains("restore_machine $emucap_path") => {
                 self.joystick_owners = [None; 2];
-                self.frame_probe = None;
                 String::new()
             }
+            "activate_machine $newID; set pause on"
+            | "activate_machine $oldID; set pause on; debug break"
+            | "delete_machine $oldID" | "delete_machine $newID" => String::new(),
             command if command.starts_with("binary encode hex [debug read_block ") => {
                 let length = command
                     .trim_end_matches(']')
@@ -364,7 +370,7 @@ fn hello_advertises_only_the_display_proven_screenshot_surface() {
     let (mut visible, _, _) = fixture(true);
     let visible_hello = result(visible.handle_request(Request::new(1, "hello", json!({}))));
     assert_eq!(visible_hello["build"], crate::build_identity::BUILD_HASH);
-    assert_eq!(visible_hello["host_api"], 3);
+    assert_eq!(visible_hello["host_api"], OPENMSX_HOST_API);
     assert!(visible_hello["methods"]
         .as_array()
         .unwrap()
@@ -507,7 +513,7 @@ fn frame_monitor_uses_one_exact_native_vsync_probe_and_fails_closed_on_drift() {
 }
 
 #[test]
-fn load_state_rebinds_the_private_frame_monitor_only_after_observing_zero() {
+fn load_state_preserves_the_transferred_private_frame_monitor() {
     let (mut bridge, commands, temp) = fixture(false);
     let state_path = temp.path().join("frame-monitor-restore.oms");
     fs::write(&state_path, b"fixture").unwrap();
@@ -524,12 +530,41 @@ fn load_state_rebinds_the_private_frame_monitor_only_after_observing_zero() {
                     == "debug probe set_bp {emucap.vdp_frame_boundary} {} {::emucap::frame_tick}"
             })
             .count(),
-        2
+        1
     );
     assert_eq!(
         bridge.control.frame_probe.as_ref().unwrap()[3],
         "::emucap::frame_tick"
     );
+}
+
+#[test]
+fn rejected_candidate_keeps_original_state_epoch_and_debugger_usable() {
+    let (mut bridge, commands, temp) = fixture(false);
+    let state_path = temp.path().join("rejected.state");
+    fs::write(&state_path, b"fixture").unwrap();
+    let epoch = bridge.capture_epoch.clone();
+    let cpu = result(bridge.handle_request(Request::new(1, "get_state", json!({}))));
+    bridge.control.fail_once = Some("activate_machine $newID; set pause on".into());
+    let rejected = bridge.handle_request(Request::new(2, "load_state", json!({"path":state_path})));
+    assert!(!rejected.ok);
+    assert!(rejected
+        .error
+        .unwrap()
+        .message
+        .contains("original frozen machine retained"));
+    assert!(!bridge.backend_terminal());
+    assert_eq!(bridge.capture_epoch, epoch);
+    assert_eq!(
+        cpu,
+        result(bridge.handle_request(Request::new(3, "get_state", json!({}))))
+    );
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s == "delete_machine $oldID"));
+    result(bridge.handle_request(Request::new(4, "step", json!({"frames":1}))));
 }
 
 #[test]
@@ -1072,4 +1107,136 @@ fn standard_keyboard_matrix_positions_are_combined_per_row() {
     );
     assert_eq!(button_position("a"), (2, 0x40));
     assert_eq!(button_position("ctrl"), (6, 0x02));
+}
+
+#[path = "openmsx_debugger_tcl_tests.rs"]
+mod debugger_tcl;
+
+#[test]
+fn debugger_failure_is_preserved_before_terminal_shutdown_and_write_errors_are_visible() {
+    for writable in [true, false] {
+        let (mut bridge, _, temp) = fixture(false);
+        bridge.launch_id = Some("launch-failure-test".into());
+        let path = temp.path().join("adapter-failure.json");
+        if !writable {
+            fs::create_dir(&path).unwrap();
+        }
+        bridge.failure_file = Some(path.clone());
+        bridge.control.debugger_drain = hex::encode("0\nmalformed\n");
+        let response = bridge.handle_request(Request::new(71, "poll_events", json!({})));
+        assert!(!response.ok);
+        assert_eq!(response.id, 71);
+        assert!(bridge.backend_terminal());
+        let error = response.error.unwrap().message;
+        assert!(error.contains("debugger event has 1 fields instead of 9"));
+        if writable {
+            let failure: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(failure["launch_id"], "launch-failure-test");
+            assert_eq!(failure["kind"], "adapter_internal_error");
+            assert_eq!(failure["operation"], "poll_events");
+            assert_eq!(failure["execution_state"], "frozen");
+            assert_eq!(failure["active"], true);
+            assert_eq!(failure["reason"], error);
+            assert_eq!(failure["frame"], 10);
+        } else {
+            assert!(error.contains("failure context persistence failed"));
+        }
+    }
+}
+
+#[test]
+fn actual_profile_advertisements_validate_without_broadening_to_turbor() {
+    for profile in [
+        OpenMsxProfile::CbiosMsx2p,
+        OpenMsxProfile::Msx1,
+        OpenMsxProfile::Msx2,
+        OpenMsxProfile::Msx2p,
+    ] {
+        for display in [false, true] {
+            let (mut bridge, _, _temp) = fixture(display);
+            // Test the advertised profile, independently of real firmware admission.
+            bridge.session.system = profile.system().into();
+            bridge.session.machine = profile.machine().into();
+            bridge.session.machine_type = profile.machine_type().into();
+            bridge.control.machine = profile.machine().into();
+            bridge.control.machine_type = profile.machine_type().into();
+            let hello = result(bridge.handle_request(Request::new(1, "hello", json!({}))));
+            let methods = hello["methods"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let ad = crate::contracts::advertisement_from_hello(&hello);
+            let valid = crate::contracts::validate_advertisement(
+                &ad,
+                Some("openmsx-rust-xml"),
+                Some(profile.system()),
+                &methods,
+            );
+            assert_eq!(
+                valid.state,
+                "validated",
+                "{}: {:?}",
+                profile.system(),
+                valid.errors
+            );
+            for (adapter, system) in [
+                ("other-adapter", profile.system()),
+                ("openmsx-rust-xml", "msxtr"),
+                ("openmsx-rust-xml", "psp"),
+            ] {
+                assert_ne!(
+                    crate::contracts::validate_advertisement(
+                        &ad,
+                        Some(adapter),
+                        Some(system),
+                        &methods
+                    )
+                    .state,
+                    "validated"
+                );
+            }
+            let status = result(bridge.handle_request(Request::new(2, "status", json!({}))));
+            assert_eq!(status["system"], profile.system());
+            assert_eq!(status["input_buttons"]["system"], profile.system());
+        }
+    }
+}
+
+#[test]
+fn unavailable_or_stale_raster_is_rejected_before_screenshot_file_creation() {
+    for value in [
+        "10 0 -1 6d31 1 16384",
+        "10 0 5 6d31 1 16384",
+        "10 0 9 6d31 0 16384",
+        "invalid",
+    ] {
+        let (mut bridge, commands, directory) = fixture(true);
+        bridge.control.raster_info = value.into();
+        commands.lock().unwrap().clear();
+        let rejected = bridge.handle_request(Request::new(1, "screenshot", json!({})));
+        assert!(!rejected.ok, "{value}");
+        assert!(!directory.path().join("screenshots").exists());
+        assert!(!commands
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("screenshot -raw")));
+        assert_eq!(bridge.control.frame, 10);
+        assert_eq!(bridge.control.pc, 0x4000);
+    }
+}
+
+#[test]
+fn reset_and_machine_restore_allocate_distinct_raster_epochs() {
+    let (mut bridge, _, directory) = fixture(true);
+    let initial = bridge.capture_epoch.clone();
+    result(bridge.handle_request(Request::new(1, "reset", json!({}))));
+    let reset = bridge.capture_epoch.clone();
+    assert_ne!(initial, reset);
+    let path = directory.path().join("restore.state");
+    fs::write(&path, b"fake native state").unwrap();
+    result(bridge.handle_request(Request::new(2, "load_state", json!({"path":path}))));
+    assert_ne!(reset, bridge.capture_epoch);
 }

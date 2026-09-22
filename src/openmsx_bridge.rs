@@ -19,6 +19,12 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
 #[path = "openmsx_bridge/breakpoints.rs"]
 mod breakpoints;
+#[path = "openmsx_bridge/capture.rs"]
+mod capture;
+#[path = "openmsx_bridge/disk_state.rs"]
+mod disk_state;
+#[path = "openmsx_bridge/failure.rs"]
+mod failure;
 #[path = "openmsx_bridge/frame.rs"]
 mod frame;
 #[path = "openmsx_bridge/input.rs"]
@@ -115,8 +121,11 @@ pub struct OpenMsxBridge<C> {
     debug_events: VecDeque<Value>,
     last_hit_seq: u64,
     debugger_fatal: Option<String>,
+    failure_file: Option<PathBuf>,
     frame_probe_native_id: Option<String>,
+    restored_state: Option<disk_state::StateScratch>,
     screenshot_sequence: u64,
+    capture_epoch: String,
     name: Option<String>,
     session_token: Option<String>,
     launch_id: Option<String>,
@@ -156,6 +165,9 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         } else {
             "set renderer none"
         })?;
+        if display {
+            control.command("set emucap_raster_capture true; set deinterlace false; set deflicker false; set videosource MSX")?;
+        }
         control.command("set mute on")?;
         control.command("set pause on")?;
 
@@ -206,8 +218,11 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             debug_events: VecDeque::new(),
             last_hit_seq: 0,
             debugger_fatal: None,
+            failure_file: std::env::var_os("EMUCAP_FAILURE_FILE").map(PathBuf::from),
             frame_probe_native_id: None,
+            restored_state: None,
             screenshot_sequence: 0,
+            capture_epoch: ulid::Ulid::generate().to_string(),
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
@@ -262,15 +277,25 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
                 result: Some(value),
                 error: None,
             },
-            Err(error) => Response {
-                id,
-                ok: false,
-                result: None,
-                error: Some(ProtocolError {
-                    kind: error_kind(&error).into(),
-                    message: error.to_string(),
-                }),
-            },
+            Err(error) => {
+                let mut message = error.to_string();
+                if self.debugger_fatal.is_some() {
+                    if let Err(persistence) = self.persist_debugger_failure(&request.method) {
+                        message.push_str(&format!(
+                            "; failure context persistence failed: {persistence}"
+                        ));
+                    }
+                }
+                Response {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(ProtocolError {
+                        kind: error_kind(&error).into(),
+                        message,
+                    }),
+                }
+            }
         }
     }
 
@@ -385,7 +410,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
                 }
             ],
             "input_buttons": {
-                "system": "msx",
+                "system": self.session.system,
                 "buttons": KEYBOARD_BUTTONS,
                 "aliases": {
                     "start": "enter",

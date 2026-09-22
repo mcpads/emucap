@@ -20,14 +20,14 @@ mod analysis_surface;
 mod args;
 #[path = "emucap-mcp/debug_surface.rs"]
 mod debug_surface;
-#[path = "emucap-mcp/input_surface.rs"]
-mod input_surface;
 #[path = "emucap-mcp/instructions.rs"]
 mod instructions;
 #[path = "emucap-mcp/launch.rs"]
 mod launch;
 #[path = "emucap-mcp/memory_write.rs"]
 mod memory_write;
+#[path = "emucap-mcp/pointer_surface.rs"]
+mod pointer_surface;
 #[path = "emucap-mcp/reattach.rs"]
 mod reattach;
 #[path = "emucap-mcp/recording.rs"]
@@ -557,13 +557,10 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Open persistent, running-time, or device-specific input controls. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
+        description = "Move, click, or drag an advertised mouse or relative pointer. Use tap for button/key input. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
     )]
-    async fn input_control(
-        &self,
-        Parameters(a): Parameters<RoutedOperationArgs>,
-    ) -> CallToolResult {
-        input_surface::execute(self, a).await
+    async fn pointer(&self, Parameters(a): Parameters<RoutedOperationArgs>) -> CallToolResult {
+        pointer_surface::execute(self, a).await
     }
 
     async fn touch(&self, Parameters(a): Parameters<TouchArgs>) -> CallToolResult {
@@ -575,7 +572,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Tap buttons for an exact frame count and return frozen with input released. Read button names from full status."
+        description = "Use for ordinary button/key input: tap for an exact frame count and return frozen with input released. Read button names from full status."
     )]
     async fn tap(&self, Parameters(a): Parameters<TapArgs>) -> CallToolResult {
         let mut l = self.link();
@@ -838,7 +835,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Open optional, data-local, or device-specific debugger operations for the current runtime. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
+        description = "Open debugger operations, including persistent input, touch, and running-time pulses. Ordinary button/key input uses tap. Call operation=describe first; execution stays in this Control session and requires the returned capability revision."
     )]
     async fn debug(
         &self,

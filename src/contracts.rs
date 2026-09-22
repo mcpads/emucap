@@ -359,7 +359,7 @@ pub fn validate_sources(catalog: &ContractCatalog, registry: &ExceptionRegistry)
     }
 
     let surfaces = ["public", "wire", "test"];
-    let routes = ["input_control", "debug", "analysis"];
+    let routes = ["pointer", "debug", "analysis"];
     let temporal_classes = ["T0", "T0/P", "T1", "T2", "T3", "T4", "T5"];
     let dispositions = ["retain", "consolidate", "migrate", "evaluate_remove"];
     let mut feature_ids = BTreeSet::new();
