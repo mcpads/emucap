@@ -32,50 +32,51 @@ override를 우선한다.
 이 저장소는 **에이전트(Claude Code·Codex 등)가 설치를 직접 수행**하도록 만들어졌다. 비개발자는
 저장소를 받은 뒤 에이전트에게 이렇게 말하면 된다:
 
-> "이 저장소 README의 'Agent 설치 절차'대로 emucap을 빌드하고 MCP 서버로 등록해줘."
+> "이 저장소 README의 'Agent 설치 절차'대로 emucap을 설치하고 MCP 서버로 등록해줘."
 
-에이전트가 아래를 순서대로 실행한다. Core 설치는 가볍고, 에뮬레이터별 어댑터는 필요할 때만
-설치한다.
+에이전트가 릴리스 Core를 먼저 설치하고, 선택한 게임에 필요한 어댑터를 준비한다.
 
 **에이전트가 사용자의 인터페이스다.** 사용자가 터미널, 빌드 도구, 에뮬레이터 설정을 모른다고 가정한다.
 명령은 에이전트가 직접 실행하고, GUI 클릭이 필요한 단계는 메뉴 위치와 버튼 이름을 짧게 안내한 뒤
 확인하고 진행한다. 사용자의 OS에 맞춰 절차를 조정한다.
 
-### 1. 사전 요건 (에이전트가 확인 후 없으면 설치)
+### 1. Core 설치 방식 선택
 
-- **Rust 1.88 이상** — `command -v cargo`와 `rustc --version`으로 확인. 없으면:
-  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
-- **C 컴파일러** (SQLite 번들 빌드용) — macOS: `xcode-select -p || xcode-select --install`.
-  Linux: `cc --version || sudo apt-get install -y build-essential`. Windows: MSVC C++ build tools를
-  설치한다(Rust installer가 설치를 제안하면 진행). 이후 일반 PowerShell에서 빌드한다.
-- **git**.
+호스트 OS와 CPU 아키텍처를 확인한다. 릴리스 버전을 설치할 때는
+[GitHub Releases](https://github.com/mcpads/emucap/releases)의 해당 코어 패키지를 우선한다.
 
-사전 빌드 코어는 [GitHub Releases](https://github.com/mcpads/emucap/releases)에서
-Windows x86-64, Linux x86-64, Apple Silicon용으로 제공합니다. 압축을 전체 해제하고
-`PREBUILT-CORE.md`를 따르면 됩니다. 코어 실행 파일 네 개는 `target/release/`에 있으므로
-코어 소스 빌드는 생략할 수 있습니다. 어댑터 브리지와 에뮬레이터 호스트는 각 어댑터의
-설치 지침에 따라 별도로 빌드하며, 해당 컴파일러 요구사항은 그대로 적용됩니다.
-Windows 패키지는 [Visual C++ x64 재배포 패키지](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)가
-필요하며, macOS 패키지는 공증되지 않았습니다.
+| 호스트 | 패키지 타깃 |
+| --- | --- |
+| Windows x86-64 | `x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
 
-### 2. Core 빌드
+파일명 앞에는 `emucap-<version>-`이 붙는다. Intel macOS처럼 일치하는 패키지가 없는 호스트나
+특정 소스 커밋을 개발하는 경우에는 소스 빌드를 선택한다.
 
-저장소 루트에서:
+### 2. Core 설치
+
+**사전 빌드 패키지:** 같은 릴리스에서 선택한 압축 파일, `SHA256SUMS`, 해당 JSON manifest를
+내려받는다. 압축 파일의 SHA-256을 `SHA256SUMS`의 해당 항목과 비교한다(macOS는
+`shasum -a 256`, Linux는 `sha256sum`, PowerShell은 `Get-FileHash -Algorithm SHA256`).
+압축 전체를 계속 사용할 설치 디렉터리에 해제한다. `target/release/`, `tools/`, `adapters/`를
+함께 유지하고, 이후 등록 명령은 그 디렉터리에서 실행한다. `PREBUILT-CORE.md`는 패키지 구성을,
+`CORE-BUILD.json`은 소스 커밋과 바이너리 해시를 기록한다. Windows에서는
+[Visual C++ x64 재배포 패키지](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)가 필요하다.
+여기까지 끝나면 3단계로 진행한다. 컴파일러는 이후 선택한 어댑터가 요구할 때 준비한다.
+
+**소스 빌드:** 설치할 릴리스 태그 또는 개발 커밋을 체크아웃한다. Git, Rust 1.88 이상,
+SQLite 번들 빌드용 C 컴파일러를 준비한다. macOS는 Xcode Command Line Tools, Linux는 배포판의
+C 빌드 도구, Windows는 MSVC C++ Build Tools를 사용한다. 저장소 루트에서 코어 네 개를 빌드한다.
 
 ```sh
-cargo build --locked --release --bins
+cargo build --locked --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
 ```
 
-산출물: `target/release/emucap-mcp`(**제어 MCP** — 에뮬레이터 조작), `emucap-track-mcp`(**추적
-MCP** — 실험 원장, emulator-less), `emucap`(케이스 번들 CLI), `emucap-broker`(다중 세션 broker),
-`emucap-mame-pc98-bridge`(PC-98 launch helper), `emucap-mame-neogeo-bridge`(Neo Geo MVS/AES/CD launch helper),
-`emucap-mupen64plus`(N64 frontend·adapter), `emucap-desmume-nds-bridge`(NDS launch helper),
-`emucap-ppsspp-bridge`(PSP launch helper), `emucap-pcsx2-bridge`(PS2 launch helper),
-`emucap-openmsx-bridge`(patch된 openMSX XML-control helper), `emucap-np2kai`(PC-98 호환 frontend),
-`emucap-xemu-bridge`(원본 Xbox QMP/GDB launch helper).
-Source build의 의존성은 전부 crates.io이고
-SQLite는 번들이라 **Rust와 C 컴파일러 외 시스템 패키지가 필요 없다**(깨끗한 체크아웃에서 그대로
-빌드된다). 첫 빌드는 의존성을 내려받느라 더 걸리고, 이후는 빠르다.
+두 경로 모두 `target/release/`에 `emucap-mcp`(제어 MCP), `emucap-track-mcp`(추적 MCP),
+`emucap`(번들·추적 CLI), `emucap-broker`(다중 세션 broker)를 준비한다(Windows는 `.exe`).
+어댑터 브리지와 에뮬레이터 호스트는 선택한 시스템의 `adapters/<adapter>/README.md`와
+빌드 요구사항에 따라 별도로 준비한다.
 
 ### 3. MCP 서버 등록 (두 MCP)
 
@@ -97,7 +98,8 @@ emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전
   질의(`query_runs`/`compare_runs`/`summarize_runs`)한다. **에뮬레이터를 모른다**(emulator-less). 제어
   MCP에 *얹혀* 실험을 남기는 add-on이라, 켜지 않아도 제어 MCP는 그대로 동작한다.
 
-0.17로 업데이트할 때는 두 MCP 서버를 다시 빌드·연결하고 도구 목록을 갱신한다.
+0.17로 업데이트할 때는 해당 코어 패키지를 설치하거나 릴리스를 빌드한 뒤, 두 MCP 서버를
+재연결하고 도구 목록을 갱신한다.
 버튼·키 입력은 `tap`, 마우스 조작은 `pointer`, 지속 입력과 터치는 `debug`로 옮겨졌다.
 원천 수정 적용을 위해 openMSX 호스트(API 5)와 PPSSPP 호스트도 다시 빌드한다.
 저장 상태 호환 조건과 나머지 변경은 [변경 기록](CHANGELOG.md)을 참고한다.
@@ -115,16 +117,17 @@ claude mcp add emucap-track   -- "$(pwd)/target/release/emucap-track-mcp"
 tools/register-codex-mcp.sh
 ```
 
-Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다. 스크립트는 source build의
-`target/release/` 바이너리를 사용해 `emucap`과 `emucap-track`을 등록한다.
+Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다. 스크립트는
+`target/release/`에 설치된 바이너리를 사용해 `emucap`과 `emucap-track`을 등록한다.
 
 필요 시 환경변수로 조정한다: `EMUCAP_PORT`(제어 MCP, 기본 47800, 점유 중이면 자동으로 다음 포트),
 `EMUCAP_TRACK_ROOT`(추적 MCP의 실험 원장 위치, 기본 작업 repo git root의 `.emucap`).
 
 등록 후 에이전트 세션을 재연결(`/mcp`)한다. **두 MCP가 각자 `bootstrap`을 노출하므로** 제어 MCP의
-`bootstrap`(에뮬 진입)과 추적 MCP의 `bootstrap`(원장 진입)이 모두 도구 목록에 보이면 성공이다. 안
-보이면 release를 다시 빌드하고 재연결한다 — MCP 서버는 release 바이너리를 실행하므로 debug 빌드는
-반영되지 않는다.
+`bootstrap`(에뮬 진입)과 추적 MCP의 `bootstrap`(원장 진입)이 모두 도구 목록에 보여야 한다.
+두 서버가 보고하는 버전을 확인하고, 제어 MCP의 `status.server_build`를 패키지의
+`CORE-BUILD.json` 소스 커밋 또는 소스 빌드의 대상 커밋과 비교한다. 도구 목록이나 식별자가
+다르면 등록된 실행 파일 경로를 확인하고 선택한 릴리스 바이너리에 재연결한다.
 
 ### 3b. 3계층과 에이전트 조립
 
@@ -159,6 +162,10 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
   기록하지 않으므로, 재현 충실도(repro_status)를 위해 추적 MCP의 `log_intervention`으로 직접 남긴다.
 
 ### 4. 첫 동작 (에이전트가 bootstrap으로 시작)
+
+설치 경로와 선택한 시스템을 바탕으로 해당 어댑터 README에 따라 브리지와 에뮬레이터 호스트를
+준비한 뒤 managed launch로 진행한다. Core 설치는 MCP 서버를 준비하는 단계이며, 어댑터의
+실행 준비 여부는 별도로 확인한다.
 
 모든 emucap 작업은 `bootstrap`으로 시작한다. 에이전트에게 "emucap `bootstrap`을 호출해줘"라고
 하면, 기본 응답이 `listener.port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을

@@ -4,6 +4,10 @@ emucap gives agents a common observation and control surface over supported emul
 supported platforms, prerequisites, and adapter-specific build instructions are in `README.md` and
 `adapters/*/README.md`.
 
+For release installation, follow README's prebuilt-core path for the host OS and architecture.
+Register the packaged core first, then prepare the chosen adapter according to its README.
+Use the source-build path for development or hosts without a matching release package.
+
 ## MCP entrypoints
 
 Register both servers:

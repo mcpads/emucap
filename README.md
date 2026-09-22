@@ -40,11 +40,10 @@ documented env overrides over the Unix shell launchers.
 This repository is built so that **an agent (Claude Code, Codex, …) performs the
 install itself**. A non-developer can hand the agent the repo and say:
 
-> "Follow this repo's README 'Agent install steps' to build emucap and register
+> "Follow this repo's README 'Agent install steps' to install emucap and register
 > it as MCP servers."
 
-The agent runs the steps below in order. The Core build is light; per-emulator
-adapters are built only when needed.
+The agent installs the released Core first, then prepares the adapter needed for the selected game.
 
 **You (the agent) are the user's interface.** Assume the user is not a developer, may not be
 comfortable with a terminal or even with installing desktop programs, and will not read this file — you
@@ -54,46 +53,45 @@ where it is ("the menu bar along the top"), quote the exact button/checkbox labe
 it before moving on. Adapt to the user's OS — this guide's shell commands are Unix-style; on Windows
 use the equivalents (and see the Platforms note above).
 
-### 1. Prerequisites (the agent checks, and installs if missing)
+### 1. Choose the Core installation
 
-Prebuilt core packages are available on the [GitHub Releases page](https://github.com/mcpads/emucap/releases)
-for Windows x86-64, Linux x86-64 and Apple Silicon. Extract the entire archive and follow
-`PREBUILT-CORE.md`: the four core executables are already in `target/release/`, so skip their
-source build. Adapter bridges and emulator hosts still follow their own build instructions;
-their compiler requirements remain applicable. Windows packages require the
+Check the host OS and CPU architecture. For a released version, prefer the matching core package
+from [GitHub Releases](https://github.com/mcpads/emucap/releases):
+
+| Host | Package target |
+| --- | --- |
+| Windows x86-64 | `x86_64-pc-windows-msvc.zip` |
+| Linux x86-64 | `x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
+
+Each filename starts with `emucap-<version>-`. Use a source build for a host without a matching
+package (including Intel macOS), or when developing a specific source revision.
+
+### 2. Install the Core
+
+**Prebuilt package:** Download the selected archive, `SHA256SUMS` and its matching JSON manifest
+from the same release. Compare the archive's SHA-256 with its entry in `SHA256SUMS`
+(`shasum -a 256` on macOS, `sha256sum` on Linux, `Get-FileHash -Algorithm SHA256` in PowerShell).
+Extract the complete archive to a stable installation directory. Keep `target/release/`, `tools/`
+and `adapters/` together, and run the following registration steps from that directory.
+`PREBUILT-CORE.md` describes the package layout; `CORE-BUILD.json` records its source revision
+and binary hashes. Windows packages require the
 [Visual C++ x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
-The macOS package is not notarized.
+This route is ready for step 3; compiler tools are installed later if the chosen adapter needs them.
 
-- **Rust 1.88 or newer** — check with `command -v cargo` and `rustc --version`. If missing:
-  `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"`
-- **C compiler** (to build the bundled SQLite) — macOS: `xcode-select -p || xcode-select --install`.
-  Linux: `cc --version || sudo apt-get install -y build-essential`. Windows: install the MSVC C++
-  build tools (the Rust installer may prompt for this); then build from a normal PowerShell.
-- **git**.
-
-### 2. Build the Core
-
-From the repo root:
+**Source build:** Check out the intended release tag or development revision. Install Git,
+Rust 1.88 or newer, and a C compiler for bundled SQLite. On macOS use Xcode Command Line Tools;
+on Linux use the distribution's C build tools; on Windows use MSVC C++ Build Tools. From the
+repository root, build the four core executables:
 
 ```sh
-cargo build --locked --release --bins
+cargo build --locked --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
 ```
 
-Outputs: `target/release/emucap-mcp` (**Control MCP** — drives the emulator),
-`emucap-track-mcp` (**Tracking MCP** — experiment ledger, emulator-less),
-`emucap` (case-bundle CLI), `emucap-broker` (multi-session broker),
-`emucap-mame-pc98-bridge` (PC-98 launch helper),
-`emucap-mame-neogeo-bridge` (Neo Geo MVS/AES/CD launch helper),
-`emucap-mupen64plus` (N64 frontend and adapter),
-`emucap-desmume-nds-bridge` (NDS launch helper),
-`emucap-ppsspp-bridge` (PSP launch helper),
-`emucap-pcsx2-bridge` (PS2 launch helper),
-`emucap-openmsx-bridge` (patched openMSX XML-control helper),
-`emucap-np2kai` (direct PC-98 compatibility frontend), and
-`emucap-xemu-bridge` (original Xbox QMP/GDB launch helper). All dependencies come from
-crates.io and SQLite is bundled, so **nothing beyond Rust and a C compiler is
-required** for a source build. The first build is slower while dependencies
-download; later builds are fast.
+Both routes place `emucap-mcp` (Control MCP), `emucap-track-mcp` (Tracking MCP), `emucap`
+(bundle/tracking CLI) and `emucap-broker` (multi-session broker) in `target/release/`
+(with `.exe` on Windows). Adapter bridges and emulator hosts are prepared separately for the
+selected system, following `adapters/<adapter>/README.md` and its build requirements.
 
 ### 3. Register the MCP servers (two of them)
 
@@ -122,7 +120,8 @@ them (see §2b).
   (emulator-less). It is an add-on layered on the Control MCP, so the Control MCP
   works fine without it.
 
-Upgrading to 0.17: refresh MCP discovery after rebuilding and reconnecting both servers.
+Upgrading to 0.17: install the matching core package or build the release, then reconnect both
+servers and refresh MCP discovery.
 Button/key actions use `tap`, mouse actions use `pointer`, and persistent input or touch uses
 `debug`. Rebuild the maintained openMSX host to API 5 and the PPSSPP host to apply their native
 fixes. See [the changelog](CHANGELOG.md) for state compatibility and other changes.
@@ -141,7 +140,7 @@ tools/register-codex-mcp.sh
 ```
 
 On Windows, run `tools/register-codex-mcp.ps1` in PowerShell. The scripts use the
-source-build binaries from `target/release/` and register `emucap` plus
+installed binaries from `target/release/` and register `emucap` plus
 `emucap-track`.
 
 Tune with environment variables as needed: `EMUCAP_PORT` (Control MCP, default
@@ -151,8 +150,9 @@ Tracking MCP's ledger location, default `.emucap` at the working repo's git root
 After registering, reconnect the agent session (`/mcp`). Since **each MCP exposes
 its own `bootstrap`**, success means both the Control MCP's `bootstrap` (emulator
 entry) and the Tracking MCP's `bootstrap` (ledger entry) appear in the tool list.
-If they don't, rebuild the release and reconnect — the MCP servers run the
-release binary, so debug builds are not picked up.
+Check both servers' reported versions and compare Control's `status.server_build` with the
+package's `CORE-BUILD.json` source revision, or the intended source-build commit. If discovery or
+identity differs, check the registered executable paths and reconnect the selected release binaries.
 
 ### 3b. Three tiers, composed by the agent
 
@@ -195,6 +195,10 @@ The two MCPs never call each other — **the agent composes them**:
   the Tracking MCP's `log_intervention` to preserve reproduction fidelity.
 
 ### 4. First run (the agent starts with bootstrap)
+
+Use the installation paths and selected system to prepare the required adapter bridge and emulator
+host from its adapter README, then continue through managed launch. Core installation alone
+establishes the MCP servers; adapter readiness is checked separately.
 
 Every emucap task starts with `bootstrap`. Ask the agent to "call emucap
 `bootstrap`", and its compact response returns `listener.port`, system IDs, a
