@@ -1,8 +1,7 @@
 # emucap
 
-emucap gives agents a common observation and control surface over supported emulators. Installation,
-supported platforms, prerequisites, and adapter-specific build instructions are in `README.md` and
-`adapters/*/README.md`.
+emucap lets agents observe and control supported emulators. See `README.md` and
+`adapters/*/README.md` for installation, platforms, prerequisites, and adapter builds.
 
 For release installation, follow README's prebuilt-core path for the host OS and architecture.
 Register the packaged core first, then prepare the chosen adapter according to its README.
