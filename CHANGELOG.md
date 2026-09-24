@@ -2,7 +2,7 @@
 
 Actively developed beta software — interfaces may still change.
 
-## Unreleased
+## 0.17.1
 
 ### Added
 - openMSX disk launches expose frozen drive-A insertion/ejection through `change_media`.
