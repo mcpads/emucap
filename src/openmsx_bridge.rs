@@ -31,6 +31,8 @@ mod frame;
 mod input;
 #[path = "openmsx_bridge/joystick.rs"]
 mod joystick;
+#[path = "openmsx_bridge/media.rs"]
+mod media;
 #[path = "openmsx_bridge/state.rs"]
 mod state;
 #[path = "openmsx_bridge/xml.rs"]
@@ -124,6 +126,7 @@ pub struct OpenMsxBridge<C> {
     failure_file: Option<PathBuf>,
     frame_probe_native_id: Option<String>,
     restored_state: Option<disk_state::StateScratch>,
+    disk_ejected: bool,
     screenshot_sequence: u64,
     capture_epoch: String,
     name: Option<String>,
@@ -221,6 +224,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             failure_file: std::env::var_os("EMUCAP_FAILURE_FILE").map(PathBuf::from),
             frame_probe_native_id: None,
             restored_state: None,
+            disk_ejected: false,
             screenshot_sequence: 0,
             capture_epoch: ulid::Ulid::generate().to_string(),
             name: std::env::var("EMUCAP_NAME").ok(),
@@ -246,6 +250,9 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "hello" => self.hello(),
             "status" => self.status(),
             "get_rom_info" => self.get_rom_info(),
+            "change_media" if self.session.media.kind == MediaKind::Disk => {
+                self.change_media(&request.params)
+            }
             "get_state" => self.get_state(&request.params),
             "read_memory" => self.read_memory(&request.params),
             "write_memory" => self.write_memory(&request.params),
@@ -301,6 +308,9 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn methods(&self) -> Vec<&'static str> {
         let mut methods = BASE_METHODS.to_vec();
+        if self.session.media.kind == MediaKind::Disk {
+            methods.push("change_media");
+        }
         if self.display {
             methods.push("screenshot");
         }
@@ -324,6 +334,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "host_api": OPENMSX_HOST_API,
             "debugger": true,
             "methods": self.methods(),
+            "media_devices": self.media_devices(),
             "memory_types": ["memory", "ram", "vram"],
             "state_groups": ["cpu"],
             "cpu_targets": [{
@@ -381,6 +392,8 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "state": if self.frozen { "frozen" } else { "running" },
             "frame": self.current_frame()?,
             "methods": self.methods(),
+            "media_devices": self.media_devices(),
+            "mounted_media": self.mounted_media()?,
             "memory_types": ["memory", "ram", "vram"],
             "region_sizes": self.region_sizes,
             "breakpoint_kinds": breakpoint_kinds(),
@@ -437,20 +450,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             },
             "backend_pid": self.control.child_pid(),
             "launch_id": self.launch_id,
-        }))
-    }
-
-    fn get_rom_info(&self) -> BridgeResult<Value> {
-        Ok(json!({
-            "system": self.session.system,
-            "machine": self.session.machine,
-            "machine_type": self.session.machine_type,
-            "media": self.session.media.kind.as_str(),
-            "path": self.session.media.source_path.display().to_string(),
-            "sha1": self.session.media.source_sha1,
-            "size": self.session.media.source_size,
-            "mounted_path": self.session.media.mounted_path.display().to_string(),
-            "firmware_manifest_sha256": self.session.firmware_manifest_sha256,
         }))
     }
 
@@ -881,6 +880,15 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
                 "openMSX returned a non-UTF-8 mounted-media path: {error}"
             ))
         })?);
+        if self.session.media.kind == MediaKind::Disk && self.disk_ejected {
+            return if observed.as_os_str().is_empty() {
+                Ok(())
+            } else {
+                Err(OpenMsxBridgeError::Emulator(
+                    "expected empty drive A".into(),
+                ))
+            };
+        }
         let expected = fs::canonicalize(&self.session.media.mounted_path)?;
         let observed = fs::canonicalize(&observed).map_err(|error| {
             OpenMsxBridgeError::Emulator(format!(

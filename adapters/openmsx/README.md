@@ -141,6 +141,27 @@ covered by that witness.
 
 ## Disk snapshot portability
 
+Disk launches expose `diska` in `status.media_devices`. At a frozen boundary use
+`change_media(device="diska", path=<absolute image>, expected_sha1=<optional SHA-1>)`
+or `change_media(device="diska", eject=true)`. Each insertion copies the requested
+bytes into the current generation; the source image is never mounted writable.
+The operation returns frozen without advancing guest time. `status.mounted_media`
+reports the current mount separately from the immutable launch source identity.
+
+The response's `previous.path`, `previous.sha1` and `previous.size` describe a sector
+export including guest writes. Reinsert that path to continue using the written data
+disk. Inserting the original source path again starts from its original bytes. Copy
+the exported file outside the generation before stopping if it must be retained.
+`load_state` similarly returns `previous_media` for the outgoing disk. These exports
+remain separate from later writable mounts and snapshot scratch files.
+
+Only drive A is supported for managed disk changes. An empty drive can execute and
+load an existing snapshot; `save_state` requires an inserted disk and rejects an empty
+drive before native serialization. Cartridge and cassette launches do not advertise
+this disk-change capability. Failed preconditions leave the mount untouched; native
+command failures require unchanged mount/frozen readback, otherwise the generation
+fails terminally rather than claiming recovery.
+
 For disk launches, `save_state` atomically publishes a self-contained ZIP at the requested
 path: native machine state, full drive-A sector image, and a manifest binding both hashes
 to source media, machine, firmware and host ABI. `load_state` validates it, creates a fresh

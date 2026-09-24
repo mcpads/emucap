@@ -9,6 +9,11 @@ use super::{
 impl<C: OpenMsxControl> OpenMsxBridge<C> {
     pub(super) fn save_state(&mut self, params: &Value) -> BridgeResult<Value> {
         self.require_frozen("save_state")?;
+        if self.disk_ejected {
+            return Err(OpenMsxBridgeError::BadState(
+                "disk snapshots require an inserted disk; insert media before save_state".into(),
+            ));
+        }
         let path = state_path(params)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -61,6 +66,8 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         }
         self.reconcile_breakpoints("load_state original")?;
         self.reconcile_frame_monitor()?;
+        let previous_media = self.preserve_disk()?;
+        let original_ejected = self.disk_ejected;
         let native_path = scratch
             .as_ref()
             .map(|s| s.machine())
@@ -81,6 +88,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         ))?;
         if let Some(scratch) = &scratch {
             self.session.media.mounted_path = scratch.disk();
+            self.disk_ejected = false;
         }
         let restored = (|| {
             self.control
@@ -97,6 +105,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             Ok(frame) => frame,
             Err(primary) => {
                 self.session.media.mounted_path = original_media;
+                self.disk_ejected = original_ejected;
                 self.frame_probe_native_id = original_probe;
                 self.debugger_fatal = None;
                 let rollback: BridgeResult<()> = (|| {
@@ -137,6 +146,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         Ok(json!({
             "status": "completed", "loaded": path.display().to_string(),
             "state": "frozen", "frame": frame,
+            "previous_media": previous_media,
         }))
     }
 

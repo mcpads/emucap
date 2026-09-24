@@ -2,6 +2,16 @@
 
 Actively developed beta software — interfaces may still change.
 
+## Unreleased
+
+### Added
+- openMSX disk launches expose frozen drive-A insertion/ejection through `change_media`.
+  Inserted images are copied into the managed generation and optional SHA-1 preconditions
+  apply to the imported bytes. Outgoing disks are exported with guest writes for recovery
+  and reinsertion; state restore also returns the outgoing disk export. Empty-drive saves
+  are rejected before serialization. Rebuild Control and the openMSX bridge and reconnect;
+  the maintained native host remains API 5.
+
 ## 0.17.0
 
 ### Changed

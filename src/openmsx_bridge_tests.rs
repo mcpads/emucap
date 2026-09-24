@@ -25,6 +25,7 @@ struct FakeControl {
     inventory_override: Option<String>,
     fail_once: Option<String>,
     media_target: PathBuf,
+    disk_change_failure: bool,
     machine: String,
     machine_type: String,
 }
@@ -55,6 +56,7 @@ impl FakeControl {
             inventory_override: None,
             fail_once: fail_once.map(str::to_owned),
             media_target,
+            disk_change_failure: false,
             machine: "C-BIOS_MSX2+".into(),
             machine_type: "MSX2+".into(),
         }
@@ -74,8 +76,26 @@ impl OpenMsxControl for FakeControl {
             "openmsx_info version" => "openMSX 21.0".into(),
             "machine_info config_name" => self.machine.clone(),
             "machine_info type" => self.machine_type.clone(),
-            "binary encode hex [encoding convertto utf-8 [dict get [machine_info media carta] target]]" => {
+            "binary encode hex [encoding convertto utf-8 [dict get [machine_info media carta] target]]"
+            | "binary encode hex [encoding convertto utf-8 [dict get [machine_info media diska] target]]" => {
                 hex::encode(self.media_target.to_string_lossy().as_bytes())
+            }
+            command if command.starts_with("diskmanipulator savedsk diska ") || command.starts_with("diska insert ") => {
+                let encoded = command.split("binary decode hex ").nth(1).unwrap().trim_end_matches(']');
+                let path = PathBuf::from(String::from_utf8(hex::decode(encoded).unwrap()).unwrap());
+                if command.starts_with("diska insert ") {
+                    self.media_target = path;
+                } else {
+                    fs::copy(&self.media_target, path)?;
+                }
+                String::new()
+            }
+            "diska eject" => {
+                self.media_target = PathBuf::new();
+                if self.disk_change_failure {
+                    return Err(OpenMsxBridgeError::Emulator("injected error after eject".into()));
+                }
+                String::new()
             }
             "openmsx_update enable setting"
             | "set throttle off"
@@ -1239,4 +1259,106 @@ fn reset_and_machine_restore_allocate_distinct_raster_epochs() {
     fs::write(&path, b"fake native state").unwrap();
     result(bridge.handle_request(Request::new(2, "load_state", json!({"path":path}))));
     assert_ne!(reset, bridge.capture_epoch);
+}
+
+#[test]
+fn disk_swap_preserves_writes_imports_exact_bytes_and_never_advances() {
+    let (mut bridge, commands, temp) = fixture(false);
+    bridge.session.media.kind = MediaKind::Disk;
+    let original = bridge.session.media.mounted_path.clone();
+    fs::write(&original, [0x5a; 512]).unwrap();
+    let source = temp.path().join("data.dsk");
+    fs::write(&source, [0xa5; 512]).unwrap();
+    use sha1::Digest;
+    let sha1 = hex::encode(sha1::Sha1::digest([0xa5; 512]));
+    let result = bridge
+        .change_media(&json!({"device":"diska", "path":source,"expected_sha1":sha1}))
+        .unwrap();
+    let preserved = PathBuf::from(result["previous"]["path"].as_str().unwrap());
+    assert_eq!(fs::read(&preserved).unwrap(), [0x5a; 512]);
+    assert_ne!(bridge.session.media.mounted_path, source);
+    fs::write(&bridge.session.media.mounted_path, [0x77; 512]).unwrap();
+    let ejected = bridge
+        .change_media(&json!({"device":"diska", "eject":true}))
+        .unwrap();
+    assert!(bridge.disk_ejected);
+    assert!(bridge
+        .save_state(&json!({"path":temp.path().join("empty.state")}))
+        .is_err());
+    let written = PathBuf::from(ejected["previous"]["path"].as_str().unwrap());
+    assert_eq!(fs::read(&written).unwrap(), [0x77; 512]);
+    bridge
+        .change_media(&json!({"device":"diska", "path":written}))
+        .unwrap();
+    assert!(!bridge.disk_ejected);
+    assert_eq!(
+        fs::read(&bridge.session.media.mounted_path).unwrap(),
+        [0x77; 512]
+    );
+    assert_eq!(fs::read(source).unwrap(), [0xa5; 512]);
+    assert_eq!(bridge.control.frame, 10);
+    assert_eq!(bridge.control.pc, 0x4000);
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c == "debug cont" || c == "set pause off"));
+}
+
+#[test]
+fn disk_swap_preflight_and_native_rejection_keep_current_disk() {
+    let (mut bridge, commands, temp) = fixture(false);
+    bridge.session.media.kind = MediaKind::Disk;
+    fs::write(&bridge.session.media.mounted_path, [0x55; 512]).unwrap();
+    let original = bridge.session.media.mounted_path.clone();
+    let source = temp.path().join("disk.dsk");
+    fs::write(&source, [0; 512]).unwrap();
+    for params in [
+        json!({"device":"diskb", "path":source}),
+        json!({"device":"diska", "path":source,"expected_sha1":"wrong"}),
+        json!({"device":"diska", "path":"relative.dsk"}),
+        json!({"device":"diska", "path":source,"eject":true}),
+    ] {
+        assert!(bridge.change_media(&params).is_err());
+    }
+    assert!(!commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|c| c.starts_with("diska ")));
+    bridge.control.fail_once = Some("diska eject".into());
+    assert!(bridge
+        .change_media(&json!({"device":"diska","eject":true}))
+        .is_err());
+    assert_eq!(bridge.control.media_target, original);
+    assert!(!bridge.backend_terminal());
+    bridge.control.paused = false;
+    bridge.control.breaked = false;
+    assert!(bridge
+        .change_media(&json!({"device":"diska","eject":true}))
+        .is_err());
+}
+
+#[test]
+fn disk_change_with_unverified_effect_is_terminal_and_preserves_recovery_bytes() {
+    let (mut bridge, _, _temp) = fixture(false);
+    bridge.session.media.kind = MediaKind::Disk;
+    fs::write(&bridge.session.media.mounted_path, [0x7b; 512]).unwrap();
+    bridge.control.disk_change_failure = true;
+    let error = bridge
+        .change_media(&json!({"device":"diska", "eject":true}))
+        .unwrap_err();
+    assert!(bridge.backend_terminal());
+    assert!(error.to_string().contains("current_media=unverified"));
+    assert!(error.to_string().contains("previous="));
+    let generation = bridge.session.user_data.parent().unwrap();
+    let exported: Vec<_> = fs::read_dir(generation)
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path().join("disk.dsk");
+            path.is_file().then_some(path)
+        })
+        .collect();
+    assert_eq!(exported.len(), 1);
+    assert_eq!(fs::read(&exported[0]).unwrap(), [0x7b; 512]);
 }
