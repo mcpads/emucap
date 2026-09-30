@@ -142,6 +142,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             ));
         }
         self.restored_state = scratch;
+        self.boundary_seq += 1;
         self.capture_epoch = ulid::Ulid::generate().to_string();
         Ok(json!({
             "status": "completed", "loaded": path.display().to_string(),
@@ -159,6 +160,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     pub(super) fn reset(&mut self) -> BridgeResult<Value> {
         self.capture_epoch = ulid::Ulid::generate().to_string();
+        self.boundary_seq += 1;
         let held = self.held_buttons.clone();
         self.release_supported_keys()?;
         self.control.command("reset; set pause on")?;

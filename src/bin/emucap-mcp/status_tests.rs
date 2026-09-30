@@ -341,6 +341,7 @@ fn connected_status_exposes_recording_only_for_a_bound_direct_generation() {
         breakpoint_kinds: vec![],
         contracts: emucap::contracts::ContractAdvertisement::Unreported,
         recording: Some(capability),
+        features: Default::default(),
         identity: EmulatorIdentity::default(),
     };
 
@@ -632,6 +633,7 @@ fn connected_status_reconciles_an_abandoned_exact_generation_capture() {
         breakpoint_kinds: vec![],
         contracts: emucap::contracts::ContractAdvertisement::Unreported,
         recording: None,
+        features: Default::default(),
         identity: EmulatorIdentity {
             launch_id: Some(launch_id.clone()),
             ..EmulatorIdentity::default()
@@ -1133,6 +1135,7 @@ fn bootstrap_not_connected_tells_agent_to_ask_when_content_unknown() {
             breakpoint_kinds: vec![],
             contracts: emucap::contracts::ContractAdvertisement::Unreported,
             recording: None,
+            features: Default::default(),
             identity: EmulatorIdentity::default(),
         },
     };
@@ -1908,6 +1911,15 @@ fn button_hint_none_for_unknown_or_absent_system() {
     );
     assert!(button_hint_for_system(Some("snes")).is_some());
     assert!(button_hint_for_system(Some("dreamcast")).is_some());
+    // The Mednafen adapter reports only the system; the hint is the WonderSwan input catalog.
+    let wswan = button_hint_for_system(Some("wswan")).unwrap();
+    assert_eq!(wswan["system"], "wswan");
+    for name in ["x1", "y4", "a", "b", "start"] {
+        assert!(wswan["buttons"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(name)));
+    }
 }
 
 #[test]

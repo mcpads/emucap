@@ -13,6 +13,10 @@
     "CORE.CLEANUP.1"
   ],
   "expectations": [
+    {"id":"MEM.BATCH.EXACT.1", "category":"invariant", "expression":"success => all_ranges_prevalidated and ordered_exact_reads and no_partial_result"},
+    {"id":"MEM.BATCH.BOUNDARY.1", "category":"observation", "expression":"success => same_global_frozen_boundary(all_reads) and no_guest_read_side_effects"},
+    {"id":"SPEED.PACING.1", "category":"invariant", "expression":"set_speed => host_pacing_only and no_implicit_pause_resume_or_guest_clock_change; frozen_before => frozen_after and unchanged_guest_time"},
+    {"id":"SPEED.READBACK.1", "category":"observation", "expression":"success => native_policy_readback_matches_request; failure => verified_previous_policy or terminal_uncertainty"},
     {
       "id": "STATE.SNAPSHOT.ADMISSION.1",
       "category": "invariant",
@@ -552,6 +556,23 @@
       "temporal_classes": ["T0"],
       "disposition": "retain",
       "expectations": ["MEM.READ.EXACT.1"]
+    },
+    {
+      "id": "memory.read_batch",
+      "surface": "public",
+      "methods": ["read_memory_batch"],
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["MEM.BATCH.EXACT.1", "MEM.BATCH.BOUNDARY.1"]
+    },
+    {
+      "id": "execution.speed",
+      "surface": "public",
+      "methods": ["execution_speed"],
+      "route": "debug",
+      "temporal_classes": ["T0"],
+      "disposition": "retain",
+      "expectations": ["SPEED.PACING.1", "SPEED.READBACK.1"]
     },
     {
       "id": "memory.write",

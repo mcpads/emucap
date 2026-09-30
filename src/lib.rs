@@ -13,6 +13,7 @@ pub mod input_movie;
 pub mod launch;
 pub mod live;
 pub mod m3u;
+pub(crate) mod mame_observation;
 pub mod mcp_result;
 pub mod mcp_stdio;
 pub mod media_graph;

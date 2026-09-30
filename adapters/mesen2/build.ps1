@@ -122,7 +122,8 @@ try {
         (Join-Path $Here "patches/0010-add-snes-cgram-lookup-events.patch"),
         (Join-Path $Here "patches/0011-expose-lua-callstack.patch"),
         (Join-Path $Here "patches/0012-add-snes-bg-chr-fetch-events.patch"),
-        (Join-Path $Here "patches/0013-fix-snes-ppu-observation-coordinates.patch")
+        (Join-Path $Here "patches/0013-fix-snes-ppu-observation-coordinates.patch"),
+        (Join-Path $Here "patches/0014-add-agent-pacing-controls.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {

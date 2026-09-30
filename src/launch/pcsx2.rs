@@ -18,7 +18,7 @@ use super::{
     RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 5;
+pub const REQUIRED_HOST_API: u32 = 7;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -275,6 +275,14 @@ fn resolve_pine_slot() -> io::Result<PineSlot> {
     })
 }
 
+/// Longest Unix socket path the platform accepts, excluding the terminating NUL. A longer PINE
+/// path makes PCSX2's bind fail without a log line, so the launch refuses it up front.
+const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+fn unix_socket_path_fits(path: &Path) -> bool {
+    path.as_os_str().len() <= MAX_UNIX_SOCKET_PATH
+}
+
 fn pine_socket_path(runtime_dir: &Path, slot: u16) -> Option<PathBuf> {
     #[cfg(unix)]
     {
@@ -306,6 +314,20 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
     let settings = data_root.join("inis");
     let memory_cards = data_root.join("memcards");
     let pine_runtime = home.join("pine");
+    let pine_socket = pine_socket_path(&pine_runtime, pine_slot);
+    if let Some(socket) = pine_socket
+        .as_deref()
+        .filter(|path| !unix_socket_path_fits(path))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "PCSX2 PINE socket path is {} bytes, above the {MAX_UNIX_SOCKET_PATH}-byte Unix socket limit; use a shorter EMUCAP_EMU_HOME: {}",
+                socket.as_os_str().len(),
+                socket.display()
+            ),
+        ));
+    }
     let base = super::emu_home_base();
     for path in [&home, &data_root, &settings, &memory_cards, &pine_runtime] {
         if super::has_symlink_component_under(&base, path) {
@@ -348,7 +370,7 @@ fn prepare_session(port: u16, bios: &Path, pine_slot: u16) -> io::Result<Prepare
     );
     std::fs::write(settings.join("PCSX2.ini"), ini)?;
     Ok(PreparedSession {
-        pine_socket: pine_socket_path(&pine_runtime, pine_slot),
+        pine_socket,
         home,
         data_root,
         pine_runtime,

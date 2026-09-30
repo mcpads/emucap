@@ -1,0 +1,189 @@
+diff --git a/Core/Core.cpp b/Core/Core.cpp
+--- a/Core/Core.cpp
++++ b/Core/Core.cpp
+@@ -19,6 +19,7 @@
+ 
+ #include <cstdint>
+ #include <mutex>
++#include <functional>
+ #include <set>
+ #include <condition_variable>
+ 
+@@ -47,7 +48,8 @@
+ #include "GPU/GPUCommon.h"
+ 
+ // Step command to execute next
+-static std::mutex g_stepMutex;
++static std::recursive_mutex g_stepMutex;
++static std::atomic<uint64_t> g_emucapMemoryEpoch{1};
+ 
+ struct CPUStepCommand {
+ 	CPUStepType type;
+@@ -234,6 +236,7 @@
+ }
+ 
+ void Core_UpdateState(CoreState newState) {
++	++g_emucapMemoryEpoch;
+ 	const CoreState state = coreState;
+ 	if ((state == CORE_RUNNING_CPU || state == CORE_NEXTFRAME) && newState != CORE_RUNNING_CPU)
+ 		coreStatePending = true;
+@@ -330,7 +333,7 @@
+ }
+ 
+ bool Core_RequestCPUStep(CPUStepType type, int stepSize) {
+-	std::lock_guard<std::mutex> guard(g_stepMutex);
++	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+ 	if (g_cpuStepCommand.type != CPUStepType::None) {
+ 		ERROR_LOG(Log::CPU, "Can't submit two steps in one host frame");
+ 		return false;
+@@ -481,7 +484,7 @@
+ 	}
+ 
+ 	// Need to check inside the lock to avoid races.
+-	std::lock_guard<std::mutex> guard(g_stepMutex);
++	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+ 
+ 	if (coreState != CORE_STEPPING_CPU || g_cpuStepCommand.empty()) {
+ 		return true;
+@@ -497,6 +500,7 @@
+ 		}
+ 		g_cpuStepCommand.clear();
+ 		steppingCounter++;
++	++g_emucapMemoryEpoch;
+ 	}
+ 
+ 	// Update disasm dialog.
+@@ -518,7 +522,7 @@
+ 	}
+ 
+ 	{
+-		std::lock_guard<std::mutex> lock(g_stepMutex);
++		std::lock_guard<std::recursive_mutex> lock(g_stepMutex);
+ 		if (!g_cpuStepCommand.empty() && Core_IsStepping()) {
+ 			// If we're in a failed step that uses a temp breakpoint, we need to be able to override it here.
+ 			switch (g_cpuStepCommand.type) {
+@@ -541,6 +545,7 @@
+ 		g_cpuStepCommand.reason = reason;
+ 		g_cpuStepCommand.relatedAddr = relatedAddress;
+ 		steppingCounter++;
++	++g_emucapMemoryEpoch;
+ 		_assert_msg_(reason != BreakReason::None, "No reason specified for break");
+ 		Core_UpdateState(CORE_STEPPING_CPU);
+ 	}
+@@ -550,6 +555,8 @@
+ 
+ // Free-threaded (or at least should be)
+ void Core_Resume() {
++	++g_emucapMemoryEpoch;
++	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+ 	// If the current PC is on a breakpoint, the user doesn't want to do nothing.
+ 	if (currentMIPS) {
+ 		g_breakpoints.SetSkipFirst(currentMIPS->pc);
+@@ -598,7 +605,7 @@
+ 
+ SteppingReason Core_GetSteppingReason() {
+ 	SteppingReason r{};
+-	std::lock_guard<std::mutex> lock(g_stepMutex);
++	std::lock_guard<std::recursive_mutex> lock(g_stepMutex);
+ 	// Core_Break intentionally clears the pending step command before the broadcaster runs.  The
+ 	// reason therefore belongs to the halted core state, not to the lifetime of g_cpuStepCommand.
+ 	r.reason = g_breakReason;
+@@ -732,3 +739,11 @@
+ const MIPSExceptionInfo &Core_GetExceptionInfo() {
+ 	return g_exceptionInfo;
+ }
++
++// Serialize a debugger observation against resume and instruction stepping. Never pauses/resumes.
++bool Core_EmucapWithHaltedCPU(const std::function<bool(uint64_t)> &read) {
++    std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
++    if (coreState != CORE_STEPPING_CPU || !g_cpuStepCommand.empty()) return false;
++    if (Core_IsActive()) return false;
++    return read(g_emucapMemoryEpoch.load());
++}
+diff --git a/Core/Debugger/WebSocket/MemorySubscriber.cpp b/Core/Debugger/WebSocket/MemorySubscriber.cpp
+--- a/Core/Debugger/WebSocket/MemorySubscriber.cpp
++++ b/Core/Debugger/WebSocket/MemorySubscriber.cpp
+@@ -18,6 +18,8 @@
+ #include <algorithm>
+ #include <cstring>
+ #include <mutex>
++#include <functional>
++#include "Core/HW/Display.h"
+ #include "Common/Data/Encoding/Base64.h"
+ #include "Common/StringUtils.h"
+ #include "Core/Core.h"
+@@ -29,11 +31,14 @@
+ #include "Core/Reporting.h"
+ #include "Core/System.h"
+ 
++static void EmucapMemoryBatch(DebuggerRequest &req);
++
+ DebuggerSubscriber *WebSocketMemoryInit(DebuggerEventHandlerMap &map) {
+ 	// No need to bind or alloc state, these are all global.
+ 	map["memory.read_u8"] = &WebSocketMemoryReadU8;
+ 	map["memory.read_u16"] = &WebSocketMemoryReadU16;
+ 	map["memory.read_u32"] = &WebSocketMemoryReadU32;
++	map["emucap.memoryBatch"] = &EmucapMemoryBatch;
+ 	map["memory.read"] = &WebSocketMemoryRead;
+ 	map["memory.readString"] = &WebSocketMemoryReadString;
+ 	map["memory.write_u8"] = &WebSocketMemoryWriteU8;
+@@ -403,3 +408,59 @@
+ 	Reporting::NotifyDebugger();
+ 	req.Respond();
+ }
++
++static bool EmucapBatchRanges(const std::string &text, std::vector<std::pair<uint32_t, uint32_t>> &ranges, uint32_t &total, uint32_t limit, uint32_t window) {
++  size_t at = 0;
++  auto number = [&](uint32_t &value) {
++    value = 0; size_t begin = at;
++    while (at < text.size()) {
++      char c = text[at];
++      unsigned digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
++      if (digit == 16) break;
++      if (value > (UINT32_MAX - digit) / 16) return false;
++      value = value * 16 + digit; ++at;
++    }
++    return at > begin;
++  };
++  total = 0;
++  while (at < text.size()) {
++    uint32_t address, length;
++    if (ranges.size() == 64 || !number(address) || at == text.size() || text[at++] != ',' || !number(length)) return false;
++    if (!length || address >= window || length > window - address || length > limit - total) return false;
++    total += length; ranges.emplace_back(address, length);
++    if (at == text.size()) return true;
++    if (text[at++] != ';' || at == text.size()) return false;
++  }
++  return false;
++}
++
++extern bool Core_EmucapWithHaltedCPU(const std::function<bool(uint64_t)> &read);
++static void EmucapMemoryBatch(DebuggerRequest &req) {
++    std::string descriptors;
++    if (!req.ParamString("ranges", &descriptors)) return;
++    std::vector<std::pair<uint32_t, uint32_t>> ranges;
++    uint32_t total = 0;
++    if (!EmucapBatchRanges(descriptors, ranges, total, 65536, 24 * 1024 * 1024))
++        return req.Fail("invalid memory batch ranges");
++    std::string bytes;
++    uint64_t frame = 0, epoch = 0;
++    bool success = Core_EmucapWithHaltedCPU([&](uint64_t stopEpoch) {
++        Memory::MemoryInitedLock lock;
++        if (!Memory::IsActive()) return false;
++        for (const auto &range : ranges)
++            if (!Memory::IsValidRange(0x08800000 + range.first, range.second)) return false;
++        bytes.reserve(total);
++        for (const auto &range : ranges)
++            bytes.append((const char *)Memory::GetPointerUnchecked(0x08800000 + range.first), range.second);
++        epoch = stopEpoch; frame = __DisplayGetNumVblanks();
++        return true;
++    });
++    if (!success) return req.Fail("memory batch requires an inactive halted CPU and live RAM");
++    const char *digits = "0123456789abcdef";
++    std::string hex; hex.reserve(bytes.size() * 2);
++    for (unsigned char byte : bytes) { hex += digits[byte >> 4]; hex += digits[byte & 15]; }
++    JsonWriter &json = req.Respond();
++    json.writeString("hex", hex);
++    json.writeUint("frame", frame);
++    json.writeUint("epoch", epoch);
++}

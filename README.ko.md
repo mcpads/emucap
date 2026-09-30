@@ -12,7 +12,7 @@ NP2kai 호환 backend(PC-98), MAME(실험적 Neo Geo MVS/AES/CD), 실험적 Mupe
 네 개를 적용한 build와 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware MSX1/MSX2/MSX2+
 카트리지 profile도 제공한다.
 
-**v0.17.1 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
+**v0.18.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
 동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
 있는 기능을 보고한다.
 
@@ -328,8 +328,8 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   `neocdz.zip`과 모든 참조 track이 존재하는 CUE entry file을 사용하며 콘텐츠 identity는 전체
   CUE graph를 포함한다. 세 profile 모두 제한된 RAM, 68000 상태·명령 스텝, 프레임 제어,
   exec/read/write breakpoint와 hit-time 증거, disassemble, frozen-frame 스크린샷과 port-0
-  입력을 제공한다. Native save/load는 MVS와 AES에서 광고하며 MAME 0.288이 unsupported로
-  표시하는 CDZ에서는 제외한다. 파일 확장자만 보고 어느 Neo Geo profile로도 자동 판정하지 않는다.
+  입력, native save/load(CDZ는 유지보수 MAME patch로)를 제공한다. 파일 확장자만 보고 어느
+  Neo Geo profile로도 자동 판정하지 않는다.
   → `adapters/mame-neogeo/README.md`
 - **Mupen64Plus Nintendo 64 (실험적, Unix)** — `adapters/mupen64plus/build.sh`를 실행하고
   `emucap-mupen64plus`를 빌드한다. 일반 카트리지 ROM은 BIOS가 필요 없다. 현재 pure interpreter로

@@ -17,6 +17,9 @@ struct FakeGdb {
     write_state_fixture: bool,
     write_dasm_fixture: bool,
     write_oversized_dasm_fixture: bool,
+    /// Reply to the host feature probe, answered outside the reply queue. Empty models a host
+    /// without the batch/pacing bindings.
+    features: String,
 }
 
 impl FakeGdb {
@@ -30,6 +33,7 @@ impl FakeGdb {
             write_state_fixture: false,
             write_dasm_fixture: false,
             write_oversized_dasm_fixture: false,
+            features: String::new(),
         }
     }
 
@@ -58,6 +62,9 @@ impl FakeGdb {
 impl GdbTransport for FakeGdb {
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.sent.push(payload.into());
+        if payload == "qEmucap,features" {
+            return Ok(self.features.clone());
+        }
         if self.write_state_fixture {
             if let Some(encoded) = payload.strip_prefix("qEmucap,savesync,") {
                 if let Ok(bytes) = hex::decode(encoded) {
@@ -158,10 +165,10 @@ fn hello_advertises_only_proven_initial_surface() {
     assert_eq!(value["contracts"]["catalog"], crate::contracts::CATALOG_ID);
     assert_eq!(
         value["contracts"]["active_exceptions"],
-        json!(MVS_ACTIVE_EXCEPTIONS)
+        json!(ACTIVE_EXCEPTIONS)
     );
     let advertisement = crate::contracts::advertisement_from_hello(&value);
-    let methods = MVS_METHODS
+    let methods = METHODS
         .iter()
         .map(|method| (*method).to_string())
         .collect::<Vec<_>>();
@@ -491,7 +498,7 @@ fn aes_hello_advertises_state_files_and_console_inputs() {
         .iter()
         .any(|button| button == "coin"));
     let advertisement = crate::contracts::advertisement_from_hello(&value);
-    let methods = MVS_METHODS
+    let methods = METHODS
         .iter()
         .map(|method| (*method).to_string())
         .collect::<Vec<_>>();
@@ -505,7 +512,7 @@ fn aes_hello_advertises_state_files_and_console_inputs() {
 }
 
 #[test]
-fn cd_hello_advertises_the_cd_profile_without_state_files() {
+fn cd_hello_advertises_the_cd_profile_with_native_state_files() {
     let mut bridge =
         NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_cd").unwrap();
     let response = bridge.handle_request(request(1, "hello", json!({})));
@@ -513,13 +520,14 @@ fn cd_hello_advertises_the_cd_profile_without_state_files() {
     assert_eq!(value["system"], "neogeo_cd");
     assert_eq!(value["region_sizes"]["ram"], CD_RAM_SIZE);
     assert_eq!(value["capability_notes"]["initial_scope"], "cdz");
+    // The pinned MAME patch registers the CD controller state and marks CDZ save-capable.
     assert_eq!(
         value["capability_notes"]["state_restore"]["supported"],
-        false
+        true
     );
     let methods = value["methods"].as_array().unwrap();
-    assert!(!methods.iter().any(|method| method == "save_state"));
-    assert!(!methods.iter().any(|method| method == "load_state"));
+    assert!(methods.iter().any(|method| method == "save_state"));
+    assert!(methods.iter().any(|method| method == "load_state"));
     assert!(value["input_buttons"]["buttons"]
         .as_array()
         .unwrap()
@@ -531,7 +539,7 @@ fn cd_hello_advertises_the_cd_profile_without_state_files() {
         .iter()
         .any(|button| button == "coin"));
     let advertisement = crate::contracts::advertisement_from_hello(&value);
-    let methods = CD_METHODS
+    let methods = METHODS
         .iter()
         .map(|method| (*method).to_string())
         .collect::<Vec<_>>();
@@ -630,15 +638,9 @@ fn cd_ram_uses_the_two_megabyte_zero_based_profile() {
 }
 
 #[test]
-fn cd_rejects_state_files_and_mvs_only_input_before_backend_mutation() {
+fn cd_rejects_mvs_only_input_before_backend_mutation() {
     let mut bridge =
         NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_cd").unwrap();
-    let save = bridge.handle_request(request(
-        1,
-        "save_state",
-        json!({"path":"/tmp/not-supported.sta"}),
-    ));
-    assert_eq!(save.error.unwrap().kind, "unknown_method");
     let coin = bridge.handle_request(request(2, "set_input", json!({"buttons":["coin"]})));
     assert_eq!(coin.error.unwrap().kind, "bad_params");
     assert!(bridge.gdb.sent.is_empty());
@@ -1047,4 +1049,79 @@ fn oversized_frame_advance_is_rejected_before_backend_mutation() {
     assert_eq!(response.error.unwrap().kind, "bad_params");
     assert!(bridge.gdb.sent.is_empty());
     assert!(bridge.gdb.timeout_changes.is_empty());
+}
+
+fn featured(system: &str, replies: &[&str]) -> NeoGeoBridge<FakeGdb> {
+    let mut gdb = FakeGdb::with(replies);
+    gdb.features = "peek_block,throttle_wait_hook,fastforward_readback".into();
+    let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), system).unwrap();
+    bridge.frozen = true;
+    bridge
+}
+
+#[test]
+fn capable_host_pairs_batch_and_pacing_methods_with_capabilities() {
+    let mut bridge = featured("neogeo_cd", &[]);
+    let hello = bridge.hello().unwrap();
+    let methods: Vec<String> = serde_json::from_value(hello["methods"].clone()).unwrap();
+    let types: Vec<String> = serde_json::from_value(hello["memory_types"].clone()).unwrap();
+    let features =
+        crate::live::link::FeatureCapabilities::from_hello(&hello, &methods, &types).unwrap();
+    assert_eq!(
+        features.memory_batch.unwrap().windows[0].length,
+        CD_RAM_SIZE
+    );
+    assert!(features.execution_speed.is_some());
+    let mut plain =
+        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_mvs").unwrap();
+    let hello = plain.hello().unwrap();
+    assert!(hello.get("memory_batch_capability").is_none());
+    assert!(!hello["methods"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m == "execution_speed"));
+}
+
+#[test]
+fn mvs_batch_offsets_ram_and_rejects_partial_payloads() {
+    let mut bridge = featured("neogeo_mvs", &["OK|2@1.500000000000000000|30|0102,ff"]);
+    let value = bridge
+        .read_memory_batch(
+            &json!({"ranges":[{"memory_type":"ram","address":16,"length":2},
+            {"memory_type":"ram","address":0xffff,"length":1}]}),
+        )
+        .unwrap();
+    assert_eq!(
+        bridge.gdb.sent.last().unwrap(),
+        &format!("qEmucap,peekbatch,{}", hex::encode("100010:2,10ffff:1"))
+    );
+    assert_eq!(value["reads"][1]["hex"], "ff");
+    let mut bridge = featured("neogeo_mvs", &["OK|2@1.5|30|0102"]);
+    assert!(bridge
+        .read_memory_batch(
+            &json!({"ranges":[{"memory_type":"ram","address":16,"length":2},
+            {"memory_type":"ram","address":0,"length":1}]})
+        )
+        .is_err());
+    bridge.frozen = false;
+    assert!(bridge
+        .read_memory_batch(&json!({"ranges":[{"memory_type":"ram","address":0,"length":1}]}))
+        .is_err());
+}
+
+#[test]
+fn slow_neogeo_step_reports_the_host_deadline_with_partial_progress() {
+    let mut bridge = featured(
+        "neogeo_mvs",
+        &["100", "3|1|10|1.0|0|0|0.016896", "OK", "DEADLINE:7", "107"],
+    );
+    let value = bridge.frame_step(300, true).unwrap();
+    assert_eq!(value["reason"], "host_deadline");
+    assert_eq!(value["completed"], 7);
+    assert_eq!(value["state"], "frozen");
+    assert!(bridge
+        .gdb
+        .sent
+        .contains(&format!("qEmucap,opdeadline,{}", hex::encode("245000"))));
 }

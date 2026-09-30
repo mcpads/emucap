@@ -214,6 +214,15 @@ pub(super) fn input_alias(key: &str) -> Option<&'static str> {
     }
 }
 
+/// Why a frame-wait operation ended before its target: a debugger stop or its host deadline.
+pub(super) fn interrupt_reason(raw: &str) -> &'static str {
+    if crate::mame_observation::deadline_frames(raw).is_some() {
+        "host_deadline"
+    } else {
+        "breakpoint"
+    }
+}
+
 pub(super) fn is_stop_packet(resp: &str) -> bool {
     resp.starts_with('S') || resp.starts_with('T')
 }

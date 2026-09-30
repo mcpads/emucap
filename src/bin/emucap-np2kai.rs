@@ -77,23 +77,31 @@ fn main() -> anyhow::Result<()> {
         )
     });
 
-    let mut next_frame = Instant::now() + host.frame_duration();
     loop {
         let command = if host.is_running() {
-            let now = Instant::now();
-            if now >= next_frame {
-                host.run_scheduled_frame()?;
-                next_frame = Instant::now() + host.frame_duration();
-                continue;
-            }
-            match command_rx.recv_timeout(next_frame - now) {
-                Ok(command) => Some(command),
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    host.run_scheduled_frame()?;
-                    next_frame = Instant::now() + host.frame_duration();
-                    None
+            match host.next_frame_start(Instant::now()) {
+                // Unlimited pacing still services one queued command between frames.
+                None => match command_rx.try_recv() {
+                    Ok(command) => Some(command),
+                    Err(mpsc::TryRecvError::Empty) => {
+                        host.run_scheduled_frame()?;
+                        None
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                },
+                Some(start) => {
+                    let now = Instant::now();
+                    if now >= start {
+                        host.run_scheduled_frame()?;
+                        None
+                    } else {
+                        match command_rx.recv_timeout(start - now) {
+                            Ok(command) => Some(command),
+                            Err(mpsc::RecvTimeoutError::Timeout) => None,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         } else {
             match command_rx.recv() {
@@ -102,17 +110,7 @@ fn main() -> anyhow::Result<()> {
             }
         };
         if let Some((request, reply_tx)) = command {
-            let was_running = host.is_running();
-            let response = host.handle_request(request);
-            let running = host.is_running();
-            let _ = reply_tx.send(response);
-            next_frame = deadline_after_command(
-                next_frame,
-                was_running,
-                running,
-                Instant::now(),
-                host.frame_duration(),
-            );
+            let _ = reply_tx.send(host.handle_request(request));
         }
     }
     terminal.store(true, Ordering::Release);
@@ -122,26 +120,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn deadline_after_command(
-    previous: std::time::Instant,
-    was_running: bool,
-    is_running: bool,
-    now: std::time::Instant,
-    frame_duration: std::time::Duration,
-) -> std::time::Instant {
-    if !was_running && is_running {
-        now + frame_duration
-    } else {
-        previous
-    }
-}
-
 #[cfg(not(unix))]
 fn main() -> anyhow::Result<()> {
     anyhow::bail!("the NP2kai frontend currently supports Unix hosts only")
 }
-
-#[cfg(all(test, unix))]
-#[path = "../emucap_np2kai_frontend_tests.rs"]
-mod tests;

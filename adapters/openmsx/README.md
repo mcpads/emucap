@@ -14,8 +14,8 @@ cargo build --locked --release --bin emucap-openmsx-bridge --bin emucap-mcp
 ```
 
 The script downloads the exact release archive, applies the pinned upstream SDL2 compatibility
-backport and all four emucap host patches, builds only inside the ignored `work/` tree, verifies the
-generated executable with `-testconfig`, and writes every patch hash and host API 5 next to
+backport and all five emucap host patches, builds only inside the ignored `work/` tree, verifies the
+generated executable with `-testconfig`, and writes every patch hash and host API 6 next to
 the binary. On macOS it uses existing Homebrew development libraries. No generated source,
 firmware, ROM, or binary is committed.
 
@@ -123,7 +123,7 @@ rotation into the screenshot source. Reset, restore and renderer reinitializatio
 A missing or stale completed raster returns `bad_state`; callers choose whether to advance.
 Capture never inserts a hidden step. Managed capture disables deinterlace and deflicker so each
 image represents one completed field; a changed capture policy is rejected. Headless capture
-remains unsupported. Host API 5 and the pinned patch digests are required; rebuild the native host,
+remains unsupported. Host API 6 and the pinned patch digests are required; rebuild the native host,
 Control and bridge together.
 
 The opt-in native witness uses a generated black/white border-toggle cartridge and checks pixels
@@ -180,3 +180,44 @@ paths are never opened. Missing guest-written disk bytes cannot be reconstructed
 a recoverable rejection. New saves always embed snapshot-time disk bytes. Cartridge and
 cassette formats retain their existing compatibility. Disk snapshots support a single unpatched
 DSK in drive A, with native state and sector image each bounded to 64 MiB.
+
+## Batched memory and execution speed
+
+`read_memory_batch` reads ordered `ranges` at one globally frozen boundary. Each range has
+`memory_type`, `address`, and `length`, using the same address domains as `read_memory`.
+Limits and admitted windows come from `status.memory_batch_capability`: 1–64 ranges,
+1–16 KiB per range, 64 KiB total, inside `memory`, `ram` or `vram`. Every range is validated
+before one native command reads them all. Success contains `reads` indexed by request position,
+exact hex bytes, `consistency: "frozen_boundary"`, and `boundary` with the runtime generation,
+native `stop_epoch`/`memory_mapping_epoch` and the VDP frame clock. The epochs change after any
+execution, load, reset, media change or debugger write, even at an unchanged frame. Invalid or
+incomplete batches produce errors without partial data. Pause explicitly before reading.
+
+Agents can adjust host pacing for automated collection or human interaction through `debug`.
+Call `debug(operation="describe")`, then use its current capability revision:
+
+- `operation="execution_speed", arguments={"mode":"limited","percent":50}`: half speed.
+- `arguments={"mode":"limited","percent":100}`: normal speed; 200 is double, 400 quadruple.
+- `arguments={"mode":"unlimited"}`: remove pacing, the existing launch default.
+- `arguments={}`: query the effective policy. `status.execution_speed` reports the same object.
+
+Limited mode admits 0.01–10000 percent in 0.01 steps (`status.execution_speed_capability`);
+other values are rejected, never rounded. It sets a host pacing target, not a guaranteed
+throughput. Policies report `mode`, `percent` (null unless `limited`), `policy_revision`, and
+the raw native settings under `diagnostics`. Changes work while running or frozen without
+pause/resume and keep a frozen stop identical. They do not change guest clocks, rendering, input
+duration or breakpoint semantics. Native fast-forward and loading acceleration are disabled by
+an explicit change; when a person enables them, or sets a speed off the 0.01 grid, the policy is
+`custom`. A change is one native transaction: a rejected or clamped setting is restored and
+reported as `failed_restored`; a newer external change is kept and reported as a conflict;
+unverifiable restoration terminates the control capability with failure evidence. Reset and
+state loads keep the current policy.
+
+Control requests remain ordered: a speed change during another Control request returns `busy`
+instead of waiting. A frame step that reaches its 10-second host budget at a slow speed stops at
+the reached frame and returns `status: "interrupted", reason: "host_deadline"` with the actual
+count, so split long advances at low percentages. Host patch 0005 lets a control command wake the
+real-time pacing sleep, so commands stay responsive at any percentage without shortening pacing.
+
+Rebuild Control and the openMSX bridge and reconnect to discover these operations. The native
+host API remains unchanged. Other adapters advertise these capabilities only when implemented.

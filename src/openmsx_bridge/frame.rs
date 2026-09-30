@@ -1,3 +1,5 @@
+use serde_json::{json, Value};
+
 use super::{BridgeResult, OpenMsxBridge, OpenMsxBridgeError, OpenMsxControl};
 
 const FRAME_PROBE: &str = "emucap.vdp_frame_boundary";
@@ -66,6 +68,108 @@ const FRAME_TCL: &str = r#"namespace eval ::emucap {
 }"#;
 
 impl<C: OpenMsxControl> OpenMsxBridge<C> {
+    pub(super) fn frame_step(&mut self, count: u64) -> BridgeResult<Value> {
+        self.require_frozen("frame step")?;
+        self.prepare_temporal_request("frame step")?;
+        let before = self.current_frame()?;
+        if let Err(primary) = self.control.advance_frames(count) {
+            if matches!(primary, OpenMsxBridgeError::HostDeadline(_)) {
+                return self.finish_deadline_frame_step(before, count);
+            }
+            let diagnostic = self
+                .control
+                .command("::emucap::frame_debug")
+                .unwrap_or_else(|error| format!("unavailable: {error}"));
+            let cleanup = self
+                .control
+                .command("::emucap::cancel_frame")
+                .and_then(|_| self.control.command("set pause on"))
+                .and_then(|_| self.control.command("debug break"))
+                .and_then(|_| self.require_stop_conjunction("failed frame step cleanup"));
+            return match cleanup {
+                Ok(()) => Err(OpenMsxBridgeError::Emulator(format!(
+                    "{primary}; frame diagnostic: {diagnostic}"
+                ))),
+                Err(cleanup) => self.fail_debugger(format!(
+                    "{primary}; frame diagnostic: {diagnostic}; \
+                     frame target cleanup also failed: {cleanup}"
+                )),
+            };
+        }
+        let after = self.current_frame()?;
+        let dropped = self.drain_debug_events()?;
+        if !self.debug_events.is_empty() || dropped != 0 {
+            if let Err(error) = self.control.command("::emucap::cancel_frame") {
+                return self.fail_debugger(format!(
+                    "breakpoint interrupted frame step but target cleanup failed: {error}"
+                ));
+            }
+            self.require_stop_conjunction("breakpoint-interrupted frame step")?;
+            return Ok(json!({
+                "status":"interrupted",
+                "reason":"breakpoint",
+                "unit":"frames",
+                "count":after.saturating_sub(before),
+                "requested":count,
+                "frame_before":before,
+                "frame":after,
+                "state":"frozen",
+                "event_pending":!self.debug_events.is_empty(),
+            }));
+        }
+        if self.control.command("debug breaked")?.trim() == "1" {
+            return self.fail_debugger(
+                "openMSX entered CPU debug break without a valid callback event".into(),
+            );
+        }
+        self.control.command("debug break")?;
+        self.control.command("set pause on")?;
+        self.require_stop_conjunction("frame step")?;
+        if after != before + count {
+            return Err(OpenMsxBridgeError::Emulator(format!(
+                "openMSX frame step mismatch: expected {}, observed {after}",
+                before + count
+            )));
+        }
+        Ok(json!({
+            "status": "completed",
+            "unit": "frames",
+            "count": count,
+            "frame_before": before,
+            "frame": after,
+            "state": "frozen",
+        }))
+    }
+
+    /// Slow pacing can make a frame target outlast the host budget. Stop at the reached boundary
+    /// and report partial progress; an unverified stop is a debugger failure, not a result.
+    fn finish_deadline_frame_step(&mut self, before: u64, count: u64) -> BridgeResult<Value> {
+        let cleanup = self
+            .control
+            .command("::emucap::cancel_frame")
+            .and_then(|_| self.control.command("set pause on"))
+            .and_then(|_| self.control.command("debug break"))
+            .and_then(|_| self.require_stop_conjunction("deadline-interrupted frame step"));
+        if let Err(error) = cleanup {
+            return self.fail_debugger(format!(
+                "frame step reached its host deadline and could not be stopped: {error}"
+            ));
+        }
+        let after = self.current_frame()?;
+        self.drain_debug_events()?;
+        Ok(json!({
+            "status": "interrupted",
+            "reason": "host_deadline",
+            "unit": "frames",
+            "count": after.saturating_sub(before),
+            "requested": count,
+            "frame_before": before,
+            "frame": after,
+            "state": "frozen",
+            "event_pending": !self.debug_events.is_empty(),
+        }))
+    }
+
     pub(super) fn initialize_frame_monitor(&mut self) -> BridgeResult<()> {
         self.control.command(FRAME_TCL)?;
         self.require_frame_probe()?;

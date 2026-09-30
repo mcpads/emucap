@@ -18,6 +18,7 @@ impl ObsLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
             responses: std::collections::HashMap::new(),

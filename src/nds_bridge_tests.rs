@@ -39,6 +39,10 @@ impl FakeGdb {
 
 impl GdbTransport for FakeGdb {
     fn send(&mut self, payload: &str) -> Result<String, GdbError> {
+        // Status reads pacing on every call; answer it outside the scripted exchange.
+        if payload == "qEmucap,pacing" {
+            return Ok("64,0,1,0".into());
+        }
         self.calls.push(payload.into());
         let Some((expected, reply)) = self.replies.pop_front() else {
             return Err(GdbError::Emulator(format!(
@@ -1783,4 +1787,37 @@ fn gdb_backend_and_stream_errors_keep_distinct_protocol_kinds() {
         "fake reset",
     )));
     assert_eq!(error_kind(&stream_error), "bridge_error");
+}
+
+#[test]
+fn native_memory_batch_reads_discontinuous_ram_once() {
+    let mut host = NdsBridge::new(
+        FakeGdb::with(&[("?", "S05"), ("qEmucap,batch:10,2;0,1", "7,7b:0102ff")]),
+        None,
+        GdbBridgeEnv::default(),
+    );
+    let reply = host
+        .read_memory_batch(&json!({"ranges":[
+            {"memory_type":"main","address":16,"length":2},
+            {"memory_type":"main","address":0,"length":1}
+        ]}))
+        .unwrap();
+    assert_eq!(reply["reads"][0]["hex"], "0102");
+    assert_eq!(reply["reads"][1]["hex"], "ff");
+    assert_eq!(host.arm9.gdb.calls, ["?", "qEmucap,batch:10,2;0,1"]);
+}
+
+#[test]
+fn pacing_setter_failure_closes_control_without_blind_rollback() {
+    let mut host = NdsBridge::new(
+        FakeGdb::with(&[("?", "S05"), ("QEmucap,pacing:32", "E03")]),
+        None,
+        GdbBridgeEnv::default(),
+    );
+    assert!(host
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap_err()
+        .to_string()
+        .contains("unverified"));
+    assert!(host.backend_terminal());
 }

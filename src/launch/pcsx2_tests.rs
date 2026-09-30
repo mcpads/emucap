@@ -107,7 +107,7 @@ fn build_sidecar_must_match_the_pinned_lock() {
          PCSX2_PATCHES_COMMIT=2222222222222222222222222222222222222222\n\
          PCSX2_PATCHES_TREE=3333333333333333333333333333333333333333\n\
          PCSX2_PATCHES_ARCHIVE_SHA256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n\
-         PCSX2_HOST_API=5\n\
+         PCSX2_HOST_API=7\n\
          PCSX2_PATCHSET_SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
     )
     .unwrap();
@@ -145,4 +145,13 @@ fn build_sidecar_must_match_the_pinned_lock() {
             "host API {} is incompatible",
             REQUIRED_HOST_API + 1
         )));
+}
+
+#[test]
+fn pine_socket_paths_beyond_the_unix_limit_are_refused() {
+    let short = pine_socket_path(Path::new("/Users/a/emucap/pcsx2/47800/pine"), 47801).unwrap();
+    assert!(unix_socket_path_fits(&short));
+    let long_dir = format!("/{}", "d".repeat(MAX_UNIX_SOCKET_PATH));
+    let long = pine_socket_path(Path::new(&long_dir), 47801).unwrap();
+    assert!(!unix_socket_path_fits(&long));
 }

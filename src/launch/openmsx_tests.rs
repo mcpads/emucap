@@ -30,7 +30,8 @@ fn write_pinned_build(repo: &Path) -> PathBuf {
          OPENMSX_FRAME_PROBE_PATCH_SHA256=dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n\
          OPENMSX_RASTER_PATCH_SHA256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n\
          OPENMSX_DISK_STATE_PATCH_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n\
-         OPENMSX_HOST_API=5\n",
+         OPENMSX_REALTIME_PATCH_SHA256=1111111111111111111111111111111111111111111111111111111111111111\n\
+         OPENMSX_HOST_API=6\n",
     )
     .unwrap();
     let binary = binary_dir.join(if cfg!(windows) {
@@ -51,6 +52,7 @@ fn write_pinned_build(repo: &Path) -> PathBuf {
             frame_probe_patch_sha256: "d".repeat(64),
             raster_patch_sha256: "e".repeat(64),
             disk_state_patch_sha256: "f".repeat(64),
+            realtime_patch_sha256: "1".repeat(64),
             native_patch: true,
         })
         .unwrap(),

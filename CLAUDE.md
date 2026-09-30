@@ -1,55 +1,42 @@
 # emucap
 
-emucap lets agents observe and control supported emulators. See `README.md` and
-`adapters/*/README.md` for installation, platforms, prerequisites, and adapter builds.
+emucap lets agents observe and control supported emulators. Installation and core packages are
+in `README.md`; adapter prerequisites and builds are in `adapters/*/README.md`.
 
-For release installation, follow README's prebuilt-core path for the host OS and architecture.
-Register the packaged core first, then prepare the chosen adapter according to its README.
-Use the source-build path for development or hosts without a matching release package.
+Register both MCP servers with their release binaries:
 
-## MCP entrypoints
+- `emucap-mcp`: live emulator control.
+- `emucap-track-mcp`: experiment records and the sole `.emucap/` writer.
 
-Register both servers:
+## Start a task
 
-- `emucap-mcp` controls a live emulator.
-- `emucap-track-mcp` stores experiment records and is the sole `.emucap/` writer.
+Call `bootstrap()` and follow `primary_action`. Request `include=["systems"]` for routing details
+or `include=["installation"]` for build paths. With known content, use `launch_plan`, managed
+`launch`, then verify identity and binding with a fresh full `status`.
 
-Start each new Control task with compact `bootstrap()`. Use `include=["systems"]` for the full
-routing catalog or `include=["installation"]` for build/runtime paths. With known content, call
-`launch_plan`, then the managed `launch`, and verify a fresh `status`.
+Full `status` is the authority for available methods, memory regions, CPU targets and limits.
+Refresh after reconnect or generation change. Pass `known_capability_revision` on repeated status
+requests to retain current execution state with a compact catalog response.
 
-Pass `get_rom_info.rom_sha1` unchanged to Tracking `run_start`. Record relevant writes, loads,
-resets, and input with `log_intervention`; record analysis evidence with `log_gate` or `log_metric`.
-Control-side analysis tools do not write the ledger.
+## Operate
 
-## Runtime safety
+Use `tap` for button/key input. Describe `pointer` for mouse controls or `debug` for specialized
+controls, then execute with the returned schema and `known_capability_revision`. Describe
+`analysis` for optional analysis. Tool descriptions and live responses supply operational details.
 
-The full live `status` is the capability authority. Use only advertised methods, memory regions,
-breakpoint domains, inputs, and contract limits. A later status may pass
-`known_capability_revision`; an `unchanged` response omits the cached catalog but retains live
-execution and continuity state.
+For several memory ranges, pause a running guest and use advertised `read_memory_batch` within
+its live windows and limits. For collection speed or human handoff, describe `debug`, query
+`execution_speed`, set an advertised rate, and check the returned policy and state.
 
-The static Control tool list is a basic remote. Memory writes, disassembly, call stacks,
-breakpoints, event polling, and live media changes are direct tools. Use `tap` for button/key input, `pointer(operation="describe")` for mouse controls,
-`debug(operation="describe")` for persistent input, touch, or debugger operations, and `analysis(operation="describe")` for optional analysis. Execute a returned
-operation through the same drawer with its capability revision.
+Wait for each dependent call's terminal response and check its execution state and cleanup
+outcome. On timeout or disconnect, inspect continuity and `get_failure_context()` before choosing
+recovery. Establish process exit from process evidence. Use managed lifecycle tools for attachment
+and replacement; end a generation with `stop(status.runtime_instance.launch_id)`.
 
-Treat connection, guest execution, process state, lease ownership, runtime binding, and preserved
-failure evidence as separate facts. A timeout or disconnected socket does not prove emulator exit.
-Inspect continuity, `runtime_instance` or `stale_runtime_instance`, and `get_failure_context` before
-replacement.
+Pass `get_rom_info.rom_sha1` unchanged to Tracking `run_start`. Record relevant mutations with
+`log_intervention` and observations with `log_gate` or `log_metric`.
 
-Never edit runtime ownership files, build detached launch commands, or terminate by executable
-name. Use `replace:true` only for intentional replacement. End a managed generation with
-`stop(status.runtime_instance.launch_id)`; it verifies generation, lease, PID, and process-start
-identity and fails closed on uncertainty.
+## Develop
 
-Wait for each dependent MCP call to finish before issuing the next one. Network request order does
-not prove write/read, load/inspect, or pause/advance order. Read adapter contracts before composing
-time-sensitive primitives.
-
-## Build and reconnect
-
-Use release binaries for registered MCP servers. After changing MCP instructions, schemas, tools,
-or runtime responses, rebuild the affected release binaries and reconnect both servers. A debug
-build does not update a running release process.
+After changing MCP instructions, schemas, tools or responses, rebuild the affected release
+binaries and reconnect the registered servers.

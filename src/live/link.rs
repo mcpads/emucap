@@ -163,7 +163,50 @@ pub struct Capabilities {
     /// Parsed and validated at hello. Public status advertises it only when the link is direct and
     /// bound to the exact managed generation and lease.
     pub recording: Option<super::recording_capability::RecordingCapability>,
+    /// Static batch/pacing domains parsed at hello; present exactly when the method is advertised.
+    pub features: FeatureCapabilities,
     pub identity: EmulatorIdentity,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FeatureCapabilities {
+    pub memory_batch: Option<super::memory_batch::MemoryBatchCapability>,
+    pub execution_speed: Option<super::pacing::ExecutionSpeedCapability>,
+}
+
+impl FeatureCapabilities {
+    /// A method and its static capability must be advertised together; either one alone is a
+    /// protocol error rather than an implicit fallback.
+    pub fn from_hello(
+        hello: &Value,
+        methods: &[String],
+        memory_types: &[String],
+    ) -> Result<Self, LinkError> {
+        let advertised = |method: &str| methods.iter().any(|name| name == method);
+        let paired = |method: &str, field: &str| match (advertised(method), hello.get(field)) {
+            (true, Some(value)) => Ok(Some(value)),
+            (false, None) => Ok(None),
+            _ => Err(LinkError::Protocol(format!(
+                "{method} and {field} must be advertised together"
+            ))),
+        };
+        let memory_batch = paired(super::memory_batch::METHOD, "memory_batch_capability")?
+            .map(|value| {
+                super::memory_batch::MemoryBatchCapability::from_hello(value, memory_types)
+                    .map_err(LinkError::Protocol)
+            })
+            .transpose()?;
+        let execution_speed = paired(super::pacing::METHOD, "execution_speed_capability")?
+            .map(|value| {
+                super::pacing::ExecutionSpeedCapability::from_hello(value)
+                    .map_err(LinkError::Protocol)
+            })
+            .transpose()?;
+        Ok(Self {
+            memory_batch,
+            execution_speed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +335,7 @@ impl Capabilities {
             breakpoint_kinds: vec![],
             contracts: ContractAdvertisement::Unreported,
             recording: None,
+            features: FeatureCapabilities::default(),
             identity: EmulatorIdentity::default(),
         }
     }
@@ -427,6 +471,7 @@ impl FakeLink {
                 breakpoint_kinds: vec![],
                 contracts: ContractAdvertisement::Unreported,
                 recording: None,
+                features: FeatureCapabilities::default(),
                 identity: EmulatorIdentity::default(),
             },
             response: Ok(result),
@@ -445,6 +490,7 @@ impl FakeLink {
                 breakpoint_kinds: vec![],
                 contracts: ContractAdvertisement::Unreported,
                 recording: None,
+                features: FeatureCapabilities::default(),
                 identity: EmulatorIdentity::default(),
             },
             response: Err(e),

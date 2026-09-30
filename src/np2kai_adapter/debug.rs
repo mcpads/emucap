@@ -9,12 +9,13 @@ impl Np2kaiHost {
         self.ensure_initialized()?;
         let length = required_num(params, "length")?;
         let address = region_address(params, length)?;
-        let bytes = self.read_absolute(
-            address,
-            usize::try_from(length).map_err(|_| {
-                Np2kaiError::BadParams("memory length does not fit this host".into())
-            })?,
-        )?;
+        let length = usize::try_from(length)
+            .map_err(|_| Np2kaiError::BadParams("memory length does not fit this host".into()))?;
+        // Inside the peek view, read without wait-state charges or GRCG/EGC processing.
+        let bytes = match self.peek_absolute(address, length) {
+            Some(bytes) => bytes,
+            None => self.read_absolute(address, length)?,
+        };
         Ok(json!({"hex": hex::encode(bytes)}))
     }
 
@@ -30,6 +31,7 @@ impl Np2kaiHost {
             return Err(Np2kaiError::BadParams("hex must contain data".into()));
         }
         let address = region_address(params, bytes.len() as u64)?;
+        self.boundary_seq += 1;
         if unsafe { (self.api.debug_write_memory)(address, bytes.as_ptr(), bytes.len()) } == 0 {
             return Err(Np2kaiError::Core("NP2kai memory write failed".into()));
         }
@@ -120,7 +122,7 @@ impl Np2kaiHost {
         let frames = optional_num(params, "frame")?
             .or(optional_num(params, "frames")?)
             .unwrap_or(0);
-        let completed = self.run_exact_frames(frames)?;
+        let (completed, stop) = self.run_exact_frames(frames)?;
         let mut read_params = params.clone();
         if let Some(object) = read_params.as_object_mut() {
             object.remove("state");
@@ -129,7 +131,8 @@ impl Np2kaiHost {
         }
         let memory = self.read_memory(&read_params)?;
         Ok(json!({
-            "status": if completed == frames {"completed"} else {"interrupted"},
+            "status": if stop.is_none() {"completed"} else {"interrupted"},
+            "reason": super::observation::AdvanceStop::reason(stop),
             "requested_frames": frames,
             "completed_frames": completed,
             "frame": self.frame,
@@ -385,6 +388,7 @@ impl Np2kaiHost {
         }
         let mut completed = 0;
         let mut interrupted = false;
+        self.boundary_seq += 1;
         unsafe { (self.api.debug_clear_stop)() };
         while completed < count {
             let outcome = unsafe { (self.api.debug_step_instruction)() };
@@ -515,6 +519,7 @@ impl Np2kaiHost {
     pub(super) fn change_media(&mut self, params: &Value) -> Np2kaiResult<Value> {
         self.require_frozen("change_media")?;
         self.ensure_initialized()?;
+        self.boundary_seq += 1;
         let device = params
             .get("device")
             .and_then(Value::as_str)
@@ -601,7 +606,17 @@ impl Np2kaiHost {
         }))
     }
 
-    fn read_absolute(&self, address: u32, length: usize) -> Np2kaiResult<Vec<u8>> {
+    /// Debugger view: `None` when any byte lies outside the native peek view.
+    pub(super) fn peek_absolute(&self, address: u32, length: usize) -> Option<Vec<u8>> {
+        if length == 0 || address as usize + length > 0x100000 {
+            return None;
+        }
+        let mut bytes = vec![0_u8; length];
+        let ok = unsafe { (self.api.debug_peek_memory)(address, bytes.as_mut_ptr(), bytes.len()) };
+        (ok != 0).then_some(bytes)
+    }
+
+    pub(super) fn read_absolute(&self, address: u32, length: usize) -> Np2kaiResult<Vec<u8>> {
         if length == 0 || length > 0x100000 || address as usize + length > 0x100000 {
             return Err(Np2kaiError::BadParams(
                 "physical memory access is out of range".into(),
@@ -735,19 +750,19 @@ impl Np2kaiHost {
     }
 }
 
-fn required_num(params: &Value, key: &str) -> Np2kaiResult<u64> {
+pub(super) fn required_num(params: &Value, key: &str) -> Np2kaiResult<u64> {
     optional_num(params, key)?
         .ok_or_else(|| Np2kaiError::BadParams(format!("missing required param: {key}")))
 }
 
-fn required_str<'a>(params: &'a Value, key: &str) -> Np2kaiResult<&'a str> {
+pub(super) fn required_str<'a>(params: &'a Value, key: &str) -> Np2kaiResult<&'a str> {
     params
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| Np2kaiError::BadParams(format!("missing required param: {key}")))
 }
 
-fn memory_region(name: &str) -> Option<&'static MemoryRegion> {
+pub(super) fn memory_region(name: &str) -> Option<&'static MemoryRegion> {
     MEMORY_REGIONS.iter().find(|region| region.name == name)
 }
 

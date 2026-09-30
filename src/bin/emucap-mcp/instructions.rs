@@ -1,38 +1,36 @@
 /// Self-contained runtime guidance returned to MCP clients.
 pub(crate) const SERVER_INSTRUCTIONS: &str = r#"Debug through the connected emulator adapter.
 
-## Authority and routing
+## Start and select
 
-Start with `bootstrap()` and follow `primary_action`. Use full `status` for names, limits and capabilities; refresh after reconnect or generation change. Compose operations when `contracts.state=validated`.
+Start with `bootstrap()` and follow `primary_action`. Full `status` supplies names, limits and capabilities; refresh after reconnect or generation change. Compose operations when `contracts.state=validated`.
 
-Use `tap` for button/key input. For mouse controls describe `pointer`; for specialized controls describe `debug`. Execute a returned schema with its `known_capability_revision`. Discover optional analysis through `analysis(operation=describe)`.
+Use `tap` for button/key input. Describe `pointer` for mouse controls or `debug` for specialized controls, then execute with the returned schema and `known_capability_revision`. Describe `analysis` for optional analysis.
 
-## Managed lifecycle
+## Manage the runtime
 
-Use launcher-owned isolated runtimes and the bound `listener.port`. Follow `launch_plan`'s system/backend selection requirements. Review each indirect media member and echo the exact returned `review_input`. After launch, verify status identity and binding.
+Use `launch_plan` and managed `launch`. Review indirect media members and submit the returned `review_input`. Verify identity and binding after launch; use the bound `listener.port`.
 
-For launch-entry evidence, inspect `start_frozen_contract`, request `start_frozen:true`, and require `state=frozen`. Treat frozen launch and advertised repeatability as separate guarantees. A running guest advances between calls.
+For launch-entry evidence, check `start_frozen_contract`, request `start_frozen:true`, and verify `state=frozen`. Check repeatability separately.
 
-For an unselected generation, inspect `bootstrap(include=["runtimes"])` and `reattach` its exact available entry. Use `stop(status.runtime_instance.launch_id)` to end a generation. Managed lifecycle tools own runtime files and verify generation, lease, PID and process-start identity; replacement requires verified ownership.
+Select an existing generation through `bootstrap(include=["runtimes"])` and `reattach` its exact entry. End a generation with `stop(status.runtime_instance.launch_id)`, including while adapter transport is unavailable.
 
-## Continuity and execution
+On timeout or disconnect, inspect `status` continuity and `get_failure_context()` before choosing recovery. Distinguish guest execution, transport, process, lease and binding state; establish exit from process evidence.
 
-Read transport, guest execution, process state, lease, binding and failure evidence separately. On timeout or disconnect, inspect continuity and `get_failure_context()` before replacement. Determine exit from process evidence. Managed `stop` also works while adapter transport is unavailable.
+## Control and observe
 
-Start each dependent call after the preceding terminal response. Choose operations by their advertised terminal state: `pause`, `step` and `tap` return frozen; `resume` and `_while_running` leave running. Split advances at live bounds.
+Wait for each dependent call's terminal response and verify its execution state and successful cleanup. Split advances at live bounds. A running guest advances between calls.
 
-Pointer operations return frozen and release transient buttons. Choose movement frames to allow guest cursor polling. Release persistent input and touch holds explicitly or end their generation. Treat cleanup failure as operation failure.
+For collection speed or human handoff, describe `debug`, query `execution_speed`, set an advertised rate, and check the returned policy and state.
 
-Debug `record_window` owns guest time and returns frozen. Use its advertised events, limits, anchors, snapshots, filters and warmup scopes; omitted options keep producer defaults. Interpret evidence within the included callback scope. `integrity=complete` supports complete-window claims; other integrity states support partial evidence.
+For several memory ranges, pause a running guest and use advertised `read_memory_batch` within its live windows and limits. Use region-relative offsets, `status.cpu_targets` for CPU/mode selection, and `status.state_groups` for `get_state`.
 
-For a recording `state_load` origin, call `save_state(preserve_for_recording=true)` and pass its frame-boundary `snapshot_id` plus a dense movie to `record_window`; that operation owns restoration.
+Pause before `change_media`, verify the resulting media state, then advance guest-visible transitions with `step` or `resume`. Account for guest writes when identifying attached media.
 
-## Evidence
+Use advertised `probe` for atomic restore/advance/read. Read screenshot raster provenance separately from capture-time guest state; breakpoint snapshots and later reads each describe their own boundary. Interpret absent hits within validated monitoring coverage and integrity.
 
-Use offsets and bounds of the selected memory region, `status.cpu_targets` and modes for CPU-aware debug, and `status.state_groups` for `get_state` selection.
+## Record evidence
 
-Pause before `change_media` and verify the resulting media state. Advance guest-visible media transitions explicitly with `step` or `resume`. Identify media at the observation time, accounting for guest writes after attachment.
+Use `debug(operation="record_window")` for bounded guest-time captures; `debug(operation="describe")` supplies setup and interpretation rules.
 
-Read screenshot raster provenance separately from the capture-time guest state. Interpret breakpoint snapshots at their reported hit boundary and later reads at their own observation time. Interpret missing hits within validated monitoring coverage and integrity. Use advertised `probe` when restore/advance/read must be atomic; its terminal state is authoritative.
-
-Use Tracking MCP for experiment records. Pass `get_rom_info.rom_sha1` unchanged to `run_start`; resolve composite identity through `launch_plan`. Establish loader consumption from runtime evidence. Record relevant mutations as interventions and observations as gates or metrics."#;
+Use Tracking MCP for experiment records. Pass `get_rom_info.rom_sha1` unchanged to `run_start`; resolve composite identity through `launch_plan`. Record relevant mutations as interventions and observations as gates or metrics."#;

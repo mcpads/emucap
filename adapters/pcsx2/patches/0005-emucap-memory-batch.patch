@@ -1,0 +1,106 @@
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -81,7 +81,7 @@
+ #endif
+ 
+ #define PINE_EMULATOR_NAME "pcsx2"
+-#define EMUCAP_HOST_API 6
++#define EMUCAP_HOST_API 7
+ #define EMUCAP_EE_RAM_SIZE 0x02000000
+ #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
+ #define EMUCAP_MAX_FRAME_ADVANCE 5000
+@@ -210,6 +210,7 @@
+ 		MsgEmuCapChangeMemoryCard = 0x94, /**< Ejects or inserts one managed file memory card. */
+ 		MsgEmuCapPacing = 0x95, /**< Returns the agent pacing readback and the frame counter. */
+ 		MsgEmuCapSetPacing = 0x96, /**< Sets a percent of the guest rate, or 0 for unlimited. */
++		MsgEmuCapMemoryBatch = 0x97, /**< One frozen EE RAM acquisition. */
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -1044,6 +1045,37 @@
+ 					ToResultVector(ret_buffer, r5900Debug.getLO().lo, ret_cnt);
+ 					ret_cnt += 8;
+ 				}, true);
++				break;
++			}
++			case MsgEmuCapMemoryBatch:
++			{
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) goto error;
++				const u32 count = FromSpan<u32>(buf, buf_cnt); buf_cnt += 4;
++				if (!count || count > 64 || !SafetyChecks(buf_cnt, count * 8, ret_cnt, 0, buf_size)) goto error;
++				std::vector<std::pair<u32, u32>> ranges;
++				u32 total = 0;
++				for (u32 i = 0; i < count; ++i) {
++					const u32 address = FromSpan<u32>(buf, buf_cnt);
++					const u32 length = FromSpan<u32>(buf, buf_cnt + 4); buf_cnt += 8;
++					if (!length || address >= EMUCAP_EE_RAM_SIZE || length > EMUCAP_EE_RAM_SIZE - address || length > 65536 - total) goto error;
++					total += length; ranges.emplace_back(address, length);
++				}
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16 + total, buf_size)) goto error;
++				bool success = false;
++				Host::RunOnCPUThread([&]() {
++					if (VMManager::GetState() != VMState::Paused || !eeMem) return;
++					// Paused VM has drained VU/GS workers; all copies run in one owner task.
++					ToResultVector(ret_buffer, VMManager::GetEmucapMemoryEpoch(), ret_cnt);
++					ToResultVector(ret_buffer, static_cast<u64>(g_FrameCount), ret_cnt + 8);
++					u32 offset = ret_cnt + 16;
++					for (const auto &range : ranges) {
++						std::memcpy(&ret_buffer[offset], &eeMem->Main[range.first], range.second);
++						offset += range.second;
++					}
++					success = true;
++				}, true);
++				if (!success) goto error;
++				ret_cnt += 16 + total;
+ 				break;
+ 			}
+ 			case MsgEmuCapReadBytes:
+diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -181,6 +181,9 @@
+ static bool s_gs_open_on_initialize = false;
+ static bool s_thread_affinities_set = false;
+ 
++static std::atomic<u64> s_emucap_memory_epoch{1};
++u64 VMManager::GetEmucapMemoryEpoch() { return s_emucap_memory_epoch.load(); }
++
+ static LimiterModeType s_limiter_mode = LimiterModeType::Nominal;
+ static s64 s_limiter_ticks_per_frame = 0;
+ static u64 s_limiter_frame_start = 0;
+@@ -264,6 +267,7 @@
+ 
+ void VMManager::SetState(VMState state)
+ {
++	++s_emucap_memory_epoch;
+ 	// Some state transitions aren't valid.
+ 	const VMState old_state = s_state.load(std::memory_order_acquire);
+ 	pxAssert(state != VMState::Initializing && state != VMState::Shutdown);
+@@ -1704,6 +1708,7 @@
+ 
+ void VMManager::Reset(bool force)
+ {
++	++s_emucap_memory_epoch;
+ 	pxAssert(HasValidVM());
+ 
+ 	// If we're running, we're probably going to be executing this at event test time,
+@@ -1836,6 +1841,7 @@
+ 
+ bool VMManager::DoLoadState(const char* filename, Error* error)
+ {
++	++s_emucap_memory_epoch;
+ 	if (GSDumpReplayer::IsReplayingDump())
+ 	{
+ 		Error::SetString(error, TRANSLATE_STR("VMManager", "Cannot load state while replaying a GS dump."));
+diff --git a/pcsx2/VMManager.h b/pcsx2/VMManager.h
+--- a/pcsx2/VMManager.h
++++ b/pcsx2/VMManager.h
+@@ -65,6 +65,7 @@
+ 
+ namespace VMManager
+ {
++	u64 GetEmucapMemoryEpoch();
+ 	/// The number of usable save state slots.
+ 	static constexpr s32 NUM_SAVE_STATE_SLOTS = 10;
+ 

@@ -19,6 +19,7 @@ use crate::live::protocol::{ProtocolError, Request, Response, PROTOCOL_VERSION};
 
 mod debug;
 mod ffi;
+mod observation;
 mod operations;
 mod support;
 
@@ -35,6 +36,8 @@ const METHODS: &[&str] = &[
     "hello",
     "status",
     "read_memory",
+    "read_memory_batch",
+    "execution_speed",
     "find_pattern",
     "dump_memory",
     "get_rom_info",
@@ -194,6 +197,9 @@ pub struct Np2kaiHost {
     tracing: bool,
     trace_rows: Vec<Value>,
     dropped_trace: u64,
+    pacer: observation::FramePacer,
+    /// Bumped by every operation that can change guest memory or mapping at one frame count.
+    boundary_seq: u64,
 }
 
 impl Np2kaiHost {
@@ -347,6 +353,8 @@ impl Np2kaiHost {
             tracing: false,
             trace_rows: Vec::new(),
             dropped_trace: 0,
+            pacer: observation::FramePacer::new(),
+            boundary_seq: 0,
         })
     }
 
@@ -370,6 +378,8 @@ impl Np2kaiHost {
             "status" => self.status(),
             "get_rom_info" => self.get_rom_info(),
             "read_memory" => self.read_memory(&request.params),
+            "read_memory_batch" => self.read_memory_batch(&request.params),
+            "execution_speed" => self.execution_speed(&request.params),
             "find_pattern" => self.find_pattern(&request.params),
             "dump_memory" => self.dump_memory(&request.params),
             "change_media" => self.change_media(&request.params),

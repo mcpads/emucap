@@ -177,14 +177,14 @@ inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 
 }
 
 # 1. 어댑터 소스 복사
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pacing.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/core/"
 echo "→ emucap.cpp/.h + input ownership + failure serializers 복사: $SRC/core/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알린다(사용자가 git
 # HEAD와 대조해 재빌드 필요 여부 확인 — build-time 임베드라 재빌드 안 하면 옛 hash 그대로). 미커밋이면 -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
-  emucap.cpp emucap.h emucap_input.h emucap_failure.cpp emucap_failure.h \
+  emucap.cpp emucap.h emucap_input.h emucap_pacing.h emucap_failure.cpp emucap_failure.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@flycast-${FLYCAST_COMMIT:0:12}"
@@ -232,6 +232,30 @@ perl -0777 -pi -e 's{recompiler = Get_Sh4Recompiler\(\);\n\trecompiler->Init\(\)
   "$SRC/core/emulator.cpp"
 inject_check 'emucap: instantiate the SH4 recompiler only when it will be initialized' "$SRC/core/emulator.cpp"
 echo "→ emulator.cpp interpreter 선택 시 unsigned SH4 JIT 초기화 생략"
+
+# 2a. 에이전트 페이싱: Flycast는 오디오 백엔드의 블로킹 push로만 게스트를 페이싱한다. 512-샘플 청크마다
+#    emucap_audio_wait()로 장치 대기를 쓸지 정하고(소리 있는 limited 100일 때만), 아니면 생성된 게스트
+#    샘플 위의 호스트 시계로 emucap_pace_samples()가 대기한다 — 오디오 장치 유무와 무관하게 같은 페이싱.
+perl -0777 -pi -e 's/(#include "emulator\.h"\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
+  "$SRC/core/audio/audiostream.cpp"
+perl -0777 -pi -e 's{\t\tif \(currentBackend != nullptr\)\n\t\t\tcurrentBackend->push\(Buffer, SAMPLE_COUNT, config::LimitFPS\);\n\t\twritePtr = 0;}{\t\tconst bool emucap_device_wait = currentBackend != nullptr \&\& emucap_audio_wait();\n\t\tif (currentBackend != nullptr)\n\t\t\tcurrentBackend->push(Buffer, SAMPLE_COUNT, emucap_device_wait);\n\t\tif (!emucap_device_wait)\n\t\t\temucap_pace_samples(SAMPLE_COUNT);\n\t\twritePtr = 0;} unless m{emucap_pace_samples}' \
+  "$SRC/core/audio/audiostream.cpp"
+inject_check 'emucap.h' "$SRC/core/audio/audiostream.cpp"
+inject_check 'emucap_pace_samples(SAMPLE_COUNT);' "$SRC/core/audio/audiostream.cpp"
+inject_check 'currentBackend->push(Buffer, SAMPLE_COUNT, emucap_device_wait);' "$SRC/core/audio/audiostream.cpp"
+echo "→ audiostream.cpp 에이전트 페이싱 주입"
+# 표시 새로고침에 맞춰 기다리는 스왑은 100% 초과 목표를 표시 주기(보통 60Hz)에 묶는다. 렌더러의
+# 스왑 간격 선택이 Flycast fast-forward처럼 emucap_vsync_released()도 보게 한다.
+for f in core/wsi/sdl.cpp core/wsi/egl.cpp core/rend/vulkan/vulkan_context.cpp \
+         core/rend/dx11/dx11context.cpp core/rend/dx9/dxcontext.cpp; do
+  perl -0777 -pi -e 's/(#include [^\n]*\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' "$SRC/$f"
+  perl -0777 -pi -e 's/!settings\.input\.fastForwardMode && config::VSync/!(settings.input.fastForwardMode || emucap_vsync_released()) \&\& config::VSync/g; s/\(settings\.input\.fastForwardMode \|\| !config::VSync\)/(settings.input.fastForwardMode || emucap_vsync_released() || !config::VSync)/g' "$SRC/$f"
+  inject_check 'emucap_vsync_released()' "$SRC/$f"
+  if grep -q '!settings.input.fastForwardMode && config::VSync' "$SRC/$f"; then
+    echo "ERROR: 스왑 VSync 조건에 emucap_vsync_released 누락: $f"; exit 1
+  fi
+done
+echo "→ 렌더러 스왑 VSync 조건에 에이전트 배속 반영"
 
 # 2b. maple_cfg.cpp 입력 주입: 게임이 실제 입력을 읽는 소비 지점(MapleConfigMap::GetInput, emu 스레드
 #    maple DMA)에서 pjs->kcode를 emucap 주입값으로 override. emu 스레드 동기라 UI 스레드 os_UpdateInputState
@@ -282,6 +306,13 @@ perl -0777 -pi -e 's/(\t+)(u32 op = ReadNexOp\(\);\n\n\t+ExecuteOpcode\(op\);\n\
 inject_check 'emucap_exec_bp_check' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
 inject_check 'emucap.h' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
 echo "→ sh4_interpreter.cpp exec BP 훅 주입(Run 루프 명령-정밀 정지)"
+
+# 2f'. sh4_interpreter Run() frozen park: the vblank service only requests a park; the loop parks right
+#    after UpdateSystem_INTC(), where no scheduler callback is in flight and the saved state is whole.
+perl -0777 -pi -e 's/(\t+)(UpdateSystem_INTC\(\);\n)(\t+\} catch \(const SH4ThrownException& ex\))/${1}${2}${1}if (g_emucap_park_pending) emucap_park();\n${3}/ unless m{emucap_park}' \
+  "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
+inject_check 'if (g_emucap_park_pending) emucap_park();' "$SRC/core/hw/sh4/interpr/sh4_interpreter.cpp"
+echo "→ sh4_interpreter.cpp timeslice-boundary frozen park 훅 주입"
 
 # 2g. sh4_interpreter Run() 루프 크래시경로 관측 훅: exec BP와 같은 자리에 매 명령 전 trace 훅을 추가 주입한다.
 #    armed(전역 bool)가 false면 bool 한 번만 봐서 핫루프 비용 0(set_trace/watch 셋 다 off면 무회귀). 같은 원본

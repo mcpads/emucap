@@ -31,6 +31,7 @@ impl Rec {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
         }
@@ -175,6 +176,7 @@ impl DebugSelectionLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::from_hello(&hello),
             },
             calls: Vec::new(),
@@ -278,6 +280,7 @@ impl ProjectionLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
             delay,
@@ -490,6 +493,7 @@ impl FaultProjectionLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
             fail_after_apply,
@@ -1214,6 +1218,7 @@ impl DumpLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
         }
@@ -1432,6 +1437,7 @@ fn frozen_save_returns_a_producer_managed_receipt_instead_of_a_caller_digest() {
             breakpoint_kinds: vec![],
             contracts: crate::contracts::ContractAdvertisement::Unreported,
             recording: Some(capability),
+            features: Default::default(),
             identity: EmulatorIdentity {
                 system: Some("snes".into()),
                 adapter: Some("mesen2-live".into()),

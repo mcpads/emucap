@@ -82,4 +82,10 @@ emucap_acquire_build_lock() {
   EMUCAP_ACTIVE_BUILD_LOCK="$lock"
   EMUCAP_ACTIVE_BUILD_START="$start"
   export EMUCAP_ACTIVE_BUILD_LOCK EMUCAP_ACTIVE_BUILD_START
+
+  # A git fsmonitor daemon started by the build would inherit descriptor 9 and hold the lock after
+  # the build exits, so the build's git commands run without it.
+  local count="${GIT_CONFIG_COUNT:-0}"
+  export "GIT_CONFIG_KEY_${count}=core.fsmonitor" "GIT_CONFIG_VALUE_${count}=false"
+  export GIT_CONFIG_COUNT=$((count + 1))
 }

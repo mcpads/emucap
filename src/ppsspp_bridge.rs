@@ -142,6 +142,27 @@ const METHODS: &[&str] = &[
     "save_state",
     "load_state",
     "reset",
+    "read_memory_batch",
+    "execution_speed",
+];
+
+/// Requests that neither change guest memory nor move the stop.
+const OBSERVATION_METHODS: &[&str] = &[
+    "hello",
+    "status",
+    "get_rom_info",
+    "read_memory",
+    "read_memory_batch",
+    "find_pattern",
+    "dump_memory",
+    "get_state",
+    "disassemble",
+    "call_stack",
+    "list_breakpoints",
+    "poll_events",
+    "screenshot",
+    "save_state",
+    "execution_speed",
 ];
 
 /// Known internal wire names that have no meaningful PPSSPP implementation.
@@ -297,6 +318,10 @@ pub struct PpssppBridge<T> {
     /// observable yet (for example, the bridge attached to an already-running PPSSPP instance).
     /// Once this process performs set/release, reconnecting MCP sessions can recover that state.
     held_buttons: Option<Vec<String>>,
+    /// Bumped by every request outside the observation set, since those can change memory or the
+    /// stop without changing the VBlank clock.
+    boundary_seq: u64,
+    control_unverified: bool,
 }
 
 impl<T: WsTransport> PpssppBridge<T> {
@@ -338,15 +363,20 @@ impl<T: WsTransport> PpssppBridge<T> {
             launch_id: None,
             next_ticket: 1,
             held_buttons: None,
+            boundary_seq: 0,
+            control_unverified: false,
         }
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.ws.is_terminal()
+        self.control_unverified || self.ws.is_terminal()
     }
 
     pub fn handle_request(&mut self, req: Request) -> Response {
         let id = req.id;
+        if !OBSERVATION_METHODS.contains(&req.method.as_str()) {
+            self.boundary_seq += 1;
+        }
         let result = match req.method.as_str() {
             "hello" => self.hello(),
             "status" => self.status(),
@@ -374,6 +404,8 @@ impl<T: WsTransport> PpssppBridge<T> {
             "save_state" => self.save_state(&req.params),
             "load_state" => self.load_state(&req.params),
             "reset" => self.reset(&req.params),
+            "read_memory_batch" => self.read_memory_batch(&req.params),
+            "execution_speed" => self.execution_speed(&req.params),
             other if UNSUPPORTED_METHODS.contains(&other) => {
                 Err(BridgeError::Unsupported(other.into()))
             }
@@ -404,6 +436,7 @@ impl<T: WsTransport> PpssppBridge<T> {
 /// surfaces as `Ws(Io(WouldBlock|TimedOut))`; `FakeWs` models it as `Io(WouldBlock)`.
 mod debug;
 mod input_state;
+mod observation;
 mod service;
 mod support;
 use support::*;

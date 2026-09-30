@@ -39,6 +39,8 @@ pub(crate) const METHODS: &[&str] = &[
     "dump_memory",
     "get_rom_info",
     "change_media",
+    "read_memory_batch",
+    "execution_speed",
     "write_memory",
     "get_state",
     "save_state",
@@ -265,6 +267,10 @@ pub struct Bridge<G> {
     next_bp: u64,
     input_fields: Option<Vec<String>>,
     pointer_relative: Option<bool>,
+    mame_features: Option<std::collections::BTreeSet<String>>,
+    /// Set when a pacing transaction could not be verified or restored; the control channel is
+    /// then no longer presented as healthy.
+    control_fatal: Option<String>,
 }
 
 impl<G: GdbTransport> Bridge<G> {
@@ -284,6 +290,8 @@ impl<G: GdbTransport> Bridge<G> {
             next_bp: 1,
             input_fields: None,
             pointer_relative: None,
+            mame_features: None,
+            control_fatal: None,
         }
     }
 
@@ -293,6 +301,8 @@ impl<G: GdbTransport> Bridge<G> {
             "hello" => self.hello(),
             "status" => self.status(),
             "read_memory" => self.read_memory(&req.params),
+            "read_memory_batch" => self.read_memory_batch(&req.params),
+            "execution_speed" => self.execution_speed(&req.params),
             "find_pattern" => self.find_pattern(&req.params),
             "dump_memory" => self.dump_memory(&req.params),
             "get_rom_info" => self.get_rom_info(),
@@ -345,7 +355,7 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.gdb.is_terminal()
+        self.gdb.is_terminal() || self.control_fatal.is_some()
     }
 }
 
@@ -354,6 +364,7 @@ mod debug_runtime;
 mod execution;
 mod machine;
 mod media;
+mod observation;
 mod service;
 mod support;
 use support::*;

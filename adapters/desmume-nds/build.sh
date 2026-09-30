@@ -30,6 +30,8 @@ PATCH8="$HERE/patches/0008-emucap-gdb-io-deadline.patch"
 PATCH9="$HERE/patches/0009-emucap-gdb-no-sigpipe.patch"
 PATCH10="$HERE/patches/0010-emucap-shared-scheduler-state.patch"
 PATCH11="$HERE/patches/0011-emucap-vblank-frame-step.patch"
+PATCH12="$HERE/patches/0012-emucap-agent-pacing.patch"
+PATCH13="$HERE/patches/0013-emucap-memory-batch.patch"
 WORK_INPUT="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 [ ! -L "$WORK_INPUT" ] || { echo "ERROR: DeSmuME work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
 mkdir -p "$WORK_INPUT"
@@ -50,18 +52,19 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 [ -f "$PATCH9" ] || { echo "ERROR: emucap gdb SIGPIPE patch not found: $PATCH9" >&2; exit 1; }
 [ -f "$PATCH10" ] || { echo "ERROR: emucap shared-scheduler state patch not found: $PATCH10" >&2; exit 1; }
 [ -f "$PATCH11" ] || { echo "ERROR: emucap VBlank frame-step patch not found: $PATCH11" >&2; exit 1; }
+[ -f "$PATCH12" ] || { echo "ERROR: emucap agent pacing patch not found: $PATCH12" >&2; exit 1; }
 
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13"; do
       cat "$patch"
     done | shasum -a 256 | awk '{print $1}'
   )"
 elif command -v sha256sum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13"; do
       cat "$patch"
     done | sha256sum | awk '{print $1}'
   )"
@@ -124,7 +127,9 @@ for entry in \
   "$PATCH8|emucap gdb I/O deadline patch (0008)" \
   "$PATCH9|emucap gdb SIGPIPE patch (0009)" \
   "$PATCH10|emucap shared-scheduler state patch (0010)" \
-  "$PATCH11|emucap VBlank frame-step patch (0011)"; do
+  "$PATCH11|emucap VBlank frame-step patch (0011)" \
+  "$PATCH12|emucap agent pacing patch (0012)" \
+  "$PATCH13|emucap memory batch patch (0013)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"
@@ -137,12 +142,18 @@ done
 emucap_scrub_build_env
 
 # 4. Configure + build the headless CLI with the GDB stub (gdb-stub forces the interpreter).
-if [ ! -f "$BUILD/build.ninja" ]; then
-  echo "→ meson setup ($BUILD)"
-  ( cd "$POSIX" && meson setup build-headless \
-      -Dfrontend-cli=true -Dgdb-stub=true \
-      -Dfrontend-gtk=false -Dfrontend-gtk2=false -Dwifi=false )
-fi
+# Dependency paths found at setup go stale when the host package manager upgrades them, so an
+# existing build directory is reconfigured every time without cached dependency lookups.
+# Unchanged commands keep their objects.
+RECONFIGURE=""
+[ -f "$BUILD/build.ninja" ] && RECONFIGURE="--reconfigure --clearcache"
+echo "→ meson setup $RECONFIGURE ($BUILD)"
+# An optimized build: the unoptimized default capped the interpreter near 68 frames per second,
+# below any target above 100 percent.
+( cd "$POSIX" && meson setup $RECONFIGURE build-headless \
+    -Dbuildtype=debugoptimized \
+    -Dfrontend-cli=true -Dgdb-stub=true \
+    -Dfrontend-gtk=false -Dfrontend-gtk2=false -Dwifi=false )
 echo "→ ninja (-j$JOBS)"
 ninja -C "$BUILD" -j"$JOBS"
 

@@ -5,6 +5,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
+. "$HERE/../_common/build-env.sh"
+emucap_scrub_build_env
 . "$HERE/upstream.lock"
 
 DEFAULT_WORK="$HERE/work"
@@ -55,6 +57,7 @@ PATCHES=(
   "$HERE/patches/0003-propagate-savestate-errors.patch"
   "$HERE/patches/0004-include-integer-abs-declaration.patch"
   "$HERE/patches/0005-preserve-high-resolution-timer-state.patch"
+  "$HERE/patches/0006-add-side-effect-free-memory-peek.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256_path /dev/stdin)"
 if [ "$ACTUAL_PATCHSET_SHA256" != "$NP2KAI_PATCHSET_SHA256" ]; then

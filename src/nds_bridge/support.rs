@@ -40,6 +40,7 @@ pub(super) fn error_kind(err: &NdsBridgeError) -> &'static str {
         NdsBridgeError::BadParams(_) => "bad_params",
         NdsBridgeError::UnknownMethod(_) => "unknown_method",
         NdsBridgeError::Unsupported(_) => "unsupported",
+        NdsBridgeError::NotFrozen(_) => "not_frozen",
         NdsBridgeError::Emulator(_) | NdsBridgeError::Gdb(GdbError::Emulator(_)) => {
             "emulator_error"
         }

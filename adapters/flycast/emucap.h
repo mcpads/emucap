@@ -14,9 +14,26 @@ void emucap_service();
 bool emucap_input_engaged();
 uint32_t emucap_kcode();
 
+// Agent pacing hooks injected into core/audio/audiostream.cpp. WriteSample pushes each 512-sample
+// chunk with emucap_audio_wait() (the audio device paces only an audible limited 100 percent) and
+// otherwise calls emucap_pace_samples(), which waits on a host clock over the generated guest
+// samples in 10 ms slices while answering read-only requests.
+bool emucap_audio_wait();
+void emucap_pace_samples(uint32_t samples);
+// A swap that waits for the host display refresh would cap a target above 100 percent at the
+// display rate, so the renderers' swap-interval choice treats it like Flycast fast-forward.
+bool emucap_vsync_released();
+
 // mainui_rend_frame(UI/GL 스레드)에서 매 렌더마다 호출. 최신 프레임 raw를 버퍼에 떠 둬서 screenshot이
 // emu 스레드에서 즉시 PNG로 인코딩(GL 불필요)할 수 있게 한다 → freeze 중에도 screenshot 동작.
 void emucap_capture_latest();
+
+// Frozen park — the vblank service requests it and the sh4_interpreter Run() loop (injected) parks
+// right after UpdateSystem_INTC(), between timeslices. No scheduler callback or tick is in flight
+// there, so a state saved or loaded while parked is the whole machine and execution resumes from it
+// exactly; parking inside the vblank callback let the scheduler continue with the pre-load timeline.
+extern bool g_emucap_park_pending;
+void emucap_park();
 
 // exec breakpoint 훅 — sh4_interpreter Run() 루프(주입)가 매 명령 전 사용한다. g_emucap_bp_armed가
 // true일 때만 emucap_exec_bp_check(pc)를 보고(핫루프 비용 0), 히트면 emucap_bp_spin(pc)로 명령-정밀 정지.

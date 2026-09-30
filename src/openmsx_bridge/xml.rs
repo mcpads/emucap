@@ -255,7 +255,16 @@ impl OpenMsxControl for XmlControl {
             if self.pause == Some(true) {
                 return Ok(());
             }
-            match self.recv_until(deadline)? {
+            let event = match self.recv_until(deadline) {
+                Err(OpenMsxBridgeError::Emulator(_)) if Instant::now() >= deadline => {
+                    return Err(OpenMsxBridgeError::HostDeadline(format!(
+                        "frame advance exceeded its {}-second host budget",
+                        ADVANCE_TIMEOUT.as_secs()
+                    )))
+                }
+                other => other?,
+            };
+            match event {
                 XmlEvent::Pause(value) => self.pause = Some(value),
                 XmlEvent::Terminal(message) => {
                     self.terminal.store(true, Ordering::Release);

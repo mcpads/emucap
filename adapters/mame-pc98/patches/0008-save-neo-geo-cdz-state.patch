@@ -1,0 +1,64 @@
+--- a/src/mame/neogeo/neogeo.cpp
++++ b/src/mame/neogeo/neogeo.cpp
+@@ -1639,7 +1639,9 @@
+ 
+ void neogeo_base_state::device_post_load()
+ {
+-	m_bank_audio_main->set_entry(m_use_cart_audio);
++	// The CD models map the sound CPU to RAM and have no audio ROM bank.
++	if (m_bank_audio_main)
++		m_bank_audio_main->set_entry(m_use_cart_audio);
+ 	set_pens();
+ }
+ 
+--- a/src/mame/neogeo/neogeocd.cpp
++++ b/src/mame/neogeo/neogeocd.cpp
+@@ -1169,8 +1169,8 @@
+ 
+ 
+ //    YEAR  NAME     PARENT  COMPAT  MACHINE     INPUT   CLASS        INIT          COMPANY FULLNAME               FLAGS */
+-CONS( 1996, neocdz,  0,      0,      neocd_ntsc, neocd,  ngcd_state,  init_neocdz,  "SNK",  "Neo-Geo CDZ (US)",    0 ) // the CDZ is the newer model
+-CONS( 1996, neocdzj, neocdz, 0,      neocd_ntsc, neocd,  ngcd_state,  init_neocdzj, "SNK",  "Neo-Geo CDZ (Japan)", 0 )
++CONS( 1996, neocdz,  0,      0,      neocd_ntsc, neocd,  ngcd_state,  init_neocdz,  "SNK",  "Neo-Geo CDZ (US)",    MACHINE_SUPPORTS_SAVE ) // the CDZ is the newer model
++CONS( 1996, neocdzj, neocdz, 0,      neocd_ntsc, neocd,  ngcd_state,  init_neocdzj, "SNK",  "Neo-Geo CDZ (Japan)", MACHINE_SUPPORTS_SAVE )
+ 
+ // NTSC region?
+ CONS( 1994, neocd,   neocdz, 0,      neocd_ntsc, neocd,  ngcd_state,  empty_init,   "SNK",  "Neo-Geo CD (NTSC?)",  MACHINE_NOT_WORKING ) // older  model, ignores disc protections?
+--- a/src/mame/shared/megacdcd.cpp
++++ b/src/mame/shared/megacdcd.cpp
+@@ -187,6 +187,35 @@
+ 	m_type1_interrupt_callback.resolve();
+ 	m_type2_interrupt_callback.resolve();
+ 	m_type3_interrupt_callback.resolve();
++
++	// The TOC pointer comes from the mounted image; everything else is controller state.
++	save_item(NAME(segacd.current_frame));
++	save_item(NAME(SCD_BUFFER));
++	save_item(NAME(SCD_STATUS));
++	save_item(NAME(SCD_STATUS_CDC));
++	save_item(NAME(SCD_CURLBA));
++	save_item(NAME(SCD_CURTRK));
++	save_item(NAME(CDC_DECODE));
++	save_item(NAME(CDC_REG0));
++	save_item(NAME(CDC_REG1));
++	save_item(NAME(CDC_BUFFER));
++	save_item(NAME(CDD_RX));
++	save_item(NAME(CDD_TX));
++	save_item(NAME(CDD_STATUS));
++	save_item(NAME(CDD_MIN));
++	save_item(NAME(CDD_SEC));
++	save_item(NAME(CDD_FRAME));
++	save_item(NAME(CDD_EXT));
++	save_item(NAME(CDD_CONTROL));
++	save_item(NAME(CDD_DONE));
++	save_item(NAME(segacd_irq_mask));
++	save_item(NAME(nff0002));
++	save_item(NAME(nff0016));
++	save_item(NAME(LC8951RegistersR));
++	save_item(NAME(LC8951RegistersW));
++	save_item(NAME(bNeoCDCommsClock));
++	save_item(NAME(NeoCDCommsWordCount));
++	save_item(NAME(NeoCD_StatusHack));
+ }
+ 
+ void lc89510_temp_device::device_reset()

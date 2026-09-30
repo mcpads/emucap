@@ -1,0 +1,216 @@
+diff --git a/pcsx2/PINE.cpp b/pcsx2/PINE.cpp
+index 147e7b39d..41846be14 100644
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -16,6 +16,7 @@
+ #include "SIO/Sio.h"
+ #include "PINE.h"
+ #include "VMManager.h"
++#include "Counters.h"
+ #include "common/Error.h"
+ #include "common/Image.h"
+ #include "common/Path.h"
+@@ -23,6 +24,8 @@
+ 
+ #include <atomic>
+ #include <chrono>
++#include <cmath>
++#include <cstring>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <span>
+@@ -78,7 +81,7 @@
+ #endif
+ 
+ #define PINE_EMULATOR_NAME "pcsx2"
+-#define EMUCAP_HOST_API 5
++#define EMUCAP_HOST_API 6
+ #define EMUCAP_EE_RAM_SIZE 0x02000000
+ #define EMUCAP_MAX_MEMORY_TRANSFER 0x20000
+ #define EMUCAP_MAX_FRAME_ADVANCE 5000
+@@ -205,6 +208,8 @@ namespace PINEServer
+ 		MsgEmuCapReset = 0x92, /**< Resets synchronously and remains paused. */
+ 		MsgEmuCapMemoryCardStatus = 0x93, /**< Returns the two main memory-card slot states. */
+ 		MsgEmuCapChangeMemoryCard = 0x94, /**< Ejects or inserts one managed file memory card. */
++		MsgEmuCapPacing = 0x95, /**< Returns the agent pacing readback and the frame counter. */
++		MsgEmuCapSetPacing = 0x96, /**< Sets a percent of the guest rate, or 0 for unlimited. */
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -1560,6 +1565,60 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
+ 					goto error;
+ 				break;
+ 			}
++			case MsgEmuCapPacing:
++			{
++				// u32 limiter mode, u32 nominal speed in hundredths of a percent, u32 target speed
++				// float bits, u64 observed-change revision, u64 frame count.
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 28, buf_size)) [[unlikely]]
++					goto error;
++				u32 mode = 0;
++				u32 nominal = 0;
++				float target = 0.0f;
++				u64 frame = 0;
++				Host::RunOnCPUThread([&mode, &nominal, &target, &frame]() {
++					mode = static_cast<u32>(VMManager::GetLimiterMode());
++					nominal = static_cast<u32>(std::lround(VMManager::GetNominalSpeed() * 10000.0));
++					target = VMManager::GetTargetSpeed();
++					frame = g_FrameCount;
++				}, true);
++				static std::string s_pacing_key;
++				static u64 s_pacing_revision = 0;
++				const std::string key = fmt::format("{}|{}|{}", mode, nominal, target);
++				if (key != s_pacing_key)
++				{
++					s_pacing_key = key;
++					s_pacing_revision++;
++				}
++				u32 target_bits;
++				std::memcpy(&target_bits, &target, sizeof(target_bits));
++				ToResultVector(ret_buffer, mode, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, nominal, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, target_bits, ret_cnt);
++				ret_cnt += 4;
++				ToResultVector(ret_buffer, s_pacing_revision, ret_cnt);
++				ret_cnt += 8;
++				ToResultVector(ret_buffer, frame, ret_cnt);
++				ret_cnt += 8;
++				break;
++			}
++			case MsgEmuCapSetPacing:
++			{
++				if (!VMManager::HasValidVM())
++					goto error;
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 0, buf_size)) [[unlikely]]
++					goto error;
++				const u32 percent = FromSpan<u32>(buf, buf_cnt);
++				buf_cnt += 4;
++				bool applied = false;
++				Host::RunOnCPUThread([percent, &applied]() { applied = VMManager::SetEmucapSpeedPercent(percent); }, true);
++				if (!applied)
++					goto error;
++				break;
++			}
+ 			default:
+ 			{
+ 			error:
+diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
+index e6263c565..4472a80a8 100644
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -185,6 +185,10 @@ static LimiterModeType s_limiter_mode = LimiterModeType::Nominal;
+ static s64 s_limiter_ticks_per_frame = 0;
+ static u64 s_limiter_frame_start = 0;
+ static float s_target_speed = 0.0f;
++// Set when the frame limiter restarts, so a wait computed for the previous target ends.
++static bool s_limiter_restarted = false;
++// emucap agent nominal speed; 0 uses the configured nominal speed.
++static float s_emucap_nominal_speed = 0.0f;
+ static bool s_target_speed_can_sync_to_host = false;
+ static bool s_target_speed_synced_to_host = false;
+ static bool s_use_vsync_for_timing = false;
+@@ -2122,7 +2126,7 @@ float VMManager::GetTargetSpeedForLimiterMode(LimiterModeType mode)
+ 	switch (s_limiter_mode)
+ 	{
+ 		case LimiterModeType::Nominal:
+-			return EmuConfig.EmulationSpeed.NominalScalar;
++			return GetNominalSpeed();
+ 
+ 		case LimiterModeType::Slomo:
+ 			return EmuConfig.EmulationSpeed.SlomoScalar;
+@@ -2174,8 +2178,9 @@ void VMManager::UpdateTargetSpeed()
+ 
+ 	const float target_frame_rate = frame_rate * target_speed;
+ 
++	// The floor only keeps the division finite; slow agent targets go well below one frame per second.
+ 	s_limiter_ticks_per_frame =
+-		static_cast<s64>(static_cast<double>(GetTickFrequency()) / static_cast<double>(std::max(frame_rate * target_speed, 1.0f)));
++		static_cast<s64>(static_cast<double>(GetTickFrequency()) / static_cast<double>(std::max(frame_rate * target_speed, 0.001f)));
+ 
+ 	DevCon.WriteLn(fmt::format("Frame rate: {}, target speed: {}, target frame rate: {}, ticks per frame: {}", frame_rate, target_speed,
+ 		target_frame_rate, s_limiter_ticks_per_frame));
+@@ -2187,9 +2192,32 @@ void VMManager::UpdateTargetSpeed()
+ 		MTGS::UpdateVSyncMode();
+ 		SPU2::OnTargetSpeedChanged();
+ 		ResetFrameLimiter();
++		s_limiter_restarted = true;
+ 	}
+ }
+ 
++float VMManager::GetNominalSpeed()
++{
++	return s_emucap_nominal_speed > 0.0f ? s_emucap_nominal_speed : EmuConfig.EmulationSpeed.NominalScalar;
++}
++
++bool VMManager::SetEmucapSpeedPercent(u32 percent)
++{
++	if (percent > 10000)
++		return false;
++	if (percent == 0)
++	{
++		SetLimiterMode(LimiterModeType::Unlimited);
++		return true;
++	}
++	s_emucap_nominal_speed = static_cast<float>(percent) / 100.0f;
++	if (s_limiter_mode == LimiterModeType::Nominal)
++		UpdateTargetSpeed();
++	else
++		SetLimiterMode(LimiterModeType::Nominal);
++	return true;
++}
++
+ bool VMManager::IsTargetSpeedAdjustedToHost()
+ {
+ 	return s_target_speed_synced_to_host;
+@@ -2224,15 +2252,20 @@ void VMManager::Internal::Throttle()
+ 		return;
+ 	}
+ 
+-	// Conversion of delta from CPU ticks (microseconds) to milliseconds
+-	const s32 msec = static_cast<s32>((sDeltaTime * -1000) / static_cast<s64>(GetTickFrequency()));
+-
+-	// If any integer value of milliseconds exists, sleep it off.
+-	// Prior comments suggested that 1-2 ms sleeps were inaccurate on some OSes;
+-	// further testing suggests instead that this was utter bullshit.
+-	if (msec > 1)
++	// emucap: sleep off whole milliseconds in slices of at most 10 ms and serve CPU-thread requests
++	// between them, so control is not held behind a long frame at a slow target. A pause or a
++	// limiter restart (a pacing change) ends the wait.
++	s_limiter_restarted = false;
++	for (;;)
+ 	{
+-		Threading::Sleep(msec - 1);
++		const s64 remaining = static_cast<s64>(uExpectedEnd) - static_cast<s64>(GetCPUTicks());
++		const s64 msec = (remaining * 1000) / static_cast<s64>(GetTickFrequency());
++		if (msec <= 1)
++			break;
++		Threading::Sleep(static_cast<int>(std::min<s64>(msec - 1, 10)));
++		Host::PumpMessagesOnCPUThread();
++		if (IsExecutionInterrupted() || s_limiter_restarted)
++			return;
+ 	}
+ 
+ 	// Conversion to milliseconds loses some precision; after sleeping off whole milliseconds,
+diff --git a/pcsx2/VMManager.h b/pcsx2/VMManager.h
+index e63bde004..30192bb7f 100644
+--- a/pcsx2/VMManager.h
++++ b/pcsx2/VMManager.h
+@@ -190,6 +190,14 @@ namespace VMManager
+ 	/// EmuConfig.EmulationSpeed without going through the usual config apply.
+ 	void UpdateTargetSpeed();
+ 
++	/// emucap agent pacing: sets the nominal speed to a percent of the guest rate in the nominal
++	/// limiter mode, or selects the unlimited mode for 0. Returns false outside 0..10000. The agent
++	/// speed survives settings reloads, which a reset performs.
++	bool SetEmucapSpeedPercent(u32 percent);
++
++	/// Returns the nominal speed in effect: the agent speed when set, otherwise the configured one.
++	float GetNominalSpeed();
++
+ 	/// Returns true if the target speed is being synchronized with the host's refresh rate.
+ 	bool IsTargetSpeedAdjustedToHost();
+ 

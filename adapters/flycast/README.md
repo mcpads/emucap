@@ -43,6 +43,24 @@ available when their primitive dependencies exist. This includes atomic `probe`:
 generation link while it pauses, restores state, advances exact frames, and reads frozen memory, so
 the native adapter does not need a duplicate wire verb. `status.methods` is authoritative.
 
+A frozen stop reached through a vblank parks at the end of that SH4 timeslice, after the scheduler
+tick and interrupt update, not inside the vblank callback. Nothing is in flight there, so a state
+saved or loaded while parked is the whole machine and the same state always resumes the same way.
+Parking inside the callback let the scheduler finish that tick with the pre-load timeline, so one
+saved state produced different guest memory and input outcomes from run to run.
+
+`read_memory_batch` reads up to 64 ranges (64 KiB) of `ram`, `vram` and `aica` at one frozen stop
+(vblank park or exec breakpoint) from their backing host arrays. `debug.execution_speed` sets an
+integer 1–10000 percent or unlimited. Upstream Flycast paces only through the audio backend's
+blocking push; the maintained hook in `audiostream.cpp` instead waits on a host clock over the
+generated AICA samples, so pacing is the same with or without an audio device. An audible
+limited 100 percent keeps the device wait (`audio_output` host constraint). Waits sleep in 10 ms
+slices and answer read-only requests, so polling never advances a slow guest; other requests end
+the wait. Above 100 percent or unlimited, the renderers stop waiting for the display refresh on
+swap, as they do for Flycast fast-forward, so the display rate does not cap the target. Flycast
+fast-forward reads back as unlimited. Frame steps follow the policy and stop
+with `reason: "host_deadline"` at the synchronous budget.
+
 A replacement Control MCP can reconnect without restarting Flycast. Do not treat a disconnected
 socket as permission to relaunch: inspect `status.continuity`, `status.runtime_instance`, and
 `get_failure_context` first. A blocked fatal SH-4 exception preserves its exact registers and recent
@@ -63,7 +81,7 @@ contracts are not available under the native adapter's vblank-frame freeze model
 Mute: sound can be turned on with `EMUCAP_MUTE=0` (default 1 = muted). The launcher writes `aica.Volume` only in
 the emucap-owned config copy.
 
-⚠ **screenshot works via a continuous buffer.** GetLastFrame needs the GL context (UI thread), but freeze (vblank-spin) blocks
+⚠ **screenshot works via a continuous buffer.** GetLastFrame needs the GL context (UI thread), but freeze (the park spin) blocks
 UI rendering, so a gui_runOnUiThread/deferred approach deadlocks. Instead, mainui_rend_frame copies the latest raw frame into a
 buffer on every render via `emucap_capture_latest()`, and on a screenshot request the emu thread PNG-encodes that buffer
 (no GL needed) → it works even while frozen (buffer = the frame just before freeze = the frozen frame). ⚠ After a load_state while

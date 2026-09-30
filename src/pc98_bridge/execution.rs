@@ -38,7 +38,8 @@ impl<G: GdbTransport> Bridge<G> {
         if let Some(raw) = stop {
             return Ok(json!({
                 "status": "interrupted",
-                "reason": "breakpoint",
+                "reason": interrupt_reason(&raw),
+                "completed": crate::mame_observation::deadline_frames(&raw),
                 "raw": raw,
                 "frame": self.current_frame(),
             }));
@@ -71,7 +72,8 @@ impl<G: GdbTransport> Bridge<G> {
             self.frozen = true;
             return Ok(json!({
                 "status": "interrupted",
-                "reason": "breakpoint",
+                "reason": interrupt_reason(&raw),
+                "completed": crate::mame_observation::deadline_frames(&raw),
                 "raw": raw,
                 "frame": self.current_frame(),
             }));

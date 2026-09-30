@@ -347,7 +347,7 @@ fn handshake_stream(
         .get("protocol_version")
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    let methods = caps_val
+    let methods: Vec<String> = caps_val
         .get("methods")
         .and_then(|v| v.as_array())
         .map(|a| {
@@ -393,6 +393,8 @@ fn handshake_stream(
         &registry,
     )
     .map_err(|error| LinkError::Protocol(error.to_string()))?;
+    let features =
+        super::link::FeatureCapabilities::from_hello(&caps_val, &methods, &memory_types)?;
     if identity.adapter.as_deref() == Some("mesen2-live") && !identity.has_mesen_native_halt() {
         return Err(LinkError::Protocol(
             "mesen-patch-required: Mesen hello lacks code_break_idle/native_halt_service"
@@ -423,6 +425,7 @@ fn handshake_stream(
             breakpoint_kinds,
             contracts: crate::contracts::advertisement_from_hello(&caps_val),
             recording,
+            features,
             identity,
         },
     ))

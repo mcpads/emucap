@@ -26,6 +26,8 @@ mod instructions;
 mod launch;
 #[path = "emucap-mcp/memory_write.rs"]
 mod memory_write;
+#[path = "emucap-mcp/observation_speed.rs"]
+mod observation_speed;
 #[path = "emucap-mcp/pointer_surface.rs"]
 mod pointer_surface;
 #[path = "emucap-mcp/reattach.rs"]
@@ -104,7 +106,14 @@ impl Emucap {
 
     fn current_surface_status(&self) -> Result<serde_json::Value, CallToolResult> {
         let mut link = self.link();
-        match observe_control_state(&mut *link) {
+        self.surface_status_with_link(&mut *link)
+    }
+
+    fn surface_status_with_link(
+        &self,
+        link: &mut dyn EmulatorLink,
+    ) -> Result<serde_json::Value, CallToolResult> {
+        match observe_control_state(link) {
             Ok(mut observation) => {
                 apply_capability_revision(&mut observation.status, None);
                 if observation
@@ -269,6 +278,16 @@ impl Emucap {
         }
     }
 
+    #[tool(
+        description = "Read ordered memory ranges together at one frozen boundary. Pause first if running. Use the windows and limits in status.memory_batch_capability; success returns every requested range."
+    )]
+    async fn read_memory_batch(
+        &self,
+        Parameters(a): Parameters<ReadMemoryBatchArgs>,
+    ) -> CallToolResult {
+        observation_speed::read_memory_batch(&mut *self.link(), a)
+    }
+
     async fn probe(&self, Parameters(a): Parameters<ProbeArgs>) -> CallToolResult {
         let mut link = self.link();
         match tools::probe(
@@ -357,7 +376,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Read the running content identity and its normalized Tracking identifier."
+        description = "Read the running content identity and its normalized Tracking identifier. Establish actual loader consumption using separate runtime evidence."
     )]
     async fn get_rom_info(&self, Parameters(_): Parameters<EmptyArgs>) -> CallToolResult {
         let (result, endpoint_port, live_launch_id) = {

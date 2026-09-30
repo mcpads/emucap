@@ -11,13 +11,14 @@ use serde_json::{Map, Value};
 use emucap::live::tools::ToolOutput;
 
 use crate::args::{
-    BreakOnResetArgs, EmptyArgs, FindPatternArgs, GetTraceArgs, PathArgs, ProbeArgs,
-    RecordWindowArgs, ResolveTileArgs, RoutedOperationArgs, SetLayerEnableArgs, SetTraceArgs,
-    WatchRegisterArgs,
+    BreakOnResetArgs, EmptyArgs, ExecutionSpeedArgs, FindPatternArgs, GetTraceArgs, PathArgs,
+    ProbeArgs, RecordWindowArgs, ResolveTileArgs, RoutedOperationArgs, SetLayerEnableArgs,
+    SetTraceArgs, WatchRegisterArgs,
 };
 use crate::{analysis_surface, invalid_request_result, recording, tool_output_result, Emucap};
 
 const OPERATIONS: &[&str] = &[
+    "execution_speed",
     "set_input",
     "hold_touch",
     "release_touch",
@@ -76,6 +77,8 @@ fn add<T: schemars::JsonSchema>(
 pub(crate) fn describe(status: &Value) -> Value {
     let mut operations = Map::new();
     input::describe(status, &mut operations);
+    add::<ExecutionSpeedArgs>(&mut operations, status, "execution_speed",
+        "Query host pacing with {}. Set limited with an advertised percent (100=normal, 50=half, 200=double), or unlimited with mode only. Check the returned effective policy and execution state. Rates and limits are in status.execution_speed_capability.");
     add::<EmptyArgs>(
         &mut operations,
         status,
@@ -98,7 +101,7 @@ pub(crate) fn describe(status: &Value) -> Value {
         &mut operations,
         status,
         "probe",
-        "Atomically restore, advance, and read one memory value.",
+        "Atomically restore, advance, and read one memory value; return frozen.",
     );
     add::<EmptyArgs>(
         &mut operations,
@@ -128,7 +131,7 @@ pub(crate) fn describe(status: &Value) -> Value {
         &mut operations,
         status,
         "record_window",
-        "Capture a negotiated bounded guest-time window and return frozen with a validated bundle.",
+        "Capture a bounded guest-time window and return frozen. Use advertised events, limits and callback scopes; omitted options keep producer defaults. For state_load, first save_state(preserve_for_recording=true), then pass its frame-boundary snapshot_id and the required dense movie; this operation owns restoration. Interpret evidence within the selected scope: integrity=complete supports complete-window claims, other integrity states support partial evidence.",
     );
     add::<WatchRegisterArgs>(
         &mut operations,
@@ -203,6 +206,10 @@ pub(crate) async fn execute(
         return tool_output_result(ToolOutput::Json(describe(
             &server.surface_description_status(),
         )));
+    }
+
+    if arguments.operation == "execution_speed" {
+        return execute_speed(server, arguments);
     }
 
     let status = match server.current_surface_status() {
@@ -299,5 +306,33 @@ pub(crate) async fn execute(
         _ => invalid_request_result(format!(
             "unknown debug operation: {operation}; call operation=describe"
         )),
+    }
+}
+
+// Admission, capability validation and mutation share one nonblocking lease acquisition.
+pub(crate) fn execute_speed(server: &Emucap, arguments: RoutedOperationArgs) -> CallToolResult {
+    let mut link = match server.link.try_lock() {
+        Ok(link) => link,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return emucap::mcp_result::error_result(
+            "busy", "active_operation: finish or cancel the active Control operation before changing pacing"),
+    };
+    let status = match server.surface_status_with_link(&mut *link) {
+        Ok(status) => status,
+        Err(error) => return error,
+    };
+    if let Err(error) = server.validate_routed_operation(
+        &status,
+        "debug",
+        "execution_speed",
+        arguments.known_capability_revision.as_deref(),
+        true,
+        advertised(&status, "execution_speed"),
+    ) {
+        return error;
+    }
+    match analysis_surface::parse_arguments("execution_speed", arguments.arguments) {
+        Ok(values) => crate::observation_speed::execution_speed_locked(&mut *link, values),
+        Err(error) => invalid_request_result(error),
     }
 }

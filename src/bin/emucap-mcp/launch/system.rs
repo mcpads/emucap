@@ -80,5 +80,5 @@ pub(super) fn adapter_for_system_and_pc98_backend(
 }
 
 pub(super) fn adapter_supports_sound(adapter: &str) -> bool {
-    matches!(adapter, "mednafen" | "mame_pc98" | "xemu")
+    matches!(adapter, "mednafen" | "mame_pc98" | "xemu" | "mesen")
 }

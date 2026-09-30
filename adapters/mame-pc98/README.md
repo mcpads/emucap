@@ -514,3 +514,15 @@ RetroArch/NP2Kai-style set with names such as `bios.rom`, `font.rom`,
 NP2Kai/libretro setup, but it is not enough for MAME `pc9821` or `pc9821ap2`,
 which require additional MAME romset files such as the `24256c-x*.bin` board
 ROMs and other driver-specific dumps.
+
+## Batched memory and execution speed
+
+Requires the current patch stack (0006 side-effect-free reads and fast-forward readback, 0007
+throttle-wait hook and sub-second waits); the bridge advertises the methods only when the plugin
+reports those bindings. `read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen stop with
+device side effects disabled, the view MAME's debugger uses; `read_memory` uses the same read.
+`debug.execution_speed` drives MAME's own governor (`speed_factor`, 0.1 percent steps from 0.1 to
+10000, or unlimited); the launch default is MAME's 100 percent. Fast-forward, refresh-rate speed or
+a non-unit throttle rate reads back as `custom`. Read-only requests are answered during throttle
+waits, so polling never advances a slow guest; a paced frame advance that would outlive its host
+budget stops with `reason: "host_deadline"`.

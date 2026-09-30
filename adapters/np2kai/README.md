@@ -66,3 +66,13 @@ presentation is invalidated before entering the native loader.
 The high-resolution timer event, callback, and divider phases are part of native
 state. An unmapped active event or callback rejects serialization instead of
 creating a state that silently loses the scheduled device event on restore.
+
+## Batched memory and execution speed
+
+`read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen frame boundary through a native
+peek: directly backed memory below `0xA4000`, text VRAM, and the graphics planes of the current
+access page (the I plane only in analog mode). The peek charges no wait states and bypasses
+GRCG/EGC processing; in-view `read_memory` uses it too. `debug.execution_speed` sets the
+frontend's pacing (0.01–10000 percent or unlimited, launch default 100). Running frames and
+frame steps, input pulses and pointer moves all follow it; a synchronous advance that would
+outlive its host budget stops with `reason: "host_deadline"`.

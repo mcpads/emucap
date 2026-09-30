@@ -281,13 +281,37 @@ pub(crate) struct RecordWindowInitialSnapshotArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadMemoryArgs {
-    /// Memory-type identifier. Read valid names from `status.memory_types`; see
-    /// the corresponding adapter README for system-specific meanings.
+    /// Select a memory view from status.memory_types. Its advertised byte size is in
+    /// status.memory_regions; address is an offset within the selected view.
     pub(crate) memory_type: String,
     /// Start address as an offset within the selected memory type.
     pub(crate) address: Num,
     /// Number of bytes to read.
     pub(crate) length: Num,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadMemoryBatchArgs {
+    /// Ordered ranges within status.memory_batch_capability.windows and limits. Requires frozen state.
+    pub(crate) ranges: Vec<ReadMemoryArgs>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExecutionSpeedArgs {
+    /// Omit both fields to query host pacing. Use limited with percent, or unlimited with mode only.
+    pub(crate) mode: Option<ExecutionSpeedMode>,
+    /// Required for limited mode: 100 = normal, 50 = half, 200 = double. Admitted values are in
+    /// status.execution_speed_capability.percent.
+    pub(crate) percent: Option<f64>,
+}
+
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecutionSpeedMode {
+    Limited,
+    Unlimited,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -311,8 +335,8 @@ pub(crate) struct ProbeArgs {
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DisassembleArgs {
-    /// Start address for disassembly. Check `status.methods` and the adapter
-    /// README for CPU, ISA, and support details. Returns [{addr,text,bytes}].
+    /// CPU address to decode, such as the PC returned by get_state.
+    /// Returns instructions as {addr,text,bytes}.
     pub(crate) address: Num,
     /// Number of instructions to decode. Default: 8; maximum: 256.
     #[serde(default = "default_disas_count")]
@@ -320,12 +344,11 @@ pub(crate) struct DisassembleArgs {
     /// Write JSON results to this path and return a summary. Omit for inline results.
     #[serde(default)]
     pub(crate) output_path: Option<String>,
-    /// Target CPU for a multi-core backend, for example NDS `arm9` or `arm7`.
-    /// Omit for the backend's default core.
+    /// Select an id from status.cpu_targets. Omit to use the target marked default.
     #[serde(default)]
     pub(crate) cpu: Option<String>,
-    /// Instruction-set mode when the backend supports an override, for example
-    /// NDS `arm`, `thumb`, or `auto`. Omit for automatic selection.
+    /// Select from the target's disassembly_modes in status.cpu_targets.
+    /// Omit for automatic instruction-set selection.
     #[serde(default)]
     pub(crate) mode: Option<String>,
 }

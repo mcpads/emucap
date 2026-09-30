@@ -198,6 +198,25 @@ wait for the previous terminal response before sending the next request.
 large disc image happens outside the request path; the response reports whether the SHA-1 is
 pending, ready, unavailable, or failed.
 
+### Batched memory and execution speed
+
+Batch payloads are acquired by one native command into a private response buffer. The bridge
+validates its full length before exposing any ranges. Native stop epochs remain stable across
+repeated reads and pacing queries at the same halt. A pacing failure after an attempted mutation
+terminates the control channel with the last verified policy. Follow the recovery action in
+`status` before issuing further commands. It does not claim that the emulator process exited or
+that guest progress was undone.
+
+
+`read_memory_batch` reads up to 64 ranges (64 KiB) of `ee` at the paused CPU thread.
+`debug.execution_speed` sets the nominal speed to an integer 1–10000 percent or selects the
+unlimited limiter (host API 7); turbo, slow motion and a fast-boot override read back as
+`custom`. The agent speed survives the settings reload a reset performs. The frame limiter sleeps
+in 10 ms slices and serves CPU-thread requests between them, so status and input answer during a
+slow frame without shortening it. `status.frame` is the frame counter, and a frame advance that
+spends the host budget returns `reason: "host_deadline"`. The PINE socket lives under the runtime
+home, so keep `EMUCAP_EMU_HOME` short enough for the Unix socket path limit.
+
 ## License boundary
 
 The Rust bridge and launcher are separate processes licensed under the repository's

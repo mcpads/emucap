@@ -1,7 +1,7 @@
 //! Initial Nintendo 64 adapter backed by a debugger-enabled Mupen64Plus core.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -20,8 +20,12 @@ mod control;
 mod debug;
 #[path = "n64_adapter_frame.rs"]
 mod frame;
+#[path = "n64_adapter_library.rs"]
+mod library;
 #[path = "n64_adapter_lifecycle.rs"]
 mod lifecycle;
+#[path = "n64_adapter_observation.rs"]
+mod observation;
 #[path = "n64_adapter_prepare.rs"]
 mod prepare;
 
@@ -31,6 +35,7 @@ use frame::{
     arm_frame_gate, cancel_frame_gate, frame_gate_is_blocked, release_frame_gate, reset_frame_gate,
     wait_frame_gate_or_debug_update, FrameGateTrigger, FrameWaitOutcome,
 };
+use library::{cstr, load_api, open_library, path_cstring, platform_library, symbol};
 use lifecycle::{
     current_readiness, debug_init_callback, debug_log_callback, debug_update_callback,
     debug_vi_callback, reset_observation_state, state_callback,
@@ -112,6 +117,8 @@ const BASE_METHODS: &[&str] = &[
     "poll_events",
     "disassemble",
     "call_stack",
+    "read_memory_batch",
+    "execution_speed",
 ];
 const ACTIVE_EXCEPTIONS: &[&str] = &[
     "n64.state-read.frozen-only",
@@ -291,6 +298,9 @@ impl Mupen64PlusHost {
     }
 
     pub fn terminal_reason() -> Option<String> {
+        if observation::CONTROL_UNVERIFIED.load(Ordering::Acquire) {
+            return Some("execution_speed policy is unverified".into());
+        }
         EXECUTION_TERMINAL
             .load(Ordering::Acquire)
             .then(|| "Mupen64Plus execution terminated".to_string())
@@ -298,6 +308,7 @@ impl Mupen64PlusHost {
 
     pub fn handle_request(&mut self, request: Request) -> Response {
         let id = request.id;
+        observation::note_request(&request.method);
         let result = match request.method.as_str() {
             "hello" => self.hello(),
             "status" => self.status(),
@@ -323,6 +334,8 @@ impl Mupen64PlusHost {
             "poll_events" => self.poll_events(&request.params),
             "disassemble" => self.disassemble(&request.params),
             "call_stack" => self.call_stack(&request.params),
+            "read_memory_batch" => self.read_memory_batch(&request.params),
+            "execution_speed" => self.execution_speed(&request.params),
             other => Err(N64Error::Unsupported(other.into())),
         };
         match result {
@@ -391,6 +404,8 @@ impl Mupen64PlusHost {
             },
             "content": self.rom_path.display().to_string(),
             "build": self.build,
+            "memory_batch_capability": Self::memory_batch_capability(),
+            "execution_speed_capability": Self::execution_speed_capability(),
         });
         let object = value.as_object_mut().expect("N64 hello object");
         if let Some(name) = &self.name {
@@ -451,10 +466,14 @@ impl Mupen64PlusHost {
             }
         });
         if connected {
-            value.as_object_mut().expect("N64 status object").insert(
+            let object = value.as_object_mut().expect("N64 status object");
+            object.insert(
                 "state".into(),
                 json!(if self.frozen { "frozen" } else { "running" }),
             );
+            if let Ok(pacing) = self.native_pacing() {
+                object.insert("execution_speed".into(), pacing.public());
+            }
         }
         Ok(value)
     }
@@ -569,7 +588,11 @@ impl Mupen64PlusHost {
                 let recovery = self.recover_frame_failure(&error);
                 return recovery.and(Err(error));
             }
-            let timeout = remaining_step_timeout(deadline, "instruction step total budget")?;
+            let timeout = remaining_step_timeout(
+                deadline,
+                "instruction step total budget",
+                OPERATION_DEADLINE,
+            )?;
             if let Err(error) =
                 wait_until("instruction boundary after frame pause", timeout, || {
                     UPDATE_COUNT.load(Ordering::Acquire) > before
@@ -584,7 +607,11 @@ impl Mupen64PlusHost {
             completed = 1;
         }
         for expected in (completed + 1)..=count {
-            let timeout = remaining_step_timeout(deadline, "instruction step total budget")?;
+            let timeout = remaining_step_timeout(
+                deadline,
+                "instruction step total budget",
+                OPERATION_DEADLINE,
+            )?;
             check_core("DebugStep", unsafe { (self.api.debug_step)() })?;
             if let Err(error) = wait_until("instruction step", timeout, || {
                 UPDATE_COUNT.load(Ordering::Acquire) >= before.saturating_add(expected)
@@ -639,12 +666,25 @@ impl Mupen64PlusHost {
         let deadline = crate::live::temporal::OperationDeadline::after(
             crate::live::temporal::MAX_SYNC_OPERATION_TIME,
         );
+        // A frame takes longer at a slow target; the stuck-render bound scales with it.
+        let frame_wait = self.native_pacing().map_or(OPERATION_DEADLINE, |pacing| {
+            pacing.frame_wait(OPERATION_DEADLINE)
+        });
 
         let mut release_debugger_pause = !self.frame_paused;
         let mut frame_before = FRAME_COUNT.load(Ordering::Acquire);
         let mut frame_before_verified = self.frame_clock_synchronized;
         let mut current_frame = frame_before;
         for index in 0..count {
+            // A paced advance stops at the reached frame once its host budget is spent.
+            if index > 0 && deadline.remaining_timeout().is_none() {
+                self.frozen = true;
+                return Ok(json!({
+                    "status": "interrupted", "reason": "host_deadline", "unit": "frames",
+                    "count": count, "completed": index, "cpu": "r4300",
+                    "frame": current_frame, "state": "frozen",
+                }));
+            }
             let continuing_from_frame_barrier = self.frame_paused;
             let observed_before = FRAME_COUNT.load(Ordering::Acquire);
             let observed_before_verified = self.frame_clock_synchronized;
@@ -678,13 +718,14 @@ impl Mupen64PlusHost {
                 release_debugger_pause = false;
             }
 
-            let timeout = match remaining_step_timeout(deadline, "frame step total budget") {
-                Ok(timeout) => timeout,
-                Err(error) => {
-                    self.recover_frame_failure(&error)?;
-                    return Err(error);
-                }
-            };
+            let timeout =
+                match remaining_step_timeout(deadline, "frame step total budget", frame_wait) {
+                    Ok(timeout) => timeout,
+                    Err(error) => {
+                        self.recover_frame_failure(&error)?;
+                        return Err(error);
+                    }
+                };
             let observed = match wait_frame_gate_or_debug_update(timeout, debug_before) {
                 Ok(FrameWaitOutcome::Frame(observed)) => observed,
                 Ok(FrameWaitOutcome::DebugUpdate(update)) => {
@@ -712,6 +753,15 @@ impl Mupen64PlusHost {
                 }
                 Err(error) => {
                     self.recover_frame_failure(&error)?;
+                    // The frame wait ran into the host budget: stop at the frames reached, frozen at
+                    // the recovered debugger boundary.
+                    if deadline.expired() {
+                        return Ok(json!({
+                            "status": "interrupted", "reason": "host_deadline", "unit": "frames",
+                            "count": count, "completed": index, "cpu": "r4300",
+                            "frame": FRAME_COUNT.load(Ordering::Acquire), "state": "frozen",
+                        }));
+                    }
                     return Err(error);
                 }
             };
@@ -956,81 +1006,6 @@ fn display_requested() -> bool {
         })
 }
 
-unsafe fn load_api(handle: *mut c_void) -> N64Result<Api> {
-    Ok(Api {
-        core_shutdown: symbol(handle, b"CoreShutdown\0")?,
-        core_attach_plugin: symbol(handle, b"CoreAttachPlugin\0")?,
-        core_detach_plugin: symbol(handle, b"CoreDetachPlugin\0")?,
-        core_do_command: symbol(handle, b"CoreDoCommand\0")?,
-        config_open_section: symbol(handle, b"ConfigOpenSection\0")?,
-        config_set_parameter: symbol(handle, b"ConfigSetParameter\0")?,
-        debug_set_callbacks: symbol(handle, b"DebugSetCallbacks\0")?,
-        debug_set_run_state: symbol(handle, b"DebugSetRunState\0")?,
-        debug_get_state: symbol(handle, b"DebugGetState\0")?,
-        debug_step: symbol(handle, b"DebugStep\0")?,
-        debug_get_cpu_data_ptr: symbol(handle, b"DebugGetCPUDataPtr\0")?,
-        debug_mem_read8: symbol(handle, b"DebugMemRead8\0")?,
-        debug_mem_write8: symbol(handle, b"DebugMemWrite8\0")?,
-        debug_breakpoint_command: symbol(handle, b"DebugBreakpointCommand\0")?,
-        debug_breakpoint_lookup: symbol(handle, b"DebugBreakpointLookup\0")?,
-        debug_breakpoint_consume: symbol(handle, b"DebugBreakpointConsume\0")?,
-        debug_decode_op: symbol(handle, b"DebugDecodeOp\0")?,
-    })
-}
-
-unsafe fn symbol<T: Copy>(handle: *mut c_void, name: &'static [u8]) -> N64Result<T> {
-    libc::dlerror();
-    let pointer = libc::dlsym(handle, cstr(name).as_ptr());
-    if pointer.is_null() {
-        return Err(N64Error::Dynamic(dl_error()));
-    }
-    debug_assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<*mut c_void>());
-    Ok(std::mem::transmute_copy(&pointer))
-}
-
-fn open_library(path: &Path) -> N64Result<*mut c_void> {
-    let path = path_cstring(path)?;
-    let handle = unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
-    if handle.is_null() {
-        Err(N64Error::Dynamic(dl_error()))
-    } else {
-        Ok(handle)
-    }
-}
-
-fn dl_error() -> String {
-    let error = unsafe { libc::dlerror() };
-    if error.is_null() {
-        "unknown dynamic loader error".into()
-    } else {
-        unsafe { CStr::from_ptr(error) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-fn platform_library(root: &Path, stem: &str) -> N64Result<PathBuf> {
-    for suffix in [".dylib", ".so", ".so.2"] {
-        let path = root.join(format!("{stem}{suffix}"));
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    Err(N64Error::BadParams(format!(
-        "Mupen64Plus library not found under {}: {stem}",
-        root.display()
-    )))
-}
-
-fn path_cstring(path: &Path) -> N64Result<CString> {
-    CString::new(path.to_string_lossy().as_bytes())
-        .map_err(|_| N64Error::BadParams(format!("path contains NUL: {}", path.display())))
-}
-
-fn cstr(bytes: &'static [u8]) -> &'static CStr {
-    CStr::from_bytes_with_nul(bytes).expect("static C string")
-}
-
 fn set_config_int(
     api: &Api,
     section: *mut c_void,
@@ -1091,10 +1066,11 @@ fn wait_until(
 fn remaining_step_timeout(
     deadline: crate::live::temporal::OperationDeadline,
     operation: &'static str,
+    frame_wait: Duration,
 ) -> N64Result<Duration> {
     deadline
         .remaining_timeout()
-        .map(|remaining| remaining.min(OPERATION_DEADLINE))
+        .map(|remaining| remaining.min(frame_wait))
         .ok_or(N64Error::Timeout(operation))
 }
 

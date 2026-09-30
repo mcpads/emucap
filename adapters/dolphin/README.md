@@ -115,9 +115,19 @@ An emucap breakpoint hit interrupts the operation and leaves the core frozen. Bo
 most 5,000 steps per request, with a 250-second operation budget. Long advances emit `working`
 responses with the original request ID. A debugger stop, deadline or lost connection stops further
 work and joins native cleanup before another session can take ownership. Interrupted replies carry
-the actual completed `count`; failure to confirm cleanup is an error, not a frozen success.
-Rebuild the maintained native adapter (host API 5).
-Split longer advances into checked calls.
+the actual completed `count` and a budget stop reports `reason: "host_deadline"`; failure to
+confirm cleanup is an error, not a frozen success. Rebuild the maintained native adapter (host API
+6). Split longer advances into checked calls.
+
+### Batched memory and execution speed
+
+`read_memory_batch` reads up to 64 ranges (64 KiB) of `main` inside MEM1 (`0x80000000`) and, on Wii,
+MEM2 (`0x90000000`) under one CPU guard while the core is paused. `debug.execution_speed` sets
+Dolphin's own emulation speed (integer 1–10000 percent, or unlimited) on the host thread, as the
+Dolphin UI does; the fast-forward hotkey reads back as unlimited and a speed outside the integer
+domain as `custom`. Frame steps follow the speed. Host patch `CoreTiming-sliced-throttle` makes the
+CPU thread's throttle sleep in 10 ms slices and stop sleeping when a pause or CPU lock is requested,
+so control stays responsive at slow speeds. `status.frame` is the VI frame counter.
 
 `reset` owns an isolated native reset-button press and release, resumes only for that guest-time
 window, and freezes in the exact release callback. This is the same hardware reset-button surface

@@ -263,6 +263,24 @@ PPSSPP has no step-count parameter), `pause`/`resume` (`cpu.stepping`/
 - BP kind `nmi`/`irq`/`dma`, range exec breakpoints (`start` must equal `end`), and
   `auto_savestate`/`snapshot` breakpoint options.
 
+## Batched memory and execution speed
+
+Batch payloads are acquired by one native command into a private response buffer. The bridge
+validates its full length before exposing any ranges. Native stop epochs remain stable across
+repeated reads and pacing queries at the same halt. A pacing failure after an attempted mutation
+terminates the control channel with the last verified policy. Follow the recovery action in
+`status` before issuing further commands. It does not claim that the emulator process exited or
+that guest progress was undone.
+
+
+`read_memory_batch` reads up to 64 ranges (64 KiB) of `main` while the CPU is halted.
+`debug.execution_speed` sets an integer 1–10000 percent of the PSP refresh or unlimited through
+the fork's `emucap.pacing`; fast-forward reads back as unlimited, and a custom or analog limit or
+netplay's forced rate as `custom`. Headless debugger sessions are paced (launch default 100
+percent); frame waits sleep in 10 ms slices that end on a debugger break or a pacing change, and
+a resume does not owe the halted time. `status.frame` is the VBlank clock, and a frame step that
+reaches the fork's 240 s budget returns `reason: "host_deadline"`.
+
 ## Operational notes
 
 - **Texture-cache regression check**: after applying the patch stack, run

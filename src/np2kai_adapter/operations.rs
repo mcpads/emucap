@@ -1,3 +1,4 @@
+use super::observation::AdvanceStop;
 use super::*;
 
 pub(super) fn launch_start_value(controlled_start: bool) -> Value {
@@ -57,7 +58,7 @@ impl Np2kaiHost {
                 "patchset_sha256": self.patchset_sha256,
                 "build_profile": self.build_profile,
                 "core_sha256": self.core_sha256,
-                "host_api": 2
+                "host_api": 3
             },
             "capability_notes": {
                 "backend_role": "pc98_hdi_compatibility_and_debugging",
@@ -76,7 +77,9 @@ impl Np2kaiHost {
                 "first_frame_boundary": "no guest frame or instruction executes before an explicit execution request"
             },
             "runtime_home": self.runtime_home.display().to_string(),
-            "launch_start": self.launch_start()
+            "launch_start": self.launch_start(),
+            "memory_batch_capability": Self::memory_batch_capability(),
+            "execution_speed_capability": Self::execution_speed_capability()
         });
         let object = value.as_object_mut().expect("NP2kai hello object");
         if let Some(name) = &self.name {
@@ -122,6 +125,7 @@ impl Np2kaiHost {
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
             "state": if self.frozen {"frozen"} else {"running"},
             "frame": self.frame,
+            "execution_speed": self.pacing_policy_value(),
             "initialized": self.initialized,
             "video_fresh": self.video_fresh,
             "launch_start": self.launch_start(),
@@ -168,6 +172,8 @@ impl Np2kaiHost {
     }
 
     pub(super) fn resume(&mut self) -> Np2kaiResult<Value> {
+        // Frozen time never accumulates pacing debt.
+        self.pacer.reanchor();
         self.frozen = false;
         Ok(json!({"status":"completed", "state":"running", "frame":self.frame}))
     }
@@ -177,10 +183,10 @@ impl Np2kaiHost {
         let count = frame_count(params)?;
         let before = self.frame;
         self.frozen = true;
-        let completed = self.run_exact_frames(count)?;
+        let (completed, stop) = self.run_exact_frames(count)?;
         Ok(json!({
-            "status":if completed == count {"completed"} else {"interrupted"},
-            "reason":if completed == count {Value::Null} else {json!("breakpoint")},
+            "status":if stop.is_none() {"completed"} else {"interrupted"},
+            "reason":AdvanceStop::reason(stop),
             "unit":"frames", "count":count, "completed":completed,
             "frame_before":before, "frame":self.frame, "state":"frozen"
         }))
@@ -191,14 +197,11 @@ impl Np2kaiHost {
         let count = frame_count(params)?;
         let was_frozen = self.frozen;
         let before = self.frame;
-        let completed = self.run_exact_frames(count)?;
-        self.frozen = was_frozen;
-        if completed != count {
-            self.frozen = true;
-        }
+        let (completed, stop) = self.run_exact_frames(count)?;
+        self.frozen = was_frozen || stop.is_some();
         Ok(json!({
-            "status":if completed == count {"completed"} else {"interrupted"},
-            "reason":if completed == count {Value::Null} else {json!("breakpoint")},
+            "status":if stop.is_none() {"completed"} else {"interrupted"},
+            "reason":AdvanceStop::reason(stop),
             "unit":"frames", "count":count, "completed":completed,
             "frame_before":before, "frame":self.frame,
             "state":if self.frozen {"frozen"} else {"running"}
@@ -241,13 +244,11 @@ impl Np2kaiHost {
         set_controls(&active);
         let result = self.run_exact_frames(frames);
         set_controls(&self.held_buttons);
-        let completed = result?;
-        self.frozen = was_frozen;
-        if completed != frames {
-            self.frozen = true;
-        }
+        let (completed, stop) = result?;
+        self.frozen = was_frozen || stop.is_some();
         Ok(json!({
-            "status":if completed == frames {"completed"} else {"interrupted"},
+            "status":if stop.is_none() {"completed"} else {"interrupted"},
+            "reason":AdvanceStop::reason(stop),
             "buttons":pulse.iter().collect::<Vec<_>>(), "frames":frames, "completed":completed,
             "persistent_buttons":self.held_buttons.iter().collect::<Vec<_>>(),
             "transient_override_engaged":false,
@@ -276,19 +277,15 @@ impl Np2kaiHost {
             )));
         }
         self.frozen = true;
-        let mut completed = 0;
-        for _ in 0..frames {
+        let (completed, stop) = self.run_paced_frames(frames, |host| {
             set_pointer_delta(dx as i16, dy as i16);
-            let result = self.run_one_frame();
+            let result = host.run_one_frame();
             set_pointer_delta(0, 0);
-            if !result? {
-                break;
-            }
-            completed += 1;
-        }
+            result
+        })?;
         Ok(json!({
-            "status":if completed == frames {"completed"} else {"interrupted"},
-            "reason":if completed == frames {Value::Null} else {json!("breakpoint")},
+            "status":if stop.is_none() {"completed"} else {"interrupted"},
+            "reason":AdvanceStop::reason(stop),
             "dx":dx, "dy":dy, "frames":frames, "completed":completed,
             "frame":self.frame, "state":"frozen", "coordinate_mode":"relative"
         }))
@@ -353,6 +350,7 @@ impl Np2kaiHost {
         // A native failure may occur after partial mutation. The prior capture
         // cannot remain advertised as current even when the load fails.
         self.video_fresh = false;
+        self.boundary_seq += 1;
         if !unsafe { (self.api.unserialize)(data.as_ptr().cast(), data.len()) } {
             return Err(Np2kaiError::Core(
                 "retro_unserialize failed; machine remains frozen but restored state is unverified"
@@ -370,6 +368,7 @@ impl Np2kaiHost {
 
     pub(super) fn reset(&mut self) -> Np2kaiResult<Value> {
         self.ensure_initialized()?;
+        self.boundary_seq += 1;
         unsafe {
             (self.api.reset)();
             // A reset breakpoint's event remains queued, but the synchronous
@@ -384,15 +383,11 @@ impl Np2kaiHost {
         }))
     }
 
-    pub(super) fn run_exact_frames(&mut self, count: u64) -> Np2kaiResult<u64> {
-        let mut completed = 0;
-        for _ in 0..count {
-            if !self.run_one_frame()? {
-                break;
-            }
-            completed += 1;
-        }
-        Ok(completed)
+    pub(super) fn run_exact_frames(
+        &mut self,
+        count: u64,
+    ) -> Np2kaiResult<(u64, Option<AdvanceStop>)> {
+        self.run_paced_frames(count, Self::run_one_frame)
     }
 
     pub(super) fn run_one_frame(&mut self) -> Np2kaiResult<bool> {

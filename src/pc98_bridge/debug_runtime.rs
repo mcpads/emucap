@@ -718,11 +718,14 @@ impl<G: GdbTransport> Bridge<G> {
         // 프레임을 안 돌리고도 interrupted+frozen로 오인되고 응답 스트림이 desync된다. step_instruction_count
         // 처럼 명령 전에 버퍼의 stale stop을 이벤트 큐로 걷어낸다.
         self.drain_buffered_stops()?;
+        let plugin_deadline_ms = self.arm_frame_deadline(budget_frames)?;
         let previous = self.gdb.get_timeout()?;
         // 트레이싱 중이면 프레임마다 수십만 명령을 디스어셈+기록하므로 무트레이스 50ms/frame
         // 예산으론 타임아웃→지연 stop이 늦게 도착한다. 트레이스일 때 프레임당 예산을 크게 잡아
         // 지연 응답이 이 recv 창 안에서 매칭되게 한다.
-        let timeout = Duration::from_millis(estimated_ms);
+        // A plugin deadline answers at the reached frame; the socket waits for that answer.
+        let timeout =
+            Duration::from_millis(plugin_deadline_ms.map_or(estimated_ms, |ms| ms + 5_000));
         self.gdb.set_timeout(timeout)?;
         let result = self.lua_cmd_allow_stop(name, Some(arg));
         let restore = self.gdb.set_timeout(previous);
@@ -764,6 +767,10 @@ impl<G: GdbTransport> Bridge<G> {
         let resp = self.send_cmd(&payload)?;
         if resp == "OK" {
             return self.drain_immediate_stops();
+        }
+        if crate::mame_observation::deadline_frames(&resp).is_some() {
+            let _ = self.drain_immediate_stops()?;
+            return Ok(Some(resp));
         }
         if is_stop_packet(&resp) {
             self.note_stop(resp.clone(), false);

@@ -29,6 +29,10 @@ also expose a bounded, best-effort R4300 call stack reconstructed from native co
 history. It reports completeness and dropped history explicitly; it never mixes RSP frames into the
 main-CPU result.
 
+Both modes expose frozen `read_memory_batch` over RDRAM and `debug` operation `execution_speed`,
+which sets and reads back the core's speed factor (1–1000 percent) and speed limiter. Core patch
+0003 (host API 4) sleeps the limiter wait in 10 ms slices that end on a pause or speed change.
+
 Visible launch additionally advertises rendered-frame stepping, bounded `run_frames`,
 `press_buttons`, PNG screenshot, native save/load, and Control-composed atomic state/frame/memory
 `probe`. Its callback barrier freezes inside the

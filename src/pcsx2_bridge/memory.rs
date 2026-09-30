@@ -92,7 +92,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         Ok(json!({ "path": path.display().to_string(), "regions": 1 }))
     }
 
-    fn read_ee_range(&mut self, start: u64, length: usize) -> BridgeResult<Vec<u8>> {
+    pub(super) fn read_ee_range(&mut self, start: u64, length: usize) -> BridgeResult<Vec<u8>> {
         let mut bytes = Vec::with_capacity(length);
         let mut offset = 0usize;
         while offset < length {

@@ -38,6 +38,8 @@ $owned = @(
   "Source/Core/Core/CMakeLists.txt",
   "Source/Core/Core/Core.cpp",
   "Source/Core/Core/Core.h",
+  "Source/Core/Core/CoreTiming.cpp",
+  "Source/Core/Core/CoreTiming.h",
   "Source/Core/Core/HW/CPU.cpp",
   "Source/Core/Core/HW/CPU.h",
   "Source/Core/Core/HW/GCPad.cpp",

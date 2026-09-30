@@ -36,6 +36,16 @@ pub(crate) use continuity::enrich_continuity;
 #[cfg(test)]
 use continuity::{enrich_runtime_instance, recording_capture_projection};
 
+#[path = "status/capability_revision.rs"]
+mod capability_revision;
+pub(crate) use capability_revision::apply_capability_revision;
+#[cfg(test)]
+use capability_revision::{capability_revision, CAPABILITY_FIELDS};
+
+#[path = "status/feature_capabilities.rs"]
+mod feature_capabilities;
+use feature_capabilities::enrich_feature_capabilities;
+
 #[path = "status/debug_capabilities.rs"]
 mod debug_capabilities;
 use debug_capabilities::enrich_debug_selection;
@@ -746,69 +756,6 @@ pub(crate) fn unknown_content_question() -> &'static str {
     "Which ROM, disc, or disk path should be used?"
 }
 
-const CAPABILITY_FIELDS: &[&str] = &[
-    "methods",
-    "memory_types",
-    "memory_regions",
-    "state_groups",
-    "cpu_targets",
-    "media_devices",
-    "breakpoint_kinds",
-    "input_buttons",
-    "input_axes",
-    "contracts",
-    "capability_notes",
-    "execution_limits",
-    "freeze_policy",
-    "bank_tagging",
-    "recording_capability",
-    "snapshot_capability",
-];
-
-fn capability_revision(value: &serde_json::Value) -> String {
-    let mut snapshot = serde_json::Map::new();
-    snapshot.insert("schema".into(), serde_json::json!(1));
-    for field in CAPABILITY_FIELDS {
-        if let Some(field_value) = value.get(field) {
-            snapshot.insert((*field).into(), field_value.clone());
-        }
-    }
-    for field in [
-        "server_build",
-        "emulator_build",
-        "emulator_identity",
-        "protocol_version",
-    ] {
-        if let Some(field_value) = value.get(field) {
-            snapshot.insert(field.into(), field_value.clone());
-        }
-    }
-    json_revision(&serde_json::Value::Object(snapshot))
-}
-
-fn remove_capability_fields(value: &mut serde_json::Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    for field in CAPABILITY_FIELDS {
-        object.remove(*field);
-    }
-}
-
-pub(crate) fn apply_capability_revision(
-    value: &mut serde_json::Value,
-    known_revision: Option<&str>,
-) -> String {
-    let revision = capability_revision(value);
-    let unchanged = known_revision == Some(revision.as_str());
-    if unchanged {
-        remove_capability_fields(value);
-    }
-    value["capability_revision"] = serde_json::json!(revision);
-    value["capability_snapshot"] = serde_json::json!(if unchanged { "unchanged" } else { "full" });
-    revision
-}
-
 pub(crate) fn enrich_connected_status(value: &mut serde_json::Value, link: &dyn EmulatorLink) {
     let base_port = link.base_port();
     let port = link.endpoint_port();
@@ -830,6 +777,7 @@ pub(crate) fn enrich_connected_status(value: &mut serde_json::Value, link: &dyn 
     enrich_debug_selection(value, &identity);
     enrich_contract_status(value, &identity, &contracts);
     enrich_recording_capability(value, recording);
+    enrich_feature_capabilities(value, &link.capabilities().features);
     enrich_link_status(value, port, token.as_deref(), Some(&identity));
     enrich_listener_ports(value, base_port, port);
     enrich_continuity(value, link);

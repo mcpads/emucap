@@ -30,6 +30,7 @@ impl SequenceLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity {
                     launch_id: Some(launch_id.into()),
                     ..Default::default()

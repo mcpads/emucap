@@ -86,12 +86,26 @@ path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fa
   (a single callback) in `psx/debug.cpp`, for PCE the HuC6280 logical read/write match in `pce/debug.cpp`,
   for PC-FX the V810 read/write match in `pcfx/debug.cpp`, and for MD the 68000 read/write match in
   `md/debug.cpp`, ④ input diagnostics `emucap_game_data_store` — the gamepad update path of
-  `ss` · `psx` · `pce` · `pce_fast` · `pcfx` · `md` · `wswan`.
+  `ss` · `psx` · `pce` · `pce_fast` · `pcfx` · `md` · `wswan`, ⑤ agent pacing in the driver's
+  `RedoFFSF`, `UpdateSoundSync` and real-time syncer (`input.cpp`, `main.cpp`, `ers.cpp`).
   Each injection is verified at build time against a fixed string.
 - automake not needed: added directly to OBJECTS in the generated Makefile.
 - Set `EMUCAP_MEDNAFEN_WORK=/path/to/build-dir` only to an empty directory or a
   directory previously created by `build.sh`.  Non-empty custom work
   directories are rejected unless they carry the script's ownership marker.
+
+## Batched memory and execution speed
+
+`read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen stop, frame-boundary or CPU
+callback, through the debugger address spaces that `read_memory` uses. Saturn `physical` is not
+a window. `debug.execution_speed` sets the driver's normal speed (integer 1–10000 percent, or
+unlimited); a held fast- or slow-forward key, netplay, or `nothrottle` without sound reads back as
+`custom`. Frame waits sleep in 10 ms slices: read-only requests are answered during a wait, so
+polling never advances a slow guest, and other requests end the wait. Frame steps, deferred frame
+operations and probes follow the policy and stop with `reason: "host_deadline"` at the
+synchronous budget. With `sound:true` the audio queue also paces the guest, reported as the
+`audio_output` host constraint; below 25 percent the real-time syncer paces the rest of each
+frame after its audio.
 
 ## Usage
 The supported path is the MCP `launch` tool. Audio is off by default; enable it explicitly and independently

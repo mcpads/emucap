@@ -33,6 +33,8 @@ mod input;
 mod joystick;
 #[path = "openmsx_bridge/media.rs"]
 mod media;
+#[path = "openmsx_bridge/observation.rs"]
+mod observation;
 #[path = "openmsx_bridge/state.rs"]
 mod state;
 #[path = "openmsx_bridge/xml.rs"]
@@ -55,6 +57,8 @@ const BASE_METHODS: &[&str] = &[
     "get_rom_info",
     "get_state",
     "read_memory",
+    "read_memory_batch",
+    "execution_speed",
     "write_memory",
     "set_input",
     "press_buttons",
@@ -94,6 +98,9 @@ pub enum OpenMsxBridgeError {
     Unsupported(String),
     #[error("{0}")]
     Emulator(String),
+    /// A guest advance reached its host wall-clock budget before its target boundary.
+    #[error("{0}")]
+    HostDeadline(String),
     #[error("{0}")]
     Protocol(String),
     #[error(transparent)]
@@ -129,6 +136,8 @@ pub struct OpenMsxBridge<C> {
     disk_ejected: bool,
     screenshot_sequence: u64,
     capture_epoch: String,
+    /// Bumped by every bridge mutation that can change memory or mapping at one emulated time.
+    boundary_seq: u64,
     name: Option<String>,
     session_token: Option<String>,
     launch_id: Option<String>,
@@ -227,12 +236,14 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             disk_ejected: false,
             screenshot_sequence: 0,
             capture_epoch: ulid::Ulid::generate().to_string(),
+            boundary_seq: 0,
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
         };
         bridge.require_runtime_identity("initialization")?;
         bridge.initialize_debugger()?;
+        bridge.initialize_pacing()?;
         Ok(bridge)
     }
 
@@ -255,6 +266,8 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             }
             "get_state" => self.get_state(&request.params),
             "read_memory" => self.read_memory(&request.params),
+            "read_memory_batch" => self.read_memory_batch(&request.params),
+            "execution_speed" => self.execution_speed(&request.params),
             "write_memory" => self.write_memory(&request.params),
             "screenshot" if self.display => self.screenshot(),
             "screenshot" => Err(OpenMsxBridgeError::Unsupported(
@@ -359,6 +372,8 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
                 "display": self.display,
                 "headless_screenshot": false,
             },
+            "memory_batch_capability": self.memory_batch_capability(),
+            "execution_speed_capability": self.execution_speed_capability(),
             "content": self.session.media.source_path.display().to_string(),
             "content_sha1": self.session.media.source_sha1,
             "build": crate::build_identity::BUILD_HASH,
@@ -394,6 +409,8 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "methods": self.methods(),
             "media_devices": self.media_devices(),
             "mounted_media": self.mounted_media()?,
+            "execution_speed": self.speed_readback()?,
+            "capability_notes": self.hello()?["capability_notes"].clone(),
             "memory_types": ["memory", "ram", "vram"],
             "region_sizes": self.region_sizes,
             "breakpoint_kinds": breakpoint_kinds(),
@@ -472,38 +489,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         }))
     }
 
-    fn read_memory(&mut self, params: &Value) -> BridgeResult<Value> {
-        self.require_frozen("read_memory")?;
-        let memory_type = memory_type(params)?;
-        let address = required_num(params, "address")?;
-        let length = required_num(params, "length")?;
-        if length > MAX_MEMORY_TRANSFER {
-            return Err(OpenMsxBridgeError::BadParams(format!(
-                "read_memory length {length} exceeds {MAX_MEMORY_TRANSFER}"
-            )));
-        }
-        self.validate_range(memory_type, address, length)?;
-        let debuggable = debuggable_name(memory_type);
-        let command =
-            format!("binary encode hex [debug read_block {debuggable} {address} {length}]");
-        let encoded = self.control.command(&command)?;
-        let bytes = hex::decode(encoded.trim()).map_err(|error| {
-            OpenMsxBridgeError::Protocol(format!("openMSX returned invalid memory hex: {error}"))
-        })?;
-        if bytes.len() as u64 != length {
-            return Err(OpenMsxBridgeError::Protocol(format!(
-                "openMSX returned {} bytes for a {length}-byte read",
-                bytes.len()
-            )));
-        }
-        Ok(json!({
-            "memory_type": memory_type,
-            "address": address,
-            "length": length,
-            "hex": hex::encode(bytes),
-        }))
-    }
-
     fn write_memory(&mut self, params: &Value) -> BridgeResult<Value> {
         self.require_frozen("write_memory")?;
         let memory_type = memory_type(params)?;
@@ -525,6 +510,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "debug write_block {debuggable} {address} [binary decode hex {}]",
             hex::encode(&bytes)
         ))?;
+        self.boundary_seq += 1;
         Ok(json!({
             "memory_type": memory_type,
             "address": address,
@@ -616,76 +602,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             .unwrap_or(1);
         validate_step_count(count)?;
         self.instruction_step(count)
-    }
-
-    fn frame_step(&mut self, count: u64) -> BridgeResult<Value> {
-        self.require_frozen("frame step")?;
-        self.prepare_temporal_request("frame step")?;
-        let before = self.current_frame()?;
-        if let Err(primary) = self.control.advance_frames(count) {
-            let diagnostic = self
-                .control
-                .command("::emucap::frame_debug")
-                .unwrap_or_else(|error| format!("unavailable: {error}"));
-            let cleanup = self
-                .control
-                .command("::emucap::cancel_frame")
-                .and_then(|_| self.control.command("set pause on"))
-                .and_then(|_| self.control.command("debug break"))
-                .and_then(|_| self.require_stop_conjunction("failed frame step cleanup"));
-            return match cleanup {
-                Ok(()) => Err(OpenMsxBridgeError::Emulator(format!(
-                    "{primary}; frame diagnostic: {diagnostic}"
-                ))),
-                Err(cleanup) => self.fail_debugger(format!(
-                    "{primary}; frame diagnostic: {diagnostic}; \
-                     frame target cleanup also failed: {cleanup}"
-                )),
-            };
-        }
-        let after = self.current_frame()?;
-        let dropped = self.drain_debug_events()?;
-        if !self.debug_events.is_empty() || dropped != 0 {
-            if let Err(error) = self.control.command("::emucap::cancel_frame") {
-                return self.fail_debugger(format!(
-                    "breakpoint interrupted frame step but target cleanup failed: {error}"
-                ));
-            }
-            self.require_stop_conjunction("breakpoint-interrupted frame step")?;
-            return Ok(json!({
-                "status":"interrupted",
-                "reason":"breakpoint",
-                "unit":"frames",
-                "count":after.saturating_sub(before),
-                "requested":count,
-                "frame_before":before,
-                "frame":after,
-                "state":"frozen",
-                "event_pending":!self.debug_events.is_empty(),
-            }));
-        }
-        if self.control.command("debug breaked")?.trim() == "1" {
-            return self.fail_debugger(
-                "openMSX entered CPU debug break without a valid callback event".into(),
-            );
-        }
-        self.control.command("debug break")?;
-        self.control.command("set pause on")?;
-        self.require_stop_conjunction("frame step")?;
-        if after != before + count {
-            return Err(OpenMsxBridgeError::Emulator(format!(
-                "openMSX frame step mismatch: expected {}, observed {after}",
-                before + count
-            )));
-        }
-        Ok(json!({
-            "status": "completed",
-            "unit": "frames",
-            "count": count,
-            "frame_before": before,
-            "frame": after,
-            "state": "frozen",
-        }))
     }
 
     fn instruction_step(&mut self, count: u64) -> BridgeResult<Value> {
@@ -1158,7 +1074,7 @@ fn error_kind(error: &OpenMsxBridgeError) -> &'static str {
         OpenMsxBridgeError::BadState(_) => "bad_state",
         OpenMsxBridgeError::UnknownMethod(_) => "unknown_method",
         OpenMsxBridgeError::Unsupported(_) => "unsupported",
-        OpenMsxBridgeError::Emulator(_) => "emulator_error",
+        OpenMsxBridgeError::Emulator(_) | OpenMsxBridgeError::HostDeadline(_) => "emulator_error",
         OpenMsxBridgeError::Protocol(_) | OpenMsxBridgeError::Io(_) => "bridge_error",
     }
 }

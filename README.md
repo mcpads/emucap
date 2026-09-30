@@ -18,7 +18,7 @@ A pinned openMSX 21.0 source build with four emucap host patches provides
 experimental C-BIOS MSX2+ and real-firmware MSX1/MSX2/MSX2+ cartridge profiles
 through a separate Rust XML-control bridge.
 
-**v0.17.1 — beta.** This repository remains under active development; interfaces and
+**v0.18.0 — beta.** This repository remains under active development; interfaces and
 behavior may change in later releases. Adapter availability is host-dependent and is
 reported by `status`.
 
@@ -153,6 +153,11 @@ entry) and the Tracking MCP's `bootstrap` (ledger entry) appear in the tool list
 Check both servers' reported versions and compare Control's `status.server_build` with the
 package's `CORE-BUILD.json` source revision, or the intended source-build commit. If discovery or
 identity differs, check the registered executable paths and reconnect the selected release binaries.
+
+For several memory ranges, pause a running guest and use advertised `read_memory_batch` within
+`status.memory_batch_capability` windows and limits. For collection speed or human handoff,
+describe `debug`, query `execution_speed` with `{}`, then set an advertised rate: `limited` with
+percent (100 = normal), or `unlimited` with mode only. Check the returned policy and state.
 
 ### 3b. Three tiers, composed by the agent
 
@@ -404,8 +409,8 @@ debugger halt to service requests without advancing the guest.
   `neocdz.zip` BIOS plus a CUE entry file whose referenced tracks all exist; its content
   identity covers the complete CUE graph. All three profiles expose bounded RAM, 68000
   state and stepping, exec/read/write breakpoints with hit-time evidence, disassembly,
-  frame control, frozen-frame screenshots, and port-0 input. Native save/load is
-  advertised for MVS and AES; MAME 0.288 marks CDZ save states unsupported.
+  frame control, frozen-frame screenshots, port-0 input, and native save/load (CDZ through
+  a maintained MAME patch).
   → `adapters/mame-neogeo/README.md`
 - **Mupen64Plus (Nintendo 64, experimental; Unix)** — run
   `adapters/mupen64plus/build.sh`, then build `emucap-mupen64plus`. Standard cartridge

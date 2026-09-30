@@ -154,6 +154,24 @@ Reads, writes, registers, disassembly, breakpoints, and stepping are still route
 A temporary routed stop guards shared Main RAM without a second interrupt, then restores the
 session's prior running or frozen state. `status.cpus` reports both endpoint states explicitly.
 
+## Batched memory and execution speed
+
+Batch payloads are acquired by one native command into a private response buffer. The bridge
+validates its full length before exposing any ranges. Native stop epochs remain stable across
+repeated reads and pacing queries at the same halt. A pacing failure after an attempted mutation
+terminates the control channel with the last verified policy. Follow the recovery action in
+`status` before issuing further commands. It does not claim that the emulator process exited or
+that guest progress was undone.
+
+
+`read_memory_batch` reads up to 64 ranges (8 KiB total in one RSP response) of `main` at the frozen shared scheduler; the
+`arm9`/`arm7` bus views are not batch windows because they reach MMIO. `debug.execution_speed`
+sets an integer 1–10000 percent of the DS refresh (59.8261 Hz) or unlimited; the disabled limiter
+or a held boost key reads back as unlimited. Patch 0012 paces the CLI frame loop in 10 ms slices
+that end on a pause or a policy change. Pacing and override-counter queries are answered while the
+guest runs, so status polling does not pause a slow guest. `status.frame` is the VBlank clock, and
+a frame step that spends the host budget returns `reason: "host_deadline"`.
+
 ## Operational notes
 
 - **Halt-on-start**: the stubs start stopped. Drive with `resume` / `step` after the bridge attaches.

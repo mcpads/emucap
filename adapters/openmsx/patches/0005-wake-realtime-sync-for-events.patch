@@ -1,0 +1,30 @@
+--- a/src/RealTime.cc
++++ b/src/RealTime.cc
+@@ -13,6 +13,8 @@
+ #include "narrow.hh"
+ #include "unreachable.hh"
+ 
++#include <algorithm>
++
+ namespace openmsx {
+ 
+ const double   SYNC_INTERVAL = 0.08;  // s
+@@ -97,9 +99,16 @@
+ 			sleep += narrow_cast<int64_t>(sleepAdjust);
+ 			int64_t delta = 0;
+ 			if (sleep > 0) {
+-				Timer::sleep(sleep); // request to sleep for 'sleep+sleepAdjust'
++				// Wake early for a distributed event such as a control command, so a slow
++				// speed setting cannot hold the main thread for a whole sync interval. The
++				// remaining lead stays in idealRealTime and is slept at the next sync; only
++				// a completed sleep calibrates the oversleep adjustment.
++				auto request = narrow<unsigned>(std::min<int64_t>(sleep, 0x7fffffff));
++				bool completed = eventDistributor.sleep(request);
+ 				auto slept = narrow<int64_t>(Timer::getTime() - currentRealTime);
+-				delta = sleep - slept; // actually slept for 'slept' us
++				if (completed) {
++					delta = sleep - slept; // actually slept for 'slept' us
++				}
+ 			}
+ 			const double ALPHA = 0.2;
+ 			sleepAdjust = sleepAdjust * (1 - ALPHA) + narrow_cast<double>(delta) * ALPHA;

@@ -421,6 +421,19 @@ system entry) from Debug → Script Window. An incompatible host fails immediate
 
 Server and client match ports via `EMUCAP_PORT`.
 
+## Batched memory and execution speed
+
+Host API 5 (patch 0014) is required. `read_memory_batch` reads up to 64 ranges (64 KiB) of any
+advertised region at one native halt through Mesen's debug view; `read_memory` uses the same view,
+so CPU-bus reads no longer trigger I/O side effects. `debug.execution_speed` drives Mesen's
+`EmulationSpeed` (integer 1–10000 percent, or unlimited); the maximum-speed toggle reads back as
+unlimited and a held turbo or rewind key as `custom` (a change is refused while rewinding). Frame
+waits are serviced in 10 ms slices: read-only requests are answered during a wait, so polling
+never advances a slow guest, and other requests end the wait. Steps and deferred frame operations
+stop with `reason: "host_deadline"` at the synchronous budget, using one-frame chunks below 100
+percent. Launches are silent by default; `launch(..., sound:true)` enables host audio, reported as
+the `audio_output` host constraint because Mesen then also paces against the audio device.
+
 ## Cross-ROM diff (original vs patched)
 
 Find what the patch broke — drive both ROMs to the same logical moment and compare state.

@@ -255,6 +255,7 @@ fn repeatable_portable_is_separate_from_ordinary_guest_data() {
             runtime: None,
             start_frozen: false,
             repeatable: false,
+            sound: false,
         };
         let ordinary = prepare_launch_portable(&request).unwrap();
         let ordinary_save = ordinary.settings.parent().unwrap().join("Saves/game.srm");
@@ -436,7 +437,7 @@ fn portable_app_bundle_replaces_copied_settings_without_touching_source() {
         assert!(source_plist.contains("<string>ca.mesen</string>"));
         assert!(!source_plist.contains("ca.mesen.emucap"));
     }
-    ensure_portable_settings(&portable, false).unwrap();
+    ensure_portable_settings(&portable, false, false).unwrap();
 
     // The source app remains read-only input, while the emucap-owned copy gets the deterministic
     // isolated profile needed for native host input.
@@ -556,6 +557,7 @@ fn gba_provision_inputs<'a>(
         runtime: None,
         start_frozen: false,
         repeatable: false,
+        sound: false,
     };
     (l, portable)
 }
@@ -567,7 +569,7 @@ fn gba_materializes_minimal_portable_settings_for_firmware_lookup() {
     let log = dir.path().join("launch.log");
     let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
 
-    ensure_portable_settings(&portable, false).unwrap();
+    ensure_portable_settings(&portable, false, false).unwrap();
 
     let settings = read(&portable.settings);
     assert_eq!(settings["Debug"]["ScriptWindow"]["AllowIoOsAccess"], true);
@@ -601,7 +603,7 @@ fn portable_setup_replaces_build_settings_with_isolated_defaults() {
     std::fs::create_dir_all(portable.settings.parent().unwrap()).unwrap();
     std::fs::write(&portable.settings, br#"{"Video":{"Scale":4}}"#).unwrap();
 
-    ensure_portable_settings(&portable, false).unwrap();
+    ensure_portable_settings(&portable, false, false).unwrap();
 
     let settings = read(&portable.settings);
     assert!(settings.get("Video").is_none());
@@ -616,7 +618,7 @@ fn non_gba_also_gets_the_portable_settings_marker() {
     let log = dir.path().join("launch.log");
     let (_, portable) = gba_provision_inputs(dir.path(), &lua, &log);
 
-    ensure_portable_settings(&portable, false).unwrap();
+    ensure_portable_settings(&portable, false, false).unwrap();
 
     assert!(portable.settings.is_file());
     assert_eq!(
@@ -641,7 +643,7 @@ fn repeatable_profile_pins_power_on_settings_and_clears_prior_guest_state() {
     std::fs::write(saves.join("old.srm"), b"prior state").unwrap();
     std::fs::write(game_config.join("old.json"), b"prior config").unwrap();
 
-    ensure_portable_settings(&portable, true).unwrap();
+    ensure_portable_settings(&portable, true, false).unwrap();
     clear_repeatable_persistence(&portable).unwrap();
 
     let settings = read(&portable.settings);
@@ -697,7 +699,7 @@ fn portable_setup_refuses_symlinked_settings() {
     std::fs::write(&target, b"user settings").unwrap();
     std::os::unix::fs::symlink(&target, &portable.settings).unwrap();
 
-    let err = ensure_portable_settings(&portable, false).unwrap_err();
+    let err = ensure_portable_settings(&portable, false, false).unwrap_err();
 
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     assert_eq!(std::fs::read(&target).unwrap(), b"user settings");
@@ -835,6 +837,7 @@ fn launch_spec_propagates_server_and_host_build_identity() {
         runtime: None,
         start_frozen: false,
         repeatable: false,
+        sound: false,
     };
     let host_build = BuildMetadata {
         upstream: "https://example.invalid/Mesen.git".into(),
@@ -881,6 +884,7 @@ fn repeatable_launch_spec_implies_controlled_start_and_exact_conditions() {
         runtime: None,
         start_frozen: false,
         repeatable: true,
+        sound: false,
     };
     let spec = launch_spec(&launch, &binary, &test_build_metadata());
 

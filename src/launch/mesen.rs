@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-pub const REQUIRED_HOST_API: u32 = 4;
+pub const REQUIRED_HOST_API: u32 = 5;
 pub const REPEATABLE_PROFILE_ID: &str = "mesen_snes_repeatable";
 pub const REPEATABLE_CONDITIONS_SHA256: &str =
     "b9f4760915a13576fe4fa5c55a75dffd0e79987ac6259cea1bff5a1701826d6b";
@@ -471,6 +471,9 @@ pub struct Launch<'a> {
     pub runtime: Option<super::RuntimeEnv<'a>>,
     pub start_frozen: bool,
     pub repeatable: bool,
+    /// Host audio output. Off by default so an agent launch is silent and the audio device cannot
+    /// act as a second pacing governor.
+    pub sound: bool,
 }
 
 fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> super::LaunchSpec {
@@ -492,6 +495,7 @@ fn launch_spec(l: &Launch<'_>, binary: &Path, host_build: &BuildMetadata) -> sup
     if l.start_frozen || l.repeatable {
         spec = spec.env("EMUCAP_START_FROZEN", "1");
     }
+    spec = spec.env("EMUCAP_MESEN_AUDIO", if l.sound { "1" } else { "0" });
     if l.repeatable {
         spec = spec
             .env("EMUCAP_EXECUTION_PROFILE", "repeatable")
@@ -523,7 +527,7 @@ fn prepare_launch_portable(l: &Launch<'_>) -> std::io::Result<PreparedPortable> 
 pub fn launch(l: &Launch) -> std::io::Result<u32> {
     let host_build = read_build_metadata(l.binary)?;
     let portable = prepare_launch_portable(l)?;
-    ensure_portable_settings(&portable, l.repeatable)?;
+    ensure_portable_settings(&portable, l.repeatable, l.sound)?;
     if l.repeatable {
         clear_repeatable_persistence(&portable)?;
     }
@@ -554,12 +558,16 @@ fn is_gba_launch(l: &Launch) -> bool {
 /// native input defaults. For GBA it also makes the staged Firmware directory the lookup path.
 /// Settings copied from the build are replaced so build-machine state cannot affect an isolated
 /// launch.
-fn portable_settings_bytes(repeatable: bool) -> std::io::Result<Vec<u8>> {
-    if !repeatable {
-        return Ok(PORTABLE_SETTINGS.as_bytes().to_vec());
-    }
+fn portable_settings_bytes(repeatable: bool, sound: bool) -> std::io::Result<Vec<u8>> {
     let mut settings: serde_json::Value = serde_json::from_str(PORTABLE_SETTINGS)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    settings["Audio"] = serde_json::json!({ "EnableAudio": sound });
+    if !repeatable {
+        let mut bytes = serde_json::to_vec_pretty(&settings)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        bytes.push(b'\n');
+        return Ok(bytes);
+    }
     settings["Snes"] = serde_json::json!({
         "RamPowerOnState": "Random",
         "EnableRandomPowerOnState": false,
@@ -573,7 +581,11 @@ fn portable_settings_bytes(repeatable: bool) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn ensure_portable_settings(portable: &PreparedPortable, repeatable: bool) -> std::io::Result<()> {
+fn ensure_portable_settings(
+    portable: &PreparedPortable,
+    repeatable: bool,
+    sound: bool,
+) -> std::io::Result<()> {
     if super::has_symlink_component_under(&portable.home, &portable.settings) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -592,7 +604,7 @@ fn ensure_portable_settings(portable: &PreparedPortable, repeatable: bool) -> st
             ),
         ));
     }
-    let settings = portable_settings_bytes(repeatable)?;
+    let settings = portable_settings_bytes(repeatable, sound)?;
     crate::path_safety::atomic_write_file(&portable.settings, &settings)
 }
 

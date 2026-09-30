@@ -95,6 +95,7 @@ impl SyntheticLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: Some(capability()),
+                features: Default::default(),
                 identity: EmulatorIdentity {
                     system: Some("snes".into()),
                     adapter: Some("synthetic-recording".into()),

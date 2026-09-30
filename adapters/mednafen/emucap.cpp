@@ -8,6 +8,7 @@
 #include <mednafen/debug.h>  // DebuggerInfoStruct, AddressSpaceType
 #include <mednafen/movie.h>  // MDFNMOV_IsPlaying(reset-origin capability gate)
 #include <mednafen/netplay.h>  // MDFNnetplay(reset is remote-commanded, not immediate)
+#include "netplay.h"            // MDFNDnetplay(driver netplay owns frame pacing)
 #include <mednafen/state.h>  // MDFNSS_SaveSM / MDFNSS_LoadSM
 #include <mednafen/MemoryStream.h>
 #include <mednafen/FileStream.h>
@@ -19,6 +20,7 @@
 #include "emucap_json_num.h"
 #include "emucap_json_strings.h"
 #include "emucap_ngp.h"
+#include "emucap_pacing.h"
 #include "emucap_pcfx.h"
 #include "emucap_recording.h"
 #include "emucap_native_failure.h"
@@ -117,6 +119,17 @@ using namespace Mednafen;
 // (MDFN_IEN_SS::VDP2::PeekRawReg)과 링크된다(익명 ns 안이면 내부 링키지로 떨어져 미해결).
 namespace MDFN_IEN_SS { namespace VDP2 { uint16 PeekRawReg(uint32 a); } }
 
+// Driver pacing hooks injected by build.sh. The driver's RedoFFSF uses emucap_base_speed() as its
+// normal speed, the real-time syncer skips its wait while emucap_unlimited(), and each sliced
+// pacing wait calls emucap_pacing_idle(). Declared outside the anonymous namespace to link.
+extern double CurGameSpeed;
+extern "C" int emucap_ffsf_state(void);
+extern "C" void emucap_ers_resync(void);
+extern "C" double emucap_base_speed(void);
+extern "C" bool emucap_unlimited(void);
+extern "C" bool emucap_audio_underpaced(void);
+extern "C" bool emucap_pacing_idle(void);
+
 namespace {
 
 const int PROTOCOL_VERSION = 1;
@@ -193,6 +206,7 @@ char g_internal_failure_reason[512]{};
 // 지연 명령(run_frames): N프레임 진행 후 응답. 진행 중엔 새 명령을 받지 않고 keepalive를 보낸다.
 long g_def_id = -1;
 long g_def_remaining = 0;
+long g_def_requested = 0;
 uint64_t g_def_progress_ms = 0;
 bool g_def_is_press = false;        // 현재 g_def가 press_buttons면 완료 시 입력 해제
 
@@ -235,6 +249,7 @@ bool g_frozen = false;
 bool g_launch_start_controlled = false;
 long g_step_id = -1;
 long g_step_remaining = 0;
+long g_step_requested = 0;
 uint64_t g_step_progress_ms = 0;
 
 // PSX can replace CPU and device state while the game thread is parked in a debugger callback.
@@ -321,6 +336,75 @@ uint64_t monotonic_millis() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
+// ---- Agent pacing and batched observation ----
+uint32_t g_base_percent = 100;
+bool g_speed_unlimited = false;
+uint64_t g_policy_revision = 0;
+std::string g_policy_key;
+// Bumped by every request outside the observation set, since those can change memory or the stop
+// without changing the frame count.
+uint64_t g_boundary_seq = 0;
+// Host budget for one synchronous advance; a paced advance stops with host_deadline instead of
+// outliving the transport deadline.
+const uint64_t ADVANCE_BUDGET_MS = 245000;
+uint64_t g_advance_deadline_ms = 0;
+// Set when a pacing wait must end (a request the wait cannot serve, a policy change, or an expired
+// advance); every wait returns at once until the next frame service clears it.
+bool g_pacing_released = false;
+uint64_t g_pacing_reconnect_ms = 0;
+
+
+void start_advance_clock() { g_advance_deadline_ms = monotonic_millis() + ADVANCE_BUDGET_MS; }
+
+bool observation_method(const std::string& method) {
+  static const char* const names[] = {
+      "hello", "status", "get_rom_info", "read_memory", "read_memory_batch", "find_pattern",
+      "dump_memory", "get_state", "get_video_state", "resolve_tile", "screenshot", "save_state",
+      "list_breakpoints", "poll_events", "disassemble", "get_trace", "call_stack",
+      "execution_speed"};
+  for (const char* name : names) {
+    if (method == name) return true;
+  }
+  return false;
+}
+
+bool advance_expired() {
+  return g_advance_deadline_ms != 0 && monotonic_millis() >= g_advance_deadline_ms;
+}
+
+// A paced advance stops at the reached frame once its host budget is spent.
+std::string deadline_reply(long requested, long remaining) {
+  return "{\"status\":\"interrupted\",\"reason\":\"host_deadline\",\"unit\":\"frames\","
+         "\"requested\":" + std::to_string(requested) + ",\"completed\":"
+      + std::to_string(requested - remaining) + ",\"frame\":" + std::to_string(g_frame)
+      + ",\"state\":\"frozen\"}";
+}
+
+bool host_audio_enabled() { return MDFN_GetSettingB("sound"); }
+
+EmucapPacingObservation native_pacing() {
+  EmucapPacingObservation o;
+  o.unthrottled = !host_audio_enabled() && MDFN_GetSettingB("nothrottle");
+  o.base = emucap_base_speed();
+  o.unlimited = g_speed_unlimited;
+  o.ffsf = emucap_ffsf_state();
+  o.current = CurGameSpeed;
+  o.netplay = MDFNDnetplay != 0;
+  return o;
+}
+
+// Records one observation; a changed native tuple is a new policy revision.
+EmucapPacingObservation observe_pacing() {
+  const EmucapPacingObservation o = native_pacing();
+  const std::string key = emucap_pacing_key(o);
+  if (key != g_policy_key) {
+    g_policy_revision++;
+    g_policy_key = key;
+  }
+  return o;
+}
+
 
 void rearm_breakpoints();
 
@@ -1810,6 +1894,124 @@ void handle_read_memory(long id, const std::string& line) {
   reply_ok(id, "{\"hex\":\"" + hex + "\"}");
 }
 
+// Side-effect-free windows: every debugger address space except Saturn's unimplemented physical bus.
+std::string memory_batch_windows_json() {
+  std::string windows;
+  if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->AddressSpaces) return windows;
+  for (auto& as : *CurGame->Debugger->AddressSpaces) {
+    if (!as.size || as.size > 0x100000000ULL || (is_ss() && as.name == "physical")) continue;
+    if (!windows.empty()) windows += ",";
+    windows += "{\"memory_type\":\"" + json_escape(as.name) + "\",\"address\":0,\"length\":"
+        + std::to_string((unsigned long long)as.size) + "}";
+  }
+  return windows;
+}
+
+std::string memory_batch_capability_json(const std::string& windows) {
+  return "{\"max_ranges\":" + std::to_string(EMUCAP_BATCH_MAX_RANGES) + ",\"max_range_bytes\":"
+      + std::to_string(EMUCAP_BATCH_MAX_BYTES) + ",\"max_total_bytes\":"
+      + std::to_string(EMUCAP_BATCH_MAX_BYTES)
+      + ",\"consistency\":\"frozen_boundary\",\"halt_kinds\":[\"frame_boundary_park\","
+        "\"cpu_callback_park\"],\"windows\":[" + windows + "]}";
+}
+
+std::string runtime_generation() {
+  const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+  if (launch_id && launch_id[0]) return launch_id;
+  return "unmanaged-pid:" + std::to_string((long)getpid());
+}
+
+// Every range is validated before any read, then all are read at this one frozen stop.
+void handle_read_memory_batch(long id, const std::string& line) {
+  if (!g_frozen) {
+    reply_err(id, "not_frozen", "read_memory_batch requires a frozen stop; call pause first");
+    return;
+  }
+  std::vector<EmucapBatchRange> ranges;
+  std::string error;
+  if (!emucap_parse_batch_ranges(line, ranges, error)) {
+    reply_err(id, "bad_params", error.c_str());
+    return;
+  }
+  for (size_t i = 0; i < ranges.size(); i++) {
+    const EmucapBatchRange& range = ranges[i];
+    if (reject_ss_physical_read(id, range.memory_type)) return;
+    if (range.address > 0xFFFFFFFFULL
+        || !validate_aspace_range(range.memory_type, (uint32)range.address, (long)range.length)) {
+      reply_err(id, "bad_params",
+                ("range " + std::to_string(i) + " is outside an advertised window").c_str());
+      return;
+    }
+  }
+  std::string reads;
+  uint64_t total = 0;
+  for (size_t i = 0; i < ranges.size(); i++) {
+    const EmucapBatchRange& range = ranges[i];
+    std::string hex;
+    if (!read_aspace_hex(range.memory_type, (uint32)range.address, (long)range.length, hex)) {
+      reply_err(id, "emulator_error", "a validated range became unreadable");
+      return;
+    }
+    if (!reads.empty()) reads += ",";
+    reads += "{\"index\":" + std::to_string(i) + ",\"memory_type\":\""
+        + json_escape(range.memory_type) + "\",\"address\":" + std::to_string(range.address)
+        + ",\"length\":" + std::to_string(range.length) + ",\"hex\":\"" + hex + "\"}";
+    total += range.length;
+  }
+  const std::string epoch = "f" + std::to_string(g_frame) + "#s" + std::to_string(g_boundary_seq);
+  reply_ok(id, "{\"state\":\"frozen\",\"consistency\":\"frozen_boundary\",\"boundary\":{"
+      "\"runtime_generation\":\"" + json_escape(runtime_generation()) + "\",\"stop_epoch\":\""
+      + epoch + "\",\"memory_mapping_epoch\":\"" + epoch + "\",\"clocks\":[{\"domain\":"
+      "\"mednafen.frame\",\"value\":" + std::to_string(g_frame) + "}]},\"total_bytes\":"
+      + std::to_string(total) + ",\"reads\":[" + reads + "]}");
+}
+
+// The agent base replaces the driver's normal speed only while no fast/slow-forward key is held;
+// a change ends any pacing wait so the new target starts now.
+void apply_agent_speed() {
+  if (emucap_ffsf_state() == 0) RefreshThrottleFPS(emucap_base_speed());
+  emucap_ers_resync();
+  g_pacing_released = true;
+}
+
+void handle_execution_speed(long id, const std::string& line) {
+  EmucapPacingRequest request;
+  std::string error;
+  if (!emucap_parse_pacing_request(line, request, error)) {
+    reply_err(id, "bad_params", error.c_str());
+    return;
+  }
+  const bool audio = host_audio_enabled();
+  const EmucapPacingObservation before = observe_pacing();
+  const std::string previous = emucap_pacing_policy_json(before, g_policy_revision, audio);
+  if (request.query) {
+    reply_ok(id, previous);
+    return;
+  }
+  const uint32_t prior_percent = g_base_percent;
+  const bool prior_unlimited = g_speed_unlimited;
+  g_speed_unlimited = request.unlimited;
+  if (!request.unlimited) g_base_percent = request.percent;
+  apply_agent_speed();
+  if (!emucap_pacing_confirms(request, native_pacing())) {
+    g_base_percent = prior_percent;
+    g_speed_unlimited = prior_unlimited;
+    apply_agent_speed();
+    const bool restored = emucap_pacing_key(native_pacing()) == emucap_pacing_key(before);
+    observe_pacing();
+    reply_err(id, "emulator_error", restored
+        ? "execution_speed failed_restored: a held fast/slow-forward key, nothrottle or netplay "
+          "owns the native speed"
+        : "execution_speed unverified: the previous policy was not restored");
+    return;
+  }
+  const EmucapPacingObservation after = observe_pacing();
+  reply_ok(id, std::string("{\"status\":\"completed\",\"state\":\"")
+      + (g_frozen ? "frozen" : "running") + "\",\"previous\":" + previous
+      + ",\"execution_speed\":" + emucap_pacing_policy_json(after, g_policy_revision, audio)
+      + ",\"frame\":" + std::to_string(g_frame) + "}");
+}
+
 void handle_write_memory(long id, const std::string& line) {
   std::string mt = json_str(line, "memory_type");
   uint32 addr = 0;
@@ -3037,6 +3239,7 @@ void handle(const std::string& line) {
     reply_err(id, "busy", "record_window owns guest progress until its terminal response");
     return;
   }
+  if (!observation_method(method)) g_boundary_seq++;
   if (method == "hello") {
     const char* sys = system_shortname();
     const bool has_debugger = CurGame && CurGame->Debugger;
@@ -3083,6 +3286,9 @@ void handle(const std::string& line) {
     if (recording_identity_available()) {
       methods += ",\"record_window\"";
     }
+    methods += ",\"execution_speed\"";
+    const std::string batch_windows = has_debugger ? memory_batch_windows_json() : "";
+    if (!batch_windows.empty()) methods += ",\"read_memory_batch\"";
     const char* repeatability_conditions = recording_repeatable_conditions();
     // memory_types: 이 게임의 debugger address space 이름들(없으면 빈 배열). read/write_memory의
     // 유효한 memory_type 목록이며, MCP가 status.memory_types로 표면화한다. 정적 추측 아님.
@@ -3150,7 +3356,13 @@ void handle(const std::string& line) {
                              ",\"breakpoint_kinds\":" +
                              breakpoint_kinds + ",\"contracts\":" +
                              contracts + ",\"execution_limits\":{\"max_sync_advance_count\":" +
-                             std::to_string(MAX_SYNC_ADVANCE) + "}}";
+                             std::to_string(MAX_SYNC_ADVANCE) + "},\"execution_speed_capability\":" +
+                             emucap_pacing_capability_json(host_audio_enabled()) +
+                             (batch_windows.empty()
+                                  ? std::string()
+                                  : ",\"memory_batch_capability\":" +
+                                        memory_batch_capability_json(batch_windows)) +
+                             "}";
     if (recording_identity_available()) {
       const char* binary_sha256 = getenv("EMUCAP_MEDNAFEN_BINARY_SHA256");
       hello_resp.pop_back();
@@ -3265,7 +3477,9 @@ void handle(const std::string& line) {
     resp += g_launch_start_controlled ? "true" : "false";
     resp += ",\"boundary\":";
     resp += g_launch_start_controlled ? "\"pre_first_instruction\"" : "null";
-    resp += "}}";
+    resp += "},\"execution_speed\":";
+    resp += emucap_pacing_policy_json(observe_pacing(), g_policy_revision, host_audio_enabled());
+    resp += "}";
     reply_ok(id, resp);
     recover_native_failure_after_status();
   } else if (method == "get_rom_info") {
@@ -3277,6 +3491,10 @@ void handle(const std::string& line) {
     handle_record_window(id, line);
   } else if (method == "read_memory") {
     handle_read_memory(id, line);
+  } else if (method == "read_memory_batch" && CurGame && CurGame->Debugger) {
+    handle_read_memory_batch(id, line);
+  } else if (method == "execution_speed") {
+    handle_execution_speed(id, line);
   } else if (method == "find_pattern") {
     handle_find_pattern(id, line);
   } else if (method == "dump_memory") {
@@ -3306,8 +3524,10 @@ void handle(const std::string& line) {
     g_frozen = false;
     g_def_id = id;             // 지연: N프레임 후 emucap_service가 완료 응답(여기선 응답 안 함)
     g_def_remaining = n;
+    g_def_requested = n;
     g_def_progress_ms = monotonic_millis();
     g_def_is_press = false;
+    start_advance_clock();
   } else if (method == "set_input") {
     long port = 0;
     if (json_num(line, "port", port) && port != 0) {
@@ -3342,10 +3562,12 @@ void handle(const std::string& line) {
     g_frozen = false;          // run_frames와 동일: 어댑터에서 직접 resume(재freeze 레이스로 g_def가 freeze_spin에 갇히는 timeout 방지)
     g_def_id = id;             // 지연: N프레임 누른 뒤 완료 응답 + 입력 해제(emucap_service)
     g_def_remaining = frames;
+    g_def_requested = frames;
     g_def_progress_ms = monotonic_millis();
     g_def_is_press = true;
+    start_advance_clock();
   } else if (method == "pause") {
-    g_frozen = true;           // 다음 프레임부터 emucap_service가 스핀
+    g_frozen = true;           // 이 요청을 처리한 emucap_service가 같은 프레임 경계에서 스핀
     // via_cb는 핸들러가 정하지 않는다 — park 위치가 정함. pause-from-running은 emucap_service park가
     // false로, pause-while-BP-frozen은 게임스레드가 freeze_spin에 남아 true 보존(회귀 방지).
     reply_ok(id, "{\"state\":\"frozen\"}");
@@ -3401,7 +3623,9 @@ void handle(const std::string& line) {
     // 프레임 중 BP가 히트해 cb 안에서 park하면 freeze_spin이 true로(park 위치가 권위).
     g_step_id = id;            // 완료 응답은 emucap_service가 frames 경과 후
     g_step_remaining = frames;
+    g_step_requested = frames;
     g_step_progress_ms = monotonic_millis();
+    start_advance_clock();
   } else if (method == "probe") {
     // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
     // frame-boundary park에서는 그대로 수행할 수 있다. CPU callback 안의 instruction-boundary
@@ -3444,6 +3668,7 @@ void handle(const std::string& line) {
     g_probe_requested = frames;
     g_probe_remaining = frames;
     g_probe_progress_ms = monotonic_millis();
+    start_advance_clock();
     g_probe_mt = probe_mt;
     g_probe_addr = probe_addr;
     g_probe_len = probe_len;
@@ -3986,17 +4211,32 @@ void serve_socket_once() {
   ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
   if (n == 0) { emucap_disconnect(); return; }  // 상대 끊김
   if (n < 0) {
-    if (emucap_sock_wouldblock()) return;         // EAGAIN/EWOULDBLOCK/EINTR: 데이터 없음
-    emucap_disconnect();                          // ECONNRESET 등 hard error → 재접속
-    return;
+    // EAGAIN/EWOULDBLOCK/EINTR: no new data, but a pacing wait may have left a request buffered.
+    if (!emucap_sock_wouldblock()) {
+      emucap_disconnect();                        // ECONNRESET 등 hard error → 재접속
+      return;
+    }
+  } else {
+    g_rx.append(tmp, (size_t)n);
   }
-  g_rx.append(tmp, (size_t)n);
   size_t pos;
   while ((pos = g_rx.find('\n')) != std::string::npos) {
     std::string l = g_rx.substr(0, pos);
     g_rx.erase(0, pos + 1);
     if (!l.empty()) handle(l);
   }
+}
+
+// Requests a pacing wait answers in place. A wait can run between frames or, for cores that sync
+// mid-frame, inside one; none of these reads or changes guest state.
+bool pacing_wait_method(const std::string& method) {
+  static const char* const names[] = {
+      "hello", "status", "get_rom_info", "poll_events", "list_breakpoints", "execution_speed",
+      "read_memory_batch"};
+  for (const char* name : names) {
+    if (method == name) return true;
+  }
+  return false;
 }
 
 // CPU 콜백(BP 히트 시 코어가 호출, MDFNI_Emulate 내부). 히트 명령에서 정지해 소켓을 스핀
@@ -4238,6 +4478,68 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
 
 }  // namespace
 
+extern "C" double emucap_base_speed(void) { return g_base_percent / 100.0; }
+extern "C" bool emucap_unlimited(void) { return g_speed_unlimited; }
+// Below the native slow-forward floor one frame of resampled audio can exceed the driver's 500 ms
+// output buffer, so the real-time syncer paces the rest of the frame after the audio write.
+extern "C" bool emucap_audio_underpaced(void) { return !g_speed_unlimited && CurGameSpeed < 0.25; }
+
+// Called by the driver's real-time syncer between sleep slices of at most 10 ms. Returns true to
+// end the wait: a request that needs the frame service is buffered, the policy changed, or an
+// advance spent its host budget.
+extern "C" bool emucap_pacing_idle(void) {
+  if (g_pacing_released) return true;
+  try {
+    long* active_id = g_def_id >= 0 ? &g_def_id : g_step_id >= 0 ? &g_step_id
+        : g_probe_id >= 0 ? &g_probe_id : nullptr;
+    if (active_id || g_insn_step_id >= 0 || g_recording) {
+      // An advance accepts no request until its terminal reply; keep its reply stream alive.
+      if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return false;
+      uint64_t* progress = g_def_id >= 0 ? &g_def_progress_ms
+          : g_step_id >= 0 ? &g_step_progress_ms : &g_probe_progress_ms;
+      if (active_id && g_tx.empty()
+          && emucap_progress_due(*progress, monotonic_millis(), PROGRESS_INTERVAL_MS)) {
+        reply_ok(*active_id, "{\"status\":\"working\"}");
+      }
+      if (active_id && advance_expired()) g_pacing_released = true;
+      return g_pacing_released;
+    }
+    if (g_fd < 0) {
+      const uint64_t now = monotonic_millis();
+      if (now - g_pacing_reconnect_ms < 20) return false;
+      g_pacing_reconnect_ms = now;
+      emucap_connect();
+      if (g_fd < 0) return false;
+    }
+    if (!g_tx.empty()) {
+      flush_tx_once();
+      if (g_fd < 0 || !g_tx.empty()) return false;
+    }
+    char tmp[8192];
+    const ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
+    if (n == 0 || (n < 0 && !emucap_sock_wouldblock())) {
+      emucap_disconnect();
+      return false;
+    }
+    if (n > 0) g_rx.append(tmp, (size_t)n);
+    size_t pos;
+    while (!g_pacing_released && (pos = g_rx.find('\n')) != std::string::npos) {
+      const std::string line = g_rx.substr(0, pos);
+      if (!line.empty() && !pacing_wait_method(json_str(line, "method"))) {
+        g_pacing_released = true;
+        break;
+      }
+      g_rx.erase(0, pos + 1);
+      if (!line.empty()) handle(line);
+    }
+  } catch (const std::exception& error) {
+    contain_service_exception("pacing_wait", error.what());
+  } catch (...) {
+    contain_service_exception("pacing_wait", "unknown native adapter exception");
+  }
+  return g_pacing_released;
+}
+
 // 게임 스레드 gamepad UpdateInput이 호출 — 코어가 실제로 읽은 입력 버퍼 비트를 기록한다.
 // status/set_input 응답으로 노출해 주입이 게임에 실제 도달한 비트를 검증한다.
 extern "C" void emucap_game_data_store(unsigned short d) {
@@ -4379,6 +4681,7 @@ void emucap_pre_first_frame() {
 void emucap_service(uint64_t frame) {
   try {
   g_frame = frame;
+  g_pacing_released = false;
   if (g_fd < 0) {
     if (!g_frozen) {
       emucap_connect();  // While running, retry each frame; a missing server is rejected immediately.
@@ -4401,7 +4704,14 @@ void emucap_service(uint64_t frame) {
     if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return;
     if (g_def_id < 0) return;
     g_def_remaining--;
-    if (g_def_remaining <= 0) {
+    if (g_def_remaining > 0 && advance_expired()) {
+      if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
+      reply_ok(g_def_id, deadline_reply(g_def_requested, g_def_remaining));
+      g_def_id = -1;
+      g_def_remaining = 0;
+      g_def_progress_ms = 0;
+      g_frozen = true;
+    } else if (g_def_remaining <= 0) {
       if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
       char buf[96];
       snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu}",
@@ -4414,7 +4724,7 @@ void emucap_service(uint64_t frame) {
                    g_def_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS)) {
       reply_ok(g_def_id, "{\"status\":\"working\"}");  // keepalive(Rust가 working은 건너뜀)
     }
-    return;
+    if (!g_frozen) return;
   }
   // 원자적 probe 진행 중: N프레임 진행(다른 명령 차단) 후 타깃 읽고 응답.
   if (g_probe_id >= 0) {
@@ -4422,24 +4732,37 @@ void emucap_service(uint64_t frame) {
     if (g_probe_id < 0) return;
     if (g_probe_remaining > 0) {
       g_probe_remaining--;
-      if (g_probe_remaining > 0 && g_tx.empty()
+      if (g_probe_remaining > 0 && advance_expired()) {
+        std::string reply = deadline_reply(g_probe_requested, g_probe_remaining);
+        reply.pop_back();
+        reply += ",\"requested_frames\":" + std::to_string(g_probe_requested)
+            + ",\"completed_frames\":" + std::to_string(g_probe_requested - g_probe_remaining) + "}";
+        reply_ok(g_probe_id, reply);
+        g_probe_id = -1;
+        g_probe_requested = 0;
+        g_probe_remaining = 0;
+        g_probe_progress_ms = 0;
+        g_frozen = true;
+      } else if (g_probe_remaining > 0 && g_tx.empty()
           && emucap_progress_due(
               g_probe_progress_ms, monotonic_millis(), PROGRESS_INTERVAL_MS))
         reply_ok(g_probe_id, "{\"status\":\"working\"}");  // 긴 진행도 타임아웃 안 나게
       if (g_probe_remaining > 0)
         return;  // 프레임 진행만(serve_socket_once 미호출 → 네트워크 갭 없음 → 결정론)
     }
-    std::string hex;
-    if (!read_aspace_hex(g_probe_mt, g_probe_addr, g_probe_len, hex)) {
-      reply_err(g_probe_id, "bad_params", "unknown memory_type or address/length exceeds the region");
-    } else {
-      reply_ok(g_probe_id, "{\"status\":\"completed\",\"requested_frames\":"
-          + std::to_string(g_probe_requested) + ",\"completed_frames\":"
-          + std::to_string(g_probe_requested) + ",\"hex\":\"" + hex + "\"}");
+    if (g_probe_id >= 0) {
+      std::string hex;
+      if (!read_aspace_hex(g_probe_mt, g_probe_addr, g_probe_len, hex)) {
+        reply_err(g_probe_id, "bad_params", "unknown memory_type or address/length exceeds the region");
+      } else {
+        reply_ok(g_probe_id, "{\"status\":\"completed\",\"requested_frames\":"
+            + std::to_string(g_probe_requested) + ",\"completed_frames\":"
+            + std::to_string(g_probe_requested) + ",\"hex\":\"" + hex + "\"}");
+      }
+      g_probe_id = -1;
+      g_probe_requested = 0;
+      g_probe_progress_ms = 0;
     }
-    g_probe_id = -1;
-    g_probe_requested = 0;
-    g_probe_progress_ms = 0;
     // A frozen probe must park at the boundary it just measured. Returning
     // here would execute another frame before the next service invocation.
   }
@@ -4448,7 +4771,12 @@ void emucap_service(uint64_t frame) {
     if (!g_tx.empty() && flush_tx_once() == TX_ERROR) return;
     if (g_step_id < 0) return;
     g_step_remaining--;
-    if (g_step_remaining == 0 && g_step_id >= 0) {
+    if (g_step_remaining > 0 && advance_expired()) {
+      reply_ok(g_step_id, deadline_reply(g_step_requested, g_step_remaining));
+      g_step_id = -1;
+      g_step_remaining = 0;
+      g_step_progress_ms = 0;
+    } else if (g_step_remaining == 0 && g_step_id >= 0) {
       char buf[96];
       snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu}",
                (unsigned long long)g_frame);
@@ -4462,13 +4790,20 @@ void emucap_service(uint64_t frame) {
     }
     if (g_step_remaining > 0) return;
   }
+  if (!g_frozen) {
+    serve_socket_once();
+    if (g_test_adapter_exception_id >= 0)
+      throw std::runtime_error("injected native adapter service exception");
+    // A pause served while running parks at this boundary; returning would run one more frame
+    // after the frozen reply.
+    if (!g_frozen) return;
+  }
   // frozen: 반환하면 게임루프가 MDFNI_Emulate를 또 부르므로, 여기서 스핀해 프레임을 막는다.
   // step(remaining>0) 또는 resume(frozen=false)이 오면 빠져나가 프레임을 진행시킨다.
-  if (g_frozen) {
+  {
     // 프레임경계 cold park. 여기로 park하는 시점에 via_cb=false(진입명령 cb 미발화 → step_instructions가
     // 첫 cb를 흡수해 정확히 N). 권위가 park 위치라 핸들러보다 견고 — pause/frame-step 완료가 여기로 오면
-    // 자동 false, BP/명령단위 park는 freeze_spin이 true. running 경로(아래 함수 끝 serve_socket_once,
-    // 미-frozen)는 안 건드린다.
+    // 자동 false, BP/명령단위 park는 freeze_spin이 true.
     g_frozen_via_cb = false;
     // probe가 대기 중이면(g_probe_id>=0) 스핀을 빠져나가 프레임을 진행시켜야 한다(probe는 진행 필요).
     // step_instructions(g_insn_remaining>0)도 마찬가지 — 빠져나가 프레임을 진행시키면 continuous cb가
@@ -4484,11 +4819,7 @@ void emucap_service(uint64_t frame) {
       }
       usleep(2000);          // 2ms — busy-spin 방지
     }
-    return;
   }
-  serve_socket_once();
-  if (g_test_adapter_exception_id >= 0)
-    throw std::runtime_error("injected native adapter service exception");
   } catch (const std::exception& error) {
     contain_service_exception("service", error.what());
   } catch (...) {

@@ -26,6 +26,18 @@ struct FakeControl {
     fail_once: Option<String>,
     media_target: PathBuf,
     disk_change_failure: bool,
+    /// throttle, speed, fastforward, fullspeedwhenloading as the native Tcl variables hold them.
+    pacing: [String; 4],
+    policy_revision: u64,
+    batch_reply: Option<String>,
+    /// Native `apply_policy` error text, such as a restored or unrestored partial update.
+    pacing_apply_error: Option<String>,
+    /// Values the native setter actually keeps, modelling a silent clamp.
+    pacing_clamp: Option<[String; 4]>,
+    restore_failure: bool,
+    external_write_after_apply: bool,
+    /// Frames reached before a frame advance hits its host deadline.
+    advance_deadline_after: Option<u64>,
     machine: String,
     machine_type: String,
 }
@@ -57,9 +69,33 @@ impl FakeControl {
             fail_once: fail_once.map(str::to_owned),
             media_target,
             disk_change_failure: false,
+            pacing: ["false".into(), "100".into(), "false".into(), "false".into()],
+            policy_revision: 0,
+            batch_reply: None,
+            pacing_apply_error: None,
+            pacing_clamp: None,
+            restore_failure: false,
+            external_write_after_apply: false,
+            advance_deadline_after: None,
             machine: "C-BIOS_MSX2+".into(),
             machine_type: "MSX2+".into(),
         }
+    }
+}
+
+impl FakeControl {
+    fn policy(&self) -> String {
+        format!("{}|{}", self.policy_revision, self.pacing.join("|"))
+    }
+
+    fn boundary(&self) -> String {
+        format!(
+            "machine1|{}.5|{}|{}|{}",
+            self.frame,
+            self.frame,
+            self.paused,
+            u8::from(self.breaked)
+        )
     }
 }
 
@@ -73,6 +109,49 @@ impl OpenMsxControl for FakeControl {
             )));
         }
         let result = match command {
+            "::emucap::policy" => self.policy(),
+            "::emucap::boundary" => self.boundary(),
+            command if command.starts_with("::emucap::apply_policy ") => {
+                if let Some(error) = &self.pacing_apply_error {
+                    return Err(OpenMsxBridgeError::Emulator(format!("openMSX rejected `{command}`: {error}")));
+                }
+                let args: Vec<_> = command.split_whitespace().skip(1).collect();
+                let (before, previous) = (self.boundary(), self.policy());
+                self.pacing = self.pacing_clamp.clone().unwrap_or_else(|| {
+                    [args[0].into(), args[1].into(), "false".into(), "false".into()]
+                });
+                self.policy_revision += 4;
+                let reply = [before, previous, self.policy(), self.boundary()].join(";");
+                self.policy_revision += u64::from(self.external_write_after_apply);
+                reply
+            }
+            command if command.starts_with("::emucap::restore_policy ") => {
+                let args: Vec<_> = command.split_whitespace().skip(1).collect();
+                if args[0].parse::<u64>().unwrap() != self.policy_revision {
+                    return Err(OpenMsxBridgeError::Emulator(format!(
+                        "openMSX rejected `{command}`: emucap-policy-conflict {}", self.policy())));
+                }
+                if self.restore_failure {
+                    return Err(OpenMsxBridgeError::Emulator("restore failure".into()));
+                }
+                self.pacing = [args[1].into(), args[2].into(), args[3].into(), args[4].into()];
+                self.policy_revision += 4;
+                self.policy()
+            }
+            command if command.starts_with("set emucap_batch [list [::emucap::boundary]];") => {
+                if let Some(reply) = &self.batch_reply { return Ok(reply.clone()); }
+                if !(self.paused && self.breaked) {
+                    return Err(OpenMsxBridgeError::Emulator("batch requires frozen state".into()));
+                }
+                let mut parts = vec![self.boundary()];
+                for chunk in command.split("[debug read_block ").skip(1) {
+                    let args: Vec<_> = chunk.split(']').next().unwrap().split_whitespace().collect();
+                    let length: usize = args.last().unwrap().parse().unwrap();
+                    parts.push("00".repeat(length));
+                }
+                parts.push(self.boundary());
+                parts.join(";")
+            }
             "openmsx_info version" => "openMSX 21.0".into(),
             "machine_info config_name" => self.machine.clone(),
             "machine_info type" => self.machine_type.clone(),
@@ -324,6 +403,13 @@ impl OpenMsxControl for FakeControl {
     }
 
     fn advance_frames(&mut self, count: u64) -> BridgeResult<()> {
+        if let Some(reached) = self.advance_deadline_after {
+            self.frame += reached;
+            self.paused = false;
+            return Err(OpenMsxBridgeError::HostDeadline(
+                "fake host deadline".into(),
+            ));
+        }
         self.frame += count;
         self.backend_frame = self.backend_frame.checked_add(count).unwrap_or(1);
         self.paused = true;
@@ -1362,3 +1448,6 @@ fn disk_change_with_unverified_effect_is_terminal_and_preserves_recovery_bytes()
     assert_eq!(exported.len(), 1);
     assert_eq!(fs::read(&exported[0]).unwrap(), [0x7b; 512]);
 }
+
+#[path = "openmsx_bridge/observation_tests.rs"]
+mod observation;

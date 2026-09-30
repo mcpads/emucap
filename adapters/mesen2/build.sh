@@ -109,6 +109,7 @@ PATCHES=(
   "$HERE/patches/0011-expose-lua-callstack.patch"
   "$HERE/patches/0012-add-snes-bg-chr-fetch-events.patch"
   "$HERE/patches/0013-fix-snes-ppu-observation-coordinates.patch"
+  "$HERE/patches/0014-add-agent-pacing-controls.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

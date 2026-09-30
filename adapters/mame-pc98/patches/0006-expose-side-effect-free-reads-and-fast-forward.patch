@@ -1,0 +1,42 @@
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -2195,6 +2195,7 @@
+ 	video_type["throttled"] = sol::property(&video_manager::throttled, &video_manager::set_throttled);
+ 	video_type["throttle_rate"] = sol::property(&video_manager::throttle_rate, &video_manager::set_throttle_rate);
+ 	video_type["frameskip"] = sol::property(&video_manager::frameskip, &video_manager::set_frameskip);
++	video_type["fastforward"] = sol::property(&video_manager::fastforward);
+ 	video_type["speed_percent"] = sol::property(&video_manager::speed_percent);
+ 	video_type["effective_frameskip"] = sol::property(&video_manager::effective_frameskip);
+ 	video_type["skip_this_frame"] = sol::property(&video_manager::skip_this_frame);
+--- a/src/frontend/mame/luaengine_mem.cpp
++++ b/src/frontend/mame/luaengine_mem.cpp
+@@ -647,6 +647,29 @@
+ 				luaL_pushresultsize(&buff, byte_count);
+ 				return sol::make_reference(s, sol::stack_reference(s, -1));
+ 			});
++	addr_space_type.set_function("read_peek_block",
++			[] (addr_space &sp, sol::this_state s, offs_t address, u32 length) -> sol::object
++			{
++				// Debugger view of logical memory: the same translation as readv_* with device
++				// side effects disabled, as the debugger memory window reads. Returns nil without
++				// a partial result when any byte cannot be translated.
++				if ((length == 0) || (length > 0x10000))
++				{
++					luaL_error(s, "Invalid length");
++					return sol::lua_nil;
++				}
++				auto side_effects = sp.space.device().machine().disable_side_effects();
++				std::vector<u8> bytes(length);
++				for (u32 i = 0; i < length; i++)
++				{
++					offs_t byte_address = address + i;
++					address_space *tspace;
++					if (!sp.dev.translate(sp.space.spacenum(), device_memory_interface::TR_READ, byte_address, tspace))
++						return sol::lua_nil;
++					bytes[i] = tspace->read_byte(byte_address);
++				}
++				return sol::make_object(s, std::string(reinterpret_cast<char const *>(bytes.data()), length));
++			});
+ 	addr_space_type.set_function("add_change_notifier",
+ 			[this] (addr_space &sp, sol::protected_function &&cb)
+ 			{

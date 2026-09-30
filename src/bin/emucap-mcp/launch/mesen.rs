@@ -55,6 +55,7 @@ pub(super) fn launch_mesen(
         runtime: Some(runtime),
         start_frozen: args.start_frozen,
         repeatable,
+        sound: args.sound.unwrap_or(false),
     };
     match emucap::launch::mesen::launch(&spec) {
         Ok(pid) => serde_json::json!({

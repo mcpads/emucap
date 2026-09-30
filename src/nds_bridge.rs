@@ -105,6 +105,27 @@ const METHODS: &[&str] = &[
     "disassemble",
     "call_stack",
     "reset",
+    "read_memory_batch",
+    "execution_speed",
+];
+
+/// Requests that neither change guest memory nor move the stop.
+const OBSERVATION_METHODS: &[&str] = &[
+    "hello",
+    "status",
+    "get_rom_info",
+    "read_memory",
+    "read_memory_batch",
+    "get_state",
+    "find_pattern",
+    "dump_memory",
+    "list_breakpoints",
+    "poll_events",
+    "screenshot",
+    "save_state",
+    "disassemble",
+    "call_stack",
+    "execution_speed",
 ];
 
 /// Methods present in the shared emucap surface but not reachable through the DeSmuME RSP
@@ -224,6 +245,8 @@ pub enum NdsBridgeError {
     Unsupported(String),
     #[error("{0}")]
     Emulator(String),
+    #[error("{0}")]
+    NotFrozen(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -249,6 +272,10 @@ pub struct NdsBridge<G> {
     bps: BTreeMap<u64, NdsBreakpoint>,
     next_bp: u64,
     events: Vec<Value>,
+    /// Bumped by every request outside the observation set, since those can change memory or the
+    /// stop without changing the VBlank clock.
+    boundary_seq: u64,
+    control_unverified: bool,
 }
 
 impl<G: GdbTransport> NdsBridge<G> {
@@ -260,11 +287,16 @@ impl<G: GdbTransport> NdsBridge<G> {
             bps: BTreeMap::new(),
             next_bp: 1,
             events: Vec::new(),
+            boundary_seq: 0,
+            control_unverified: false,
         }
     }
 
     pub fn handle_request(&mut self, req: Request) -> Response {
         let id = req.id;
+        if !OBSERVATION_METHODS.contains(&req.method.as_str()) {
+            self.boundary_seq += 1;
+        }
         let result = match req.method.as_str() {
             "hello" => self.hello(),
             "status" => self.status(),
@@ -292,6 +324,8 @@ impl<G: GdbTransport> NdsBridge<G> {
             "disassemble" => self.disassemble(&req.params),
             "call_stack" => self.call_stack(&req.params),
             "reset" => self.reset(&req.params),
+            "read_memory_batch" => self.read_memory_batch(&req.params),
+            "execution_speed" => self.execution_speed(&req.params),
             other if UNSUPPORTED_METHODS.contains(&other) => {
                 Err(NdsBridgeError::Unsupported(other.into()))
             }
@@ -317,7 +351,8 @@ impl<G: GdbTransport> NdsBridge<G> {
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.arm9.gdb.is_terminal()
+        self.control_unverified
+            || self.arm9.gdb.is_terminal()
             || self
                 .arm7
                 .as_ref()
@@ -329,6 +364,7 @@ mod breakpoints;
 mod cpu;
 mod debug;
 mod input_state;
+mod observation;
 mod service;
 mod support;
 use support::*;

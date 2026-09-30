@@ -107,7 +107,8 @@ impl<G: GdbTransport> Bridge<G> {
             self.frozen = true;
             return Ok(json!({
                 "status": "interrupted",
-                "reason": "breakpoint",
+                "reason": interrupt_reason(&raw),
+                "completed": crate::mame_observation::deadline_frames(&raw),
                 "raw": raw,
                 "buttons": buttons,
                 "frames": frames,
@@ -162,7 +163,8 @@ impl<G: GdbTransport> Bridge<G> {
         if let Some(raw) = stop {
             return Ok(json!({
                 "status": "interrupted",
-                "reason": "breakpoint",
+                "reason": interrupt_reason(&raw),
+                "completed": crate::mame_observation::deadline_frames(&raw),
                 "raw": raw,
                 "dx": dx,
                 "dy": dy,
@@ -196,7 +198,16 @@ impl<G: GdbTransport> Bridge<G> {
         METHODS
             .iter()
             .copied()
-            .filter(|method| *method != "move_pointer" || self.pointer_relative_available())
+            .filter(|method| match *method {
+                "move_pointer" => self.pointer_relative_available(),
+                "read_memory_batch" => {
+                    crate::mame_observation::supports_batch(&self.mame_features())
+                }
+                "execution_speed" => {
+                    crate::mame_observation::supports_pacing(&self.mame_features())
+                }
+                _ => true,
+            })
             .collect()
     }
 

@@ -39,6 +39,12 @@ pub(crate) fn button_hint_for_system(system: Option<&str>) -> Option<serde_json:
             "aliases": {"start": "option", "enter": "option", "return": "option"},
             "notes": "Neo Geo Pocket and Neo Geo Pocket Color share the Mednafen ngp module and built-in controller."
         }),
+        "wswan" | "ws" | "wsc" | "wonderswan" => serde_json::json!({
+            "system": "wswan",
+            "buttons": ["x1", "x2", "x3", "x4", "y1", "y2", "y3", "y4", "a", "b", "start", "up", "down", "left", "right"],
+            "aliases": {"up-x": "x1", "right-x": "x2", "down-x": "x3", "left-x": "x4", "up-y": "y1", "right-y": "y2", "down-y": "y3", "left-y": "y4", "enter": "start", "return": "start"},
+            "notes": "WonderSwan and WonderSwan Color have two cursor groups: X1-X4 (up/right/down/left) for horizontal play and Y1-Y4 for vertical play. up/down/left/right map to the X group."
+        }),
         "pc98" => serde_json::json!({
             "system": "pc98",
             "buttons": ["enter", "esc", "space", "up", "down", "left", "right", "backspace", "tab", "del", "ins", "home", "help", "stop", "copy", "shift", "ctrl", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "vf1", "vf2", "vf3", "vf4", "vf5", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "kp0", "kp1", "kp2", "kp3", "kp4", "kp5", "kp6", "kp7", "kp8", "kp9"],

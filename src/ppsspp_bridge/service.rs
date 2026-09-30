@@ -163,6 +163,7 @@ impl<T: WsTransport> PpssppBridge<T> {
         // debugger-halt indicator pause/resume/step_instructions act on, so `state` is derived from
         // that, not from `game.status`.
         let stepping = self.cpu_is_stepping()?;
+        let pacing = self.native_pacing(json!({})).ok();
         let ppsspp_version = version
             .get("version")
             .and_then(Value::as_str)
@@ -190,6 +191,8 @@ impl<T: WsTransport> PpssppBridge<T> {
             "capability_notes": capability_notes(),
             "ppsspp_version": ppsspp_version,
             "game": game_status.get("game").cloned().unwrap_or(Value::Null),
+            "frame": pacing.map(|pacing| pacing.vblank),
+            "execution_speed": pacing.map(|pacing| pacing.public()),
             "input_buttons": psp_input_buttons_json(),
             "execution_limits": {
                 "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
@@ -250,6 +253,8 @@ impl<T: WsTransport> PpssppBridge<T> {
                 "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
                 "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
             },
+            "memory_batch_capability": Self::memory_batch_capability(),
+            "execution_speed_capability": Self::execution_speed_capability(),
         });
         let obj = result.as_object_mut().expect("hello is an object");
         if let Some(name) = &self.name {

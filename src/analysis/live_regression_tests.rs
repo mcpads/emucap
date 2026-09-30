@@ -24,6 +24,7 @@ impl DetReplayLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: crate::live::link::EmulatorIdentity::default(),
             },
             obs_queue: std::collections::VecDeque::new(),
@@ -554,6 +555,7 @@ impl Pc98InputReplayLink {
                 breakpoint_kinds: vec![],
                 contracts: crate::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: crate::live::link::EmulatorIdentity {
                     system: Some("pc98".into()),
                     adapter: Some("mame-pc98-gdb".into()),

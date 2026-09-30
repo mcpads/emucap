@@ -10,6 +10,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
+. "$HERE/../_common/build-env.sh"
+emucap_scrub_build_env
 . "$HERE/upstream.lock"
 VER="${MAME_VER:-$MAME_LOCK_VERSION}"
 TAG="${MAME_TAG:-$MAME_LOCK_TAG}"
@@ -109,7 +111,7 @@ PATCHES=()
 if [ -d "$PATCH_DIR" ]; then
   while IFS= read -r source_patch; do
     [ -n "$source_patch" ] && PATCHES+=("$source_patch")
-  done < <(find "$PATCH_DIR" -type f -name '*.patch' | sort)
+  done < <(find "$PATCH_DIR" -type f -name '*.patch' | LC_ALL=C sort)
 fi
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"

@@ -70,6 +70,7 @@ fi
 PATCHES=(
   "$HERE/patches/0001-fail-closed-core-worker-init.patch"
   "$HERE/patches/0002-consume-breakpoint-latch.patch"
+  "$HERE/patches/0003-slice-speed-limiter-wait.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -90,6 +91,7 @@ PATCHED_MEMBERS=(
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/api_export.ver"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/debugger.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/m64p_debugger.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/main.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/workqueue.c"

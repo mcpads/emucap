@@ -10,7 +10,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 PATCHSET_SHA256="$(
   cd "$HERE"
   find patches -type f -name '*.patch' -print0 |
-    sort -z |
+    LC_ALL=C sort -z |
     xargs -0 shasum -a 256 |
     shasum -a 256 |
     awk '{print $1}'

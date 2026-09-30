@@ -20,11 +20,13 @@ use breakpoints::{breakpoint_kinds, is_breakpoint_stop};
 #[path = "neogeo_bridge/file_io.rs"]
 mod file_io;
 use file_io::{absolute_path, default_adapter_home, sha256_regular_file, state_partial_sibling};
+#[path = "neogeo_bridge/observation.rs"]
+mod observation;
 #[path = "neogeo_bridge/support.rs"]
 mod support;
 use support::*;
 
-const MVS_METHODS: &[&str] = &[
+const METHODS: &[&str] = &[
     "hello",
     "status",
     "get_rom_info",
@@ -50,47 +52,10 @@ const MVS_METHODS: &[&str] = &[
     "disassemble",
     "call_stack",
 ];
-const CD_METHODS: &[&str] = &[
-    "hello",
-    "status",
-    "get_rom_info",
-    "get_state",
-    "read_memory",
-    "write_memory",
-    "screenshot",
-    "set_input",
-    "press_buttons",
-    "pause",
-    "resume",
-    "step",
-    "step_instructions",
-    "run_frames",
-    "reset",
-    "set_breakpoint",
-    "clear_breakpoint",
-    "list_breakpoints",
-    "clear_all_breakpoints",
-    "poll_events",
-    "disassemble",
-    "call_stack",
-];
-const MVS_ACTIVE_EXCEPTIONS: &[&str] = &[
+const ACTIVE_EXCEPTIONS: &[&str] = &[
     "neogeo.state-read.frozen-only",
     "neogeo.state-save.frozen-only",
     "neogeo.state-load.frozen-only",
-    "neogeo.memory-read.frozen-only",
-    "neogeo.memory-read.bounded",
-    "neogeo.memory-write.frozen-only",
-    "neogeo.input-hold.port-zero-only",
-    "neogeo.input-pulse.constraints",
-    "neogeo.execution-step.main-cpu-only",
-    "neogeo.execution-pause.machine-global",
-    "neogeo.execution-resume.machine-global",
-    "neogeo.breakpoint.pausing-subset",
-    "neogeo.call-stack.frozen-best-effort",
-];
-const CD_ACTIVE_EXCEPTIONS: &[&str] = &[
-    "neogeo.state-read.frozen-only",
     "neogeo.memory-read.frozen-only",
     "neogeo.memory-read.bounded",
     "neogeo.memory-write.frozen-only",
@@ -141,20 +106,6 @@ impl NeoGeoProfile {
         }
     }
 
-    fn methods(self) -> &'static [&'static str] {
-        match self {
-            Self::Mvs | Self::Aes => MVS_METHODS,
-            Self::Cd => CD_METHODS,
-        }
-    }
-
-    fn active_exceptions(self) -> &'static [&'static str] {
-        match self {
-            Self::Mvs | Self::Aes => MVS_ACTIVE_EXCEPTIONS,
-            Self::Cd => CD_ACTIVE_EXCEPTIONS,
-        }
-    }
-
     fn ram(self) -> (u64, u64) {
         match self {
             Self::Mvs | Self::Aes => (MVS_RAM_BASE, MVS_RAM_SIZE),
@@ -175,10 +126,6 @@ impl NeoGeoProfile {
             Self::Aes => "aes",
             Self::Cd => "cdz",
         }
-    }
-
-    fn supports_state_files(self) -> bool {
-        matches!(self, Self::Mvs | Self::Aes)
     }
 }
 
@@ -238,6 +185,8 @@ pub struct NeoGeoBridge<G> {
     last_hit_seq: u64,
     next_reset_seq: u64,
     adapter_home: PathBuf,
+    mame_features: Option<std::collections::BTreeSet<String>>,
+    control_fatal: Option<String>,
 }
 
 impl<G: GdbTransport> NeoGeoBridge<G> {
@@ -257,6 +206,8 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             adapter_home: std::env::var_os("EMUCAP_ADAPTER_HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(default_adapter_home),
+            mame_features: None,
+            control_fatal: None,
         })
     }
 
@@ -267,9 +218,15 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "status" => self.status(),
             "get_rom_info" => self.get_rom_info(),
             "get_state" => self.get_state(),
-            "save_state" if self.profile.supports_state_files() => self.save_state(&req.params),
-            "load_state" if self.profile.supports_state_files() => self.load_state(&req.params),
+            "save_state" => self.save_state(&req.params),
+            "load_state" => self.load_state(&req.params),
             "read_memory" => self.read_memory(&req.params),
+            "read_memory_batch" if self.advertised_methods().contains(&"read_memory_batch") => {
+                self.read_memory_batch(&req.params)
+            }
+            "execution_speed" if self.advertised_methods().contains(&"execution_speed") => {
+                self.execution_speed(&req.params)
+            }
             "write_memory" => self.write_memory(&req.params),
             "screenshot" => self.screenshot(),
             "set_input" => self.set_input(&req.params),
@@ -309,27 +266,21 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.gdb.is_terminal()
+        self.gdb.is_terminal() || self.control_fatal.is_some()
     }
 
-    fn hello(&self) -> BridgeResult<Value> {
-        let methods = self.profile.methods();
+    fn hello(&mut self) -> BridgeResult<Value> {
+        let methods = self.advertised_methods();
         let (_, ram_size) = self.profile.ram();
         let input_buttons = self.profile.input_buttons();
-        let state_restore = match self.profile {
-            NeoGeoProfile::Mvs | NeoGeoProfile::Aes => json!({
-                "supported": true,
-                "format": "mame-native",
-                "save_completion": "pre-save notifier plus completed non-empty file",
-                "load_completion": "post-load notifier",
-                "execution_state": "frozen",
-                "screenshot_after_load": "step one frozen frame before judging the restored screen",
-            }),
-            NeoGeoProfile::Cd => json!({
-                "supported": false,
-                "reason": "MAME 0.288 does not mark the CDZ driver as supporting save states",
-            }),
-        };
+        let state_restore = json!({
+            "supported": true,
+            "format": "mame-native",
+            "save_completion": "pre-save notifier plus completed non-empty file",
+            "load_completion": "post-load notifier",
+            "execution_state": "frozen",
+            "screenshot_after_load": "step one frozen frame before judging the restored screen",
+        });
         let mut value = json!({
             "protocol_version": PROTOCOL_VERSION,
             "system": self.system,
@@ -345,7 +296,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             }],
             "region_sizes": {"ram": ram_size},
             "breakpoint_kinds": breakpoint_kinds(),
-            "contracts": crate::contracts::advertisement_value(self.profile.active_exceptions()),
+            "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
             "input_buttons": {"system": self.system, "buttons": input_buttons},
             "capability_notes": {
                 "implemented_methods": methods,
@@ -365,6 +316,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 },
             },
         });
+        self.feature_capabilities(&methods, &mut value);
         let obj = value.as_object_mut().expect("hello object");
         if let Some(name) = &self.env.name {
             obj.insert("name".into(), json!(name));
@@ -387,7 +339,12 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn status(&mut self) -> BridgeResult<Value> {
         self.drain_breakpoint_packets()?;
-        let methods = self.profile.methods();
+        let methods = self.advertised_methods();
+        let execution_speed = if methods.contains(&"execution_speed") {
+            Some(self.execution_speed_value()?)
+        } else {
+            None
+        };
         let (_, ram_size) = self.profile.ram();
         let input_buttons = self.profile.input_buttons();
         let frame = self.current_frame()?;
@@ -401,6 +358,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             "debugger": true,
             "state": if self.frozen { "frozen" } else { "running" },
             "frame": frame,
+            "execution_speed": execution_speed,
             "methods": methods,
             "memory_types": ["ram"],
             "region_sizes": {"ram": ram_size},
@@ -809,10 +767,8 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         } else {
             "runframes"
         };
+        let timeout = self.frame_wait_timeout(count)?;
         let previous_timeout = self.gdb.get_timeout()?;
-        let estimated_ms = FRAME_OPERATION_STARTUP_MS
-            .saturating_add(count.saturating_mul(FRAME_OPERATION_BUDGET_MS));
-        let timeout = Duration::from_millis(estimated_ms);
         self.gdb.set_timeout(timeout)?;
         let outcome = self.lua_cmd(command, Some(&count.to_string()));
         let restore = self.gdb.set_timeout(previous_timeout);
@@ -838,6 +794,19 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 "breakpoint_id":event["id"],
                 "event":event,
                 "frame_before":before,
+                "state":"frozen",
+            }));
+        }
+        if let Some(completed) = crate::mame_observation::deadline_frames(&response) {
+            self.frozen = true;
+            return Ok(json!({
+                "status":"interrupted",
+                "reason":"host_deadline",
+                "unit":"frames",
+                "count":count,
+                "completed":completed,
+                "frame_before":before,
+                "frame":self.current_frame()?,
                 "state":"frozen",
             }));
         }
@@ -921,7 +890,19 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 "Neo Geo press_buttons supports at most {MAX_INPUT_FRAMES} frames"
             )));
         }
-        let response = self.lua_cmd("press", Some(&format!("{frames}:{}", buttons.join(","))))?;
+        let timeout = self.frame_wait_timeout(frames)?;
+        let previous_timeout = self.gdb.get_timeout()?;
+        self.gdb.set_timeout(timeout)?;
+        let outcome = self.lua_cmd("press", Some(&format!("{frames}:{}", buttons.join(","))));
+        self.gdb.set_timeout(previous_timeout)?;
+        let response = outcome?;
+        if let Some(completed) = crate::mame_observation::deadline_frames(&response) {
+            self.frozen = true;
+            return Ok(
+                json!({"status":"interrupted", "reason":"host_deadline", "buttons":buttons,
+                "frames":frames, "completed":completed, "state":"frozen"}),
+            );
+        }
         if is_breakpoint_stop(&response) {
             let event = self.record_breakpoint_hit(response)?;
             return Ok(json!({

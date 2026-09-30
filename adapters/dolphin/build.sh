@@ -41,6 +41,8 @@ git -C "$SRC" checkout -- \
   Source/Core/Core/CMakeLists.txt \
   Source/Core/Core/Core.cpp \
   Source/Core/Core/Core.h \
+  Source/Core/Core/CoreTiming.cpp \
+  Source/Core/Core/CoreTiming.h \
   Source/Core/Core/HW/CPU.cpp \
   Source/Core/Core/HW/CPU.h \
   Source/Core/Core/HW/GCPad.cpp \
@@ -88,9 +90,14 @@ COMMON_ARGS=(
   -DUSE_BUNDLED_MOLTENVK=OFF
   -DMACOS_CODE_SIGNING=OFF
   -DUSE_SYSTEM_LIBS=AUTO
+  # The bundled fmt is pinned with the Dolphin commit instead of whichever host fmt is installed.
+  -DUSE_SYSTEM_FMT=OFF
 )
 
+# Cached system-library paths go stale when the host package manager upgrades them, so each build
+# configures from a fresh cache. Unchanged compile commands keep their objects.
 HEADLESS_BUILD="$SRC/build-emucap-headless"
+rm -f "$HEADLESS_BUILD/CMakeCache.txt"
 cmake -S "$SRC" -B "$HEADLESS_BUILD" "${COMMON_ARGS[@]}" -DENABLE_HEADLESS=ON -DENABLE_QT=OFF
 cmake --build "$HEADLESS_BUILD" --target dolphin-nogui -j "$JOBS"
 
@@ -99,7 +106,7 @@ PATCHSET_SHA256="$(
   {
     shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h
     find patches -type f -name '*.patch' -print0 |
-      sort -z |
+      LC_ALL=C sort -z |
       xargs -0 shasum -a 256
   } | shasum -a 256 | awk '{print $1}'
 )"
@@ -130,6 +137,7 @@ echo "built: $HEADLESS_BIN"
 # EMUCAP_DOLPHIN_BUILD_GUI at its default to produce DolphinQt.app for display=true.
 if [ "${EMUCAP_DOLPHIN_BUILD_GUI:-1}" != "0" ]; then
   GUI_BUILD="$SRC/build-emucap-gui"
+  rm -f "$GUI_BUILD/CMakeCache.txt"
   if cmake -S "$SRC" -B "$GUI_BUILD" "${COMMON_ARGS[@]}" -DENABLE_HEADLESS=OFF -DENABLE_QT=ON &&
      cmake --build "$GUI_BUILD" --target dolphin-emu -j "$JOBS"; then
     if [ -d "$GUI_BUILD/Binaries/DolphinQt.app" ]; then

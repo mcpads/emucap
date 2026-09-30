@@ -138,7 +138,8 @@ patch -d "$SRC" -p1 < "$HERE/patches/0001-restore-md-clock-origins.patch"
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
   "$HERE/emucap_recording.cpp" "$HERE/emucap_recording.h" \
   "$HERE/emucap_ngp.h" \
-  "$HERE/emucap_json_num.h" "$HERE/emucap_json_strings.h" "$SRC/src/drivers/"
+  "$HERE/emucap_json_num.h" "$HERE/emucap_json_strings.h" "$HERE/emucap_pacing.h" \
+  "$SRC/src/drivers/"
 cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
   "$SRC/src/ngp/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
@@ -151,14 +152,14 @@ git -C "$HERE" diff --quiet HEAD -- \
   emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
   emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
-  ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
+  emucap_pacing.h ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 PATCHSET_SHA256="$({
   for path in \
     build.sh patches/0001-restore-md-clock-origins.patch emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
     emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
-    emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
+    emucap_pacing.h emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
   done
   for path in \
@@ -201,6 +202,33 @@ perl -0777 -pi -e \
   "$SRC/src/drivers/main.cpp"
 inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp 훅 삽입 실패"
 inject_check emucap_pre_first_frame "$SRC/src/drivers/main.cpp" "main.cpp pre-first 훅 삽입 실패"
+
+# 4a. 에이전트 페이싱: 드라이버의 보통 속도(빨리/느리게 감기 키가 없을 때)를 에이전트 base로 바꾸고,
+#     unlimited에서는 실시간 대기를 건너뛰며, 긴 대기는 10 ms 조각으로 자면서 제어 요청을 받는다.
+#     사운드가 켜져 있고 속도가 네이티브 느리게 감기 하한(0.25) 아래면 한 프레임의 리샘플 오디오가
+#     드라이버 버퍼(500 ms)를 넘을 수 있어, 나머지 시간은 실시간 싱커가 맞춘다.
+perl -0777 -pi -e 's{(static void RedoFFSF\(void\)\n\{\n if\(inff\)\n  RefreshThrottleFPS\(MDFN_GetSettingF\("ffspeed"\)\);\n else if\(insf\)\n  RefreshThrottleFPS\(MDFN_GetSettingF\("sfspeed"\)\);\n else\n  RefreshThrottleFPS\()1(\);\n\}\n)}{extern "C" double emucap_base_speed(void);\n\n${1}emucap_base_speed()${2}\nextern "C" int emucap_ffsf_state(void) { return inff ? 1 : (insf ? 2 : 0); }\n} unless m{emucap_ffsf_state}' \
+  "$SRC/src/drivers/input.cpp"
+inject_check 'RefreshThrottleFPS(emucap_base_speed());' "$SRC/src/drivers/input.cpp" "input.cpp 페이싱 base 삽입 실패"
+inject_check 'extern "C" int emucap_ffsf_state(void)' "$SRC/src/drivers/input.cpp" "input.cpp ffsf 관측 삽입 실패"
+perl -0777 -pi -e 's{(static EmuRealSyncher ers;\n)}{${1}extern "C" bool emucap_unlimited(void);\nextern "C" bool emucap_audio_underpaced(void);\nextern "C" void emucap_ers_resync(void) { ers.SetETtoRT(); }\n} unless m{emucap_ers_resync}' \
+  "$SRC/src/drivers/main.cpp"
+perl -0777 -pi -e 's{\n  if\(NoWaiting && Count > cw\)\n}{\n  if((NoWaiting || emucap_unlimited()) && Count > cw)\n}' \
+  "$SRC/src/drivers/main.cpp"
+perl -0777 -pi -e 's{(\n  Sound_Write\(Buffer, Count\);\n\n)  if\(NeedETtoRT\)\n   ers\.SetETtoRT\(\);\n}{${1}  if(emucap_audio_underpaced())\n   ers.Sync();\n  else if(NeedETtoRT || emucap_unlimited())\n   ers.SetETtoRT();\n}' \
+  "$SRC/src/drivers/main.cpp"
+perl -0777 -pi -e 's{\n  if\(!NoWaiting && !nothrottle && GameThreadRun && !MDFNDnetplay\)\n   ers\.Sync\(\);\n}{\n  if(emucap_unlimited())\n   ers.SetETtoRT();\n  else if(!NoWaiting && !nothrottle && GameThreadRun && !MDFNDnetplay)\n   ers.Sync();\n}' \
+  "$SRC/src/drivers/main.cpp"
+inject_check 'extern "C" void emucap_ers_resync(void) { ers.SetETtoRT(); }' "$SRC/src/drivers/main.cpp" "main.cpp 싱커 재동기 삽입 실패"
+inject_check 'if((NoWaiting || emucap_unlimited()) && Count > cw)' "$SRC/src/drivers/main.cpp" "main.cpp unlimited 오디오 삽입 실패"
+inject_check 'else if(NeedETtoRT || emucap_unlimited())' "$SRC/src/drivers/main.cpp" "main.cpp 저속 오디오 삽입 실패"
+inject_check 'else if(!NoWaiting && !nothrottle && GameThreadRun && !MDFNDnetplay)' "$SRC/src/drivers/main.cpp" "main.cpp 무음 페이싱 삽입 실패"
+perl -0777 -pi -e 's{(#include "ers\.h"\n)}{${1}\nextern "C" bool emucap_pacing_idle(void);\n} unless m{emucap_pacing_idle}' \
+  "$SRC/src/drivers/ers.cpp"
+perl -0777 -pi -e 's{\n  if\(SleepTime >= 0\)\n   Time::SleepMS\(SleepTime\);\n}{\n  if(SleepTime >= 0)\n  {\n   Time::SleepMS(std::min<int64>(SleepTime, 10));\n   if(emucap_pacing_idle())\n   {\n    EmuTime = (int64)Time::MonoMS() * EmuClock / 1000;\n    break;\n   }\n  }\n}' \
+  "$SRC/src/drivers/ers.cpp"
+inject_check 'Time::SleepMS(std::min<int64>(SleepTime, 10));' "$SRC/src/drivers/ers.cpp" "ers.cpp 페이싱 대기 삽입 실패"
+inject_check 'if(emucap_pacing_idle())' "$SRC/src/drivers/ers.cpp" "ers.cpp 제어 서비스 삽입 실패"
 
 # 4b. 입력 주입(코어-비특이): mednafen.cpp의 movie/netplay와 동일 위상(Emulate 직전 + MidSync)에서
 #     PortData[0]을 주입한다. 드라이버 Input_Update 주입은 게임 INTBACK이 읽는 스냅샷과 위상이
@@ -670,6 +698,8 @@ inject_check '&NGPDBGInfo' "$SRC/src/ngp/neopop.cpp" "ngp debugger capability in
 #    --enable-ss 명시 필수. 나머지는 기본 on이지만 명시해 의도를 고정한다.
 echo "→ configure (--enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-ngp --enable-debugger)"
 cd "$SRC"
+. "$HERE/../_common/build-env.sh"
+emucap_scrub_build_env
 if command -v brew >/dev/null 2>&1; then
   export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
 fi

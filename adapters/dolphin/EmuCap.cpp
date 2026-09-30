@@ -47,9 +47,11 @@ using SOCKET = int;
 #include "Common/Event.h"
 #include "Common/FileUtil.h"
 #include "Common/SocketContext.h"
+#include "Core/AchievementManager.h"
 #include "Core/Config/MainSettings.h"
 #include "Core/Config/WiimoteSettings.h"
 #include "Core/Core.h"
+#include "Core/CoreTiming.h"
 #include "Core/Debugger/Debugger_SymbolMap.h"
 #include "Core/Debugger/PPCDebugInterface.h"
 #include "Core/HW/CPU.h"
@@ -58,6 +60,7 @@ using SOCKET = int;
 #include "Core/HW/Wiimote.h"
 #include "Core/HW/WiimoteEmu/DesiredWiimoteState.h"
 #include "Core/HW/WiimoteEmu/WiimoteEmu.h"
+#include "Core/Movie.h"
 #include "Core/PowerPC/BreakPoints.h"
 #include "Core/PowerPC/Gekko.h"
 #include "Core/PowerPC/JitInterface.h"
@@ -410,7 +413,315 @@ void AddExecutionLimits(picojson::object& result)
   result["execution_limits"] = picojson::value(limits);
 }
 
-picojson::object Hello(Core::System&, const picojson::object&)
+// ---- Agent pacing and batched observation ----
+constexpr uint32_t PACING_MIN_PERCENT = 1;
+constexpr uint32_t PACING_MAX_PERCENT = 10000;
+constexpr size_t BATCH_MAX_RANGES = 64;
+constexpr uint64_t BATCH_MAX_BYTES = 65536;
+constexpr u32 MEM1_BASE = 0x80000000;
+constexpr u32 MEM2_BASE = 0x90000000;
+// Bumped by every request outside the observation set, since those can change memory or the stop
+// without changing the frame count.
+std::atomic<u64> s_boundary_seq{0};
+std::mutex s_pacing_mutex;
+u64 s_policy_revision = 0;
+std::string s_policy_key;
+
+bool ObservationMethod(const std::string& method)
+{
+  static const char* const names[] = {
+      "hello",       "status",    "read_memory",      "read_memory_batch", "get_state",
+      "disassemble", "call_stack", "list_breakpoints", "poll_events",       "save_state",
+      "screenshot",  "execution_speed"};
+  return std::any_of(std::begin(names), std::end(names),
+                     [&](const char* name) { return method == name; });
+}
+
+u64 CurrentFrame(Core::System& system)
+{
+  return system.GetMovie().GetCurrentFrame();
+}
+
+struct PacingObservation
+{
+  float speed;
+  bool temp_disabled;
+};
+
+PacingObservation NativePacing()
+{
+  return {Config::Get(Config::MAIN_EMULATION_SPEED), Core::GetIsThrottlerTempDisabled()};
+}
+
+// Integer percent of a limited native speed inside the domain, or 0.
+uint32_t LimitedPercent(float speed)
+{
+  if (!(speed > 0.0f))
+    return 0;
+  const double scaled = static_cast<double>(speed) * 100.0;
+  const double percent = std::round(scaled);
+  if (std::fabs(scaled - percent) > 1e-3 || percent < PACING_MIN_PERCENT ||
+      percent > PACING_MAX_PERCENT)
+    return 0;
+  return static_cast<uint32_t>(percent);
+}
+
+// Records one observation; a changed native tuple is a new policy revision.
+std::pair<PacingObservation, u64> ObservePacing()
+{
+  const PacingObservation o = NativePacing();
+  char key[64];
+  std::snprintf(key, sizeof(key), "%.9g|%d", o.speed, o.temp_disabled ? 1 : 0);
+  std::lock_guard lock(s_pacing_mutex);
+  if (s_policy_key != key)
+  {
+    ++s_policy_revision;
+    s_policy_key = key;
+  }
+  return {o, s_policy_revision};
+}
+
+// The throttler's temporary disable (fast-forward hotkey) and speed 0 are unlimited; a speed
+// outside the integer domain is custom.
+picojson::object PacingPolicy(const PacingObservation& o, u64 revision)
+{
+  picojson::object r;
+  std::string mode = "custom";
+  picojson::value percent;
+  if (o.temp_disabled || o.speed <= 0.0f)
+  {
+    mode = "unlimited";
+  }
+  else if (const uint32_t limited = LimitedPercent(o.speed))
+  {
+    mode = "limited";
+    percent = picojson::value(static_cast<double>(limited));
+  }
+  r["mode"] = picojson::value(mode);
+  r["percent"] = percent;
+  r["source"] = picojson::value(std::string("native"));
+  r["policy_revision"] = picojson::value(std::to_string(revision));
+  r["host_constraints"] = picojson::value(picojson::array{});
+  picojson::object diagnostics;
+  diagnostics["emulation_speed"] = picojson::value(static_cast<double>(o.speed));
+  diagnostics["throttler_temp_disabled"] = picojson::value(o.temp_disabled);
+  r["diagnostics"] = picojson::value(diagnostics);
+  return r;
+}
+
+picojson::object CurrentPacingPolicy()
+{
+  const auto [o, revision] = ObservePacing();
+  return PacingPolicy(o, revision);
+}
+
+picojson::object PacingCapability()
+{
+  picojson::object percent;
+  percent["min"] = picojson::value(static_cast<double>(PACING_MIN_PERCENT));
+  percent["max"] = picojson::value(static_cast<double>(PACING_MAX_PERCENT));
+  percent["quantum"] = picojson::value(1.0);
+  picojson::object r;
+  r["modes"] = picojson::value(
+      picojson::array{picojson::value(std::string("limited")), picojson::value(std::string("unlimited"))});
+  r["percent"] = picojson::value(percent);
+  r["states"] = picojson::value(
+      picojson::array{picojson::value(std::string("running")), picojson::value(std::string("frozen"))});
+  r["scope"] = picojson::value(std::string("host_pacing"));
+  r["source"] = picojson::value(std::string("native"));
+  r["control_service_ms"] = picojson::value(20.0);
+  r["host_constraints"] = picojson::value(picojson::array{});
+  return r;
+}
+
+// Side-effect-free windows of the flat main address space: MEM1 and, on Wii, MEM2.
+std::vector<std::pair<u32, u32>> BatchWindows(Core::System& system)
+{
+  std::vector<std::pair<u32, u32>> windows;
+  auto& memory = system.GetMemory();
+  if (memory.GetRamSizeReal() != 0)
+    windows.emplace_back(MEM1_BASE, memory.GetRamSizeReal());
+  if (memory.GetExRamSizeReal() != 0)
+    windows.emplace_back(MEM2_BASE, memory.GetExRamSizeReal());
+  return windows;
+}
+
+picojson::object BatchCapability(Core::System& system)
+{
+  picojson::array windows;
+  for (const auto& [base, size] : BatchWindows(system))
+  {
+    picojson::object window;
+    window["memory_type"] = picojson::value(std::string("main"));
+    window["address"] = picojson::value(static_cast<double>(base));
+    window["length"] = picojson::value(static_cast<double>(size));
+    windows.push_back(picojson::value(window));
+  }
+  picojson::object r;
+  r["max_ranges"] = picojson::value(static_cast<double>(BATCH_MAX_RANGES));
+  r["max_range_bytes"] = picojson::value(static_cast<double>(BATCH_MAX_BYTES));
+  r["max_total_bytes"] = picojson::value(static_cast<double>(BATCH_MAX_BYTES));
+  r["consistency"] = picojson::value(std::string("frozen_boundary"));
+  r["halt_kinds"] = picojson::value(picojson::array{picojson::value(std::string("core_paused"))});
+  r["windows"] = picojson::value(windows);
+  return r;
+}
+
+// Applies a native speed on the host thread, where Dolphin's own UI changes it.
+bool SetNativeSpeed(float speed)
+{
+  auto done = std::make_shared<Common::Event>();
+  Core::QueueHostJob([speed, done](Core::System&) {
+    Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, speed);
+    done->Set();
+  });
+  return done->WaitFor(STEP_WAIT_SLICE);
+}
+
+picojson::object ExecutionSpeed(Core::System& system, const picojson::object& p)
+{
+  const auto mode_it = p.find("mode");
+  const auto percent_it = p.find("percent");
+  if (mode_it == p.end() && percent_it == p.end())
+    return CurrentPacingPolicy();
+  const std::string mode =
+      mode_it != p.end() && mode_it->second.is<std::string>() ? mode_it->second.get<std::string>() : "";
+  uint64_t percent = 0;
+  const bool unlimited = mode == "unlimited" && percent_it == p.end();
+  const bool limited = mode == "limited" && GetU64(p, "percent", percent) &&
+                       percent >= PACING_MIN_PERCENT && percent <= PACING_MAX_PERCENT;
+  if (!unlimited && !limited)
+  {
+    return Fail("bad_params", "use limited with an integer percent in 1..10000, unlimited without "
+                              "percent, or omit both");
+  }
+  if (limited && percent < 100 && AchievementManager::GetInstance().IsHardcoreModeActive())
+  {
+    return Fail("emulator_error", "execution_speed failed_restored: achievements hardcore mode "
+                                  "keeps the speed at or above 100 percent");
+  }
+  const auto [before, before_revision] = ObservePacing();
+  const picojson::object previous = PacingPolicy(before, before_revision);
+  const float target = unlimited ? 0.0f : static_cast<float>(percent) / 100.0f;
+  if (!SetNativeSpeed(target))
+    return Fail("timeout", "execution_speed: the host thread did not apply the speed");
+  const PacingObservation now = NativePacing();
+  const bool confirmed = !now.temp_disabled &&
+                         (unlimited ? now.speed <= 0.0f : LimitedPercent(now.speed) == percent);
+  if (!confirmed)
+  {
+    const bool restored = SetNativeSpeed(before.speed) && NativePacing().speed == before.speed;
+    ObservePacing();
+    return Fail("emulator_error",
+                restored ? "execution_speed failed_restored: the fast-forward hotkey owns the speed" :
+                           "execution_speed unverified: the previous policy was not restored");
+  }
+  picojson::object r;
+  r["status"] = picojson::value(std::string("completed"));
+  r["state"] = picojson::value(
+      std::string(Core::GetState(system) == Core::State::Paused ? "frozen" : "running"));
+  r["previous"] = picojson::value(previous);
+  r["execution_speed"] = picojson::value(CurrentPacingPolicy());
+  r["frame"] = picojson::value(static_cast<double>(CurrentFrame(system)));
+  return r;
+}
+
+std::string RuntimeGeneration()
+{
+  const std::string launch_id = EnvOr("EMUCAP_LAUNCH_ID", "");
+  if (!launch_id.empty())
+    return launch_id;
+#ifdef _WIN32
+  return "unmanaged-pid:" + std::to_string(static_cast<long>(GetCurrentProcessId()));
+#else
+  return "unmanaged-pid:" + std::to_string(static_cast<long>(getpid()));
+#endif
+}
+
+// Every range is validated before any read, then all are read under one CPU guard at the paused
+// core.
+picojson::object ReadMemoryBatch(Core::System& system, const picojson::object& p)
+{
+  if (Core::GetState(system) != Core::State::Paused)
+    return Fail("not_frozen", "read_memory_batch requires a frozen core; call pause first");
+  const auto ranges_it = p.find("ranges");
+  if (ranges_it == p.end() || !ranges_it->second.is<picojson::array>())
+    return Fail("bad_params", "ranges must be an array");
+  const auto& ranges = ranges_it->second.get<picojson::array>();
+  if (ranges.empty() || ranges.size() > BATCH_MAX_RANGES)
+    return Fail("bad_params", "ranges must contain 1..64 entries");
+  struct Range
+  {
+    std::string memory_type;
+    u32 address;
+    u32 length;
+  };
+  std::vector<Range> parsed;
+  uint64_t total = 0;
+  const auto windows = BatchWindows(system);
+  for (size_t i = 0; i < ranges.size(); ++i)
+  {
+    const std::string index = std::to_string(i);
+    if (!ranges[i].is<picojson::object>())
+      return Fail("bad_params", "range " + index + " must be an object");
+    const auto& range = ranges[i].get<picojson::object>();
+    const auto type_it = range.find("memory_type");
+    uint64_t address = 0, length = 0;
+    if (type_it == range.end() || !type_it->second.is<std::string>() ||
+        type_it->second.get<std::string>() != "main" || !GetU64(range, "address", address) ||
+        !GetU64(range, "length", length) || length == 0)
+    {
+      return Fail("bad_params", "range " + index + " needs memory_type main, address and length");
+    }
+    total += length;
+    if (total > BATCH_MAX_BYTES)
+      return Fail("bad_params", "ranges exceed 65536 bytes");
+    const bool inside = std::any_of(windows.begin(), windows.end(), [&](const auto& window) {
+      return address >= window.first && length <= window.second &&
+             address - window.first <= window.second - length;
+    });
+    if (!inside)
+      return Fail("bad_params", "range " + index + " is outside an advertised window");
+    parsed.push_back({"main", static_cast<u32>(address), static_cast<u32>(length)});
+  }
+  picojson::array reads;
+  u64 frame = 0;
+  {
+    SafeAccess sa(system);
+    frame = CurrentFrame(system);
+    for (size_t i = 0; i < parsed.size(); ++i)
+    {
+      std::vector<uint8_t> buf(parsed[i].length);
+      system.GetMemory().CopyFromEmu(buf.data(), parsed[i].address, buf.size());
+      picojson::object read;
+      read["index"] = picojson::value(static_cast<double>(i));
+      read["memory_type"] = picojson::value(parsed[i].memory_type);
+      read["address"] = picojson::value(static_cast<double>(parsed[i].address));
+      read["length"] = picojson::value(static_cast<double>(parsed[i].length));
+      read["hex"] = picojson::value(ToHex(buf.data(), buf.size()));
+      reads.push_back(picojson::value(read));
+    }
+  }
+  const std::string epoch =
+      "f" + std::to_string(frame) + "#s" + std::to_string(s_boundary_seq.load());
+  picojson::object clock;
+  clock["domain"] = picojson::value(std::string("dolphin.vi_frame"));
+  clock["value"] = picojson::value(static_cast<double>(frame));
+  picojson::object boundary;
+  boundary["runtime_generation"] = picojson::value(RuntimeGeneration());
+  boundary["stop_epoch"] = picojson::value(epoch);
+  boundary["memory_mapping_epoch"] = picojson::value(epoch);
+  boundary["clocks"] = picojson::value(picojson::array{picojson::value(clock)});
+  picojson::object r;
+  r["state"] = picojson::value(std::string("frozen"));
+  r["consistency"] = picojson::value(std::string("frozen_boundary"));
+  r["boundary"] = picojson::value(boundary);
+  r["total_bytes"] = picojson::value(static_cast<double>(total));
+  r["reads"] = picojson::value(reads);
+  return r;
+}
+
+picojson::object Hello(Core::System& core_system, const picojson::object&)
 {
   const std::string system = EnvOr("EMUCAP_SYSTEM", "gamecube");
   const bool gamecube = IsGameCubeSystem(system);
@@ -425,7 +736,7 @@ picojson::object Hello(Core::System&, const picojson::object&)
        {"read_memory", "write_memory", "get_state", "status", "pause", "resume",
         "step", "step_instructions", "set_breakpoint", "clear_breakpoint", "list_breakpoints",
         "clear_all_breakpoints", "poll_events", "disassemble", "call_stack", "save_state",
-        "load_state", "screenshot", "reset"})
+        "load_state", "screenshot", "reset", "execution_speed", "read_memory_batch"})
   {
     methods.push_back(picojson::value(std::string(m)));
   }
@@ -485,6 +796,8 @@ picojson::object Hello(Core::System&, const picojson::object&)
   picojson::array mt;
   mt.push_back(picojson::value(std::string("main")));
   r["memory_types"] = picojson::value(mt);
+  r["execution_speed_capability"] = picojson::value(PacingCapability());
+  r["memory_batch_capability"] = picojson::value(BatchCapability(core_system));
   if (IsWiiSystem(system))
   {
     picojson::object input_device;
@@ -516,6 +829,8 @@ picojson::object Status(Core::System& system, const picojson::object&)
   r["system"] = picojson::value(active_system);
   r["state"] = picojson::value(std::string(st == Core::State::Paused ? "frozen" : "running"));
   r["adapter"] = picojson::value(std::string("dolphin-native"));
+  r["frame"] = picojson::value(static_cast<double>(CurrentFrame(system)));
+  r["execution_speed"] = picojson::value(CurrentPacingPolicy());
   // Lightweight breakpoint diagnostics. dbg_effective is Config::IsDebuggingEnabled()
   // (MAIN_ENABLE_DEBUGGING and not achievements-hardcore) and must be true for core checks.
   // cpu_core: 0=Interpreter, 1=JIT64, 4=JITARM64, 5=CachedInterpreter.
@@ -848,7 +1163,7 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
     {
       interrupted_reason = s_stop.load()                ? "shutdown"
                            : s_request_cancelled.load() ? "disconnected"
-                                                        : "deadline";
+                                                        : "host_deadline";
       break;
     }
     u64 interruption_before;
@@ -897,6 +1212,9 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
     return Fail("bad_params", "frame count must be in 1..5000");
   if (Core::GetState(system) != Core::State::Paused)
     return Fail("bad_state", "frame step requires a frozen core");
+  // Pace this advance from now: a frame advance from a pause reports no state change, so the time
+  // spent frozen would otherwise be owed and run unpaced up to the fallback limit.
+  system.GetCoreTiming().RestartThrottle();
 
   struct FrameStart
   {
@@ -938,7 +1256,7 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
       return AdvanceOutcome(completed, count,
                             s_stop.load()                ? "shutdown"
                             : s_request_cancelled.load() ? "disconnected"
-                                                         : "deadline");
+                                                         : "host_deadline");
     }
     u64 completion_before = 0;
     u64 interruption_before = 0;
@@ -1005,7 +1323,7 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
                             : s_request_cancelled.load() ? "disconnected"
                                                          : "shutdown");
     if (!signaled || std::chrono::steady_clock::now() >= operation_deadline)
-      return AdvanceOutcome(completed, count, "deadline");
+      return AdvanceOutcome(completed, count, "host_deadline");
     return Fail("not_connected", "Dolphin stopped while frame step was in progress");
   }
 
@@ -1503,6 +1821,8 @@ Handler Lookup(const std::string& m)
   if (m == "load_state") return LoadState;
   if (m == "screenshot") return Screenshot;
   if (m == "set_input") return SetInput;
+  if (m == "execution_speed") return ExecutionSpeed;
+  if (m == "read_memory_batch") return ReadMemoryBatch;
   return nullptr;
 }
 
@@ -1567,6 +1887,8 @@ void ServeSession(Core::System& system, SOCKET sock)
         s_handler_error_kind.clear();
         s_handler_error.clear();
         s_request_cancelled.store(false);
+        if (!ObservationMethod(method))
+          ++s_boundary_seq;
         const bool advance = h == StepFrames || h == StepInstructions;
         picojson::object result =
             advance ? Temporal::RunWithProgress(

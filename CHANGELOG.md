@@ -2,6 +2,73 @@
 
 Actively developed beta software — interfaces may still change.
 
+## 0.18.0 (release candidate)
+
+### Added
+- openMSX frozen `read_memory_batch` reads multiple validated ranges in one native command and
+  reports a native stop boundary (`runtime_generation`, `stop_epoch`, `memory_mapping_epoch`).
+- Agent-controlled openMSX host pacing through `debug` operation `execution_speed`: arbitrary
+  supported percentages or unlimited speed, with native readback and preserved execution state.
+- Common batch and pacing contracts: adapters advertise `memory_batch_capability` and
+  `execution_speed_capability` with the method; Control admits requests against them before
+  forwarding, verifies replies, and returns `busy` for pacing changes during another operation.
+- NP2kai, MAME PC-98, MAME Neo Geo, Mesen2, Mednafen, Flycast, Dolphin, DeSmuME, PCSX2,
+  PPSSPP and Mupen64Plus advertise `read_memory_batch` and `execution_speed`. Dolphin, DeSmuME,
+  PCSX2 and PPSSPP `status` now report `frame`.
+  NP2kai paces its own frame loop; MAME keeps its native governor with a maintained throttle hook.
+
+### Changed
+- Compact, self-contained agent guidance uses live tool metadata for memory and CPU selection;
+  recording setup and interpretation are available through `debug(operation="describe")`.
+- NP2kai frame steps, input pulses and pointer moves follow the pacing policy (launch default 100
+  percent). Set `unlimited` for maximum-speed stepping. A paced advance that would outlive its
+  host budget returns `interrupted` with `reason: "host_deadline"` and the reached count.
+- NP2kai and MAME `read_memory` read without device side effects where the native view allows it,
+  so PC-98 graphics VRAM reads no longer drive GRCG/EGC latches.
+- openMSX requires host API 6 (patch 0005); rebuild the native host with `adapters/openmsx/build.sh`.
+- MAME and NP2kai builds scrub Homebrew toolchain overrides like the other native adapters.
+- Mesen2 requires host API 5 (patch 0014). Mesen launches are silent unless `sound:true`, and
+  Mesen `read_memory` uses the debug view. `freeze_policy.savestate_safe` moved to the dynamic
+  status field `halt_savestate_safe`.
+- Mednafen frame steps, deferred frame operations and probes follow the pacing policy, and
+  `pause` from a running guest stops at the current frame boundary instead of one frame later.
+  The build scrubs Homebrew toolchain overrides; rebuild with `adapters/mednafen/build.sh`.
+- Flycast paces on a host clock over generated audio samples instead of the audio device, so
+  pacing no longer depends on an audio backend. Frame steps park at the reported vblank and a
+  pause from a running guest parks at the current vblank; both previously ran one more frame.
+  Rebuild with `adapters/flycast/build.sh`.
+- Adapter builds run their git commands without fsmonitor, whose daemons held the build lock.
+- Dolphin requires host API 6; a budget-stopped advance reports `reason: "host_deadline"` instead
+  of `deadline`. Dolphin builds configure from a fresh CMake cache with the bundled fmt.
+- DeSmuME paces at the DS refresh rate instead of a fixed 60 frames per second and builds
+  optimized; a frame step that spends its host budget returns `interrupted` with
+  `reason: "host_deadline"` instead of an error. Rebuild with `adapters/desmume-nds/build.sh`.
+- PCSX2 requires host API 7; a budget-stopped frame advance reports `reason: "host_deadline"`, and
+  a launch whose PINE socket path exceeds the Unix socket limit is refused with that reason.
+- PPSSPP headless debugger sessions are now paced at 100 percent instead of running unthrottled;
+  set `unlimited` for the former behavior. Rebuild with `adapters/ppsspp/build.sh`.
+- Mupen64Plus requires host API 4 (core patch 0003); a pause or speed change no longer waits out a
+  slow limiter sleep, and a budget-stopped frame step returns `interrupted` with
+  `reason: "host_deadline"` instead of an error. Rebuild with `adapters/mupen64plus/build.sh`.
+
+### Fixed
+- Pacing requests reject concurrent operations before waiting on the session lock. Native pacing
+  mutation failures close unverified control sessions while preserving the last confirmed policy.
+- DeSmuME, PCSX2 and PPSSPP memory batches use one native acquisition per request.
+- PPSSPP reports network-governed pacing before local limiter settings.
+- Flycast loads a saved state deterministically. A frozen stop now parks at the end of the SH4
+  timeslice instead of inside the vblank scheduler callback, where a load let the scheduler finish
+  the tick with the pre-load timeline; the same state gave different guest memory and input
+  outcomes from run to run. A state saved by an earlier build, which lacks the pending scanline
+  event, gets it rescheduled from the restored video state on load. Rebuild with
+  `adapters/flycast/build.sh`.
+- MAME Neo Geo CD (`neogeo_cd`) supports native `save_state`/`load_state` and therefore `probe`.
+  Shared MAME patch 0008 registers the CD controller state, marks CDZ save-capable and keeps the
+  Neo Geo post-load hook off the audio ROM bank the CD models lack. Rebuild MAME with
+  `adapters/mame-neogeo/build.sh` and `adapters/mame-pc98/build.sh`.
+- WonderSwan `status` lists its input buttons (X1–X4, Y1–Y4, A, B, Start); it previously offered
+  none although `set_input` accepted them. Rebuild Control and reconnect.
+
 ## 0.17.1
 
 ### Added

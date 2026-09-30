@@ -13,6 +13,8 @@ local HAS_HOST_NATIVE_CALLSTACK = type(emu.getCallstack) == "function"
 local HAS_NATIVE_CALLSTACK = SYS.native_call_stack and HAS_HOST_NATIVE_CALLSTACK
 local HAS_CALLSTACK = HAS_SHADOW_CALLSTACK or HAS_NATIVE_CALLSTACK
 local HAS_POWER_CYCLE = type(emu.powerCycle) == "function"
+local HAS_AGENT_PACING = type(emu.getPacing) == "function" and type(emu.setPacing) == "function"
+  and type(emu.endPacingWait) == "function" and emu.eventType.pacingIdle ~= nil
 local HAS_SNES_PPU_OBJ_EVENTS = SYS.system == "snes"
   and emu.eventType.snesPpuObjEvaluationStart ~= nil
   and emu.eventType.snesPpuObjScanlineHandoff ~= nil
@@ -48,6 +50,7 @@ local FreezeState = require("emucap_freeze_state")
 local Memory = require("emucap_memory")
 local Recording = require("emucap_recording")
 local NativeCallstack = require("emucap_native_callstack")
+local Pacing = require("emucap_pacing")
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -59,7 +62,8 @@ local PORT = tonumber(os.getenv("EMUCAP_PORT") or "") or 47800
 local PROTOCOL_VERSION = 1
 -- Older scripts remain usable with API 2/3 hosts.  The pinned launcher requires API 4, whose added
 -- native call-stack hook is advertised only by entries that use it.
-local MESEN_HOST_API = HAS_HOST_NATIVE_CALLSTACK and 4 or (HAS_POWER_CYCLE and 3 or 2)
+local MESEN_HOST_API = HAS_AGENT_PACING and 5
+  or (HAS_HOST_NATIVE_CALLSTACK and 4 or (HAS_POWER_CYCLE and 3 or 2))
 local MESEN_UPSTREAM_COMMIT = os.getenv("EMUCAP_MESEN_UPSTREAM_COMMIT")
 local MESEN_PATCHSET_SHA256 = os.getenv("EMUCAP_MESEN_PATCHSET_SHA256")
 local MESEN_BINARY_SHA256 = os.getenv("EMUCAP_MESEN_BINARY_SHA256")
@@ -135,6 +139,38 @@ local frame = 0
 -- 브레이크포인트/이벤트 상태
 local KEEPALIVE_FRAMES = 30
 local deferred = nil           -- run_frames/press_buttons 진행 상태 { id, kind, remaining, age }
+-- Host budget for one synchronous advance (step or deferred frame operation). At slow pacing an
+-- advance stops at the reached boundary with reason host_deadline instead of outliving transport.
+local ADVANCE_BUDGET_MS = 245000
+local advance_deadline_ms = nil
+local pending_line = nil       -- request read during a pacing wait, handled at the next frame
+local boundary_seq = 0         -- bumped by every request that can change memory or the stop
+local pacing_state = Pacing.new_state()
+local HOST_AUDIO = os.getenv("EMUCAP_MESEN_AUDIO") ~= "0"
+
+local function start_deferred(...)
+  advance_deadline_ms = wall_ms() + ADVANCE_BUDGET_MS
+  boundary_seq = boundary_seq + 1
+  return Deferred.start(...)
+end
+
+local function start_step(...)
+  advance_deadline_ms = wall_ms() + ADVANCE_BUDGET_MS
+  boundary_seq = boundary_seq + 1
+  return Step.start(...)
+end
+
+local function advance_expired()
+  return advance_deadline_ms ~= nil and wall_ms() >= advance_deadline_ms
+end
+
+-- One-frame step chunks below normal speed keep each chunk, and so the deadline check, short.
+local function frame_chunk_limit()
+  if not HAS_AGENT_PACING then return STEP_CHUNK end
+  local speed = emu.getPacing().effectiveSpeed
+  if speed > 0 and speed < 100 then return 1 end
+  return STEP_CHUNK
+end
 local pending_io = nil         -- save_state/load_state 진행 상태 { id, kind, path, ref }
 local recording = nil          -- bounded, generation-bound host-sink recording transaction
 local recording_reset = nil    -- validated/sink-bound request waiting for the native reset callback
@@ -223,7 +259,10 @@ end
 local ARRAY_MT = {}
 local function as_array(t) return setmetatable(t or {}, ARRAY_MT) end
 
+local JSON_NULL = setmetatable({}, {})
+
 local function jvalue(v)
+  if v == JSON_NULL then return "null" end
   local t = type(v)
   if t == "number" then
     return (v == math.floor(v)) and string.format("%d", v) or tostring(v)
@@ -562,6 +601,112 @@ local function normalize_debug_selection(method, p)
   return nil
 end
 
+-- Mesen's debug memory-type variant (0x100) reads without I/O side effects.
+local DEBUG_READ = 0x100
+
+local BATCH_MAX_RANGES = 64
+local BATCH_MAX_BYTES = 65536
+
+-- Every advertised region is readable through the debug (side-effect-free) view while the native
+-- debugger holds the machine.
+local function memory_batch_capability(regions)
+  local windows = {}
+  for _, region in ipairs(regions) do
+    windows[#windows + 1] = { memory_type = region.memory_type, address = 0, length = region.size }
+  end
+  return {
+    max_ranges = BATCH_MAX_RANGES,
+    max_range_bytes = BATCH_MAX_BYTES,
+    max_total_bytes = BATCH_MAX_BYTES,
+    consistency = "frozen_boundary",
+    halt_kinds = as_array({ "native_debugger_halt" }),
+    windows = as_array(windows),
+  }
+end
+
+local function observed_pacing()
+  local native = emu.getPacing()
+  pacing_state = Pacing.observe(pacing_state, native)
+  return native, Pacing.public(pacing_state, native, JSON_NULL, as_array, HOST_AUDIO)
+end
+
+function handlers.execution_speed(p)
+  if not HAS_AGENT_PACING then
+    return false, "unsupported", "the active Mesen host does not expose agent pacing"
+  end
+  local request, err = Pacing.parse_request(p)
+  if not request then return false, "bad_params", err end
+  local before, previous = observed_pacing()
+  if request == "query" then return true, previous end
+  if before.rewind then
+    return false, "bad_state", "rewind is active; release it before changing pacing"
+  end
+  -- One emulation-thread call applies and reads back; nothing else runs in between.
+  local applied = emu.setPacing(request.speed)
+  pacing_state = Pacing.observe(pacing_state, applied)
+  if not Pacing.confirms(request, applied) then
+    local restored = emu.setPacing(before.emulationSpeed, before.maximumSpeed)
+    pacing_state = Pacing.observe(pacing_state, restored)
+    if restored.emulationSpeed == before.emulationSpeed
+        and restored.maximumSpeed == before.maximumSpeed then
+      return false, "emulator_error",
+        "execution_speed failed_restored: a held turbo or rewind override replaced the target"
+    end
+    return false, "emulator_error", "execution_speed unverified: previous policy was not restored"
+  end
+  return true, {
+    status = "completed",
+    state = STATE == "frozen" and "frozen" or "running",
+    previous = previous,
+    execution_speed = Pacing.public(pacing_state, applied, JSON_NULL, as_array, HOST_AUDIO),
+    frame = frame,
+  }
+end
+
+function handlers.read_memory_batch(p)
+  if STATE ~= "frozen" or Step.active(step_operation) or deferred then
+    return false, "bad_state", "read_memory_batch requires a frozen machine; call pause first"
+  end
+  local ranges = p.ranges
+  if type(ranges) ~= "table" or #ranges < 1 or #ranges > BATCH_MAX_RANGES then
+    return false, "bad_params", "ranges must contain 1..64 entries"
+  end
+  local resolved, total = {}, 0
+  for i, range in ipairs(ranges) do
+    local length = range.length
+    if type(length) ~= "number" or length < 1 or length ~= math.floor(length) then
+      return false, "bad_params", string.format("range %d length must be a positive integer", i - 1)
+    end
+    local region, kind, message = Memory.range(emu, SYS, range.memory_type, range.address, length)
+    if not region then return false, kind, string.format("range %d: %s", i - 1, message) end
+    total = total + length
+    if total > BATCH_MAX_BYTES then return false, "bad_params", "ranges exceed 65536 bytes" end
+    resolved[i] = { region = region, range = range }
+  end
+  local reads = {}
+  for i, item in ipairs(resolved) do
+    local out, view = {}, item.region.memory_type | DEBUG_READ
+    for k = 0, item.range.length - 1 do
+      out[#out + 1] = string.format("%02x", emu.read(item.range.address + k, view, false))
+    end
+    reads[i] = { index = i - 1, memory_type = item.range.memory_type, address = item.range.address,
+      length = item.range.length, hex = table.concat(out) }
+  end
+  local epoch = string.format("f%d#s%d", frame, boundary_seq)
+  return true, {
+    state = "frozen",
+    consistency = "frozen_boundary",
+    boundary = {
+      runtime_generation = os.getenv("EMUCAP_LAUNCH_ID") or ("unmanaged-port:" .. tostring(PORT)),
+      stop_epoch = epoch,
+      memory_mapping_epoch = epoch,
+      clocks = as_array({ { domain = "mesen.start_frame", value = frame } }),
+    },
+    total_bytes = total,
+    reads = as_array(reads),
+  }
+end
+
 function handlers.hello()
   local memory_regions = nil
   if emu and emu.memType then
@@ -580,6 +725,9 @@ function handlers.hello()
     method_list[#method_list + 1] = "observe_snapshot_halt"
   end
   if HAS_POWER_CYCLE then method_list[#method_list + 1] = "power_cycle" end
+  local batch_regions = memory_regions ~= nil and #memory_regions > 0
+  if batch_regions then method_list[#method_list + 1] = "read_memory_batch" end
+  if HAS_AGENT_PACING then method_list[#method_list + 1] = "execution_speed" end
   if HAS_DISASM then method_list[#method_list + 1] = "disassemble" end
   if HAS_CALLSTACK then method_list[#method_list + 1] = "call_stack" end
   if RECORDING_SUPPORTED then
@@ -672,6 +820,8 @@ function handlers.hello()
       result.memory_types[#result.memory_types + 1] = region.memory_type
     end
   end
+  if batch_regions then result.memory_batch_capability = memory_batch_capability(memory_regions) end
+  if HAS_AGENT_PACING then result.execution_speed_capability = Pacing.capability(as_array, HOST_AUDIO) end
   local name = os.getenv("EMUCAP_NAME")
   if name then result.name = name end
   local token = os.getenv("EMUCAP_SESSION_TOKEN")
@@ -697,7 +847,7 @@ function handlers.read_memory(p)
   if not region then return false, kind, message end
   local out = {}
   for i = 0, length - 1 do
-    out[#out + 1] = string.format("%02x", emu.read(p.address + i, region.memory_type, false))
+    out[#out + 1] = string.format("%02x", emu.read(p.address + i, region.memory_type | DEBUG_READ, false))
   end
   return true, { hex = table.concat(out) }
 end
@@ -717,6 +867,7 @@ function handlers.write_memory(p)
     emu.write(p.address + n, byte, region.memory_type)
     n = n + 1
   end
+  boundary_seq = boundary_seq + 1
   return true, { written = n }
 end
 
@@ -814,7 +965,14 @@ function handlers.status()
     } }),
     execution_limits = { max_sync_advance_count = MAX_SYNC_ADVANCE },
   }
+  if HAS_AGENT_PACING then
+    local _, policy = observed_pacing()
+    r.execution_speed = policy
+  end
   if STATE == "frozen" then r.reason = freeze_state.reason end
+  -- Dynamic: true only while serving a savestate-safe halt. Kept out of the static freeze_policy so
+  -- it does not change the capability revision between requests.
+  r.halt_savestate_safe = halt_savestate_safe
   local held_buttons = {}
   if input_hold then
     for name, pressed in pairs(input_hold.tbl) do
@@ -835,7 +993,6 @@ function handlers.status()
     mode = "native_halt_service",
     service_event = "codeBreakIdle",
     savestate_event = "codeBreakIdleSavestate",
-    savestate_safe = halt_savestate_safe,
     service_interval_ms = HALT_SERVICE_INTERVAL_MS,
     instruction_drift = 0,
     host_pause_adoption = true,
@@ -895,6 +1052,7 @@ end
 -- 게임을 리셋한다(리셋 버튼 없으면 전원 재투입과 동일). 로드된 ROM 바이트는 그대로이므로
 -- "처음부터 다시"엔 쓰되, 리빌드한 ROM 검증은 Mesen의 "Reload ROM" 단축키를 쓴다(Lua 미노출).
 function handlers.reset()
+  boundary_seq = boundary_seq + 1
   restart_after_reply = "reset"
   return true, { reset = true, reconnect = true }
 end
@@ -905,6 +1063,7 @@ function handlers.power_cycle()
   if not HAS_POWER_CYCLE then
     return false, "unsupported", "the active Mesen host does not expose native power cycle"
   end
+  boundary_seq = boundary_seq + 1
   restart_after_reply = "power_cycle"
   return true, { power_cycle = true, reconnect = true }
 end
@@ -1038,7 +1197,7 @@ local function on_io_exec()
       complete_probe(op.id, op.probe)
       emu.breakExecution()
     else
-      deferred = Deferred.start(
+      deferred = start_deferred(
         session_epoch, op.id, "probe", op.probe.frame, op.probe)
     end
     return
@@ -1057,6 +1216,7 @@ end
 local function arm_io(kind, id, path)
   if not path then reply_err(id, "bad_params", "path is required"); return end
   pending_io = { kind = kind, id = id, path = path }
+  boundary_seq = boundary_seq + 1
   pending_io.ref = emu.addMemoryCallback(on_io_exec, emu.callbackType.exec, IO_LO, IO_HI, CPU)
 end
 
@@ -1146,7 +1306,7 @@ local function frozen_state_io(method, id, p)
     complete_probe(id, probe)
     return nil
   end
-  deferred = Deferred.start(session_epoch, id, "probe", probe.frame, probe)
+  deferred = start_deferred(session_epoch, id, "probe", probe.frame, probe)
   return "resume"
 end
 
@@ -2433,7 +2593,7 @@ local function dispatch(line)
   if method == "run_frames" then
     local frames, err = bounded_sync_count(p.n, 1, false)
     if not frames then reply_err(id, "bad_params", err); return end
-    deferred = Deferred.start(session_epoch, id, "run", frames)
+    deferred = start_deferred(session_epoch, id, "run", frames)
     return
   end
   if method == "press_buttons" then
@@ -2442,7 +2602,7 @@ local function dispatch(line)
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = Deferred.start(session_epoch, id, "press", frames)
+    deferred = start_deferred(session_epoch, id, "press", frames)
     return
   end
   if method == "save_state" then arm_io("save", id, p.path); return end
@@ -2476,7 +2636,7 @@ local function handle_in_freeze(line)
   elseif method == "step" or method == "step_instructions" then
     local unit, count, err = Step.parse_wire_step(method, p, MAX_SYNC_ADVANCE)
     if not unit then reply_err(id, "bad_params", err); return nil end
-    step_operation = Step.start(session_epoch, id, unit, count)
+    step_operation = start_step(session_epoch, id, unit, count)
     freeze_state = FreezeState.halt("step", false)
     return "step"
   elseif method == "pause" then
@@ -2487,7 +2647,7 @@ local function handle_in_freeze(line)
     -- free-run으로 one-shot watch/BP를 조기 소진시키는 레이스라 제거됨 — Mednafen과 동일 원자 resume 규약).
     local frames, err = bounded_sync_count(p.n, 1, false)
     if not frames then reply_err(id, "bad_params", err); return nil end
-    deferred = Deferred.start(session_epoch, id, "run", frames)
+    deferred = start_deferred(session_epoch, id, "run", frames)
     return "resume"
   elseif method == "press_buttons" then
     local frames, frame_err = bounded_sync_count(p.frames, 1, false)
@@ -2495,7 +2655,7 @@ local function handle_in_freeze(line)
     local tbl, err = buttons_to_table(p.buttons)
     if not tbl then reply_err(id, "bad_params", err); return nil end
     input_hold = { port = p.port or 0, tbl = tbl }
-    deferred = Deferred.start(session_epoch, id, "press", frames)
+    deferred = start_deferred(session_epoch, id, "press", frames)
     return "resume"
   elseif method == "save_state" or method == "load_state" or method == "probe" then
     return frozen_state_io(method, id, p)
@@ -2518,7 +2678,7 @@ local function do_step_chunk()
   freeze_snapshot = nil
   local unit = step_operation.unit
   local chunk
-  step_operation, chunk = Step.take_chunk(step_operation, STEP_CHUNK, INSTR_CHUNK)
+  step_operation, chunk = Step.take_chunk(step_operation, frame_chunk_limit(), INSTR_CHUNK)
   if unit == "instructions" then
     emu.step(chunk, emu.stepType.step)   -- CPU 명령 단위
   else
@@ -2527,6 +2687,7 @@ local function do_step_chunk()
 end
 
 resume_from_freeze = function()
+  boundary_seq = boundary_seq + 1
   STATE = "running"
   freeze_start_ms = nil
   freeze_disc_ms = nil
@@ -2573,6 +2734,13 @@ local function service_frozen_once()
     if effect then
       freeze_state = FreezeState.after_step(effect.result.unit)
       apply_step_terminal(effect)
+    elseif advance_expired() then
+      local unit = step_operation.unit
+      local completed = step_operation.requested - step_operation.remaining
+      step_operation, effect = Step.interrupt(step_operation, "host_deadline", nil, frame)
+      effect.result.completed = completed
+      freeze_state = FreezeState.after_step(unit)
+      apply_step_terminal(effect)
     else
       send_line(string.format(
         '{"id":%d,"ok":true,"result":{"status":"working"}}',
@@ -2596,7 +2764,8 @@ local function service_frozen_once()
   end
 
   -- 호스트는 request를 직렬화한다. idle callback 하나는 완성된 NDJSON request 한 건만 소비한다.
-  local line = poll_line()
+  local line = pending_line or poll_line()
+  pending_line = nil
   if line then
     freeze_start_ms = wall_ms()
     freeze_disc_ms = nil
@@ -2748,12 +2917,44 @@ emu.addEventCallback(function()
     prev_freeze_key = fk
   end
   -- 지연 명령(run_frames/press_buttons) 진행 중이면 그것만 진행(에이전트는 대기 중).
-  if deferred then tick_deferred(); return end
-  local line = poll_line()
+  if deferred then
+    if advance_expired() then halt_for_debug_stop("host_deadline") else tick_deferred() end
+    return
+  end
+  local line = pending_line or poll_line()
+  pending_line = nil
   if line and dispatch(line) == "freeze" then
     emu.breakExecution()
   end
 end, emu.eventType.startFrame)
+
+-- Requests answered between frames during a pacing wait. Anything else ends the wait and is
+-- handled at the next frame, so a status poll never advances a slow guest early.
+local WAIT_SAFE_METHODS = {
+  hello = true, status = true, get_rom_info = true, poll_events = true, list_breakpoints = true,
+  execution_speed = true, pause = true,
+}
+
+if HAS_AGENT_PACING then
+  emu.addEventCallback(function()
+    if deferred or Step.active(step_operation) then
+      if advance_expired() then emu.endPacingWait() end
+      return
+    end
+    if STATE ~= "running" or recording or recording_reset or not conn or pending_line then return end
+    if Tx.pending(tx) and flush_tx() == "restarting" then return end
+    local line = poll_line()
+    if not line then return end
+    local _, method = parse_request(line)
+    if not WAIT_SAFE_METHODS[method] then
+      pending_line = line
+      emu.endPacingWait()
+      return
+    end
+    if dispatch(line) == "freeze" then emu.breakExecution() end
+    if STATE ~= "running" then emu.endPacingWait() end
+  end, emu.eventType.pacingIdle)
+end
 
 CPU = emu.cpuType[SYS.cpu_type]   -- 브레이크포인트/세이브스테이트 exec 콜백용
 

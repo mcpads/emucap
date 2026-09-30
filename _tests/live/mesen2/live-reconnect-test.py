@@ -369,12 +369,7 @@ end, emu.eventType.codeBreakIdleSavestate)
                     f"safe frozen save changed guest state: before={baseline} after={after_save}"
                 )
             safe_status = session.request("status")
-            if (
-                safe_status.get("result", {})
-                .get("freeze_policy", {})
-                .get("savestate_safe")
-                is not True
-            ):
+            if safe_status.get("result", {}).get("halt_savestate_safe") is not True:
                 raise RuntimeError(
                     f"pause halt did not advertise its savestate-safe boundary: {safe_status}"
                 )

@@ -1085,6 +1085,7 @@ fn is_read_only(method: &str) -> bool {
             | "status"
             | "get_state"
             | "read_memory"
+            | "read_memory_batch"
             | "screenshot"
             | "get_trace"
             | "call_stack"

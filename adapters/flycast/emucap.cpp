@@ -1,11 +1,20 @@
 // emucap — Flycast(Dreamcast/SH-4) 어댑터. emucap-mcp 서버에 NDJSON 클라이언트로 접속하고,
 // vblank마다 emucap_service()로 요청을 처리한다(emu 스레드 — 락 불필요). Mednafen emucap 패턴을
-// Flycast API로 적응: 메모리=공통 region(ram/vram/aica)→SH-4 addrspace, 레지스터=Sh4cntx, freeze=vblank 훅 스핀.
+// Flycast API로 적응: 메모리=공통 region(ram/vram/aica)→SH-4 addrspace, 레지스터=Sh4cntx, freeze=vblank 뒤
+// timeslice 경계 park(emucap_park).
 // 빌드/주입은 adapters/flycast/build.sh. 광고 메서드는 런타임에 hello/status.methods로 확인한다.
 #include "emulator.h"
 #include "emucap_failure.h"
 #include "emucap_input.h"
 #include "emucap_native_failure.h"
+#include "emucap_pacing.h"
+#include "cfg/option.h"               // config::AudioVolume (audible host audio)
+#include "hw/aica/aica_if.h"          // aica_ram (batch backing view)
+#include "hw/pvr/pvr_mem.h"           // vram (batch backing view)
+#include "hw/pvr/spg.h"               // rescheduleSPG (load_state)
+#include "hw/sh4/sh4_sched.h"         // sh4_sched_is_scheduled (load_state)
+extern int vblank_schid;              // hw/pvr/spg.cpp scanline scheduler slot
+#include "hw/sh4/sh4_mem.h"           // mem_b (batch backing view)
 #include "hw/sh4/sh4_if.h"
 #include "hw/sh4/sh4_opcode_list.h"  // OpDesc[]·Disassemble (disassemble)
 #include "hw/mem/addrspace.h"
@@ -79,6 +88,7 @@ void emucap_encode_png(const unsigned char* raw, int w, int h, std::vector<unsig
 // exec breakpoint armed 플래그(전역 — sh4_interpreter.cpp Run() 훅이 extern으로 읽는다). BP가 하나라도
 // 있을 때만 true → 없으면 인터프리터 핫루프는 bool 한 번만 본다(조회 비용 0). emucap.cpp가 갱신.
 bool g_emucap_bp_armed = false;
+bool g_emucap_park_pending = false;
 // 실행추적/레지스터워치 armed 플래그(전역 — 같은 Run() 훅이 extern으로 읽는다). set_trace 또는
 // watch_register가 켜졌을 때만 true → 셋 다 off면 인터프리터 핫루프는 bool 한 번만 봐서 훅 비용 0.
 // rebuild_trace_armed()가 g_trace_enabled||g_watch_enabled로 매번 재계산해 갱신한다.
@@ -99,6 +109,8 @@ std::atomic<uint64_t> g_observed_frame{0};  // UI-thread diagnostics read this s
 bool g_frozen = false;    // freeze 상태(스핀으로 프레임 진행 차단)
 long g_step_id = -1;      // step(frames) 완료 응답 대기 id
 long g_step_remaining = 0;
+long g_step_requested = 0;
+uint64_t g_step_progress_ms = 0;
 // 입력 홀드: set_input은 emucap_service(emu 스레드)에서 쓰고, Maple GetInput 소비 지점이 읽는다.
 // 소유권+pressed mask 단일 atomic snapshot이며 빈 mask는 네이티브 입력권을 반환한다.
 EmucapFlycastInputOverride g_input_override;
@@ -151,6 +163,27 @@ bool g_failure_dismissed = false;
 bool g_failure_synthetic = false;
 bool g_synthetic_fatal_pending = false;
 long g_test_adapter_exception_id = -1;
+
+// ---- Agent pacing and batched observation ----
+// Read by the render thread (emucap_vsync_released) as well as the emulation thread.
+std::atomic<std::uint32_t> g_pace_percent{100};
+std::atomic<bool> g_pace_unlimited{false};
+uint64_t g_policy_revision = 0;
+std::string g_policy_key;
+EmucapSamplePacer g_pacer;
+// Set when a pacing wait must end (a request the wait cannot serve, a policy change, or an expired
+// advance); every wait returns at once until the next vblank service clears it.
+bool g_pacing_released = false;
+bool g_in_pacing_wait = false;
+uint64_t g_pacing_reconnect_ms = 0;
+// Bumped by every request outside the observation set, since those can change memory or the stop
+// without changing the frame count.
+uint64_t g_boundary_seq = 0;
+// Host budget for one synchronous advance; a paced advance stops with host_deadline instead of
+// outliving the transport deadline.
+const uint64_t ADVANCE_BUDGET_MS = 245000;
+const uint64_t PROGRESS_INTERVAL_MS = 1000;
+uint64_t g_advance_deadline_ms = 0;
 std::atomic<bool> g_failure_shutdown_requested{false};
 std::string g_failure_reason;
 uint32_t g_failure_epc = 0;
@@ -533,6 +566,103 @@ bool normalize_sync_advance(long id, long& count) {
 // 방지한다(긴 진행이 5초 읽기 타임아웃에 안 걸리게). 같은 id로 보내야 서버가 같은 호출로 인식한다.
 void reply_working(long id) { reply_ok(id, "{\"status\":\"working\"}"); }
 
+uint64_t monotonic_ms() {
+	return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+int64_t monotonic_ns() {
+	return (int64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void start_advance(long id, long frames) {
+	g_step_id = id;
+	g_step_remaining = frames;
+	g_step_requested = frames;
+	g_step_progress_ms = monotonic_ms();
+	g_advance_deadline_ms = g_step_progress_ms + ADVANCE_BUDGET_MS;
+}
+
+bool advance_expired() {
+	return g_step_id >= 0 && monotonic_ms() >= g_advance_deadline_ms;
+}
+
+bool observation_method(const std::string& method) {
+	static const char* const names[] = {
+		"hello", "status", "get_rom_info", "read_memory", "read_memory_batch", "find_pattern",
+		"get_state", "screenshot", "save_state", "list_breakpoints", "poll_events", "disassemble",
+		"get_trace", "call_stack", "execution_speed"};
+	for (const char* name : names) {
+		if (method == name) return true;
+	}
+	return false;
+}
+
+bool host_audio_enabled() { return (int)config::AudioVolume > 0; }
+
+EmucapPacingObservation native_pacing() {
+	EmucapPacingObservation o;
+	o.percent = g_pace_percent;
+	o.unlimited = g_pace_unlimited;
+	o.fast_forward = settings.input.fastForwardMode;
+	o.mute_audio = settings.aica.muteAudio;
+	o.audio = host_audio_enabled();
+	return o;
+}
+
+// Records one observation; a changed native tuple is a new policy revision.
+EmucapPacingObservation observe_pacing() {
+	const EmucapPacingObservation o = native_pacing();
+	const std::string key = emucap_pacing_key(o);
+	if (key != g_policy_key) {
+		g_policy_revision++;
+		g_policy_key = key;
+	}
+	return o;
+}
+
+std::string pacing_policy_json() {
+	return emucap_pacing_policy_json(observe_pacing(), g_policy_revision);
+}
+
+void handle_execution_speed(long id, const std::string& line) {
+	EmucapPacingRequest request;
+	std::string error;
+	if (!emucap_parse_pacing_request(line, request, error)) {
+		reply_err(id, "bad_params", error.c_str());
+		return;
+	}
+	const EmucapPacingObservation before = observe_pacing();
+	const std::string previous = emucap_pacing_policy_json(before, g_policy_revision);
+	if (request.query) {
+		reply_ok(id, previous);
+		return;
+	}
+	const std::uint32_t prior_percent = g_pace_percent;
+	const bool prior_unlimited = g_pace_unlimited;
+	g_pace_unlimited = request.unlimited;
+	if (!request.unlimited) g_pace_percent = request.percent;
+	// A new target starts now: a wait in progress ends and the clock re-anchors.
+	g_pacer.reanchor();
+	if (g_in_pacing_wait) g_pacing_released = true;
+	if (!emucap_pacing_confirms(request, native_pacing())) {
+		g_pace_percent = prior_percent;
+		g_pace_unlimited = prior_unlimited;
+		const bool restored = emucap_pacing_key(native_pacing()) == emucap_pacing_key(before);
+		observe_pacing();
+		reply_err(id, "emulator_error", restored
+			? "execution_speed failed_restored: Flycast fast-forward or muted netplay audio owns the speed"
+			: "execution_speed unverified: the previous policy was not restored");
+		return;
+	}
+	const EmucapPacingObservation after = observe_pacing();
+	reply_ok(id, std::string("{\"status\":\"completed\",\"state\":\"")
+		+ (g_frozen ? "frozen" : "running") + "\",\"previous\":" + previous
+		+ ",\"execution_speed\":" + emucap_pacing_policy_json(after, g_policy_revision)
+		+ ",\"frame\":" + std::to_string(g_frame) + "}");
+}
+
 // 구조화 에러(균일 인터페이스): 미지원 memory_type은 silent-accept 말고 supported를 동반해
 // 거부한다 — 친 시점에 in-context로 자가교정. Rust ProtocolError는 kind+message만 전달하므로(extra
 // 필드는 드롭) field/value/supported를 message에 실어 에이전트에 노출한다.
@@ -645,6 +775,72 @@ void handle_read_memory(long id, const std::string& line) {
 	}
 	reply_ok(id, std::string("{\"hex\":\"") + hex + "\"}");
 }
+// Backing store of a region: main RAM, the linear 64-bit VRAM view and AICA RAM are plain host
+// arrays, so reading them has no device side effects.
+const u8* region_backing(const DCRegion& r) {
+	RamRegion* backing = nullptr;
+	size_t size = 0;
+	if (r.base == 0x8C000000u) { backing = &mem_b; size = RAM_SIZE; }
+	else if (r.base == 0x04000000u) { backing = &vram; size = VRAM_SIZE; }
+	else if (r.base == 0x00800000u) { backing = &aica::aica_ram; size = ARAM_SIZE; }
+	if (backing == nullptr || size < r.size) return nullptr;
+	return &(*backing)[0];
+}
+
+std::string runtime_generation() {
+	const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+	if (launch_id && launch_id[0]) return launch_id;
+	return "unmanaged-pid:" + std::to_string((long)getpid());
+}
+
+// Every range is validated before any read, then all are read at this one frozen stop.
+void handle_read_memory_batch(long id, const std::string& line) {
+	if (!g_frozen) {
+		reply_err(id, "not_frozen", "read_memory_batch requires a frozen stop; call pause first");
+		return;
+	}
+	std::vector<EmucapBatchRange> ranges;
+	std::string error;
+	if (!emucap_parse_batch_ranges(line, ranges, error)) {
+		reply_err(id, "bad_params", error.c_str());
+		return;
+	}
+	std::vector<const u8*> sources;
+	for (size_t i = 0; i < ranges.size(); i++) {
+		const DCRegion* r = find_region(ranges[i].memory_type);
+		const u8* backing = r ? region_backing(*r) : nullptr;
+		if (backing == nullptr || ranges[i].address > r->size
+			|| ranges[i].length > r->size - ranges[i].address) {
+			reply_err(id, "bad_params",
+				("range " + std::to_string(i) + " is outside an advertised window").c_str());
+			return;
+		}
+		sources.push_back(backing + ranges[i].address);
+	}
+	std::string reads;
+	uint64_t total = 0;
+	for (size_t i = 0; i < ranges.size(); i++) {
+		std::string hex;
+		hex.reserve((size_t)ranges[i].length * 2);
+		for (uint64_t b = 0; b < ranges[i].length; b++) {
+			char h[3];
+			snprintf(h, sizeof(h), "%02x", sources[i][b]);
+			hex += h;
+		}
+		if (!reads.empty()) reads += ",";
+		reads += "{\"index\":" + std::to_string(i) + ",\"memory_type\":\"" + ranges[i].memory_type
+			+ "\",\"address\":" + std::to_string(ranges[i].address) + ",\"length\":"
+			+ std::to_string(ranges[i].length) + ",\"hex\":\"" + hex + "\"}";
+		total += ranges[i].length;
+	}
+	const std::string epoch = "f" + std::to_string(g_frame) + "#s" + std::to_string(g_boundary_seq);
+	reply_ok(id, "{\"state\":\"frozen\",\"consistency\":\"frozen_boundary\",\"boundary\":{"
+		"\"runtime_generation\":\"" + json_escape(runtime_generation()) + "\",\"stop_epoch\":\""
+		+ epoch + "\",\"memory_mapping_epoch\":\"" + epoch + "\",\"clocks\":[{\"domain\":"
+		"\"flycast.vblank\",\"value\":" + std::to_string(g_frame) + "}]},\"total_bytes\":"
+		+ std::to_string(total) + ",\"reads\":[" + reads + "]}");
+}
+
 void handle_write_memory(long id, const std::string& line) {
 	std::string mt = json_str(line, "memory_type");
 	const DCRegion* r = find_region(mt);
@@ -722,6 +918,9 @@ void handle_load_state(long id, const std::string& line) {
 		if ((long)r != sz) { reply_err(id, "io_error", "failed to read file"); return; }
 		Deserializer deser(buf.data(), (size_t)sz);
 		emu.loadstate(deser);
+		// A state saved inside the vblank callback by an earlier build has no pending scanline
+		// event; schedule the next one from the restored SPG state so the machine keeps running.
+		if (!sh4_sched_is_scheduled(vblank_schid)) rescheduleSPG();
 	} catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
 	{
 		std::lock_guard<std::mutex> lk(g_fb_mtx);
@@ -1037,6 +1236,7 @@ void handle(const std::string& line) {
 		reply_err(id, "crashed", "Flycast is quarantined at a fatal SH4 exception; mutation refused");
 		return;
 	}
+	if (!observation_method(method)) g_boundary_seq++;
 	try {
 		if (method == "hello") {
 			std::string r = "{\"protocol_version\":1,\"system\":\"dreamcast\",\"adapter\":\"flycast-native\",\"build\":\"" EMUCAP_BUILD_HASH "\",\"name\":\"";
@@ -1047,7 +1247,8 @@ void handle(const std::string& line) {
 			     "\"set_input\",\"pause\",\"resume\",\"step\",\"reset\","
 			     "\"set_breakpoint\",\"clear_breakpoint\",\"clear_all_breakpoints\",\"list_breakpoints\",\"poll_events\","
 			     "\"find_pattern\",\"disassemble\",\"get_rom_info\","
-			     "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\",\"dismiss_failure\"";
+			     "\"set_trace\",\"get_trace\",\"watch_register\",\"call_stack\",\"dismiss_failure\","
+			     "\"read_memory_batch\",\"execution_speed\"";
 			if (env_enabled("EMUCAP_ENABLE_TEST_FATAL")) r += ",\"test_fatal\"";
 			if (env_enabled("EMUCAP_ENABLE_TEST_ADAPTER_EXCEPTION"))
 				r += ",\"test_adapter_exception\"";
@@ -1061,7 +1262,17 @@ void handle(const std::string& line) {
 			     "\"range_mode\":\"exact\",\"memory_type_used\":false,\"snapshot\":false}],"
 			     "\"execution_limits\":{\"max_sync_advance_count\":";
 			r += std::to_string(MAX_SYNC_ADVANCE);
-			r += "},\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","
+			r += "},\"execution_speed_capability\":" + emucap_pacing_capability_json(host_audio_enabled());
+			r += ",\"memory_batch_capability\":{\"max_ranges\":64,\"max_range_bytes\":65536,"
+			     "\"max_total_bytes\":65536,\"consistency\":\"frozen_boundary\","
+			     "\"halt_kinds\":[\"vblank_park\",\"exec_breakpoint_park\"],\"windows\":[";
+			for (size_t w = 0; w < sizeof(kDCRegions) / sizeof(kDCRegions[0]); w++) {
+				if (w) r += ",";
+				r += "{\"memory_type\":\"" + std::string(kDCRegions[w].mt) + "\",\"address\":0,\"length\":"
+					+ std::to_string(kDCRegions[w].size) + "}";
+			}
+			r += "]}";
+			r += ",\"contracts\":{\"catalog\":\"emucap-feature-contracts/v3\","
 			     "\"active_exceptions\":[\"flycast.execution.instruction-step-absent\","
 			     "\"flycast.call-stack.best-effort\",\"flycast.input-hold.port-zero-only\"]}}";
 			const char* tok = getenv("EMUCAP_SESSION_TOKEN");
@@ -1115,6 +1326,7 @@ void handle(const std::string& line) {
 			}
 			result += std::string(",\"frame_capture_available\":")
 				+ (g_capture_disabled.load() ? "false" : "true");
+			result += ",\"execution_speed\":" + pacing_policy_json();
 			result += "}";
 			reply_ok(id, result);
 			recover_native_failure_after_status();
@@ -1139,6 +1351,10 @@ void handle(const std::string& line) {
 			method == "test_adapter_exception"
 			&& env_enabled("EMUCAP_ENABLE_TEST_ADAPTER_EXCEPTION")) {
 			g_test_adapter_exception_id = id;
+		} else if (method == "read_memory_batch") {
+			handle_read_memory_batch(id, line);
+		} else if (method == "execution_speed") {
+			handle_execution_speed(id, line);
 		} else if (method == "read_memory") {
 			handle_read_memory(id, line);
 		} else if (method == "write_memory") {
@@ -1156,8 +1372,7 @@ void handle(const std::string& line) {
 			json_num(line, "n", n);
 			if (!normalize_sync_advance(id, n)) return;
 			g_frozen = false;
-			g_step_id = id;
-			g_step_remaining = n;
+			start_advance(id, n);
 		} else if (method == "set_input") {
 			long port = 0;
 			if (json_num(line, "port", port) && port != 0) {
@@ -1193,8 +1408,7 @@ void handle(const std::string& line) {
 			json_num(line, "frames", frames);
 			if (!normalize_sync_advance(id, frames)) return;
 			g_frozen = true;
-			g_step_id = id;        // 완료 응답은 emucap_service가 frames 경과 후
-			g_step_remaining = frames;
+			start_advance(id, frames);  // 완료 응답은 emucap_service가 frames 경과 후
 		} else if (method == "step_instructions") {
 			reply_err(id, "unsupported", "instruction stepping is unavailable with the vblank frame-freeze model; use frame step or run_frames");
 		} else if (method == "reset") {
@@ -1276,11 +1490,14 @@ void serve_socket_once() {
 		// 논블로킹이라 EAGAIN/EWOULDBLOCK은 "데이터 없음"(정상). 그 외(ECONNRESET 등)는 죽은 링크다 —
 		// 끊어 g_fd<0로 만들어 재연결을 유도한다. 안 그러면 RST 시 frozen 스핀이 영영 빠져나오지 못한다
 		// (서버 P0 타임아웃 드롭이 unread 바이트 때문에 FIN이 아닌 RST를 보내는 케이스가 정확히 이것).
-		if (emucap_sock_wouldblock()) return;
-		emucap_disconnect();
-		return;
+		// A pacing wait may have left a request buffered, so no new data still serves g_rx.
+		if (!emucap_sock_wouldblock()) {
+			emucap_disconnect();
+			return;
+		}
+	} else {
+		g_rx.append(tmp, (size_t)n);
 	}
-	g_rx.append(tmp, (size_t)n);
 	size_t pos;
 	while ((pos = g_rx.find('\n')) != std::string::npos) {
 		std::string l = g_rx.substr(0, pos);
@@ -1289,7 +1506,96 @@ void serve_socket_once() {
 	}
 }
 
+// Requests a pacing wait answers in place. Waits run inside a frame on the emulation thread; none of
+// these reads or changes guest state.
+bool pacing_wait_method(const std::string& method) {
+	static const char* const names[] = {
+		"hello", "status", "get_rom_info", "poll_events", "list_breakpoints", "execution_speed",
+		"read_memory_batch"};
+	for (const char* name : names) {
+		if (method == name) return true;
+	}
+	return false;
+}
+
+// One sleep slice of a pacing wait. Returns true to end the wait: a request that needs the vblank
+// service is buffered, the policy changed, or an advance spent its host budget.
+bool pacing_idle() {
+	if (g_pacing_released) return true;
+	if (g_step_id >= 0) {
+		// An advance accepts no request until its terminal reply; keep its reply stream alive.
+		if (!g_tx.empty()) flush_tx_once();
+		if (g_tx.empty() && monotonic_ms() - g_step_progress_ms >= PROGRESS_INTERVAL_MS) {
+			g_step_progress_ms = monotonic_ms();
+			reply_working(g_step_id);
+		}
+		if (advance_expired()) g_pacing_released = true;
+		return g_pacing_released;
+	}
+	if (g_fd < 0) {
+		const uint64_t now = monotonic_ms();
+		if (now - g_pacing_reconnect_ms < 20) return false;
+		g_pacing_reconnect_ms = now;
+		emucap_connect();
+		if (g_fd < 0) return false;
+	}
+	if (!g_tx.empty()) {
+		flush_tx_once();
+		if (g_fd < 0 || !g_tx.empty()) return false;
+	}
+	char tmp[8192];
+	const ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
+	if (n == 0 || (n < 0 && !emucap_sock_wouldblock())) {
+		emucap_disconnect();
+		return false;
+	}
+	if (n > 0) g_rx.append(tmp, (size_t)n);
+	size_t pos;
+	while (!g_pacing_released && (pos = g_rx.find('\n')) != std::string::npos) {
+		const std::string line = g_rx.substr(0, pos);
+		if (!line.empty() && !pacing_wait_method(json_str(line, "method"))) {
+			g_pacing_released = true;
+			break;
+		}
+		g_rx.erase(0, pos + 1);
+		if (!line.empty()) handle(line);
+	}
+	return g_pacing_released;
+}
+
 }  // namespace
+
+bool emucap_audio_wait() { return emucap_pacing_device_wait(native_pacing()); }
+
+bool emucap_vsync_released() { return g_pace_unlimited || g_pace_percent > 100; }
+
+void emucap_pace_samples(uint32_t samples) {
+	try {
+		if (g_pace_unlimited) {
+			g_pacer.reanchor();
+			return;
+		}
+		const int64_t deadline = g_pacer.deadline_after(samples, g_pace_percent, monotonic_ns());
+		for (;;) {
+			const int64_t remaining = deadline - monotonic_ns();
+			if (remaining <= 0) return;
+			usleep((useconds_t)std::min<int64_t>(remaining / 1000, 10000));
+			g_in_pacing_wait = true;
+			const bool released = pacing_idle();
+			g_in_pacing_wait = false;
+			if (released) {
+				g_pacer.reanchor();
+				return;
+			}
+		}
+	} catch (const std::exception& error) {
+		g_in_pacing_wait = false;
+		contain_service_exception("pacing_wait", error.what());
+	} catch (...) {
+		g_in_pacing_wait = false;
+		contain_service_exception("pacing_wait", "unknown native adapter exception");
+	}
+}
 
 void emucap_capture_fatal_sh4(
 	const char* reason,
@@ -1419,49 +1725,74 @@ void emucap_service() {
 		// 입력 주입은 MapleConfigMap::GetInput(emu 스레드 소비 지점)의 pjs->kcode override에서 이뤄진다
 		// (maple_cfg.cpp, build.sh 주입). 여기선 kcode[] 전역을 쓰지 않는다: 게임 입력엔 불필요(GetInput
 		// override가 항상 이김)하고 UI 스레드 gamepad 핸들러와 경쟁하므로 주입 상태는 emucap_kcode()에서 합친다.
-		if (g_fd < 0) { emucap_connect(); return; }   // 매 프레임 재연결 시도
+		g_pacing_released = false;
+		if (g_fd < 0 && !g_frozen) { emucap_connect(); return; }   // running이면 매 프레임 재연결 시도
 		// step(frames)/run_frames: 카운트다운 — 이 프레임은 진행시킨다(return → vblank 반환 → 1프레임 진행).
 		if (g_step_remaining > 0) {
 			if (!g_tx.empty()) flush_tx_once();
-			// 긴 진행은 30프레임마다 keepalive를 보내 서버 읽기 타임아웃(5s)을 막는다(인터프리터가 느려
-			// 수백 프레임이 5s를 넘는다). 서버는 status:"working"을 건너뛰므로 같은 호출이 유지된다.
-			if (g_step_id >= 0 && (g_step_remaining % 30) == 0 && g_tx.empty()) reply_working(g_step_id);
+			// 긴 진행은 1초마다 keepalive를 보내 서버 읽기 타임아웃(5s)을 막는다(인터프리터나 느린
+			// pacing에서 수백 프레임이 5s를 넘는다). 서버는 status:"working"을 건너뛰므로 같은 호출이 유지된다.
+			if (g_step_id >= 0 && g_tx.empty() && monotonic_ms() - g_step_progress_ms >= PROGRESS_INTERVAL_MS) {
+				g_step_progress_ms = monotonic_ms();
+				reply_working(g_step_id);
+			}
 			g_step_remaining--;
-			if (g_step_remaining == 0 && g_step_id >= 0) {
+			if (g_step_remaining > 0 && advance_expired()) {
+				reply_ok(g_step_id, "{\"status\":\"interrupted\",\"reason\":\"host_deadline\","
+					"\"unit\":\"frames\",\"requested\":" + std::to_string(g_step_requested)
+					+ ",\"completed\":" + std::to_string(g_step_requested - g_step_remaining)
+					+ ",\"frame\":" + std::to_string(g_frame) + ",\"state\":\"frozen\"}");
+				g_step_id = -1;
+				g_step_remaining = 0;
+				g_frozen = true;
+			} else if (g_step_remaining == 0 && g_step_id >= 0) {
 				char buf[96];
 				snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu,\"state\":\"%s\"}",
 					(unsigned long long)g_frame, g_frozen ? "frozen" : "running");
 				reply_ok(g_step_id, buf);
 				g_step_id = -1;
-				// step이면 frozen을 유지해 다음 프레임부터 스핀, run_frames이면 running 유지.
 			}
-			return;
+			// A step parks at the vblank it reports; run_frames stays running.
+			if (g_step_remaining > 0 || !g_frozen) return;
 		}
 
-		// freeze: 스핀하며 소켓만 서비스 → vblank가 반환 안 돼 프레임 진행이 막힌다.
-		// 연결끊김(/mcp 재연결 등) 시 제자리에서 재접속한다 — 스핀을 나가면 vblank가 반환돼 프레임이
-		// 진행해(frozen 장면 유실), emucap_bp_spin과 동일하게 frozen을 유지한 채 재연결한다(장면 보존).
-		if (g_frozen) {
-			while (g_frozen && g_step_remaining == 0) {
-				if (g_fd < 0) { emucap_connect(); if (g_fd < 0) { usleep(2000); continue; } }
-				serve_socket_once();
-				usleep(2000);
+		if (!g_frozen) {
+			serve_socket_once();
+			if (g_test_adapter_exception_id >= 0)
+				throw std::runtime_error("injected native adapter service exception");
+			if (g_synthetic_fatal_pending) {
+				g_synthetic_fatal_pending = false;
+				emucap_capture_fatal_sh4(
+					"Synthetic SH4 fatal (test gate)", Sh4cntx.pc, 0xFFFFFFFFu, 0, 0, 0);
 			}
-			return;
+			// A pause served while running parks at this vblank; returning would run one more frame
+			// after the frozen reply.
+			if (!g_frozen) return;
 		}
 
-		serve_socket_once();
-		if (g_test_adapter_exception_id >= 0)
-			throw std::runtime_error("injected native adapter service exception");
-		if (g_synthetic_fatal_pending) {
-			g_synthetic_fatal_pending = false;
-			emucap_capture_fatal_sh4(
-				"Synthetic SH4 fatal (test gate)", Sh4cntx.pc, 0xFFFFFFFFu, 0, 0, 0);
-		}
+		// Frozen: park at the end of this timeslice rather than inside the vblank callback.
+		g_emucap_park_pending = true;
 	} catch (const std::exception& error) {
 		contain_service_exception("service", error.what());
 	} catch (...) {
 		contain_service_exception("service", "unknown native adapter exception");
+	}
+}
+
+// Spin serving only the socket, so no guest instruction runs until a resume or step. A lost
+// connection is re-established in place, like emucap_bp_spin, so the frozen scene is kept.
+void emucap_park() {
+	g_emucap_park_pending = false;
+	try {
+		while (g_frozen && g_step_remaining == 0) {
+			if (g_fd < 0) { emucap_connect(); if (g_fd < 0) { usleep(2000); continue; } }
+			serve_socket_once();
+			usleep(2000);
+		}
+	} catch (const std::exception& error) {
+		contain_service_exception("park", error.what());
+	} catch (...) {
+		contain_service_exception("park", "unknown native adapter exception");
 	}
 }
 

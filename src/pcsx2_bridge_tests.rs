@@ -19,8 +19,28 @@ impl FakePine {
     }
 }
 
+/// Nominal 100 percent, revision 1, frame 0: the pacing readback status asks for every time.
+fn nominal_pacing_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    payload.extend_from_slice(&10_000u32.to_le_bytes());
+    payload.extend_from_slice(&1.0f32.to_bits().to_le_bytes());
+    payload.extend_from_slice(&1u64.to_le_bytes());
+    payload.extend_from_slice(&0u64.to_le_bytes());
+    payload
+}
+
 impl PineTransport for FakePine {
     fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>> {
+        // Status reads pacing on every call; answer it outside the scripted exchange.
+        if request == [0x95]
+            && self
+                .expected
+                .front()
+                .is_none_or(|(next, _)| next.as_slice() != [0x95])
+        {
+            return Ok(nominal_pacing_payload());
+        }
         let (expected, response) = self.expected.pop_front().expect("unexpected PINE request");
         assert_eq!(request, expected);
         response
@@ -1184,4 +1204,50 @@ fn long_pine_exchange_uses_its_budget_then_restores_normal_timeout() {
     assert!(pine.transact(&[MSG_STATUS]).is_err());
     assert!(pine.is_terminal());
     host.join().unwrap();
+}
+
+#[test]
+fn pacing_readback_failure_closes_control_after_native_mutation() {
+    let mut setter = vec![0x96];
+    setter.extend_from_slice(&50u32.to_le_bytes());
+    let mut host = bridge(vec![
+        (vec![0x95], Ok(nominal_pacing_payload())),
+        (setter, Ok(vec![])),
+        (vec![0x95], Ok(vec![0])),
+    ]);
+    let error = host
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap_err();
+    assert!(error.to_string().contains("unverified"));
+    assert!(error.to_string().contains("last verified policy"));
+    assert!(host.backend_terminal());
+}
+
+#[test]
+fn memory_batch_uses_one_native_acquisition_and_rejects_short_payload() {
+    for short in [false, true] {
+        let mut body = vec![0x97];
+        for n in [2u32, 16, 2, 0, 1] {
+            body.extend_from_slice(&n.to_le_bytes());
+        }
+        let mut payload = 7u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&123u64.to_le_bytes());
+        payload.extend_from_slice(if short { &[1, 2][..] } else { &[1, 2, 255][..] });
+        let mut host = bridge(vec![
+            (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+            (body, Ok(payload)),
+        ]);
+        let result = host.read_memory_batch(&json!({"ranges":[
+            {"memory_type":"ee","address":16,"length":2},
+            {"memory_type":"ee","address":0,"length":1}
+        ]}));
+        if short {
+            assert!(result.is_err());
+            assert!(host.backend_terminal());
+        } else {
+            let reply = result.unwrap();
+            assert_eq!(reply["reads"][0]["hex"], "0102");
+            assert_eq!(reply["reads"][1]["hex"], "ff");
+        }
+    }
 }

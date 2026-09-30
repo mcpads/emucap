@@ -4,6 +4,8 @@ pub mod capture_capsule;
 pub mod continuity;
 mod evidence_identity;
 pub mod link;
+pub mod memory_batch;
+pub mod pacing;
 pub mod protocol;
 pub mod reconnect;
 pub mod recording;

@@ -44,6 +44,8 @@ impl<G: GdbTransport> NdsBridge<G> {
                 "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
                 "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
             },
+            "memory_batch_capability": Self::memory_batch_capability(),
+            "execution_speed_capability": Self::execution_speed_capability(),
         });
         let obj = result.as_object_mut().expect("hello is an object");
         if let Some(name) = &self.env.name {
@@ -73,6 +75,7 @@ impl<G: GdbTransport> NdsBridge<G> {
             override_status_json(self.arm9.override_remaining("qEmucap,inputstatus").ok());
         let touch_override =
             override_status_json(self.arm9.override_remaining("qEmucap,touchstatus").ok());
+        let pacing = self.native_pacing().ok();
         Ok(json!({
             "connected": true,
             "system": "nds",
@@ -98,6 +101,8 @@ impl<G: GdbTransport> NdsBridge<G> {
             "input_buttons": nds_input_buttons_json(),
             "input_override": input_override,
             "touch_override": touch_override,
+            "frame": pacing.map(|pacing| pacing.clock),
+            "execution_speed": pacing.map(|pacing| pacing.public()),
             "execution_limits": {
                 "max_sync_advance_count": crate::live::temporal::MAX_SYNC_ADVANCE_COUNT,
                 "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis() as u64,
@@ -477,12 +482,19 @@ impl<G: GdbTransport> NdsBridge<G> {
                 if status.terminal == FrameStepTerminal::Interrupted {
                     self.arm9.note_stop(stop);
                 }
-                return Err(NdsBridgeError::Emulator(format!(
-                    "NDS frame step exceeded the {} ms deadline after {} of {} VBlank-start events; both CPUs are frozen",
-                    crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis(),
-                    status.completed,
-                    count
-                )));
+                // A paced advance stops at the reached VBlank once its host budget is spent.
+                return Ok(json!({
+                    "status": "interrupted",
+                    "reason": "host_deadline",
+                    "unit": "frames",
+                    "count": status.completed,
+                    "requested": count,
+                    "clock": "nds_vblank_start_complete",
+                    "start_frame": status.start,
+                    "end_frame": status.end,
+                    "state": "frozen",
+                    "cpus": {"arm9":"frozen", "arm7":"frozen"},
+                }));
             }
             std::thread::sleep(FRAME_STEP_POLL_INTERVAL);
         }

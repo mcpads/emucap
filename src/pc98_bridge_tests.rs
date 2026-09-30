@@ -15,6 +15,9 @@ struct FakeGdb {
     timeout: Duration,
     timeouts: Vec<Duration>,
     interrupts: usize,
+    /// Reply to the host feature probe, answered outside the scripted sequence. None models a
+    /// host without the batch/pacing bindings.
+    features: Option<String>,
 }
 
 impl FakeGdb {
@@ -49,6 +52,9 @@ impl FakeGdb {
 impl GdbTransport for FakeGdb {
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.calls.push(payload.into());
+        if payload == "qEmucap,features" {
+            return Ok(self.features.clone().unwrap_or_default());
+        }
         let Some((expected, reply)) = self.replies.pop_front() else {
             return Err(GdbError::Emulator(format!(
                 "unexpected fake GDB call: {payload}"
@@ -2379,3 +2385,6 @@ fn empty_device_payload_does_not_finalize_unrestored_devices() {
         assert_eq!(result["postload"]["status"], "skipped");
     }
 }
+
+#[path = "pc98_bridge/observation_tests.rs"]
+mod observation;

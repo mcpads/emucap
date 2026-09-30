@@ -47,6 +47,13 @@ impl WsTransport for FakeWs {
     }
 
     fn call(&mut self, event: &str, params: Value) -> Result<Value, BridgeError> {
+        // Status reads pacing on every call; answer it outside the scripted exchange.
+        if event == "emucap.pacing" && self.replies.front().is_none_or(|(next, _)| next != event) {
+            return Ok(
+                json!({"percent": 100, "fast_forward": false, "fps_limit": 0,
+                "network_forced": false, "revision": 1, "vblank": 0}),
+            );
+        }
         self.calls.push((event.to_string(), params));
         let Some((expected, reply)) = self.replies.pop_front() else {
             return Err(BridgeError::Emulator(format!(
@@ -2872,4 +2879,52 @@ fn get_rom_info_rejects_missing_content_file() {
     let resp = bridge.handle_request(Request::new(1, "get_rom_info", json!({})));
     assert!(!resp.ok);
     assert_eq!(resp.error.unwrap().kind, "bad_params");
+}
+
+#[test]
+fn native_memory_batch_reads_once_and_rejects_incomplete_reply() {
+    for short in [false, true] {
+        let mut host = PpssppBridge::with_content(
+            FakeWs::with(&[
+                ("cpu.status", json!({"stepping":true})),
+                (
+                    "emucap.memoryBatch",
+                    json!({"epoch":7,"frame":123,"hex":if short {"0102"} else {"0102ff"}}),
+                ),
+            ]),
+            None,
+        );
+        let result = host.read_memory_batch(&json!({"ranges":[
+            {"memory_type":"main","address":16,"length":2},
+            {"memory_type":"main","address":0,"length":1}
+        ]}));
+        assert_eq!(host.ws.calls[1].1["ranges"], "10,2;0,1");
+        if short {
+            assert!(result.is_err());
+            assert!(host.backend_terminal());
+        } else {
+            let reply = result.unwrap();
+            assert_eq!(reply["reads"][0]["hex"], "0102");
+            assert_eq!(reply["reads"][1]["hex"], "ff");
+        }
+    }
+}
+
+#[test]
+fn pacing_invalid_post_set_readback_closes_control() {
+    let before = json!({"percent":100,"fast_forward":false,"fps_limit":0,"network_forced":false,"revision":1,"vblank":0});
+    let mut host = PpssppBridge::with_content(
+        FakeWs::with(&[
+            ("emucap.pacing", before),
+            ("emucap.pacing", json!({"percent":50})),
+        ]),
+        None,
+    );
+    assert!(host
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap_err()
+        .to_string()
+        .contains("unverified"));
+    assert!(host.backend_terminal());
+    assert_eq!(host.ws.calls.len(), 2);
 }

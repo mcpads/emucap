@@ -1,0 +1,202 @@
+diff --git i/Core/Debugger/LuaApi.cpp w/Core/Debugger/LuaApi.cpp
+index ddcf1bb..67e1247 100644
+--- i/Core/Debugger/LuaApi.cpp
++++ w/Core/Debugger/LuaApi.cpp
+@@ -18,6 +18,7 @@
+ #include "Shared/RewindManager.h"
+ #include "Shared/SaveStateManager.h"
+ #include "Shared/Emulator.h"
++#include "Shared/EmuSettings.h"
+ #include "Shared/Video/BaseVideoFilter.h"
+ #include "Shared/Video/VideoRenderer.h"
+ #include "Shared/Video/DrawScreenBufferCommand.h"
+@@ -132,6 +133,9 @@ int LuaApi::GetLibrary(lua_State* lua)
+ 
+ 		{ "reset", LuaApi::Reset },
+ 		{ "powerCycle", LuaApi::PowerCycle },
++		{ "getPacing", LuaApi::GetPacing },
++		{ "setPacing", LuaApi::SetPacing },
++		{ "endPacingWait", LuaApi::EndPacingWait },
+ 		{ "stop", LuaApi::Stop },
+ 		{ "breakExecution", LuaApi::BreakExecution },
+ 		{ "resume", LuaApi::Resume },
+@@ -769,6 +773,53 @@ int LuaApi::PowerCycle(lua_State* lua)
+ 	return l.ReturnCount();
+ }
+ 
++static void PushPacing(lua_State* lua, Emulator* emu)
++{
++	EmuSettings* settings = emu->GetSettings();
++	EmulationConfig& cfg = settings->GetEmulationConfig();
++	lua_newtable(lua);
++	lua_pushintvalue(emulationSpeed, cfg.EmulationSpeed);
++	lua_pushintvalue(turboSpeed, cfg.TurboSpeed);
++	lua_pushintvalue(rewindSpeed, cfg.RewindSpeed);
++	lua_pushintvalue(effectiveSpeed, settings->GetEmulationSpeed());
++	lua_pushboolvalue(maximumSpeed, settings->CheckFlag(EmulationFlags::MaximumSpeed));
++	lua_pushboolvalue(turbo, settings->CheckFlag(EmulationFlags::Turbo));
++	lua_pushboolvalue(rewind, settings->CheckFlag(EmulationFlags::Rewind));
++}
++
++int LuaApi::GetPacing(lua_State* lua)
++{
++	LuaCallHelper l(lua);
++	checkparams();
++	PushPacing(lua, _emu);
++	return 1;
++}
++
++int LuaApi::SetPacing(lua_State* lua)
++{
++	//Sets the base speed in percent (0 = unlimited) and the maximum-speed override (cleared unless
++	//requested) in one emulation-thread call, then returns the observed policy. Held turbo/rewind
++	//keys still override.
++	LuaCallHelper l(lua);
++	l.ForceParamCount(2);
++	bool maximumSpeed = l.ReadBool(false);
++	uint32_t speed = l.ReadInteger();
++	checkminparams(1);
++	EmuSettings* settings = _emu->GetSettings();
++	settings->GetEmulationConfig().EmulationSpeed = speed;
++	settings->SetFlagState(EmulationFlags::MaximumSpeed, maximumSpeed);
++	PushPacing(lua, _emu);
++	return 1;
++}
++
++int LuaApi::EndPacingWait(lua_State* lua)
++{
++	LuaCallHelper l(lua);
++	checkparams();
++	_emu->RequestPacingWake();
++	return l.ReturnCount();
++}
++
+ int LuaApi::Stop(lua_State* lua)
+ {
+ 	LuaCallHelper l(lua);
+diff --git i/Core/Debugger/LuaApi.h w/Core/Debugger/LuaApi.h
+index fadfc70..cdf307b 100644
+--- i/Core/Debugger/LuaApi.h
++++ w/Core/Debugger/LuaApi.h
+@@ -63,6 +63,9 @@ public:
+ 
+ 	static int Reset(lua_State* lua);
+ 	static int PowerCycle(lua_State* lua);
++	static int GetPacing(lua_State* lua);
++	static int SetPacing(lua_State* lua);
++	static int EndPacingWait(lua_State* lua);
+ 	static int Stop(lua_State* lua);
+ 	static int BreakExecution(lua_State* lua);
+ 	static int Resume(lua_State* lua);
+diff --git i/Core/Shared/Emulator.cpp w/Core/Shared/Emulator.cpp
+index 23d100e..d17dc69 100644
+--- i/Core/Shared/Emulator.cpp
++++ w/Core/Shared/Emulator.cpp
+@@ -68,6 +68,7 @@ Emulator::Emulator()
+ {
+ 	_paused = false;
+ 	_pauseOnNextFrame = false;
++	_pacingWakeRequested = false;
+ 	_stopFlag = false;
+ 	_isRunAheadFrame = false;
+ 	_lockCounter = 0;
+@@ -260,11 +261,17 @@ void Emulator::ProcessEndOfFrame()
+ {
+ 	if(!_isRunAheadFrame) {
+ 		_frameLimiter->ProcessFrame();
++		_pacingWakeRequested = false;
+ 		while(_frameLimiter->WaitForNextFrame()) {
+ 			if(_stopFlag || _frameDelay != GetFrameDelay() || _paused || _pauseOnNextFrame || _lockCounter > 0) {
+ 				//Need to process another event, stop sleeping
+ 				break;
+ 			}
++			//A control script may service requests during a long pacing wait and end it early
++			ProcessEvent(EventType::PacingIdle);
++			if(_pacingWakeRequested) {
++				break;
++			}
+ 		}
+ 
+ 		double newFrameDelay = GetFrameDelay();
+diff --git i/Core/Shared/Emulator.h w/Core/Shared/Emulator.h
+index ef8e994..9a6b848 100644
+--- i/Core/Shared/Emulator.h
++++ w/Core/Shared/Emulator.h
+@@ -102,6 +102,7 @@ private:
+ 	atomic<bool> _stopFlag;
+ 	atomic<bool> _paused;
+ 	atomic<bool> _pauseOnNextFrame;
++	atomic<bool> _pacingWakeRequested;
+ 	atomic<bool> _threadPaused;
+ 
+ 	atomic<int> _debugRequestCount;
+@@ -341,6 +342,8 @@ public:
+ 	}
+ 
+ 	void ProcessEvent(EventType type, std::optional<CpuType> cpuType = std::nullopt);
++	//Ends the current frame-pacing wait early; the pacing target itself is unchanged.
++	void RequestPacingWake() { _pacingWakeRequested = true; }
+ 	template<CpuType cpuType> void AddDebugEvent(DebugEventType evtType);
+ 	void BreakIfDebugging(CpuType sourceCpu, BreakSource source);
+ 
+diff --git i/Core/Shared/EventType.h w/Core/Shared/EventType.h
+index 9e712d3..d9be07c 100644
+--- i/Core/Shared/EventType.h
++++ w/Core/Shared/EventType.h
+@@ -25,6 +25,7 @@ enum class EventType
+ 	SnesPpuObjConsumptionRead,
+ 	SnesPpuCgramLookup,
+ 	SnesPpuBgChrFetch,
++	PacingIdle,
+ 
+ 	LastValue
+ };
+diff --git i/Core/Shared/FrameLimiter.h w/Core/Shared/FrameLimiter.h
+index d89a07b..939a8b5 100644
+--- i/Core/Shared/FrameLimiter.h
++++ w/Core/Shared/FrameLimiter.h
+@@ -41,9 +41,10 @@ public:
+ 
+ 	bool WaitForNextFrame()
+ 	{
+-		if(_targetTime - _clockTimer.GetElapsedMS() > 50) {
++		if(_targetTime - _clockTimer.GetElapsedMS() > 15) {
+ 			//When sleeping for a long time (e.g <= 25% speed), sleep in small chunks and check to see if we need to stop sleeping between each sleep call
+-			_clockTimer.WaitUntil(_clockTimer.GetElapsedMS() + 40);
++			//Chunks stay short so a control script can service requests at any speed
++			_clockTimer.WaitUntil(_clockTimer.GetElapsedMS() + 10);
+ 			return true;
+ 		}
+ 
+diff --git i/UI/Debugger/Documentation/LuaDocumentation.json w/UI/Debugger/Documentation/LuaDocumentation.json
+index 0a7c8eb..db84a93 100644
+--- i/UI/Debugger/Documentation/LuaDocumentation.json
++++ w/UI/Debugger/Documentation/LuaDocumentation.json
+@@ -346,6 +346,27 @@
+ 	],
+ 	"returnValue": { "type": "Int", "description": "A 32-bit (signed or unsigned) value." }
+ },
++{
++	"name": "getPacing",
++	"category": "Emulation",
++	"description": "Returns the pacing settings: emulationSpeed, turboSpeed, rewindSpeed and effectiveSpeed in percent (0 = unlimited), plus the maximumSpeed, turbo and rewind overrides.",
++	"returnValue": { "type": "Table", "description": "The observed pacing settings." }
++},
++{
++	"name": "setPacing",
++	"category": "Emulation",
++	"description": "Sets the base emulation speed in percent (0 = unlimited) and the maximum-speed override (cleared unless requested), then returns the observed pacing settings.",
++	"parameters": [
++		{ "name": "speed", "type": "Integer", "description": "Speed in percent; 0 removes pacing." },
++		{ "name": "maximumSpeed", "type": "Bool", "description": "Optional maximum-speed override; defaults to false." }
++	],
++	"returnValue": { "type": "Table", "description": "The observed pacing settings." }
++},
++{
++	"name": "endPacingWait",
++	"category": "Emulation",
++	"description": "Ends the current frame-pacing wait early, typically from a pacingIdle callback, without changing the pacing target."
++},
+ {
+ 	"name": "powerCycle",
+ 	"category": "Emulation",

@@ -73,6 +73,7 @@ fn connect_expected(
             breakpoint_kinds: vec![],
             contracts: crate::contracts::ContractAdvertisement::Unreported,
             recording: None,
+            features: Default::default(),
             identity: EmulatorIdentity::default(),
         },
         next_id: 1,
@@ -105,7 +106,7 @@ fn connect_expected(
         .get("broker_registration_id")
         .and_then(Value::as_u64)
         .ok_or_else(|| LinkError::Protocol("broker attach omitted registration identity".into()))?;
-    let methods = res
+    let methods: Vec<String> = res
         .get("methods")
         .and_then(|m| m.as_array())
         .map(|a| {
@@ -145,6 +146,7 @@ fn connect_expected(
     .map_err(|error| LinkError::Protocol(error.to_string()))?;
     crate::debug_selection::parse_debug_capabilities(&res)
         .map_err(|error| LinkError::Protocol(format!("invalid debug capabilities: {error}")))?;
+    let features = super::link::FeatureCapabilities::from_hello(&res, &methods, &memory_types)?;
     link.caps = Capabilities {
         protocol_version: PROTOCOL_VERSION,
         methods,
@@ -153,6 +155,7 @@ fn connect_expected(
         breakpoint_kinds,
         contracts: crate::contracts::advertisement_from_hello(&res),
         recording,
+        features,
         identity: EmulatorIdentity::from_hello(&res),
     };
     Ok(link)
@@ -455,6 +458,7 @@ impl EmulatorLink for LazyBrokerLink {
                     breakpoint_kinds: vec![],
                     contracts: crate::contracts::ContractAdvertisement::Unreported,
                     recording: None,
+                    features: Default::default(),
                     identity: EmulatorIdentity::default(),
                 })
             })

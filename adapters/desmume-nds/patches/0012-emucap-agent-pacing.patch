@@ -1,0 +1,196 @@
+diff --git a/desmume/src/frontend/posix/cli/main.cpp b/desmume/src/frontend/posix/cli/main.cpp
+index 3340109..cfb544c 100644
+--- a/desmume/src/frontend/posix/cli/main.cpp
++++ b/desmume/src/frontend/posix/cli/main.cpp
+@@ -58,6 +58,8 @@ static bool g_emucap_headless = true;
+ #ifdef GDB_STUB
+ #include "../armcpu.h"
+ #include "../gdbstub.h"
++// Implemented by the GDB stub, which owns the agent pacing policy.
++void emucap_pace_frames(int frames, int native_unlimited);
+ class CliDriver : public BaseDriver
+ {
+ private:
+@@ -605,6 +607,12 @@ int main(int argc, char ** argv) {
+ #ifdef DISPLAY_FPS
+     now = SDL_GetTicks();
+ #endif
++#ifdef GDB_STUB
++    /* emucap: the agent pacing clock replaces the fixed 60 FPS limiter; a disabled limiter or a
++     * held boost key is native unlimited. */
++    emucap_pace_frames(1 + my_config.frameskip,
++                       my_config.disable_limiter || (ctrls_cfg.keypad & KEYMASK_(KEY_BOOST - 1)));
++#else
+     if ( !my_config.disable_limiter && !(ctrls_cfg.keypad & KEYMASK_(KEY_BOOST - 1))) {
+ #ifndef DISPLAY_FPS
+       now = SDL_GetTicks();
+@@ -617,6 +625,7 @@ int main(int argc, char ** argv) {
+         SDL_Delay(delay);
+       }
+     }
++#endif
+     // always count frames, we'll mess up if the limiter gets turned on later otherwise
+     limiter_frame_counter += 1 + my_config.frameskip;
+ 
+diff --git a/desmume/src/gdbstub/gdbstub.cpp b/desmume/src/gdbstub/gdbstub.cpp
+index 91be5c8..9c439cc 100644
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -40,8 +40,11 @@
+ // PNG encoding, and std::string for the arbitrarily large screenshot reply.
+ #include "../GPU.h"
+ #include <zlib.h>
++#include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <string>
++#include <thread>
+ #include <vector>
+ 
+ // emucap savestate + disassemble commands: native DeSmuME save/load and the ARM/Thumb
+@@ -91,6 +94,61 @@ static struct emucap_frame_step_state emucap_frame_step = {
+   EMUCAP_FRAME_STEP_IDLE, NULL, 0, 0, 0, 0, 0
+ };
+ 
++// Agent pacing. The CLI frame loop waits in emucap_pace_frames() after each emulated frame. The
++// target is a percent of the DS refresh (560190 cycles at 33513982 Hz); 0 is unlimited. The stub
++// thread changes it and reads it back while the guest runs, and a break request or a policy
++// change ends the current wait so control does not queue behind a slow frame.
++static std::atomic<uint32_t> emucap_pace_percent{100};
++static std::atomic<bool> emucap_native_unlimited{false};
++static std::atomic<uint64_t> emucap_pace_revision{1};
++static std::atomic<bool> emucap_pace_wake{false};
++static std::atomic<uint64_t> emucap_vblank_clock{0};
++
++void emucap_pace_frames(int frames, int native_unlimited) {
++  typedef std::chrono::steady_clock clock;
++  static clock::time_point deadline;
++  static bool anchored = false;
++  const bool native = native_unlimited != 0;
++  if (emucap_native_unlimited.exchange(native) != native)
++    emucap_pace_revision.fetch_add(1);
++  const uint32_t percent = emucap_pace_percent.load();
++  if (native || percent == 0 || emucap_pace_wake.exchange(false)) {
++    anchored = false;
++    return;
++  }
++  const clock::time_point now = clock::now();
++  // A host that falls this far behind (a stop or a slow host) re-anchors instead of catching up.
++  if (!anchored || now - deadline > std::chrono::milliseconds(100)) {
++    deadline = now;
++    anchored = true;
++  }
++  deadline += std::chrono::nanoseconds(
++      (int64_t)frames * 560190LL * 1000000000LL / 33513982LL * 100 / percent);
++  for (;;) {
++    const clock::duration remaining = deadline - clock::now();
++    if (remaining <= clock::duration::zero())
++      return;
++    std::this_thread::sleep_for(std::min<clock::duration>(remaining, std::chrono::milliseconds(10)));
++    if (emucap_pace_wake.exchange(false)) {
++      anchored = false;
++      return;
++    }
++  }
++}
++
++// Requests the stub answers while the guest runs: they read or set pacing and override counters
++// only, so they neither touch guest state nor need a stopped CPU.
++static bool emucap_running_safe_packet(const uint8_t *packet) {
++  static const char *const prefixes[] = {
++    "qEmucap,pacing", "QEmucap,pacing:", "qEmucap,inputstatus", "qEmucap,touchstatus",
++  };
++  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
++    if (strncmp((const char *)packet, prefixes[i], strlen(prefixes[i])) == 0)
++      return true;
++  }
++  return false;
++}
++
+ #ifdef __GNUC__
+ #define UNUSED_PARM( parm) parm __attribute__((unused))
+ #else
+@@ -420,6 +478,7 @@ static void emucap_stop_sibling_gdb_stubs(struct gdb_stub_state *source) {
+ 
+ void emucap_gdbstub_vblank_start_complete() {
+   emucap_frame_step.clock++;
++  emucap_vblank_clock.fetch_add(1, std::memory_order_relaxed);
+   if (emucap_frame_step.terminal != EMUCAP_FRAME_STEP_RUNNING)
+     return;
+ 
+@@ -1234,6 +1293,14 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+     else if ( strncmp( (const char *)packet, "qEmucap,framestepstatus", 23) == 0) {
+       send_size = emucap_format_frame_step_status((char *)out_ptr, BUFMAX);
+     }
++    // Pacing readback: <percent, 0=unlimited>,<native unlimited 0/1>,<revision>,<VBlank clock>, hex.
++    else if ( strncmp( (const char *)packet, "qEmucap,pacing", 14) == 0) {
++      send_size = snprintf( (char *)out_ptr, BUFMAX, "%x,%x,%llx,%llx",
++                            (unsigned)emucap_pace_percent.load(),
++                            emucap_native_unlimited.load() ? 1u : 0u,
++                            (unsigned long long)emucap_pace_revision.load(),
++                            (unsigned long long)emucap_vblank_clock.load());
++    }
+     // emucap disassemble: qEmucap,disasm:<hexaddr>,<hexcount>[,<mode>] -> base64 of
+     // newline-separated "<addr>|<opcode>|<text>" rows on this stub's CPU. mode is an
+     // optional single char: 'a'=ARM, 't'=Thumb; absent = auto from the CPU CPSR T-bit.
+@@ -1266,6 +1333,22 @@ processPacket_gdb( SOCKET_TYPE sock, const uint8_t *packet,
+       strcpy( (char *)out_ptr, "OK");
+       send_size = 2;
+     }
++    // emucap pacing: QEmucap,pacing:<hex percent> sets 1..10000 percent of the DS refresh, 0 is
++    // unlimited. Replies OK, or E01 outside the domain.
++    else if ( strncmp( (const char *)packet, "QEmucap,pacing:", 15) == 0) {
++      const uint8_t *p = &packet[15];
++      uint32_t percent = 0;
++      if ( hexToInt( &p, &percent) && percent <= 10000) {
++        if ( emucap_pace_percent.exchange(percent) != percent)
++          emucap_pace_revision.fetch_add(1);
++        emucap_pace_wake.store(true);
++        strcpy( (char *)out_ptr, "OK");
++        send_size = 2;
++      } else {
++        strcpy( (char *)out_ptr, "E01");
++        send_size = 3;
++      }
++    }
+     // emucap touch: QEmucap,touch:release -> lift; QEmucap,touch:<hexX>,<hexY>[,<hexframes>] -> press.
+     else if ( strncmp( (const char *)packet, "QEmucap,touch:", 14) == 0) {
+       emucap_apply_touch( &packet[14]);
+@@ -1929,6 +2012,8 @@ WINAPI listenerThread_gdb( void *data) {
+             case READ_BREAK: {
+               /* break the running of the cpu */
+ 				if ( state->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE) {
++                /* end a pacing wait so the break takes effect at the next instruction */
++                emucap_pace_wake.store(true);
+                 /* this will cause the emulation to break the execution */
+                 DEBUG_LOG( "Breaking execution\n");
+ 
+@@ -1948,8 +2033,15 @@ WINAPI listenerThread_gdb( void *data) {
+               struct packet_reader_gdb *packet = &state->rx_packet;
+ 
+               if ( state->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE) {
+-                /* not ready to process packet yet, send a bad reply */
+-                reply = '-';
++                if ( packet->read_checksum == packet->checksum &&
++                     emucap_running_safe_packet( state->rx_packet.buffer)) {
++                  reply = '+';
++                  process_packet = 1;
++                }
++                else {
++                  /* not ready to process packet yet, send a bad reply */
++                  reply = '-';
++                }
+               }
+               else {
+                 /* send a reply based on the checksum and if okay process the packet */
+@@ -1967,7 +2059,9 @@ WINAPI listenerThread_gdb( void *data) {
+               if ( write_res != 1) {
+                 close_socket = 1;
+               }
+-              else {
++              else if ( process_packet) {
++                /* a rejected packet is retransmitted by the debugger; answering it as well
++                   would leave a second reply in the stream */
+                 if ( processPacket_gdb( gdb_sock, state->rx_packet.buffer,
+                                         state) == -1) {
+                   close_socket = 1;

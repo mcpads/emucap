@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) const RETRO_API_VERSION: u32 = 1;
-pub(super) const DEBUG_API_VERSION: u32 = 1;
+pub(super) const DEBUG_API_VERSION: u32 = 2;
 pub(super) const BP_EXEC: u32 = 0;
 pub(super) const BP_READ: u32 = 1;
 pub(super) const BP_WRITE: u32 = 2;
@@ -210,6 +210,7 @@ pub(super) struct CoreApi {
     pub(super) serialize: RetroSerialize,
     pub(super) unserialize: RetroUnserialize,
     pub(super) debug_read_memory: DebugReadMemory,
+    pub(super) debug_peek_memory: DebugReadMemory,
     pub(super) debug_write_memory: DebugWriteMemory,
     pub(super) debug_get_registers: DebugGetRegisters,
     pub(super) debug_step_instruction: DebugStepInstruction,
@@ -296,6 +297,7 @@ impl CoreApi {
             serialize: symbol!("retro_serialize", RetroSerialize),
             unserialize: symbol!("retro_unserialize", RetroUnserialize),
             debug_read_memory: symbol!("emucap_np2_read_memory", DebugReadMemory),
+            debug_peek_memory: symbol!("emucap_np2_peek_memory", DebugReadMemory),
             debug_write_memory: symbol!("emucap_np2_write_memory", DebugWriteMemory),
             debug_get_registers: symbol!("emucap_np2_get_regs", DebugGetRegisters),
             debug_step_instruction: symbol!("emucap_np2_step_instruction", DebugStepInstruction),

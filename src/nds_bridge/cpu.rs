@@ -363,8 +363,25 @@ impl<G: GdbTransport> CpuConn<G> {
         Ok(())
     }
 
+    /// Queries the fork answers while the guest runs (pacing and override counters). A frozen core
+    /// takes the normal path; a running one is not paused, so polling cannot shorten a pacing wait.
+    pub(super) fn query_running_safe(&mut self, payload: &str) -> NdsResult<String> {
+        // A stop that is already waiting means the core is halted; take the frozen path so the
+        // stop is classified before the reply.
+        self.drain_stops()?;
+        if self.frozen {
+            return self.send_cmd(payload);
+        }
+        let mut resp = self.gdb.send(payload)?;
+        while is_stop_packet(&resp) {
+            self.note_stop(resp);
+            resp = self.gdb.recv_reply()?;
+        }
+        Ok(resp)
+    }
+
     pub(super) fn override_remaining(&mut self, status_command: &str) -> NdsResult<i64> {
-        let resp = self.send_cmd(status_command)?;
+        let resp = self.query_running_safe(status_command)?;
         let remaining = resp.parse::<i64>().map_err(|_| {
             NdsBridgeError::Emulator(format!(
                 "timed override status returned an invalid value: {resp:?}"

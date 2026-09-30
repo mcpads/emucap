@@ -76,6 +76,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     pub(super) fn change_media(&mut self, params: &Value) -> BridgeResult<Value> {
         self.require_frozen("change_media")?;
+        self.boundary_seq += 1;
         if params.get("device").and_then(Value::as_str) != Some("diska") {
             return Err(OpenMsxBridgeError::BadParams(
                 "use device diska from status.media_devices".into(),

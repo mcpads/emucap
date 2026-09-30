@@ -12,6 +12,7 @@ mod debug;
 mod input;
 mod media;
 mod memory;
+mod observation;
 mod video;
 
 use std::collections::BTreeMap;
@@ -33,7 +34,7 @@ const PINE_MAX_REPLY: usize = 450_000;
 const PCSX2_EE_RAM_SIZE: u64 = 0x0200_0000;
 const MAX_MEMORY_TRANSFER: usize = 0x2_0000;
 const MAX_INPUT_FRAMES: u64 = 240;
-pub const REQUIRED_HOST_API: u32 = 5;
+pub const REQUIRED_HOST_API: u32 = 7;
 
 const MSG_VERSION: u8 = 0x08;
 const MSG_TITLE: u8 = 0x0b;
@@ -91,6 +92,27 @@ const METHODS: &[&str] = &[
     "poll_events",
     "call_stack",
     "reset",
+    "read_memory_batch",
+    "execution_speed",
+];
+
+/// Requests that neither change guest memory nor move the stop.
+const OBSERVATION_METHODS: &[&str] = &[
+    "hello",
+    "status",
+    "get_rom_info",
+    "read_memory",
+    "read_memory_batch",
+    "find_pattern",
+    "dump_memory",
+    "get_state",
+    "disassemble",
+    "save_state",
+    "screenshot",
+    "list_breakpoints",
+    "poll_events",
+    "call_stack",
+    "execution_speed",
 ];
 
 const ACTIVE_EXCEPTIONS: &[&str] = &[
@@ -325,6 +347,10 @@ pub struct Pcsx2Bridge<T> {
     host_api: u32,
     next_breakpoint_id: u64,
     breakpoints: BTreeMap<u64, Pcsx2Breakpoint>,
+    /// Bumped by every request outside the observation set, since those can change memory or the
+    /// stop without changing the frame counter.
+    boundary_seq: u64,
+    control_unverified: bool,
 }
 
 enum ContentSha1 {
@@ -391,6 +417,8 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             host_api: 0,
             next_breakpoint_id: 1,
             breakpoints: BTreeMap::new(),
+            boundary_seq: 0,
+            control_unverified: false,
         };
         bridge.host_api = bridge.read_u32_command(MSG_EMUCAP_VERSION, &[])?;
         if bridge.host_api != REQUIRED_HOST_API {
@@ -403,11 +431,14 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.pine.is_terminal()
+        self.control_unverified || self.pine.is_terminal()
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {
         let id = request.id;
+        if !OBSERVATION_METHODS.contains(&request.method.as_str()) {
+            self.boundary_seq += 1;
+        }
         let result = match request.method.as_str() {
             "hello" => self.hello(),
             "status" => self.status(),
@@ -435,6 +466,8 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "poll_events" => self.poll_events(),
             "call_stack" => self.call_stack(),
             "reset" => self.reset(),
+            "read_memory_batch" => self.read_memory_batch(&request.params),
+            "execution_speed" => self.execution_speed(&request.params),
             other if UNSUPPORTED_METHODS.contains(&other) => {
                 Err(Pcsx2BridgeError::Unsupported(other.into()))
             }
@@ -528,6 +561,8 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
                 "input_pulse_max_frames": MAX_INPUT_FRAMES,
             },
             "capability_notes": capability_notes(),
+            "memory_batch_capability": Self::memory_batch_capability(),
+            "execution_speed_capability": Self::execution_speed_capability(),
         });
         let object = value.as_object_mut().expect("hello object");
         if let Some(name) = &self.name {
@@ -550,6 +585,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         let version = self.read_string_command(MSG_VERSION)?;
         let input_override = self.input_override_info()?;
         let media = self.memory_card_status()?;
+        let pacing = self.native_pacing()?;
         Ok(json!({
             "connected": true,
             "system": "ps2",
@@ -569,6 +605,8 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "media_activity": media.activity_json(),
             "input_buttons": pcsx2_input_buttons_json(),
             "input_override": input_override,
+            "frame": pacing.frame,
+            "execution_speed": pacing.public(),
             "pcsx2_host_api": self.host_api,
             "pcsx2_version": version,
             "contracts": crate::contracts::advertisement_value(ACTIVE_EXCEPTIONS),
@@ -741,7 +779,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             "unit": "frames",
             "state": "frozen",
             "status": if reason == 0 { "completed" } else { "interrupted" },
-            "reason": match reason { 0 => "requested_count", 1 => "external_pause_or_debugger_stop", _ => "deadline" },
+            "reason": match reason { 0 => "requested_count", 1 => "external_pause_or_debugger_stop", _ => "host_deadline" },
         }))
     }
 

@@ -11,6 +11,17 @@ local exports = {
 
 local emucap_gdbstub = exports
 
+-- MAME console point identifiers and debugger command expressions are hexadecimal.
+-- Wire replies remain decimal numeric identifiers for the Rust bridge.
+function exports.debugger_point_index(message, prefix)
+  local digits = tostring(message):match(prefix .. " ([%x]+)%f[^%w]")
+  return digits and tonumber(digits, 16) or nil
+end
+
+function exports.debugger_point_clear_command(kind, index)
+  return string.format("%sclear %X", kind, index)
+end
+
 local regmaps = {
   i386 = {
     togdb = {
@@ -211,8 +222,28 @@ end
 
 local packet_sequence = 0
 
+-- The socket is non-blocking; a large reply can be accepted partially. Retry the remainder so a
+-- packet is never truncated on the wire.
+local function write_all(socket, data)
+  local offset = 1
+  local idle_until
+  while offset <= #data do
+    local written = socket:write(data:sub(offset)) or 0
+    if written > 0 then
+      offset = offset + written
+      idle_until = nil
+    else
+      local now = os.clock()
+      idle_until = idle_until or (now + 5)
+      if now > idle_until then
+        error("socket write stalled")
+      end
+    end
+  end
+end
+
 local function packet(socket, payload)
-  socket:write("$" .. payload .. "#" .. chksum(payload))
+  write_all(socket, "$" .. payload .. "#" .. chksum(payload))
   packet_sequence = packet_sequence + 1
 end
 
@@ -247,6 +278,16 @@ function emucap_gdbstub.startplugin()
   local frame_wait_screen_start
   local frame_wait_probe
   local frame_wait_release_input = false
+  -- Host deadline (osd ticks) for the current frame wait and its requested count. A paced advance
+  -- that cannot reach its target in time stops at the reached frame and reports DEADLINE.
+  local frame_wait_deadline
+  local frame_wait_requested
+  local next_frame_wait_deadline_ms
+  local throttle_wait_hook
+  -- Bumped by every request that can change memory, registers or the stop at one emulated time.
+  local boundary_seq = 0
+  local pacing_revision = 0
+  local pacing_last_key
   local clear_inputs
   local refresh_input_bindings
   local break_on_reset_enabled = false
@@ -275,6 +316,8 @@ function emucap_gdbstub.startplugin()
     frame_wait_screen_start = nil
     frame_wait_probe = nil
     frame_wait_release_input = false
+    frame_wait_deadline = nil
+    frame_wait_requested = nil
     if release_input and clear_inputs then
       clear_inputs()
     end
@@ -495,6 +538,10 @@ function emucap_gdbstub.startplugin()
       print("emucap_gdbstub: input discovery after reset failed "
         .. tostring(input_call_ok and input_error or input_ok))
     end
+    local video = manager.machine.video
+    if video.set_throttle_wait_hook and throttle_wait_hook then
+      video:set_throttle_wait_hook(throttle_wait_hook)
+    end
     -- A synchronous reset completes at this notifier, not when soft_reset merely
     -- accepts the request.
     finish_pending_reset_reply(points_ok and "OK" or "E0E")
@@ -508,6 +555,10 @@ function emucap_gdbstub.startplugin()
     finish_pending_reset_reply("E17")
     pending_save = nil
     pending_load = nil
+    local video = manager.machine and manager.machine.video
+    if video and video.set_throttle_wait_hook then
+      video:set_throttle_wait_hook(nil)
+    end
     consolelog = nil
     cpu = nil
     debugger = nil
@@ -590,14 +641,26 @@ function emucap_gdbstub.startplugin()
     end
   end
 
-  local function read_program_hex(addr, len)
-    local out = {}
+  -- Debugger view with device side effects disabled (GRCG/EGC latches, read-clear registers).
+  -- Returns nil when any byte cannot be translated.
+  local function read_program_bytes(addr, len)
     local space = cpu.spaces["program"]
+    if space.read_peek_block then
+      return space:read_peek_block(addr, len)
+    end
+    local out = {}
     for count = 1, len do
-      out[count] = string.format("%.2x", space:readv_u8(addr))
-      addr = addr + 1
+      out[count] = string.char(space:readv_u8(addr + count - 1))
     end
     return table.concat(out)
+  end
+
+  local function read_program_hex(addr, len)
+    local bytes = read_program_bytes(addr, len)
+    if not bytes then
+      return nil
+    end
+    return (bytes:gsub(".", function(c) return string.format("%.2x", string.byte(c)) end))
   end
 
   local function stop_debugger()
@@ -694,7 +757,7 @@ function emucap_gdbstub.startplugin()
 
     trace("note_bp detected msg=[" .. tostring(msg) .. "] execstate=" .. tostring(debugger.execution_state))
     local map = regmaps[cpu.shortname]
-    local point = tonumber(msg:match("Stopped at breakpoint ([0-9]+)"))
+    local point = exports.debugger_point_index(msg, "Stopped at breakpoint")
     if point then
       running = false
       local reply_to_frame_wait = frame_wait_target ~= nil
@@ -704,7 +767,7 @@ function emucap_gdbstub.startplugin()
       local payload
       if addr then
         -- use bpclear (not bpdisable) so re-arm at same address succeeds
-        run_debugger_command("bpclear " .. tostring(point))
+        run_debugger_command(exports.debugger_point_clear_command("bp", point))
         breaks.byaddr[addr] = nil
         breaks.byidx[point] = nil
         if breaks.pause then breaks.pause[point] = nil end
@@ -734,7 +797,7 @@ function emucap_gdbstub.startplugin()
       return true
     end
 
-    point = tonumber(msg:match("Stopped at watchpoint ([0-9]+)"))
+    point = exports.debugger_point_index(msg, "Stopped at watchpoint")
     if point then
       running = false
       local reply_to_frame_wait = frame_wait_target ~= nil
@@ -744,7 +807,7 @@ function emucap_gdbstub.startplugin()
       local payload
       if wp then
         -- use wpclear (not wpdisable) so re-arm at same address succeeds
-        run_debugger_command("wpclear " .. tostring(point))
+        run_debugger_command(exports.debugger_point_clear_command("wp", point))
         watches.byidx[point] = nil
         watches.byaddr[wp.key] = nil
         breakpoint_hit_seq = breakpoint_hit_seq + 1
@@ -768,7 +831,7 @@ function emucap_gdbstub.startplugin()
       return true
     end
 
-    point = tonumber(msg:match("Stopped at registerpoint ([0-9]+)"))
+    point = exports.debugger_point_index(msg, "Stopped at registerpoint")
     if point then
       running = false
       local reply_to_frame_wait = frame_wait_target ~= nil
@@ -778,7 +841,7 @@ function emucap_gdbstub.startplugin()
       local payload
       if rp then
         -- use rpclear (not rpdisable) so the registerpoint can be re-set
-        run_debugger_command("rpclear " .. tostring(point))
+        run_debugger_command(exports.debugger_point_clear_command("rp", point))
         regpoints.byidx[point] = nil
         payload = "T05regwatch:" .. makele(cpu.state[map.pcreg].value, map.addrsize) .. ";idx:" .. tostring(point) .. ";regs:" .. regs_payload(map)
       else
@@ -938,7 +1001,7 @@ function emucap_gdbstub.startplugin()
     local idx
     if consolelog then
       for i = before + 1, #consolelog do
-        idx = tonumber(tostring(consolelog[i]):match("Breakpoint (%d+) set"))
+        idx = exports.debugger_point_index(consolelog[i], "Breakpoint")
         if idx then break end
       end
     end
@@ -981,6 +1044,11 @@ function emucap_gdbstub.startplugin()
     -- frame number during boot; an absolute target would then become unreachable and strand the
     -- pending request until its socket timeout.
     frame_wait_target = frames
+    frame_wait_requested = frames
+    if next_frame_wait_deadline_ms then
+      frame_wait_deadline = emu.osd_ticks() + (emu.osd_ticks_per_second() * next_frame_wait_deadline_ms) // 1000
+      next_frame_wait_deadline_ms = nil
+    end
     frame_wait_stop = stop_on_done and true or false
     frame_wait_screen_start = frame_wait_stop and current_frame() or nil
     frame_wait_release_input = release_input_on_done and true or false
@@ -999,6 +1067,7 @@ function emucap_gdbstub.startplugin()
     if not frame_wait_target then
       return
     end
+    local reached, done
     if frame_wait_stop and frame_wait_screen_start then
       local frame_now = current_frame()
       if frame_now < frame_wait_screen_start then
@@ -1009,14 +1078,24 @@ function emucap_gdbstub.startplugin()
         ack_packet(socket, "E15")
         return
       end
-      if frame_now - frame_wait_screen_start < frame_wait_target then
-        return
-      end
+      done = frame_now - frame_wait_screen_start
+      reached = done >= frame_wait_target
     else
       frame_wait_target = frame_wait_target - 1
-      if frame_wait_target > 0 then
-        return
+      done = (frame_wait_requested or 0) - frame_wait_target
+      reached = frame_wait_target <= 0
+    end
+    if not reached then
+      if frame_wait_deadline and emu.osd_ticks() >= frame_wait_deadline then
+        clear_frame_wait()
+        if debugger then
+          running = false
+          debugger.execution_state = "stop"
+          hold_requested = true
+        end
+        ack_packet(socket, "DEADLINE:" .. tostring(done))
       end
+      return
     end
 
     local should_stop = frame_wait_stop
@@ -1029,7 +1108,7 @@ function emucap_gdbstub.startplugin()
     end
     if probe then
       local map = regmaps[cpu.shortname]
-      ack_packet(socket, "HEX:" .. read_program_hex(probe.addr, probe.len) .. "|FRAME:" .. tostring(current_frame()) .. "|REGS:" .. regs_payload(map))
+      ack_packet(socket, "HEX:" .. (read_program_hex(probe.addr, probe.len) or "") .. "|FRAME:" .. tostring(current_frame()) .. "|REGS:" .. regs_payload(map))
     else
       ack_packet(socket, "OK")
     end
@@ -1096,7 +1175,7 @@ function emucap_gdbstub.startplugin()
       return
     end
     local idx = breaks.byaddr[addr]
-    run_debugger_command("bpclear " .. tostring(idx))
+    run_debugger_command(exports.debugger_point_clear_command("bp", idx))
     breaks.byaddr[addr] = nil
     breaks.byidx[idx] = nil
     ack_packet(socket, "OK")
@@ -1138,7 +1217,7 @@ function emucap_gdbstub.startplugin()
     local idx
     if consolelog then
       for i = before + 1, #consolelog do
-        idx = tonumber(tostring(consolelog[i]):match("Watchpoint (%d+) set"))
+        idx = exports.debugger_point_index(consolelog[i], "Watchpoint")
         if idx then break end
       end
     end
@@ -1168,7 +1247,7 @@ function emucap_gdbstub.startplugin()
       return
     end
     local idx = watches.byaddr[key]
-    run_debugger_command("wpclear " .. tostring(idx))
+    run_debugger_command(exports.debugger_point_clear_command("wp", idx))
     watches.byaddr[key] = nil
     watches.byidx[idx] = nil
     ack_packet(socket, "OK")
@@ -1181,7 +1260,7 @@ function emucap_gdbstub.startplugin()
       return
     end
     local addr = breaks.byidx[idx]
-    run_debugger_command("bpclear " .. tostring(idx))
+    run_debugger_command(exports.debugger_point_clear_command("bp", idx))
     breaks.byidx[idx] = nil
     breaks.byaddr[addr] = nil
     ack_packet(socket, "OK")
@@ -1194,7 +1273,7 @@ function emucap_gdbstub.startplugin()
       return
     end
     local wp = watches.byidx[idx]
-    run_debugger_command("wpclear " .. tostring(idx))
+    run_debugger_command(exports.debugger_point_clear_command("wp", idx))
     watches.byidx[idx] = nil
     watches.byaddr[wp.key] = nil
     ack_packet(socket, "OK")
@@ -1210,7 +1289,7 @@ function emucap_gdbstub.startplugin()
     local idx
     if consolelog then
       for i = before + 1, #consolelog do
-        idx = tonumber(tostring(consolelog[i]):match("Registerpoint (%d+) set"))
+        idx = exports.debugger_point_index(consolelog[i], "Registerpoint")
         if idx then break end
       end
     end
@@ -1228,7 +1307,7 @@ function emucap_gdbstub.startplugin()
       ack_packet(socket, "E00")
       return
     end
-    run_debugger_command("rpclear " .. tostring(idx))
+    run_debugger_command(exports.debugger_point_clear_command("rp", idx))
     regpoints.byidx[idx] = nil
     ack_packet(socket, "OK")
   end
@@ -1276,6 +1355,60 @@ function emucap_gdbstub.startplugin()
 
   local StateItems = require("emucap_gdbstub.state_items")
 
+  local function time_string()
+    local t = manager.machine.time
+    return string.format("%d.%018d", t.seconds, t.attoseconds)
+  end
+
+  -- Opaque stop identity: request sequence, emulated time and screen frame.
+  local function boundary_token()
+    return tostring(boundary_seq) .. "@" .. time_string() .. "|" .. tostring(current_frame())
+  end
+
+  -- Effective native governor. The revision is the plugin's count of observed tuple changes on
+  -- the emulation thread, so a UI toggle between two observations is seen as a new revision.
+  local function native_pacing()
+    local video = manager.machine.video
+    local fastforward = false
+    pcall(function() fastforward = video.fastforward and true or false end)
+    local refresh_speed = false
+    pcall(function() refresh_speed = manager.machine.options.entries["refreshspeed"]:value() and true or false end)
+    return {
+      throttled = video.throttled and true or false,
+      speed = video.speed_factor,
+      rate = video.throttle_rate,
+      fastforward = fastforward,
+      refresh_speed = refresh_speed,
+    }
+  end
+
+  local function pacing_payload()
+    local n = native_pacing()
+    local key = string.format("%s|%d|%s|%s|%s", n.throttled and "1" or "0", n.speed,
+      tostring(n.rate), n.fastforward and "1" or "0", n.refresh_speed and "1" or "0")
+    if key ~= pacing_last_key then
+      pacing_revision = pacing_revision + 1
+      pacing_last_key = key
+    end
+    local period = 0
+    local screen = first_screen()
+    if screen then
+      pcall(function() period = screen.frame_period end)
+    end
+    return tostring(pacing_revision) .. "|" .. key .. "|" .. string.format("%.9f", period)
+  end
+
+  local function apply_native_pacing(throttled, speed, rate)
+    local video = manager.machine.video
+    if speed then
+      video.speed_factor = speed
+    end
+    if rate then
+      video.throttle_rate = rate
+    end
+    video.throttled = throttled
+  end
+
   local function handle_emucap(payload)
     local name, rest = payload:match("^qEmucap,([^,]*),?(.*)$")
     if not name then
@@ -1284,6 +1417,110 @@ function emucap_gdbstub.startplugin()
 
     if name == "frame" then
       ack_packet(socket, tostring(current_frame()))
+      return true
+    elseif name == "features" then
+      local space = cpu and cpu.spaces["program"]
+      local video = manager.machine.video
+      local features = {}
+      if space and space.read_peek_block then
+        features[#features + 1] = "peek_block"
+      end
+      if video.set_throttle_wait_hook then
+        features[#features + 1] = "throttle_wait_hook"
+      end
+      if pcall(function() return video.fastforward end) and video.fastforward ~= nil then
+        features[#features + 1] = "fastforward_readback"
+      end
+      ack_packet(socket, table.concat(features, ","))
+      return true
+    elseif name == "pacing" then
+      ack_packet(socket, pacing_payload())
+      return true
+    elseif name == "setpacing" then
+      -- One emulation-thread call: observe, apply, read back. "limited|<per mille>" or "unlimited".
+      local spec = hex_to_string(rest or "") or ""
+      local mode, speed = spec:match("^(%a+)|?(%d*)$")
+      speed = tonumber(speed)
+      if not ((mode == "limited" and speed and speed >= 1 and speed <= 100000)
+          or (mode == "unlimited" and not speed)) then
+        ack_packet(socket, "E00")
+        return true
+      end
+      local before = boundary_token()
+      local previous_native = native_pacing()
+      local previous = pacing_payload()
+      local ok, err = pcall(function()
+        if mode == "limited" then
+          apply_native_pacing(true, speed, 1.0)
+        else
+          apply_native_pacing(false)
+        end
+      end)
+      if not ok then
+        local restored = pcall(apply_native_pacing, previous_native.throttled,
+          previous_native.speed, previous_native.rate)
+        ack_packet(socket, "E1D:" .. (restored and "restored" or "unrestored") .. ":" .. string_to_hex(tostring(err)))
+        return true
+      end
+      ack_packet(socket, previous .. ";" .. pacing_payload() .. ";" .. before .. ";" .. boundary_token())
+      return true
+    elseif name == "restorepacing" then
+      -- Compare-and-set: restore only while the transaction's applied revision is still current.
+      local spec = hex_to_string(rest or "") or ""
+      local expected, throttled, speed, rate = spec:match("^(%d+)|([01])|(%d+)|([%d%.]+)$")
+      if not expected then
+        ack_packet(socket, "E00")
+        return true
+      end
+      local current = pacing_payload()
+      if tostring(pacing_revision) ~= expected then
+        ack_packet(socket, "CONFLICT|" .. current)
+        return true
+      end
+      local ok = pcall(apply_native_pacing, throttled == "1", tonumber(speed), tonumber(rate))
+      ack_packet(socket, ok and pacing_payload() or "E1D:unrestored")
+      return true
+    elseif name == "opdeadline" then
+      local ms = tonumber(hex_to_string(rest or "") or "")
+      if not ms or ms < 1 then
+        ack_packet(socket, "E00")
+        return true
+      end
+      next_frame_wait_deadline_ms = ms
+      ack_packet(socket, "OK")
+      return true
+    elseif name == "peekbatch" then
+      -- Side-effect-free reads of every range at one frozen stop; all or nothing.
+      local spec = hex_to_string(rest or "")
+      if not spec or not cpu or not debugger then
+        ack_packet(socket, "E00")
+        return true
+      end
+      if running or frame_wait_target or not manager.machine.paused then
+        ack_packet(socket, "E1E")
+        return true
+      end
+      local space = cpu.spaces["program"]
+      if not space.read_peek_block then
+        ack_packet(socket, "E1F")
+        return true
+      end
+      local before = boundary_token()
+      local parts = {}
+      for address, length in spec:gmatch("(%x+):(%x+)") do
+        length = tonumber(length, 16)
+        local bytes = space:read_peek_block(tonumber(address, 16), length)
+        if not bytes or #bytes ~= length then
+          ack_packet(socket, "E1C")
+          return true
+        end
+        parts[#parts + 1] = string_to_hex(bytes)
+      end
+      if boundary_token() ~= before then
+        ack_packet(socket, "E20")
+        return true
+      end
+      ack_packet(socket, "OK|" .. before .. "|" .. table.concat(parts, ","))
       return true
     elseif name == "mediastatus" then
       ack_packet(socket, media_status_payload())
@@ -1954,7 +2191,7 @@ function emucap_gdbstub.startplugin()
       if addr and len then
         addr = tonumber(addr, 16)
         len = tonumber(len, 16)
-        ack_packet(socket, read_program_hex(addr, len))
+        ack_packet(socket, read_program_hex(addr, len) or "E1C")
       else
         ack_packet(socket, "E00")
       end
@@ -2030,8 +2267,19 @@ function emucap_gdbstub.startplugin()
     return payload:sub(1, 1)
   end
 
+  -- Requests after which memory, registers or the stop may differ at one emulated time.
+  local boundary_operations = {
+    pause = true, M = true, G = true, s = true, c = true,
+    framestep = true, runframes = true, press = true, pointermove = true, stop = true,
+    stateload = true, load = true, loadsync = true, loaditems = true, loadpixels = true,
+    finishload = true, regload = true, reset = true, resetsync = true, mediachange = true,
+  }
+
   handle_payload_safely = function(payload)
     local operation = request_operation(payload)
+    if boundary_operations[operation] then
+      boundary_seq = boundary_seq + 1
+    end
     local response_before = packet_sequence
     local ok, handler_error = pcall(function()
       if injected_failure_request ~= ""
@@ -2067,6 +2315,55 @@ function emucap_gdbstub.startplugin()
       end
     end
     return true
+  end
+
+  -- Read-only requests answered inside a throttle wait. Serving them there keeps a status poll
+  -- from ending the wait and advancing a slow guest early; any other request ends the wait so
+  -- it is handled at the frame boundary.
+  local mid_wait_operations = {
+    frame = true, pacing = true, features = true, mediastatus = true,
+    inputstatus = true, inputfields = true, pointerstatus = true,
+  }
+
+  local function pending_payload()
+    local start = rxbuf:find("%$")
+    if not start then
+      return nil
+    end
+    local hash = rxbuf:find("#", start + 1, true)
+    if not hash or #rxbuf < hash + 2 then
+      return nil
+    end
+    return rxbuf:sub(start + 1, hash - 1)
+  end
+
+  -- Runs while MAME's native throttle sleeps between frames. Returning true ends the wait so a
+  -- control request or a paced advance deadline is handled at any speed.
+  throttle_wait_hook = function()
+    if not socket or not cpu or manager.machine.paused then
+      return false
+    end
+    if frame_wait_deadline and emu.osd_ticks() >= frame_wait_deadline then
+      return true
+    end
+    if not pcall(read_socket) then
+      return false
+    end
+    while true do
+      if rxbuf:find("\x03", 1, true) then
+        return true
+      end
+      local payload = pending_payload()
+      if not payload then
+        return false
+      end
+      if not mid_wait_operations[request_operation(payload)] then
+        return true
+      end
+      if not handle_payload_safely(next_packet()) then
+        return false
+      end
+    end
   end
 
   emu.register_periodic(function()

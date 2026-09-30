@@ -71,6 +71,7 @@ fn session_cleanup_refuses_a_replacement_launch_generation() {
             breakpoint_kinds: vec![],
             contracts: crate::contracts::ContractAdvertisement::Unreported,
             recording: None,
+            features: Default::default(),
             identity: EmulatorIdentity {
                 launch_id: Some("original-generation".into()),
                 ..EmulatorIdentity::default()

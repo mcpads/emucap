@@ -1,0 +1,111 @@
+diff --git a/desmume/src/gdbstub/gdbstub.cpp b/desmume/src/gdbstub/gdbstub.cpp
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -103,6 +103,7 @@
+ static std::atomic<uint64_t> emucap_pace_revision{1};
+ static std::atomic<bool> emucap_pace_wake{false};
+ static std::atomic<uint64_t> emucap_vblank_clock{0};
++static std::atomic<uint64_t> emucap_memory_epoch{1};
+ 
+ void emucap_pace_frames(int frames, int native_unlimited) {
+   typedef std::chrono::steady_clock clock;
+@@ -140,7 +141,7 @@
+ // only, so they neither touch guest state nor need a stopped CPU.
+ static bool emucap_running_safe_packet(const uint8_t *packet) {
+   static const char *const prefixes[] = {
+-    "qEmucap,pacing", "QEmucap,pacing:", "qEmucap,inputstatus", "qEmucap,touchstatus",
++    "qEmucap,batch:", "qEmucap,pacing", "QEmucap,pacing:", "qEmucap,inputstatus", "qEmucap,touchstatus",
+   };
+   for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+     if (strncmp((const char *)packet, prefixes[i], strlen(prefixes[i])) == 0)
+@@ -471,6 +472,7 @@
+     stub->cpu_ctrl->remove_post_ex_fn(stub->cpu_ctrl->data);
+     stub->cpu_ctrl->stall(stub->cpu_ctrl->data);
+     stub->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
++    ++emucap_memory_epoch;
+     stub->stop_type = STOP_UNKNOWN;
+     stub->stop_address = 0;
+   }
+@@ -545,6 +547,7 @@
+     stub->cpu_ctrl->stall(stub->cpu_ctrl->data);
+     stub->emu_stub_state = gdb_stub_state::STOPPED_EMU_GDB_STATE;
+     stub->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
++    ++emucap_memory_epoch;
+     stub->main_stop_flag = 1;
+     stub->stop_type = STOP_UNKNOWN;
+     stub->stop_address = 0;
+@@ -1231,6 +1234,32 @@
+ }
+ 
+ 
++
++static bool EmucapBatchRanges(const std::string &text, std::vector<std::pair<uint32_t, uint32_t>> &ranges, uint32_t &total, uint32_t limit, uint32_t window) {
++  size_t at = 0;
++  auto number = [&](uint32_t &value) {
++    value = 0; size_t begin = at;
++    while (at < text.size()) {
++      char c = text[at];
++      unsigned digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : 16;
++      if (digit == 16) break;
++      if (value > (UINT32_MAX - digit) / 16) return false;
++      value = value * 16 + digit; ++at;
++    }
++    return at > begin;
++  };
++  total = 0;
++  while (at < text.size()) {
++    uint32_t address, length;
++    if (ranges.size() == 64 || !number(address) || at == text.size() || text[at++] != ',' || !number(length)) return false;
++    if (!length || address >= window || length > window - address || length > limit - total) return false;
++    total += length; ranges.emplace_back(address, length);
++    if (at == text.size()) return true;
++    if (text[at++] != ';' || at == text.size()) return false;
++  }
++  return false;
++}
++
+ /**
+  * Returns -1 if there is a socket error.
+  */
+@@ -1250,6 +1279,7 @@
+   DEBUG_LOG("Processing packet %c\n", packet[0]);
+   gdbstub_mutex_lock();
+ 
++  if (strchr("cCsSMXGPZzQ", packet[0]) != NULL && strncmp((const char *)packet, "QEmucap,pacing:", 15) != 0) ++emucap_memory_epoch;
+   switch( packet[0]) {
+   case 3:
+     /* The break command */
+@@ -1300,6 +1330,25 @@
+                             emucap_native_unlimited.load() ? 1u : 0u,
+                             (unsigned long long)emucap_pace_revision.load(),
+                             (unsigned long long)emucap_vblank_clock.load());
++    }
++    // One stopped-scheduler acquisition; the 8 KiB cap fits a single RSP reply.
++    else if (strncmp((const char *)packet, "qEmucap,batch:", 14) == 0) {
++      std::vector<std::pair<uint32_t, uint32_t>> ranges;
++      uint32_t total = 0;
++      if (stub->ctl_stub_state != gdb_stub_state::STOPPED_GDB_STATE ||
++          !EmucapBatchRanges((const char *)packet + 14, ranges, total, 8192, 4 * 1024 * 1024)) {
++        strcpy((char *)out_ptr, "E03"); send_size = 3;
++      } else {
++        send_size = snprintf((char *)out_ptr, BUFMAX, "%llx,%llx:",
++          (unsigned long long)emucap_memory_epoch.load(), (unsigned long long)emucap_vblank_clock.load());
++        const char *digits = "0123456789abcdef";
++        for (const auto &range : ranges) {
++          for (uint32_t i = 0; i < range.second; ++i) {
++            unsigned byte = MMU.MAIN_MEM[range.first + i];
++            out_ptr[send_size++] = digits[byte >> 4]; out_ptr[send_size++] = digits[byte & 15];
++          }
++        }
++      }
+     }
+     // emucap disassemble: qEmucap,disasm:<hexaddr>,<hexcount>[,<mode>] -> base64 of
+     // newline-separated "<addr>|<opcode>|<text>" rows on this stub's CPU. mode is an
+@@ -2291,6 +2340,7 @@
+     stub->active = 1;
+ 	stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
+ 	stub->ctl_stub_state = gdb_stub_state::STOPPED_GDB_STATE;
++    ++emucap_memory_epoch;
+     stub->rx_packet.state = IDLE_READ_STATE;
+ 
+     stub->main_stop_flag = 1;

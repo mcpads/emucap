@@ -39,6 +39,7 @@ impl InputWireLink {
                     },
                 ),
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
             calls: vec![],
@@ -75,6 +76,7 @@ impl StepWireLink {
                 breakpoint_kinds: vec![],
                 contracts: emucap::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
             last_method: None,
@@ -110,6 +112,7 @@ impl DetReplayLink {
                 breakpoint_kinds: vec![],
                 contracts: emucap::contracts::ContractAdvertisement::Unreported,
                 recording: None,
+                features: Default::default(),
                 identity: EmulatorIdentity::default(),
             },
             obs_queue: std::collections::VecDeque::new(),
@@ -288,6 +291,7 @@ fn front_panel_exposes_basic_controls_and_hides_drawer_operations() {
         "tap",
         "change_media",
         "write_memory",
+        "read_memory_batch",
         "disassemble",
         "call_stack",
         "set_breakpoint",
@@ -349,6 +353,7 @@ fn drawers_publish_only_current_operations_and_bind_execution_to_the_revision() 
         "methods": [
             "probe",
             "power_cycle",
+            "execution_speed",
             "disassemble",
             "set_input",
             "hold_touch",
@@ -360,6 +365,7 @@ fn drawers_publish_only_current_operations_and_bind_execution_to_the_revision() 
     let debug = debug_surface::describe(&status);
     assert!(debug["operations"]["probe"].is_object());
     assert!(debug["operations"]["power_cycle"].is_object());
+    assert!(debug["operations"]["execution_speed"]["arguments_schema"].is_object());
     assert!(debug["operations"].get("disassemble").is_none());
     assert!(debug["operations"].get("record_window").is_none());
     assert_eq!(debug["capability_revision"], "revision-a");

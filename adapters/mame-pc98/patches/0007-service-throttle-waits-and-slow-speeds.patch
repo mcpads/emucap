@@ -1,0 +1,140 @@
+--- a/src/emu/video.h
++++ b/src/emu/video.h
+@@ -10,6 +10,8 @@
+ 
+ #pragma once
+ 
++#include <functional>
++
+ #ifndef __EMU_H__
+ #error Dont include this file directly; include emu.h instead.
+ #endif
+@@ -61,6 +63,9 @@
+ 	void set_fastforward(bool ffwd) { m_fastforward = ffwd; }
+ 	void set_output_changed() { m_output_changed = true; }
+ 	void set_speed_factor(int speed) { m_speed = speed; }
++	// Called at bounded intervals while a throttle wait sleeps; returning true ends the wait so the
++	// frame can finish and queued control requests are serviced without waiting a full frame.
++	void set_throttle_wait_hook(std::function<bool ()> &&hook) { m_throttle_wait_hook = std::move(hook); }
+ 
+ 	// misc
+ 	void toggle_record_movie(movie_recording::format format);
+@@ -145,6 +150,7 @@
+ 	u32                 m_seconds_to_run;           // number of seconds to run before quitting
+ 	bool                m_auto_frameskip;           // flag: true if we're automatically frameskipping
+ 	u32                 m_speed;                    // overall speed (*1000)
++	std::function<bool ()> m_throttle_wait_hook;  // services control during throttle waits
+ 	bool                m_low_latency;              // flag: true if we are throttling after blitting
+ 
+ 	// frameskipping
+--- a/src/emu/video.cpp
++++ b/src/emu/video.cpp
+@@ -29,7 +29,9 @@
+ 
+ #include "rendersw.hxx"
+ 
++#include <limits>
+ 
++
+ //**************************************************************************
+ //  DEBUGGING
+ //**************************************************************************
+@@ -725,7 +727,13 @@
+ 		// between 0 and 1/10th of a second ... anything outside of this range is obviously
+ 		// wrong and requires a resync
+ 		attoseconds_t emu_delta_attoseconds = (emutime - m_throttle_emutime).as_attoseconds();
+-		if (emu_delta_attoseconds < 0 || emu_delta_attoseconds >= (ATTOSECONDS_PER_SECOND / (m_speed ? m_speed : 1000)) * 100)
++		// the anomaly bound is 1/10 s of speed-scaled emulated time; below 1.1% speed the
++		// product exceeds attoseconds_t, so saturate instead of wrapping negative
++		u32 const speed = m_speed ? m_speed : 1000;
++		attoseconds_t const max_emu_delta = (speed > 10)
++				? (ATTOSECONDS_PER_SECOND / speed) * 100
++				: std::numeric_limits<attoseconds_t>::max();
++		if (emu_delta_attoseconds < 0 || emu_delta_attoseconds >= max_emu_delta)
+ 		{
+ 			if (LOG_THROTTLE)
+ 				machine().logerror("Resync due to weird emutime delta: %s\n", attotime(0, emu_delta_attoseconds).as_string(18));
+@@ -761,6 +769,9 @@
+ 		// determine how far ahead real time is versus emulated time; note that we use the
+ 		// accumulated times for this instead of the deltas for the current update because
+ 		// we want to track time over a longer duration than a single update
++		// as_attoseconds() saturates at one second, which would cap every wait at one second per
++		// update; keep the full lead for slow speed factors
++		double const real_is_ahead_seconds = (m_throttle_emutime - m_throttle_realtime).as_double();
+ 		attoseconds_t real_is_ahead_attoseconds = (m_throttle_emutime - m_throttle_realtime).as_attoseconds();
+ 
+ 		// if we're more than 1/10th of a second out, or if we are behind at all and emulation
+@@ -778,12 +789,18 @@
+ 			return;
+ 
+ 		// compute the target real time, in ticks, where we want to be
+-		osd_ticks_t target_ticks = m_throttle_last_ticks + real_is_ahead_attoseconds / attoseconds_per_tick;
++		osd_ticks_t const ahead_ticks = (real_is_ahead_seconds >= 1.0)
++				? osd_ticks_t(real_is_ahead_seconds * double(ticks_per_second) / double(m_throttle_rate))
++				: osd_ticks_t(real_is_ahead_attoseconds / attoseconds_per_tick);
++		osd_ticks_t target_ticks = m_throttle_last_ticks + ahead_ticks;
+ 
+ 		// throttle until we read the target, and update real time to match the final time
+ 		diff_ticks = throttle_until_ticks(target_ticks) - m_throttle_last_ticks;
+ 		m_throttle_last_ticks += diff_ticks;
+-		m_throttle_realtime += attotime(0, diff_ticks * attoseconds_per_tick);
++		// a wait of one second or more does not fit a single attoseconds field
++		m_throttle_realtime += (diff_ticks < ticks_per_second)
++				? attotime(0, diff_ticks * attoseconds_per_tick)
++				: attotime::from_double(double(diff_ticks) * double(attoseconds_per_tick) / double(ATTOSECONDS_PER_SECOND));
+ 		return;
+ 	}
+ 
+@@ -816,6 +833,11 @@
+ 		else
+ 			delta = 0;
+ 
++		// with a wait hook, sleep in slices of at most 5 ms so control is serviced at any speed
++		osd_ticks_t const slice = osd_ticks_per_second() / 200;
++		if (m_throttle_wait_hook && delta > slice)
++			delta = slice;
++
+ 		// see if we can sleep
+ 		bool const slept = allowed_to_sleep && delta;
+ 		if (slept)
+@@ -840,6 +862,8 @@
+ 			}
+ 		}
+ 		current_ticks = new_ticks;
++		if (m_throttle_wait_hook && current_ticks < target_ticks && m_throttle_wait_hook())
++			break;
+ 	}
+ 
+ 	return current_ticks;
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -2216,6 +2216,29 @@
+ 	video_type["throttle_rate"] = sol::property(&video_manager::throttle_rate, &video_manager::set_throttle_rate);
+ 	video_type["frameskip"] = sol::property(&video_manager::frameskip, &video_manager::set_frameskip);
+ 	video_type["fastforward"] = sol::property(&video_manager::fastforward);
++	video_type.set_function("set_throttle_wait_hook",
++			[this] (video_manager &vm, sol::object callback)
++			{
++				if (callback == sol::lua_nil)
++				{
++					vm.set_throttle_wait_hook(nullptr);
++					return;
++				}
++				// Bind to the main Lua thread: a plugin may register from a notifier coroutine whose
++				// thread is collected before the hook runs.
++				vm.set_throttle_wait_hook(
++						[this, hook = callback.as<sol::main_protected_function>()] () -> bool
++						{
++							auto result = invoke_direct(hook);
++							if (!result.valid())
++							{
++								sol::error err = result;
++								osd_printf_error("[LUA ERROR] in throttle wait hook: %s\n", err.what());
++								return false;
++							}
++							return (result.get_type() == sol::type::boolean) && result.get<bool>();
++						});
++			});
+ 	video_type["speed_percent"] = sol::property(&video_manager::speed_percent);
+ 	video_type["effective_frameskip"] = sol::property(&video_manager::effective_frameskip);
+ 	video_type["skip_this_frame"] = sol::property(&video_manager::skip_this_frame);

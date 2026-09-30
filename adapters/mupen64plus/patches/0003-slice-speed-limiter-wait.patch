@@ -1,0 +1,34 @@
+--- a/src/main/main.c
++++ b/src/main/main.c
+@@ -959,6 +959,16 @@
+         l_FrameAdvance = 0;
+         StateChanged(M64CORE_EMU_STATE, M64EMU_PAUSED);
+     }
++}
++
++/* emucap: a debugger or core pause, a disabled limiter or a speed change ends a limiter wait. */
++static int emucap_limiter_wait_interrupted(int speed_factor)
++{
++#ifdef DBG
++    if (g_DebuggerActive && g_dbg_runstate == M64P_DBG_RUNSTATE_PAUSED)
++        return 1;
++#endif
++    return g_rom_pause || !l_MainSpeedLimit || l_SpeedFactor != speed_factor;
+ }
+ 
+ static void apply_speed_limiter(void)
+@@ -1016,7 +1026,13 @@
+     if(l_MainSpeedLimit && sleepTime > 0 && sleepTime < maxSleepNeeded*SpeedFactorMultiple)
+     {
+         while(sleepTime >= 0) {
+-            SDL_Delay((unsigned int) sleepTime);
++            /* emucap: sleep in slices of at most 10 ms so control is not held behind a long
++             * wait at a slow speed. */
++            SDL_Delay((unsigned int) (sleepTime < 10 ? sleepTime : 10));
++            if (emucap_limiter_wait_interrupted(lastSpeedFactor)) {
++                resetOnce = 0;
++                break;
++            }
+ 
+             CurrentFPSTime = SDL_GetTicks();
+             elapsedRealTime = CurrentFPSTime - StartFPSTime;

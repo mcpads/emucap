@@ -55,6 +55,18 @@ impl<G: GdbTransport> Bridge<G> {
             },
         });
         let obj = result.as_object_mut().expect("hello is an object");
+        if methods.contains(&"read_memory_batch") {
+            obj.insert(
+                "memory_batch_capability".into(),
+                json!(Self::memory_batch_capability()),
+            );
+        }
+        if methods.contains(&"execution_speed") {
+            obj.insert(
+                "execution_speed_capability".into(),
+                json!(Self::execution_speed_capability()),
+            );
+        }
         if let Some(name) = &self.env.name {
             obj.insert("name".into(), json!(name));
         }
@@ -92,8 +104,14 @@ impl<G: GdbTransport> Bridge<G> {
         if methods.contains(&"move_pointer") {
             active_exceptions.push("pc98.pointer-relative.constraints");
         }
+        let execution_speed = if methods.contains(&"execution_speed") {
+            Some(self.execution_speed_value()?)
+        } else {
+            None
+        };
         Ok(json!({
             "connected": true,
+            "execution_speed": execution_speed,
             "system": "pc98",
             "adapter": "mame-pc98-rust-gdb",
             "backend": "lua-gdbstub",
