@@ -133,13 +133,21 @@ echo "→ 추출"
 safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
 patch -d "$SRC" -p1 < "$HERE/patches/0001-restore-md-clock-origins.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0002-bound-resampler-decimation-read.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0003-preserve-deinterlacer-history.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0004-preserve-temporal-blur-history.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0005-bind-native-video-processing-history.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0006-preserve-driver-surfaces-during-presentation.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0007-serialize-driver-restoration-with-presentation.patch"
 
 # 3. emucap 소켓 클라이언트
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
+  "$HERE/emucap_completed_frame.h" "$HERE/emucap_driver_frames.h" "$HERE/emucap_driver_video.h" "$HERE/emucap_driver_video.inc" "$HERE/emucap_presentation_surface.h" "$HERE/emucap_video_format.h" \
   "$HERE/emucap_recording.cpp" "$HERE/emucap_recording.h" \
   "$HERE/emucap_ngp.h" \
   "$HERE/emucap_json_num.h" "$HERE/emucap_json_strings.h" "$HERE/emucap_pacing.h" \
   "$SRC/src/drivers/"
+cp "$HERE/emucap_video_format.h" "$SRC/src/video/"
 cp "$HERE/emucap_ngp.h" "$HERE/emucap_ngp_debug.h" "$HERE/emucap_ngp_debug.inc" \
   "$SRC/src/ngp/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/src/drivers/"
@@ -148,8 +156,12 @@ cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
-  build.sh upstream.lock patches/0001-restore-md-clock-origins.patch \
-  emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+  build.sh upstream.lock patches/0001-restore-md-clock-origins.patch patches/0002-bound-resampler-decimation-read.patch \
+  patches/0003-preserve-deinterlacer-history.patch patches/0004-preserve-temporal-blur-history.patch \
+    patches/0005-bind-native-video-processing-history.patch \
+    patches/0006-preserve-driver-surfaces-during-presentation.patch \
+    patches/0007-serialize-driver-restoration-with-presentation.patch \
+  emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
   emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
   emucap_pacing.h ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
@@ -157,7 +169,12 @@ git -C "$HERE" diff --quiet HEAD -- \
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 PATCHSET_SHA256="$({
   for path in \
-    build.sh patches/0001-restore-md-clock-origins.patch emucap.cpp emucap.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+    build.sh patches/0001-restore-md-clock-origins.patch patches/0002-bound-resampler-decimation-read.patch \
+    patches/0003-preserve-deinterlacer-history.patch patches/0004-preserve-temporal-blur-history.patch \
+    patches/0005-bind-native-video-processing-history.patch \
+    patches/0006-preserve-driver-surfaces-during-presentation.patch \
+    patches/0007-serialize-driver-restoration-with-presentation.patch \
+    emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
     emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
     emucap_pacing.h emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
@@ -189,24 +206,34 @@ MD_REPEATABLE_CONDITIONS_SHA256="$(sha256_path "$HERE/md-repeatable-profile.json
 inject_check() { grep -qF "$1" "$2" || { echo "ERROR: $3"; exit 1; }; }
 count_of() { grep -cF "$1" "$2" 2>/dev/null || true; }
 
-# 4. main.cpp 훅: emucap.h include + 첫 MDFNI_Emulate 이전 controlled-start park + 프레임 루프
-#    서비스 호출(MDFNI_Emulate 직후, SoftFB 직전). 화면 캡처(emucap_capture)도 여기 — 모든
-#    Mednafen 코어의 공통 드라이버 경로라 screenshot 동작.
+# 4. Capture before presentation; service after driver output and buffer-role selection.
+#    The controlled-start park precedes per-frame bindings and policy reads.
 perl -0777 -pi -e 's/(#include "main\.h"\n)/${1}#include "emucap.h"\n/ unless m{emucap\.h}' \
   "$SRC/src/drivers/main.cpp"
 perl -0777 -pi -e \
-  's/(\n[ \t]*if\(MDFN_UNLIKELY\(StateFuzzTest\)\))/\n\t ::emucap_pre_first_frame();${1}/ unless m{emucap_pre_first_frame}' \
+  's/(\n[ \t]*fskip = ers\.NeedFrameSkip\(\);)/\n\t ::emucap_pre_first_frame();${1}/ unless m{emucap_pre_first_frame}' \
   "$SRC/src/drivers/main.cpp"
 perl -0777 -pi -e \
-  's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}{ static uint64_t emucap_frame = 0; ::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths); ::emucap_service(++emucap_frame); }\n${1}${2}/m unless m{emucap_service}' \
+  's/(\n[ \t]*fskip \|= \(bool\)NoWaiting;)/${1}\n\t if(::emucap_frame_consumer_active()) fskip = false;/ unless m{emucap_frame_consumer_active}' \
   "$SRC/src/drivers/main.cpp"
-inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp 훅 삽입 실패"
-inject_check emucap_pre_first_frame "$SRC/src/drivers/main.cpp" "main.cpp pre-first 훅 삽입 실패"
+perl -0777 -pi -e \
+  's/^([ \t]*)(SoftFB\[SoftFB_BackBuffer\]\.rect = espec\.DisplayRect;)/${1}::emucap_capture((const void*)espec.surface, (const void*)\&espec.DisplayRect, (const void*)espec.LineWidths, espec.InterlaceOn ? espec.InterlaceField : -1);\n${1}${2}/m unless m{emucap_capture}' \
+  "$SRC/src/drivers/main.cpp"
+perl -0777 -pi -e \
+  's/(\n[ \t]*SoftFB_BackBuffer \^= do_flip;\n[ \t]*\})/${1}\n\t { static uint64_t emucap_frame = 0; ::emucap_service(++emucap_frame); }/ unless m{emucap_service}' \
+  "$SRC/src/drivers/main.cpp"
+inject_check emucap_capture "$SRC/src/drivers/main.cpp" "main.cpp capture hook insertion failed"
+inject_check emucap_pre_first_frame "$SRC/src/drivers/main.cpp" "main.cpp pre-first hook insertion failed"
+inject_check emucap_frame_consumer_active "$SRC/src/drivers/main.cpp" "main.cpp frame consumer hook insertion failed"
+inject_check 'emucap_service(++emucap_frame)' "$SRC/src/drivers/main.cpp" "main.cpp settled frame service insertion failed"
 
 # 4a. 에이전트 페이싱: 드라이버의 보통 속도(빨리/느리게 감기 키가 없을 때)를 에이전트 base로 바꾸고,
 #     unlimited에서는 실시간 대기를 건너뛰며, 긴 대기는 10 ms 조각으로 자면서 제어 요청을 받는다.
 #     사운드가 켜져 있고 속도가 네이티브 느리게 감기 하한(0.25) 아래면 한 프레임의 리샘플 오디오가
 #     드라이버 버퍼(500 ms)를 넘을 수 있어, 나머지 시간은 실시간 싱커가 맞춘다.
+perl -0777 -pi -e 's{espec\.soundmultiplier = CurGameSpeed;}{espec.soundmultiplier = emucap_host_audio_ratio();}' \
+  "$SRC/src/drivers/main.cpp"
+inject_check 'espec.soundmultiplier = emucap_host_audio_ratio();' "$SRC/src/drivers/main.cpp" "main.cpp host audio ratio 삽입 실패"
 perl -0777 -pi -e 's{(static void RedoFFSF\(void\)\n\{\n if\(inff\)\n  RefreshThrottleFPS\(MDFN_GetSettingF\("ffspeed"\)\);\n else if\(insf\)\n  RefreshThrottleFPS\(MDFN_GetSettingF\("sfspeed"\)\);\n else\n  RefreshThrottleFPS\()1(\);\n\}\n)}{extern "C" double emucap_base_speed(void);\n\n${1}emucap_base_speed()${2}\nextern "C" int emucap_ffsf_state(void) { return inff ? 1 : (insf ? 2 : 0); }\n} unless m{emucap_ffsf_state}' \
   "$SRC/src/drivers/input.cpp"
 inject_check 'RefreshThrottleFPS(emucap_base_speed());' "$SRC/src/drivers/input.cpp" "input.cpp 페이싱 base 삽입 실패"

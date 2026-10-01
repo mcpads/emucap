@@ -40,7 +40,13 @@ impl FakeGdb {
     fn with_state_save(replies: &[&str]) -> Self {
         let mut gdb = Self::with(replies);
         gdb.write_state_fixture = true;
+        gdb.features = "settled_state_io,native_raster_state".into();
         gdb
+    }
+
+    fn with_state_io(mut self) -> Self {
+        self.features = "settled_state_io,native_raster_state".into();
+        self
     }
 
     fn with_async(mut self, packets: &[&str]) -> Self {
@@ -468,8 +474,12 @@ fn disassemble_rejects_oversized_backend_output_and_removes_it() {
 
 #[test]
 fn aes_hello_advertises_state_files_and_console_inputs() {
-    let mut bridge =
-        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_aes").unwrap();
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::default().with_state_io(),
+        GdbBridgeEnv::default(),
+        "neogeo_aes",
+    )
+    .unwrap();
     let response = bridge.handle_request(request(1, "hello", json!({})));
     let value = response.result.unwrap();
     assert_eq!(value["system"], "neogeo_aes");
@@ -479,10 +489,9 @@ fn aes_hello_advertises_state_files_and_console_inputs() {
         value["capability_notes"]["state_restore"]["supported"],
         true
     );
-    assert!(
-        value["capability_notes"]["state_restore"]["screenshot_after_load"]
-            .as_str()
-            .is_some_and(|note| note.contains("one frozen frame"))
+    assert_eq!(
+        value["capability_notes"]["state_restore"]["admitted_halt_kinds"],
+        json!(["settled_scheduler"])
     );
     let methods = value["methods"].as_array().unwrap();
     assert!(methods.iter().any(|method| method == "save_state"));
@@ -513,8 +522,12 @@ fn aes_hello_advertises_state_files_and_console_inputs() {
 
 #[test]
 fn cd_hello_advertises_the_cd_profile_with_native_state_files() {
-    let mut bridge =
-        NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), "neogeo_cd").unwrap();
+    let mut bridge = NeoGeoBridge::new(
+        FakeGdb::default().with_state_io(),
+        GdbBridgeEnv::default(),
+        "neogeo_cd",
+    )
+    .unwrap();
     let response = bridge.handle_request(request(1, "hello", json!({})));
     let value = response.result.unwrap();
     assert_eq!(value["system"], "neogeo_cd");
@@ -715,7 +728,7 @@ fn native_save_waits_for_backend_completion_and_publishes_the_file() {
     let path = dir.path().join("state with spaces.sta");
     std::fs::write(&path, b"prior-state").unwrap();
     let mut bridge = NeoGeoBridge::new(
-        FakeGdb::with_state_save(&["OK", "42"]),
+        FakeGdb::with_state_save(&["STATE:completed", "42"]),
         GdbBridgeEnv::default(),
         "neogeo_mvs",
     )
@@ -733,7 +746,7 @@ fn native_save_waits_for_backend_completion_and_publishes_the_file() {
         bridge.gdb.timeout_changes,
         vec![STATE_OPERATION_TIMEOUT, Duration::from_secs(5)]
     );
-    assert!(bridge.gdb.sent[0].starts_with("qEmucap,savesync,"));
+    assert!(bridge.gdb.sent[1].starts_with("qEmucap,savesync,"));
 }
 
 #[test]
@@ -742,7 +755,7 @@ fn native_load_waits_for_post_load_completion_and_stays_frozen() {
     let path = dir.path().join("state.sta");
     std::fs::write(&path, b"MAMESAVE-fixture").unwrap();
     let mut bridge = NeoGeoBridge::new(
-        FakeGdb::with(&["OK", "7"]),
+        FakeGdb::with(&["STATE:completed", "7"]).with_state_io(),
         GdbBridgeEnv::default(),
         "neogeo_mvs",
     )
@@ -762,7 +775,7 @@ fn native_load_waits_for_post_load_completion_and_stays_frozen() {
         bridge.gdb.timeout_changes,
         vec![STATE_OPERATION_TIMEOUT, Duration::from_secs(5)]
     );
-    assert!(bridge.gdb.sent[0].starts_with("qEmucap,loadsync,"));
+    assert!(bridge.gdb.sent[1].starts_with("qEmucap,loadsync,"));
 }
 
 #[test]
@@ -1124,4 +1137,86 @@ fn slow_neogeo_step_reports_the_host_deadline_with_partial_progress() {
         .gdb
         .sent
         .contains(&format!("qEmucap,opdeadline,{}", hex::encode("245000"))));
+}
+
+#[test]
+fn state_io_requires_native_capability_before_dispatch() {
+    for features in ["", "settled_state_io", "native_raster_state"] {
+        let gdb = FakeGdb {
+            features: features.into(),
+            ..FakeGdb::default()
+        };
+        let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_aes").unwrap();
+        let hello = bridge.hello().unwrap();
+        assert_eq!(
+            hello["capability_notes"]["state_restore"]["supported"],
+            false
+        );
+        assert!(!hello["methods"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == "save_state" || m == "load_state"));
+        assert!(bridge
+            .state_lua_cmd("loadsync", Path::new("unused.sta"))
+            .is_err());
+        assert_eq!(bridge.gdb.sent, vec!["qEmucap,features"]);
+    }
+}
+
+#[test]
+fn state_io_rejections_preserve_control_but_uncertain_restore_is_terminal() {
+    for (reply, kind, terminal) in [
+        ("STATE:unsafe_halt", "unsafe_halt", false),
+        ("STATE:open_failed", "emulator_error", false),
+        ("STATE:rollback_capture_failed", "emulator_error", false),
+        ("STATE:load_failed_rolled_back", "emulator_error", false),
+        ("STATE:load_failed_unverified", "emulator_error", true),
+        ("OK", "emulator_error", true),
+        ("STATE:unknown", "emulator_error", true),
+    ] {
+        let mut bridge = NeoGeoBridge::new(
+            FakeGdb::with(&[reply]).with_state_io(),
+            GdbBridgeEnv::default(),
+            "neogeo_aes",
+        )
+        .unwrap();
+        bridge.frozen = true;
+        let error = bridge
+            .state_lua_cmd("loadsync", Path::new("fixture.sta"))
+            .unwrap_err();
+        assert_eq!(error_kind(&error), kind, "{reply}");
+        assert_eq!(bridge.backend_terminal(), terminal, "{reply}");
+        assert_eq!(bridge.gdb.timeout, Duration::from_secs(5));
+        if terminal {
+            let dispatched = bridge.gdb.sent.len();
+            assert!(!bridge.handle_request(request(7, "resume", json!({}))).ok);
+            assert_eq!(bridge.gdb.sent.len(), dispatched);
+        }
+    }
+}
+
+#[test]
+fn memory_batches_advertise_each_supported_pause_owner() {
+    for native_state_io in [false, true] {
+        let mut gdb = FakeGdb::default();
+        gdb.features = if native_state_io {
+            "peek_block,settled_state_io"
+        } else {
+            "peek_block"
+        }
+        .into();
+        let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_aes").unwrap();
+        let hello = bridge.hello().unwrap();
+        let kinds = hello["memory_batch_capability"]["halt_kinds"]
+            .as_array()
+            .unwrap();
+        assert!(kinds
+            .iter()
+            .any(|kind| kind == "debugger_stop_and_machine_pause"));
+        assert_eq!(
+            kinds.iter().any(|kind| kind == "settled_scheduler"),
+            native_state_io
+        );
+    }
 }

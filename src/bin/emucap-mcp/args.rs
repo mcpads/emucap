@@ -958,9 +958,8 @@ pub(crate) struct LaunchArgs {
     /// unsupported adapters ignore this field.
     #[serde(default)]
     pub(crate) display: Option<bool>,
-    /// Enable audio output independently of display. Currently supported by
-    /// Mednafen and PC-98 systems. Default: false. Unsupported adapters reject
-    /// true rather than silently ignoring it.
+    /// Enable audio output independently of display. Default: false.
+    /// launch_plan.sound_contract reports support for the selected adapter.
     #[serde(default)]
     pub(crate) sound: Option<bool>,
     /// Optional emulated sound board for PC-98. This is independent of host

@@ -1,0 +1,160 @@
+--- a/hw/xbox/mcpx/apu/apu.c
++++ b/hw/xbox/mcpx/apu/apu.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "apu_int.h"
++#include "apu.h"
+ #include "exec/icount.h"
+ 
+ MCPXAPUState *g_state; // Used via debug handlers
+@@ -29,6 +30,56 @@
+     *ticks = g_state ? g_state->guest_tick_calls : 0;
+     *retries = g_state ? g_state->guest_retry_calls : 0;
+     *quanta = g_state ? g_state->guest_completed_quanta : 0;
++}
++
++bool mcpx_apu_clock_continuation(MCPXAPUContinuation *out)
++{
++    MCPXAPUState *d = g_state;
++    uint32_t queue[MCPX_HW_MAX_VOICES][2];
++    uint64_t locks[4];
++    uint32_t samples[NUM_SAMPLES_PER_FRAME][2];
++    G_STATIC_ASSERT(sizeof(float) == sizeof(uint32_t));
++
++    if (!d || runstate_is_running()) {
++        return false;
++    }
++    qemu_mutex_lock(&d->lock);
++    VoiceWorkDispatch *work = &d->vp.voice_work_dispatch;
++    if (work->queue_len < 0 || work->queue_len > MCPX_HW_MAX_VOICES) {
++        qemu_mutex_unlock(&d->lock);
++        return false;
++    }
++    out->pending = d->guest_voice_pending;
++    out->queue_length = work->queue_len;
++    out->deadline = d->guest_deadline;
++    out->timer_deadline = d->guest_timer ? timer_expire_time_ns(d->guest_timer) : -1;
++    out->fraction = d->guest_fraction;
++    out->ep_frame_div = d->ep_frame_div;
++    for (int i = 0; i < work->queue_len; i++) {
++        queue[i][0] = cpu_to_be32(work->queue[i].voice);
++        queue[i][1] = cpu_to_be32(work->queue[i].list);
++    }
++    for (int i = 0; i < 4; i++) {
++        locks[i] = cpu_to_be64(d->vp.voice_locked[i]);
++    }
++    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
++        for (int channel = 0; channel < 2; channel++) {
++            uint32_t bits;
++            memcpy(&bits, &d->vp.sample_buf[i][channel], sizeof(bits));
++            samples[i][channel] = cpu_to_be32(bits);
++        }
++    }
++    qemu_mutex_unlock(&d->lock);
++    g_autofree char *queue_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
++        (const guchar *)queue, out->queue_length * sizeof(queue[0]));
++    g_autofree char *locks_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
++        (const guchar *)locks, sizeof(locks));
++    g_autofree char *samples_hash = g_compute_checksum_for_data(G_CHECKSUM_SHA256,
++        (const guchar *)samples, sizeof(samples));
++    g_strlcpy(out->queue_sha256, queue_hash, sizeof(out->queue_sha256));
++    g_strlcpy(out->locks_sha256, locks_hash, sizeof(out->locks_sha256));
++    g_strlcpy(out->samples_sha256, samples_hash, sizeof(out->samples_sha256));
++    return true;
+ }
+ 
+ static void update_irq(MCPXAPUState *d)
+--- a/hw/xbox/mcpx/apu/apu.h
++++ b/hw/xbox/mcpx/apu/apu.h
+@@ -27,4 +27,16 @@
+ /* BQL-owned diagnostic counters, not serialized guest state. */
+ void mcpx_apu_clock_counters(uint64_t *ticks, uint64_t *retries, uint64_t *quanta);
+ 
++typedef struct MCPXAPUContinuation {
++    bool pending;
++    uint32_t queue_length;
++    int64_t deadline, timer_deadline;
++    uint32_t fraction;
++    int32_t ep_frame_div;
++    char queue_sha256[65], locks_sha256[65], samples_sha256[65];
++} MCPXAPUContinuation;
++
++/* Read under BQL while frozen; device lock owns the continuation projection. */
++bool mcpx_apu_clock_continuation(MCPXAPUContinuation *out);
++
+ #endif
+--- a/qapi/xemu-emucap.json
++++ b/qapi/xemu-emucap.json
+@@ -26,7 +26,38 @@
+             'devices': 'str' } }
+ 
+ ##
++# @XemuEmucapAudioContinuation:
++#
++# @pending: a prepared quantum is waiting for guest voice unlock
++#
++# @queue-length: prepared voice count
++#
++# @queue-sha256: SHA-256 of ordered big-endian uint32 voice/list pairs
++#
++# @locks-sha256: SHA-256 of four big-endian uint64 lock bitmap words
++#
++# @samples-sha256: SHA-256 of interleaved big-endian IEEE binary32
++#     scratch samples
++#
++# @deadline: logical quantum deadline in guest virtual nanoseconds
++#
++# @timer-deadline: next callback deadline in guest virtual nanoseconds
++#
++# @fraction: carried numerator remainder modulo 48000
++#
++# @ep-frame-div: serialized DSP phase
++##
++{ 'struct': 'XemuEmucapAudioContinuation',
++  'data': { 'pending': 'bool', 'queue-length': 'uint32',
++            'queue-sha256': 'str', 'locks-sha256': 'str', 'samples-sha256': 'str',
++            'deadline': 'int', 'timer-deadline': 'int', 'fraction': 'uint32',
++            'ep-frame-div': 'int32' } }
++
++##
+ # @XemuEmucapStatus:
++#
++# @apu-continuation: native audio projection, present only while
++#     frozen
+ #
+ # @clock-profile: effective guest timing profile
+ #
+@@ -63,7 +94,8 @@
+             'input-engaged': 'bool',
+             'pacing-percent': 'uint32', 'pacing-revision': 'uint64',
+             'virtual-ns': 'int', 'instructions': 'int',
+-            'apu-ticks': 'uint64', 'apu-retries': 'uint64', 'apu-quanta': 'uint64' } }
++            'apu-ticks': 'uint64', 'apu-retries': 'uint64', 'apu-quanta': 'uint64',
++            '*apu-continuation': 'XemuEmucapAudioContinuation' } }
+ 
+ ##
+ # @xemu-emucap-status:
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -88,6 +88,20 @@
+     status->clock_profile = clock_profile();
+     mcpx_apu_clock_counters(&status->apu_ticks, &status->apu_retries,
+                             &status->apu_quanta);
++    MCPXAPUContinuation audio;
++    if (mcpx_apu_clock_continuation(&audio)) {
++        XemuEmucapAudioContinuation *view = g_new0(XemuEmucapAudioContinuation, 1);
++        view->pending = audio.pending;
++        view->queue_length = audio.queue_length;
++        view->queue_sha256 = g_strdup(audio.queue_sha256);
++        view->locks_sha256 = g_strdup(audio.locks_sha256);
++        view->samples_sha256 = g_strdup(audio.samples_sha256);
++        view->deadline = audio.deadline;
++        view->timer_deadline = audio.timer_deadline;
++        view->fraction = audio.fraction;
++        view->ep_frame_div = audio.ep_frame_div;
++        status->apu_continuation = view;
++    }
+     return status;
+ }
+ 

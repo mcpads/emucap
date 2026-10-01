@@ -124,3 +124,39 @@ pub fn result_status(result: &Value) -> &str {
         .and_then(|v| v.as_str())
         .unwrap_or(STATUS_COMPLETED)
 }
+
+// Consume at most one buffered chunk per poll. A continuously trickling partial frame must
+// not keep the executor inside a read loop after the native worker has completed.
+pub(crate) fn read_ndjson_chunk(
+    reader: &mut impl BufRead,
+    pending: &mut Vec<u8>,
+) -> io::Result<Option<String>> {
+    let available = reader.fill_buf()?;
+    if available.is_empty() {
+        return if pending.is_empty() {
+            Ok(None)
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated control frame",
+            ))
+        };
+    }
+    let newline = available.iter().position(|byte| *byte == b'\n');
+    let payload = newline.unwrap_or(available.len());
+    if pending.len().saturating_add(payload) > MAX_NDJSON_FRAME_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "control frame too large",
+        ));
+    }
+    let consumed = newline.map_or(available.len(), |n| n + 1);
+    pending.extend_from_slice(&available[..consumed]);
+    reader.consume(consumed);
+    if newline.is_none() {
+        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+    }
+    String::from_utf8(std::mem::take(pending))
+        .map(Some)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}

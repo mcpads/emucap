@@ -755,3 +755,474 @@ fn unresolved_recording_cleanup_blocks_mutation_without_calling_the_adapter() {
     ));
     assert_eq!(link.inner.outcomes.len(), 1, "inner mutation must not run");
 }
+
+fn temporal_key(runtime: &str) -> crate::live::reconnect::cancellation::OperationKey {
+    crate::live::reconnect::cancellation::OperationKey {
+        runtime: runtime.into(),
+        owner_id: "attachment-a".into(),
+        operation_id: "parent-operation".into(),
+    }
+}
+
+#[test]
+fn temporal_quarantine_survives_status_and_replacement_controller() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47901);
+    let key = temporal_key(&current.launch_id);
+    let inner = SequenceLink::new(
+        47901,
+        &current.launch_id,
+        [Outcome::Ok(serde_json::json!({"state":"frozen"}))],
+    );
+    let mut link = ObservedLink::with_store(inner, store.clone());
+    link.begin_temporal_control(&key).unwrap();
+    assert!(
+        matches!(link.call("reset",serde_json::json!({})),Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_quarantined")
+    );
+    link.finish_temporal_control(&key, false).unwrap();
+    assert_eq!(
+        link.acquire_control_lease(&current.launch_id)
+            .unwrap()
+            .state,
+        LeaseState::Held
+    );
+    link.call("status", serde_json::json!({})).unwrap();
+    assert!(link.continuity().evidence.failure_context_available);
+    assert_eq!(
+        link.failure_context()["temporal_operation"]["state"],
+        "unverified"
+    );
+    assert_eq!(
+        store
+            .read_link_json::<LinkRecord>(47901, &current.launch_id)
+            .unwrap()
+            .unwrap()
+            .temporal_operation
+            .unwrap()
+            .state,
+        TemporalState::Unverified
+    );
+    drop(link);
+    let mut replacement = ObservedLink::with_store(
+        SequenceLink::new(47901, &current.launch_id, []),
+        store.clone(),
+    );
+    replacement.control_key = Some("replacement-controller".into());
+    assert!(
+        matches!(replacement.call("pause",serde_json::json!({"_temporal_owner":key})),Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_quarantined")
+    );
+    assert!(replacement.finish_temporal_control(&key, true).is_err());
+    assert!(store
+        .read_link_json::<LinkRecord>(47901, &current.launch_id)
+        .unwrap()
+        .unwrap()
+        .temporal_operation
+        .is_some());
+}
+
+#[test]
+fn abandoned_active_temporal_owner_blocks_new_work_until_verified_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47902);
+    let key = temporal_key(&current.launch_id);
+    let mut link = ObservedLink::with_store(
+        SequenceLink::new(47902, &current.launch_id, []),
+        store.clone(),
+    );
+    link.begin_temporal_control(&key).unwrap();
+    drop(link); // No terminal finalizer, as after a lost controller.
+    let mut replacement = ObservedLink::with_store(
+        SequenceLink::new(47902, &current.launch_id, []),
+        store.clone(),
+    );
+    assert!(
+        matches!(replacement.call("step",serde_json::json!({"frames":1})),Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_quarantined")
+    );
+    let mut wrong_key = key.clone();
+    wrong_key.operation_id = "later-operation".into();
+    assert!(replacement.begin_temporal_control(&wrong_key).is_err());
+    assert!(replacement
+        .finish_temporal_control(&wrong_key, true)
+        .is_err());
+    let record = store
+        .read_link_json::<LinkRecord>(47902, &current.launch_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.temporal_operation.unwrap().key, key);
+}
+
+#[test]
+fn matching_temporal_cleanup_clears_marker_before_next_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47903);
+    let key = temporal_key(&current.launch_id);
+    let inner = SequenceLink::new(
+        47903,
+        &current.launch_id,
+        [
+            Outcome::Ok(serde_json::json!({"state":"frozen"})),
+            Outcome::Ok(serde_json::json!({"status":"completed"})),
+        ],
+    );
+    let mut link = ObservedLink::with_store(inner, store.clone());
+    link.begin_temporal_control(&key).unwrap();
+    link.call("pause", serde_json::json!({"_temporal_owner":key}))
+        .unwrap();
+    assert!(store
+        .read_link_json::<LinkRecord>(47903, &current.launch_id)
+        .unwrap()
+        .unwrap()
+        .temporal_operation
+        .is_some());
+    link.finish_temporal_control(&key, true).unwrap();
+    link.call("step", serde_json::json!({"frames":1})).unwrap();
+    assert!(store
+        .read_link_json::<LinkRecord>(47903, &current.launch_id)
+        .unwrap()
+        .unwrap()
+        .temporal_operation
+        .is_none());
+}
+
+#[test]
+fn temporal_guard_never_clears_a_replacement_generation_or_exposes_owner_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let old = current(&store, 47904);
+    let key = temporal_key(&old.launch_id);
+    let mut link =
+        ObservedLink::with_store(SequenceLink::new(47904, &old.launch_id, []), store.clone());
+    link.control_key = Some("private-controller-key".into());
+    link.begin_temporal_control(&key).unwrap();
+    let record = store
+        .read_link_json::<LinkRecord>(47904, &old.launch_id)
+        .unwrap()
+        .unwrap();
+    let public = record.public_value().to_string();
+    assert!(!public.contains("private-controller-key"));
+    assert!(!public.contains("attachment-a"));
+    let new = current(&store, 47904);
+    assert_ne!(old.launch_id, new.launch_id);
+    assert!(link.finish_temporal_control(&key, true).is_err());
+    assert!(store
+        .read_link_json::<LinkRecord>(47904, &new.launch_id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn invalid_temporal_metadata_cannot_be_erased_by_lease_refresh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(tmp.path().join("sessions"));
+    let current = current(&store, 47906);
+    let key = temporal_key(&current.launch_id);
+    let mut link = ObservedLink::with_store(
+        SequenceLink::new(47906, &current.launch_id, []),
+        store.clone(),
+    );
+    link.begin_temporal_control(&key).unwrap();
+    store
+        .update_link_json::<LinkRecord, _>(47906, &current.launch_id, |record| {
+            let mut record = record.unwrap();
+            record.launch_id = "wrong-runtime".into();
+            Ok(record)
+        })
+        .unwrap();
+    assert!(link.call("reset", serde_json::json!({})).is_err());
+    let record = store
+        .read_link_json::<LinkRecord>(47906, &current.launch_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.launch_id, "wrong-runtime");
+    assert!(record.temporal_operation.is_some());
+    assert!(link.finish_temporal_control(&key, true).is_err());
+}
+
+struct ExclusiveBrokerLink(SequenceLink);
+impl EmulatorLink for ExclusiveBrokerLink {
+    fn capabilities(&self) -> &Capabilities {
+        self.0.capabilities()
+    }
+    fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError> {
+        self.0.call(method, params)
+    }
+    fn has_exclusive_control(&self) -> bool {
+        !self.0.caps.methods.is_empty()
+    }
+}
+
+#[test]
+fn broker_temporal_ownership_uses_the_exact_local_capsule_without_an_endpoint_port() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let manifest = current(&store, 47920);
+    let key = temporal_key(&manifest.launch_id);
+    let mut link = ObservedLink::with_store(
+        ExclusiveBrokerLink(SequenceLink::new(0, &manifest.launch_id, [])),
+        store.clone(),
+    );
+    assert_eq!(link.endpoint_port(), None);
+    link.begin_temporal_control(&key).unwrap();
+    let record: LinkRecord = store
+        .read_link_json(47920, &manifest.launch_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.temporal_operation.unwrap().key, key);
+    link.finish_temporal_control(&key, true).unwrap();
+    let record: LinkRecord = store
+        .read_link_json(47920, &manifest.launch_id)
+        .unwrap()
+        .unwrap();
+    assert!(record.temporal_operation.is_none());
+    assert_eq!(link.endpoint_port(), None);
+}
+
+#[test]
+fn broker_disconnect_retains_quarantine_at_the_admitted_location() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let manifest = current(&store, 47921);
+    let key = temporal_key(&manifest.launch_id);
+    let mut link = ObservedLink::with_store(
+        ExclusiveBrokerLink(SequenceLink::new(0, &manifest.launch_id, [])),
+        store.clone(),
+    );
+    link.begin_temporal_control(&key).unwrap();
+    link.inner.0.caps = Capabilities::empty();
+    link.finish_temporal_control(&key, false).unwrap();
+    let record: LinkRecord = store
+        .read_link_json(47921, &manifest.launch_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.temporal_operation.unwrap().state,
+        TemporalState::Unverified
+    );
+    let mut replacement = ObservedLink::with_store(
+        ExclusiveBrokerLink(SequenceLink::new(0, &manifest.launch_id, [])),
+        store,
+    );
+    assert!(
+        matches!(replacement.call("reset",serde_json::json!({})),Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_quarantined")
+    );
+}
+
+#[test]
+fn ambiguous_or_corrupt_broker_location_never_falls_back_to_unmanaged_mutation() {
+    for duplicate in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let store = RuntimeStore::new(temp.path().join("sessions"));
+        let manifest = current(&store, 47922);
+        std::fs::create_dir_all(store.session_dir(47923)).unwrap();
+        if duplicate {
+            let mut other = manifest.clone();
+            other.port = 47923;
+            std::fs::write(
+                store.current_path(47923),
+                serde_json::to_vec(&other).unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::write(store.current_path(47923), b"corrupt").unwrap();
+        }
+        let inner = ExclusiveBrokerLink(SequenceLink::new(
+            0,
+            &manifest.launch_id,
+            [Outcome::Ok(serde_json::json!({"state":"frozen"}))],
+        ));
+        let mut link = ObservedLink::with_store(inner, store.clone());
+        assert!(link
+            .begin_temporal_control(&temporal_key(&manifest.launch_id))
+            .is_err());
+        assert!(link.call("reset", serde_json::json!({})).is_err());
+        assert_eq!(link.inner.0.outcomes.len(), 1);
+        link.call("status", serde_json::json!({})).unwrap();
+        assert!(store
+            .read_link_json::<LinkRecord>(47922, &manifest.launch_id)
+            .unwrap()
+            .is_none());
+    }
+}
+
+#[test]
+fn broker_completion_never_clears_a_replacement_generation() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let first = current(&store, 47924);
+    let key = temporal_key(&first.launch_id);
+    let mut link = ObservedLink::with_store(
+        ExclusiveBrokerLink(SequenceLink::new(0, &first.launch_id, [])),
+        store.clone(),
+    );
+    link.begin_temporal_control(&key).unwrap();
+    let next = current(&store, 47924);
+    assert!(link.finish_temporal_control(&key, true).is_err());
+    assert!(store
+        .read_link_json::<LinkRecord>(47924, &next.launch_id)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn broker_with_only_a_local_unpublished_generation_cannot_mutate() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let prepared = store.prepare(47925).unwrap();
+    let mut link = ObservedLink::with_store(
+        ExclusiveBrokerLink(SequenceLink::new(0, prepared.launch_id(), [])),
+        store,
+    );
+    assert!(link
+        .begin_temporal_control(&temporal_key(prepared.launch_id()))
+        .is_err());
+    assert!(link.call("pause", serde_json::json!({})).is_err());
+}
+
+#[test]
+fn actual_broker_link_binds_local_generation_for_durable_ownership() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+    let temp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let manifest = current(&store, 47926);
+    let identity = manifest.launch_id.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let worker = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let attach: Value = serde_json::from_str(&line).unwrap();
+        writeln!(stream,"{}",serde_json::json!({"id":attach["id"],"ok":true,"result":{
+            "attached_name":"owned", "broker_registration_id":1,"methods":["pause"],"launch_id":identity}})).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let pause: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(pause["method"], "pause");
+        assert_eq!(pause["params"]["_temporal_owner"]["runtime"], identity);
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id":pause["id"],"ok":true,"result":{"state":"frozen"}})
+        )
+        .unwrap();
+    });
+    let native = crate::live::broker_link::connect(&address, None, Duration::from_secs(2)).unwrap();
+    let mut link = ObservedLink::with_store(native, store.clone());
+    let key = temporal_key(&manifest.launch_id);
+    link.begin_temporal_control(&key).unwrap();
+    assert_eq!(link.endpoint_port(), None);
+    link.call("pause", serde_json::json!({"_temporal_owner":key}))
+        .unwrap();
+    link.finish_temporal_control(&key, true).unwrap();
+    let record: LinkRecord = store
+        .read_link_json(47926, &manifest.launch_id)
+        .unwrap()
+        .unwrap();
+    assert!(record.temporal_operation.is_none());
+    worker.join().unwrap();
+}
+
+#[test]
+fn broker_lease_wait_cannot_restart_a_temporal_dispatch_deadline() {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::{Duration, Instant};
+    struct DelayedLink {
+        caps: Capabilities,
+        observed: Arc<AtomicUsize>,
+        closed: Arc<AtomicBool>,
+    }
+    impl EmulatorLink for DelayedLink {
+        fn capabilities(&self) -> &Capabilities {
+            self.observed.fetch_add(1, Ordering::SeqCst);
+            &self.caps
+        }
+        fn has_exclusive_control(&self) -> bool {
+            true
+        }
+        fn call(&mut self, _: &str, _: Value) -> Result<Value, LinkError> {
+            panic!("expired request reached native dispatch")
+        }
+        fn call_with_progress(
+            &mut self,
+            _: &str,
+            _: Value,
+            _: &mut ProgressObserver<'_>,
+            _: &ProgressCallControl,
+        ) -> Result<Value, LinkError> {
+            panic!("expired request reached native dispatch")
+        }
+        fn prepare_reconnect(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let store = RuntimeStore::new(temp.path().join("sessions"));
+    let manifest = current(&store, 47927);
+    let observed = Arc::new(AtomicUsize::new(0));
+    let closed = Arc::new(AtomicBool::new(false));
+    let caps = SequenceLink::new(0, &manifest.launch_id, []).caps;
+    let mut link = ObservedLink::with_store(
+        DelayedLink {
+            caps,
+            observed: observed.clone(),
+            closed: closed.clone(),
+        },
+        store.clone(),
+    );
+    let key = temporal_key(&manifest.launch_id);
+    link.begin_temporal_control(&key).unwrap();
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(
+            store
+                .generation_dir(47927, &manifest.launch_id)
+                .join(".link.lock"),
+        )
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    observed.store(0, Ordering::SeqCst);
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let control = ProgressCallControl {
+        max_host_ms: Some(2000),
+        temporal_stop_ms: Some(500),
+        temporal_deadline: Some(deadline),
+        ..Default::default()
+    };
+    let worker = std::thread::spawn(move || {
+        link.call_with_progress(
+            "pause",
+            serde_json::json!({"_temporal_owner":key}),
+            &mut |_| Ok(()),
+            &control,
+        )
+    });
+    let wait_until = Instant::now() + Duration::from_secs(3);
+    while observed.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < wait_until);
+        std::thread::yield_now();
+    }
+    // The first deadline check passed and runtime resolution entered. Hold the
+    // actual generation lock past the deadline, then permit ownership refresh.
+    std::thread::sleep(
+        deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+    );
+    fs2::FileExt::unlock(&lock).unwrap();
+    let result = worker.join().unwrap();
+    assert!(
+        matches!(result,Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_unverified")
+    );
+    assert!(closed.load(Ordering::SeqCst));
+}

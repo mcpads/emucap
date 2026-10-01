@@ -38,12 +38,48 @@ git -C "$SRC" config -f .gitmodules --get-regexp path |
 # Restore only files owned by this patch stack. Build directories and downloaded submodules remain
 # reusable, but no stale adapter source can survive a rebuild.
 git -C "$SRC" checkout -- \
+  Source/Core/AudioCommon/AudioCommon.cpp \
+  Source/Core/AudioCommon/AudioCommon.h \
+  Source/Core/AudioCommon/Mixer.cpp \
+  Source/Core/AudioCommon/Mixer.h \
+  Source/Core/VideoCommon/Present.cpp \
+  Source/Core/VideoCommon/FramebufferManager.cpp \
+  Source/Core/VideoCommon/FramebufferManager.h \
+  Source/Core/VideoCommon/FramebufferShaderGen.cpp \
+  Source/Core/VideoCommon/FramebufferShaderGen.h \
+  Source/Core/VideoCommon/Present.h \
+  Source/Core/VideoCommon/VideoBackendBase.cpp \
+  Source/Core/VideoCommon/VideoBackendBase.h \
+  Source/Core/VideoCommon/VideoState.cpp \
+  Source/Core/VideoCommon/VideoState.h \
+  Source/Core/Common/Config/ConfigInfo.h \
+  Source/Core/Common/Config/Config.h \
+  Source/Core/Common/Config/Layer.h \
+  Source/Core/Common/Config/Layer.cpp \
+  Source/Core/Common/Config/Config.cpp \
+  Source/Core/Common/ChunkFile.h \
+  Source/Core/VideoCommon/TextureCacheBase.cpp \
+  Source/Core/VideoCommon/TextureCacheBase.h \
+  Source/Core/VideoCommon/TextureConfig.cpp \
+  Source/Core/VideoCommon/TextureConfig.h \
+  Source/Core/VideoCommon/AbstractStagingTexture.cpp \
+  Source/Core/VideoCommon/AbstractStagingTexture.h \
+  Source/Core/DolphinQt/Config/SDLHints/SDLHintsWindow.cpp \
   Source/Core/Core/CMakeLists.txt \
+  Source/Core/Core/DSPEmulator.h \
+  Source/Core/Core/HW/DSPLLE/DSPLLE.h \
   Source/Core/Core/Core.cpp \
   Source/Core/Core/Core.h \
   Source/Core/Core/CoreTiming.cpp \
+  Source/Core/Core/AchievementManager.cpp \
+  Source/Core/DolphinQt/HotkeyScheduler.cpp \
   Source/Core/Core/CoreTiming.h \
+  Source/Core/Core/Movie.cpp \
+  Source/Core/Core/Movie.h \
   Source/Core/Core/HW/CPU.cpp \
+  Source/Core/Core/HW/EXI/EXI.h \
+  Source/Core/Core/HW/EXI/EXI.cpp \
+  Source/Core/Core/HW/EXI/EXI_Channel.cpp \
   Source/Core/Core/HW/CPU.h \
   Source/Core/Core/HW/GCPad.cpp \
   Source/Core/Core/HW/ProcessorInterface.cpp \
@@ -52,10 +88,13 @@ git -C "$SRC" checkout -- \
   Source/Core/Core/PowerPC/BreakPoints.cpp \
   Source/Core/Core/PowerPC/BreakPoints.h \
   Source/Core/Core/PowerPC/PowerPC.cpp \
+  Source/Core/Core/PowerPC/PPCAnalyst.cpp \
   Source/Core/Core/State.cpp \
+  Source/Core/Core/IOS/USB/Bluetooth/BTBase.h \
   Source/Core/Core/State.h \
   Source/Core/VideoCommon/FrameDumper.cpp \
   Source/Core/VideoCommon/FrameDumper.h \
+  Source/Core/DolphinNoGUI/Platform.cpp \
   Source/Core/DolphinNoGUI/Platform.h \
   Source/Core/DolphinNoGUI/PlatformHeadless.cpp \
   Source/Core/DolphinNoGUI/MainNoGUI.cpp \
@@ -66,12 +105,16 @@ git -C "$SRC" clean -fdq -- \
   Source/Core/Core/EmuCap.h \
   Source/Core/Core/EmuCapInput.cpp \
   Source/Core/Core/EmuCapInput.h \
-  Source/Core/Core/EmuCapTemporal.h
+  Source/Core/Core/EmuCapTemporal.h \
+  Source/Core/Core/EmuCapPacing.h \
+  Source/Core/Core/EmuCapAudio.h
 cp "$HERE/EmuCap.cpp" "$SRC/Source/Core/Core/EmuCap.cpp"
 cp "$HERE/EmuCap.h" "$SRC/Source/Core/Core/EmuCap.h"
 cp "$HERE/EmuCapInput.cpp" "$SRC/Source/Core/Core/EmuCapInput.cpp"
 cp "$HERE/EmuCapInput.h" "$SRC/Source/Core/Core/EmuCapInput.h"
 cp "$HERE/EmuCapTemporal.h" "$SRC/Source/Core/Core/EmuCapTemporal.h"
+cp "$HERE/EmuCapPacing.h" "$SRC/Source/Core/Core/EmuCapPacing.h"
+cp "$HERE/EmuCapAudio.h" "$SRC/Source/Core/Core/EmuCapAudio.h"
 for patch in "$HERE"/patches/*.patch; do
   echo "applying $(basename "$patch")"
   git -C "$SRC" apply --check "$patch"
@@ -82,6 +125,9 @@ if [ "$(uname)" = "Darwin" ]; then
   export CC=/usr/bin/clang
   export CXX=/usr/bin/clang++
 fi
+bash "$HERE/test-settings.sh" "$SRC"
+bash "$HERE/test-mixer.sh" "$SRC"
+bash "$HERE/test-state-failure.sh" "$SRC"
 JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 COMMON_ARGS=(
   -G Ninja
@@ -104,7 +150,7 @@ cmake --build "$HEADLESS_BUILD" --target dolphin-nogui -j "$JOBS"
 PATCHSET_SHA256="$(
   cd "$HERE"
   {
-    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h
+    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h EmuCapPacing.h EmuCapAudio.h
     find patches -type f -name '*.patch' -print0 |
       LC_ALL=C sort -z |
       xargs -0 shasum -a 256

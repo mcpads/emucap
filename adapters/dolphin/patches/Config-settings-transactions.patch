@@ -1,0 +1,568 @@
+--- a/Source/Core/Common/Config/ConfigInfo.h
++++ b/Source/Core/Common/Config/ConfigInfo.h
+@@ -23,6 +23,27 @@
+   bool operator==(const Location& other) const;
+   bool operator<(const Location& other) const;
+ };
++
++// Native settings storage owner. Nested mutations defer callbacks until the outermost
++// lock is released. A try-lock lets control requests report busy without waiting on a writer.
++class SettingsTransaction
++{
++public:
++  SettingsTransaction();
++  explicit SettingsTransaction(std::try_to_lock_t);
++  ~SettingsTransaction();
++  bool OwnsLock() const { return m_lock.owns_lock(); }
++  SettingsTransaction(const SettingsTransaction&) = delete;
++  SettingsTransaction& operator=(const SettingsTransaction&) = delete;
++
++private:
++  std::unique_lock<std::recursive_mutex> m_lock;
++};
++
++// Mutation stamps are distinct from cache invalidation and callback notification counts.
++u64 GetSettingWriteRevision(const Location& location);
++u64 GetLayerViewRevision();
++void NotifySettingWrite(const Location& location);
+ 
+ template <typename T>
+ struct CachedValue
+--- a/Source/Core/Common/Config/Config.h
++++ b/Source/Core/Common/Config/Config.h
+@@ -111,6 +111,7 @@
+ template <typename InfoT, typename ValueT>
+ void Set(LayerType layer, const InfoT& info, const ValueT& value)
+ {
++  SettingsTransaction transaction;
+   if (GetLayer(layer)->Set(info, value))
+     OnConfigChanged();
+ }
+@@ -130,6 +131,7 @@
+ template <typename InfoT, typename ValueT>
+ void SetBaseOrCurrent(const Info<InfoT>& info, const ValueT& value)
+ {
++  SettingsTransaction transaction;
+   if (GetActiveLayerForConfig(info) == LayerType::Base)
+     Set(LayerType::Base, info, value);
+   else
+@@ -139,6 +141,7 @@
+ template <typename T>
+ void DeleteKey(LayerType layer, const Info<T>& info)
+ {
++  SettingsTransaction transaction;
+   if (GetLayer(layer)->DeleteKey(info.GetLocation()))
+     OnConfigChanged();
+ }
+--- a/Source/Core/Common/Config/Layer.h
++++ b/Source/Core/Common/Config/Layer.h
+@@ -69,31 +69,19 @@
+   const LayerType m_layer;
+ };
+ 
++// Iteration owns a snapshot; no unlocked iterator into mutable native storage escapes.
+ class Section
+ {
+ public:
+-  using iterator = LayerMap::iterator;
+-  Section(iterator begin_, iterator end_) : m_begin(begin_), m_end(end_) {}
+-  iterator begin() const { return m_begin; }
+-  iterator end() const { return m_end; }
++  using iterator = LayerMap::const_iterator;
++  Section(iterator begin, iterator end) : m_values(begin, end) {}
++  iterator begin() const { return m_values.begin(); }
++  iterator end() const { return m_values.end(); }
+ 
+ private:
+-  iterator m_begin;
+-  iterator m_end;
++  LayerMap m_values;
+ };
+-
+-class ConstSection
+-{
+-public:
+-  using iterator = LayerMap::const_iterator;
+-  ConstSection(iterator begin_, iterator end_) : m_begin(begin_), m_end(end_) {}
+-  iterator begin() const { return m_begin; }
+-  iterator end() const { return m_end; }
+-
+-private:
+-  iterator m_begin;
+-  iterator m_end;
+-};
++using ConstSection = Section;
+ 
+ class Layer
+ {
+@@ -116,6 +104,7 @@
+   template <typename T>
+   std::optional<T> Get(const Location& location) const
+   {
++    SettingsTransaction transaction;
+     const auto iter = m_map.find(location);
+     if (iter == m_map.end() || !iter->second.has_value())
+       return std::nullopt;
+@@ -144,15 +133,18 @@
+ 
+   bool Set(const Location& location, std::string new_value)
+   {
++    SettingsTransaction transaction;
+     const auto iter = m_map.find(location);
+     if (iter != m_map.end() && iter->second == new_value)
+       return false;
+-    m_is_dirty = true;
+     m_map.insert_or_assign(location, std::move(new_value));
++    Changed(location);
+     return true;
+   }
+ 
+-  void MarkAsDirty() { m_is_dirty = true; }
++  void MarkAsDirty();
++  // Only the configuration layer table changes publication. Prepared layers are private.
++  void SetPublished(bool published);
+ 
+   Section GetSection(System system, const std::string& section);
+   ConstSection GetSection(System system, const std::string& section) const;
+@@ -162,7 +154,14 @@
+   void Save();
+ 
+   LayerType GetLayer() const;
+-  const LayerMap& GetLayerMap() const;
++  LayerMap GetLayerMap() const;
++
++private:
++  void Changed(const Location& location);
++  bool m_published = false;
++  u64 m_write_revision = 0;
++  std::map<Location, u64> m_key_revisions;
++  std::mutex m_io_mutex;
+ 
+ protected:
+   bool m_is_dirty = false;
+--- a/Source/Core/Common/Config/Layer.cpp
++++ b/Source/Core/Common/Config/Layer.cpp
+@@ -33,18 +33,20 @@
+ 
+ bool Layer::Exists(const Location& location) const
+ {
++  SettingsTransaction transaction;
+   const auto iter = m_map.find(location);
+   return iter != m_map.end() && iter->second.has_value();
+ }
+ 
+ bool Layer::DeleteKey(const Location& location)
+ {
+-  m_is_dirty = true;
++  SettingsTransaction transaction;
+   bool had_value = false;
+   const auto iter = m_map.find(location);
+   if (iter != m_map.end() && iter->second.has_value())
+   {
+     iter->second.reset();
++    Changed(location);
+     had_value = true;
+   }
+ 
+@@ -53,39 +55,107 @@
+ 
+ void Layer::DeleteAllKeys()
+ {
+-  m_is_dirty = true;
++  SettingsTransaction transaction;
+   for (auto& pair : m_map)
+   {
+-    pair.second.reset();
++    if (pair.second)
++    {
++      pair.second.reset();
++      Changed(pair.first);
++    }
+   }
+ }
+ 
+ Section Layer::GetSection(System system, const std::string& section)
+ {
++  SettingsTransaction transaction;
+   return Section{m_map.lower_bound(Location{system, section, ""}),
+                  m_map.lower_bound(Location{system, section + '\001', ""})};
+ }
+ 
+ ConstSection Layer::GetSection(System system, const std::string& section) const
+ {
++  SettingsTransaction transaction;
+   return ConstSection{m_map.lower_bound(Location{system, section, ""}),
+                       m_map.lower_bound(Location{system, section + '\001', ""})};
+ }
+ 
++void Layer::Changed(const Location& location)
++{
++  m_is_dirty = true;
++  m_key_revisions[location] = ++m_write_revision;
++  if (m_published)
++    NotifySettingWrite(location);
++}
++
++void Layer::MarkAsDirty()
++{
++  SettingsTransaction transaction;
++  m_is_dirty = true;
++  ++m_write_revision;
++}
++
++void Layer::SetPublished(bool published)
++{
++  SettingsTransaction transaction;
++  m_published = published;
++}
++
+ void Layer::Load()
+ {
+-  if (m_loader)
+-    m_loader->Load(this);
+-  m_is_dirty = false;
++  if (!m_loader)
++    return;
++  std::lock_guard io_lock(m_io_mutex);
++  Layer candidate(m_layer);
++  std::map<Location, u64> key_revisions;
++  u64 revision;
++  {
++    SettingsTransaction transaction;
++    candidate.m_map = m_map;
++    key_revisions = m_key_revisions;
++    revision = m_write_revision;
++  }
++  // Parse off to the side. A file wait never owns the settings gate.
++  m_loader->Load(&candidate);
++  {
++    SettingsTransaction transaction;
++    const bool concurrent_write = m_write_revision != revision;
++    for (const auto& [location, value] : candidate.m_map)
++    {
++      // A newer write to this key wins over the earlier reload. Other keys still load.
++      if (m_key_revisions[location] != key_revisions[location])
++        continue;
++      const auto previous = m_map.find(location);
++      if (previous == m_map.end() || previous->second != value)
++      {
++        m_map.insert_or_assign(location, value);
++        Changed(location);
++      }
++    }
++    m_is_dirty = concurrent_write;
++  }
+ }
+ 
+ void Layer::Save()
+ {
+-  if (!m_loader || !m_is_dirty)
++  if (!m_loader)
+     return;
+-
+-  m_loader->Save(this);
+-  m_is_dirty = false;
++  std::lock_guard io_lock(m_io_mutex);
++  Layer snapshot(m_layer);
++  u64 revision;
++  {
++    SettingsTransaction transaction;
++    if (!m_is_dirty)
++      return;
++    snapshot.m_map = m_map;
++    revision = m_write_revision;
++  }
++  m_loader->Save(&snapshot);
++  {
++    SettingsTransaction transaction;
++    if (m_write_revision == revision)
++      m_is_dirty = false;
++  }
+ }
+ 
+ LayerType Layer::GetLayer() const
+@@ -93,8 +163,9 @@
+   return m_layer;
+ }
+ 
+-const LayerMap& Layer::GetLayerMap() const
++LayerMap Layer::GetLayerMap() const
+ {
++  SettingsTransaction transaction;
+   return m_map;
+ }
+ }  // namespace Config
+--- a/Source/Core/Common/Config/Config.cpp
++++ b/Source/Core/Common/Config/Config.cpp
+@@ -7,7 +7,6 @@
+ #include <atomic>
+ #include <map>
+ #include <mutex>
+-#include <shared_mutex>
+ #include <utility>
+ #include <vector>
+ 
+@@ -17,27 +16,86 @@
+ {
+ using Layers = std::map<LayerType, std::shared_ptr<Layer>>;
+ 
++// Construct before s_layers so layer destructors can still take the gate at shutdown.
++static std::recursive_mutex s_settings_lock;
++static std::map<Location, u64> s_setting_revisions;
++static u64 s_write_revision = 0;
++static u64 s_layer_view_revision = 0;
++static std::atomic<u64> s_config_version = 0;
++static thread_local unsigned s_transaction_depth = 0;
++static thread_local bool s_notification_pending = false;
+ static Layers s_layers;
+ static std::vector<std::pair<ConfigChangedCallbackID, ConfigChangedCallback>> s_callbacks;
+ static size_t s_next_callback_id = 0;
+ static std::atomic<u32> s_callback_guards = 0;
+-static std::atomic<u64> s_config_version = 0;
+-
+-static std::shared_mutex s_layers_rw_lock;
+ static std::recursive_mutex s_callbacks_lock;
+ 
+-using ReadLock = std::shared_lock<std::shared_mutex>;
+-using WriteLock = std::unique_lock<std::shared_mutex>;
++SettingsTransaction::SettingsTransaction() : m_lock(s_settings_lock)
++{
++  ++s_transaction_depth;
++}
++
++SettingsTransaction::SettingsTransaction(std::try_to_lock_t) : m_lock(s_settings_lock, std::try_to_lock)
++{
++  if (m_lock.owns_lock())
++    ++s_transaction_depth;
++}
++
++SettingsTransaction::~SettingsTransaction()
++{
++  if (!m_lock.owns_lock())
++    return;
++  const bool notify = --s_transaction_depth == 0 && s_notification_pending;
++  if (notify)
++    s_notification_pending = false;
++  m_lock.unlock();
++  if (notify)
++    OnConfigChanged();
++}
++
++void NotifySettingWrite(const Location& location)
++{
++  SettingsTransaction transaction;
++  s_setting_revisions[location] = ++s_write_revision;
++  s_config_version.fetch_add(1, std::memory_order_relaxed);
++}
++
++u64 GetSettingWriteRevision(const Location& location)
++{
++  SettingsTransaction transaction;
++  const auto it = s_setting_revisions.find(location);
++  return it == s_setting_revisions.end() ? 0 : it->second;
++}
++
++u64 GetLayerViewRevision()
++{
++  SettingsTransaction transaction;
++  return s_layer_view_revision;
++}
++
++static void NotifyLayerViewChange()
++{
++  s_layer_view_revision = ++s_write_revision;
++  s_config_version.fetch_add(1, std::memory_order_relaxed);
++}
+ 
+ static void AddLayerInternal(std::shared_ptr<Layer> layer)
+ {
+-  {
+-    WriteLock lock(s_layers_rw_lock);
+-
+-    const Config::LayerType layer_type = layer->GetLayer();
+-    s_layers.insert_or_assign(layer_type, std::move(layer));
+-  }
+-  OnConfigChanged();
++  // Keep the displaced layer alive until after the gate is released: its destructor may save.
++  std::shared_ptr<Layer> retired;
++  {
++    SettingsTransaction transaction;
++    const LayerType type = layer->GetLayer();
++    if (auto it = s_layers.find(type); it != s_layers.end())
++    {
++      retired = std::move(it->second);
++      retired->SetPublished(false);
++    }
++    layer->SetPublished(true);
++    s_layers.insert_or_assign(type, std::move(layer));
++    NotifyLayerViewChange();
++    OnConfigChanged();
++  }
+ }
+ 
+ void AddLayer(std::unique_ptr<ConfigLayerLoader> loader)
+@@ -47,25 +105,25 @@
+ 
+ std::shared_ptr<Layer> GetLayer(LayerType layer)
+ {
+-  ReadLock lock(s_layers_rw_lock);
+-
+-  std::shared_ptr<Layer> result;
++  SettingsTransaction transaction;
+   const auto it = s_layers.find(layer);
+-  if (it != s_layers.end())
+-  {
+-    result = it->second;
+-  }
+-  return result;
++  return it == s_layers.end() ? nullptr : it->second;
+ }
+ 
+ void RemoveLayer(LayerType layer)
+ {
+-  {
+-    WriteLock lock(s_layers_rw_lock);
+-
+-    s_layers.erase(layer);
+-  }
+-  OnConfigChanged();
++  std::shared_ptr<Layer> retired;
++  {
++    SettingsTransaction transaction;
++    if (const auto it = s_layers.find(layer); it != s_layers.end())
++    {
++      retired = std::move(it->second);
++      retired->SetPublished(false);
++      s_layers.erase(it);
++      NotifyLayerViewChange();
++    }
++    OnConfigChanged();
++  }
+ }
+ 
+ ConfigChangedCallbackID AddConfigChangedCallback(ConfigChangedCallback func)
+@@ -97,6 +155,11 @@
+   // even when callbacks are suppressed.
+   s_config_version.fetch_add(1, std::memory_order_relaxed);
+ 
++  if (s_transaction_depth)
++  {
++    s_notification_pending = true;
++    return;
++  }
+   if (s_callback_guards)
+     return;
+ 
+@@ -111,47 +174,63 @@
+   return s_config_version.load(std::memory_order_relaxed);
+ }
+ 
+-// Explicit load and save of layers
++// Retain layers, not the storage gate, across file I/O.
++static std::vector<std::shared_ptr<Layer>> LayerSnapshot()
++{
++  SettingsTransaction transaction;
++  std::vector<std::shared_ptr<Layer>> result;
++  for (const auto& [type, layer] : s_layers)
++    result.push_back(layer);
++  return result;
++}
++
+ void Load()
+ {
+-  {
+-    ReadLock lock(s_layers_rw_lock);
+-
+-    for (auto& layer : s_layers)
+-      layer.second->Load();
+-  }
++  for (const auto& layer : LayerSnapshot())
++    layer->Load();
+   OnConfigChanged();
+ }
+ 
+ void Save()
+ {
+-  {
+-    ReadLock lock(s_layers_rw_lock);
+-
+-    for (auto& layer : s_layers)
+-      layer.second->Save();
+-  }
++  for (const auto& layer : LayerSnapshot())
++    layer->Save();
+   OnConfigChanged();
+ }
+ 
+ void Init()
+ {
+-  // These layers contain temporary values
+   ClearCurrentRunLayer();
+ }
+ 
+ void Shutdown()
+ {
+-  WriteLock lock(s_layers_rw_lock);
+-
+-  s_layers.clear();
++  Layers retired;
++  {
++    SettingsTransaction transaction;
++    retired.swap(s_layers);
++    for (const auto& [type, layer] : retired)
++      layer->SetPublished(false);
++    NotifyLayerViewChange();
++  }
+ }
+ 
+ void ClearCurrentRunLayer()
+ {
+-  WriteLock lock(s_layers_rw_lock);
+-
+-  s_layers.insert_or_assign(LayerType::CurrentRun, std::make_shared<Layer>(LayerType::CurrentRun));
++  std::shared_ptr<Layer> retired;
++  {
++    SettingsTransaction transaction;
++    const auto it = s_layers.find(LayerType::CurrentRun);
++    if (it != s_layers.end())
++    {
++      retired = std::move(it->second);
++      retired->SetPublished(false);
++    }
++    auto layer = std::make_shared<Layer>(LayerType::CurrentRun);
++    layer->SetPublished(true);
++    s_layers.insert_or_assign(LayerType::CurrentRun, std::move(layer));
++    NotifyLayerViewChange();
++  }
+ }
+ 
+ static const std::map<System, std::string> system_to_name = {
+@@ -198,7 +277,7 @@
+ 
+ LayerType GetActiveLayerForConfig(const Location& config)
+ {
+-  ReadLock lock(s_layers_rw_lock);
++  SettingsTransaction transaction;
+ 
+   for (auto layer : SEARCH_ORDER)
+   {
+@@ -217,7 +296,7 @@
+ std::optional<std::string> GetAsString(const Location& config)
+ {
+   std::optional<std::string> result;
+-  ReadLock lock(s_layers_rw_lock);
++  SettingsTransaction transaction;
+ 
+   for (auto layer : SEARCH_ORDER)
+   {
+--- a/Source/Core/DolphinQt/Config/SDLHints/SDLHintsWindow.cpp
++++ b/Source/Core/DolphinQt/Config/SDLHints/SDLHintsWindow.cpp
+@@ -186,7 +186,7 @@
+   Config::Section section = layer->GetSection(Config::System::Main, "SDL_Hints");
+ 
+   for (auto& row_data : section)
+-    row_data.second.reset();
++    layer->DeleteKey(row_data.first);
+ 
+   // Add each item still in the table to the config file
+   for (int row = 0; row < m_hints_table->rowCount(); ++row)

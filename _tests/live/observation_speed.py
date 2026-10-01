@@ -5,6 +5,7 @@ The adapter profile supplies only launch arguments and memory ranges; every chec
 Control MCP surface and the live capabilities. Generated evidence stays in the private output.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -18,21 +19,25 @@ from support import McpProcess  # noqa: E402
 
 
 class Witness:
-    def __init__(self, out, env):
+    def __init__(self, out, env, binary=None):
         self.out = out
         self.rows = []
-        self.process = McpProcess(ROOT / 'target/release/emucap-mcp', env)
+        self.process = McpProcess(binary or ROOT / 'target/release/emucap-mcp', env)
         self.revision = None
 
-    def call(self, name, arguments=None, error=False):
+    def call_result(self, name, arguments=None):
         started = time.perf_counter()
         response = self.process.request('tools/call', {'name': name, 'arguments': arguments or {}}, timeout=300)
         elapsed = time.perf_counter() - started
         self.rows.append({'tool': name, 'arguments': arguments, 'seconds': elapsed, 'response': response})
         (self.out / 'requests.json').write_text(json.dumps(self.rows, indent=2))
         failed = bool(response.get('error') or response.get('result', {}).get('isError'))
-        assert failed == error, response
-        return response.get('result', {}).get('structuredContent', response)
+        return response.get('result', {}).get('structuredContent', response), failed
+
+    def call(self, name, arguments=None, error=False):
+        content, failed = self.call_result(name, arguments)
+        assert failed == error, content
+        return content
 
     def seconds(self):
         return self.rows[-1]['seconds']
@@ -94,7 +99,7 @@ def check_batch(w, ranges, rejected, groups):
     return {'individual': single_seconds, 'batch': batch_seconds, 'boundary': batch['boundary']}
 
 
-def check_pacing(w, ranges, frames, running_seconds):
+def check_pacing(w, ranges, frames, running_seconds, clock_groups=()):
     timings = []
     for policy in [{'mode': 'limited', 'percent': p} for p in (50, 100, 200, 400)] + [{'mode': 'unlimited'}]:
         epoch = w.call('read_memory_batch', {'ranges': ranges[:1]})['boundary']['stop_epoch']
@@ -103,9 +108,15 @@ def check_pacing(w, ranges, frames, running_seconds):
         assert changed['execution_speed']['mode'] == policy['mode'], changed
         assert changed['execution_speed']['percent'] == policy.get('percent'), changed
         assert w.call('read_memory_batch', {'ranges': ranges[:1]})['boundary']['stop_epoch'] == epoch
+        clocks_before = w.call('get_state', {'groups': clock_groups}) if clock_groups else None
         step = w.call('step', {'unit': 'frames', 'count': frames})
+        seconds = w.seconds()
         assert step['status'] == 'completed', step
-        timings.append({'policy': policy, 'frames': frames, 'seconds': w.seconds()})
+        timing = {'policy': policy, 'frames': frames, 'seconds': seconds}
+        if clock_groups:
+            timing['native_clocks_before'] = clocks_before
+            timing['native_clocks_after'] = w.call('get_state', {'groups': clock_groups})
+        timings.append(timing)
     running = []
     for percent in (50, 200):
         w.speed({'mode': 'limited', 'percent': percent})
@@ -132,36 +143,59 @@ def check_pacing(w, ranges, frames, running_seconds):
     return {'steps': timings, 'running': running}
 
 
-def check_lifecycle(w, out, status):
+def instruction_units(status):
+    units = status.get('contracts', {}).get('constraints', {}).get('execution.step.units', ['instructions'])
+    return 'instructions' in units
+
+
+def state_call(w, status, name, arguments):
+    # Ask the producer at the current boundary first. Only an explicit unsafe_halt rejection
+    # permits this witness to seek an instruction boundary before retrying.
+    content = None
+    for count in (0, 1, 1, 5, 23, 101, 499, 2003):
+        if count and not instruction_units(status):
+            return None, content
+        if count:
+            w.call('step', {'unit': 'instructions', 'count': count})
+        content, failed = w.call_result(name, arguments)
+        if not failed:
+            return content, None
+        if 'unsafe_halt' not in json.dumps(content):
+            return None, content
+    return None, content
+
+
+def check_lifecycle(w, out, status, checkpoint=None):
     w.speed({'mode': 'limited', 'percent': 50})
     w.call('reset')
     assert w.speed({})['percent'] == 50
     if w.call('status')['state'] != 'frozen':
         w.call('pause')
-    state = str(out / 'pacing.state')
-    save = {'path': state}
-    if 'instruction_snapshot_capture' in json.dumps(status):
-        save['snapshot_key'] = 'pacing-lifecycle'
-    # Some hosts save only at a proven main-CPU instruction halt.
-    units = status.get('contracts', {}).get('constraints', {}).get('execution.step.units', ['instructions'])
-    if 'instructions' in units:
-        w.call('step', {'unit': 'instructions', 'count': 1})
-    saved = w.process.request('tools/call', {'name': 'save_state', 'arguments': save}, timeout=300)
-    content = saved.get('result', {}).get('structuredContent', {})
-    if saved.get('result', {}).get('isError'):
-        # Record a host that cannot save at this frozen boundary instead of claiming the check.
-        return {'reset_preserved': True, 'load_preserved': None, 'save_error': content}
+    state = Path(checkpoint).resolve(strict=True) if checkpoint else out / 'pacing.state'
+    if not checkpoint:
+        save = {'path': str(state)}
+        if 'instruction_snapshot_capture' in json.dumps(status):
+            save['snapshot_key'] = 'pacing-lifecycle'
+        saved, error = state_call(w, status, 'save_state', save)
+        if saved is None:
+            return {'reset_preserved': True, 'load_preserved': None, 'save_error': error}
+    snapshot_hash = hashlib.sha256(state.read_bytes()).hexdigest()
     w.speed({'mode': 'limited', 'percent': 400})
-    w.call('load_state', {'path': state})
-    assert w.speed({})['percent'] == 400
-    return {'reset_preserved': True, 'load_preserved': True}
+    before_load = w.speed({})
+    loaded, error = state_call(w, status, 'load_state', {'path': str(state)})
+    assert loaded is not None, error
+    assert w.speed({}) == before_load
+    assert hashlib.sha256(state.read_bytes()).hexdigest() == snapshot_hash
+    return {'reset_preserved': True, 'load_preserved': True,
+            'snapshot_source': 'provided' if checkpoint else 'saved', 'snapshot_sha256': snapshot_hash}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--profile', type=Path, required=True,
-                        help='JSON: launch_plan, launch overrides, env, warmup_frames, ranges, rejected')
+                        help='JSON: launch_plan, launch overrides, env, warmup_frames, ranges, rejected, '
+                             'lifecycle_checkpoint, pacing_clock_groups')
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -199,9 +233,10 @@ def main():
         result['ranges'] = profile['ranges']
         assert result['batch']['boundary']['runtime_generation'] == launch['launch_id']
         result['pacing'] = check_pacing(w, profile['ranges'], profile.get('step_frames', 60),
-                                        profile.get('running_seconds', 2.0))
+                                        profile.get('running_seconds', 2.0),
+                                        profile.get('pacing_clock_groups', ()))
         if profile.get('lifecycle', True):
-            result['lifecycle'] = check_lifecycle(w, out, status)
+            result['lifecycle'] = check_lifecycle(w, out, status, profile.get('lifecycle_checkpoint'))
         result['passed'] = True
         (out / 'result.json').write_text(json.dumps(result, indent=2))
         print(json.dumps(result, indent=2))

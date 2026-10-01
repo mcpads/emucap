@@ -1,3 +1,6 @@
+pub(crate) mod wire;
+pub mod owner;
+
 use std::time::{Duration, Instant};
 
 /// Maximum work admitted to one synchronous frame/instruction advance. Longer travel is composed
@@ -62,3 +65,40 @@ pub fn finish_with_cleanup<T, E>(
 #[cfg(test)]
 #[path = "temporal_tests.rs"]
 mod tests;
+
+/// Producer-advertised methods whose native stop can be verified after a keyed cancellation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CancellationCapability {
+    pub methods: Vec<String>,
+    pub control_service_ms: u64,
+    pub stop_host_ms: u64,
+}
+
+impl CancellationCapability {
+    pub fn from_hello(value: &serde_json::Value, methods: &[String]) -> Result<Self, String> {
+        let capability: Self = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+        if capability.methods.is_empty()
+            || capability.control_service_ms == 0
+            || capability.control_service_ms > 50
+            || capability.stop_host_ms < capability.control_service_ms
+            || capability.stop_host_ms > 300_000
+        {
+            return Err("invalid temporal cancellation bounds".into());
+        }
+        let mut unique = std::collections::HashSet::new();
+        for method in &capability.methods {
+            if !matches!(method.as_str(), "step" | "step_instructions")
+                || !methods.contains(method)
+                || !unique.insert(method)
+            {
+                return Err("invalid temporal cancellation method".into());
+            }
+        }
+        Ok(capability)
+    }
+}
+
+pub(crate) fn fresh_identity() -> String {
+    format!("{}{}", ulid::Ulid::generate(), ulid::Ulid::generate())
+}

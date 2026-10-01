@@ -5,12 +5,16 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use super::control_session::{self, Attachment, EventKind, SessionEvent};
 use super::protocol::{read_ndjson_frame, to_line, Request};
+
+mod outbound;
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct Emu {
-    to_emu: TcpStream, // 에뮬레이터로 쓰는 writer
+    to_emu: outbound::Outbound, // registration-scoped serialized producer writer
+    lifecycle_runtime: Option<String>,
     methods: Vec<String>,
     identity: serde_json::Value,
     session: Option<TcpStream>, // 페어링된 세션 writer(없으면 드레인)
@@ -99,11 +103,22 @@ fn fence_incoming(line: &str, cur_gen: u64) -> Option<String> {
     Some(v.to_string())
 }
 
-#[derive(Default)]
 struct Registry {
+    instance: String,
     emus: HashMap<String, Emu>,
     anon: u64,
     next_gen: u64, // 등록·attach마다 증가하는 세대 카운터.
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            instance: super::temporal::fresh_identity(),
+            emus: HashMap::new(),
+            anon: 0,
+            next_gen: 0,
+        }
+    }
 }
 
 type Shared = Arc<Mutex<Registry>>;
@@ -166,6 +181,10 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         Err(_) => return,
     };
     let result = v.get("result").cloned().unwrap_or(serde_json::Value::Null);
+    let lifecycle_runtime = match control_session::advertised_runtime(&result) {
+        Ok(runtime) => runtime,
+        Err(_) => return,
+    };
     let identity = super::link::EmulatorIdentity::from_hello(&result);
     if identity.adapter.as_deref() == Some("mesen2-live") && !identity.has_mesen_native_halt() {
         return;
@@ -185,6 +204,10 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         Ok(s) => s,
         Err(_) => return,
     };
+    let emu_writer = match outbound::Outbound::new(emu_writer) {
+        Ok(writer) => writer,
+        Err(_) => return,
+    };
     let (name, my_gen, old_session) = {
         let mut g = lock(&reg);
         let nm = result
@@ -200,7 +223,7 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         // shutdown은 블록하지 않으므로 lock 안에서 OK.
         // lock 밖에서 알림을 쓴다(lock 쥔 채 소켓 write 금지).
         let old_session = g.emus.remove(&nm).and_then(|old| {
-            let _ = old.to_emu.shutdown(std::net::Shutdown::Both);
+            old.to_emu.close();
             old.session
         });
         g.next_gen += 1;
@@ -209,6 +232,7 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
             nm.clone(),
             Emu {
                 to_emu: emu_writer,
+                lifecycle_runtime,
                 methods: methods.clone(),
                 identity: result.clone(),
                 session: None,
@@ -238,15 +262,7 @@ fn handle_emulator(stream: TcpStream, reg: Shared) {
         // 전역 레지스트리 mutex를 쥔 채 실행돼 broker 트래픽이 그 뒤로 직렬화된다. session_gen은 여기서
         // 복사한 값으로 펜싱하므로(스냅샷 시점 세대) 동시 steal에도 의미가 바뀌지 않는다(옛 writer로의
         // 쓰기는 steal 시 소켓이 닫혀 무해).
-        let target = {
-            let g = lock(&reg);
-            g.emus.get(&name).and_then(|e| {
-                e.session
-                    .as_ref()
-                    .and_then(|s| s.try_clone().ok())
-                    .map(|s| (s, e.session_gen))
-            })
-        };
+        let target = response_target(&reg, &name, my_gen);
         // 페어링 세션 없음, 또는 fence_incoming이 None(옛/steal된 세션 응답)이면 폐기.
         if let Some((mut s, sess_gen)) = target {
             if let Some(out) = fence_incoming(raw, sess_gen) {
@@ -334,6 +350,7 @@ fn handle_session(stream: TcpStream, reg: Shared) {
             Ok(nm) => {
                 g.next_gen += 1;
                 let sg = g.next_gen;
+                let instance = g.instance.clone();
                 let e = g.emus.get_mut(&nm).unwrap();
                 let same_registration =
                     expected_registration_id.is_none_or(|expected| expected == e.gen);
@@ -347,30 +364,18 @@ fn handle_session(stream: TcpStream, reg: Shared) {
                     Err(r#"{"kind":"identity_mismatch","message":"managed launch identity changed"}"#.to_string())
                 } else if !same_registration && !same_launch {
                     Err(r#"{"kind":"identity_mismatch","message":"broker emulator registration changed"}"#.to_string())
-                } else if e.session.is_some() {
-                    if expected_registration_id.is_none() || !same_registration {
-                        Err(r#"{"kind":"busy"}"#.to_string())
-                    } else {
-                        // A reconnect carrying the exact registration identity is an explicit,
-                        // generation-fenced continuation of the same application link. Wake the
-                        // obsolete front session; session_gen fencing keeps its late replies out.
-                        if let Some(old) = e.session.take() {
-                            let _ = old.shutdown(std::net::Shutdown::Both);
-                        }
-                        let methods = e.methods.clone();
-                        let identity = e.identity.clone();
-                        e.session = Some(sess_writer);
-                        e.session_gen = sg;
-                        my_session_gen = sg;
-                        Ok((nm, methods, identity, e.gen))
-                    }
+                } else if e.session.is_some()
+                    && (expected_registration_id.is_none() || !same_registration)
+                {
+                    Err(r#"{"kind":"busy"}"#.to_string())
                 } else {
-                    let methods = e.methods.clone();
-                    let identity = e.identity.clone();
-                    e.session = Some(sess_writer);
-                    e.session_gen = sg;
-                    my_session_gen = sg;
-                    Ok((nm, methods, identity, e.gen))
+                    match pair_session(e, &instance, sess_writer, sg) {
+                        Ok(()) => {
+                            my_session_gen = sg;
+                            Ok((nm, e.methods.clone(), e.identity.clone(), e.gen))
+                        }
+                        Err(_) => Err(r#"{"kind":"not_connected","message":"producer lifecycle delivery failed"}"#.to_string()),
+                    }
                 }
             }
             Err(x) => Err(x),
@@ -387,7 +392,9 @@ fn handle_session(stream: TcpStream, reg: Shared) {
         }
     };
     let (name, methods, identity, registration) = chosen;
-    let mut result = serde_json::Map::new();
+    // Producer metadata is opaque to the broker. Preserve extensions and override only
+    // broker-owned routing fields after copying the complete hello result.
+    let mut result = identity.as_object().cloned().unwrap_or_default();
     result.insert(
         "attached_name".into(),
         serde_json::Value::String(name.clone()),
@@ -397,78 +404,156 @@ fn handle_session(stream: TcpStream, reg: Shared) {
         "broker_registration_id".into(),
         serde_json::json!(registration),
     );
-    if let Some(obj) = identity.as_object() {
-        for key in [
-            "system",
-            "adapter",
-            "build",
-            "name",
-            "session_token",
-            "content",
-            "launch_id",
-            "memory_types",
-            "memory_regions",
-            "breakpoint_kinds",
-            "contracts",
-            "host_features",
-            "mesen_host_api",
-            "host_build",
-            "recording",
-        ] {
-            if let Some(v) = obj.get(key) {
-                result.insert(key.into(), v.clone());
-            }
-        }
-    }
     let resp = serde_json::json!({"id": req_id, "ok": true, "result": result});
     if write_line(&mut to_sess, &resp.to_string()).is_err() {
         // 세션 끊김: 내가 설정한 페어링일 때만 언페어.
-        let mut g = lock(&reg);
-        if let Some(e) = g.emus.get_mut(&name) {
-            if e.session_gen == my_session_gen {
-                e.session = None;
-            }
-        }
+        detach_session(&reg, &name, registration, my_session_gen);
         return;
     }
-    // 세션-리더: 줄을 읽어 페어링 에뮬레이터로 전달.
-    // writer는 lock 안에서 try_clone만 — 쓰기는 lock 밖.
+    // Admit under the registry lock; the registration's sole writer performs I/O outside it.
     while let Ok(Some(line)) = read_ndjson_frame(&mut reader, &mut pending) {
         let trimmed = line.trim_end();
-        let ping = is_ping_line(trimmed);
-        let emu = {
-            let g = lock(&reg);
-            if ping {
-                None // _ping은 에뮬레이터로 전달하지 않고 드레인(heartbeat 전용)
-            } else {
-                g.emus.get(&name).and_then(|e| e.to_emu.try_clone().ok())
-            }
-        };
-        if ping {
+        if is_ping_line(trimmed) {
             continue;
         }
-        match emu {
-            Some(mut e) => {
-                // 요청 id를 이 세션 세대로 네임스페이스해 보낸다 — 응답 echo가 이 세션 것임을 나타내,
-                // steal 이후 옛 세션 응답이 신규 소유자에게 오배달되지 않게 한다(fence_incoming).
-                let out = fence_outgoing(trimmed, my_session_gen);
-                if write_line(&mut e, &out).is_err() {
-                    let _ = e.shutdown(std::net::Shutdown::Both);
-                    break;
-                }
-            }
-            None => break, // 에뮬레이터 사라짐
+        let out = fence_outgoing(trimmed, my_session_gen);
+        if !matches!(
+            enqueue_request(&reg, &name, registration, my_session_gen, out),
+            Ok(true)
+        ) {
+            break;
         }
     }
     // 세션 끊김: 내가 설정한 페어링일 때만 언페어(에뮬레이터는 유지 = 지속성).
     // 그 사이 에뮬레이터 replace로 다른 세션이 페어링됐다면(session_gen 불일치) 건드리지 않는다.
-    let mut g = lock(&reg);
-    if let Some(e) = g.emus.get_mut(&name) {
-        if e.session_gen == my_session_gen {
-            e.session = None;
-        }
+    detach_session(&reg, &name, registration, my_session_gen);
+}
+
+fn attachment(instance: &str, registration: u64, session: u64) -> Attachment {
+    Attachment {
+        broker_instance: instance.into(),
+        registration,
+        session,
     }
 }
+fn lifecycle(emu: &Emu, instance: &str, session: u64, kind: EventKind) -> std::io::Result<()> {
+    if let Some(runtime) = &emu.lifecycle_runtime {
+        emu.to_emu.enqueue(
+            SessionEvent {
+                kind,
+                runtime: runtime.clone(),
+                attachment: attachment(instance, emu.gen, session),
+            }
+            .envelope()
+            .to_string(),
+        )?;
+    }
+    Ok(())
+}
+fn pair_session(
+    emu: &mut Emu,
+    instance: &str,
+    writer: TcpStream,
+    session: u64,
+) -> std::io::Result<()> {
+    if let Some(old) = emu.session.take() {
+        let _ = old.shutdown(std::net::Shutdown::Both);
+        lifecycle(emu, instance, emu.session_gen, EventKind::Detach)?;
+    }
+    lifecycle(emu, instance, session, EventKind::Attach)?;
+    emu.session = Some(writer);
+    emu.session_gen = session;
+    Ok(())
+}
+fn detach_session(reg: &Shared, name: &str, registration: u64, session: u64) {
+    let mut g = lock(reg);
+    let instance = g.instance.clone();
+    if let Some(emu) = g.emus.get_mut(name).filter(|emu| {
+        emu.gen == registration && emu.session_gen == session && emu.session.is_some()
+    }) {
+        emu.session = None;
+        // Queue failure closes the producer transport; it cannot silently omit owner loss.
+        let _ = lifecycle(emu, &instance, session, EventKind::Detach);
+    }
+}
+
+/// Linearization point for frontend messages. A stale buffered line cannot acquire the new route.
+fn enqueue_request(
+    reg: &Shared,
+    name: &str,
+    registration: u64,
+    session: u64,
+    line: String,
+) -> std::io::Result<bool> {
+    // Parse and serialize outside the global registry lock; recheck admission after encoding.
+    let mut parsed = serde_json::from_str::<serde_json::Value>(&line).ok();
+    if parsed
+        .as_ref()
+        .is_some_and(control_session::has_reserved_fields)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "reserved control lifecycle fields",
+        ));
+    }
+    let stamp = {
+        let g = lock(reg);
+        let Some(emu) = g.emus.get(name).filter(|emu| {
+            emu.gen == registration && emu.session_gen == session && emu.session.is_some()
+        }) else {
+            return Ok(false);
+        };
+        emu.lifecycle_runtime
+            .as_ref()
+            .map(|_| attachment(&g.instance, registration, session))
+    };
+    let line = if let Some(stamp) = stamp {
+        let value = parsed.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid controlled request",
+            )
+        })?;
+        let params = value
+            .get_mut("params")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "controlled request params must be an object",
+                )
+            })?;
+        params.insert(
+            control_session::ATTACHMENT_FIELD.into(),
+            serde_json::to_value(stamp).unwrap(),
+        );
+        value.to_string()
+    } else {
+        line
+    };
+    let g = lock(reg);
+    let Some(emu) = g.emus.get(name).filter(|emu| {
+        emu.gen == registration && emu.session_gen == session && emu.session.is_some()
+    }) else {
+        return Ok(false);
+    };
+    emu.to_emu.enqueue(line)?;
+    Ok(true)
+}
+
+fn response_target(reg: &Shared, name: &str, registration: u64) -> Option<(TcpStream, u64)> {
+    let g = lock(reg);
+    let emu = g.emus.get(name).filter(|emu| emu.gen == registration)?;
+    emu.session
+        .as_ref()?
+        .try_clone()
+        .ok()
+        .map(|session| (session, emu.session_gen))
+}
+
+#[cfg(test)]
+#[path = "broker/routing_tests.rs"]
+mod routing_tests;
 
 #[cfg(test)]
 mod fence_tests {

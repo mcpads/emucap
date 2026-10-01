@@ -104,8 +104,9 @@ unlimited); a held fast- or slow-forward key, netplay, or `nothrottle` without s
 polling never advances a slow guest, and other requests end the wait. Frame steps, deferred frame
 operations and probes follow the policy and stop with `reason: "host_deadline"` at the
 synchronous budget. With `sound:true` the audio queue also paces the guest, reported as the
-`audio_output` host constraint; below 25 percent the real-time syncer paces the rest of each
-frame after its audio.
+`audio_output` host constraint. Below 25 percent, host playback uses the native 0.25 resampling
+floor and the real-time syncer supplies the remaining wait; playback can have gaps.
+`diagnostics.host_audio_ratio` reports that ratio separately from the requested guest pacing.
 
 ## Usage
 The supported path is the MCP `launch` tool. Audio is off by default; enable it explicitly and independently

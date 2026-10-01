@@ -1,0 +1,81 @@
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -687,9 +687,14 @@
+   // Helper for getting a cache entry from an ID.
+   std::map<u32, RcTcacheEntry> id_map;
+   RcTcacheEntry null_entry;
+-  auto GetEntry = [&id_map, &null_entry](u32 id) -> RcTcacheEntry& {
++  auto GetEntry = [&p, &id_map, &null_entry](u32 id) -> RcTcacheEntry& {
+     auto iter = id_map.find(id);
+-    return iter == id_map.end() ? null_entry : iter->second;
++    if (iter == id_map.end())
++    {
++      p.SetError();
++      return null_entry;
++    }
++    return iter->second;
+   };
+ 
+   // Only clear out state when actually restoring/loading.
+@@ -704,13 +709,18 @@
+   p.Do(size);
+   for (u32 i = 0; i < size; i++)
+   {
+-    // Even if the texture isn't valid, we still need to create the cache entry object
+-    // to update the point in the state state. We'll just throw it away if it's invalid.
+     auto tex = DeserializeTexture(p);
++    if (!tex || !tex->texture || p.HasError())
++    {
++      p.SetError();
++      return;
++    }
+     auto entry =
+         std::make_shared<TCacheEntry>(std::move(tex->texture), std::move(tex->framebuffer));
+     entry->textures_by_hash_iter = m_textures_by_hash.end();
+     entry->DoState(p);
++    if (p.HasError())
++      return;
+     if (entry->texture && commit_state)
+       id_map.emplace(i, entry);
+   }
+@@ -725,6 +735,8 @@
+     p.Do(id2);
+     auto e1 = GetEntry(id1);
+     auto e2 = GetEntry(id2);
++    if (p.HasError())
++      return;
+     if (e1 && e2)
+       e1->CreateReference(e2.get());
+   }
+@@ -739,6 +751,8 @@
+     p.Do(id);
+ 
+     auto& entry = GetEntry(id);
++    if (p.HasError())
++      return;
+     if (entry)
+       m_textures_by_address.emplace(addr, entry);
+   }
+@@ -753,6 +767,8 @@
+     p.Do(id);
+ 
+     auto& entry = GetEntry(id);
++    if (p.HasError())
++      return;
+     if (entry)
+       entry->textures_by_hash_iter = m_textures_by_hash.emplace(hash, entry);
+   }
+@@ -771,6 +787,13 @@
+     p.Do(id);
+ 
+     auto& entry = GetEntry(id);
++    if (p.HasError())
++      return;
++    if (index >= m_bound_textures.size())
++    {
++      p.SetError();
++      return;
++    }
+     if (entry)
+       m_bound_textures[index] = entry;
+   }

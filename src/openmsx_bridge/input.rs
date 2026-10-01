@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::{optional_num, BridgeResult, OpenMsxBridgeError};
 
@@ -143,4 +143,48 @@ pub(super) fn button_position(button: &str) -> (u8, u8) {
         "right" => (8, 0x80),
         _ => unreachable!("normalized button"),
     }
+}
+
+// These debug views are side-effect-free. One Tcl evaluation observes all input fields on the
+// native owner thread without eight XML round trips or guest execution between those reads.
+pub(super) const INPUT_OBSERVATION_COMMAND: &str = "list [debug read keymatrix 2] [debug read keymatrix 6] [debug read keymatrix 7] [debug read keymatrix 8] [debug read emucap_joystick_override 0] [debug read emucap_joystick_override 1] [debug read joystickports 0] [debug read joystickports 1]";
+
+pub(super) struct InputObservation {
+    pub matrix: Value,
+    pub owners: [Option<u8>; 2],
+    pub guest_values: [u8; 2],
+}
+
+pub(super) fn decode_joystick_owner(encoded: u64, index: usize) -> BridgeResult<Option<u8>> {
+    match encoded {
+        0 => Ok(None),
+        0x80..=0xbf => Ok(Some((encoded as u8) & 0x3f)),
+        value => Err(OpenMsxBridgeError::Protocol(format!(
+            "openMSX returned invalid joystick override status {value:#x} for port {}",
+            index + 1
+        ))),
+    }
+}
+
+pub(super) fn parse_input_observation(raw: &str) -> BridgeResult<InputObservation> {
+    let bytes = raw
+        .split_whitespace()
+        .map(str::parse::<u8>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            OpenMsxBridgeError::Protocol("invalid native input observation byte".into())
+        })?;
+    let [r2, r6, r7, r8, owner0, owner1, guest0, guest1] = bytes.as_slice() else {
+        return Err(OpenMsxBridgeError::Protocol(
+            "native input observation requires eight bytes".into(),
+        ));
+    };
+    Ok(InputObservation {
+        matrix: json!({"2": r2, "6": r6, "7": r7, "8": r8}),
+        owners: [
+            decode_joystick_owner(u64::from(*owner0), 0)?,
+            decode_joystick_owner(u64::from(*owner1), 1)?,
+        ],
+        guest_values: [*guest0, *guest1],
+    })
 }

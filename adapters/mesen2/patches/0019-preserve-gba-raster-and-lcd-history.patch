@@ -1,0 +1,174 @@
+--- a/Core/GBA/GbaConsole.h
++++ b/Core/GBA/GbaConsole.h
+@@ -112,6 +112,7 @@
+ 	uint32_t GetMasterClockRate() override;
+ 
+ 	BaseVideoFilter* GetVideoFilter(bool getDefaultFilter) override;
++	void* GetVideoFrameData() override;
+ 
+ 	RomFormat GetRomFormat() override;
+ 	AudioTrackInfo GetAudioTrackInfo() override;
+--- a/Core/GBA/GbaConsole.cpp
++++ b/Core/GBA/GbaConsole.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include "Shared/Video/VideoDecoder.h"
+ #include "GBA/GbaConsole.h"
+ #include "GBA/GbaCpu.h"
+ #include "GBA/GbaPpu.h"
+@@ -488,8 +489,23 @@
+ 	settings->InitializeRam(settings->GetGbaConfig().RamPowerOnState, data, length);
+ }
+ 
++void* GbaConsole::GetVideoFrameData()
++{
++	return _ppu->GetPreviousCompletedFrame();
++}
++
+ void GbaConsole::Serialize(Serializer& s)
+ {
++	if(!s.IsSaving() && s.GetFormat() != SerializeFormat::Map) {
++		s.PushNamePrefix("_ppu", -1);
++		bool validRaster = GbaPpu::ValidateRasterState(s);
++		s.PopNamePrefix();
++		if(!validRaster) {
++			s.SetErrorFlag();
++			return;
++		}
++		_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
++	}
+ 	SV(_cpu);
+ 	SV(_ppu);
+ 	SV(_apu);
+--- a/Core/GBA/GbaPpu.h
++++ b/Core/GBA/GbaPpu.h
+@@ -118,6 +118,8 @@
+ 
+ 	uint16_t* _outputBuffers[2] = {};
+ 	uint16_t* _currentBuffer = nullptr;
++	uint16_t _completedFrame[GbaConstants::PixelCount] = {};
++	uint16_t _previousCompletedFrame[GbaConstants::PixelCount] = {};
+ 
+ 	GbaPixelData* _oamWriteOutput = nullptr;
+ 	GbaPixelData* _oamReadOutput = nullptr;
+@@ -276,5 +278,7 @@
+ 	bool IsBitmapMode() { return _state.BgMode >= 3; }
+ 	bool IsOverclockScanline() { return _inOverclock; }
+ 
++	uint16_t* GetPreviousCompletedFrame() { return _previousCompletedFrame; }
++	static bool ValidateRasterState(Serializer& s);
+ 	void Serialize(Serializer& s) override;
+ };
+\ No newline at end of file
+--- a/Core/GBA/GbaPpu.cpp
++++ b/Core/GBA/GbaPpu.cpp
+@@ -186,7 +186,11 @@
+ 	_emu->ProcessEvent(EventType::EndFrame, CpuType::Gba);
+ 	_emu->GetNotificationManager()->SendNotification(ConsoleNotificationType::PpuFrameDone);
+ 
++	_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
++	std::copy(std::begin(_completedFrame), std::end(_completedFrame), _previousCompletedFrame);
++	std::copy(_currentBuffer, _currentBuffer + GbaConstants::PixelCount, _completedFrame);
+ 	RenderedFrame frame(_currentBuffer, GbaConstants::ScreenWidth, GbaConstants::ScreenHeight, 1.0, _state.FrameCount, _console->GetControlManager()->GetPortStates());
++	frame.Data = _previousCompletedFrame;
+ 	bool rewinding = _emu->GetRewindManager()->IsRewinding();
+ 	_emu->GetVideoDecoder()->UpdateFrame(frame, rewinding, rewinding);
+ 
+@@ -1602,6 +1606,18 @@
+ 	}
+ }
+ 
++bool GbaPpu::ValidateRasterState(Serializer& s)
++{
++	uint32_t version = 0;
++	uint8_t index = 0xff;
++	return s.TryReadValue("rasterVersion", version) && version == 1
++		&& s.TryReadValue("outputBufferIndex", index) && index < 2
++		&& s.HasValueSize("outputBuffer0", GbaConstants::PixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("outputBuffer1", GbaConstants::PixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("completedFrame", GbaConstants::PixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("previousCompletedFrame", GbaConstants::PixelCount * sizeof(uint16_t));
++}
++
+ void GbaPpu::Serialize(Serializer& s)
+ {
+ 	SV(_state.FrameCount);
+@@ -1688,6 +1704,17 @@
+ 	SV(_state.OutWindowControl);
+ 
+ 	if(s.GetFormat() != SerializeFormat::Map) {
++		uint32_t rasterVersion = 1;
++		uint8_t outputBufferIndex = _currentBuffer == _outputBuffers[1] ? 1 : 0;
++		s.Stream(rasterVersion, "rasterVersion");
++		s.Stream(outputBufferIndex, "outputBufferIndex");
++		s.StreamArray(_outputBuffers[0], GbaConstants::PixelCount, "outputBuffer0");
++		s.StreamArray(_outputBuffers[1], GbaConstants::PixelCount, "outputBuffer1");
++		s.StreamArray(_completedFrame, GbaConstants::PixelCount, "completedFrame");
++		s.StreamArray(_previousCompletedFrame, GbaConstants::PixelCount, "previousCompletedFrame");
++		if(!s.IsSaving()) {
++			_currentBuffer = _outputBuffers[outputBufferIndex];
++		}
+ 		for(int i = 0; i < 5; i++) {
+ 			SVI(_state.WindowActiveLayers[i][0]);
+ 			SVI(_state.WindowActiveLayers[i][1]);
+--- a/Core/GBA/GbaDefaultVideoFilter.h
++++ b/Core/GBA/GbaDefaultVideoFilter.h
+@@ -12,7 +12,6 @@
+ 	uint32_t _calculatedPalette[0x8000] = {};
+ 	VideoConfig _videoConfig = {};
+ 
+-	uint16_t* _prevFrame = nullptr;
+ 	bool _blendFrames = false;
+ 	bool _gbaAdjustColors = false;
+ 
+--- a/Core/GBA/GbaDefaultVideoFilter.cpp
++++ b/Core/GBA/GbaDefaultVideoFilter.cpp
+@@ -12,13 +12,12 @@
+ {
+ 	InitLookupTable();
+ 	_applyNtscFilter = applyNtscFilter;
+-	_prevFrame = new uint16_t[GbaConstants::PixelCount];
+-	memset(_prevFrame, 0, GbaConstants::PixelCount * sizeof(uint16_t));
++
+ }
+ 
+ GbaDefaultVideoFilter::~GbaDefaultVideoFilter()
+ {
+-	delete[] _prevFrame;
++
+ }
+ 
+ FrameInfo GbaDefaultVideoFilter::GetFrameInfo()
+@@ -80,11 +79,8 @@
+ 		_gbaAdjustColors = adjustColors;
+ 		InitLookupTable();
+ 	}
+-	bool blendFrames = gbaConfig.BlendFrames && !_emu->GetRewindManager()->IsRewinding() && !_emu->IsPaused();
+-	if(_blendFrames != blendFrames) {
+-		_blendFrames = blendFrames;
+-		memset(_prevFrame, 0, GbaConstants::PixelCount * sizeof(uint16_t));
+-	}
++	_blendFrames = gbaConfig.BlendFrames && !_emu->GetRewindManager()->IsRewinding()
++		&& _frameData != nullptr;
+ 
+ 	_videoConfig = config;
+ }
+@@ -99,9 +95,6 @@
+ 		}
+ 	}
+ 
+-	if(_blendFrames) {
+-		std::copy(ppuOutputBuffer, ppuOutputBuffer + GbaConstants::PixelCount, _prevFrame);
+-	}
+ 
+ 	if(_applyNtscFilter) {
+ 		_ntscFilter.ApplyFilter(out, GbaConstants::ScreenWidth, GbaConstants::ScreenHeight, IsOddFrame());
+@@ -111,7 +104,7 @@
+ uint32_t GbaDefaultVideoFilter::GetPixel(uint16_t* ppuFrame, uint32_t offset)
+ {
+ 	if(_blendFrames) {
+-		return BlendPixels(_calculatedPalette[_prevFrame[offset] & 0x7FFF], _calculatedPalette[ppuFrame[offset] & 0x7FFF]);
++		return BlendPixels(_calculatedPalette[static_cast<const uint16_t*>(_frameData)[offset] & 0x7FFF], _calculatedPalette[ppuFrame[offset] & 0x7FFF]);
+ 	} else {
+ 		return _calculatedPalette[ppuFrame[offset] & 0x7FFF];
+ 	}

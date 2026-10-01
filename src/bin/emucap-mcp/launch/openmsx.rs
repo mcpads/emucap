@@ -65,6 +65,7 @@ pub(super) fn launch_openmsx(
     let content = Path::new(&args.content_path);
     let log = adapter_log_path("openmsx", port, "openmsx.log");
     let display = args.display.unwrap_or(false);
+    let sound = args.sound.unwrap_or(false);
     let launch = openmsx_launch::Launch {
         binary: &binary,
         bridge: &bridge,
@@ -77,6 +78,7 @@ pub(super) fn launch_openmsx(
         session_token: token,
         runtime: Some(runtime),
         display,
+        sound,
     };
     match openmsx_launch::launch(&launch) {
         Ok(launched) => serde_json::json!({
@@ -86,6 +88,7 @@ pub(super) fn launch_openmsx(
             "openmsx_pid": launched.openmsx_pid,
             "bridge_pid": launched.bridge_pid,
             "display": display,
+            "sound": sound,
             "port": port,
             "binary": binary.display().to_string(),
             "bridge": bridge.display().to_string(),

@@ -1,0 +1,97 @@
+--- a/Core/Shared/Video/VideoDecoder.h
++++ b/Core/Shared/Video/VideoDecoder.h
+@@ -34,6 +34,11 @@
+ 	FrameInfo _lastFrameSize = {};
+ 	RenderedFrame _frame = {};
+ 
++	//Owned copy of the last submitted guest image, separate from the live raster buffers.
++	SimpleLock _snapshotFrameLock;
++	RenderedFrame _snapshotFrame = {};
++	vector<uint16_t> _snapshotPixels;
++
+ 	VideoFilterType _videoFilterType = VideoFilterType::None;
+ 	unique_ptr<BaseVideoFilter> _videoFilter;
+ 	unique_ptr<ScaleFilter> _scaleFilter;
+@@ -62,6 +67,8 @@
+ 
+ 	void UpdateFrame(RenderedFrame frame, bool sync, bool forRewind);
+ 
++	bool CopySnapshotFrame(RenderedFrame& frame, vector<uint16_t>& pixels);
++
+ 	void WaitForAsyncFrameDecode();
+ 
+ 	bool IsRunning();
+--- a/Core/Shared/Video/VideoDecoder.cpp
++++ b/Core/Shared/Video/VideoDecoder.cpp
+@@ -33,6 +33,11 @@
+ 
+ void VideoDecoder::Init()
+ {
++	{
++		auto lock = _snapshotFrameLock.AcquireSafe();
++		_snapshotFrame = {};
++		_snapshotPixels.clear();
++	}
+ 	UpdateVideoFilter();
+ 	_videoFilter->SetBaseFrameInfo(_baseFrameSize);
+ }
+@@ -194,6 +199,15 @@
+ 
+ 	_emu->OnBeforeSendFrame();
+ 
++	{
++		auto lock = _snapshotFrameLock.AcquireSafe();
++		const uint16_t* pixels = static_cast<const uint16_t*>(frame.FrameBuffer);
++		_snapshotPixels.assign(pixels, pixels + size_t(frame.Width) * frame.Height);
++		_snapshotFrame = frame;
++		_snapshotFrame.FrameBuffer = nullptr;
++		_snapshotFrame.Data = nullptr;
++		_snapshotFrame.InputData.clear();
++	}
+ 	_frame = frame;
+ 	if(sync) {
+ 		DecodeFrame(forRewind);
+@@ -202,6 +216,18 @@
+ 		_waitForFrame.Signal();
+ 	}
+ 	_frameCount++;
++}
++
++bool VideoDecoder::CopySnapshotFrame(RenderedFrame& frame, vector<uint16_t>& pixels)
++{
++	auto lock = _snapshotFrameLock.AcquireSafe();
++	if(_snapshotPixels.empty()) {
++		return false;
++	}
++	pixels = _snapshotPixels;
++	frame = _snapshotFrame;
++	frame.FrameBuffer = pixels.data();
++	return true;
+ }
+ 
+ void VideoDecoder::StartThread()
+--- a/Core/Shared/SaveStateManager.cpp
++++ b/Core/Shared/SaveStateManager.cpp
+@@ -115,10 +115,21 @@
+ void SaveStateManager::SaveVideoData(ostream& stream)
+ {
+ 	PpuFrameInfo frame = _emu->GetPpuFrame();
++	RenderedFrame completed;
++	double scale = _emu->GetVideoDecoder()->GetLastFrameScale();
++	vector<uint16_t> pixels;
++	if(_emu->GetVideoDecoder()->CopySnapshotFrame(completed, pixels)) {
++		frame.FrameBuffer = reinterpret_cast<uint8_t*>(pixels.data());
++		frame.FrameBufferSize = pixels.size() * sizeof(uint16_t);
++		frame.Width = completed.Width;
++		frame.Height = completed.Height;
++		scale = completed.Scale;
++	}
++	//Before the first submitted frame, retain the native initial preview behavior.
+ 	WriteValue(stream, frame.FrameBufferSize);
+ 	WriteValue(stream, frame.Width);
+ 	WriteValue(stream, frame.Height);
+-	WriteValue(stream, (uint32_t)(_emu->GetVideoDecoder()->GetLastFrameScale() * 100));
++	WriteValue(stream, (uint32_t)(scale * 100));
+ 
+ 	unsigned long compressedSize = compressBound(frame.FrameBufferSize);
+ 	vector<uint8_t> compressedData(compressedSize, 0);

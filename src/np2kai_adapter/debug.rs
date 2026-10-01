@@ -432,7 +432,7 @@ impl Np2kaiHost {
         let mut instructions = Vec::new();
         for _ in 0..count {
             let current = address;
-            let mut text = [0_i8; 256];
+            let mut text: [c_char; 256] = [0; 256];
             let mut next = 0_u32;
             let mut bytes = [0_u8; 16];
             let mut byte_count = bytes.len();

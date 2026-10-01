@@ -1,0 +1,58 @@
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -19,6 +19,7 @@
+ #include "exec/cpu-common.h"
+ #include "qapi/qapi-commands-xemu-emucap.h"
+ #include "system/runstate.h"
++#include "system/system.h"
+ #include "system/tcg.h"
+ #include "xemu-emucap.h"
+ #include "xemu-emucap-pacing.h"
+@@ -65,6 +66,8 @@
+                                   "precise-icount" : "unsupported");
+     profile->instruction_ns = icount_to_ns(1);
+     profile->multi_thread = qemu_tcg_mttcg_enabled();
++    profile->rtc_clock = g_strdup(rtc_clock == QEMU_CLOCK_VIRTUAL ?
++                                   "virtual" : "unsupported");
+     profile->devices = g_strdup("nv2a-apu-virtual");
+     xemu_emucap_clock_options(&profile->sleep, &profile->align);
+     return profile;
+--- a/qapi/xemu-emucap.json
++++ b/qapi/xemu-emucap.json
+@@ -17,13 +17,15 @@
+ # @sleep: native icount sleep option
+ #
+ # @align: native icount align option
++#
++# @rtc-clock: effective RTC timer domain
+ #
+ # @devices: compiled guest device scheduling model
+ ##
+ { 'struct': 'XemuEmucapClockProfile',
+   'data': { 'scheduler': 'str', 'instruction-ns': 'int',
+             'multi-thread': 'bool', 'sleep': 'bool', 'align': 'bool',
+-            'devices': 'str' } }
++            'devices': 'str', 'rtc-clock': 'str' } }
+ 
+ ##
+ # @XemuEmucapAudioContinuation:
+--- a/accel/tcg/icount-common.c
++++ b/accel/tcg/icount-common.c
+@@ -34,6 +34,7 @@
+ #include "qemu/seqlock.h"
+ #include "system/replay.h"
+ #include "system/runstate.h"
++#include "system/system.h"
+ #include "hw/core/cpu.h"
+ #include "exec/icount.h"
+ #include "ui/xemu-emucap-pacing.h"
+@@ -53,7 +54,8 @@
+ 
+ bool xemu_emucap_clock_supported(void)
+ {
+-    return icount_enabled() == ICOUNT_PRECISE && !icount_sleep &&
++    return rtc_clock == QEMU_CLOCK_VIRTUAL &&
++           icount_enabled() == ICOUNT_PRECISE && !icount_sleep &&
+            !icount_align_option && icount_to_ns(1) >= 1 && icount_to_ns(1) <= 8;
+ }
+ 

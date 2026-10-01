@@ -1,0 +1,13 @@
+--- a/Source/Core/Core/PowerPC/PPCAnalyst.cpp
++++ b/Source/Core/Core/PowerPC/PPCAnalyst.cpp
+@@ -895,7 +895,9 @@
+       {
+         code[i].branchTo = code[caller].address + 4;
+         if ((inst.BO & BO_DONT_DECREMENT_FLAG) && (inst.BO & BO_DONT_CHECK_CONDITION) &&
+-            numFollows < BRANCH_FOLLOWING_THRESHOLD)
++            numFollows < BRANCH_FOLLOWING_THRESHOLD &&
++            !(m_is_debugging_enabled &&
++              system.GetPowerPC().GetBreakPoints().IsAddressBreakPoint(code[i].address)))
+         {
+           // bclrx with unconditional branch = return
+           // Follow it if we can propagate the LR value of the last CALL instruction.

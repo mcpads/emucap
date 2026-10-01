@@ -7,6 +7,7 @@
 #include "Core/EmuCap.h"
 #include "Core/EmuCapInput.h"
 #include "Core/EmuCapTemporal.h"
+#include "Core/EmuCapPacing.h"
 
 #include <algorithm>
 #include <atomic>
@@ -43,6 +44,7 @@ using SOCKET = int;
 
 #include <picojson.h>
 
+#include "AudioCommon/AudioCommon.h"
 #include "Common/Config/Config.h"
 #include "Common/Event.h"
 #include "Common/FileUtil.h"
@@ -52,9 +54,11 @@ using SOCKET = int;
 #include "Core/Config/WiimoteSettings.h"
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
+#include "Core/DSPEmulator.h"
 #include "Core/Debugger/Debugger_SymbolMap.h"
 #include "Core/Debugger/PPCDebugInterface.h"
 #include "Core/HW/CPU.h"
+#include "Core/HW/DSP.h"
 #include "Core/HW/ProcessorInterface.h"
 #include "Core/HW/Memmap.h"
 #include "Core/HW/Wiimote.h"
@@ -69,7 +73,9 @@ using SOCKET = int;
 #include "Core/State.h"
 #include "Core/System.h"
 #include "InputCommon/GCPadStatus.h"
+#include "VideoCommon/Fifo.h"
 #include "VideoCommon/FrameDumper.h"
+#include "VideoCommon/VideoBackendBase.h"
 
 namespace EmuCap
 {
@@ -77,6 +83,10 @@ namespace
 {
 std::thread s_thread;
 std::atomic<bool> s_stop{false};
+// Uncertain native mutations retire control for this process, including automatic reconnects.
+// A fresh managed launch is the recovery boundary; Stop still performs normal process cleanup.
+std::atomic<bool> s_control_retired{false};
+std::atomic<uint64_t> s_runtime_generation{0};
 std::atomic<bool> s_started{false};
 std::atomic<bool> s_request_cancelled{false};
 
@@ -115,7 +125,7 @@ constexpr u64 MAX_BREAKPOINT_SPAN = 64 * 1024;
 constexpr u64 MAX_POWERPC_ACCESS_WIDTH = 8;
 constexpr auto SYNC_RESPONSE_BUDGET = Temporal::OPERATION_BUDGET;
 constexpr auto FRAME_STEP_WORK_BUDGET = Temporal::OPERATION_BUDGET;
-constexpr auto RESET_WORK_BUDGET = std::chrono::seconds(3);
+constexpr auto RESET_WORK_BUDGET = Temporal::OPERATION_BUDGET;
 constexpr auto STEP_WAIT_SLICE = std::chrono::seconds(1);
 
 std::mutex s_frame_step_mutex;
@@ -127,6 +137,7 @@ std::mutex s_reset_mutex;
 std::condition_variable s_reset_cv;
 std::atomic<u64> s_next_reset_token{1};
 u64 s_completed_reset_token = 0;
+u64 s_active_reset_token = 0;
 
 // GameCube and Wii input have separate identities and consumer clocks.
 std::mutex s_input_mutex;
@@ -423,9 +434,6 @@ constexpr u32 MEM2_BASE = 0x90000000;
 // Bumped by every request outside the observation set, since those can change memory or the stop
 // without changing the frame count.
 std::atomic<u64> s_boundary_seq{0};
-std::mutex s_pacing_mutex;
-u64 s_policy_revision = 0;
-std::string s_policy_key;
 
 bool ObservationMethod(const std::string& method)
 {
@@ -442,15 +450,14 @@ u64 CurrentFrame(Core::System& system)
   return system.GetMovie().GetCurrentFrame();
 }
 
-struct PacingObservation
-{
-  float speed;
-  bool temp_disabled;
-};
+using PacingObservation = Pacing::Observation;
 
+// Caller holds the settings gate across values and mutation stamps.
 PacingObservation NativePacing()
 {
-  return {Config::Get(Config::MAIN_EMULATION_SPEED), Core::GetIsThrottlerTempDisabled()};
+  return {Config::Get(Config::MAIN_EMULATION_SPEED), Core::GetIsThrottlerTempDisabled(),
+          {Config::GetSettingWriteRevision(Config::MAIN_EMULATION_SPEED.GetLocation()),
+           Config::GetLayerViewRevision(), Core::GetThrottlerOverrideRevision()}};
 }
 
 // Integer percent of a limited native speed inside the domain, or 0.
@@ -466,24 +473,9 @@ uint32_t LimitedPercent(float speed)
   return static_cast<uint32_t>(percent);
 }
 
-// Records one observation; a changed native tuple is a new policy revision.
-std::pair<PacingObservation, u64> ObservePacing()
-{
-  const PacingObservation o = NativePacing();
-  char key[64];
-  std::snprintf(key, sizeof(key), "%.9g|%d", o.speed, o.temp_disabled ? 1 : 0);
-  std::lock_guard lock(s_pacing_mutex);
-  if (s_policy_key != key)
-  {
-    ++s_policy_revision;
-    s_policy_key = key;
-  }
-  return {o, s_policy_revision};
-}
-
 // The throttler's temporary disable (fast-forward hotkey) and speed 0 are unlimited; a speed
 // outside the integer domain is custom.
-picojson::object PacingPolicy(const PacingObservation& o, u64 revision)
+picojson::object PacingPolicy(const PacingObservation& o)
 {
   picojson::object r;
   std::string mode = "custom";
@@ -500,7 +492,9 @@ picojson::object PacingPolicy(const PacingObservation& o, u64 revision)
   r["mode"] = picojson::value(mode);
   r["percent"] = percent;
   r["source"] = picojson::value(std::string("native"));
-  r["policy_revision"] = picojson::value(std::to_string(revision));
+  r["policy_revision"] = picojson::value(std::to_string(o.revision[0]) + ":" +
+                                         std::to_string(o.revision[1]) + ":" +
+                                         std::to_string(o.revision[2]));
   r["host_constraints"] = picojson::value(picojson::array{});
   picojson::object diagnostics;
   diagnostics["emulation_speed"] = picojson::value(static_cast<double>(o.speed));
@@ -511,8 +505,10 @@ picojson::object PacingPolicy(const PacingObservation& o, u64 revision)
 
 picojson::object CurrentPacingPolicy()
 {
-  const auto [o, revision] = ObservePacing();
-  return PacingPolicy(o, revision);
+  Config::SettingsTransaction transaction(std::try_to_lock);
+  if (!transaction.OwnsLock())
+    return Fail("busy", "native settings are being changed; retry the query");
+  return PacingPolicy(NativePacing());
 }
 
 picojson::object PacingCapability()
@@ -567,15 +563,38 @@ picojson::object BatchCapability(Core::System& system)
   return r;
 }
 
-// Applies a native speed on the host thread, where Dolphin's own UI changes it.
-bool SetNativeSpeed(float speed)
+// Native host dispatch with cancellation shared by the caller and the queued callback.
+struct PacingJobResult
 {
-  auto done = std::make_shared<Common::Event>();
-  Core::QueueHostJob([speed, done](Core::System&) {
-    Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, speed);
-    done->Set();
+  Temporal::HostJobOutcome job;
+  Pacing::Change change;
+};
+
+PacingJobResult SetNativeSpeed(float speed)
+{
+  const auto deadline = std::chrono::steady_clock::now() + STEP_WAIT_SLICE;
+  auto job = std::make_shared<Temporal::HostJob>(deadline);
+  auto change = std::make_shared<Pacing::Change>();
+  const uint64_t generation = s_runtime_generation.load();
+  Core::QueueHostJob([speed, job, change, generation, deadline](Core::System&) {
+    const auto admit = [generation, deadline] {
+      return !s_stop.load() && !s_control_retired.load() &&
+             s_runtime_generation.load() == generation &&
+             std::chrono::steady_clock::now() < deadline;
+    };
+    job->Execute(admit, [&] {
+      *change = Pacing::Apply(speed, admit, NativePacing, [](float target) {
+        Config::SetBaseOrCurrent(Config::MAIN_EMULATION_SPEED, target);
+        Core::SetIsThrottlerTempDisabled(false);
+      });
+      return true;
+    });
   });
-  return done->WaitFor(STEP_WAIT_SLICE);
+  const auto outcome = job->Wait();
+  // A timed-out callback can still be filling change. Only completion publishes its fields.
+  if (outcome != Temporal::HostJobOutcome::Completed)
+    return {outcome, {}};
+  return {outcome, *change};
 }
 
 picojson::object ExecutionSpeed(Core::System& system, const picojson::object& p)
@@ -595,33 +614,38 @@ picojson::object ExecutionSpeed(Core::System& system, const picojson::object& p)
     return Fail("bad_params", "use limited with an integer percent in 1..10000, unlimited without "
                               "percent, or omit both");
   }
-  if (limited && percent < 100 && AchievementManager::GetInstance().IsHardcoreModeActive())
+  if ((unlimited || (limited && percent < 100)) &&
+      AchievementManager::GetInstance().IsHardcoreModeActive())
   {
     return Fail("emulator_error", "execution_speed failed_restored: achievements hardcore mode "
                                   "keeps the speed at or above 100 percent");
   }
-  const auto [before, before_revision] = ObservePacing();
-  const picojson::object previous = PacingPolicy(before, before_revision);
+  const picojson::object last_verified = CurrentPacingPolicy();
+  if (!s_handler_error.empty())
+    return {};
   const float target = unlimited ? 0.0f : static_cast<float>(percent) / 100.0f;
-  if (!SetNativeSpeed(target))
-    return Fail("timeout", "execution_speed: the host thread did not apply the speed");
-  const PacingObservation now = NativePacing();
-  const bool confirmed = !now.temp_disabled &&
-                         (unlimited ? now.speed <= 0.0f : LimitedPercent(now.speed) == percent);
-  if (!confirmed)
+  const auto result = SetNativeSpeed(target);
+  if (result.job == Temporal::HostJobOutcome::Cancelled ||
+      (result.job == Temporal::HostJobOutcome::Completed &&
+       result.change.outcome == Pacing::Outcome::Cancelled))
+    return Fail("timeout", "execution_speed: queued change cancelled before application");
+  if (result.job == Temporal::HostJobOutcome::Completed &&
+      result.change.outcome == Pacing::Outcome::Busy)
+    return Fail("busy", "native settings are being changed; retry execution_speed");
+  if (result.job != Temporal::HostJobOutcome::Completed ||
+      result.change.outcome != Pacing::Outcome::Completed)
   {
-    const bool restored = SetNativeSpeed(before.speed) && NativePacing().speed == before.speed;
-    ObservePacing();
-    return Fail("emulator_error",
-                restored ? "execution_speed failed_restored: the fast-forward hotkey owns the speed" :
-                           "execution_speed unverified: the previous policy was not restored");
+    s_control_retired.store(true);
+    return Fail("emulator_error", "execution_speed unverified: native application or policy "
+                "verification did not complete; control retired; guest progress is unknown; "
+                "last verified policy=" + picojson::value(last_verified).serialize());
   }
   picojson::object r;
   r["status"] = picojson::value(std::string("completed"));
   r["state"] = picojson::value(
       std::string(Core::GetState(system) == Core::State::Paused ? "frozen" : "running"));
-  r["previous"] = picojson::value(previous);
-  r["execution_speed"] = picojson::value(CurrentPacingPolicy());
+  r["previous"] = picojson::value(PacingPolicy(result.change.previous));
+  r["execution_speed"] = picojson::value(PacingPolicy(result.change.verified));
   r["frame"] = picojson::value(static_cast<double>(CurrentFrame(system)));
   return r;
 }
@@ -820,6 +844,21 @@ picojson::object Hello(Core::System& core_system, const picojson::object&)
   return r;
 }
 
+picojson::object AudioOutput()
+{
+  const auto observed = AudioCommon::GetOutputObservation();
+  picojson::object output;
+  output["stream_generation"] = picojson::value(std::to_string(observed.generation));
+  output["backend"] = observed.backend.empty() ? picojson::value() : picojson::value(observed.backend);
+  output["initialized"] = picojson::value(observed.initialized);
+  output["phase"] = picojson::value(std::string(observed.phase));
+  output["last_run_result"] = picojson::value(std::string(observed.last_run_result));
+  output["start_verified"] = picojson::value(observed.start_verified);
+  output["failure"] = observed.failure ? picojson::value(std::string(observed.failure)) : picojson::value();
+  output["fallback"] = observed.fallback ? picojson::value(std::string(observed.fallback)) : picojson::value();
+  return output;
+}
+
 picojson::object Status(Core::System& system, const picojson::object&)
 {
   picojson::object r;
@@ -830,7 +869,10 @@ picojson::object Status(Core::System& system, const picojson::object&)
   r["state"] = picojson::value(std::string(st == Core::State::Paused ? "frozen" : "running"));
   r["adapter"] = picojson::value(std::string("dolphin-native"));
   r["frame"] = picojson::value(static_cast<double>(CurrentFrame(system)));
+  r["audio_output"] = picojson::value(AudioOutput());
   r["execution_speed"] = picojson::value(CurrentPacingPolicy());
+  if (!s_handler_error.empty())
+    return {};
   // Lightweight breakpoint diagnostics. dbg_effective is Config::IsDebuggingEnabled()
   // (MAIN_ENABLE_DEBUGGING and not achievements-hardcore) and must be true for core checks.
   // cpu_core: 0=Interpreter, 1=JIT64, 4=JITARM64, 5=CachedInterpreter.
@@ -938,12 +980,31 @@ picojson::object WriteMemory(Core::System& system, const picojson::object& p)
 picojson::object GetState(Core::System& system, const picojson::object&)
 {
   picojson::object state;
+  picojson::value components;
   {
     SafeAccess sa(system);
     state = CpuState(system.GetPPCState());
+    const auto core_state = Core::GetState(system);
+    if (core_state == Core::State::Paused || core_state == Core::State::Running)
+    {
+      const auto* dsp = system.GetDSP().GetDSPEmulator();
+      if (dsp && g_video_backend)
+      {
+        picojson::object observed;
+        observed["cpu_engine"] = picojson::value(std::string(system.GetPowerPC().GetCPUName()));
+        observed["dual_core"] = picojson::value(system.IsDualCoreMode());
+        observed["deterministic_gpu_thread"] =
+            picojson::value(system.GetFifo().UseDeterministicGPUThread());
+        observed["dsp_engine"] = picojson::value(std::string(dsp->IsLLE() ? "lle" : "hle"));
+        observed["dsp_worker_present"] = picojson::value(dsp->HasWorkerThread());
+        observed["video_backend"] = picojson::value(g_video_backend->GetConfigName());
+        components = picojson::value(observed);
+      }
+    }
   }
   picojson::object r;
   r["state"] = picojson::value(state);
+  r["runtime_components"] = std::move(components);
   return r;
 }
 
@@ -1035,14 +1096,30 @@ picojson::object Resume(Core::System& system, const picojson::object&)
   return r;
 }
 
-bool CancelResetTap(Core::System& system)
+bool FinishResetTap(u64 token)
 {
-  auto completed = std::make_shared<Common::Event>();
-  Core::RunOnCPUThread(system, [&system, completed] {
-    system.GetProcessorInterface().CancelEmucapResetButtonTap();
-    completed->Set();
+  auto cleanup = std::make_shared<Temporal::HostJob>(
+      Temporal::HostJob::Clock::now() + STEP_WAIT_SLICE);
+  Core::QueueHostJob([cleanup, token](Core::System& owner) {
+    cleanup->Execute([&] { return Core::IsRunning(owner); }, [&] {
+      // Finish an admitted operation even if ordinary pause permission changed.
+      Core::SetState(owner, Core::State::Paused, true, true);
+      SafeAccess access(owner);
+      if (Core::GetState(owner) != Core::State::Paused)
+        return false;
+      {
+        std::lock_guard lock(s_reset_mutex);
+        if (s_active_reset_token == token)
+          s_active_reset_token = 0;
+      }
+      owner.GetProcessorInterface().CancelEmucapResetButtonTap();
+      return true;
+    });
   });
-  return completed->WaitFor(STEP_WAIT_SLICE);
+  if (cleanup->Wait() == Temporal::HostJobOutcome::Completed)
+    return true;
+  s_control_retired.store(true);
+  return false;
 }
 
 picojson::object Reset(Core::System& system, const picojson::object& p)
@@ -1053,37 +1130,91 @@ picojson::object Reset(Core::System& system, const picojson::object& p)
   if (state != Core::State::Running && state != Core::State::Paused)
     return Fail("bad_state", "reset requires a running or frozen core");
 
-  // Reset is a bounded debugger transaction, not an asynchronous UI button click. Establish one
-  // frozen starting position, arm an adapter-owned reset tap, and resume only until its native
-  // release callback or an emucap breakpoint stops execution.
-  Core::SetState(system, Core::State::Paused);
   const u64 token = s_next_reset_token.fetch_add(1);
-  u64 interruption_before = 0;
+  if (token == 0 || token > (std::numeric_limits<u64>::max() >> 1))
   {
-    std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+    s_control_retired.store(true);
+    return Fail("bad_state", "reset token space exhausted; control retired");
+  }
+  u64 interruption_before;
+  {
+    std::lock_guard lock(s_frame_step_mutex);
     interruption_before = s_breakpoint_interruptions;
   }
-  system.GetProcessorInterface().EmucapResetButtonTap(token);
-  Core::SetState(system, Core::State::Running);
+  auto start = std::make_shared<Temporal::HostJob>(
+      Temporal::HostJob::Clock::now() + STEP_WAIT_SLICE);
+  auto admitted = std::make_shared<std::atomic<bool>>(false);
+  auto hit_before_arm = std::make_shared<std::atomic<bool>>(false);
+  Core::QueueHostJob([start, admitted, hit_before_arm, token, interruption_before](Core::System& owner) {
+    start->Execute([] { return !s_stop.load() && !s_request_cancelled.load(); }, [&] {
+      Core::SetState(owner, Core::State::Paused);
+      if (Core::GetState(owner) != Core::State::Paused)
+        return true;  // Native pause rejection: no reset tap was armed.
+      {
+        SafeAccess access(owner);
+        {
+          std::lock_guard lock(s_frame_step_mutex);
+          if (s_breakpoint_interruptions != interruption_before)
+          {
+            hit_before_arm->store(true);
+            return true;
+          }
+        }
+        if (s_stop.load() || s_request_cancelled.load())
+          return true;
+        {
+          std::lock_guard lock(s_reset_mutex);
+          s_active_reset_token = token;
+        }
+        owner.GetProcessorInterface().EmucapResetButtonTap(token);
+        admitted->store(true);
+      }
+      Core::SetState(owner, Core::State::Running);
+      return true;
+    });
+  });
+  const auto dispatch = start->Wait();
+  if (dispatch != Temporal::HostJobOutcome::Completed)
+  {
+    if (dispatch == Temporal::HostJobOutcome::Unverified)
+      s_control_retired.store(true);
+    return Fail("timeout", dispatch == Temporal::HostJobOutcome::Unverified ?
+        "reset admission unverified; control retired" : "reset cancelled before admission");
+  }
+  if (!admitted->load())
+  {
+    if (hit_before_arm->load())
+    {
+      picojson::object r;
+      r["status"] = picojson::value(std::string("interrupted"));
+      r["reset"] = picojson::value(std::string("native_button_tap"));
+      r["state"] = picojson::value(std::string("frozen"));
+      return r;
+    }
+    if (s_stop.load() || s_request_cancelled.load())
+      return Fail("not_connected", "reset cancelled before its button was armed");
+    return Fail("bad_state", "native pause rejected reset admission");
+  }
 
   const auto deadline = std::chrono::steady_clock::now() + RESET_WORK_BUDGET;
   bool completed = false;
   bool interrupted = false;
-  while (!completed && !interrupted && !s_stop.load())
   {
-    {
-      std::unique_lock<std::mutex> lock(s_reset_mutex);
-      s_reset_cv.wait_until(lock, deadline);
+    std::unique_lock lock(s_reset_mutex);
+    const auto terminal = [&] {
       completed = s_completed_reset_token == token;
-    }
-    {
-      std::lock_guard<std::mutex> lock(s_frame_step_mutex);
-      interrupted = s_breakpoint_interruptions != interruption_before;
-    }
-    if (std::chrono::steady_clock::now() >= deadline)
-      break;
+      {
+        std::lock_guard frame_lock(s_frame_step_mutex);
+        interrupted = s_breakpoint_interruptions != interruption_before;
+      }
+      return completed || interrupted || s_stop.load() || s_request_cancelled.load();
+    };
+    while (!terminal() && std::chrono::steady_clock::now() < deadline)
+      s_reset_cv.wait_until(lock, std::min(deadline,
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(100)), terminal);
   }
-
+  if (!FinishResetTap(token))
+    return Fail("timeout", "reset stop or button cleanup unverified; control retired");
   if (completed)
   {
     picojson::object r;
@@ -1093,10 +1224,6 @@ picojson::object Reset(Core::System& system, const picojson::object& p)
     r["state"] = picojson::value(std::string("frozen"));
     return r;
   }
-
-  Core::SetState(system, Core::State::Paused);
-  if (!CancelResetTap(system))
-    return Fail("timeout", "reset stopped but reset-button cleanup did not complete");
   if (interrupted)
   {
     picojson::object r;
@@ -1105,8 +1232,8 @@ picojson::object Reset(Core::System& system, const picojson::object& p)
     r["state"] = picojson::value(std::string("frozen"));
     return r;
   }
-  if (s_stop.load())
-    return Fail("not_connected", "Dolphin stopped while reset was in progress");
+  if (s_stop.load() || s_request_cancelled.load())
+    return Fail("not_connected", "Dolphin reset cancelled during shutdown or connection loss");
   return Fail("timeout", "reset button did not reach its native release boundary");
 }
 
@@ -1173,9 +1300,12 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
     }
     Common::Event completed;
     cpu.StepOpcode(&completed);
-    if (!WaitForAdvanceEvent(completed, operation_deadline))
+    const bool signaled = WaitForAdvanceEvent(completed, operation_deadline);
+    // The event flag can wake us before the CPU's notification returns. Fence its publisher
+    // on every path before this stack event leaves scope, not only on cancellation.
+    can_restore_mode = cpu.ReleaseStepEvent(&completed);
+    if (!signaled || !can_restore_mode)
     {
-      can_restore_mode = cpu.CancelStepOpcode(&completed);
       completed_all = false;
       break;
     }
@@ -1191,6 +1321,12 @@ picojson::object StepInstructions(Core::System& system, const picojson::object& 
   }
   if (can_restore_mode)
     power_pc.SetMode(old_mode);
+  else
+  {
+    s_control_retired.store(true);
+    return Fail("emulator_error", "instruction step unverified: CPU is still active after event "
+                                  "release; control retired");
+  }
   if (!completed_all)
     return Fail("timeout", "instruction step did not complete within the operation deadline");
   return AdvanceOutcome(completed_count, count, interrupted_reason);
@@ -1234,104 +1370,114 @@ picojson::object StepFrames(Core::System& system, const picojson::object& p)
         [cleanup](Core::System &host_system)
         {
           Core::CancelFrameStep(host_system);
-          if (Core::IsRunning(host_system))
-            Core::SetState(host_system, Core::State::Paused);
           cleanup->frozen.store(Core::GetState(host_system) == Core::State::Paused);
           cleanup->done.Set();
         });
     return cleanup->done.WaitFor(STEP_WAIT_SLICE) && cleanup->frozen.load();
   };
 
-  // The session writer emits working responses independently while this worker owns the advance.
-  // Leave terminal cleanup below the outer link's 300-second deferred deadline.
-  const auto operation_deadline = std::chrono::steady_clock::now() + FRAME_STEP_WORK_BUDGET;
-  uint64_t completed = 0;
-  for (; completed < count; ++completed)
+  const auto run = [&]() -> picojson::object
   {
-    if (s_stop.load() || s_request_cancelled.load() ||
-        std::chrono::steady_clock::now() >= operation_deadline)
+    // The session writer emits working responses independently while this worker owns the advance.
+    // Leave terminal cleanup below the outer link's 300-second deferred deadline.
+    const auto operation_deadline = std::chrono::steady_clock::now() + FRAME_STEP_WORK_BUDGET;
+    uint64_t completed = 0;
+    for (; completed < count; ++completed)
     {
-      if (!cancel_frame_step())
-        return Fail("timeout", "frame advance terminal cleanup did not complete");
-      return AdvanceOutcome(completed, count,
-                            s_stop.load()                ? "shutdown"
-                            : s_request_cancelled.load() ? "disconnected"
-                                                         : "host_deadline");
-    }
-    u64 completion_before = 0;
-    u64 interruption_before = 0;
-    {
-      std::lock_guard<std::mutex> lock(s_frame_step_mutex);
-      completion_before = s_frame_step_completions;
-      interruption_before = s_breakpoint_interruptions;
-    }
-
-    auto start = std::make_shared<FrameStart>();
-    Core::QueueHostJob([start](Core::System& host_system) {
-      if (!start->cancelled.load())
-        start->accepted.store(Core::DoFrameStep(host_system));
-      start->dispatched.Set();
-    });
-
-    if (!WaitForAdvanceEvent(start->dispatched, operation_deadline))
-    {
-      start->cancelled.store(true);
-      if (!cancel_frame_step())
+      if (s_stop.load() || s_request_cancelled.load() ||
+          std::chrono::steady_clock::now() >= operation_deadline)
       {
-        return Fail("timeout",
-                    "frame step dispatch timed out and cleanup did not complete on the host thread");
+        if (!cancel_frame_step())
+          return Fail("timeout", "frame advance terminal cleanup did not complete");
+        return AdvanceOutcome(completed, count,
+                              s_stop.load()                ? "shutdown"
+                              : s_request_cancelled.load() ? "disconnected"
+                                                           : "host_deadline");
       }
+      u64 completion_before = 0;
+      u64 interruption_before = 0;
       {
-        std::lock_guard lock(s_frame_step_mutex);
+        std::lock_guard<std::mutex> lock(s_frame_step_mutex);
+        completion_before = s_frame_step_completions;
+        interruption_before = s_breakpoint_interruptions;
+      }
+
+      auto start = std::make_shared<FrameStart>();
+      const bool keep_audio = completed + 1 < count;
+      Core::QueueHostJob([start, keep_audio](Core::System& host_system) {
+        if (!start->cancelled.load())
+          start->accepted.store(Core::DoFrameStep(host_system, keep_audio));
+        start->dispatched.Set();
+      });
+
+      if (!WaitForAdvanceEvent(start->dispatched, operation_deadline))
+      {
+        start->cancelled.store(true);
+        if (!cancel_frame_step())
+        {
+          return Fail("timeout",
+                      "frame step dispatch timed out and cleanup did not complete on the host thread");
+        }
+        {
+          std::lock_guard lock(s_frame_step_mutex);
+          if (s_frame_step_completions != completion_before)
+            ++completed;
+        }
+        return AdvanceOutcome(completed, count,
+                              s_stop.load() ? "shutdown"
+                              : s_request_cancelled.load() ? "disconnected" : "dispatch_deadline");
+      }
+      if (!start->accepted.load())
+      {
+        if (completed != 0)
+          return AdvanceOutcome(completed, count, "native_rejected");
+        return Fail("bad_state", "Dolphin did not accept frame step from the frozen state");
+      }
+
+      std::unique_lock<std::mutex> lock(s_frame_step_mutex);
+      const bool signaled =
+          s_frame_step_cv.wait_until(lock, operation_deadline,
+                                     [&]
+                                     {
+                                       return s_frame_step_completions != completion_before ||
+                                              s_breakpoint_interruptions != interruption_before ||
+                                              s_stop.load() || s_request_cancelled.load();
+                                     });
+      const bool frame_completed = s_frame_step_completions != completion_before;
+      const bool interrupted = s_breakpoint_interruptions != interruption_before;
+      lock.unlock();
+
+      if (frame_completed && !interrupted && !s_request_cancelled.load() && !s_stop.load())
+        continue;
+      if (!cancel_frame_step())
+        return Fail("timeout", "frame step stopped but cleanup did not complete on the host thread");
+      // A frame may finish between the wakeup and host-thread cancellation. Count it only after
+      // cleanup has made the completion counter stable.
+      {
+        std::lock_guard counter_lock(s_frame_step_mutex);
         if (s_frame_step_completions != completion_before)
           ++completed;
       }
-      return AdvanceOutcome(completed, count,
-                            s_stop.load() ? "shutdown"
-                            : s_request_cancelled.load() ? "disconnected" : "dispatch_deadline");
+      if (interrupted || s_request_cancelled.load() || s_stop.load())
+        return AdvanceOutcome(completed, count,
+                              interrupted                  ? "breakpoint"
+                              : s_request_cancelled.load() ? "disconnected"
+                                                           : "shutdown");
+      if (!signaled || std::chrono::steady_clock::now() >= operation_deadline)
+        return AdvanceOutcome(completed, count, "host_deadline");
+      return Fail("not_connected", "Dolphin stopped while frame step was in progress");
     }
-    if (!start->accepted.load())
-      return Fail("bad_state", "Dolphin did not accept frame step from the frozen state");
 
-    std::unique_lock<std::mutex> lock(s_frame_step_mutex);
-    const bool signaled =
-        s_frame_step_cv.wait_until(lock, operation_deadline,
-                                   [&]
-                                   {
-                                     return s_frame_step_completions != completion_before ||
-                                            s_breakpoint_interruptions != interruption_before ||
-                                            s_stop.load() || s_request_cancelled.load();
-                                   });
-    const bool frame_completed = s_frame_step_completions != completion_before;
-    const bool interrupted = s_breakpoint_interruptions != interruption_before;
-    lock.unlock();
-
-    if (frame_completed && !interrupted && !s_request_cancelled.load() && !s_stop.load())
-      continue;
-    if (!cancel_frame_step())
-      return Fail("timeout", "frame step stopped but cleanup did not complete on the host thread");
-    // A frame may finish between the wakeup and host-thread cancellation. Count it only after
-    // cleanup has made the completion counter stable.
-    {
-      std::lock_guard counter_lock(s_frame_step_mutex);
-      if (s_frame_step_completions != completion_before)
-        ++completed;
-    }
-    if (interrupted || s_request_cancelled.load() || s_stop.load())
-      return AdvanceOutcome(completed, count,
-                            interrupted                  ? "breakpoint"
-                            : s_request_cancelled.load() ? "disconnected"
-                                                         : "shutdown");
-    if (!signaled || std::chrono::steady_clock::now() >= operation_deadline)
-      return AdvanceOutcome(completed, count, "host_deadline");
-    return Fail("not_connected", "Dolphin stopped while frame step was in progress");
-  }
-
-  picojson::object r;
-  r["status"] = picojson::value(std::string("completed"));
-  r["count"] = picojson::value(static_cast<double>(completed));
-  r["state"] = picojson::value(std::string("frozen"));
-  return r;
+    picojson::object r;
+    r["status"] = picojson::value(std::string("completed"));
+    r["count"] = picojson::value(static_cast<double>(completed));
+    r["state"] = picojson::value(std::string("frozen"));
+    return r;
+  };
+  auto result = run();
+  if (!cancel_frame_step())
+    return Fail("timeout", "frame advance terminal cleanup did not complete");
+  return result;
 }
 
 picojson::object SetBreakpoint(Core::System& system, const picojson::object& p)
@@ -1622,10 +1768,20 @@ picojson::object LoadState(Core::System& system, const picojson::object& p)
   const std::string path = path_value->second.get<std::string>();
   if (!File::IsFile(path))
     return Fail("bad_params", "savestate path is not a file");
-  if (!State::LoadAsSynchronous(system, path))
-    return Fail("emulator_error", "Dolphin failed to load a coherent savestate");
+  const auto result = State::LoadAsSynchronous(system, path);
+  if (result == State::LoadResult::Unrecoverable)
+  {
+    s_control_retired.store(true);
+    return Fail("recovery_failed", "Dolphin state rollback failed; restart the managed session");
+  }
+  if (result == State::LoadResult::RolledBack)
+    return Fail("emulator_error", "Dolphin rejected the savestate and restored the previous state");
+  if (result != State::LoadResult::Loaded && result != State::LoadResult::LoadedLegacy)
+    return Fail("emulator_error", "Dolphin rejected the savestate before target decoding");
 
   picojson::object r;
+  r["presentation_history"] = picojson::value(std::string(
+      result == State::LoadResult::Loaded ? "restored" : "legacy_unavailable"));
   r["status"] = picojson::value(std::string("loaded"));
   r["path"] = picojson::value(path);
   r["state"] = picojson::value(std::string("frozen"));
@@ -1826,6 +1982,91 @@ Handler Lookup(const std::string& m)
   return nullptr;
 }
 
+// A state operation keeps the actual CPU/context owner until the caller has attempted
+// its response. The shared object also fences queued work after caller cancellation.
+class StateCall : public std::enable_shared_from_this<StateCall>
+{
+public:
+  picojson::object Run(Core::System& system, Handler handler, picojson::object params)
+  {
+    if (Core::GetState(system) != Core::State::Paused)
+    {
+      std::lock_guard lock(mutex);
+      phase = Phase::Cancelled;
+      return Fail("bad_state", "state operation requires a frozen core");
+    }
+    const auto self = shared_from_this();
+    Core::RunOnCPUThreadWithHostLock(system, [self, &system, handler, params = std::move(params)] {
+      {
+        std::lock_guard lock(self->mutex);
+        if (self->phase != Phase::Queued)
+          return;
+        if (s_stop.load() || s_request_cancelled.load() || Clock::now() >= self->deadline)
+        {
+          self->phase = Phase::Cancelled;
+          self->changed.notify_all();
+          return;
+        }
+        if (Core::GetState(system) != Core::State::Paused)
+        {
+          self->boundary_rejected = true;
+          self->phase = Phase::Cancelled;
+          self->changed.notify_all();
+          return;
+        }
+        self->phase = Phase::Applying;
+      }
+      auto result = handler(system, params);
+      std::unique_lock lock(self->mutex);
+      self->result = std::move(result);
+      self->phase = Phase::Ready;
+      self->changed.notify_all();
+      self->changed.wait(lock, [&] { return self->response_attempted; });
+      self->phase = Phase::Finished;
+      self->changed.notify_all();
+    });
+    std::unique_lock lock(mutex);
+    while (phase == Phase::Queued || phase == Phase::Applying)
+    {
+      if (phase == Phase::Queued &&
+          (s_stop.load() || s_request_cancelled.load() || Clock::now() >= deadline))
+      {
+        phase = Phase::Cancelled;
+        changed.notify_all();
+        break;
+      }
+      // Started serialization cannot be abandoned safely. Retire admission if it
+      // exceeds its owner budget, then join its native result before releasing it.
+      if (phase == Phase::Applying && Clock::now() >= deadline)
+        s_control_retired.store(true);
+      changed.wait_for(lock, std::chrono::milliseconds(10));
+    }
+    if (phase == Phase::Cancelled)
+      return boundary_rejected ? Fail("bad_state", "state operation requires a frozen core") :
+                                 Fail("cancelled", "state operation cancelled before native execution");
+    return result;
+  }
+
+  void ReleaseAndJoin()
+  {
+    std::unique_lock lock(mutex);
+    response_attempted = true;
+    changed.notify_all();
+    changed.wait(lock, [&] { return phase == Phase::Finished || phase == Phase::Cancelled; });
+  }
+
+private:
+  using Clock = std::chrono::steady_clock;
+  enum class Phase { Queued, Applying, Ready, Finished, Cancelled };
+  const Clock::time_point deadline = Clock::now() + Temporal::OPERATION_BUDGET;
+  std::mutex mutex;
+  std::condition_variable changed;
+  Phase phase = Phase::Queued;
+  bool response_attempted = false;
+  bool boundary_rejected = false;
+  picojson::object result;
+};
+
 bool SendLine(SOCKET sock, const std::string& line)
 {
   const std::string out = line + "\n";
@@ -1877,6 +2118,8 @@ void ServeSession(Core::System& system, SOCKET sock)
       picojson::object resp;
       resp["id"] = picojson::value(id);
       Handler h = Lookup(method);
+      const bool state_operation = h == SaveState || h == LoadState;
+      const auto state_call = state_operation ? std::make_shared<StateCall>() : nullptr;
       if (!h)
       {
         resp["ok"] = picojson::value(false);
@@ -1889,10 +2132,12 @@ void ServeSession(Core::System& system, SOCKET sock)
         s_request_cancelled.store(false);
         if (!ObservationMethod(method))
           ++s_boundary_seq;
-        const bool advance = h == StepFrames || h == StepInstructions;
+        const bool advance = h == StepFrames || h == StepInstructions || h == Reset;
         picojson::object result =
-            advance ? Temporal::RunWithProgress(
-                          [&] { return h(system, params); },
+            (advance || state_operation) ? Temporal::RunWithProgress(
+                          [&] {
+                            return state_call ? state_call->Run(system, h, params) : h(system, params);
+                          },
                           [&]
                           {
                             picojson::object progress;
@@ -1907,6 +2152,7 @@ void ServeSession(Core::System& system, SOCKET sock)
                           {
                             s_request_cancelled.store(true);
                             s_frame_step_cv.notify_all();
+                            s_reset_cv.notify_all();
                           })
                     : h(system, params);
         if (s_handler_error.empty())
@@ -1922,7 +2168,10 @@ void ServeSession(Core::System& system, SOCKET sock)
                         s_handler_error);
         }
       }
-      if (!SendLine(sock, picojson::value(resp).serialize()))
+      const bool sent = SendLine(sock, picojson::value(resp).serialize());
+      if (state_call)
+        state_call->ReleaseAndJoin();
+      if (!sent || s_control_retired.load())
         return;
     }
 
@@ -1936,7 +2185,7 @@ void ServeSession(Core::System& system, SOCKET sock)
 void ThreadMain(Core::System& system, unsigned short port)
 {
   Common::SocketContext socket_context;  // Windows WSAStartup RAII
-  while (!s_stop.load())
+  while (!s_stop.load() && !s_control_retired.load())
   {
     SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == INVALID_SOCKET)
@@ -2086,6 +2335,12 @@ void NotifyFrameStepComplete()
   s_frame_step_cv.notify_all();
 }
 
+bool IsResetTapActive(u64 token)
+{
+  std::lock_guard lock(s_reset_mutex);
+  return token != 0 && s_active_reset_token == token;
+}
+
 void NotifyResetTapComplete(Core::System& system, u64 token)
 {
   // Stop in the same CPU-thread callback that releases the adapter-owned reset button. The
@@ -2094,12 +2349,33 @@ void NotifyResetTapComplete(Core::System& system, u64 token)
   {
     std::lock_guard<std::mutex> lock(s_reset_mutex);
     s_completed_reset_token = token;
+    s_active_reset_token = 0;
   }
   s_reset_cv.notify_all();
 }
 
+void ConfigureAudioOutput()
+{
+  if (EnvOr("EMUCAP_PORT", "").empty())
+    return;
+  const std::string sound = EnvOr("EMUCAP_DOLPHIN_SOUND", "");
+  if (sound != "0" && sound != "1")
+    return;
+  const std::string backend = sound == "1" ? AudioCommon::GetDefaultSoundBackend() : "No Audio Output";
+  // This scope ends (and callbacks run) before any device initialization.
+  Config::SettingsTransaction transaction;
+  Config::SetCurrent(Config::MAIN_AUDIO_BACKEND, backend);
+  if (sound == "1")
+  {
+    Config::SetCurrent(Config::MAIN_AUDIO_MUTED, false);
+    Config::SetCurrent(Config::MAIN_AUDIO_VOLUME, Config::MAIN_AUDIO_VOLUME.GetDefaultValue());
+  }
+}
+
 void Start(Core::System& system)
 {
+  if (s_control_retired.load())
+    return;
   if (s_started.exchange(true))
     return;
   const char* port_env = std::getenv("EMUCAP_PORT");
@@ -2112,12 +2388,14 @@ void Start(Core::System& system)
   // adapter is active so breakpoint behavior does not depend on a user-profile setting.
   Config::SetBaseOrCurrent(Config::MAIN_ENABLE_DEBUGGING, true);
   s_stop.store(false);
+  ++s_runtime_generation;
   s_thread = std::thread([&system, port] { ThreadMain(system, port); });
 }
 
 void Stop()
 {
   s_stop.store(true);
+  ++s_runtime_generation;
   s_frame_step_cv.notify_all();
   s_reset_cv.notify_all();
   {

@@ -1,0 +1,30 @@
+--- a/ui/xemu.c
++++ b/ui/xemu.c
+@@ -802,6 +802,18 @@
+  * Renders the main interface. Usually called from the main thread,
+  * but may sometimes be called from another thread.
+  */
++static void present_frame(struct xemu_console *scon)
++{
++    if (emucap_hidden_window) {
++        /* Hidden windows have no presentation consumer. A vsync swap may
++         * wait indefinitely and prevent servicing frozen capture requests.
++         * Bound host repaint work without advancing any guest clock. */
++        SDL_Delay(16);
++    } else {
++        SDL_GL_SwapWindow(scon->real_window);
++    }
++}
++
+ static void gl_render_frame(struct xemu_console *scon)
+ {
+     static bool rendering;
+@@ -862,7 +874,7 @@
+     }
+ 
+     nv2a_release_framebuffer_surface();
+-    SDL_GL_SwapWindow(scon->real_window);
++    present_frame(scon);
+     assert(glGetError() == GL_NO_ERROR);
+ 
+     qatomic_set(&rendering, false);

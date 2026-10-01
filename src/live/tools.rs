@@ -13,6 +13,9 @@ use super::temporal::finish_with_cleanup;
 pub(crate) use super::tools_state::save_state_in_store;
 pub use super::tools_state::{save_state, save_state_for_recording, save_state_with_key};
 
+mod cancellable;
+pub use cancellable::{step_with_cancellation, tap_with_cancellation};
+
 mod pointer;
 pub use pointer::{click_pointer, drag_pointer, move_pointer};
 

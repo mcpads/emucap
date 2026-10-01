@@ -58,6 +58,7 @@ pub struct Launch<'a> {
     pub session_token: Option<&'a str>,
     pub runtime: Option<RuntimeEnv<'a>>,
     pub display: bool,
+    pub sound: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +236,7 @@ pub fn launch_spec(
         .arg(runtime_home.to_string_lossy().into_owned())
         .arg(if launch.display { "1" } else { "0" })
         .arg(pid_file.to_string_lossy().into_owned())
+        .arg(if launch.sound { "1" } else { "0" })
         .env(
             "EMUCAP_CONTENT",
             launch.content.to_string_lossy().into_owned(),

@@ -192,6 +192,7 @@ impl Mupen64PlusHost {
         eprintln!("[mupen64plus-native] debugger callbacks registered");
 
         let (api, core_handle, plugins) = preparation.finish();
+        frame::set_frame_resume_hook(api.debug_frame_resume);
         Ok(Self {
             api,
             core_handle,

@@ -1,0 +1,91 @@
+--- a/Utilities/Serializer.h
++++ b/Utilities/Serializer.h
+@@ -477,6 +477,23 @@
+ 		}
+ 	}
+ 
++	bool HasValueSize(const char* name, uint32_t size)
++	{
++		auto value = _values.find(GetKey(name, -1));
++		return value != _values.end() && value->second.Size == size;
++	}
++
++	template<typename T> bool TryReadValue(const char* name, T& value)
++	{
++		static_assert(std::is_arithmetic<T>::value, "Expected scalar value");
++		auto entry = _values.find(GetKey(name, -1));
++		if(entry == _values.end() || entry->second.Size != sizeof(T)) {
++			return false;
++		}
++		ReadValue(value, entry->second.DataPtr);
++		return true;
++	}
++
+ 	bool ContainsKey(const char* name)
+ 	{
+ 		string key = GetKey(name, -1);
+--- a/Core/SMS/SmsVdp.h
++++ b/Core/SMS/SmsVdp.h
+@@ -197,5 +197,6 @@
+ 		return previousBuffer ? ((_currentOutputBuffer == _outputBuffers[0]) ? _outputBuffers[1] : _outputBuffers[0]) : _currentOutputBuffer;
+ 	}
+ 
++	static bool ValidateRasterState(Serializer& s);
+ 	void Serialize(Serializer& s) override;
+ };
+\ No newline at end of file
+--- a/Core/SMS/SmsVdp.cpp
++++ b/Core/SMS/SmsVdp.cpp
+@@ -1498,6 +1498,16 @@
+ 	}
+ }
+ 
++bool SmsVdp::ValidateRasterState(Serializer& s)
++{
++	uint32_t version = 0;
++	uint8_t index = 0xff;
++	return s.TryReadValue("rasterVersion", version) && version == 1
++		&& s.TryReadValue("outputBufferIndex", index) && index < 2
++		&& s.HasValueSize("outputBuffer0", 256 * 240 * sizeof(uint16_t))
++		&& s.HasValueSize("outputBuffer1", 256 * 240 * sizeof(uint16_t));
++}
++
+ void SmsVdp::Serialize(Serializer& s)
+ {
+ 	SVArray(_videoRam, 0x4000);
+@@ -1563,6 +1573,16 @@
+ 	SV(_state.NametableAddressMask);
+ 
+ 	if(s.GetFormat() != SerializeFormat::Map) {
++		//The console preflights the raster payload before deserializing any device.
++		uint32_t rasterVersion = 1;
++		uint8_t outputBufferIndex = _currentOutputBuffer == _outputBuffers[1] ? 1 : 0;
++		s.Stream(rasterVersion, "rasterVersion");
++		s.Stream(outputBufferIndex, "outputBufferIndex");
++		s.StreamArray(_outputBuffers[0], 256 * 240, "outputBuffer0");
++		s.StreamArray(_outputBuffers[1], 256 * 240, "outputBuffer1");
++		if(!s.IsSaving()) {
++			_currentOutputBuffer = _outputBuffers[outputBufferIndex];
++		}
+ 		//Hide these entries from the Lua API
+ 		SV(_revision);
+ 		SV(_lastMasterClock);
+--- a/Core/SMS/SmsConsole.cpp
++++ b/Core/SMS/SmsConsole.cpp
+@@ -361,6 +361,16 @@
+ 
+ void SmsConsole::Serialize(Serializer& s)
+ {
++	if(!s.IsSaving() && s.GetFormat() != SerializeFormat::Map) {
++		s.PushNamePrefix("_vdp", -1);
++		bool validRaster = SmsVdp::ValidateRasterState(s);
++		s.PopNamePrefix();
++		if(!validRaster) {
++			//Legacy or incomplete raster history cannot resume exactly. Reject before CPU/device writes.
++			s.SetErrorFlag();
++			return;
++		}
++	}
+ 	SV(_cpu);
+ 	SV(_vdp);
+ 	SV(_controlManager);

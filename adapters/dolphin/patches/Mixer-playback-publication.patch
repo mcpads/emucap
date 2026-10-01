@@ -1,0 +1,211 @@
+diff --git i/Source/Core/AudioCommon/Mixer.cpp w/Source/Core/AudioCommon/Mixer.cpp
+index a57b602..bf69e6e 100644
+--- i/Source/Core/AudioCommon/Mixer.cpp
++++ w/Source/Core/AudioCommon/Mixer.cpp
+@@ -61,7 +61,7 @@ void Mixer::DoState(PointerWrap& p)
+ }
+ 
+ // Executed from sound stream thread
+-void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
++void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples, const PlaybackConfig& config)
+ {
+   constexpr u32 INDEX_HALF = 0x80000000;
+   constexpr DT_s FADE_IN_RC = DT_s(0.008);
+@@ -69,10 +69,11 @@ void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
+ 
+   // We need at least a double because the index jump has 24 bits of fractional precision.
+   const double out_sample_rate = m_mixer->m_output_sample_rate;
+-  double in_sample_rate = double(m_input_sample_rate_dividend) / m_input_sample_rate_divisor;
++  double in_sample_rate = double(m_input_sample_rate_dividend.load(std::memory_order_relaxed)) /
++                          m_input_sample_rate_divisor.load(std::memory_order_relaxed);
+ 
+-  const double emulation_speed = m_mixer->m_config_emulation_speed;
+-  if (!m_mixer->m_config_audio_preserve_pitch && 0 < emulation_speed && emulation_speed != 1.0)
++  const double emulation_speed = config.emulation_speed;
++  if (!config.preserve_pitch && 0 < emulation_speed && emulation_speed != 1.0)
+     in_sample_rate *= emulation_speed;
+ 
+   const double base = static_cast<double>(1 << GRANULE_FRAC_BITS);
+@@ -86,7 +87,7 @@ void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
+   const StereoPair volume{m_LVolume.load() / 256.0f, m_RVolume.load() / 256.0f};
+ 
+   // Calculate the ideal length of the granule queue.
+-  const std::size_t buffer_size_ms = m_mixer->m_config_audio_buffer_ms;
++  const std::size_t buffer_size_ms = config.buffer_ms;
+   const std::size_t buffer_size_samples = std::llround(buffer_size_ms * in_sample_rate / 1000.0);
+ 
+   // Limit the possible queue sizes to any number between 4 and 64.
+@@ -109,9 +110,9 @@ void Mixer::MixerFifo::Mix(s16* samples, std::size_t num_samples)
+     // If either index is less than the index jump, that means we reached
+     // the end of the of the buffer and need to load the next granule.
+     if (front_index < index_jump)
+-      fade_audio = Dequeue(&m_front);
++      fade_audio = Dequeue(&m_front, config.fill_audio_gaps);
+     else if (back_index < index_jump)
+-      fade_audio = Dequeue(&m_back);
++      fade_audio = Dequeue(&m_back, config.fill_audio_gaps);
+ 
+     // The Granules are pre-windowed, so we can just add them together
+     const std::size_t ft = front_index >> GRANULE_FRAC_BITS;
+@@ -168,16 +169,17 @@ std::size_t Mixer::Mix(s16* samples, std::size_t num_samples)
+ 
+   memset(samples, 0, num_samples * 2 * sizeof(s16));
+ 
+-  m_dma_mixer.Mix(samples, num_samples);
+-  m_streaming_mixer.Mix(samples, num_samples);
++  const auto config = GetPlaybackConfig();
++  m_dma_mixer.Mix(samples, num_samples, config);
++  m_streaming_mixer.Mix(samples, num_samples, config);
+   for (std::size_t i = 0; i < m_wiimote_speaker_mixers.size(); ++i)
+   {
+-    if (!m_config_wiimote_routing_enabled || !m_config_wiimote_output_enabled[i])
+-      m_wiimote_speaker_mixers[i].Mix(samples, num_samples);
++    if (!config.wiimote_routing_enabled || !config.wiimote_output_enabled[i])
++      m_wiimote_speaker_mixers[i].Mix(samples, num_samples, config);
+   }
+-  m_skylander_portal_mixer.Mix(samples, num_samples);
++  m_skylander_portal_mixer.Mix(samples, num_samples, config);
+   for (auto& mixer : m_gba_mixers)
+-    mixer.Mix(samples, num_samples);
++    mixer.Mix(samples, num_samples, config);
+ 
+   return num_samples;
+ }
+@@ -282,7 +284,8 @@ std::size_t Mixer::MixWiimoteSpeaker(std::size_t wiimote_index, s16* samples,
+     return 0;
+ 
+   memset(samples, 0, num_samples * 2 * sizeof(s16));
+-  m_wiimote_speaker_mixers[wiimote_index].Mix(samples, num_samples);
++  const auto config = GetPlaybackConfig();
++  m_wiimote_speaker_mixers[wiimote_index].Mix(samples, num_samples, config);
+   return num_samples;
+ }
+ 
+@@ -424,15 +427,27 @@ void Mixer::StopLogDSPAudio()
+   }
+ }
+ 
++Mixer::PlaybackConfig Mixer::GetPlaybackConfig() const
++{
++  std::lock_guard lock(m_playback_config_mutex);
++  return m_playback_config;
++}
++
+ void Mixer::RefreshConfig()
+ {
+-  m_config_emulation_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
+-  m_config_audio_preserve_pitch = Config::Get(Config::MAIN_AUDIO_PRESERVE_PITCH);
+-  m_config_fill_audio_gaps = Config::Get(Config::MAIN_AUDIO_FILL_GAPS);
+-  m_config_audio_buffer_ms = Config::Get(Config::MAIN_AUDIO_BUFFER_SIZE);
+-  m_config_wiimote_routing_enabled = Config::Get(Config::MAIN_WIIMOTE_AUDIO_ROUTING_ENABLED);
+-  for (std::size_t i = 0; i < m_config_wiimote_output_enabled.size(); ++i)
+-    m_config_wiimote_output_enabled[i] = Config::Get(Config::MAIN_WIIMOTE_AUDIO_OUTPUT_ENABLED[i]);
++  // Keep collection and publication ordered with other refreshes. Readers never acquire
++  // the settings gate while holding the cache lock, and mix without either lock held.
++  Config::SettingsTransaction transaction;
++  PlaybackConfig config;
++  config.emulation_speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++  config.preserve_pitch = Config::Get(Config::MAIN_AUDIO_PRESERVE_PITCH);
++  config.fill_audio_gaps = Config::Get(Config::MAIN_AUDIO_FILL_GAPS);
++  config.buffer_ms = Config::Get(Config::MAIN_AUDIO_BUFFER_SIZE);
++  config.wiimote_routing_enabled = Config::Get(Config::MAIN_WIIMOTE_AUDIO_ROUTING_ENABLED);
++  for (std::size_t i = 0; i < config.wiimote_output_enabled.size(); ++i)
++    config.wiimote_output_enabled[i] = Config::Get(Config::MAIN_WIIMOTE_AUDIO_OUTPUT_ENABLED[i]);
++  std::lock_guard lock(m_playback_config_mutex);
++  m_playback_config = config;
+ }
+ 
+ void Mixer::MixerFifo::DoState(PointerWrap& p)
+@@ -550,7 +565,7 @@ void Mixer::MixerFifo::Enqueue()
+   m_queue_looping.store(false, std::memory_order_relaxed);
+ }
+ 
+-bool Mixer::MixerFifo::Dequeue(Granule* granule)
++bool Mixer::MixerFifo::Dequeue(Granule* granule, bool fill_audio_gaps)
+ {
+   const std::size_t granule_queue_size = m_granule_queue_size.load(std::memory_order_relaxed);
+   const std::size_t head = m_queue_head.load(std::memory_order_acquire);
+@@ -570,7 +585,7 @@ bool Mixer::MixerFifo::Dequeue(Granule* granule)
+   {
+     // Only fill gaps when running to prevent stutter on pause.
+     const bool is_running = Core::GetState(Core::System::GetInstance()) == Core::State::Running;
+-    if (m_mixer->m_config_fill_audio_gaps && is_running)
++    if (fill_audio_gaps && is_running)
+     {
+       // Jump the playhead to half the queue size behind the head.
+       // This provides smoother audio playback than suddenly stopping.
+diff --git i/Source/Core/AudioCommon/Mixer.h w/Source/Core/AudioCommon/Mixer.h
+index aca334b..956167c 100644
+--- i/Source/Core/AudioCommon/Mixer.h
++++ w/Source/Core/AudioCommon/Mixer.h
+@@ -6,6 +6,7 @@
+ #include <array>
+ #include <atomic>
+ #include <bit>
++#include <mutex>
+ 
+ #include "AudioCommon/SurroundDecoder.h"
+ #include "AudioCommon/WaveFile.h"
+@@ -60,6 +61,17 @@ public:
+   static constexpr u64 FIXED_SAMPLE_RATE_DIVIDEND = 54000000 * 2;
+ 
+ private:
++  struct PlaybackConfig
++  {
++    float emulation_speed = 1.0f;
++    bool preserve_pitch = false;
++    bool fill_audio_gaps = false;
++    int buffer_ms = 0;
++    bool wiimote_routing_enabled = false;
++    std::array<bool, 4> wiimote_output_enabled{};
++  };
++
++  PlaybackConfig GetPlaybackConfig() const;
+   const std::size_t SURROUND_CHANNELS = 6;
+ 
+   class MixerFifo final
+@@ -121,7 +133,7 @@ private:
+         Enqueue();
+     }
+ 
+-    void Mix(s16* samples, std::size_t num_samples);
++    void Mix(s16* samples, std::size_t num_samples, const PlaybackConfig& config);
+ 
+     void SetInputSampleRateDividend(u32 rate_dividend);
+     u32 GetInputSampleRateDividend() const;
+@@ -136,8 +148,8 @@ private:
+     Mixer* m_mixer;
+ 
+     // All non-GBA MixerFifo instances use FIXED_SAMPLE_RATE_DIVIDEND.
+-    u32 m_input_sample_rate_dividend;
+-    u32 m_input_sample_rate_divisor;
++    std::atomic<u32> m_input_sample_rate_dividend;
++    std::atomic<u32> m_input_sample_rate_divisor;
+ 
+     Granule m_next_buffer{};
+     std::size_t m_next_buffer_index = 0;
+@@ -154,7 +166,7 @@ private:
+     float m_fade_volume = 1.0;
+ 
+     void Enqueue();
+-    bool Dequeue(Granule* granule);
++    bool Dequeue(Granule* granule, bool fill_audio_gaps);
+ 
+     // Volume ranges from 0-256
+     std::atomic<s32> m_LVolume{256};
+@@ -194,12 +206,9 @@ private:
+   bool m_log_dtk_audio = false;
+   bool m_log_dsp_audio = false;
+ 
+-  float m_config_emulation_speed;
+-  bool m_config_audio_preserve_pitch;
+-  bool m_config_fill_audio_gaps;
+-  int m_config_audio_buffer_ms;
+-  bool m_config_wiimote_routing_enabled = false;
+-  std::array<bool, 4> m_config_wiimote_output_enabled{};
++  // Settings gate -> cache lock for publication. Audio copies under the cache lock only.
++  mutable std::mutex m_playback_config_mutex;
++  PlaybackConfig m_playback_config;
+ 
+   Config::ConfigChangedCallbackID m_config_changed_callback_id;
+ };

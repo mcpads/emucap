@@ -1,0 +1,172 @@
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -11,13 +11,19 @@
+ 
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
++#include "qemu/timer.h"
++#include "hw/boards.h"
++#include "hw/xbox/nv2a/nv2a.h"
++#include "exec/cpu-common.h"
+ #include "qapi/qapi-commands-xemu-emucap.h"
+ #include "system/runstate.h"
+ #include "xemu-emucap.h"
+ #include "xemu-input.h"
+ #include "xui/xemu-hud.h"
+ 
+-#define XEMU_EMUCAP_API 1
++#define XEMU_EMUCAP_API 2
++#define XEMU_EMUCAP_BATCH_MAX_RANGES 64
++#define XEMU_EMUCAP_BATCH_MAX_BYTES 65536
+ #define XEMU_EMUCAP_MAX_FRAME_STEP 5000
+ 
+ typedef struct XemuEmucapInput {
+@@ -60,6 +66,78 @@
+     status->input_engaged = input.engaged;
+     G_UNLOCK(xemu_emucap);
+     return status;
++}
++
++static uint64_t current_frame_boundary(void)
++{
++    uint64_t value;
++
++    G_LOCK(xemu_emucap);
++    value = frame_boundary;
++    G_UNLOCK(xemu_emucap);
++    return value;
++}
++
++XemuEmucapMemoryBatch *qmp_xemu_emucap_read_memory_batch(
++    XemuEmucapMemoryRangeList *ranges, Error **errp)
++{
++    XemuEmucapMemoryBatch *reply;
++    strList **tail;
++    uint64_t total = 0;
++    unsigned count = 0;
++    uint8_t *buffer;
++
++    if (runstate_is_running()) {
++        error_setg(errp, "read-memory-batch requires a stopped VM");
++        return NULL;
++    }
++    if (!ranges) {
++        error_setg(errp, "at least one range is required");
++        return NULL;
++    }
++    for (XemuEmucapMemoryRangeList *it = ranges; it; it = it->next) {
++        uint64_t address = it->value->address;
++        uint64_t length = it->value->length;
++
++        if (++count > XEMU_EMUCAP_BATCH_MAX_RANGES) {
++            error_setg(errp, "at most %u ranges", XEMU_EMUCAP_BATCH_MAX_RANGES);
++            return NULL;
++        }
++        if (length == 0 || address > current_machine->ram_size ||
++            length > current_machine->ram_size - address) {
++            error_setg(errp, "range 0x%" PRIx64 "+0x%" PRIx64
++                       " is outside physical RAM", address, length);
++            return NULL;
++        }
++        total += length;
++        if (total > XEMU_EMUCAP_BATCH_MAX_BYTES) {
++            error_setg(errp, "at most %u bytes in total",
++                       XEMU_EMUCAP_BATCH_MAX_BYTES);
++            return NULL;
++        }
++    }
++
++    reply = g_new0(XemuEmucapMemoryBatch, 1);
++    tail = &reply->reads;
++    buffer = g_malloc(XEMU_EMUCAP_BATCH_MAX_BYTES);
++    nv2a_emucap_hold_writers(true);
++    reply->frame_boundary = current_frame_boundary();
++    reply->virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    for (XemuEmucapMemoryRangeList *it = ranges; it; it = it->next) {
++        uint32_t length = it->value->length;
++        char *hex = g_malloc(length * 2 + 1);
++
++        cpu_physical_memory_read(it->value->address, buffer, length);
++        for (uint32_t i = 0; i < length; i++) {
++            hex[i * 2] = "0123456789abcdef"[buffer[i] >> 4];
++            hex[i * 2 + 1] = "0123456789abcdef"[buffer[i] & 0xf];
++        }
++        hex[length * 2] = '\0';
++        QAPI_LIST_APPEND(tail, hex);
++    }
++    nv2a_emucap_hold_writers(false);
++    g_free(buffer);
++    return reply;
+ }
+ 
+ void qmp_xemu_emucap_set_input(bool engaged, uint16_t buttons,
+--- a/qapi/xemu-emucap.json
++++ b/qapi/xemu-emucap.json
+@@ -153,3 +153,39 @@
+ ##
+ { 'command': 'xemu-emucap-load-disc',
+   'data': { 'path': 'str' } }
++
++##
++# @XemuEmucapMemoryRange:
++#
++# @address: physical RAM offset
++#
++# @length: byte count
++##
++{ 'struct': 'XemuEmucapMemoryRange',
++  'data': { 'address': 'uint64', 'length': 'uint32' } }
++
++##
++# @XemuEmucapMemoryBatch:
++#
++# @frame-boundary: running-only NV2A frame counter at the read
++#
++# @virtual-ns: guest virtual clock at the read
++#
++# @reads: hexadecimal bytes of each range in request order
++##
++{ 'struct': 'XemuEmucapMemoryBatch',
++  'data': { 'frame-boundary': 'uint64',
++            'virtual-ns': 'int',
++            'reads': ['str'] } }
++
++##
++# @xemu-emucap-read-memory-batch:
++#
++# Read physical RAM ranges at one stopped boundary while the NV2A
++# writers are parked.  The VM must be stopped.
++#
++# @ranges: at most 64 ranges of at most 65536 bytes in total
++##
++{ 'command': 'xemu-emucap-read-memory-batch',
++  'data': { 'ranges': ['XemuEmucapMemoryRange'] },
++  'returns': 'XemuEmucapMemoryBatch' }
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -279,6 +279,15 @@
+     pfifo_kick(d);
+     qemu_mutex_unlock(&d->pgraph.lock);
+     qemu_mutex_unlock(&d->pfifo.lock);
++}
++
++void nv2a_emucap_hold_writers(bool hold)
++{
++    if (hold) {
++        nv2a_lock_fifo(g_nv2a);
++    } else {
++        nv2a_unlock_fifo(g_nv2a);
++    }
+ }
+ 
+ static void nv2a_reset(NV2AState *d)
+--- a/hw/xbox/nv2a/nv2a.h
++++ b/hw/xbox/nv2a/nv2a.h
+@@ -30,4 +30,7 @@
+ const uint8_t *nv2a_get_dac_palette(void);
+ int nv2a_get_screen_off(void);
+ 
++/* Park or release the NV2A FIFO and PGRAPH writers of guest RAM. BQL held. */
++void nv2a_emucap_hold_writers(bool hold);
++
+ #endif

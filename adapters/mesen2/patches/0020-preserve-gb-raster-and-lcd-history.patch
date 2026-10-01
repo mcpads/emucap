@@ -1,0 +1,259 @@
+--- a/Core/Gameboy/GbPpu.h
++++ b/Core/Gameboy/GbPpu.h
+@@ -1,6 +1,7 @@
+ #pragma once
+ #include "pch.h"
+ #include "Gameboy/GbTypes.h"
++#include "Gameboy/GbConstants.h"
+ #include "Utilities/ISerializable.h"
+ 
+ class Emulator;
+@@ -20,6 +21,10 @@
+ 	GbDmaController* _dmaController = nullptr;
+ 	uint16_t* _outputBuffers[2] = {};
+ 	uint16_t* _currentBuffer = nullptr;
++	uint16_t _completedFrame[GbConstants::LinkedPixelCount] = {};
++	uint16_t _previousCompletedFrame[GbConstants::LinkedPixelCount] = {};
++	uint32_t _completedPixelCount = 0;
++	void SubmitFrame(RenderedFrame& frame, bool synchronous, bool rewinding);
+ 	EmuSettings* _settings = nullptr;
+ 	uint16_t* _eventViewerBuffers[2] = {};
+ 	uint16_t* _currentEventViewerBuffer = nullptr;
+@@ -156,5 +161,7 @@
+ 
+ 	void DebugSendFrame();
+ 
++	uint16_t* GetPreviousCompletedFrame() { return _completedPixelCount ? _previousCompletedFrame : nullptr; }
++	static bool ValidateRasterState(Serializer& s);
+ 	void Serialize(Serializer& s) override;
+ };
+--- a/Core/Gameboy/GbPpu.cpp
++++ b/Core/Gameboy/GbPpu.cpp
+@@ -841,13 +841,30 @@
+ 		}
+ 	} else {
+ 		bool rewinding = _emu->GetRewindManager()->IsRewinding();
+-		_emu->GetVideoDecoder()->UpdateFrame(frame, rewinding, rewinding);
++		SubmitFrame(frame, rewinding, rewinding);
+ 		_emu->ProcessEndOfFrame();
+ 	}
+ 
+ 	_gameboy->ProcessEndOfFrame();
+ 
+ 	_currentBuffer = _currentBuffer == _outputBuffers[0] ? _outputBuffers[1] : _outputBuffers[0];
++}
++
++void GbPpu::SubmitFrame(RenderedFrame& frame, bool synchronous, bool rewinding)
++{
++	GbPpu* owner = _gameboy->IsPrimaryConsole() ? this : _gameboy->GetLinkedConsole()->GetPpu();
++	_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
++	uint32_t count = frame.Width * frame.Height;
++	assert(count <= GbConstants::LinkedPixelCount);
++	if(owner->_completedPixelCount == count) {
++		std::copy(owner->_completedFrame, owner->_completedFrame + count, owner->_previousCompletedFrame);
++	} else {
++		std::fill(std::begin(owner->_previousCompletedFrame), std::end(owner->_previousCompletedFrame), 0);
++	}
++	std::copy(static_cast<uint16_t*>(frame.FrameBuffer), static_cast<uint16_t*>(frame.FrameBuffer) + count, owner->_completedFrame);
++	owner->_completedPixelCount = count;
++	frame.Data = owner->_previousCompletedFrame;
++	_emu->GetVideoDecoder()->UpdateFrame(frame, synchronous, rewinding);
+ }
+ 
+ void GbPpu::SendLinkedFrame(RenderedFrame& frame)
+@@ -856,9 +873,9 @@
+ 	bool forRewind = _emu->GetRewindManager()->IsRewinding();
+ 
+ 	if(cfg.LocalLinkCableVideoOutput == GbLocalLinkOutputOption::MainSystemOnly && _gameboy->IsPrimaryConsole()) {
+-		_emu->GetVideoDecoder()->UpdateFrame(frame, forRewind, forRewind);
++		SubmitFrame(frame, forRewind, forRewind);
+ 	} else if(cfg.LocalLinkCableVideoOutput == GbLocalLinkOutputOption::SubSystemOnly && !_gameboy->IsPrimaryConsole()) {
+-		_emu->GetVideoDecoder()->UpdateFrame(frame, forRewind, forRewind);
++		SubmitFrame(frame, forRewind, forRewind);
+ 	} else if(cfg.LocalLinkCableVideoOutput == GbLocalLinkOutputOption::Both) {
+ 		if(_gameboy->IsPrimaryConsole()) {
+ 			GbPpu* otherPpu = _gameboy->GetLinkedConsole()->GetPpu();
+@@ -872,7 +889,7 @@
+ 			}
+ 
+ 			VideoMergeResult merged = AvMergeUtilities::MergeFrames(frame, otherFrame);
+-			_emu->GetVideoDecoder()->UpdateFrame(merged.Frame, true, forRewind);
++			SubmitFrame(merged.Frame, true, forRewind);
+ 		}
+ 	}
+ }
+@@ -1316,6 +1333,20 @@
+ 	if(autoInc) {
+ 		pos = (pos + 1) & 0x3F;
+ 	}
++}
++
++bool GbPpu::ValidateRasterState(Serializer& s)
++{
++	uint32_t version = 0, count = 0;
++	uint8_t index = 0xff;
++	return s.TryReadValue("rasterVersion", version) && version == 1
++		&& s.TryReadValue("outputBufferIndex", index) && index < 2
++		&& s.TryReadValue("completedPixelCount", count)
++		&& (count == 0 || count == GbConstants::PixelCount || count == GbConstants::LinkedPixelCount)
++		&& s.HasValueSize("outputBuffer0", GbConstants::PixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("outputBuffer1", GbConstants::PixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("completedFrame", GbConstants::LinkedPixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("previousCompletedFrame", GbConstants::LinkedPixelCount * sizeof(uint16_t));
+ }
+ 
+ void GbPpu::Serialize(Serializer& s)
+@@ -1361,6 +1392,18 @@
+ 	}
+ 
+ 	if(s.GetFormat() != SerializeFormat::Map) {
++		uint32_t rasterVersion = 1;
++		uint8_t outputBufferIndex = _currentBuffer == _outputBuffers[1] ? 1 : 0;
++		s.Stream(rasterVersion, "rasterVersion");
++		s.Stream(outputBufferIndex, "outputBufferIndex");
++		s.Stream(_completedPixelCount, "completedPixelCount");
++		s.StreamArray(_outputBuffers[0], GbConstants::PixelCount, "outputBuffer0");
++		s.StreamArray(_outputBuffers[1], GbConstants::PixelCount, "outputBuffer1");
++		s.StreamArray(_completedFrame, GbConstants::LinkedPixelCount, "completedFrame");
++		s.StreamArray(_previousCompletedFrame, GbConstants::LinkedPixelCount, "previousCompletedFrame");
++		if(!s.IsSaving()) {
++			_currentBuffer = _outputBuffers[outputBufferIndex];
++		}
+ 		//Hide these entries from the Lua API
+ 		SV(_windowCounter);
+ 		SV(_isFirstFrame);
+--- a/Core/Gameboy/Gameboy.h
++++ b/Core/Gameboy/Gameboy.h
+@@ -119,6 +119,8 @@
+ 	void RunLinkedConsole();
+ 	bool IsPrimaryConsole();
+ 
++	bool ValidateRasterState(Serializer& s);
++	void* GetVideoFrameData() override;
+ 	void Serialize(Serializer& s) override;
+ 	optional<SaveStateCompatInfo> ValidateSaveStateCompatibility(Serializer& s, ConsoleType stateConsoleType) override;
+ 
+--- a/Core/Gameboy/Gameboy.cpp
++++ b/Core/Gameboy/Gameboy.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include "Shared/Video/VideoDecoder.h"
+ #include "Gameboy/Gameboy.h"
+ #include "Gameboy/GbCpu.h"
+ #include "Gameboy/GbPpu.h"
+@@ -365,8 +366,33 @@
+ 	return _mainConsole == nullptr;
+ }
+ 
++void* Gameboy::GetVideoFrameData()
++{
++	return _ppu->GetPreviousCompletedFrame();
++}
++
++bool Gameboy::ValidateRasterState(Serializer& s)
++{
++	s.PushNamePrefix("_ppu", -1);
++	bool valid = GbPpu::ValidateRasterState(s);
++	s.PopNamePrefix();
++	if(valid && _secondaryConsole) {
++		s.PushNamePrefix("_secondaryConsole", -1);
++		valid = _secondaryConsole->ValidateRasterState(s);
++		s.PopNamePrefix();
++	}
++	return valid;
++}
++
+ void Gameboy::Serialize(Serializer& s)
+ {
++	if(!s.IsSaving() && s.GetFormat() != SerializeFormat::Map) {
++		if(!ValidateRasterState(s)) {
++			s.SetErrorFlag();
++			return;
++		}
++		_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
++	}
+ 	SV(_cpu);
+ 	SV(_ppu);
+ 	SV(_apu);
+--- a/Core/SNES/SnesConsole.cpp
++++ b/Core/SNES/SnesConsole.cpp
+@@ -351,6 +351,17 @@
+ 
+ void SnesConsole::Serialize(Serializer& s)
+ {
++	if(!s.IsSaving() && s.GetFormat() != SerializeFormat::Map && _cart->GetGameboy()) {
++		s.PushNamePrefix("_cart", -1);
++		s.PushNamePrefix("_gameboy", -1);
++		bool valid = _cart->GetGameboy()->ValidateRasterState(s);
++		s.PopNamePrefix();
++		s.PopNamePrefix();
++		if(!valid) {
++			s.SetErrorFlag();
++			return;
++		}
++	}
+ 	SV(_cpu);
+ 	SV(_memoryManager);
+ 	SV(_ppu);
+--- a/Core/Gameboy/GbDefaultVideoFilter.h
++++ b/Core/Gameboy/GbDefaultVideoFilter.h
+@@ -12,7 +12,6 @@
+ 	uint32_t _calculatedPalette[0x8000] = {};
+ 	VideoConfig _videoConfig = {};
+ 
+-	uint16_t* _prevFrame = nullptr;
+ 	bool _blendFrames = false;
+ 	bool _gbcAdjustColors = false;
+ 
+--- a/Core/Gameboy/GbDefaultVideoFilter.cpp
++++ b/Core/Gameboy/GbDefaultVideoFilter.cpp
+@@ -12,13 +12,10 @@
+ {
+ 	InitLookupTable();
+ 	_applyNtscFilter = applyNtscFilter;
+-	_prevFrame = new uint16_t[GbConstants::LinkedPixelCount];
+-	memset(_prevFrame, 0, GbConstants::LinkedPixelCount * sizeof(uint16_t));
+ }
+ 
+ GbDefaultVideoFilter::~GbDefaultVideoFilter()
+ {
+-	delete[] _prevFrame;
+ }
+ 
+ FrameInfo GbDefaultVideoFilter::GetFrameInfo()
+@@ -84,11 +81,8 @@
+ 		_gbcAdjustColors = adjustColors;
+ 		InitLookupTable();
+ 	}
+-	bool blendFrames = gbConfig.BlendFrames && !_emu->GetRewindManager()->IsRewinding() && !_emu->IsPaused();
+-	if(_blendFrames != blendFrames) {
+-		_blendFrames = blendFrames;
+-		memset(_prevFrame, 0, GbConstants::LinkedPixelCount * sizeof(uint16_t));
+-	}
++	_blendFrames = gbConfig.BlendFrames && !_emu->GetRewindManager()->IsRewinding()
++		&& _frameData != nullptr;
+ 	_videoConfig = config;
+ }
+ 
+@@ -107,9 +101,6 @@
+ 		}
+ 	}
+ 
+-	if(_blendFrames) {
+-		std::copy(ppuOutputBuffer, ppuOutputBuffer + (frame.Width * frame.Height), _prevFrame);
+-	}
+ 
+ 	if(_applyNtscFilter) {
+ 		_ntscFilter.ApplyFilter(out, frame.Width, frame.Height, IsOddFrame());
+@@ -119,9 +110,9 @@
+ uint32_t GbDefaultVideoFilter::GetPixel(uint16_t* ppuFrame, uint32_t offset)
+ {
+ 	if(_blendFrames) {
+-		return BlendPixels(_calculatedPalette[_prevFrame[offset]], _calculatedPalette[ppuFrame[offset]]);
++		return BlendPixels(_calculatedPalette[static_cast<const uint16_t*>(_frameData)[offset] & 0x7FFF], _calculatedPalette[ppuFrame[offset] & 0x7FFF]);
+ 	} else {
+-		return _calculatedPalette[ppuFrame[offset]];
++		return _calculatedPalette[ppuFrame[offset] & 0x7FFF];
+ 	}
+ }
+ 

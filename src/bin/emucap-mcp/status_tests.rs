@@ -396,11 +396,13 @@ fn recording_capture_status_is_bounded_and_omits_private_staging_paths() {
             canonical_path: "/private/evidence".into(),
             device: Some(1),
             inode: Some(2),
+            created_at: None,
         },
         staging_identity: FilesystemIdentity {
             canonical_path: "/private/evidence/.capture-test.staging-secret".into(),
             device: Some(1),
             inode: Some(3),
+            created_at: None,
         },
         lease: CaptureLeaseIdentity::current(),
         state: CaptureState::Recording,
@@ -570,6 +572,7 @@ fn connected_status_reconciles_an_abandoned_exact_generation_capture() {
     let record = LinkRecord {
         schema_version: 1,
         launch_id: launch_id.clone(),
+        temporal_operation: None,
         lease: Some(LeaseRecord {
             control_session_key: former_lease.control_session_key.clone(),
             holder: former_lease.holder.clone(),

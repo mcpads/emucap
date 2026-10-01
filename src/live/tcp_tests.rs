@@ -2025,6 +2025,8 @@ fn tcp_progress_is_typed_and_cancellation_sends_one_exact_abort() {
             params: serde_json::json!({"capture_id": "capture-progress"}),
         }),
         max_host_ms: Some(2000),
+        temporal_stop_ms: None,
+        temporal_deadline: None,
     };
     let mut observed = Vec::new();
     let result = link
@@ -2068,6 +2070,8 @@ fn tcp_progress_call_clamps_socket_io_to_the_active_recording_deadline() {
         cancellation: RequestCancellation::default(),
         abort: None,
         max_host_ms: Some(120),
+        temporal_stop_ms: None,
+        temporal_deadline: None,
     };
     let started = std::time::Instant::now();
     let result = link.call_with_progress(
@@ -2088,4 +2092,90 @@ fn tcp_progress_call_clamps_socket_io_to_the_active_recording_deadline() {
         elapsed < Duration::from_millis(600),
         "120ms total deadline was hidden behind the 2s socket timeout: {elapsed:?}"
     );
+}
+
+#[test]
+fn tcp_temporal_cancellation_drains_terminal_before_next_call() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let control = super::temporal::wire::tests::control();
+    let trigger = control.cancellation.clone();
+    let worker = std::thread::spawn(move || {
+        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["step", "status"]);
+        let mut ready = String::new();
+        reader.read_line(&mut ready).unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        writeln!(writer,"{}",serde_json::json!({"id":ready["id"],"ok":true,"result":{"state":"frozen"}})).unwrap();
+        super::temporal::wire::tests::peer(reader, writer, trigger, true);
+    });
+    link.call("status", serde_json::json!({})).unwrap();
+    let result = link
+        .call_with_progress(
+            "step",
+            serde_json::json!({"_control":control.abort.as_ref().unwrap().params}),
+            &mut |_| panic!("plain temporal keepalive is not recording progress"),
+            &control,
+        )
+        .unwrap();
+    assert_eq!(result["reason"], "cancelled");
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["state"],
+        "frozen"
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn tcp_parent_deadline_closes_a_partial_reply_without_reconnecting() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let worker = std::thread::spawn(move || {
+        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["status"]);
+        let mut ready = String::new();
+        reader.read_line(&mut ready).unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id":ready["id"],"ok":true,"result":{"state":"frozen"}})
+        )
+        .unwrap();
+        super::temporal::wire::tests::stalled_parent_peer(reader, writer);
+    });
+    link.call("status", serde_json::json!({})).unwrap();
+    let mut control = super::temporal::wire::tests::control();
+    control.max_host_ms = Some(50);
+    let key = &control.abort.as_ref().unwrap().params;
+    let started = std::time::Instant::now();
+    assert!(link
+        .call_with_progress(
+            "finish_temporal_operation",
+            serde_json::json!({"parent":key,"_temporal_owner":key}),
+            &mut |_| panic!("unexpected progress"),
+            &control
+        )
+        .is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    worker.join().unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        link.call_with_progress(
+            "finish_temporal_operation",
+            serde_json::json!({"parent":key,"_temporal_owner":key}),
+            &mut |_| Ok(()),
+            &control
+        ),
+        Err(LinkError::NotConnected)
+    ));
+    assert!(started.elapsed() < Duration::from_millis(100));
 }

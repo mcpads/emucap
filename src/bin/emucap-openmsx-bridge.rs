@@ -4,15 +4,17 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{anyhow, Context};
 use emucap::launch::openmsx::PreparedSession;
-use emucap::live::reconnect::{serve_reconnecting_controlled, BridgeReply};
+use emucap::live::reconnect::cancellation::TemporalAdmission;
+use emucap::live::reconnect::owned::serve_reconnecting_owned;
+use emucap::live::reconnect::{serve_reconnecting_cancellable, BridgeReply};
 use emucap::openmsx_bridge::{OpenMsxBridge, XmlControl};
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
-    if args.len() != 7 {
+    if !(7..=8).contains(&args.len()) {
         eprintln!(
             "usage: emucap-openmsx-bridge <EMUCAP_PORT> <OPENMSX_BIN> <SESSION_MANIFEST> \
-             <RUNTIME_HOME> <DISPLAY:0|1> <PID_FILE>"
+             <RUNTIME_HOME> <DISPLAY:0|1> <PID_FILE> [SOUND:0|1]"
         );
         std::process::exit(2);
     }
@@ -31,6 +33,11 @@ fn main() -> anyhow::Result<()> {
         other => return Err(anyhow!("DISPLAY must be 0 or 1, got {other:?}")),
     };
     let pid_file = PathBuf::from(&args[6]);
+    let sound = match args.get(7).map(|value| value.to_string_lossy()).as_deref() {
+        None | Some("0") => false,
+        Some("1") => true,
+        other => return Err(anyhow!("SOUND must be 0 or 1, got {other:?}")),
+    };
     let session_bytes =
         emucap::path_safety::read_bounded_regular_file_no_follow(&session_manifest, 1024 * 1024)
             .with_context(|| {
@@ -48,27 +55,51 @@ fn main() -> anyhow::Result<()> {
     let control = XmlControl::spawn(&binary, &session, &runtime_home, display)
         .context("start pinned openMSX XML control channel")?;
     let terminal = control.terminal_handle();
-    let mut bridge = OpenMsxBridge::new(control, &session, &runtime_home, display)
+    let mut bridge = OpenMsxBridge::new(control, &session, &runtime_home, display, sound)
         .context("initialize openMSX bridge")?;
     write_pid_file(&pid_file, bridge.child_pid()).context("publish openMSX child pid")?;
 
-    let result = serve_reconnecting_controlled(
-        port,
-        "openmsx-rust",
-        move |request| {
-            let response = bridge.handle_request(request);
-            if bridge.backend_terminal() {
-                BridgeReply::terminate_with(response)
-            } else {
-                BridgeReply::continue_with(response)
-            }
-        },
-        move || {
-            terminal
-                .load(Ordering::Acquire)
-                .then(|| "openMSX control channel closed".to_string())
-        },
-    )
+    let runtime = std::env::var("EMUCAP_LAUNCH_ID")
+        .ok()
+        .filter(|id| !id.is_empty());
+    let result = if let Some(runtime) = runtime {
+        serve_reconnecting_owned(
+            port,
+            "openmsx-rust",
+            bridge,
+            move || {
+                terminal
+                    .load(Ordering::Acquire)
+                    .then(|| "openMSX control channel closed".to_string())
+            },
+            TemporalAdmission {
+                runtime,
+                methods: vec!["step".into()],
+            },
+        )
+    } else {
+        serve_reconnecting_cancellable(
+            port,
+            "openmsx-rust",
+            move |request, cancellation| {
+                let response = bridge.handle_request_cancellable(request, cancellation);
+                if bridge.backend_terminal() {
+                    BridgeReply::terminate_with(response)
+                } else {
+                    BridgeReply::continue_with(response)
+                }
+            },
+            move || {
+                terminal
+                    .load(Ordering::Acquire)
+                    .then(|| "openMSX control channel closed".to_string())
+            },
+            TemporalAdmission {
+                runtime: std::env::var("EMUCAP_LAUNCH_ID").unwrap_or_default(),
+                methods: vec!["step".into()],
+            },
+        )
+    }
     .context("serve reconnecting openMSX session");
     let _ = fs::remove_file(pid_file);
     result

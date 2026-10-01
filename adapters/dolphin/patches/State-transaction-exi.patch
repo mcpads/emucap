@@ -1,0 +1,114 @@
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -40,6 +40,7 @@
+ #include "Core/Core.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/GeckoCode.h"
++#include "Core/HW/EXI/EXI.h"
+ #include "Core/HW/HW.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/Wiimote.h"
+@@ -225,8 +226,12 @@
+ {
+   u8* ptr = buffer.data();
+   PointerWrap p(&ptr, buffer.size(), PointerWrap::Mode::Read);
++  auto& exi = system.GetExpansionInterface();
++  exi.BeginStateLoad();
+   DoState(system, p);
+-  return p.IsReadMode();
++  const bool loaded = p.IsReadMode();
++  exi.FinishStateLoad(loaded);
++  return loaded;
+ }
+ 
+ // Returns the required size, or 0 on failure.
+--- a/Source/Core/Core/HW/EXI/EXI.h
++++ b/Source/Core/Core/HW/EXI/EXI.h
+@@ -6,6 +6,8 @@
+ #include <array>
+ #include <initializer_list>
+ #include <memory>
++#include <utility>
++#include <vector>
+ 
+ #include "Common/CommonTypes.h"
+ #include "Common/EnumFormatter.h"
+@@ -74,6 +76,10 @@
+   void Shutdown();
+   void DoState(PointerWrap& p);
+ 
++  void BeginStateLoad();
++  void QueueMemoryCardReload(u8 channel, u8 device_num);
++  void FinishStateLoad(bool loaded);
++
+   void RegisterMMIO(MMIO::Mapping* mmio, u32 base);
+ 
+   void UpdateInterrupts();
+@@ -98,6 +104,9 @@
+ 
+   std::array<std::unique_ptr<CEXIChannel>, MAX_EXI_CHANNELS> m_channels;
+ 
++  // Host actions wait until timing and CPU state have both been restored. Not serialized.
++  std::vector<std::pair<u8, u8>> m_pending_memory_card_reloads;
++
+   bool m_using_overridden_sram = false;
+ 
+   Core::System& m_system;
+--- a/Source/Core/Core/HW/EXI/EXI.cpp
++++ b/Source/Core/Core/HW/EXI/EXI.cpp
+@@ -183,6 +183,30 @@
+     channel->DoState(p);
+ }
+ 
++void ExpansionInterfaceManager::BeginStateLoad()
++{
++  m_pending_memory_card_reloads.clear();
++}
++
++void ExpansionInterfaceManager::QueueMemoryCardReload(u8 channel, u8 device_num)
++{
++  m_pending_memory_card_reloads.emplace_back(channel, device_num);
++}
++
++void ExpansionInterfaceManager::FinishStateLoad(bool loaded)
++{
++  auto pending = std::exchange(m_pending_memory_card_reloads, {});
++  if (!loaded)
++    return;
++
++  for (const auto& [channel, device_num] : pending)
++  {
++    // Preserve the card migration policy, but schedule against the fully restored CPU clock.
++    m_channels.at(channel)->AddDevice(EXIDeviceType::None, device_num);
++    ChangeDevice(channel, device_num, EXIDeviceType::MemoryCardFolder, CoreTiming::FromThread::CPU);
++  }
++}
++
+ void ExpansionInterfaceManager::RegisterMMIO(MMIO::Mapping* mmio, u32 base)
+ {
+   for (int i = 0; i < MAX_EXI_CHANNELS; ++i)
+--- a/Source/Core/Core/HW/EXI/EXI_Channel.cpp
++++ b/Source/Core/Core/HW/EXI/EXI_Channel.cpp
+@@ -263,7 +263,8 @@
+       AddDevice(std::move(save_device), device_index, false);
+     }
+ 
+-    if (type == EXIDeviceType::MemoryCardFolder && old_header_data != m_memcard_header_data &&
++    if (p.IsReadMode() && type == EXIDeviceType::MemoryCardFolder &&
++        old_header_data != m_memcard_header_data &&
+         !m_system.GetMovie().IsMovieActive())
+     {
+       // We have loaded a savestate that has a GCI folder memcard that is different to the virtual
+@@ -280,9 +281,9 @@
+       // notify_presence_changed flag set to true? Not sure how software behaves if the previous and
+       // the new device type are identical in this case. I assume there is a reason we have this
+       // grace period when switching in the GUI.
+-      AddDevice(EXIDeviceType::None, device_index);
+-      m_system.GetExpansionInterface().ChangeDevice(
+-          m_channel_id, device_index, EXIDeviceType::MemoryCardFolder, CoreTiming::FromThread::CPU);
++      // DoState restores hardware before CPU downcount. Defer notifications and events until
++      // the complete state has loaded, while execution is still paused.
++      m_system.GetExpansionInterface().QueueMemoryCardReload(m_channel_id, device_index);
+     }
+   }
+ }

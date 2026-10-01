@@ -1,0 +1,66 @@
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -434,26 +434,14 @@
+     nv2a_reset(s);
+ }
+ 
+-// Note: This is handled as a VM state change and not as a `pre_save` callback
+-// because we want to halt the FIFO before any VM state is saved/restored to
+-// avoid corruption.
++/* RAM is serialized before this device. Materialize GPU writes at every
++ * stopped boundary, including PAUSED/DEBUG: saving an already stopped VM does
++ * not emit another runstate notification. Host rendering maintenance remains
++ * serviceable while the guest FIFO is halted. */
+ static void nv2a_vm_state_change(void *opaque, bool running, RunState state)
+ {
+     NV2AState *d = opaque;
+-    if (state == RUN_STATE_SAVE_VM) {
+-        nv2a_lock_fifo(d);
+-        qatomic_set(&d->pfifo.halt, true);
+-        pgraph_pre_savevm_trigger(d);
+-        nv2a_unlock_fifo(d);
+-        bql_unlock();
+-        pgraph_pre_savevm_wait(d);
+-        bql_lock();
+-        nv2a_lock_fifo(d);
+-    } else if (state == RUN_STATE_RESTORE_VM) {
+-        nv2a_lock_fifo(d);
+-        qatomic_set(&d->pfifo.halt, true);
+-        nv2a_unlock_fifo(d);
+-    } else if (state == RUN_STATE_RUNNING) {
++    if (running) {
+         nv2a_lock_fifo(d);
+         qatomic_set(&d->pfifo.halt, false);
+         nv2a_unlock_fifo(d);
+@@ -464,7 +452,22 @@
+         bql_unlock();
+         pgraph_pre_shutdown_wait(d);
+         bql_lock();
+-    }
++    } else {
++        nv2a_lock_fifo(d);
++        qatomic_set(&d->pfifo.halt, true);
++        pgraph_pre_savevm_trigger(d);
++        nv2a_unlock_fifo(d);
++        bql_unlock();
++        pgraph_pre_savevm_wait(d);
++        bql_lock();
++    }
++}
++
++static int nv2a_pre_save(void *opaque)
++{
++    NV2AState *d = opaque;
++    nv2a_lock_fifo(d);
++    return 0;
+ }
+ 
+ static int nv2a_post_save(void *opaque)
+@@ -528,6 +531,7 @@
+     .name = "nv2a",
+     .version_id = 3,
+     .minimum_version_id = 1,
++    .pre_save = nv2a_pre_save,
+     .post_save = nv2a_post_save,
+     .post_load = nv2a_post_load,
+     .pre_load = nv2a_pre_load,

@@ -12,9 +12,12 @@ struct FakeControl {
     raster_info: String,
     pc: u64,
     paused: bool,
+    muted: bool,
+    ignore_mute_write: bool,
     breaked: bool,
     terminal: bool,
     keymatrix: [u8; 12],
+    ignore_keyboard_release: bool,
     joystick_owners: [Option<u8>; 2],
     native_breakpoints: Vec<String>,
     frame_probe: Option<[String; 4]>,
@@ -55,9 +58,12 @@ impl FakeControl {
             raster_info: "10 0 -1 6d616368696e6531 1 16384".into(),
             pc: 0x4000,
             paused: true,
+            muted: true,
+            ignore_mute_write: false,
             breaked: false,
             terminal: false,
             keymatrix: [0xff; 12],
+            ignore_keyboard_release: false,
             joystick_owners: [None; 2],
             native_breakpoints: Vec::new(),
             frame_probe: None,
@@ -100,6 +106,8 @@ impl FakeControl {
 }
 
 impl OpenMsxControl for FakeControl {
+    fn set_request_cancellation(&mut self, _: crate::live::link::RequestCancellation) {}
+    fn set_command_deadline(&mut self, _: Option<std::time::Instant>) {}
     fn command(&mut self, command: &str) -> BridgeResult<String> {
         self.commands.lock().unwrap().push(command.to_string());
         if self.fail_once.as_deref() == Some(command) {
@@ -182,7 +190,6 @@ impl OpenMsxControl for FakeControl {
             | "set renderer SDLGL-PP"
             | "set renderer none"
             | "set emucap_raster_capture true; set deinterlace false; set deflicker false; set videosource MSX"
-            | "set mute on"
             | "debug step" => {
                 if command == "debug step" {
                     self.pc = self.pc.wrapping_add(1);
@@ -191,6 +198,19 @@ impl OpenMsxControl for FakeControl {
                 }
                 String::new()
             }
+            "set mute on" | "set mute off" => {
+                if !self.ignore_mute_write {
+                    self.muted = command == "set mute on";
+                }
+                self.muted.to_string()
+            }
+            "set mute" => self.muted.to_string(),
+            input::INPUT_OBSERVATION_COMMAND => [
+                self.keymatrix[2], self.keymatrix[6], self.keymatrix[7], self.keymatrix[8],
+                self.joystick_owners[0].map(|mask| 0x80 | mask).unwrap_or(0),
+                self.joystick_owners[1].map(|mask| 0x80 | mask).unwrap_or(0),
+                self.joystick_owners[0].unwrap_or(0x3f), self.joystick_owners[1].unwrap_or(0x3f),
+            ].iter().map(u8::to_string).collect::<Vec<_>>().join(" "),
             "debug break" => {
                 self.breaked = true;
                 String::new()
@@ -378,7 +398,7 @@ impl OpenMsxControl for FakeControl {
                 let parts = command.split_whitespace().collect::<Vec<_>>();
                 let row = parts[1].parse::<usize>().unwrap();
                 let mask = parts[2].parse::<u8>().unwrap();
-                self.keymatrix[row] |= mask;
+                if !self.ignore_keyboard_release { self.keymatrix[row] |= mask; }
                 String::new()
             }
             command if command.starts_with("keymatrixdown ") => {
@@ -462,7 +482,7 @@ fn fixture_with_failure(
         fail_once,
         prepared.session.media.mounted_path.clone(),
     );
-    let bridge = OpenMsxBridge::new(control, &prepared.session, temp.path(), display).unwrap();
+    let bridge = OpenMsxBridge::new(control, &prepared.session, temp.path(), display, false).unwrap();
     (bridge, commands, temp)
 }
 
@@ -1451,3 +1471,87 @@ fn disk_change_with_unverified_effect_is_terminal_and_preserves_recovery_bytes()
 
 #[path = "openmsx_bridge/observation_tests.rs"]
 mod observation;
+
+#[test]
+fn launch_audio_is_independent_of_display_and_read_back_from_native() {
+    for display in [false, true] {
+        for sound in [false, true] {
+            let (bridge, _, temp) = fixture(display);
+            let control = FakeControl::new(
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+                bridge.session.media.mounted_path.clone(),
+            );
+            let mut initialized =
+                OpenMsxBridge::new(control, &bridge.session, temp.path(), display, sound).unwrap();
+            assert_eq!(
+                initialized.status().unwrap()["diagnostics"]["audio_muted"],
+                !sound
+            );
+            initialized.control.muted = sound;
+            assert_eq!(
+                initialized.status().unwrap()["diagnostics"]["audio_muted"],
+                sound
+            );
+        }
+    }
+}
+
+#[test]
+fn launch_rejects_acknowledged_but_unapplied_audio_policy() {
+    let (bridge, _, temp) = fixture(false);
+    let mut control = bridge.control;
+    control.ignore_mute_write = true;
+    let initialized = OpenMsxBridge::new(control, &bridge.session, temp.path(), false, true);
+    assert!(matches!(initialized, Err(OpenMsxBridgeError::Emulator(message))
+        if message.contains("did not apply")));
+}
+
+#[test]
+fn status_reads_input_in_one_native_command_and_preserves_ownership_checks() {
+    let (mut bridge, commands, _temp) = fixture(false);
+    commands.lock().unwrap().clear();
+    bridge.status().unwrap();
+    let calls = commands.lock().unwrap().clone();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.as_str() == input::INPUT_OBSERVATION_COMMAND)
+            .count(),
+        1
+    );
+    assert!(!calls.iter().any(|c| c.starts_with("debug read keymatrix ")
+        || c.starts_with("debug read joystickports ")
+        || c.starts_with("debug read emucap_joystick_override ")));
+    bridge.control.joystick_owners[1] = Some(0x2f);
+    assert!(
+        matches!(bridge.status(), Err(OpenMsxBridgeError::Protocol(message))
+        if message.contains("ownership diverged"))
+    );
+}
+
+#[test]
+fn native_input_observation_requires_complete_valid_bytes_and_owner_encoding() {
+    let observed = input::parse_input_observation("191 253 127 222 0 175 63 47").unwrap();
+    assert_eq!(observed.matrix, json!({"2":191,"6":253,"7":127,"8":222}));
+    assert_eq!(observed.owners, [None, Some(47)]);
+    assert_eq!(observed.guest_values, [63, 47]);
+    for invalid in [
+        "",
+        "1 2 3 4 0 0 5",
+        "1 2 3 4 0 0 5 6 7",
+        "256 2 3 4 0 0 5 6",
+        "1 2 3 4 1 0 5 6",
+        "1 2 3 4 0 192 5 6",
+        "1 2 3 4 0 0 -1 6",
+        "1 2 3 4 0 0 x 6",
+    ] {
+        assert!(
+            input::parse_input_observation(invalid).is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[path = "openmsx_bridge/temporal_owner_tests.rs"]
+mod temporal_owner;

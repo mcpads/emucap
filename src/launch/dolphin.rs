@@ -9,7 +9,73 @@ use std::path::{Path, PathBuf};
 
 use super::spec::{dolphin_spec, SpecOpts};
 
-pub const REQUIRED_HOST_API: u32 = 6;
+pub const REQUIRED_HOST_API: u32 = 7;
+
+/// Admit native output evidence, or wait for an in-flight native transition. Stream evidence
+/// describes actual native call results; it does not promise physical device audibility.
+pub fn audio_output_ready(status: &serde_json::Value, sound: bool) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct Observation {
+        stream_generation: String,
+        backend: Option<String>,
+        initialized: bool,
+        phase: String,
+        last_run_result: String,
+        start_verified: bool,
+        failure: Option<String>,
+    }
+    let malformed = || "Dolphin did not report valid native audio output evidence".to_string();
+    let value = status.get("audio_output").ok_or_else(malformed)?;
+    if value.get("failure").is_none() || value.get("backend").is_none() {
+        return Err(malformed());
+    }
+    let observed: Observation = serde_json::from_value(value.clone()).map_err(|_| malformed())?;
+    if observed
+        .stream_generation
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .is_none()
+    {
+        return Err(malformed());
+    }
+    if let Some(failure) = observed.failure {
+        return Err(format!("Dolphin audio output unavailable: {failure}"));
+    }
+    if matches!(
+        observed.phase.as_str(),
+        "initializing" | "starting" | "stopping"
+    ) {
+        return Ok(false);
+    }
+    if observed.phase != "ready" || !observed.initialized {
+        return Err("Dolphin audio output is not initialized".into());
+    }
+    let backend = observed
+        .backend
+        .filter(|name| !name.is_empty())
+        .ok_or_else(malformed)?;
+    if (backend != "No Audio Output") != sound {
+        return Err(format!(
+            "Dolphin audio backend {backend:?} does not satisfy sound:{sound}"
+        ));
+    }
+    if !sound {
+        return Ok(true);
+    }
+    if !observed.start_verified {
+        return Err("Dolphin audio output has no successful native start".into());
+    }
+    match observed.last_run_result.as_str() {
+        "started" => Ok(true),
+        "stopped" => match status.get("state").and_then(serde_json::Value::as_str) {
+            Some("frozen") => Ok(true),
+            Some("running") => Ok(false),
+            _ => Err(malformed()),
+        },
+        _ => Err("Dolphin audio output has no settled successful run result".into()),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -319,6 +385,7 @@ pub struct Launch<'a> {
     pub session_token: Option<&'a str>,
     pub runtime: Option<super::RuntimeEnv<'a>>,
     pub display: bool,
+    pub sound: bool,
 }
 
 pub fn launch(launch: &Launch) -> std::io::Result<u32> {
@@ -337,6 +404,7 @@ pub fn launch(launch: &Launch) -> std::io::Result<u32> {
         launch.log_path,
         &portable.user_dir,
         launch.system,
+        launch.sound,
         &opts,
     )
     .env("EMUCAP_DOLPHIN_UPSTREAM_COMMIT", &host_build.commit)

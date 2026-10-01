@@ -29,6 +29,7 @@ use files::copy_verified;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedGeneration {
+    pub clock_shift: u8,
     pub runtime_home: PathBuf,
     pub log: PathBuf,
     pub settings: PathBuf,
@@ -136,6 +137,14 @@ fn prepare_generation_under(
     launch: &Launch<'_>,
     emu_home_base: &Path,
 ) -> io::Result<PreparedGeneration> {
+    let candidate = std::env::var("EMUCAP_XEMU_QUALIFICATION_SHIFT")
+        .map(Some)
+        .or_else(|error| match error {
+            std::env::VarError::NotPresent => Ok(None),
+            _ => Err(io::Error::new(io::ErrorKind::InvalidInput, error)),
+        })?;
+    let clock_shift = crate::xemu_bridge::qualification_shift(candidate.as_deref())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     validate_content(launch.content)?;
     let base = emu_home_base.join("xemu").join(launch.port.to_string());
     let generations = base.join("generations");
@@ -194,6 +203,7 @@ fn prepare_generation_under(
         .open(&settings)?
         .write_all(config.as_bytes())?;
     Ok(PreparedGeneration {
+        clock_shift,
         runtime_home,
         log,
         settings,
@@ -243,6 +253,15 @@ fn emulator_spec(
         .arg("-qmp")
         .arg(format!("tcp:127.0.0.1:{qmp_port},server=on,wait=off"))
         .arg("-S")
+        .arg("-accel")
+        .arg("tcg,thread=single")
+        .arg("-rtc")
+        .arg("clock=vm")
+        .arg("-icount")
+        .arg(format!(
+            "shift={},align=off,sleep=off",
+            prepared.clock_shift
+        ))
         .env(
             "EMUCAP_XEMU_SCREEN_ROOT",
             prepared.screenshots.to_string_lossy(),
@@ -261,6 +280,7 @@ fn bridge_spec(
     eeprom_identity: &FileIdentity,
 ) -> LaunchSpec {
     let mut spec = LaunchSpec::new(launch.bridge, &prepared.log)
+        .env("EMUCAP_XEMU_CLOCK_SHIFT", prepared.clock_shift.to_string())
         .arg(launch.port.to_string())
         .arg(format!("127.0.0.1:{qmp_port}"))
         .arg(format!("127.0.0.1:{gdb_port}"))

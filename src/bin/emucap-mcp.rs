@@ -36,12 +36,16 @@ mod reattach;
 mod recording;
 #[path = "emucap-mcp/regression.rs"]
 mod regression;
+#[path = "emucap-mcp/request_ownership.rs"]
+mod request_ownership;
 #[path = "emucap-mcp/state_snapshot.rs"]
 mod state_snapshot;
 #[path = "emucap-mcp/status.rs"]
 mod status;
 #[path = "emucap-mcp/stop.rs"]
 mod stop;
+#[path = "emucap-mcp/temporal.rs"]
+mod temporal;
 
 #[cfg(test)]
 #[path = "emucap-mcp/tests.rs"]
@@ -78,6 +82,8 @@ struct SurfaceStatusCache {
 #[derive(Clone)]
 struct Emucap {
     link: SharedLink,
+    control_slot: Arc<tokio::sync::Semaphore>,
+    connection: request_ownership::Connection,
     last_full_surface_status: Arc<Mutex<Option<SurfaceStatusCache>>>,
     tool_router: ToolRouter<Emucap>,
 }
@@ -87,6 +93,8 @@ impl Emucap {
     fn new(link: SharedLink) -> Self {
         Self {
             link,
+            control_slot: Arc::new(tokio::sync::Semaphore::new(1)),
+            connection: Default::default(),
             last_full_surface_status: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
         }
@@ -593,12 +601,12 @@ impl Emucap {
     #[tool(
         description = "Use for ordinary button/key input: tap for an exact frame count and return frozen with input released. Read button names from full status."
     )]
-    async fn tap(&self, Parameters(a): Parameters<TapArgs>) -> CallToolResult {
-        let mut l = self.link();
-        match tools::tap(&mut *l, a.port, &a.buttons, a.press_frames, a.after_frames) {
-            Ok(o) => tool_output_result(o),
-            Err(e) => link_error_result(e),
-        }
+    async fn tap(
+        &self,
+        Parameters(a): Parameters<TapArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        temporal::execute(self.link.clone(), temporal::Operation::Tap(a), context).await
     }
 
     async fn hold_until(&self, Parameters(a): Parameters<HoldUntilArgs>) -> CallToolResult {
@@ -666,12 +674,12 @@ impl Emucap {
     #[tool(
         description = "Advance by an exact number of advertised frame or instruction boundaries and return frozen. A configured pausing debugger stop preempts the advance and returns status=interrupted with its stop evidence. Read allowed units and bounds from the live contract."
     )]
-    async fn step(&self, Parameters(a): Parameters<StepArgs>) -> CallToolResult {
-        let mut l = self.link();
-        match tools::step(&mut *l, a.count, a.unit, a.cpu.as_deref()) {
-            Ok(o) => tool_output_result(o),
-            Err(e) => link_error_result(e),
-        }
+    async fn step(
+        &self,
+        Parameters(a): Parameters<StepArgs>,
+        context: RequestContext<RoleServer>,
+    ) -> CallToolResult {
+        temporal::execute(self.link.clone(), temporal::Operation::Step(a), context).await
     }
 
     #[tool(description = "Resume normal execution from a frozen state.")]
@@ -975,6 +983,29 @@ impl Emucap {
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for Emucap {
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        mut context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let permit = match self.control_slot.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Ok(error_result(
+                    "busy",
+                    "active_operation: another Control operation is in progress",
+                )
+                .into())
+            }
+        };
+        context.extensions.insert(request_ownership::Admission::new(
+            permit,
+            self.connection.register(),
+        ));
+        let call = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(call).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("emucap-mcp", env!("CARGO_PKG_VERSION")))
@@ -1067,7 +1098,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let server = Emucap::new(link);
-    let service = server.serve(emucap::mcp_stdio::bounded_stdio()).await?;
+    let transport = server
+        .connection
+        .transport(emucap::mcp_stdio::bounded_stdio());
+    let service = server.serve(transport).await?;
     service.waiting().await?;
     Ok(())
 }

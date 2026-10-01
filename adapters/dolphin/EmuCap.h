@@ -27,6 +27,9 @@ class System;
 
 namespace EmuCap
 {
+// Apply explicit managed audio selection once, before native stream initialization.
+void ConfigureAudioOutput();
+
 // Start the adapter thread once when EMUCAP_PORT is set; otherwise do nothing.
 void Start(Core::System& system);
 
@@ -54,5 +57,7 @@ void NotifyFrameStepComplete();
 
 // Called by the adapter-owned reset-button release event on the CPU thread. The token prevents a
 // user, movie, or other native reset tap from completing an emucap request.
+// CPU-owner callbacks must validate before touching the button or notifying IOS.
+bool IsResetTapActive(u64 token);
 void NotifyResetTapComplete(Core::System& system, u64 token);
 }  // namespace EmuCap

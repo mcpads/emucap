@@ -21,6 +21,7 @@ struct FrameGate {
     shutdown: bool,
     frame: u64,
     debug_update: u64,
+    resume_hook: Option<unsafe extern "C" fn()>,
 }
 
 pub(super) enum FrameWaitOutcome {
@@ -113,6 +114,14 @@ pub(super) fn cancel_frame_gate() {
     condvar.notify_all();
 }
 
+pub(super) fn set_frame_resume_hook(hook: unsafe extern "C" fn()) {
+    let mut gate = frame_gate()
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    gate.resume_hook = Some(hook);
+}
+
 pub(super) fn reset_frame_gate() {
     let (lock, condvar) = frame_gate();
     let mut gate = lock.lock().unwrap_or_else(|error| error.into_inner());
@@ -122,6 +131,7 @@ pub(super) fn reset_frame_gate() {
     gate.shutdown = false;
     gate.frame = 0;
     gate.debug_update = 0;
+    gate.resume_hook = None;
     condvar.notify_all();
 }
 
@@ -139,6 +149,7 @@ pub(super) fn shutdown_frame_gate() {
     gate.trigger = FrameGateTrigger::NextFrame;
     gate.blocked = false;
     gate.shutdown = true;
+    gate.resume_hook = None;
     condvar.notify_all();
 }
 
@@ -165,6 +176,11 @@ pub(super) extern "C" fn frame_callback(frame: u32) {
             gate = condvar
                 .wait(gate)
                 .unwrap_or_else(|error| error.into_inner());
+        }
+        // Still on the emulation thread. Keeping the gate locked also serializes
+        // shutdown/unregistration against this call into the loaded native core.
+        if let Some(resume) = gate.resume_hook {
+            unsafe { resume() };
         }
     }
 }

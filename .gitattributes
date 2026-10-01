@@ -1,2 +1,4 @@
 # Patch bytes are pinned by upstream.lock; never normalize embedded upstream line endings.
 adapters/*/patches/*.patch -text -whitespace
+# Native diagnostic patches also preserve upstream context and line endings.
+_tests/live/xemu/*.patch -text -whitespace

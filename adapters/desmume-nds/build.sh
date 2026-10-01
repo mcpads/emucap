@@ -32,6 +32,7 @@ PATCH10="$HERE/patches/0010-emucap-shared-scheduler-state.patch"
 PATCH11="$HERE/patches/0011-emucap-vblank-frame-step.patch"
 PATCH12="$HERE/patches/0012-emucap-agent-pacing.patch"
 PATCH13="$HERE/patches/0013-emucap-memory-batch.patch"
+PATCH14="$HERE/patches/0014-reanchor-pacing-on-resume.patch"
 WORK_INPUT="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 [ ! -L "$WORK_INPUT" ] || { echo "ERROR: DeSmuME work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
 mkdir -p "$WORK_INPUT"
@@ -57,14 +58,14 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13" "$PATCH14"; do
       cat "$patch"
     done | shasum -a 256 | awk '{print $1}'
   )"
 elif command -v sha256sum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13" "$PATCH14"; do
       cat "$patch"
     done | sha256sum | awk '{print $1}'
   )"
@@ -129,7 +130,8 @@ for entry in \
   "$PATCH10|emucap shared-scheduler state patch (0010)" \
   "$PATCH11|emucap VBlank frame-step patch (0011)" \
   "$PATCH12|emucap agent pacing patch (0012)" \
-  "$PATCH13|emucap memory batch patch (0013)"; do
+  "$PATCH13|emucap memory batch patch (0013)" \
+  "$PATCH14|resume pacing anchor patch (0014)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"

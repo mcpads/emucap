@@ -1,0 +1,42 @@
+--- a/include/qemu/osdep.h
++++ b/include/qemu/osdep.h
+@@ -858,14 +858,24 @@
+  * for the current thread.
+  */
+ #ifdef __APPLE__
++/* Shared across translation units, private to each host thread. Unknown until
++ * the first explicit transition; never assume the thread's initial JIT mode. */
++extern __thread int qemu_thread_jit_mode;
++
+ static inline void qemu_thread_jit_execute(void)
+ {
+-    pthread_jit_write_protect_np(true);
++    if (qemu_thread_jit_mode != 1) {
++        pthread_jit_write_protect_np(true);
++        qemu_thread_jit_mode = 1;
++    }
+ }
+ 
+ static inline void qemu_thread_jit_write(void)
+ {
+-    pthread_jit_write_protect_np(false);
++    if (qemu_thread_jit_mode != 0) {
++        pthread_jit_write_protect_np(false);
++        qemu_thread_jit_mode = 0;
++    }
+ }
+ #else
+ static inline void qemu_thread_jit_write(void) {}
+--- a/util/osdep.c
++++ b/util/osdep.c
+@@ -30,6 +30,10 @@
+ #include "qemu/mprotect.h"
+ #include "qemu/hw-version.h"
+ #include "monitor/monitor.h"
++
++#ifdef __APPLE__
++__thread int qemu_thread_jit_mode = -1;
++#endif
+ 
+ static const char *hw_version = QEMU_HW_VERSION;
+ 

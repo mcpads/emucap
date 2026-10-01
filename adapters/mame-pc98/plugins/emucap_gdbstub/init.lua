@@ -294,6 +294,9 @@ function emucap_gdbstub.startplugin()
   local pending_reset
   local pending_save
   local pending_load
+  local pending_settled_stop
+  local settled_pause_owned = false
+  local control_unverified = false
   local pending_reset_reply = false
   local breakpoint_hit_seq = 0
   local socket
@@ -320,6 +323,22 @@ function emucap_gdbstub.startplugin()
     frame_wait_requested = nil
     if release_input and clear_inputs then
       clear_inputs()
+    end
+  end
+
+  local function native_state_io_available()
+    local machine = manager.machine
+    return is_neogeo_profile and machine.state_file_io ~= nil
+      and machine.state_io_boundary ~= nil
+  end
+
+  local function request_settled_stop(reply)
+    running = false
+    hold_requested = false
+    pending_settled_stop = reply
+    if not manager.machine.paused then
+      emu.pause()
+      settled_pause_owned = true
     end
   end
 
@@ -509,6 +528,10 @@ function emucap_gdbstub.startplugin()
       print("emucap_gdbstub: reset point verification failed " .. tostring(points_error))
     end
     consolelast = #consolelog
+    if pending_settled_stop then
+      ack_packet(socket, "E17")
+      pending_settled_stop = nil
+    end
     running = false
     rxbuf = ""
     -- A machine reset restarts the screen frame counter. Generic frame advances count frame
@@ -549,12 +572,14 @@ function emucap_gdbstub.startplugin()
   end)
 
   stop_subscription = emu.add_machine_stop_notifier(function()
-    if socket and (pending_save or pending_load) then
+    if socket and (pending_save or pending_load or pending_settled_stop) then
       ack_packet(socket, "E17")
     end
     finish_pending_reset_reply("E17")
     pending_save = nil
     pending_load = nil
+    pending_settled_stop = nil
+    settled_pause_owned = false
     local video = manager.machine and manager.machine.video
     if video and video.set_throttle_wait_hook then
       video:set_throttle_wait_hook(nil)
@@ -927,7 +952,8 @@ function emucap_gdbstub.startplugin()
     -- emu.pause()로 머신을 실제 halt한다(검증: pc 완전 고정·크래시 없음; register_periodic은 paused여도 발화해
     -- 이 스핀의 소켓 서비스가 유지됨). 스핀 탈출(=step/continue/frame로 재개)에서 emu.unpause()한다. 우리가 pause한
     -- 경우만 unpause(외부/중첩 pause 상태 보존).
-    local paused_here = false
+    local paused_here = settled_pause_owned
+    settled_pause_owned = false
     if manager.machine and not manager.machine.paused then
       emu.pause()
       paused_here = true
@@ -970,7 +996,7 @@ function emucap_gdbstub.startplugin()
     end
     -- 스핀 탈출 = 재개(step/continue/frame-wait). 우리가 pause했으면 실제 머신을 unpause해 진행시킨다
     -- (debugger execution_state="run"/go만으론 emu.pause된 머신이 안 도므로 emu.unpause가 필수).
-    if paused_here and manager.machine and manager.machine.paused then
+    if paused_here and not control_unverified and manager.machine and manager.machine.paused then
       emu.unpause()
     end
     trace("svcfrozen exit execstate=" .. tostring(debugger and debugger.execution_state) .. " running=" .. tostring(running) .. " fwt=" .. tostring(frame_wait_target) .. " paused_here=" .. tostring(paused_here))
@@ -1023,6 +1049,11 @@ function emucap_gdbstub.startplugin()
     return manager.machine.screens and manager.machine.screens:at(1)
   end
 
+  local function native_raster_state_available()
+    local screen = first_screen()
+    return screen and screen.raster_state_supported == true
+  end
+
   local function current_frame()
     local screen = first_screen()
     if screen then
@@ -1072,6 +1103,10 @@ function emucap_gdbstub.startplugin()
       local frame_now = current_frame()
       if frame_now < frame_wait_screen_start then
         clear_frame_wait()
+        if native_state_io_available() then
+          request_settled_stop({ payload = "E15" })
+          return
+        end
         running = false
         debugger.execution_state = "stop"
         hold_requested = true
@@ -1088,6 +1123,10 @@ function emucap_gdbstub.startplugin()
     if not reached then
       if frame_wait_deadline and emu.osd_ticks() >= frame_wait_deadline then
         clear_frame_wait()
+        if native_state_io_available() then
+          request_settled_stop({ payload = "DEADLINE:" .. tostring(done) })
+          return
+        end
         if debugger then
           running = false
           debugger.execution_state = "stop"
@@ -1101,6 +1140,10 @@ function emucap_gdbstub.startplugin()
     local should_stop = frame_wait_stop
     local probe = frame_wait_probe
     clear_frame_wait()
+    if should_stop and native_state_io_available() then
+      request_settled_stop({ probe = probe, payload = "OK" })
+      return
+    end
     if should_stop and debugger then
       running = false
       debugger.execution_state = "stop"
@@ -1422,6 +1465,12 @@ function emucap_gdbstub.startplugin()
       local space = cpu and cpu.spaces["program"]
       local video = manager.machine.video
       local features = {}
+      if native_state_io_available() then
+        features[#features + 1] = "settled_state_io"
+      end
+      if native_raster_state_available() then
+        features[#features + 1] = "native_raster_state"
+      end
       if space and space.read_peek_block then
         features[#features + 1] = "peek_block"
       end
@@ -1626,6 +1675,26 @@ function emucap_gdbstub.startplugin()
       else
         print("emucap_gdbstub: save failed " .. tostring(err))
         ack_packet(socket, "E03")
+      end
+      return true
+    elseif (name == "savesync" or name == "loadsync") and is_neogeo_profile then
+      local path = hex_to_string(rest or "")
+      if not native_state_io_available() or not native_raster_state_available() then
+        ack_packet(socket, "STATE:unsupported")
+      elseif not path or path == "" then
+        ack_packet(socket, "STATE:invalid_path")
+      else
+        local ok, result = pcall(function()
+          return manager.machine:state_file_io(name == "loadsync", path)
+        end)
+        if not ok then
+          print("emucap_gdbstub: native state I/O failed " .. tostring(result))
+          result = name == "loadsync" and "load_failed_unverified" or "save_failed"
+        end
+        if result == "load_failed_unverified" then
+          control_unverified = true
+        end
+        ack_packet(socket, "STATE:" .. tostring(result))
       end
       return true
     elseif name == "savesync" then
@@ -2159,6 +2228,12 @@ function emucap_gdbstub.startplugin()
 
   handle = function(payload)
     if payload == "\x03" then
+      if native_state_io_available() and debugger.execution_state ~= "stop"
+          and not in_frozen_socket_service then
+        clear_frame_wait()
+        request_settled_stop({ payload = "S05", interrupt = true })
+        return
+      end
       debugger.execution_state = "stop"
       running = false
       hold_requested = true  -- explicit pause 의도 → note_stop이 홀드한다(내부 스톱과 구분)
@@ -2166,6 +2241,10 @@ function emucap_gdbstub.startplugin()
       return
     end
 
+    if control_unverified then
+      ack_packet(socket, "STATE:load_failed_unverified")
+      return
+    end
     local cmd = payload:sub(1, 1)
     local map = regmaps[cpu.shortname]
 
@@ -2370,6 +2449,23 @@ function emucap_gdbstub.startplugin()
     if not cpu or not debugger then
       return
     end
+    if pending_settled_stop then
+      if not manager.machine.state_io_boundary then
+        return
+      end
+      local reply = pending_settled_stop
+      pending_settled_stop = nil
+      local payload = reply.payload
+      if reply.probe then
+        local probe = reply.probe
+        payload = "HEX:" .. (read_program_hex(probe.addr, probe.len) or "")
+          .. "|FRAME:" .. tostring(current_frame()) .. "|REGS:" .. regs_payload(regmaps[cpu.shortname])
+      end
+      if reply.interrupt then packet(socket, payload) else ack_packet(socket, payload) end
+      service_frozen_socket()
+      return
+    end
+    if control_unverified then return end
     check_input_release()
     if trace_enabled then
       local st = debugger.execution_state
@@ -2390,7 +2486,7 @@ function emucap_gdbstub.startplugin()
       if not payload then
         break
       end
-      if not handle_payload_safely(payload) then
+      if not handle_payload_safely(payload) or pending_settled_stop then
         return
       end
     end

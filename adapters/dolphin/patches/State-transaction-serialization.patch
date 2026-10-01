@@ -1,0 +1,151 @@
+--- a/Source/Core/Common/ChunkFile.h
++++ b/Source/Core/Common/ChunkFile.h
+@@ -49,12 +49,21 @@
+   u8** m_ptr_current;
+   u8* m_ptr_end;
+   Mode m_mode;
++  bool m_failed = false;
+ 
+ public:
+   PointerWrap(u8** ptr, size_t size, Mode mode)
+       : m_ptr_current(ptr), m_ptr_end(*ptr + size), m_mode(mode)
+   {
+   }
++
++  // A failed operation is distinct from a successful size measurement.
++  void SetError()
++  {
++    m_failed = true;
++    m_mode = Mode::Measure;
++  }
++  bool HasError() const { return m_failed; }
+ 
+   void SetMeasureMode() { m_mode = Mode::Measure; }
+   void SetVerifyMode() { m_mode = Mode::Verify; }
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -229,7 +229,7 @@
+   auto& exi = system.GetExpansionInterface();
+   exi.BeginStateLoad();
+   DoState(system, p);
+-  const bool loaded = p.IsReadMode();
++  const bool loaded = p.IsReadMode() && !p.HasError();
+   exi.FinishStateLoad(loaded);
+   return loaded;
+ }
+@@ -243,6 +243,9 @@
+   u8* ptr = buffer.data();
+   PointerWrap pointer_wrap(&ptr, buffer.size(), PointerWrap::Mode::Write);
+   DoState(system, pointer_wrap);
++  if (pointer_wrap.HasError())
++    return 0;
++
+   const auto measured_size = pointer_wrap.GetOffsetFromPreviousPosition(buffer.data());
+ 
+   if (pointer_wrap.IsWriteMode())
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -490,7 +490,11 @@
+ 
+           u32 stride = AbstractTexture::CalculateStrideForFormat(config.format, level_width);
+           u32 size = stride * level_height;
+-          m_readback_texture->ReadTexels(rect, texture_data, stride);
++          if (!m_readback_texture->ReadTexels(rect, texture_data, stride))
++          {
++            p.SetError();
++            return;
++          }
+ 
+           texture_data += size;
+         }
+@@ -499,13 +503,14 @@
+   }
+   else
+   {
++    p.SetError();
+     PanicAlertFmt("Failed to create staging texture for serialization");
+   }
+ }
+ 
+ std::optional<TextureCacheBase::TexPoolEntry> TextureCacheBase::DeserializeTexture(PointerWrap& p)
+ {
+-  TextureConfig config;
++  TextureConfig config{};
+   p.Do(config);
+ 
+   // Read in the size from the save state, then texture data will point to
+@@ -513,12 +518,18 @@
+   u32 total_size = 0;
+   u8* texture_data = p.DoExternal(total_size);
+ 
+-  if (!p.IsReadMode() || total_size == 0)
++  if (!p.IsReadMode())
+     return std::nullopt;
++  if (total_size == 0)
++  {
++    p.SetError();
++    return std::nullopt;
++  }
+ 
+   auto tex = AllocateTexture(config);
+   if (!tex)
+   {
++    p.SetError();
+     PanicAlertFmt("Failed to create texture for deserialization");
+     return std::nullopt;
+   }
+@@ -535,7 +546,8 @@
+       if ((start + size) > total_size)
+       {
+         ERROR_LOG_FMT(VIDEO, "Insufficient texture data for layer {} level {}", layer, level);
+-        return tex;
++        p.SetError();
++        return std::nullopt;
+       }
+ 
+       tex->texture->Load(level, level_width, level_height, level_width, &texture_data[start], size);
+--- a/Source/Core/VideoCommon/AbstractStagingTexture.cpp
++++ b/Source/Core/VideoCommon/AbstractStagingTexture.cpp
+@@ -31,12 +31,12 @@
+   CopyToTexture(src_rect, dst, dst_rect, dst_layer, dst_level);
+ }
+ 
+-void AbstractStagingTexture::ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr,
++bool AbstractStagingTexture::ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr,
+                                         u32 out_stride)
+ {
+   ASSERT(m_type != StagingTextureType::Upload);
+   if (!PrepareForAccess())
+-    return;
++    return false;
+ 
+   ASSERT(rect.left >= 0 && static_cast<u32>(rect.right) <= m_config.width && rect.top >= 0 &&
+          static_cast<u32>(rect.bottom) <= m_config.height);
+@@ -51,7 +51,7 @@
+       m_map_stride == out_stride)
+   {
+     std::memcpy(out_ptr, current_ptr, m_map_stride * rect.GetHeight());
+-    return;
++    return true;
+   }
+ 
+   size_t copy_size = std::min(static_cast<size_t>(rect.GetWidth() * m_texel_size), m_map_stride);
+@@ -63,6 +63,7 @@
+     current_ptr += m_map_stride;
+     dst_ptr += out_stride;
+   }
++  return true;
+ }
+ 
+ void AbstractStagingTexture::ReadTexel(u32 x, u32 y, void* out_ptr)
+--- a/Source/Core/VideoCommon/AbstractStagingTexture.h
++++ b/Source/Core/VideoCommon/AbstractStagingTexture.h
+@@ -70,7 +70,7 @@
+   // Reads the specified rectangle from the staging texture to out_ptr, with the specified stride
+   // (length in bytes of each row). CopyFromTexture must be called first. The contents of any
+   // texels outside of the rectangle used for CopyFromTexture is undefined.
+-  void ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr, u32 out_stride);
++  bool ReadTexels(const MathUtil::Rectangle<int>& rect, void* out_ptr, u32 out_stride);
+   void ReadTexel(u32 x, u32 y, void* out_ptr);
+ 
+   // Copies the texels from in_ptr to the staging texture, which can be read by the GPU, with the

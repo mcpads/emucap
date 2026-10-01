@@ -286,3 +286,56 @@ fn slow_frame_step_reports_partial_progress_at_the_host_deadline() {
     assert_eq!(value["state"], "frozen");
     assert!(!bridge.backend_terminal());
 }
+
+#[test]
+fn cancelled_frame_step_verifies_stop_and_does_not_poison_next_request() {
+    let (mut bridge, commands, _temp) = fixture(false);
+    let cancellation = crate::live::link::RequestCancellation::default();
+    cancellation.cancel();
+    commands.lock().unwrap().clear();
+    let value =
+        result(bridge.handle_request_cancellable(
+            Request::new(1, "step", json!({"frames":60})),
+            cancellation,
+        ));
+    assert_eq!(value["status"], "interrupted");
+    assert_eq!(value["reason"], "cancelled");
+    assert_eq!(value["count"], 0);
+    assert_eq!(value["state"], "frozen");
+    assert!(bridge.control.paused && bridge.control.breaked);
+    assert!(commands
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s == "::emucap::cancel_frame"));
+    let next = result(bridge.handle_request(Request::new(2, "step", json!({"frames":2}))));
+    assert_eq!(next["status"], "completed");
+    assert_eq!(next["count"], 2);
+}
+
+#[test]
+fn cancellation_cleanup_failure_retires_native_control() {
+    let (mut bridge, _, _temp) = fixture(false);
+    bridge.control.fail_once = Some("::emucap::cancel_frame".into());
+    let cancellation = crate::live::link::RequestCancellation::default();
+    cancellation.cancel();
+    let response = bridge
+        .handle_request_cancellable(Request::new(1, "step", json!({"frames":60})), cancellation);
+    assert!(!response.ok);
+    assert!(bridge.backend_terminal());
+}
+
+#[test]
+fn cancellation_envelope_cannot_enable_instruction_stepping() {
+    let (mut bridge, commands, _temp) = fixture(false);
+    commands.lock().unwrap().clear();
+    let response = bridge.handle_request(Request::new(
+        1,
+        "step",
+        json!({
+            "unit":"instructions", "count":10, "_control":{}
+        }),
+    ));
+    assert_eq!(response.error.unwrap().kind, "unsupported");
+    assert!(commands.lock().unwrap().is_empty());
+}

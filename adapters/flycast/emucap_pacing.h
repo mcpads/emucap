@@ -115,8 +115,11 @@ inline bool emucap_parse_batch_ranges(
   if (out.empty()) { error = "ranges must contain 1..64 entries"; return false; }
   std::uint64_t total = 0;
   for (const EmucapBatchRange& range : out) {
+    if (range.length > EMUCAP_BATCH_MAX_BYTES - total) {
+      error = "ranges exceed 65536 bytes";
+      return false;
+    }
     total += range.length;
-    if (total > EMUCAP_BATCH_MAX_BYTES) { error = "ranges exceed 65536 bytes"; return false; }
   }
   return true;
 }

@@ -8,13 +8,18 @@ const FRAME_CALLBACK: &str = "::emucap::frame_tick";
 const FRAME_TCL: &str = r#"namespace eval ::emucap {
     variable frame_seq 0
     variable frame_target {}
+    variable frame_generation 0
 
     proc next_frame {count} {
-        after realtime 0 [list ::emucap::start_frame $count]
+        variable frame_generation
+        incr frame_generation
+        after realtime 0 [list ::emucap::start_frame $count $frame_generation]
         return {}
     }
 
-    proc start_frame {count} {
+    proc start_frame {count generation} {
+        variable frame_generation
+        if {$generation != $frame_generation} { return {} }
         variable frame_seq
         variable frame_target
         if {$frame_target ne {}} {
@@ -28,8 +33,10 @@ const FRAME_TCL: &str = r#"namespace eval ::emucap {
     proc frame_tick {} {
         variable frame_seq
         variable frame_target
+        variable frame_generation
         incr frame_seq
         if {$frame_target ne {} && $frame_seq >= $frame_target} {
+            incr frame_generation
             set frame_target {}
             set ::pause on
         }
@@ -37,6 +44,8 @@ const FRAME_TCL: &str = r#"namespace eval ::emucap {
 
     proc cancel_frame {} {
         variable frame_target
+        variable frame_generation
+        incr frame_generation
         set frame_target {}
         return {}
     }
@@ -72,9 +81,15 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         self.require_frozen("frame step")?;
         self.prepare_temporal_request("frame step")?;
         let before = self.current_frame()?;
-        if let Err(primary) = self.control.advance_frames(count) {
+        if let Err(primary) = self
+            .control
+            .advance_frames_cancellable(count, &self.request_cancellation)
+        {
             if matches!(primary, OpenMsxBridgeError::HostDeadline(_)) {
-                return self.finish_deadline_frame_step(before, count);
+                return self.finish_interrupted_frame_step(before, count, "host_deadline");
+            }
+            if matches!(primary, OpenMsxBridgeError::Cancelled) {
+                return self.finish_interrupted_frame_step(before, count, "cancelled");
             }
             let diagnostic = self
                 .control
@@ -143,31 +158,41 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     /// Slow pacing can make a frame target outlast the host budget. Stop at the reached boundary
     /// and report partial progress; an unverified stop is a debugger failure, not a result.
-    fn finish_deadline_frame_step(&mut self, before: u64, count: u64) -> BridgeResult<Value> {
-        let cleanup = self
-            .control
-            .command("::emucap::cancel_frame")
-            .and_then(|_| self.control.command("set pause on"))
-            .and_then(|_| self.control.command("debug break"))
-            .and_then(|_| self.require_stop_conjunction("deadline-interrupted frame step"));
-        if let Err(error) = cleanup {
-            return self.fail_debugger(format!(
-                "frame step reached its host deadline and could not be stopped: {error}"
-            ));
+    fn finish_interrupted_frame_step(
+        &mut self,
+        before: u64,
+        count: u64,
+        reason: &str,
+    ) -> BridgeResult<Value> {
+        self.control.set_command_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(500),
+        ));
+        let result: BridgeResult<Value> = (|| {
+            self.control.command("::emucap::cancel_frame")?;
+            self.control.command("set pause on")?;
+            self.control.command("debug break")?;
+            self.require_stop_conjunction("interrupted frame step")?;
+            let after = self.current_frame()?;
+            self.drain_debug_events()?;
+            Ok(json!({
+                "status": "interrupted",
+                "reason": if self.debug_events.is_empty() { reason } else { "breakpoint" },
+                "unit": "frames",
+                "count": after.saturating_sub(before),
+                "requested": count,
+                "frame_before": before,
+                "frame": after,
+                "state": "frozen",
+                "event_pending": !self.debug_events.is_empty(),
+            }))
+        })();
+        self.control.set_command_deadline(None);
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => self.fail_debugger(format!(
+                "frame step interrupted by {reason} and stop evidence is incomplete: {error}"
+            )),
         }
-        let after = self.current_frame()?;
-        self.drain_debug_events()?;
-        Ok(json!({
-            "status": "interrupted",
-            "reason": "host_deadline",
-            "unit": "frames",
-            "count": after.saturating_sub(before),
-            "requested": count,
-            "frame_before": before,
-            "frame": after,
-            "state": "frozen",
-            "event_pending": !self.debug_events.is_empty(),
-        }))
     }
 
     pub(super) fn initialize_frame_monitor(&mut self) -> BridgeResult<()> {

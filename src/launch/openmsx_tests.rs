@@ -115,6 +115,7 @@ fn launch_spec_isolates_and_passes_exact_process_identity_inputs() {
         session_token: Some("token"),
         runtime: None,
         display: false,
+        sound: true,
     };
     let session_manifest = runtime_home.join("generation/session.json");
     let spec = launch_spec(&launch, &session_manifest, &runtime_home, &pid_file);
@@ -127,6 +128,7 @@ fn launch_spec_isolates_and_passes_exact_process_identity_inputs() {
             runtime_home.to_str().unwrap(),
             "0",
             pid_file.to_str().unwrap(),
+            "1",
         ]
     );
     assert!(spec

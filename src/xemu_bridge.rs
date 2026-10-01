@@ -16,7 +16,10 @@ use crate::gdb_rsp::{GdbBridgeEnv, GdbError, GdbTransport};
 use crate::live::protocol::{ProtocolError, Request, Response};
 use crate::qmp::{QmpError, QmpTransport};
 
-pub const REQUIRED_HOST_API: u64 = 1;
+mod clock_profile;
+pub use clock_profile::{qualification_shift, XemuClockProfile};
+
+pub const REQUIRED_HOST_API: u64 = 3;
 const HOST_FEATURES: &[&str] = &["controlled_start"];
 const MAX_MEMORY_TRANSFER: usize = 0x2_0000;
 const MAX_MEMORY_CHUNK: usize = 0x2000;
@@ -26,6 +29,9 @@ const XBOX_RAM_SIZE: u64 = 0x0400_0000;
 const SCREENSHOT_POLL_INTERVAL: Duration = Duration::from_millis(8);
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const FRAME_STOP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+/// Frames count NV2A vblanks, which the patched host raises on guest virtual time.
+const FRAME_CLOCK: &str = "nv2a_vblank_guest_time";
 const CONTRACT_EXCEPTIONS: &[&str] = &[
     "xemu.state-save.frozen-only",
     "xemu.state-load.frozen-only",
@@ -59,6 +65,8 @@ const METHODS: &[&str] = &[
     "save_state",
     "load_state",
     "probe",
+    "read_memory_batch",
+    "execution_speed",
 ];
 
 // Recognize historical wire names only to return a stable unsupported error. They are not a
@@ -112,6 +120,7 @@ pub struct XemuHostBuildIdentity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XemuStateEnvironment {
+    pub clock_profile: XemuClockProfile,
     pub hdd: PathBuf,
     pub eeprom: PathBuf,
     pub host_build: XemuHostBuildIdentity,
@@ -144,7 +153,10 @@ impl XemuStateEnvironment {
             binary_sha256: required("EMUCAP_XEMU_HOST_BINARY_SHA256")?,
         };
         host_build.validate()?;
+        let shift = required("EMUCAP_XEMU_CLOCK_SHIFT")?;
+        let clock_profile = XemuClockProfile::candidate(qualification_shift(Some(&shift))?)?;
         Ok(Self {
+            clock_profile,
             hdd,
             eeprom,
             host_build,
@@ -270,6 +282,10 @@ pub struct XemuBridge<Q, G> {
     pending_state_snapshot_cleanup: Vec<(String, String)>,
     state_media_identity_cache: Option<state::MediaIdentityCache>,
     hello_completed: bool,
+    /// Bumped by every request outside the observation set, since those can change memory or
+    /// the stop without changing the frame counter.
+    boundary_seq: u64,
+    control_unverified: bool,
 }
 
 impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
@@ -303,12 +319,21 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             pending_state_snapshot_cleanup: Vec::new(),
             state_media_identity_cache: None,
             hello_completed: false,
+            boundary_seq: 0,
+            control_unverified: false,
         }
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {
         let id = request.id;
-        let result = if let Some(reason) = self.state_integrity_error.as_deref() {
+        if !observation::OBSERVATION_METHODS.contains(&request.method.as_str()) {
+            self.boundary_seq += 1;
+        }
+        let result = if self.control_unverified {
+            Err(XemuBridgeError::BadState(
+                "Xbox native control is unverified; stop this generation".into(),
+            ))
+        } else if let Some(reason) = self.state_integrity_error.as_deref() {
             if request.method == "status" {
                 self.status()
             } else {
@@ -344,6 +369,8 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 "save_state" => self.save_state(&request.params),
                 "load_state" => self.load_state(&request.params),
                 "probe" => self.probe(&request.params),
+                "read_memory_batch" => self.read_memory_batch(&request.params),
+                "execution_speed" => self.execution_speed(&request.params),
                 other if KNOWN_UNAVAILABLE_WIRE_METHODS.contains(&other) => {
                     Err(XemuBridgeError::Unsupported(other.into()))
                 }
@@ -370,7 +397,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
     }
 
     pub fn backend_terminal(&self) -> bool {
-        self.qmp.is_terminal() || self.gdb.is_terminal()
+        self.control_unverified || self.qmp.is_terminal() || self.gdb.is_terminal()
     }
 }
 
@@ -378,6 +405,7 @@ mod debug;
 mod input;
 mod media;
 mod memory;
+mod observation;
 mod service;
 mod state;
 mod support;

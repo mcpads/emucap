@@ -954,14 +954,6 @@ pub(crate) fn make_launch_plan(port: Option<u16>, args: &LaunchPlanArgs) -> serd
                 "reason": "known BIOS files are copied into the emucap-owned per-port Mednafen home; ~/.mednafen is never used"
             }
         })
-    } else if adapter == "flycast" {
-        serde_json::json!({
-            "EMUCAP_MUTE": {
-                "default": "1",
-                "applies_when": "unset",
-                "reason": "1=mute (default, for debugging); set EMUCAP_MUTE=0 to keep sound. The launcher applies this to the emucap-owned isolated config copy."
-            }
-        })
     } else if adapter == "mesen2" {
         serde_json::json!({
             "EMUCAP_MESEN_LUA": {

@@ -1,0 +1,59 @@
+--- a/src/drivers/main.cpp
++++ b/src/drivers/main.cpp
+@@ -41,6 +41,7 @@
+ #endif
+ 
+ #include <atomic>
++#include "emucap_driver_video.h"
+ 
+ #include "input.h"
+ #include "Joystick.h"
+@@ -276,6 +277,8 @@
+ static MThreading::Sem* VTWakeupSem;
+ static MThreading::Mutex *VTMutex = NULL, *EVMutex = NULL;
+ static MThreading::Mutex *StdoutMutex = NULL;
++
++#include "emucap_driver_video.inc"
+ 
+ //
+ //
+@@ -2032,7 +2035,7 @@
+     if(vtr >= 0)
+     {
+      if(!VideoError)
+-      BlitScreen(SoftFB[vtr].surface.get(), &SoftFB[vtr].rect, SoftFB[vtr].lw.get(), VTRotated, SoftFB[vtr].field, VTSSnapshot);
++      EmucapBlitReadyFrame(vtr);
+ 
+      // Set to -1 after we're done blitting everything(including on-screen display stuff), and NOT just the emulated system's video surface.
+      VTReady.store(-1, std::memory_order_release);
+@@ -2065,6 +2068,8 @@
+ {
+  bool ret = true;
+ 
++ EmucapCompletedFrame empty_display;
++ EmucapPublishedFrame.swap(empty_display);
+  VTReady.store(-1, std::memory_order_release);
+ 
+  NeedExitNow = false;
+--- a/src/drivers/video.cpp
++++ b/src/drivers/video.cpp
+@@ -1649,7 +1649,7 @@
+  float sub;
+ } volatile JoyGunTranslate[2] = { { 0, 0 }, { 0, 0 } };
+ 
+-void BlitScreen(MDFN_Surface *msurface, const MDFN_Rect *DisplayRect, const int32 *LineWidths, const int new_rotated, const int InterlaceField, const bool take_ssnapshot)
++void BlitScreen(const MDFN_Surface *msurface, const MDFN_Rect *DisplayRect, const int32 *LineWidths, const int new_rotated, const int InterlaceField, const bool take_ssnapshot)
+ {
+  //
+  // Reduce CPU usage when minimized, and prevent OpenGL memory quasi-leaks on Windows(though I have the feeling there's a
+--- a/src/drivers/video.h
++++ b/src/drivers/video.h
+@@ -22,7 +22,7 @@
+ //
+ // Functions called from main thread:
+ //
+-void BlitScreen(MDFN_Surface *, const MDFN_Rect *DisplayRect, const int32 *LineWidths, const int rotated, const int InterlaceField, const bool take_ssnapshot);
++void BlitScreen(const MDFN_Surface *, const MDFN_Rect *DisplayRect, const int32 *LineWidths, const int rotated, const int InterlaceField, const bool take_ssnapshot);
+ 
+ void Video_ShowNotice(MDFN_NoticeType t, char* s);
+ 

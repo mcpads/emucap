@@ -1,0 +1,86 @@
+--- a/src/emu/video.h
++++ b/src/emu/video.h
+@@ -58,11 +58,11 @@
+ 
+ 	// setters
+ 	void set_frameskip(int frameskip);
+-	void set_throttled(bool throttled) { m_throttled = throttled; }
+-	void set_throttle_rate(float throttle_rate) { m_throttle_rate = throttle_rate; }
+-	void set_fastforward(bool ffwd) { m_fastforward = ffwd; }
++	void set_throttled(bool throttled) { if (m_throttled != throttled) { m_throttled = throttled; m_throttle_resync = true; } }
++	void set_throttle_rate(float throttle_rate) { if (m_throttle_rate != throttle_rate) { m_throttle_rate = throttle_rate; m_throttle_resync = true; } }
++	void set_fastforward(bool ffwd) { if (m_fastforward != ffwd) { m_fastforward = ffwd; m_throttle_resync = true; } }
+ 	void set_output_changed() { m_output_changed = true; }
+-	void set_speed_factor(int speed) { m_speed = speed; }
++	void set_speed_factor(int speed) { if (m_speed != speed) { m_speed = speed; m_throttle_resync = true; } }
+ 	// Called at bounded intervals while a throttle wait sleeps; returning true ends the wait so the
+ 	// frame can finish and queued control requests are serviced without waiting a full frame.
+ 	void set_throttle_wait_hook(std::function<bool ()> &&hook) { m_throttle_wait_hook = std::move(hook); }
+@@ -130,6 +130,7 @@
+ 	osd_ticks_t         m_throttle_last_ticks;      // osd_ticks the last call to throttle
+ 	attotime            m_throttle_realtime;        // real time the last call to throttle
+ 	attotime            m_throttle_emutime;         // emulated time the last call to throttle
++	bool                m_throttle_resync = true; // host anchor invalidated by policy/load changes
+ 	u32                 m_throttle_history;         // history of frames where we were fast enough
+ 
+ 	// dynamic speed computation
+--- a/src/emu/video.cpp
++++ b/src/emu/video.cpp
+@@ -534,6 +534,7 @@
+ 
+ void video_manager::postload()
+ {
++	m_throttle_resync = true;
+ 	attotime const emutime = machine().time();
+ 	for (const auto &x : m_movie_recordings)
+ 		x->set_next_frame_time(emutime);
+@@ -707,6 +708,10 @@
+ 			emutime = (emutime * 1000) / m_speed;
+ 		}
+ 
++		// A changed policy has a different scaled-time origin, not accumulated debt.
++		if (m_throttle_resync)
++			break;
++
+ 		// compute conversion factors up front
+ 		osd_ticks_t ticks_per_second = osd_ticks_per_second();
+ 		attoseconds_t attoseconds_per_tick = ATTOSECONDS_PER_SECOND / ticks_per_second * m_throttle_rate;
+@@ -726,14 +731,12 @@
+ 		// reported value from our current value; this should be a small value somewhere
+ 		// between 0 and 1/10th of a second ... anything outside of this range is obviously
+ 		// wrong and requires a resync
+-		attoseconds_t emu_delta_attoseconds = (emutime - m_throttle_emutime).as_attoseconds();
+-		// the anomaly bound is 1/10 s of speed-scaled emulated time; below 1.1% speed the
+-		// product exceeds attoseconds_t, so saturate instead of wrapping negative
++		attotime const emu_delta = emutime - m_throttle_emutime;
++		attoseconds_t const emu_delta_attoseconds = emu_delta.as_attoseconds();
+ 		u32 const speed = m_speed ? m_speed : 1000;
+-		attoseconds_t const max_emu_delta = (speed > 10)
+-				? (ATTOSECONDS_PER_SECOND / speed) * 100
+-				: std::numeric_limits<attoseconds_t>::max();
+-		if (emu_delta_attoseconds < 0 || emu_delta_attoseconds >= max_emu_delta)
++		// Compare full durations: as_attoseconds saturates at one second.
++		attotime const max_emu_delta = attotime(0, ATTOSECONDS_PER_SECOND / 10) * 1000 / speed;
++		if (emu_delta < attotime::zero || emu_delta >= max_emu_delta)
+ 		{
+ 			if (LOG_THROTTLE)
+ 				machine().logerror("Resync due to weird emutime delta: %s\n", attotime(0, emu_delta_attoseconds).as_string(18));
+@@ -806,6 +809,9 @@
+ 
+ 	// reset realtime and emutime to the same value
+ 	m_throttle_realtime = m_throttle_emutime = emutime;
++	m_throttle_last_ticks = osd_ticks();
++	m_throttle_history = 0;
++	m_throttle_resync = false;
+ }
+ 
+ 
+@@ -953,7 +959,7 @@
+ 			if (target_speed != m_speed)
+ 			{
+ 				osd_printf_verbose("Adjusting target speed to %.1f%% (hw=%.2fHz, game=%.2fHz, adjusted=%.2fHz)\n", target_speed / 10.0, minrefresh, ATTOSECONDS_TO_HZ(min_frame_period), ATTOSECONDS_TO_HZ(min_frame_period * 1000.0 / target_speed));
+-				m_speed = target_speed;
++				set_speed_factor(target_speed);
+ 			}
+ 		}
+ 	}

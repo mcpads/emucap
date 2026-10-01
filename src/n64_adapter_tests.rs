@@ -437,3 +437,43 @@ fn native_operation_completion_can_arrive_from_the_host_worker() {
     control::wait_operation_result(&RESULT, "test host-worker completion").unwrap();
     worker.join().unwrap();
 }
+
+#[test]
+fn frame_resume_hook_runs_on_the_parked_thread_and_is_retired_before_shutdown() {
+    static OBSERVED: std::sync::Mutex<Vec<std::thread::ThreadId>> =
+        std::sync::Mutex::new(Vec::new());
+    unsafe extern "C" fn resumed() {
+        OBSERVED.lock().unwrap().push(std::thread::current().id());
+    }
+    let _guard = frame_gate_test_lock().lock().unwrap();
+    reset_frame_gate();
+    OBSERVED.lock().unwrap().clear();
+    frame::set_frame_resume_hook(resumed);
+    frame::frame_callback(0);
+    assert!(OBSERVED.lock().unwrap().is_empty());
+
+    // Normal release and cancellation both end a real park on its owning thread.
+    for cancel in [false, true] {
+        arm_frame_gate(FrameGateTrigger::NextFrame).unwrap();
+        let callback = std::thread::spawn(|| frame::frame_callback(1));
+        let owner = callback.thread().id();
+        wait_frame_gate(Duration::from_secs(1)).unwrap();
+        if cancel {
+            frame::cancel_frame_gate();
+        } else {
+            release_frame_gate().unwrap();
+        }
+        callback.join().unwrap();
+        assert_eq!(OBSERVED.lock().unwrap().pop(), Some(owner));
+    }
+
+    arm_frame_gate(FrameGateTrigger::NextFrame).unwrap();
+    let callback = std::thread::spawn(|| frame::frame_callback(2));
+    wait_frame_gate(Duration::from_secs(1)).unwrap();
+    frame::shutdown_frame_gate();
+    callback.join().unwrap();
+    assert!(OBSERVED.lock().unwrap().is_empty());
+    reset_frame_gate();
+    frame::frame_callback(3);
+    assert!(OBSERVED.lock().unwrap().is_empty());
+}

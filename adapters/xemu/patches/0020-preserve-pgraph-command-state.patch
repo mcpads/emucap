@@ -1,0 +1,392 @@
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -23,6 +23,9 @@
+ #include "qemu/main-loop.h"
+ #include "hw/core/cpu.h"
+ #include "ui/xemu-emucap.h"
++#include "migration/qemu-file.h"
++#include "qapi/error.h"
++#include "hw/xbox/nv2a/pgraph/snapshot.h"
+ 
+ #define NV2A_VBLANK_HZ 60
+ #define NV2A_VBLANK_MAX_PERIOD_NS DIV_ROUND_UP(NANOSECONDS_PER_SECOND, NV2A_VBLANK_HZ)
+@@ -490,7 +493,6 @@
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
+     if (d->vblank_fraction >= NV2A_VBLANK_HZ) {
+-        nv2a_unlock_fifo(d);
+         return -EINVAL;
+     }
+ 
+@@ -501,19 +503,35 @@
+         d->vblank_fraction = 0;
+         nv2a_vblank_arm(d);
+     }
++    /* Device registers are restored without pgraph_reg_w. Invalidate shader
++     * selection and uniform upload history before the renderer consumes them. */
++    d->pgraph.program_data_dirty = true;
++    bitmap_fill(d->pgraph.regs_dirty, 0x2000 / sizeof(uint32_t));
++    memset(d->pgraph.vsh_constants_dirty, 1, sizeof(d->pgraph.vsh_constants_dirty));
++    memset(d->pgraph.ltctxa_dirty, 1, sizeof(d->pgraph.ltctxa_dirty));
++    memset(d->pgraph.ltctxb_dirty, 1, sizeof(d->pgraph.ltctxb_dirty));
++    memset(d->pgraph.ltc1_dirty, 1, sizeof(d->pgraph.ltc1_dirty));
++    memset(d->pgraph.texture_dirty, 1, sizeof(d->pgraph.texture_dirty));
+     qatomic_set(&d->pgraph.flush_pending, true);
+-    nv2a_unlock_fifo(d);
+     return 0;
+ }
+ 
+-const VMStateDescription vmstate_nv2a_pgraph_vertex_attributes = {
+-    .name = "nv2a/pgraph/vertex-attr",
+-    .version_id = 1,
+-    .minimum_version_id = 1,
+-    .fields = (VMStateField[]) {
+-        // FIXME
+-        VMSTATE_END_OF_LIST()
+-    }
++static int nv2a_command_state_get(QEMUFile *f, void *pv, size_t size,
++                                  const VMStateField *field)
++{
++    return pgraph_snapshot_get(f, pv);
++}
++
++static int nv2a_command_state_put(QEMUFile *f, void *pv, size_t size,
++                                  const VMStateField *field, JSONWriter *vmdesc)
++{
++    return pgraph_snapshot_put(f, pv);
++}
++
++static const VMStateInfo vmstate_nv2a_command_state = {
++    .name = "nv2a-command-state",
++    .get = nv2a_command_state_get,
++    .put = nv2a_command_state_put,
+ };
+ 
+ static const VMStateDescription vmstate_nv2a_vblank = {
+@@ -528,14 +546,11 @@
+     }
+ };
+ 
+-static const VMStateDescription vmstate_nv2a = {
+-    .name = "nv2a",
+-    .version_id = 3,
+-    .minimum_version_id = 1,
+-    .pre_save = nv2a_pre_save,
+-    .post_save = nv2a_post_save,
++static const VMStateDescription vmstate_nv2a_payload = {
++    .name = "nv2a/payload",
++    .version_id = 4,
++    .minimum_version_id = 4,
+     .post_load = nv2a_post_load,
+-    .pre_load = nv2a_pre_load,
+     .fields = (VMStateField[]) {
+         // FIXME: Split this up into subsections
+         VMSTATE_PCI_DEVICE(parent_obj, NV2AState),
+@@ -613,7 +628,6 @@
+         VMSTATE_BOOL_ARRAY(pgraph.ltctxb_dirty, NV2AState, NV2A_LTCTXB_COUNT),
+         VMSTATE_UINT32_2DARRAY(pgraph.ltc1, NV2AState, NV2A_LTC1_COUNT, 4),
+         VMSTATE_BOOL_ARRAY(pgraph.ltc1_dirty, NV2AState, NV2A_LTC1_COUNT),
+-        VMSTATE_STRUCT_ARRAY(pgraph.vertex_attributes, NV2AState, NV2A_VERTEXSHADER_ATTRIBUTES, 1, vmstate_nv2a_pgraph_vertex_attributes, VertexAttribute),
+         VMSTATE_UINT32(pgraph.inline_array_length, NV2AState),
+         VMSTATE_UINT32_SUB_ARRAY(pgraph.inline_array, NV2AState, 0, NV2A_MAX_BATCH_LENGTH_V2),
+         VMSTATE_UINT32_SUB_ARRAY_V(pgraph.inline_array, NV2AState, NV2A_MAX_BATCH_LENGTH_V2, NV2A_MAX_BATCH_LENGTH - NV2A_MAX_BATCH_LENGTH_V2, 3),
+@@ -651,11 +665,58 @@
+         VMSTATE_BOOL(pgraph.waiting_for_nop, NV2AState),
+         VMSTATE_UNUSED(1),
+         VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
++        VMSTATE_SINGLE(pgraph, NV2AState, 4, vmstate_nv2a_command_state, PGRAPHState),
++        { .name = "vblank", .version_id = 4, .size = sizeof(NV2AState),
++          .flags = VMS_STRUCT, .offset = 0, .vmsd = &vmstate_nv2a_vblank },
+         VMSTATE_END_OF_LIST()
+     },
+-    .subsections = (const VMStateDescription * const []) {
+-        &vmstate_nv2a_vblank,
+-        NULL
++};
++
++/* VMState skips post_load on field/subsection errors. Own the lock around
++ * the entire decoder so truncation and malformed input cannot strand the FIFO. */
++static int nv2a_payload_get(QEMUFile *f, void *pv, size_t size,
++                            const VMStateField *field)
++{
++    NV2AState *d = pv;
++    Error *err = NULL;
++    nv2a_pre_load(d);
++    int ret = vmstate_load_state(f, &vmstate_nv2a_payload, d, 4, &err);
++    nv2a_unlock_fifo(d);
++    if (err) {
++        qemu_file_set_error_obj(f, ret < 0 ? ret : -EINVAL, err);
++    }
++    return ret;
++}
++
++static int nv2a_payload_put(QEMUFile *f, void *pv, size_t size,
++                            const VMStateField *field, JSONWriter *vmdesc)
++{
++    NV2AState *d = pv;
++    Error *err = NULL;
++    nv2a_pre_save(d);
++    int ret = vmstate_save_state(f, &vmstate_nv2a_payload, d, vmdesc, &err);
++    nv2a_post_save(d);
++    if (err) {
++        qemu_file_set_error_obj(f, ret < 0 ? ret : -EINVAL, err);
++    }
++    return ret;
++}
++
++static const VMStateInfo vmstate_nv2a_payload_info = {
++    .name = "nv2a-payload",
++    .get = nv2a_payload_get,
++    .put = nv2a_payload_put,
++};
++
++static const VMStateDescription vmstate_nv2a = {
++    .name = "nv2a",
++    /* Prior versions omit guest command state and cannot continue faithfully. */
++    .version_id = 4,
++    .minimum_version_id = 4,
++    .fields = (const VMStateField[]) {
++        { .name = "payload", .size = sizeof(NV2AState), .flags = VMS_SINGLE,
++          .offset = 0, .info = &vmstate_nv2a_payload_info },
++        VMSTATE_END_OF_LIST()
+     },
+ };
+ 
+--- /dev/null
++++ b/hw/xbox/nv2a/pgraph/snapshot.h
+@@ -0,0 +1,235 @@
++/* SPDX-License-Identifier: LGPL-2.0-or-later
++ * Guest PGRAPH command state. Included after pgraph.h and qemu-file.h.
++ * Wire integers and float bit patterns are big endian; host resources stay local.
++ */
++#ifndef NV2A_PGRAPH_SNAPSHOT_H
++#define NV2A_PGRAPH_SNAPSHOT_H
++
++_Static_assert(sizeof(float) == sizeof(uint32_t), "PGRAPH floats must be 32 bits");
++
++#define PGRAPH_SNAPSHOT_FLOATS(F) \
++    F(material_alpha, 1) \
++    F(light_infinite_half_vector, NV2A_MAX_LIGHTS * 3) \
++    F(light_infinite_direction, NV2A_MAX_LIGHTS * 3) \
++    F(light_local_position, NV2A_MAX_LIGHTS * 3) \
++    F(light_local_attenuation, NV2A_MAX_LIGHTS * 3) \
++    F(specular_params, 6) F(specular_power, 1) \
++    F(specular_params_back, 6) F(specular_power_back, 1) F(point_params, 8)
++
++static void pgraph_snapshot_put_floats(QEMUFile *f, const void *values, size_t n)
++{
++    const uint8_t *p = values;
++    for (size_t i = 0; i < n; i++) {
++        uint32_t bits;
++        memcpy(&bits, p + i * sizeof(bits), sizeof(bits));
++        qemu_put_be32(f, bits);
++    }
++}
++
++static void pgraph_snapshot_get_floats(QEMUFile *f, void *values, size_t n)
++{
++    uint8_t *p = values;
++    for (size_t i = 0; i < n; i++) {
++        uint32_t bits = qemu_get_be32(f);
++        memcpy(p + i * sizeof(bits), &bits, sizeof(bits));
++    }
++}
++
++static bool pgraph_snapshot_bounds(const PGRAPHState *pg)
++{
++    if (pg->inline_buffer_length > NV2A_MAX_BATCH_LENGTH ||
++        pg->inline_array_length > NV2A_MAX_BATCH_LENGTH ||
++        pg->inline_elements_length > NV2A_MAX_BATCH_LENGTH ||
++        pg->draw_arrays_length > ARRAY_SIZE(pg->draw_arrays_start)) {
++        return false;
++    }
++    for (unsigned i = 0; i < pg->draw_arrays_length; i++) {
++        int32_t start = pg->draw_arrays_start[i], count = pg->draw_arrays_count[i];
++        if (start < 0 || count <= 0 || (uint64_t)start + count > INT32_MAX) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool pgraph_snapshot_draw_bounds(const PGRAPHState *pg, unsigned minimum)
++{
++    if (!pg->draw_arrays_length) {
++        return true;
++    }
++    unsigned actual_min = UINT32_MAX, actual_max = 0;
++    for (unsigned i = 0; i < pg->draw_arrays_length; i++) {
++        actual_min = MIN(actual_min, (unsigned)pg->draw_arrays_start[i]);
++        actual_max = MAX(actual_max, (unsigned)(pg->draw_arrays_start[i] +
++                                               pg->draw_arrays_count[i]));
++    }
++    return minimum == actual_min && pg->draw_arrays_max_count == actual_max;
++}
++
++static bool pgraph_snapshot_attribute_valid(const VertexAttribute *a)
++{
++    static const unsigned sizes[] = { 1, 2, 4, 0, 1, 2, 4 };
++    if (a->format >= ARRAY_SIZE(sizes) || !sizes[a->format] ||
++        a->count > 4 || a->stride > 255 || a->offset > 0x7fffffff) {
++        return false;
++    }
++    /* Disabled attributes may still have their zero-initialized size. */
++    return (a->size == sizes[a->format] || (!a->count && !a->size)) &&
++           (a->format != 6 || a->count <= 1);
++}
++
++static int pgraph_snapshot_put(QEMUFile *f, const PGRAPHState *pg)
++{
++    if (!pgraph_snapshot_bounds(pg) ||
++        !pgraph_snapshot_draw_bounds(pg, pg->draw_arrays_min_start)) {
++        return -EINVAL;
++    }
++    for (unsigned i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
++        const VertexAttribute *a = &pg->vertex_attributes[i];
++        if (!pgraph_snapshot_attribute_valid(a) ||
++            (a->inline_buffer_populated && pg->inline_buffer_length && !a->inline_buffer)) {
++            return -EINVAL;
++        }
++    }
++    qemu_put_be32(f, 1); /* Command-state wire revision. */
++    qemu_put_be32(f, pg->inline_buffer_length);
++    qemu_put_be32(f, pg->draw_arrays_min_start);
++    qemu_put_byte(f, pg->draw_arrays_prevent_connect);
++    qemu_put_be64(f, pg->beta.object_instance);
++    qemu_put_be32(f, pg->beta.beta);
++    qemu_put_byte(f, pg->zpass_pixel_count_enable);
++    for (unsigned i = 0; i < NV2A_MAX_TEXTURES; i++) {
++        qemu_put_byte(f, pg->texture_matrix_enable[i]);
++    }
++    qemu_put_be16(f, pg->compressed_attrs);
++    qemu_put_be16(f, pg->uniform_attrs);
++    qemu_put_be16(f, pg->swizzle_attrs);
++#define PUT_FLOATS(member, count) pgraph_snapshot_put_floats(f, &pg->member, count);
++    PGRAPH_SNAPSHOT_FLOATS(PUT_FLOATS)
++#undef PUT_FLOATS
++    for (unsigned i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
++        const VertexAttribute *a = &pg->vertex_attributes[i];
++        qemu_put_byte(f, a->dma_select);
++        qemu_put_be64(f, a->offset);
++        qemu_put_be32(f, a->format);
++        qemu_put_be32(f, a->size);
++        qemu_put_be32(f, a->count);
++        qemu_put_be32(f, a->stride);
++        pgraph_snapshot_put_floats(f, a->inline_value, 4);
++        qemu_put_byte(f, a->inline_buffer_populated);
++        if (a->inline_buffer_populated) {
++            pgraph_snapshot_put_floats(f, a->inline_buffer, (size_t)pg->inline_buffer_length * 4);
++        }
++    }
++    return qemu_file_get_error(f);
++}
++
++static bool pgraph_snapshot_get_bool(QEMUFile *f, bool *v)
++{
++    unsigned byte = qemu_get_byte(f);
++    *v = byte != 0;
++    return byte <= 1;
++}
++
++static int pgraph_snapshot_get(QEMUFile *f, PGRAPHState *pg)
++{
++    if (!pgraph_snapshot_bounds(pg) || qemu_get_be32(f) != 1) {
++        return -EINVAL;
++    }
++    /* This temporary contains only decoded values, never initialized host locks. */
++    PGRAPHState *s = g_try_malloc0(sizeof(*s));
++    if (!s) {
++        return -ENOMEM;
++    }
++    int ret = -EINVAL;
++    s->inline_buffer_length = qemu_get_be32(f);
++    if (s->inline_buffer_length != pg->inline_buffer_length) {
++        goto out;
++    }
++    s->draw_arrays_min_start = qemu_get_be32(f);
++    if (!pgraph_snapshot_get_bool(f, &s->draw_arrays_prevent_connect)) {
++        goto out;
++    }
++    if (!pgraph_snapshot_draw_bounds(pg, s->draw_arrays_min_start)) {
++        goto out;
++    }
++    s->beta.object_instance = qemu_get_be64(f);
++    s->beta.beta = qemu_get_be32(f);
++    if (!pgraph_snapshot_get_bool(f, &s->zpass_pixel_count_enable)) {
++        goto out;
++    }
++    for (unsigned i = 0; i < NV2A_MAX_TEXTURES; i++) {
++        if (!pgraph_snapshot_get_bool(f, &s->texture_matrix_enable[i])) {
++            goto out;
++        }
++    }
++    s->compressed_attrs = qemu_get_be16(f);
++    s->uniform_attrs = qemu_get_be16(f);
++    s->swizzle_attrs = qemu_get_be16(f);
++#define GET_FLOATS(member, count) pgraph_snapshot_get_floats(f, &s->member, count);
++    PGRAPH_SNAPSHOT_FLOATS(GET_FLOATS)
++#undef GET_FLOATS
++    for (unsigned i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
++        VertexAttribute *a = &s->vertex_attributes[i];
++        if (!pgraph_snapshot_get_bool(f, &a->dma_select)) {
++            goto out;
++        }
++        a->offset = qemu_get_be64(f);
++        a->format = qemu_get_be32(f);
++        a->size = qemu_get_be32(f);
++        a->count = qemu_get_be32(f);
++        a->stride = qemu_get_be32(f);
++        pgraph_snapshot_get_floats(f, a->inline_value, 4);
++        if (!pgraph_snapshot_get_bool(f, &a->inline_buffer_populated) ||
++            !pgraph_snapshot_attribute_valid(a)) {
++            goto out;
++        }
++        size_t n = (size_t)s->inline_buffer_length * 4;
++        if (a->inline_buffer_populated && n) {
++            if (!pg->vertex_attributes[i].inline_buffer) {
++                goto out;
++            }
++            a->inline_buffer = g_try_malloc(n * sizeof(float));
++            if (!a->inline_buffer) {
++                ret = -ENOMEM;
++                goto out;
++            }
++            pgraph_snapshot_get_floats(f, a->inline_buffer, n);
++        }
++        if (qemu_file_get_error(f)) {
++            goto out;
++        }
++    }
++    /* Publish only after complete validation. Existing allocations stay owned. */
++    pg->draw_arrays_min_start = s->draw_arrays_min_start;
++    pg->draw_arrays_prevent_connect = s->draw_arrays_prevent_connect;
++    pg->beta = s->beta;
++    pg->zpass_pixel_count_enable = s->zpass_pixel_count_enable;
++    memcpy(pg->texture_matrix_enable, s->texture_matrix_enable, sizeof(pg->texture_matrix_enable));
++    pg->compressed_attrs = s->compressed_attrs;
++    pg->uniform_attrs = s->uniform_attrs;
++    pg->swizzle_attrs = s->swizzle_attrs;
++#define COPY_FLOATS(member, count) memcpy(&pg->member, &s->member, (count) * sizeof(float));
++    PGRAPH_SNAPSHOT_FLOATS(COPY_FLOATS)
++#undef COPY_FLOATS
++    for (unsigned i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
++        VertexAttribute *a = &pg->vertex_attributes[i];
++        float *buffer = a->inline_buffer;
++        if (s->vertex_attributes[i].inline_buffer) {
++            memcpy(buffer, s->vertex_attributes[i].inline_buffer,
++                   (size_t)s->inline_buffer_length * 4 * sizeof(float));
++        }
++        *a = s->vertex_attributes[i];
++        a->inline_buffer = buffer;
++        /* Offset is recomputed by bind_inline_array; conversion is renderer local. */
++    }
++    ret = 0;
++ out:
++    for (unsigned i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
++        g_free(s->vertex_attributes[i].inline_buffer);
++    }
++    g_free(s);
++    return ret;
++}
++#undef PGRAPH_SNAPSHOT_FLOATS
++#endif

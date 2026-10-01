@@ -6,6 +6,42 @@ Control MCP listener over NDJSON.
 
 `status.methods` and `status.memory_types` are authoritative for every live session.
 
+`launch(sound=true)` selects Dolphin's native default audio backend and verifies initialization
+and successful start before accepting the managed launch. The default `sound=false` selects
+`No Audio Output`. `status.audio_output` reports the actual backend, stream lifetime and native
+start/stop results, including failures. A frozen guest normally has a stopped stream with a
+verified earlier start. Host volume and device delivery remain native output behavior.
+
+Bounded multi-frame advances retain output across their internal frame stops and finish with
+native CPU/audio cleanup. A native refusal after partial progress returns `interrupted` with
+`reason=native_rejected` and the completed frame count. Mixer playback settings are copied coherently for each mix operation;
+sample-rate reads and writes are synchronized. `EMUCAP_SANITIZERS=thread bash
+adapters/dolphin/test-mixer.sh` checks the actual Mixer/Config concurrency paths on a prepared
+native source tree. Device playback and guest behavior use the runtime profile witnesses.
+`_tests/live/dolphin-advance-test.py --sound` verifies output cleanup after completed advances,
+breakpoints and connection loss using its own native child and caller-provided content.
+Add `--shutdown` to require graceful native termination during an active advance.
+
+A restore before the first XFB clears stale native presentation identity so frame continuation
+starts from the saved origin. `_tests/live/dolphin_frame_restore.py` checks repeated and paced
+continuation using caller-provided profiles and checkpoints. `status.cpu_core` reports the
+configured CPU enum. `get_state.runtime_components` reports the actual CPU engine, SC/DC,
+actual deterministic GPU-thread mode, DSP engine and worker presence, and selected video backend
+under the CPU/DSP/FIFO guard.
+It is separate from architectural registers and is null outside an active core. The witness
+accepts `expected_runtime_components` to check profile selection and verifies that repeated
+frozen reads preserve the boundary and running reads leave execution running.
+
+New snapshots preserve the current presentation, live texture references and every EFB color/depth
+sample, including stereo layers, independently of optional texture-cache saving. Loads return
+`presentation_history: restored`. Legacy snapshots remain loadable and return
+`presentation_history: legacy_unavailable`; their missing display history cannot be recovered.
+New files use an explicit presentation-format descriptor and are rejected by the old reader.
+The native CPU/context owner retains each state operation through its response attempt.
+`_tests/live/dolphin/presentation_continuation.py` checks ordered continuation across pacing
+policies with the independently authored Wii fixture; its usage is in the
+[fixture guide](../../_tests/live/dolphin/wii-pacing-fixture/README.md).
+
 ## Native adapter
 
 The native adapter keeps Dolphin's normal JIT for free-running execution. It temporarily switches
@@ -47,6 +83,12 @@ On Windows, `build.ps1` applies the same pinned patch stack with Visual Studio 2
 same metadata sidecar expected by the native launcher. This source path is kept in sync, but its
 runtime behavior has not been verified in this repository's current macOS test environment.
 
+Unix builds also run `test-settings.sh` against the patched native configuration sources. To
+repeat it, use `bash adapters/dolphin/test-settings.sh`; set `EMUCAP_SANITIZERS=thread` or
+`EMUCAP_SANITIZERS=address,undefined` for sanitizer checks. The test covers concurrent writes,
+cache visibility, callback ordering, layer changes and writes during settings-file I/O. Pacing
+tests cover verified replies, competing writes, native clamps and deadlines during notification.
+
 ## Launch
 
 Use the MCP launcher:
@@ -63,7 +105,7 @@ Headless mode is the default. `display=true` selects the compatible DolphinQt bu
 render window. Both modes run from an emucap-owned portable copy with a per-port `--user`
 directory. The fork also routes DolphinQt state through that directory, and the launcher rejects
 redirecting symlinks inside the portable tree, leaving an installed Dolphin and its profile
-untouched. Audio output is disabled.
+untouched.
 
 Follow the normal connection sequence:
 
@@ -116,8 +158,7 @@ most 5,000 steps per request, with a 250-second operation budget. Long advances 
 responses with the original request ID. A debugger stop, deadline or lost connection stops further
 work and joins native cleanup before another session can take ownership. Interrupted replies carry
 the actual completed `count` and a budget stop reports `reason: "host_deadline"`; failure to
-confirm cleanup is an error, not a frozen success. Rebuild the maintained native adapter (host API
-6). Split longer advances into checked calls.
+confirm cleanup is an error, not a frozen success. Split longer advances into checked calls.
 
 ### Batched memory and execution speed
 
@@ -132,9 +173,14 @@ so control stays responsive at slow speeds. `status.frame` is the VI frame count
 `reset` owns an isolated native reset-button press and release, resumes only for that guest-time
 window, and freezes in the exact release callback. This is the same hardware reset-button surface
 used by Dolphin's UI; completion does not claim that guest software has finished rebooting. A
-pausing emucap breakpoint may preempt it. Interruption and timeout cancel the adapter-owned release
-event, force the button unpressed, and leave the core frozen. User and movie reset taps use a
-different event identity and cannot complete or be canceled by an emucap request.
+pausing emucap breakpoint may preempt it. Reset preserves host pacing and emits progress while
+waiting within the bounded operation budget. Interruption, disconnect and timeout cancel owned
+events, release the button and verify the native stop; unverified cleanup retires process control.
+User and movie taps use a different event identity. `_tests/live/dolphin-advance-test.py --reset`
+checks release, breakpoint and disconnect behavior; `--shutdown` adds the native exit gate and
+`--frozen-shutdown` selects its frozen one-percent case. Managed headless shutdown reaches native
+host teardown independently of guest pacing. `test-platform-shutdown.sh` checks native managed
+and unmanaged shutdown routing on a prepared source tree.
 
 ### Breakpoints
 
@@ -179,10 +225,12 @@ native sample without carrying ownership into another launch.
 
 ### Savestates
 
-`save_state` and `load_state` require a frozen core and preserve that state on return. Save captures
+`save_state` and `load_state` require a frozen core and return frozen on success. Save captures
 one CPU/device snapshot, completes compression to a same-directory staging file, validates the
 result, and publishes it only after all work is complete. Load rejects missing files before
 mutation and acknowledges success only after Dolphin has restored the complete snapshot.
+A failed load with successful rollback keeps the session usable. `recovery_failed` means rollback
+failed: the CPU is powered down and the managed session must be restarted.
 
 ### Screenshots
 

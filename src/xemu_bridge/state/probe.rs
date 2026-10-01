@@ -33,7 +33,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             json!({
                 "status":"completed", "count":0, "requested":0,
                 "start_frame":start_frame, "end_frame":start_frame,
-                "clock":"nv2a_display_update_accepted_while_running", "state":"frozen"
+                "clock":FRAME_CLOCK, "state":"frozen"
             })
         } else {
             self.step_frames(&json!({"count":requested_frames}))?

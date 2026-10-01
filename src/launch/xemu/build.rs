@@ -6,7 +6,7 @@ use super::files::identity_for_regular_file;
 use crate::launch::{find_on_path, is_runnable_file};
 
 const LOCK: &str = include_str!("../../../adapters/xemu/upstream.lock");
-pub const REQUIRED_HOST_API: u32 = 1;
+pub const REQUIRED_HOST_API: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {

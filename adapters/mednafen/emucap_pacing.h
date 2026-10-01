@@ -25,6 +25,12 @@ const std::uint64_t EMUCAP_BATCH_MAX_BYTES = 65536;
 const std::uint32_t EMUCAP_PACING_MIN_PERCENT = 1;
 const std::uint32_t EMUCAP_PACING_MAX_PERCENT = 10000;
 
+// Host playback uses the native slow-forward floor. The guest-time governor still uses the
+// requested rate; its real-time syncer supplies the remaining wait below this audio ratio.
+inline double emucap_audio_ratio(double speed) {
+  return speed < 0.25 ? 0.25 : speed;
+}
+
 // Plain string value for key inside one flat JSON object; escapes are rejected.
 inline bool emucap_flat_json_string(const std::string& object, const char* key, std::string& out) {
   const std::string pattern = std::string("\"") + key + "\"";
@@ -86,8 +92,11 @@ inline bool emucap_parse_batch_ranges(
   if (out.empty()) { error = "ranges must contain 1..64 entries"; return false; }
   std::uint64_t total = 0;
   for (const EmucapBatchRange& range : out) {
+    if (range.length > EMUCAP_BATCH_MAX_BYTES - total) {
+      error = "ranges exceed 65536 bytes";
+      return false;
+    }
     total += range.length;
-    if (total > EMUCAP_BATCH_MAX_BYTES) { error = "ranges exceed 65536 bytes"; return false; }
   }
   return true;
 }
@@ -161,12 +170,14 @@ inline std::string emucap_pacing_policy_json(
       }
     }
   }
-  char diag[192];
+  char diag[256];
   std::snprintf(diag, sizeof(diag),
                 "{\"base_speed\":%.17g,\"unlimited\":%s,\"fast_slow_forward\":%d,"
-                "\"current_speed\":%.17g,\"netplay\":%s,\"nothrottle\":%s}",
+                "\"current_speed\":%.17g,\"netplay\":%s,\"nothrottle\":%s,"
+                "\"host_audio_ratio\":%.17g}",
                 o.base, o.unlimited ? "true" : "false", o.ffsf, o.current,
-                o.netplay ? "true" : "false", o.unthrottled ? "true" : "false");
+                o.netplay ? "true" : "false", o.unthrottled ? "true" : "false",
+                emucap_audio_ratio(o.current));
   return "{\"mode\":\"" + mode + "\",\"percent\":" + percent
       + ",\"source\":\"native\",\"policy_revision\":\"" + std::to_string(revision)
       + "\",\"host_constraints\":" + (audio ? "[\"audio_output\"]" : "[]")

@@ -1,0 +1,177 @@
+--- a/Core/SMS/SmsConsole.cpp
++++ b/Core/SMS/SmsConsole.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include "Shared/Video/VideoDecoder.h"
+ #include "SMS/SmsConsole.h"
+ #include "SMS/SmsCpu.h"
+ #include "SMS/SmsControlManager.h"
+@@ -359,6 +360,11 @@
+ 	settings->InitializeRam(ramState, data, length);
+ }
+ 
++void* SmsConsole::GetVideoFrameData()
++{
++	return _vdp->GetPreviousCompletedFrame();
++}
++
+ void SmsConsole::Serialize(Serializer& s)
+ {
+ 	if(!s.IsSaving() && s.GetFormat() != SerializeFormat::Map) {
+@@ -370,6 +376,7 @@
+ 			s.SetErrorFlag();
+ 			return;
+ 		}
++		_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
+ 	}
+ 	SV(_cpu);
+ 	SV(_vdp);
+--- a/Core/SMS/SmsConsole.h
++++ b/Core/SMS/SmsConsole.h
+@@ -73,6 +73,7 @@
+ 	PpuFrameInfo GetPpuFrame() override;
+ 	uint32_t GetFrameCount() override;
+ 	BaseVideoFilter* GetVideoFilter(bool getDefaultFilter) override;
++	void* GetVideoFrameData() override;
+ 
+ 	uint64_t GetMasterClock() override;
+ 	uint32_t GetMasterClockRate() override;
+--- a/Core/SMS/SmsDefaultVideoFilter.h
++++ b/Core/SMS/SmsDefaultVideoFilter.h
+@@ -13,7 +13,6 @@
+ private:
+ 	uint32_t _calculatedPalette[0x8000] = {};
+ 	VideoConfig _videoConfig = {};
+-	uint16_t _prevFrame[256 * 240] = {};
+ 	bool _blendFrames = false;
+ 	SmsConsole* _console = nullptr;
+ 
+@@ -27,11 +26,10 @@
+ 			InitLookupTable();
+ 		}
+ 
+-		bool blendFrames = _console->GetModel() == SmsModel::GameGear && smsConfig.GgBlendFrames && !_emu->GetRewindManager()->IsRewinding() && !_emu->IsPaused();
+-		if(_blendFrames != blendFrames) {
+-			_blendFrames = blendFrames;
+-			memset(_prevFrame, 0, 256 * 240 * sizeof(uint16_t));
+-		}
++		//Only native completed-frame submissions carry the matching guest history.
++		//Preview/debug frames without that history retain their unblended display.
++		_blendFrames = _console->GetModel() == SmsModel::GameGear && smsConfig.GgBlendFrames
++			&& !_emu->GetRewindManager()->IsRewinding() && _frameData != nullptr;
+ 		_videoConfig = config;
+ 	}
+ 
+@@ -60,7 +58,7 @@
+ 	uint32_t GetPixel(uint16_t* vdpFrame, uint32_t offset)
+ 	{
+ 		if(_blendFrames) {
+-			return BlendPixels(_calculatedPalette[_prevFrame[offset]], _calculatedPalette[vdpFrame[offset]]);
++			return BlendPixels(_calculatedPalette[static_cast<const uint16_t*>(_frameData)[offset]], _calculatedPalette[vdpFrame[offset]]);
+ 		} else {
+ 			return _calculatedPalette[vdpFrame[offset]];
+ 		}
+@@ -99,8 +97,5 @@
+ 			}
+ 		}
+ 
+-		if(_blendFrames) {
+-			std::copy(in, in + 256 * 240, _prevFrame);
+-		}
+ 	}
+ };
+\ No newline at end of file
+--- a/Core/SMS/SmsVdp.cpp
++++ b/Core/SMS/SmsVdp.cpp
+@@ -645,7 +645,12 @@
+ 
+ 		_emu->GetNotificationManager()->SendNotification(ConsoleNotificationType::PpuFrameDone);
+ 
++		//The decoder may still read the previous completed pair. Retire that read before rotating.
++		_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
++		std::copy(std::begin(_completedFrame), std::end(_completedFrame), _previousCompletedFrame);
++		std::copy(_currentOutputBuffer, _currentOutputBuffer + 256 * 240, _completedFrame);
+ 		RenderedFrame frame(_currentOutputBuffer, 256, 240, 1.0, _state.FrameCount, _console->GetControlManager()->GetPortStates());
++		frame.Data = _previousCompletedFrame;
+ 		bool rewinding = _emu->GetRewindManager()->IsRewinding();
+ 		_emu->GetVideoDecoder()->UpdateFrame(frame, rewinding, rewinding);
+ 
+@@ -1502,10 +1507,12 @@
+ {
+ 	uint32_t version = 0;
+ 	uint8_t index = 0xff;
+-	return s.TryReadValue("rasterVersion", version) && version == 1
++	return s.TryReadValue("rasterVersion", version) && version == 2
+ 		&& s.TryReadValue("outputBufferIndex", index) && index < 2
+ 		&& s.HasValueSize("outputBuffer0", 256 * 240 * sizeof(uint16_t))
+-		&& s.HasValueSize("outputBuffer1", 256 * 240 * sizeof(uint16_t));
++		&& s.HasValueSize("outputBuffer1", 256 * 240 * sizeof(uint16_t))
++		&& s.HasValueSize("completedFrame", 256 * 240 * sizeof(uint16_t))
++		&& s.HasValueSize("previousCompletedFrame", 256 * 240 * sizeof(uint16_t));
+ }
+ 
+ void SmsVdp::Serialize(Serializer& s)
+@@ -1574,12 +1581,14 @@
+ 
+ 	if(s.GetFormat() != SerializeFormat::Map) {
+ 		//The console preflights the raster payload before deserializing any device.
+-		uint32_t rasterVersion = 1;
++		uint32_t rasterVersion = 2;
+ 		uint8_t outputBufferIndex = _currentOutputBuffer == _outputBuffers[1] ? 1 : 0;
+ 		s.Stream(rasterVersion, "rasterVersion");
+ 		s.Stream(outputBufferIndex, "outputBufferIndex");
+ 		s.StreamArray(_outputBuffers[0], 256 * 240, "outputBuffer0");
+ 		s.StreamArray(_outputBuffers[1], 256 * 240, "outputBuffer1");
++		s.StreamArray(_completedFrame, 256 * 240, "completedFrame");
++		s.StreamArray(_previousCompletedFrame, 256 * 240, "previousCompletedFrame");
+ 		if(!s.IsSaving()) {
+ 			_currentOutputBuffer = _outputBuffers[outputBufferIndex];
+ 		}
+--- a/Core/SMS/SmsVdp.h
++++ b/Core/SMS/SmsVdp.h
+@@ -60,6 +60,8 @@
+ 
+ 	uint16_t* _outputBuffers[2] = {};
+ 	uint16_t* _currentOutputBuffer = nullptr;
++	uint16_t _completedFrame[256 * 240] = {};
++	uint16_t _previousCompletedFrame[256 * 240] = {};
+ 
+ 	SmsVdpState _state = {};
+ 	uint64_t _lastMasterClock = 0;
+@@ -197,6 +199,7 @@
+ 		return previousBuffer ? ((_currentOutputBuffer == _outputBuffers[0]) ? _outputBuffers[1] : _outputBuffers[0]) : _currentOutputBuffer;
+ 	}
+ 
++	uint16_t* GetPreviousCompletedFrame() { return _previousCompletedFrame; }
+ 	static bool ValidateRasterState(Serializer& s);
+ 	void Serialize(Serializer& s) override;
+ };
+\ No newline at end of file
+--- a/Core/Shared/Interfaces/IConsole.h
++++ b/Core/Shared/Interfaces/IConsole.h
+@@ -92,6 +92,7 @@
+ 
+ 	virtual uint32_t GetFrameCount() = 0;
+ 	virtual PpuFrameInfo GetPpuFrame() = 0;
++	virtual void* GetVideoFrameData() { return nullptr; }
+ 
+ 	virtual string GetHash(HashType hashType) { return {}; }
+ 
+--- a/Core/Shared/SaveStateManager.cpp
++++ b/Core/Shared/SaveStateManager.cpp
+@@ -6,6 +6,7 @@
+ #include "Shared/SaveStateManager.h"
+ #include "Shared/MessageManager.h"
+ #include "Shared/Emulator.h"
++#include "Shared/Interfaces/IConsole.h"
+ #include "Shared/EmuSettings.h"
+ #include "Shared/Movies/MovieManager.h"
+ #include "Shared/RenderedFrame.h"
+@@ -221,6 +222,7 @@
+ 				//Only send the saved frame if the emulation is paused and no avi recording is in progress
+ 				//Otherwise the avi recorder will receive an extra frame that has no sound, which will
+ 				//create a video vs audio desync in the avi file.
++				frame.Data = _emu->GetConsole()->GetVideoFrameData();
+ 				_emu->GetVideoDecoder()->UpdateFrame(frame, true, false);
+ 			}
+ 			return true;

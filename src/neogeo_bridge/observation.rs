@@ -19,10 +19,18 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         features
     }
 
+    pub(super) fn supports_state_io(&mut self) -> bool {
+        let features = self.mame_features();
+        features.contains("settled_state_io") && features.contains("native_raster_state")
+    }
+
     /// Profile methods plus the batch and pacing methods the connected host proved it supports.
     pub(super) fn advertised_methods(&mut self) -> Vec<&'static str> {
         let features = self.mame_features();
         let mut methods = METHODS.to_vec();
+        if !features.contains("settled_state_io") || !features.contains("native_raster_state") {
+            methods.retain(|method| !matches!(*method, "save_state" | "load_state"));
+        }
         if mame::supports_batch(&features) {
             methods.push("read_memory_batch");
         }
@@ -50,11 +58,19 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn batch_capability(&self) -> MemoryBatchCapability {
         let (_, size) = self.profile.ram();
-        mame::batch_capability(vec![MemoryWindow {
+        let mut capability = mame::batch_capability(vec![MemoryWindow {
             memory_type: "ram".into(),
             address: 0,
             length: size,
-        }])
+        }]);
+        if self
+            .mame_features
+            .as_ref()
+            .is_some_and(|features| features.contains("settled_state_io"))
+        {
+            capability.halt_kinds.push("settled_scheduler".into());
+        }
+        capability
     }
 
     pub(super) fn read_memory_batch(&mut self, params: &Value) -> BridgeResult<Value> {
@@ -212,7 +228,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         Ok(Duration::from_millis(deadline + 5_000))
     }
 
-    fn fail_control<T>(&mut self, message: String) -> BridgeResult<T> {
+    pub(super) fn fail_control<T>(&mut self, message: String) -> BridgeResult<T> {
         self.control_fatal = Some(message.clone());
         Err(BridgeError::Emulator(message))
     }

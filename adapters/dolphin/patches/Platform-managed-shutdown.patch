@@ -1,0 +1,57 @@
+--- a/Source/Core/DolphinNoGUI/Platform.cpp
++++ b/Source/Core/DolphinNoGUI/Platform.cpp
+@@ -3,10 +3,20 @@
+ 
+ #include "DolphinNoGUI/Platform.h"
+ 
++#include <cstdlib>
++
+ #include "Core/HW/ProcessorInterface.h"
+ #include "Core/IOS/IOS.h"
+ #include "Core/IOS/STM/STM.h"
+ #include "Core/System.h"
++
++Platform::Platform()
++    : m_emucap_managed([] {
++        const char* port = std::getenv("EMUCAP_PORT");
++        return port && *port;
++      }())
++{
++}
+ 
+ Platform::~Platform() = default;
+ 
+@@ -23,6 +33,12 @@
+ {
+   if (m_shutdown_requested.TestAndClear())
+   {
++    // A controlled process termination must not wait for a paced guest to handle IOS power.
++    if (m_emucap_managed)
++    {
++      m_running.Clear();
++      return;
++    }
+     const auto& system = Core::System::GetInstance();
+     const auto ios = system.GetIOS();
+     const auto stm = ios ? ios->GetDeviceByName("/dev/stm/eventhook") : nullptr;
+--- a/Source/Core/DolphinNoGUI/Platform.h
++++ b/Source/Core/DolphinNoGUI/Platform.h
+@@ -12,6 +12,7 @@
+ class Platform
+ {
+ public:
++  Platform();
+   virtual ~Platform();
+ 
+   bool IsRunning() const { return m_running.IsSet(); }
+@@ -48,6 +49,10 @@
+   static std::unique_ptr<Platform> CreateMacOSPlatform();
+ #endif
+ 
++private:
++  // Launch mode survives startup, disconnection and control retirement.
++  const bool m_emucap_managed;
++
+ protected:
+   void UpdateRunningFlag();
+ 

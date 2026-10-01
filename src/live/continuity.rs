@@ -6,7 +6,6 @@
 
 use std::io;
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::link::{
@@ -17,260 +16,13 @@ use super::runtime::{
     LeaseView, ProcessIdentity, ProcessState, RuntimeStore, TerminationRecord,
 };
 
-const LINK_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TransportState {
-    Connected,
-    Stalled,
-    Disconnected,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionState {
-    Running,
-    Frozen,
-    Crashed,
-    Exited,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EvidenceState {
-    Live,
-    Exact,
-    LastGood,
-    Unavailable,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RuntimeBindingState {
-    Bound,
-    Mismatched,
-    Unmanaged,
-    Unobserved,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeBinding {
-    pub state: RuntimeBindingState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_launch_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub live_launch_id: Option<String>,
-    pub reason: String,
-}
-
-impl Default for RuntimeBinding {
-    fn default() -> Self {
-        Self {
-            state: RuntimeBindingState::Unobserved,
-            current_launch_id: None,
-            live_launch_id: None,
-            reason: "no live adapter identity has been observed".into(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TransportContinuity {
-    pub state: TransportState,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_response_unix_ms: Option<u64>,
-    pub consecutive_timeouts: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ExecutionContinuity {
-    pub state: ExecutionState,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct EvidenceContinuity {
-    pub state: EvidenceState,
-    pub failure_context_available: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct FailureObservation {
-    pub active: bool,
-    pub kind: String,
-    pub operation: String,
-    pub observed_at_unix_ms: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovered_at_unix_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RuntimeDiagnostic {
-    pub artifact: String,
-    pub path: String,
-    pub kind: String,
-    pub reason: String,
-    /// False only for an evidence artifact whose bytes are never used to establish process,
-    /// generation, or lease ownership. Older serialized diagnostics default to fail-closed.
-    #[serde(default = "runtime_diagnostic_blocks_transition_by_default")]
-    pub blocks_generation_transition: bool,
-}
-
-const fn runtime_diagnostic_blocks_transition_by_default() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContinuitySnapshot {
-    pub runtime_binding: RuntimeBinding,
-    pub transport: TransportContinuity,
-    pub execution: ExecutionContinuity,
-    pub evidence: EvidenceContinuity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_failure: Option<FailureObservation>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub runtime_diagnostics: Vec<RuntimeDiagnostic>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub termination: Option<TerminationRecord>,
-    /// Kept out of the `continuity` JSON; status surfaces it under `runtime_instance.lease`.
-    #[serde(skip)]
-    pub lease: LeaseView,
-    /// Distinguishes a missing lease record from a present record whose holder is unverifiable.
-    #[serde(skip)]
-    pub lease_record_present: bool,
-}
-
-impl Default for ContinuitySnapshot {
-    fn default() -> Self {
-        Self {
-            runtime_binding: RuntimeBinding::default(),
-            transport: TransportContinuity {
-                state: TransportState::Disconnected,
-                last_response_unix_ms: None,
-                consecutive_timeouts: 0,
-            },
-            execution: ExecutionContinuity {
-                state: ExecutionState::Unknown,
-                source: "host".into(),
-            },
-            evidence: EvidenceContinuity {
-                state: EvidenceState::Unavailable,
-                failure_context_available: false,
-            },
-            last_failure: None,
-            runtime_diagnostics: Vec::new(),
-            termination: None,
-            lease: LeaseView::unknown(),
-            lease_record_present: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LinkRecord {
-    pub schema_version: u32,
-    pub launch_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub lease: Option<LeaseRecord>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_identity: Option<EmulatorIdentity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_response_unix_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_method: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_status: Option<Value>,
-    pub transport_state: TransportState,
-    pub consecutive_timeouts: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last_failure: Option<FailureObservation>,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub truncated: bool,
-    pub updated_at_unix_ms: u64,
-}
-
-impl LinkRecord {
-    pub(crate) fn new(launch_id: String) -> Self {
-        Self {
-            schema_version: LINK_SCHEMA_VERSION,
-            launch_id,
-            lease: None,
-            last_identity: None,
-            last_response_unix_ms: None,
-            last_method: None,
-            last_status: None,
-            transport_state: TransportState::Disconnected,
-            consecutive_timeouts: 0,
-            last_failure: None,
-            truncated: false,
-            updated_at_unix_ms: super::runtime::now_unix_ms(),
-        }
-    }
-
-    pub(crate) fn bounded(mut self) -> Self {
-        if let Some(identity) = self.last_identity.as_mut() {
-            // Reclaim capability is transport auth, never diagnostic evidence.
-            identity.session_token = None;
-        }
-        let size = serde_json::to_vec(&self)
-            .map(|v| v.len())
-            .unwrap_or(usize::MAX);
-        if size as u64 <= super::runtime::MAX_CAPSULE_FILE_BYTES {
-            return self;
-        }
-        self.truncated = true;
-        self.last_status = Some(serde_json::json!({
-            "truncated": true,
-            "reason": "last_status exceeded runtime capsule limit"
-        }));
-        if let Some(identity) = self.last_identity.as_mut() {
-            for value in [
-                &mut identity.system,
-                &mut identity.adapter,
-                &mut identity.build,
-                &mut identity.name,
-                &mut identity.content,
-                &mut identity.launch_id,
-            ] {
-                if let Some(value) = value.as_mut() {
-                    value.truncate(1024);
-                }
-            }
-        }
-        if let Some(failure) = self.last_failure.as_mut() {
-            failure.kind.truncate(128);
-            failure.operation.truncate(128);
-        }
-        if serde_json::to_vec(&self)
-            .map(|bytes| bytes.len() as u64 > super::runtime::MAX_CAPSULE_FILE_BYTES)
-            .unwrap_or(true)
-        {
-            self.last_identity = None;
-        }
-        self
-    }
-
-    pub fn public_value(&self) -> Value {
-        let mut identity = self.last_identity.clone();
-        if let Some(identity) = identity.as_mut() {
-            identity.session_token = None;
-        }
-        serde_json::json!({
-            "launch_id": self.launch_id,
-            "last_identity": identity,
-            "last_response_unix_ms": self.last_response_unix_ms,
-            "last_method": self.last_method,
-            "last_status": self.last_status,
-            "transport_state": self.transport_state,
-            "consecutive_timeouts": self.consecutive_timeouts,
-            "last_failure": self.last_failure,
-            "truncated": self.truncated,
-            "updated_at_unix_ms": self.updated_at_unix_ms,
-        })
-    }
-}
+#[path = "continuity_state.rs"]
+mod state;
+pub use state::{
+    ContinuitySnapshot, EvidenceContinuity, EvidenceState, ExecutionContinuity, ExecutionState,
+    FailureObservation, LinkRecord, RuntimeBinding, RuntimeBindingState, RuntimeDiagnostic,
+    TemporalOperation, TemporalState, TransportContinuity, TransportState,
+};
 
 /// Common wrapper for direct and broker links. All durable writes are scoped to the current launch
 /// generation; records from another launch id are read as stale evidence and never merged as active.
@@ -280,6 +32,7 @@ pub struct ObservedLink<L> {
     control_key: Option<String>,
     holder: ProcessIdentity,
     current: Option<CurrentManifest>,
+    temporal_port: Option<u16>,
     record: Option<LinkRecord>,
     live_record: Option<LinkRecord>,
     runtime_binding: RuntimeBinding,
@@ -305,6 +58,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
             control_key: control_session_key(),
             holder: capture_process(std::process::id()),
             current: None,
+            temporal_port: None,
             record: None,
             live_record: None,
             runtime_binding: RuntimeBinding::default(),
@@ -315,6 +69,18 @@ impl<L: EmulatorLink> ObservedLink<L> {
         };
         observed.refresh_runtime();
         observed
+    }
+
+    fn current_temporal(&self) -> Option<&TemporalOperation> {
+        let current = self.current.as_ref()?;
+        let record = self
+            .record
+            .as_ref()
+            .filter(|record| record.launch_id == current.launch_id)?;
+        record
+            .temporal_operation
+            .as_ref()
+            .filter(|operation| operation.key.runtime == current.launch_id)
     }
 
     fn current_location(&self) -> Option<(u16, &str)> {
@@ -329,7 +95,31 @@ impl<L: EmulatorLink> ObservedLink<L> {
         self.runtime_diagnostics.clear();
         self.adapter_failure = None;
         self.termination = None;
-        let Some(port) = self.inner.endpoint_port() else {
+        let resolved = if let Some(port) = self.inner.endpoint_port() {
+            self.store
+                .read_current(port)
+                .map_err(|error| ("current", self.store.current_path(port), error))
+        } else if self.inner.has_exclusive_control() {
+            match self.inner.capabilities().identity.launch_id.as_deref() {
+                Some(launch_id) => self
+                    .store
+                    .current_for_launch(launch_id)
+                    .map_err(|error| ("runtime_lookup", self.store.root().to_path_buf(), error)),
+                None => Ok(None),
+            }
+        } else {
+            Ok(None)
+        };
+        self.current = match resolved {
+            Ok(current) => current,
+            Err((artifact, path, error)) => {
+                self.runtime_diagnostics
+                    .push(runtime_diagnostic(artifact, path, &error));
+                None
+            }
+        };
+        let Some(port) = self.current.as_ref().map(|current| current.port) else {
+            self.record = None;
             self.runtime_binding = runtime_binding(
                 None,
                 &self.inner.capabilities().identity,
@@ -337,17 +127,6 @@ impl<L: EmulatorLink> ObservedLink<L> {
             );
             self.rebuild_snapshot();
             return;
-        };
-        self.current = match self.store.read_current(port) {
-            Ok(current) => current,
-            Err(error) => {
-                self.runtime_diagnostics.push(runtime_diagnostic(
-                    "current",
-                    self.store.current_path(port),
-                    &error,
-                ));
-                None
-            }
         };
         self.runtime_binding = runtime_binding(
             self.current.as_ref(),
@@ -514,10 +293,41 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 .and_then(|record| record.lease.as_ref())
                 .is_some(),
         };
+        self.snapshot.evidence.failure_context_available |= self.current_temporal().is_some();
+    }
+
+    fn check_temporal_deadline(&mut self, control: &ProgressCallControl) -> Result<(), LinkError> {
+        if control.temporal_stop_ms.is_some()
+            && control
+                .temporal_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            self.inner.prepare_reconnect();
+            return Err(LinkError::Emulator {
+                kind: "temporal_unverified".into(),
+                message: "temporal deadline expired during runtime ownership admission".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn require_runtime_lookup(&self) -> io::Result<()> {
+        if let Some(diagnostic) = self
+            .runtime_diagnostics
+            .iter()
+            .find(|d| d.artifact == "runtime_lookup")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                diagnostic.reason.clone(),
+            ));
+        }
+        Ok(())
     }
 
     fn claim_lease(&mut self) -> io::Result<LeaseView> {
         self.refresh_runtime();
+        self.require_runtime_lookup()?;
         if self.runtime_binding.state != RuntimeBindingState::Bound {
             return Ok(LeaseView::unknown());
         }
@@ -526,6 +336,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
 
     fn claim_lease_for(&mut self, expected_launch_id: Option<&str>) -> io::Result<LeaseView> {
         self.refresh_runtime();
+        self.require_runtime_lookup()?;
         if expected_launch_id.is_none() && self.runtime_binding.state != RuntimeBindingState::Bound
         {
             return Ok(LeaseView::unknown());
@@ -585,6 +396,38 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 else {
                     return Ok(());
                 };
+                let record = self
+                    .store
+                    .read_link_json::<LinkRecord>(port, &launch_id)
+                    .map_err(|e| LinkError::Protocol(format!("temporal safety metadata: {e}")))?;
+                if let Some(operation) = record.and_then(|record| record.temporal_operation) {
+                    let owned = operation.state == TemporalState::Active
+                        && operation.key.runtime == launch_id
+                        && operation.holder == self.holder
+                        && operation.control_session_key == self.control_key
+                        && params.get("_temporal_owner")
+                            == Some(
+                                &serde_json::to_value(&operation.key)
+                                    .map_err(|e| LinkError::Protocol(e.to_string()))?,
+                            )
+                        && matches!(
+                            method,
+                            "pause"
+                                | "set_input"
+                                | "step"
+                                | "step_instructions"
+                                | "begin_temporal_operation"
+                                | "finish_temporal_operation"
+                        );
+                    if !owned {
+                        return Err(LinkError::Emulator {
+                            kind: "temporal_quarantined".into(),
+                            message:
+                                "this runtime has a temporal operation without verified cleanup"
+                                    .into(),
+                        });
+                    }
+                }
                 let capsule = self
                     .store
                     .read_capture_json::<super::capture_capsule::CaptureCapsule>(port, &launch_id)
@@ -810,7 +653,7 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 }
                 value
             });
-        serde_json::json!({
+        let mut value = serde_json::json!({
             "continuity": self.snapshot,
             "link_failure": if self.runtime_binding.state == RuntimeBindingState::Bound {
                 self.record.as_ref().map(LinkRecord::public_value)
@@ -818,7 +661,13 @@ impl<L: EmulatorLink> ObservedLink<L> {
                 self.live_record.as_ref().map(LinkRecord::public_value)
             },
             "adapter_failure": adapter_failure,
-        })
+        });
+        if let Some(operation) = self.current_temporal() {
+            value["temporal_operation"] = serde_json::json!({
+                "launch_id":operation.key.runtime,"operation_id":operation.key.operation_id,"state":operation.state,
+            });
+        }
+        value
     }
 }
 
@@ -833,6 +682,15 @@ pub(crate) fn claim_generation_lease(
     let record_launch_id = launch_id.to_string();
     let compatibility_store = store.clone();
     store.update_current_link_json::<LinkRecord, _>(port, launch_id, move |record| {
+        if record
+            .as_ref()
+            .is_some_and(|r| r.temporal_operation.is_some() && r.launch_id != record_launch_id)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "temporal marker belongs to a mismatched runtime record",
+            ));
+        }
         let mut record = record
             .filter(|record| record.launch_id == record_launch_id)
             .unwrap_or_else(|| LinkRecord::new(record_launch_id.clone()));
@@ -996,9 +854,11 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
         observer: &mut ProgressObserver<'_>,
         control: &ProgressCallControl,
     ) -> Result<Value, LinkError> {
+        self.check_temporal_deadline(control)?;
         if !is_read_only(method) {
             self.ensure_mutation_lease(method, &params)?;
         }
+        self.check_temporal_deadline(control)?;
         let result = self
             .inner
             .call_with_progress(method, params, observer, control);
@@ -1007,6 +867,118 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
             Err(error) => self.record_failure(method, error),
         }
         result
+    }
+
+    fn begin_temporal_control(
+        &mut self,
+        key: &super::reconnect::cancellation::OperationKey,
+    ) -> Result<(), LinkError> {
+        key.validate()
+            .map_err(|e| LinkError::Protocol(e.to_string()))?;
+        self.ensure_mutation_lease("begin_temporal_control", &serde_json::json!({}))?;
+        let (port, runtime) = self.current_location().ok_or_else(|| LinkError::Emulator {
+            kind: "unsupported".into(),
+            message: "temporal control requires a durable bound runtime".into(),
+        })?;
+        if runtime != key.runtime {
+            return Err(LinkError::Protocol("temporal runtime mismatch".into()));
+        }
+        let key = key.clone();
+        let holder = self.holder.clone();
+        let control_session_key = self.control_key.clone();
+        let updated = self
+            .store
+            .update_current_link_json::<LinkRecord, _>(port, &key.runtime.clone(), move |record| {
+                let mut record =
+                    record.ok_or_else(|| io::Error::other("runtime lease record missing"))?;
+                if record.launch_id != key.runtime
+                    || record.temporal_operation.is_some()
+                    || !record.lease.as_ref().is_some_and(|lease| {
+                        lease.holder == holder && lease.control_session_key == control_session_key
+                    })
+                {
+                    return Err(io::Error::other("temporal admission ownership changed"));
+                }
+                record.temporal_operation = Some(TemporalOperation {
+                    key,
+                    holder,
+                    control_session_key,
+                    state: TemporalState::Active,
+                });
+                record.updated_at_unix_ms = super::runtime::now_unix_ms();
+                Ok(record.bounded())
+            })
+            .map_err(|e| LinkError::Protocol(format!("persist temporal admission: {e}")))?;
+        self.record = Some(updated);
+        self.temporal_port = Some(port);
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    fn finish_temporal_control(
+        &mut self,
+        key: &super::reconnect::cancellation::OperationKey,
+        verified: bool,
+    ) -> Result<(), LinkError> {
+        self.refresh_runtime();
+        if verified {
+            self.require_runtime_lookup()
+                .map_err(|e| LinkError::Protocol(e.to_string()))?;
+        }
+        let port = self
+            .temporal_port
+            .or_else(|| self.current_location().map(|(port, _)| port))
+            .ok_or_else(|| LinkError::Protocol("temporal runtime location missing".into()))?;
+        if verified && self.inner.capabilities().identity.launch_id.as_deref() != Some(&key.runtime)
+        {
+            return Err(LinkError::Protocol(
+                "verified temporal cleanup belongs to another runtime".into(),
+            ));
+        }
+        let holder = self.holder.clone();
+        let control_key = self.control_key.clone();
+        let updated = self
+            .store
+            .update_current_link_json::<LinkRecord, _>(port, &key.runtime, |record| {
+                let mut record =
+                    record.ok_or_else(|| io::Error::other("temporal record missing"))?;
+                if record.launch_id != key.runtime
+                    || !record.lease.as_ref().is_some_and(|lease| {
+                        lease.holder == holder && lease.control_session_key == control_key
+                    })
+                {
+                    return Err(io::Error::other("temporal completion lease changed"));
+                }
+                let operation = record
+                    .temporal_operation
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("temporal owner missing"))?;
+                if operation.key != *key
+                    || operation.holder != holder
+                    || operation.control_session_key != control_key
+                    || operation.state != TemporalState::Active
+                {
+                    return Err(io::Error::other("temporal completion ownership changed"));
+                }
+                if verified {
+                    record.temporal_operation = None;
+                } else {
+                    operation.state = TemporalState::Unverified;
+                }
+                record.updated_at_unix_ms = super::runtime::now_unix_ms();
+                Ok(record.bounded())
+            })
+            .map_err(|e| LinkError::Protocol(format!("persist temporal completion: {e}")))?;
+        self.record = Some(updated);
+        if verified {
+            self.temporal_port = None;
+        }
+        self.rebuild_snapshot();
+        Ok(())
+    }
+
+    fn attachment_id(&self) -> Option<&str> {
+        self.inner.attachment_id()
     }
 
     fn supports_session_reconnect(&self) -> bool {
@@ -1078,7 +1050,7 @@ impl<L: EmulatorLink> EmulatorLink for ObservedLink<L> {
     }
 }
 
-fn is_read_only(method: &str) -> bool {
+pub(crate) fn is_read_only(method: &str) -> bool {
     matches!(
         method,
         "hello"
@@ -1188,10 +1160,6 @@ pub(super) fn lease_view(lease: &LeaseRecord, holder: &ProcessIdentity) -> Lease
         state,
         holder_pid: Some(lease.holder.pid),
     }
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[cfg(test)]

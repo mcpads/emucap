@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -131,6 +132,8 @@ def main() -> int:
     parser.add_argument("--rom", required=True)
     parser.add_argument("--binary")
     parser.add_argument("--mcp-binary")
+    parser.add_argument("--expected-server-build", help="Exact audited candidate identity; defaults to the current clean commit")
+    parser.add_argument("--output", type=Path, help="Retain private recording artifacts in a new directory")
     parser.add_argument("--wall-delay", type=float, default=0.75)
     args = parser.parse_args()
 
@@ -149,7 +152,12 @@ def main() -> int:
         if not path.is_file():
             raise SystemExit(f"{label} not found: {path}")
 
-    with tempfile.TemporaryDirectory(prefix="emucap-mednafen-md-repeatable-") as temp:
+    if args.output:
+        args.output = args.output.resolve()
+        args.output.mkdir(parents=True, exist_ok=False)
+    workspace = (contextlib.nullcontext(str(args.output)) if args.output else
+                 tempfile.TemporaryDirectory(prefix="emucap-mednafen-md-repeatable-"))
+    with workspace as temp:
         home = Path(temp)
         output_root = home / "bundles"
         output_root.mkdir()
@@ -169,12 +177,12 @@ def main() -> int:
         try:
             mcp.initialize()
             bootstrap = mcp.tool("bootstrap", {})
-            source_revision = subprocess.check_output(
-                ["git", "rev-parse", "--short=7", "HEAD"], cwd=ROOT, text=True
+            source_revision = args.expected_server_build or subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT, text=True
             ).strip()
             if bootstrap.get("server_build") != source_revision:
                 raise RuntimeError(
-                    "release MCP does not identify the current committed source: "
+                    "release MCP does not identify the expected source: "
                     f"server={bootstrap.get('server_build')} source={source_revision}"
                 )
 
@@ -226,7 +234,8 @@ def main() -> int:
                 if terminal.get("state") != "frozen":
                     raise RuntimeError(f"recording did not finish frozen: {terminal}")
             finally:
-                mcp.tool("stop", {"launch_id": launch_id}, timeout=20)
+                stopped = mcp.tool("stop", {"launch_id": launch_id}, timeout=20)
+                (home / "repeatable-stop.json").write_text(json.dumps(stopped, indent=2))
 
             ordinary = mcp.tool(
                 "launch",
@@ -246,7 +255,8 @@ def main() -> int:
                 if ordinary_status.get("recording_capability", {}).get("repeatability") is not None:
                     raise RuntimeError("ordinary launch advertised opt-in repeatability")
             finally:
-                mcp.tool("stop", {"launch_id": ordinary_id}, timeout=20)
+                stopped = mcp.tool("stop", {"launch_id": ordinary_id}, timeout=20)
+                (home / "ordinary-stop.json").write_text(json.dumps(stopped, indent=2))
 
             print(
                 json.dumps(

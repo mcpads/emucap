@@ -1,0 +1,46 @@
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -100,6 +100,7 @@
+ static Common::HookableEvent<Core::State> s_state_changed_event;
+ 
+ static bool s_is_throttler_temp_disabled = false;
++static u64 s_throttler_override_revision = 0;
+ static bool s_frame_step = false;
+ static std::atomic<bool> s_stop_frame_step;
+ 
+@@ -134,12 +135,24 @@
+ 
+ bool GetIsThrottlerTempDisabled()
+ {
++  Config::SettingsTransaction transaction;
+   return s_is_throttler_temp_disabled;
+ }
+ 
+ void SetIsThrottlerTempDisabled(bool disable)
+ {
+-  s_is_throttler_temp_disabled = disable;
++  Config::SettingsTransaction transaction;
++  if (s_is_throttler_temp_disabled != disable)
++  {
++    s_is_throttler_temp_disabled = disable;
++    ++s_throttler_override_revision;
++  }
++}
++
++u64 GetThrottlerOverrideRevision()
++{
++  Config::SettingsTransaction transaction;
++  return s_throttler_override_revision;
+ }
+ 
+ void FrameUpdateOnCPUThread()
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -27,6 +27,7 @@
+ 
+ bool GetIsThrottlerTempDisabled();
+ void SetIsThrottlerTempDisabled(bool disable);
++u64 GetThrottlerOverrideRevision();
+ 
+ void Callback_NewField(Core::System& system);
+ 

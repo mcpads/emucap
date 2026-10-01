@@ -1,0 +1,143 @@
+--- a/src/emu/schedule.h
++++ b/src/emu/schedule.h
+@@ -111,6 +111,10 @@
+ 	emu_timer *first_timer() const noexcept { return m_timer_list; }
+ 	device_execute_interface *currently_executing() const noexcept { return m_executing_device; }
+ 	bool can_save() const;
++	bool at_state_io_boundary() const noexcept
++	{
++		return !m_in_timeslice && !m_executing_device && !m_callback_timer;
++	}
+ 
+ 	// execution
+ 	void timeslice();
+@@ -147,6 +151,9 @@
+ 	template <bool CheckIndex = false> emu_timer &timer_list_insert(emu_timer &timer);
+ 	emu_timer &timer_list_remove(emu_timer &timer);
+ 	void execute_timers();
++
++	// Host execution ownership, never serialized as guest state.
++	bool m_in_timeslice = false;
+ 
+ 	// internal state
+ 	running_machine &           m_machine;                  // reference to our machine
+--- a/src/emu/schedule.cpp
++++ b/src/emu/schedule.cpp
+@@ -392,6 +392,12 @@
+ 
+ void device_scheduler::timeslice()
+ {
++	struct execution_scope
++	{
++		bool &active;
++		explicit execution_scope(bool &value) : active(value) { assert(!active); active = true; }
++		~execution_scope() { active = false; }
++	} scope(m_in_timeslice);
+ 	bool call_debugger = ((machine().debug_flags & DEBUG_FLAG_ENABLED) != 0);
+ 
+ 	// build the execution list if we don't have one yet
+--- a/src/emu/machine.h
++++ b/src/emu/machine.h
+@@ -147,6 +147,9 @@
+ 	const std::string &basename() const { return m_basename; }
+ 	int sample_rate() const { return m_sample_rate; }
+ 	bool save_or_load_pending() const { return !m_saveload_pending_file.empty(); }
++	bool state_io_boundary() const;
++	bool state_io_ready() const;
++	std::string state_file_io(bool load, std::string const &filename);
+ 
+ 	// RAII-based side effect disable
+ 	// NOP-ed when passed false, to make it more easily conditional
+@@ -307,6 +310,7 @@
+ 		SAVE,
+ 		LOAD
+ 	};
++	bool                   m_state_file_io_active = false;
+ 	saveload_schedule       m_saveload_schedule;
+ 	attotime                m_saveload_schedule_time;
+ 	std::string             m_saveload_pending_file;
+--- a/src/emu/machine.cpp
++++ b/src/emu/machine.cpp
+@@ -596,6 +596,70 @@
+ //  soon as possible
+ //-------------------------------------------------
+ 
++bool running_machine::state_io_boundary() const
++{
++	return m_scheduler.at_state_io_boundary();
++}
++
++bool running_machine::state_io_ready() const
++{
++	return m_current_phase == machine_phase::RUNNING && m_paused
++		&& state_io_boundary() && m_scheduler.can_save()
++		&& !m_state_file_io_active && m_saveload_schedule == saveload_schedule::NONE;
++}
++
++std::string running_machine::state_file_io(bool load, std::string const &filename)
++{
++	if (!state_io_ready())
++		return "unsafe_halt";
++	if (filename.empty())
++		return "invalid_path";
++	struct operation_scope
++	{
++		bool &active;
++		explicit operation_scope(bool &value) : active(value) { active = true; }
++		~operation_scope() { active = false; }
++	} scope(m_state_file_io_active);
++
++	emu_file file("", load ? OPEN_FLAG_READ : (OPEN_FLAG_WRITE | OPEN_FLAG_CREATE | OPEN_FLAG_CREATE_PATHS));
++	if (file.open(filename))
++		return "open_failed";
++	if (!load)
++	{
++		bool ok = false;
++		try { ok = m_save.write_file(file) == STATERR_NONE; }
++		catch (...) { }
++		if (!ok)
++			file.remove_on_close();
++		file.close();
++		return ok ? "completed" : "save_failed";
++	}
++
++	// Capture the native rollback image before the first load write. A failed
++	// restore is explicitly uncertain; the caller must not retain healthy control.
++	std::vector<u8> previous;
++	try
++	{
++		previous.resize(ram_state::get_size(m_save));
++		if (m_save.write_buffer(previous.data(), previous.size()) != STATERR_NONE)
++			return "rollback_capture_failed";
++	}
++	catch (...) { return "rollback_capture_failed"; }
++	bool loaded = false;
++	try { loaded = m_save.read_file(file) == STATERR_NONE; }
++	catch (...) { }
++	file.close();
++	if (loaded)
++		return "completed";
++	try
++	{
++		if (m_save.read_buffer(previous.data(), previous.size()) == STATERR_NONE)
++			return "load_failed_rolled_back";
++	}
++	catch (...) { }
++	return "load_failed_unverified";
++}
++
+ void running_machine::schedule_save(std::string &&filename)
+ {
+ 	// specify the filename to save or load
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -1419,6 +1419,9 @@
+ 	machine_type.set_function("soft_reset", &running_machine::schedule_soft_reset);
+ 	machine_type.set_function("save", &running_machine::schedule_save); // TODO: some kind of completion notification?
+ 	machine_type.set_function("load", &running_machine::schedule_load); // TODO: some kind of completion notification?
++	machine_type["state_io_boundary"] = sol::property(&running_machine::state_io_boundary);
++	machine_type["state_io_ready"] = sol::property(&running_machine::state_io_ready);
++	machine_type.set_function("state_file_io", &running_machine::state_file_io);
+ 	machine_type.set_function("buffer_save",
+ 			[] (running_machine &m, sol::this_state s)
+ 			{

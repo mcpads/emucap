@@ -1,0 +1,77 @@
+--- a/src/main/main.c
++++ b/src/main/main.c
+@@ -971,6 +971,13 @@
+     return g_rom_pause || !l_MainSpeedLimit || l_SpeedFactor != speed_factor;
+ }
+ 
++/* Emulation-thread owned: discard only elapsed halted host time. */
++static int l_SpeedLimiterReset = 0;
++void main_reset_speed_limiter(void)
++{
++    l_SpeedLimiterReset = 1;
++}
++
+ static void apply_speed_limiter(void)
+ {
+     static unsigned long totalVIs = 0;
+@@ -986,11 +993,12 @@
+     const double AdjustedLimit = VILimitMilliseconds * SpeedFactorMultiple;
+ 
+     //if this is the first time or we are resuming from pause
+-    if(StartFPSTime == 0 || !resetOnce || lastSpeedFactor != l_SpeedFactor)
++    if(StartFPSTime == 0 || !resetOnce || l_SpeedLimiterReset || lastSpeedFactor != l_SpeedFactor)
+     {
+        StartFPSTime = CurrentFPSTime;
+        totalVIs = 0;
+        resetOnce = 1;
++       l_SpeedLimiterReset = 0;
+     }
+     else
+     {
+@@ -1019,9 +1027,7 @@
+        resetOnce = 0;
+     }
+ 
+-    if (sleepTime < minSleepNeeded) {
+-        totalVIs += (unsigned long)(minSleepNeeded/AdjustedLimit);
+-    }
++    /* resetOnce discards the old VI anchor on the next call. */
+ 
+     if(l_MainSpeedLimit && sleepTime > 0 && sleepTime < maxSleepNeeded*SpeedFactorMultiple)
+     {
+@@ -1074,6 +1080,7 @@
+             SDL_Delay(10);
+             main_check_inputs();
+         }
++        main_reset_speed_limiter();
+     }
+ }
+ 
+--- a/src/main/main.h
++++ b/src/main/main.h
+@@ -78,6 +78,7 @@
+ void main_speeddown(int percent);
+ void main_set_fastforward(int enable);
+ void main_speedlimiter_toggle(void);
++void main_reset_speed_limiter(void);
+ 
+ void main_take_next_screenshot(void);
+ 
+--- a/src/debugger/dbg_debugger.c
++++ b/src/debugger/dbg_debugger.c
+@@ -27,6 +27,7 @@
+ #include "dbg_breakpoints.h"
+ #include "dbg_debugger.h"
+ #include "dbg_memory.h"
++#include "main/main.h"
+ 
+ #ifdef DBG
+ 
+@@ -96,6 +97,7 @@
+     if (g_dbg_runstate == M64P_DBG_RUNSTATE_PAUSED) {
+         // The emulation thread is blocked until a step call via the API.
+         SDL_SemWait(sem_pending_steps);
++        main_reset_speed_limiter();
+     }
+ 
+     previousPC = pc;

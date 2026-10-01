@@ -794,8 +794,8 @@ impl Mupen64PlusHost {
                 .collect::<Vec<_>>();
             let opcode =
                 u32::from_be_bytes(bytes.as_slice().try_into().expect("four opcode bytes"));
-            let mut mnemonic = [0_i8; 128];
-            let mut arguments = [0_i8; 128];
+            let mut mnemonic: [c_char; 128] = [0; 128];
+            let mut arguments: [c_char; 128] = [0; 128];
             unsafe {
                 (self.api.debug_decode_op)(
                     opcode,

@@ -35,12 +35,48 @@ git -C $Src submodule update --init --recursive --depth 1 --jobs 4
 if ($LASTEXITCODE -ne 0) { throw "failed to update Dolphin submodules" }
 
 $owned = @(
+  "Source/Core/AudioCommon/AudioCommon.cpp",
+  "Source/Core/AudioCommon/AudioCommon.h",
+  "Source/Core/AudioCommon/Mixer.cpp",
+  "Source/Core/AudioCommon/Mixer.h",
+  "Source/Core/VideoCommon/Present.cpp",
+  "Source/Core/VideoCommon/FramebufferManager.cpp",
+  "Source/Core/VideoCommon/FramebufferManager.h",
+  "Source/Core/VideoCommon/FramebufferShaderGen.cpp",
+  "Source/Core/VideoCommon/FramebufferShaderGen.h",
+  "Source/Core/VideoCommon/Present.h",
+  "Source/Core/VideoCommon/VideoBackendBase.cpp",
+  "Source/Core/VideoCommon/VideoBackendBase.h",
+  "Source/Core/VideoCommon/VideoState.cpp",
+  "Source/Core/VideoCommon/VideoState.h",
+  "Source/Core/Common/Config/ConfigInfo.h",
+  "Source/Core/Common/Config/Config.h",
+  "Source/Core/Common/Config/Layer.h",
+  "Source/Core/Common/Config/Layer.cpp",
+  "Source/Core/Common/Config/Config.cpp",
+  "Source/Core/Common/ChunkFile.h",
+  "Source/Core/VideoCommon/TextureCacheBase.cpp",
+  "Source/Core/VideoCommon/TextureCacheBase.h",
+  "Source/Core/VideoCommon/TextureConfig.cpp",
+  "Source/Core/VideoCommon/TextureConfig.h",
+  "Source/Core/VideoCommon/AbstractStagingTexture.cpp",
+  "Source/Core/VideoCommon/AbstractStagingTexture.h",
+  "Source/Core/DolphinQt/Config/SDLHints/SDLHintsWindow.cpp",
   "Source/Core/Core/CMakeLists.txt",
+  "Source/Core/Core/DSPEmulator.h",
+  "Source/Core/Core/HW/DSPLLE/DSPLLE.h",
   "Source/Core/Core/Core.cpp",
   "Source/Core/Core/Core.h",
   "Source/Core/Core/CoreTiming.cpp",
+  "Source/Core/Core/AchievementManager.cpp",
+  "Source/Core/DolphinQt/HotkeyScheduler.cpp",
   "Source/Core/Core/CoreTiming.h",
+  "Source/Core/Core/Movie.cpp",
+  "Source/Core/Core/Movie.h",
   "Source/Core/Core/HW/CPU.cpp",
+  "Source/Core/Core/HW/EXI/EXI.h",
+  "Source/Core/Core/HW/EXI/EXI.cpp",
+  "Source/Core/Core/HW/EXI/EXI_Channel.cpp",
   "Source/Core/Core/HW/CPU.h",
   "Source/Core/Core/HW/GCPad.cpp",
   "Source/Core/Core/HW/ProcessorInterface.cpp",
@@ -49,10 +85,13 @@ $owned = @(
   "Source/Core/Core/PowerPC/BreakPoints.cpp",
   "Source/Core/Core/PowerPC/BreakPoints.h",
   "Source/Core/Core/PowerPC/PowerPC.cpp",
+  "Source/Core/Core/PowerPC/PPCAnalyst.cpp",
   "Source/Core/Core/State.cpp",
+  "Source/Core/Core/IOS/USB/Bluetooth/BTBase.h",
   "Source/Core/Core/State.h",
   "Source/Core/VideoCommon/FrameDumper.cpp",
   "Source/Core/VideoCommon/FrameDumper.h",
+  "Source/Core/DolphinNoGUI/Platform.cpp",
   "Source/Core/DolphinNoGUI/Platform.h",
   "Source/Core/DolphinNoGUI/PlatformHeadless.cpp",
   "Source/Core/DolphinNoGUI/MainNoGUI.cpp",
@@ -62,7 +101,7 @@ $owned = @(
 git -C $Src checkout -- $owned
 if ($LASTEXITCODE -ne 0) { throw "failed to restore files owned by the patch stack" }
 git -C $Src clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h `
-  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h Source/Core/Core/EmuCapTemporal.h
+  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h Source/Core/Core/EmuCapTemporal.h Source/Core/Core/EmuCapPacing.h Source/Core/Core/EmuCapAudio.h
 if ($LASTEXITCODE -ne 0) { throw "failed to clean stale adapter sources" }
 
 Copy-Item -LiteralPath (Join-Path $here "EmuCap.cpp") `
@@ -75,6 +114,11 @@ Copy-Item -LiteralPath (Join-Path $here "EmuCapInput.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapInput.h") -Force
 Copy-Item -LiteralPath (Join-Path $here "EmuCapTemporal.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapTemporal.h") -Force
+Copy-Item -LiteralPath (Join-Path $here "EmuCapPacing.h") `
+  -Destination (Join-Path $Src "Source\Core\Core\EmuCapPacing.h") -Force
+
+Copy-Item -LiteralPath (Join-Path $here "EmuCapAudio.h") `
+  -Destination (Join-Path $Src "Source\Core\Core\EmuCapAudio.h") -Force
 
 foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
     Sort-Object Name) {
@@ -115,7 +159,7 @@ function Get-LowerSha256([string]$Path) {
   (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h")
+$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h", "EmuCapPacing.h", "EmuCapAudio.h")
 $digestInputs += Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
   Sort-Object Name |
   ForEach-Object { "patches/$($_.Name)" }

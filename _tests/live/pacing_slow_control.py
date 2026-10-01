@@ -58,13 +58,16 @@ def main():
         # A frame clock that counts several frames per vertical blank (rendered frames) allows one
         # blank's worth through `polled_frame_allowance`.
         polled = []
+        poll_seconds = []
         for _ in range(10):
             time.sleep(0.1)
             polled.append(w.call('status')['frame'])
+            poll_seconds.append(w.seconds())
         allowance = profile.get('polled_frame_allowance', 1)
         assert polled[-1] - before['frame'] <= allowance, (before['frame'], polled, allowance)
         w.call('pause')
         latency['pause'] = w.seconds()
+        latency['slowest_status'] = max([latency['status'], *poll_seconds])
         after = w.call('status')
         assert after['state'] == 'frozen', after
         changed = w.speed({'mode': 'limited', 'percent': 100})
@@ -74,7 +77,8 @@ def main():
         for name, seconds in latency.items():
             assert seconds < bound, (name, seconds, bound)
         result = {'slowest_percent': slowest, 'latency': latency, 'polled_frames': polled,
-                  'frames_while_running': after['frame'] - before['frame']}
+                  'frames_while_running': after['frame'] - before['frame'],
+                  'status_poll_seconds': poll_seconds}
         if args.deadline_frames:
             w.speed({'mode': 'limited', 'percent': profile.get('deadline_percent', 1)})
             step = w.call('step', {'unit': 'frames', 'count': args.deadline_frames})

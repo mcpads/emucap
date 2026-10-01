@@ -557,6 +557,8 @@ fn broker_progress_preserves_sequence_and_exact_abort_identity() {
             params: serde_json::json!({"capture_id": "capture-broker"}),
         }),
         max_host_ms: Some(2000),
+        temporal_stop_ms: None,
+        temporal_deadline: None,
     };
     let mut observed = Vec::new();
     let result = link
@@ -574,4 +576,95 @@ fn broker_progress_preserves_sequence_and_exact_abort_identity() {
     assert_eq!(observed, vec![(7, 99)]);
     assert_eq!(result["status"], "interrupted");
     h.join().unwrap();
+}
+
+#[test]
+fn broker_temporal_cancellation_drains_ack_before_next_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let control = super::temporal::wire::tests::control();
+    let trigger = control.cancellation.clone();
+    let worker =
+        std::thread::spawn(move || {
+            let (mut writer, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            let mut attach = String::new();
+            reader.read_line(&mut attach).unwrap();
+            let attach: serde_json::Value = serde_json::from_str(&attach).unwrap();
+            writeln!(writer,"{}",serde_json::json!({"id":attach["id"],"ok":true,"result":{
+            "attached_name":"temporal", "broker_registration_id":1, "methods":["step","status"]
+        }})).unwrap();
+            super::temporal::wire::tests::peer(reader, writer, trigger, false);
+        });
+    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let result = link
+        .call_with_progress(
+            "step",
+            serde_json::json!({"_control":control.abort.as_ref().unwrap().params}),
+            &mut |_| panic!("plain temporal keepalive is not recording progress"),
+            &control,
+        )
+        .unwrap();
+    assert_eq!(result["reason"], "cancelled");
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["state"],
+        "frozen"
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn broker_parent_deadline_closes_a_partial_reply_without_reconnecting() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let worker = std::thread::spawn(move || {
+        let (mut writer, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let mut attach = String::new();
+        reader.read_line(&mut attach).unwrap();
+        let attach: serde_json::Value = serde_json::from_str(&attach).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id":attach["id"],"ok":true,"result":{
+            "attached_name":"parent", "broker_registration_id":1,"methods":["status"]}})
+        )
+        .unwrap();
+        // Lazy link's initial status establishes the admitted attachment.
+        let mut status = String::new();
+        reader.read_line(&mut status).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id":status["id"],"ok":true,"result":{"state":"frozen"}})
+        )
+        .unwrap();
+        super::temporal::wire::tests::stalled_parent_peer(reader, writer);
+    });
+    let mut link = broker_link::lazy(&addr, None, Duration::from_secs(2));
+    link.call("status", serde_json::json!({})).unwrap();
+    let mut control = super::temporal::wire::tests::control();
+    control.max_host_ms = Some(50);
+    let key = &control.abort.as_ref().unwrap().params;
+    let started = std::time::Instant::now();
+    assert!(link
+        .call_with_progress(
+            "finish_temporal_operation",
+            serde_json::json!({"parent":key,"_temporal_owner":key}),
+            &mut |_| panic!("unexpected progress"),
+            &control
+        )
+        .is_err());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    worker.join().unwrap();
+    assert!(matches!(
+        link.call_with_progress(
+            "finish_temporal_operation",
+            serde_json::json!({"parent":key,"_temporal_owner":key}),
+            &mut |_| Ok(()),
+            &control
+        ),
+        Err(LinkError::NotConnected)
+    ));
 }

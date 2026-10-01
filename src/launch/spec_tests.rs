@@ -267,6 +267,7 @@ fn dolphin_headless_spec_uses_isolated_user_and_headless_platform() {
         Path::new("/tmp/dolphin.log"),
         Path::new("/tmp/dolphin-user"),
         "gamecube",
+        true,
         &opts("game.gcm"),
     );
     assert!(spec
@@ -277,6 +278,10 @@ fn dolphin_headless_spec_uses_isolated_user_and_headless_platform() {
         .args
         .windows(2)
         .any(|args| args == ["--exec".to_string(), "game.gcm".to_string()]));
+    assert!(spec
+        .env
+        .contains(&("EMUCAP_DOLPHIN_SOUND".into(), "1".into())));
+    assert!(!spec.args.iter().any(|arg| arg.contains("DSP.Backend")));
     assert!(spec.args.iter().any(|arg| arg == "--platform=headless"));
     assert!(!spec.args.iter().any(|arg| arg == "--batch"));
     assert!(spec
@@ -297,15 +302,15 @@ fn dolphin_gui_spec_uses_batch_render_window() {
         Path::new("/tmp/dolphin.log"),
         Path::new("/tmp/dolphin-user"),
         "wii",
+        false,
         &options,
     );
 
     assert!(spec.args.iter().any(|arg| arg == "--batch"));
     assert!(!spec.args.iter().any(|arg| arg == "--platform=headless"));
     assert!(spec
-        .args
-        .iter()
-        .any(|arg| arg == "--config=Dolphin.DSP.Backend=No Audio Output"));
+        .env
+        .contains(&("EMUCAP_DOLPHIN_SOUND".into(), "0".into())));
     assert!(spec
         .args
         .iter()

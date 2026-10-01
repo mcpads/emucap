@@ -2,6 +2,7 @@ pub mod broker;
 pub mod broker_link;
 pub mod capture_capsule;
 pub mod continuity;
+pub mod control_session;
 mod evidence_identity;
 pub mod link;
 pub mod memory_batch;

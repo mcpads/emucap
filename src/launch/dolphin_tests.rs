@@ -1,6 +1,81 @@
 use super::*;
 use crate::test_env::{lock_env, EnvGuard};
 
+fn output_status(backend: &str, result: &str, state: &str) -> serde_json::Value {
+    serde_json::json!({
+        "state": state,
+        "audio_output": {
+            "stream_generation": "1", "backend": backend, "initialized": true,
+            "phase": "ready", "last_run_result": result, "start_verified": true,
+            "failure": null
+        }
+    })
+}
+
+#[test]
+fn audio_admission_uses_actual_backend_and_accepts_frozen_stopped_output() {
+    let started = output_status("native", "started", "running");
+    let stopped = output_status("native", "stopped", "frozen");
+    assert_eq!(audio_output_ready(&started, true), Ok(true));
+    assert_eq!(audio_output_ready(&stopped, true), Ok(true));
+    assert!(audio_output_ready(&started, false).is_err());
+    let null = output_status("No Audio Output", "stopped", "frozen");
+    assert_eq!(audio_output_ready(&null, false), Ok(true));
+    assert!(audio_output_ready(&null, true).is_err());
+    assert_eq!(
+        audio_output_ready(&output_status("native", "stopped", "running"), true),
+        Ok(false)
+    );
+}
+
+#[test]
+fn audio_admission_rejects_failures_and_missing_start_evidence() {
+    let valid = output_status("native", "stopped", "frozen");
+    for (field, value) in [
+        ("initialized", serde_json::json!(false)),
+        ("start_verified", serde_json::json!(false)),
+        ("failure", serde_json::json!("stop_failed")),
+        ("phase", serde_json::json!("absent")),
+        ("last_run_result", serde_json::json!("failed")),
+        ("stream_generation", serde_json::json!("0")),
+        ("backend", serde_json::json!(null)),
+    ] {
+        let mut status = valid.clone();
+        status["audio_output"][field] = value;
+        assert!(audio_output_ready(&status, true).is_err(), "{field}");
+    }
+    for field in [
+        "backend",
+        "failure",
+        "phase",
+        "initialized",
+        "start_verified",
+        "stream_generation",
+        "last_run_result",
+    ] {
+        let mut status = valid.clone();
+        status["audio_output"]
+            .as_object_mut()
+            .unwrap()
+            .remove(field);
+        assert!(
+            audio_output_ready(&status, true).is_err(),
+            "missing {field}"
+        );
+    }
+    assert!(audio_output_ready(&serde_json::json!({}), true).is_err());
+}
+
+#[test]
+fn audio_admission_waits_only_for_pending_native_evidence() {
+    for phase in ["initializing", "starting", "stopping"] {
+        let mut status = output_status("native", "unattempted", "frozen");
+        status["audio_output"]["phase"] = serde_json::json!(phase);
+        status["audio_output"]["start_verified"] = serde_json::json!(false);
+        assert_eq!(audio_output_ready(&status, true), Ok(false));
+    }
+}
+
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;

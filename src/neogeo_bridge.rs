@@ -135,6 +135,8 @@ pub enum BridgeError {
     BadParams(String),
     #[error("{0}")]
     BadState(String),
+    #[error("{0}")]
+    UnsafeHalt(String),
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("{0}")]
@@ -213,38 +215,42 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     pub fn handle_request(&mut self, req: Request) -> Response {
         let id = req.id;
-        let result = match req.method.as_str() {
-            "hello" => self.hello(),
-            "status" => self.status(),
-            "get_rom_info" => self.get_rom_info(),
-            "get_state" => self.get_state(),
-            "save_state" => self.save_state(&req.params),
-            "load_state" => self.load_state(&req.params),
-            "read_memory" => self.read_memory(&req.params),
-            "read_memory_batch" if self.advertised_methods().contains(&"read_memory_batch") => {
-                self.read_memory_batch(&req.params)
+        let result = if let Some(reason) = &self.control_fatal {
+            Err(BridgeError::Emulator(reason.clone()))
+        } else {
+            match req.method.as_str() {
+                "hello" => self.hello(),
+                "status" => self.status(),
+                "get_rom_info" => self.get_rom_info(),
+                "get_state" => self.get_state(),
+                "save_state" => self.save_state(&req.params),
+                "load_state" => self.load_state(&req.params),
+                "read_memory" => self.read_memory(&req.params),
+                "read_memory_batch" if self.advertised_methods().contains(&"read_memory_batch") => {
+                    self.read_memory_batch(&req.params)
+                }
+                "execution_speed" if self.advertised_methods().contains(&"execution_speed") => {
+                    self.execution_speed(&req.params)
+                }
+                "write_memory" => self.write_memory(&req.params),
+                "screenshot" => self.screenshot(),
+                "set_input" => self.set_input(&req.params),
+                "press_buttons" => self.press_buttons(&req.params),
+                "pause" => self.pause(&req.params),
+                "resume" => self.resume(&req.params),
+                "step" => self.step(&req.params),
+                "step_instructions" => self.step_instructions(&req.params),
+                "run_frames" => self.run_frames(&req.params),
+                "reset" => self.reset(),
+                "set_breakpoint" => self.set_breakpoint(&req.params),
+                "clear_breakpoint" => self.clear_breakpoint(&req.params),
+                "list_breakpoints" => self.list_breakpoints(),
+                "clear_all_breakpoints" => self.clear_all_breakpoints(),
+                "poll_events" => self.poll_events(&req.params),
+                "disassemble" => self.disassemble(&req.params),
+                "call_stack" => self.call_stack(&req.params),
+                other => Err(BridgeError::UnknownMethod(other.into())),
             }
-            "execution_speed" if self.advertised_methods().contains(&"execution_speed") => {
-                self.execution_speed(&req.params)
-            }
-            "write_memory" => self.write_memory(&req.params),
-            "screenshot" => self.screenshot(),
-            "set_input" => self.set_input(&req.params),
-            "press_buttons" => self.press_buttons(&req.params),
-            "pause" => self.pause(&req.params),
-            "resume" => self.resume(&req.params),
-            "step" => self.step(&req.params),
-            "step_instructions" => self.step_instructions(&req.params),
-            "run_frames" => self.run_frames(&req.params),
-            "reset" => self.reset(),
-            "set_breakpoint" => self.set_breakpoint(&req.params),
-            "clear_breakpoint" => self.clear_breakpoint(&req.params),
-            "list_breakpoints" => self.list_breakpoints(),
-            "clear_all_breakpoints" => self.clear_all_breakpoints(),
-            "poll_events" => self.poll_events(&req.params),
-            "disassemble" => self.disassemble(&req.params),
-            "call_stack" => self.call_stack(&req.params),
-            other => Err(BridgeError::UnknownMethod(other.into())),
         };
         match result {
             Ok(value) => Response {
@@ -274,12 +280,13 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
         let (_, ram_size) = self.profile.ram();
         let input_buttons = self.profile.input_buttons();
         let state_restore = json!({
-            "supported": true,
+            "supported": methods.contains(&"save_state"),
             "format": "mame-native",
-            "save_completion": "pre-save notifier plus completed non-empty file",
-            "load_completion": "post-load notifier",
+            "save_completion": "native serialization and file close at a settled scheduler boundary",
+            "load_completion": "native restore and postload at a settled scheduler boundary",
             "execution_state": "frozen",
-            "screenshot_after_load": "step one frozen frame before judging the restored screen",
+            "admitted_halt_kinds": ["settled_scheduler"],
+            "unsafe_halt": "instruction hooks, timer callbacks and pending anonymous timers reject before state I/O",
         });
         let mut value = json!({
             "protocol_version": PROTOCOL_VERSION,
@@ -1013,30 +1020,37 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 path.display()
             ))
         })?;
+        if !self.supports_state_io() {
+            return Err(BridgeError::Emulator(
+                "MAME host lacks settled native state I/O with raster history; rebuild the maintained adapter".into(),
+            ));
+        }
         let previous_timeout = self.gdb.get_timeout()?;
         self.gdb.set_timeout(STATE_OPERATION_TIMEOUT)?;
-        let outcome = self.lua_cmd(name, Some(path));
+        let outcome = self
+            .gdb
+            .send(&format!("qEmucap,{name},{}", hex::encode(path)));
         let restore = self.gdb.set_timeout(previous_timeout);
         let response = match (outcome, restore) {
             (Ok(value), Ok(())) => value,
-            (Err(primary), Ok(())) => return Err(primary),
-            (Ok(_), Err(cleanup)) => {
-                return Err(BridgeError::Emulator(format!(
-                    "MAME {name} completed but failed to restore the GDB timeout: {cleanup}"
-                )))
-            }
-            (Err(primary), Err(cleanup)) => {
-                return Err(BridgeError::Emulator(format!(
-                    "{primary}; additionally failed to restore the GDB timeout: {cleanup}"
-                )))
-            }
+            (result, cleanup) => return self.fail_control(format!(
+                "MAME {name} completion/control unverified: result={result:?}; timeout_restore={cleanup:?}"
+            )),
         };
-        if response != "OK" {
-            return Err(BridgeError::Emulator(format!(
-                "MAME {name} returned an unexpected response: {response}"
-            )));
+        match response.as_str() {
+            "STATE:completed" => Ok(()),
+            "STATE:unsafe_halt" => Err(BridgeError::UnsafeHalt(
+                "native state I/O requires a paused, settled scheduler without pending anonymous timers".into(),
+            )),
+            "STATE:invalid_path" | "STATE:open_failed" | "STATE:save_failed"
+            | "STATE:rollback_capture_failed" | "STATE:load_failed_rolled_back"
+            | "STATE:unsupported" => Err(BridgeError::Emulator(format!(
+                "MAME {name} failed: {response}"
+            ))),
+            _ => self.fail_control(format!(
+                "MAME {name} execution/control unverified: {response}"
+            )),
         }
-        Ok(())
     }
 
     fn require_frozen(&self, operation: &str) -> BridgeResult<()> {

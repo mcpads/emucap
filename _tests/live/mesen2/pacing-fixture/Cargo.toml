@@ -1,0 +1,10 @@
+[package]
+name = "sms-pacing-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+z80 = { git = "https://github.com/mcpads/retro-typed-isa.git", rev = "41ee9a9788a8cdf2c9b94fd787e9e6bdfd279865" }

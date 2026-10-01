@@ -1,0 +1,257 @@
+--- a/src/main/savestates.c
++++ b/src/main/savestates.c
+@@ -78,6 +78,26 @@
+     struct work_struct work;
+ };
+ 
++/* A queued native load owns its admitted bytes until consumption or job cleanup. */
++struct prepared_native_state {
++    unsigned int version;
++    unsigned char *data;
++    char queue[1024];
++    unsigned char using_tlb[4];
++    unsigned char extra[4096];
++    uint32_t jitter;
++    int has_jitter;
++};
++static struct prepared_native_state *prepared_load;
++static void discard_prepared_load(void)
++{
++    if (prepared_load) {
++        free(prepared_load->data);
++        free(prepared_load);
++        prepared_load = NULL;
++    }
++}
++
+ /* Returns the malloc'd full path of the currently selected savestate. */
+ static char *savestates_generate_path(savestates_type type)
+ {
+@@ -154,6 +174,7 @@
+ 
+ void savestates_set_job(savestates_job j, savestates_type t, const char *fn)
+ {
++    discard_prepared_load();
+     if (fname != NULL)
+     {
+         free(fname);
+@@ -186,21 +207,18 @@
+ #define PUTDATA(buff, type, value) \
+     do { type x = value; PUTARRAY(&x, buff, type, 1); } while(0)
+ 
+-static int savestates_load_m64p(struct device* dev, char *filepath)
++static struct prepared_native_state *read_native_state(char *filepath)
+ {
+     unsigned char header[44];
+     gzFile f;
+     unsigned int version;
+-    int i;
+-    uint32_t FCR31;
+ 
+     size_t savestateSize;
+     unsigned char *savestateData, *curr;
+-    char queue[1024];
+-    unsigned char using_tlb_data[4];
+-    unsigned char data_0001_0200[4096]; // 4k for extra state from v1.2
+-
+-    uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
++    char queue[1024] = {0};
++    unsigned char using_tlb_data[4] = {0};
++    unsigned char data_0001_0200[4096] = {0}; // 4k for extra state from v1.2
++
+ 
+     SDL_LockMutex(savestates_lock);
+ 
+@@ -209,7 +227,7 @@
+     {
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not open state file: %s", filepath);
+         SDL_UnlockMutex(savestates_lock);
+-        return 0;
++        return NULL;
+     }
+ 
+     /* Read and check Mupen64Plus magic number. */
+@@ -218,7 +236,7 @@
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Could not read header from state file %s", filepath);
+         gzclose(f);
+         SDL_UnlockMutex(savestates_lock);
+-        return 0;
++        return NULL;
+     }
+     curr = header;
+ 
+@@ -227,7 +245,7 @@
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State file: %s is not a valid Mupen64plus savestate.", filepath);
+         gzclose(f);
+         SDL_UnlockMutex(savestates_lock);
+-        return 0;
++        return NULL;
+     }
+     curr += 8;
+ 
+@@ -240,7 +258,7 @@
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State version (%08x) isn't compatible. Please update Mupen64Plus.", version);
+         gzclose(f);
+         SDL_UnlockMutex(savestates_lock);
+-        return 0;
++        return NULL;
+     }
+ 
+     if(memcmp((char *)curr, ROM_SETTINGS.MD5, 32))
+@@ -248,7 +266,7 @@
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State ROM MD5 does not match current ROM.");
+         gzclose(f);
+         SDL_UnlockMutex(savestates_lock);
+-        return 0;
++        return NULL;
+     }
+     curr += 32;
+ 
+@@ -260,7 +278,7 @@
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Insufficient memory to load state.");
+         gzclose(f);
+         SDL_UnlockMutex(savestates_lock);
+-        return 0;
++        return NULL;
+     }
+     if (version == 0x00010000) /* original savestate version */
+     {
+@@ -271,7 +289,7 @@
+             free(savestateData);
+             gzclose(f);
+             SDL_UnlockMutex(savestates_lock);
+-            return 0;
++            return NULL;
+         }
+     }
+     else if (version == 0x00010100) // saves entire eventqueue plus 4-byte using_tlb flags
+@@ -284,7 +302,7 @@
+             free(savestateData);
+             gzclose(f);
+             SDL_UnlockMutex(savestates_lock);
+-            return 0;
++            return NULL;
+         }
+     }
+     else // version >= 0x00010200  saves entire eventqueue, 4-byte using_tlb flags and extra state
+@@ -298,7 +316,7 @@
+             free(savestateData);
+             gzclose(f);
+             SDL_UnlockMutex(savestates_lock);
+-            return 0;
++            return NULL;
+         }
+     }
+ 
+@@ -306,14 +324,45 @@
+     SDL_UnlockMutex(savestates_lock);
+ 
+     /* Validate the optional native extension before mutating any device. */
+-    uint32_t restored_jitter = dev->r4300.interrupt_jitter_state;
++    uint32_t restored_jitter = 0;
+     if (version >= 0x00010200 && interrupt_jitter_decode(
+             data_0001_0200 + sizeof(data_0001_0200) - INTERRUPT_JITTER_RECORD_SIZE,
+             INTERRUPT_JITTER_RECORD_SIZE, &restored_jitter) < 0) {
+         free(savestateData);
+         main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid interrupt jitter state");
+-        return 0;
+-    }
++        return NULL;
++    }
++
++    struct prepared_native_state *snapshot = malloc(sizeof(*snapshot));
++    if (!snapshot) { free(savestateData); return NULL; }
++    snapshot->version = version;
++    snapshot->data = savestateData;
++    memcpy(snapshot->queue, queue, sizeof(queue));
++    memcpy(snapshot->using_tlb, using_tlb_data, sizeof(using_tlb_data));
++    memcpy(snapshot->extra, data_0001_0200, sizeof(data_0001_0200));
++    snapshot->jitter = restored_jitter;
++    snapshot->has_jitter = restored_jitter != 0;
++    return snapshot;
++}
++
++static int savestates_load_m64p(struct device* dev, char *filepath)
++{
++    struct prepared_native_state *snapshot = prepared_load;
++    prepared_load = NULL;
++    if (!snapshot) snapshot = read_native_state(filepath);
++    if (!snapshot) return 0;
++    unsigned int version = snapshot->version;
++    unsigned char *savestateData = snapshot->data, *curr = snapshot->data;
++    char queue[1024];
++    unsigned char using_tlb_data[4], data_0001_0200[4096];
++    memcpy(queue, snapshot->queue, sizeof(queue));
++    memcpy(using_tlb_data, snapshot->using_tlb, sizeof(using_tlb_data));
++    memcpy(data_0001_0200, snapshot->extra, sizeof(data_0001_0200));
++    uint32_t restored_jitter = snapshot->has_jitter ? snapshot->jitter : dev->r4300.interrupt_jitter_state;
++    free(snapshot);
++    int i;
++    uint32_t FCR31;
++    uint32_t* cp0_regs = r4300_cp0_regs(&dev->r4300.cp0);
+ 
+     // Parse savestate
+     dev->rdram.regs[0][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
+@@ -1410,8 +1459,36 @@
+     }
+ }
+ 
++/* The frontend must hold a frozen producer boundary while preparing a load. */
++int savestates_prepare_load(const char *path)
++{
++    if (job != savestates_job_nothing || prepared_load) return M64ERR_INVALID_STATE;
++    if (!path) return M64ERR_UNSUPPORTED; /* Preserve native slot loading. */
++    savestates_type detected = savestates_detect_type((char *)path);
++    if (detected == savestates_type_pj64_zip || detected == savestates_type_pj64_unc)
++        return M64ERR_UNSUPPORTED; /* Existing legacy import path. */
++    if (detected != savestates_type_m64p) return M64ERR_INPUT_INVALID;
++    struct prepared_native_state *snapshot = read_native_state((char *)path);
++    if (!snapshot) return M64ERR_INPUT_INVALID;
++    savestates_set_job(savestates_job_load, savestates_type_m64p, path);
++    if (!fname) {
++        free(snapshot->data);
++        free(snapshot);
++        savestates_clear_job();
++        return M64ERR_NO_MEMORY;
++    }
++    prepared_load = snapshot;
++    return M64ERR_SUCCESS;
++}
++
+ int savestates_load(void)
+ {
++    if (prepared_load) {
++        int ret = savestates_load_m64p(&g_dev, fname);
++        StateChanged(M64CORE_STATE_LOADCOMPLETE, ret);
++        savestates_clear_job();
++        return ret;
++    }
+     FILE *fPtr = NULL;
+     char *filepath = NULL;
+     int ret = 0;
+--- a/src/main/savestates.h
++++ b/src/main/savestates.h
+@@ -46,6 +46,7 @@
+ void savestates_deinit(void);
+ 
+ int savestates_load(void);
++int savestates_prepare_load(const char *path);
+ int savestates_save(void);
+ 
+ void savestates_select_slot(unsigned int s);
+--- a/src/api/frontend.c
++++ b/src/api/frontend.c
+@@ -307,8 +307,13 @@
+                 return M64ERR_INPUT_ASSERT;
+             return main_core_state_set((m64p_core_param) ParamInt, *((int *)ParamPtr));
+         case M64CMD_STATE_LOAD:
++        {
++            if (!g_EmulatorRunning) return M64ERR_INVALID_STATE;
++            m64p_error prepared = (m64p_error)savestates_prepare_load((char *)ParamPtr);
++            if (prepared != M64ERR_UNSUPPORTED) return prepared;
+             main_state_load((char *) ParamPtr);
+             return M64ERR_SUCCESS;
++        }
+         case M64CMD_STATE_SAVE:
+             if (!g_EmulatorRunning)
+                 return M64ERR_INVALID_STATE;

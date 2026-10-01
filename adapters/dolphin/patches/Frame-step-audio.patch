@@ -1,0 +1,157 @@
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -102,7 +102,8 @@
+ 
+ static bool s_is_throttler_temp_disabled = false;
+ static u64 s_throttler_override_revision = 0;
+-static bool s_frame_step = false;
++enum class FrameStepMode { Inactive, StopAudio, KeepAudio };
++static std::atomic<FrameStepMode> s_frame_step{FrameStepMode::Inactive};
+ static std::atomic<bool> s_stop_frame_step;
+ 
+ // Threads other than the CPU thread must hold this when taking on the role of the CPU thread.
+@@ -543,7 +544,7 @@
+   // This will become the CPU thread.
+   DeclareAsCPUThread();
+ 
+-  s_frame_step = false;
++  s_frame_step.store(FrameStepMode::Inactive);
+ 
+   // If settings have changed since the previous run, notify callbacks.
+   CPUThreadConfigCallback::CheckForConfigChanges();
+@@ -895,7 +896,7 @@
+ // Called from VideoInterface::Update (CPU thread) at emulated field boundaries
+ void Callback_NewField(Core::System& system)
+ {
+-  if (s_frame_step)
++  if (s_frame_step.load() != FrameStepMode::Inactive)
+   {
+     // To ensure that s_stop_frame_step is up to date, wait for the GPU thread queue to empty,
+     // since it is may contain a swap event (which will call Callback_FramePresented). This hurts
+@@ -906,10 +907,13 @@
+     // (as opposed to the previous frame being displayed for another frame).
+     if (s_stop_frame_step.load())
+     {
+-      s_frame_step = false;
+-      system.GetCPU().Break();
+-      NotifyStateChanged(Core::GetState(system));
+-      EmuCap::NotifyFrameStepComplete();
++      const auto mode = s_frame_step.exchange(FrameStepMode::Inactive);
++      if (mode != FrameStepMode::Inactive)
++      {
++        system.GetCPU().BreakForFrameStep(mode == FrameStepMode::KeepAudio);
++        NotifyStateChanged(Core::GetState(system));
++        EmuCap::NotifyFrameStepComplete();
++      }
+     }
+   }
+ 
+@@ -1025,7 +1029,7 @@
+ }
+ 
+ // NOTE: Host Thread
+-bool DoFrameStep(Core::System& system)
++bool DoFrameStep(Core::System& system, bool keep_audio_running)
+ {
+   if (AchievementManager::GetInstance().IsHardcoreModeActive())
+   {
+@@ -1039,11 +1043,11 @@
+   {
+     // if already paused, frame advance for 1 frame
+     s_stop_frame_step = false;
+-    s_frame_step = true;
++    s_frame_step.store(keep_audio_running ? FrameStepMode::KeepAudio : FrameStepMode::StopAudio);
+     SetState(system, State::Running, false);
+     return true;
+   }
+-  else if (!s_frame_step)
++  else if (s_frame_step.load() == FrameStepMode::Inactive)
+   {
+     // if not paused yet, pause immediately instead
+     SetState(system, State::Paused);
+@@ -1055,11 +1059,11 @@
+ void CancelFrameStep(Core::System& system)
+ {
+   std::lock_guard lock(s_core_mutex);
+-  if (!s_frame_step)
+-    return;
+-
+-  s_frame_step = false;
+-  SetState(system, State::Paused);
++  s_frame_step.store(FrameStepMode::Inactive);
++  // An intermediate frame may have stopped the CPU while retaining output. Always finish
++  // the admitted operation, including when pause restrictions changed after admission.
++  if (IsRunning(system))
++    SetState(system, State::Paused, true, true);
+ }
+ 
+ void UpdateInputGate(bool require_focus, bool require_full_focus)
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -184,7 +184,7 @@
+ // WMUserJobDispatch will be sent when something is added to the queue.
+ void HostDispatchJobs(Core::System& system);
+ 
+-bool DoFrameStep(Core::System& system);
++bool DoFrameStep(Core::System& system, bool keep_audio_running = false);
+ void CancelFrameStep(Core::System& system);
+ 
+ void UpdateInputGate(bool require_focus, bool require_full_focus = false);
+--- a/Source/Core/Core/HW/CPU.cpp
++++ b/Source/Core/Core/HW/CPU.cpp
+@@ -222,12 +222,12 @@
+ }
+ 
+ // Requires holding m_state_change_lock
+-void CPUManager::RunAdjacentSystems(bool running)
++void CPUManager::RunAdjacentSystems(bool running, bool keep_audio_running)
+ {
+   // NOTE: We're assuming these will not try to call Break or SetStepping.
+   m_system.GetFifo().EmulatorState(running);
+   // Core is responsible for shutting down the sound stream.
+-  if (m_state != State::PowerDown)
++  if (m_state != State::PowerDown && !keep_audio_running)
+     AudioCommon::SetSoundStreamRunning(m_system, running);
+ }
+ 
+@@ -344,6 +344,11 @@
+ 
+ void CPUManager::Break()
+ {
++  BreakForFrameStep(false);
++}
++
++void CPUManager::BreakForFrameStep(bool keep_audio_running)
++{
+   std::lock_guard state_lock(m_state_change_lock);
+ 
+   // If another thread is trying to PauseAndLock then we need to remember this
+@@ -357,7 +362,7 @@
+   // We'll deadlock if we synchronize, the CPU may block waiting for our caller to
+   // finish resulting in the CPU loop never terminating.
+   SetStateLocked(State::Stepping);
+-  RunAdjacentSystems(false);
++  RunAdjacentSystems(false, keep_audio_running);
+ }
+ 
+ void CPUManager::Continue()
+--- a/Source/Core/Core/HW/CPU.h
++++ b/Source/Core/Core/HW/CPU.h
+@@ -74,6 +74,8 @@
+   //   which enables it to avoid deadlocks but also makes it less safe so it
+   //   should not be used by the Host.
+   void Break();
++  // Native intermediate frame completion may retain host output while CPU/FIFO stop.
++  void BreakForFrameStep(bool keep_audio_running);
+ 
+   // This should only be called from the CPU thread
+   void Continue();
+@@ -110,7 +112,7 @@
+   void FlushStepSyncEventLocked();
+   void ExecutePendingJobs(std::unique_lock<std::mutex>& state_lock);
+   void StartTimePlayedTimer();
+-  void RunAdjacentSystems(bool running);
++  void RunAdjacentSystems(bool running, bool keep_audio_running = false);
+   bool SetStateLocked(State s);
+ 
+   // CPU Thread execution state.

@@ -1,0 +1,53 @@
+--- a/src/drivers/video.cpp
++++ b/src/drivers/video.cpp
+@@ -28,6 +28,7 @@
+ #include <trio/trio.h>
+ 
+ #include "video.h"
++#include "emucap_presentation_surface.h"
+ #include "opengl.h"
+ #include "shader.h"
+ #include "nongl.h"
+@@ -472,6 +473,7 @@
+ static MDFN_PixelFormat game_pf; // Pixel format for game texture/surface
+ static MDFN_PixelFormat osd_pf;	 // Pixel format for OSD textures/surfaces
+ static MDFN_PixelFormat emu_pf;
++static EmucapPresentationSurface presentation_surface;
+ 
+ static void GrabbyGoAway(void);
+ 
+@@ -482,6 +484,7 @@
+ 
+ static void SyncCleanup(void)
+ {
++ presentation_surface.clear();
+  if(SMSurface)
+  {
+   delete SMSurface;
+@@ -1753,7 +1756,7 @@
+   }
+  }
+ 
+- msurface->SetFormat(emu_pf, true);
++ const MDFN_Surface* presented = &presentation_surface.convert(*msurface, emu_pf);
+ 
+  src_rect.x = DisplayRect->x;
+  src_rect.w = DisplayRect->w;
+@@ -1762,7 +1765,7 @@
+ 
+  if(LineWidths[0] == ~0) // Skip multi line widths code?
+  {
+-  SubBlit(msurface, src_rect, screen_dest_rect, InterlaceField);
++  SubBlit(presented, src_rect, screen_dest_rect, InterlaceField);
+  }
+  else
+  {
+@@ -1811,7 +1814,7 @@
+      sub_dest_rect.h = 1;
+ 
+     // Blit here!
+-    SubBlit(msurface, sub_src_rect, sub_dest_rect, InterlaceField);
++    SubBlit(presented, sub_src_rect, sub_dest_rect, InterlaceField);
+ 
+     last_y = y;
+ 

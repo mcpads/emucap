@@ -1,0 +1,179 @@
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -41,6 +41,7 @@
+ #include "Core/CoreTiming.h"
+ #include "Core/GeckoCode.h"
+ #include "Core/HW/EXI/EXI.h"
++#include "Core/HW/CPU.h"
+ #include "Core/HW/HW.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/Wiimote.h"
+@@ -839,21 +840,24 @@
+   ret_data.swap(buffer);
+ }
+ 
+-static bool LoadAsFromCore(Core::System& system, std::string filename)
++static LoadResult UndoLoadFromCore(Core::System& system);
++
++static LoadResult LoadAsFromCore(Core::System& system, std::string filename)
+ {
+   // Ensure all data has reached the filesystem before trying to use it.
+   s_compress_and_dump_thread.WaitForCompletion();
+ 
+   // Save temp buffer for undo load state
+   auto& movie = system.GetMovie();
+-  if (!movie.IsJustStartingRecordingInputFromSaveState())
++  const bool captured_undo = !movie.IsJustStartingRecordingInputFromSaveState();
++  if (captured_undo)
+   {
+     Common::UniqueBuffer<u8> undo_buffer{std::size_t(s_last_state_size)};
+     const auto undo_size = SaveToBuffer(system, undo_buffer);
+     if (undo_size == 0)
+     {
+       Core::DisplayMessage("Unable to load: could not capture undo state", OSD::Duration::NORMAL);
+-      return false;
++      return LoadResult::Rejected;
+     }
+     undo_buffer.assign(undo_buffer.extract().first, undo_size);
+     s_undo_load_buffer.swap(undo_buffer);
+@@ -866,6 +870,7 @@
+ 
+   bool was_file_read = false;
+   bool loaded_successfully = false;
++  LoadResult result = LoadResult::Rejected;
+ 
+   // brackets here are so buffer gets freed ASAP
+   {
+@@ -883,6 +888,7 @@
+   {
+     if (loaded_successfully)
+     {
++      result = LoadResult::Loaded;
+       const std::filesystem::path temp_filename(StringToPath(filename));
+       Core::DisplayMessage(
+           fmt::format("Loaded State from {}", PathToString(temp_filename.filename())), 2000);
+@@ -900,14 +906,23 @@
+     {
+       Core::DisplayMessage("The savestate could not be loaded", OSD::Duration::NORMAL);
+ 
+-      // since we could be in an inconsistent state now (and might crash or whatever), undo.
+-      UndoLoadState(system);
+-    }
+-  }
+-
+-  if (s_on_after_load_callback)
++      if (captured_undo && UndoLoadFromCore(system) == LoadResult::Loaded)
++      {
++        result = LoadResult::RolledBack;
++      }
++      else
++      {
++        // PowerDown is sticky until CPU initialization. Neither GUI resume nor
++        // a debugger step may execute a partially restored machine.
++        system.GetCPU().Stop();
++        result = LoadResult::Unrecoverable;
++      }
++    }
++  }
++
++  if (result != LoadResult::Unrecoverable && s_on_after_load_callback)
+     s_on_after_load_callback();
+-  return was_file_read && loaded_successfully;
++  return result;
+ }
+ 
+ void LoadAs(Core::System& system, std::string filename)
+@@ -920,10 +935,10 @@
+   });
+ }
+ 
+-bool LoadAsSynchronous(Core::System& system, std::string filename)
++LoadResult LoadAsSynchronous(Core::System& system, std::string filename)
+ {
+   if (!CheckIfStateLoadIsAllowed(system))
+-    return false;
++    return LoadResult::Rejected;
+ 
+   Core::CPUThreadGuard guard(system);
+   return LoadAsFromCore(system, std::move(filename));
+@@ -1002,38 +1017,36 @@
+   });
+ }
+ 
+-// Load the last state before loading the state
++// Called with CPU ownership; return the actual decoder outcome to the load owner.
++static LoadResult UndoLoadFromCore(Core::System& system)
++{
++  if (s_undo_load_buffer.empty())
++    return LoadResult::Rejected;
++
++  auto& movie = system.GetMovie();
++  const std::string dtmpath = File::GetUserPath(D_STATESAVES_IDX) + "undo.dtm";
++  if (movie.IsMovieActive() && !File::Exists(dtmpath))
++    return LoadResult::Rejected;
++
++  if (!LoadFromBuffer(system, s_undo_load_buffer))
++    return LoadResult::Unrecoverable;
++  if (movie.IsMovieActive())
++    movie.LoadInput(dtmpath);
++  return LoadResult::Loaded;
++}
++
++// Load the last state before loading the state.
+ void UndoLoadState(Core::System& system)
+ {
+   if (!CheckIfStateLoadIsAllowed(system))
+     return;
+ 
+   Core::RunOnCPUThread(system, [&system] {
+-    if (s_undo_load_buffer.empty())
+-    {
+-      PanicAlertFmtT("There is nothing to undo!");
+-      return;
+-    }
+-
+-    auto& movie = system.GetMovie();
+-    if (movie.IsMovieActive())
+-    {
+-      // Note: Only the CPU thread writes to "undo.dtm".
+-      const std::string dtmpath = File::GetUserPath(D_STATESAVES_IDX) + "undo.dtm";
+-      if (File::Exists(dtmpath))
+-      {
+-        LoadFromBuffer(system, s_undo_load_buffer);
+-        movie.LoadInput(dtmpath);
+-      }
+-      else
+-      {
+-        PanicAlertFmtT("No undo.dtm found, aborting undo load state to prevent movie desyncs");
+-      }
+-    }
+-    else
+-    {
+-      LoadFromBuffer(system, s_undo_load_buffer);
+-    }
++    const auto result = UndoLoadFromCore(system);
++    if (result == LoadResult::Unrecoverable)
++      system.GetCPU().Stop();
++    if (result != LoadResult::Loaded)
++      Core::DisplayMessage("Unable to restore undo state", OSD::Duration::NORMAL);
+   });
+ }
+ 
+--- a/Source/Core/Core/State.h
++++ b/Source/Core/Core/State.h
+@@ -101,7 +101,14 @@
+ // Synchronous variants for control surfaces that must not acknowledge completion while CPU-thread
+ // capture/restore or background compression is still pending.
+ bool SaveAsSynchronous(Core::System& system, std::string filename);
+-bool LoadAsSynchronous(Core::System& system, std::string filename);
++enum class LoadResult
++{
++  Loaded,
++  Rejected,
++  RolledBack,
++  Unrecoverable,
++};
++LoadResult LoadAsSynchronous(Core::System& system, std::string filename);
+ 
+ void LoadLastSaved(Core::System& system, int i = 1);
+ void SaveFirstSaved(Core::System& system);

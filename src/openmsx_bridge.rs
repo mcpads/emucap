@@ -35,6 +35,8 @@ mod joystick;
 mod media;
 #[path = "openmsx_bridge/observation.rs"]
 mod observation;
+#[path = "openmsx_bridge/temporal_owner.rs"]
+mod temporal_owner;
 #[path = "openmsx_bridge/state.rs"]
 mod state;
 #[path = "openmsx_bridge/xml.rs"]
@@ -88,6 +90,8 @@ const BASE_EXCEPTIONS: &[&str] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpenMsxBridgeError {
+    #[error("another parent operation owns native control")]
+    Busy,
     #[error("{0}")]
     BadParams(String),
     #[error("{0}")]
@@ -101,6 +105,8 @@ pub enum OpenMsxBridgeError {
     /// A guest advance reached its host wall-clock budget before its target boundary.
     #[error("{0}")]
     HostDeadline(String),
+    #[error("frame advance cancelled")]
+    Cancelled,
     #[error("{0}")]
     Protocol(String),
     #[error(transparent)]
@@ -110,8 +116,22 @@ pub enum OpenMsxBridgeError {
 type BridgeResult<T> = Result<T, OpenMsxBridgeError>;
 
 pub trait OpenMsxControl {
+    /// Bind XML setup, arming and cleanup to the same request cancellation.
+    fn set_request_cancellation(&mut self, cancellation: crate::live::link::RequestCancellation);
+    /// Apply one absolute deadline to every command in a cleanup sequence.
+    fn set_command_deadline(&mut self, deadline: Option<std::time::Instant>);
     fn command(&mut self, command: &str) -> BridgeResult<String>;
     fn advance_frames(&mut self, count: u64) -> BridgeResult<()>;
+    fn advance_frames_cancellable(
+        &mut self,
+        count: u64,
+        cancellation: &crate::live::link::RequestCancellation,
+    ) -> BridgeResult<()> {
+        if cancellation.is_cancelled() {
+            return Err(OpenMsxBridgeError::Cancelled);
+        }
+        self.advance_frames(count)
+    }
     fn is_terminal(&self) -> bool;
     fn child_pid(&self) -> u32;
 }
@@ -124,6 +144,7 @@ pub struct OpenMsxBridge<C> {
     frozen: bool,
     region_sizes: BTreeMap<&'static str, u64>,
     held_buttons: BTreeSet<String>,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
     joystick_owners: [Option<u8>; 2],
     breakpoints: BTreeMap<u64, PublicBreakpoint>,
     next_breakpoint_id: u64,
@@ -141,6 +162,7 @@ pub struct OpenMsxBridge<C> {
     name: Option<String>,
     session_token: Option<String>,
     launch_id: Option<String>,
+    request_cancellation: crate::live::link::RequestCancellation,
 }
 
 impl<C: OpenMsxControl> OpenMsxBridge<C> {
@@ -149,6 +171,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         session: &PreparedSession,
         runtime_home: &Path,
         display: bool,
+        sound: bool,
     ) -> BridgeResult<Self> {
         let profile = session.verify()?;
         if profile == OpenMsxProfile::MsxTurboR {
@@ -180,7 +203,12 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         if display {
             control.command("set emucap_raster_capture true; set deinterlace false; set deflicker false; set videosource MSX")?;
         }
-        control.command("set mute on")?;
+        control.command(if sound { "set mute off" } else { "set mute on" })?;
+        if read_audio_muted(&mut control)? == sound {
+            return Err(OpenMsxBridgeError::Emulator(
+                "openMSX did not apply the requested host audio policy".into(),
+            ));
+        }
         control.command("set pause on")?;
 
         let mut region_sizes = BTreeMap::new();
@@ -224,6 +252,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             frozen: true,
             region_sizes,
             held_buttons: BTreeSet::new(),
+            producer_ownership: None,
             joystick_owners: [None; 2],
             breakpoints: BTreeMap::new(),
             next_breakpoint_id: 1,
@@ -240,6 +269,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             name: std::env::var("EMUCAP_NAME").ok(),
             session_token: std::env::var("EMUCAP_SESSION_TOKEN").ok(),
             launch_id: std::env::var("EMUCAP_LAUNCH_ID").ok(),
+            request_cancellation: Default::default(),
         };
         bridge.require_runtime_identity("initialization")?;
         bridge.initialize_debugger()?;
@@ -253,6 +283,19 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     pub fn backend_terminal(&self) -> bool {
         self.control.is_terminal() || self.debugger_fatal.is_some()
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        request: Request,
+        cancellation: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.control.set_request_cancellation(cancellation.clone());
+        self.request_cancellation = cancellation;
+        let response = self.handle_request(request);
+        self.request_cancellation = Default::default();
+        self.control.set_request_cancellation(Default::default());
+        response
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {
@@ -394,9 +437,21 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
     fn status(&mut self) -> BridgeResult<Value> {
         self.drain_debug_events()?;
         self.refresh_execution_state()?;
-        let input_matrix = self.input_matrix()?;
-        let joystick_owners = self.checked_joystick_owners()?;
-        let joystick_values = [self.guest_joystick_value(0)?, self.guest_joystick_value(1)?];
+        let input = input::parse_input_observation(
+            &self.control.command(input::INPUT_OBSERVATION_COMMAND)?,
+        )?;
+        let input_matrix = input.matrix;
+        let joystick_owners = input.owners;
+        let joystick_values = input.guest_values;
+        for (index, native) in joystick_owners.iter().enumerate() {
+            if *native != self.joystick_owners[index] {
+                return Err(OpenMsxBridgeError::Protocol(format!(
+                    "joystick port {} ownership diverged: bridge={:?}, native={native:?}",
+                    index + 1,
+                    self.joystick_owners[index]
+                )));
+            }
+        }
         let any_input_override =
             !self.held_buttons.is_empty() || joystick_owners.iter().any(Option::is_some);
         Ok(json!({
@@ -410,6 +465,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             "media_devices": self.media_devices(),
             "mounted_media": self.mounted_media()?,
             "execution_speed": self.speed_readback()?,
+            "diagnostics": { "audio_muted": read_audio_muted(&mut self.control)? },
             "capability_notes": self.hello()?["capability_notes"].clone(),
             "memory_types": ["memory", "ram", "vram"],
             "region_sizes": self.region_sizes,
@@ -578,6 +634,17 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
 
     fn step(&mut self, params: &Value) -> BridgeResult<Value> {
         require_z80(params)?;
+        if params.get("_control").is_some()
+            && params
+                .get("unit")
+                .and_then(Value::as_str)
+                .unwrap_or("frames")
+                != "frames"
+        {
+            return Err(OpenMsxBridgeError::Unsupported(
+                "temporal cancellation currently requires frame stepping".into(),
+            ));
+        }
         let count = optional_num(params, "count")?
             .or(optional_num(params, "frames")?)
             .unwrap_or(1);
@@ -850,25 +917,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         }
     }
 
-    fn input_matrix(&mut self) -> BridgeResult<Value> {
-        let mut rows = serde_json::Map::new();
-        for row in [2_u8, 6, 7, 8] {
-            let value = parse_decimal(
-                &self
-                    .control
-                    .command(&format!("debug read keymatrix {row}"))?,
-                "keyboard matrix row",
-            )?;
-            if value > u8::MAX as u64 {
-                return Err(OpenMsxBridgeError::Protocol(format!(
-                    "openMSX returned an invalid keyboard matrix byte for row {row}: {value}"
-                )));
-            }
-            rows.insert(row.to_string(), json!(value));
-        }
-        Ok(Value::Object(rows))
-    }
-
     fn validate_range(&self, memory_type: &str, address: u64, length: u64) -> BridgeResult<()> {
         let size = self.region_sizes[memory_type];
         if !matches!(address.checked_add(length), Some(end) if end <= size) {
@@ -1070,6 +1118,8 @@ fn parse_decimal(raw: &str, label: &str) -> BridgeResult<u64> {
 
 fn error_kind(error: &OpenMsxBridgeError) -> &'static str {
     match error {
+        OpenMsxBridgeError::Busy => "busy",
+        OpenMsxBridgeError::Cancelled => "cancelled",
         OpenMsxBridgeError::BadParams(_) => "bad_params",
         OpenMsxBridgeError::BadState(_) => "bad_state",
         OpenMsxBridgeError::UnknownMethod(_) => "unknown_method",
@@ -1098,6 +1148,16 @@ fn xml_unescape(text: &str) -> String {
         .replace("&quot;", "\"")
         .replace("&apos;", "'")
         .replace("&amp;", "&")
+}
+
+fn read_audio_muted(control: &mut impl OpenMsxControl) -> BridgeResult<bool> {
+    match control.command("set mute")?.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(OpenMsxBridgeError::Protocol(format!(
+            "invalid native mute readback: {other:?}"
+        ))),
+    }
 }
 
 #[cfg(test)]

@@ -1,0 +1,58 @@
+--- a/Core/Debugger/Debugger.h
++++ b/Core/Debugger/Debugger.h
+@@ -172,6 +172,7 @@
+ 
+ 	void ProcessEvent(EventType type, std::optional<CpuType> cpuType);
+ 	bool HasEventCallback(EventType type);
++	bool HasNativeHaltService();
+ 	void ProcessSnesObservationEvent(EventType type, const SnesObservationEvent& event);
+ 	const SnesObservationEvent& GetSnesObservationEvent() { return _snesObservationEvent; }
+ 
+--- a/Core/Debugger/Debugger.cpp
++++ b/Core/Debugger/Debugger.cpp
+@@ -646,6 +646,12 @@
+ 	}
+ }
+ 
++bool Debugger::HasNativeHaltService()
++{
++	return HasEventCallback(EventType::CodeBreakIdle)
++		|| HasEventCallback(EventType::CodeBreakIdleSavestate);
++}
++
+ bool Debugger::HasEventCallback(EventType type)
+ {
+ 	return _scriptManager->HasEventCallback(type);
+--- a/Core/SNES/SnesPpu.cpp
++++ b/Core/SNES/SnesPpu.cpp
+@@ -509,7 +509,8 @@
+ 			Debugger* debugger = _emu->InternalGetDebugger();
+ 			_bgChrFetchDebugger = debugger && debugger->HasEventCallback(EventType::SnesPpuBgChrFetch)
+ 				? debugger : nullptr;
+-			bool preserveRendererObservation = _bgChrFetchDebugger
++			bool preserveRendererObservation = (debugger && debugger->HasNativeHaltService())
++				|| _bgChrFetchDebugger
+ 				|| (debugger && debugger->HasEventCallback(EventType::SnesPpuCgramLookup));
+ 
+ 			_skipRender =
+--- a/Core/GBA/GbaPpu.cpp
++++ b/Core/GBA/GbaPpu.cpp
+@@ -7,6 +7,7 @@
+ #include "GBA/GbaDmaController.h"
+ #include "GBA/Debugger/GbaPpuTools.h"
+ #include "Debugger/DebugTypes.h"
++#include "Debugger/Debugger.h"
+ #include "Shared/Emulator.h"
+ #include "Shared/EmuSettings.h"
+ #include "Shared/BaseControlManager.h"
+@@ -158,7 +159,10 @@
+ 
+ 		_emu->ProcessEvent(EventType::StartFrame, CpuType::Gba);
+ 
++		Debugger* debugger = _emu->InternalGetDebugger();
++		bool preserveRendererObservation = debugger && debugger->HasNativeHaltService();
+ 		_skipRender =
++			!preserveRendererObservation &&
+ 			!cfg.DisableFrameSkipping &&
+ 			!_emu->GetRewindManager()->IsRewinding() &&
+ 			!_emu->GetVideoRenderer()->IsRecording() &&

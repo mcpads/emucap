@@ -76,6 +76,10 @@ pub struct FilesystemIdentity {
     pub device: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inode: Option<u64>,
+    // Inodes can be reused as soon as a directory is removed. Missing birth
+    // time (including older capsules) cannot establish ownership for recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<std::time::SystemTime>,
 }
 
 impl FilesystemIdentity {
@@ -98,6 +102,7 @@ impl FilesystemIdentity {
                 canonical_path,
                 device: Some(metadata.dev()),
                 inode: Some(metadata.ino()),
+                created_at: metadata.created().ok(),
             })
         }
         #[cfg(not(unix))]
@@ -106,6 +111,7 @@ impl FilesystemIdentity {
                 canonical_path,
                 device: None,
                 inode: None,
+                created_at: metadata.created().ok(),
             })
         }
     }
@@ -116,7 +122,9 @@ impl FilesystemIdentity {
             && self.device.is_some()
             && self.device == current.device
             && self.inode.is_some()
-            && self.inode == current.inode)
+            && self.inode == current.inode
+            && self.created_at.is_some()
+            && self.created_at == current.created_at)
     }
 }
 

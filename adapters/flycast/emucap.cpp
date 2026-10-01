@@ -8,6 +8,8 @@
 #include "emucap_input.h"
 #include "emucap_native_failure.h"
 #include "emucap_pacing.h"
+#include "emucap_state.h"
+#include "hw/sh4/sh4_interpreter.h"
 #include "cfg/option.h"               // config::AudioVolume (audible host audio)
 #include "hw/aica/aica_if.h"          // aica_ram (batch backing view)
 #include "hw/pvr/pvr_mem.h"           // vram (batch backing view)
@@ -17,6 +19,8 @@ extern int vblank_schid;              // hw/pvr/spg.cpp scanline scheduler slot
 #include "hw/sh4/sh4_mem.h"           // mem_b (batch backing view)
 #include "hw/sh4/sh4_if.h"
 #include "hw/sh4/sh4_opcode_list.h"  // OpDesc[]·Disassemble (disassemble)
+static_assert(MT == 0 && EX == 1 && BR == 2 && LS == 3 && FE == 4 && CO == 5,
+              "managed snapshot execution-unit encoding must stay stable");
 #include "hw/mem/addrspace.h"
 #include "types.h"                    // settings.content (get_rom_info)
 #include "input/gamepad.h"          // DreamcastKey: DC_BTN_* / DC_DPAD_* 비트(kcode active-low)
@@ -889,18 +893,22 @@ void handle_get_state(long id) {
 void handle_save_state(long id, const std::string& line) {
 	std::string path = json_str(line, "path");
 	if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
+	if (!Sh4Interpreter::Instance) { reply_err(id, "unsupported", "state capture requires the interpreter continuation"); return; }
 	try {
+		u32 timing_unit, timing_memory;
+		Sh4Interpreter::Instance->saveTiming(timing_unit, timing_memory);
 		Serializer sizer;            // 1패스: 크기 산출
 		dc_serialize(sizer);
 		size_t sz = sizer.size();
-		std::vector<u8> buf(sz);
-		Serializer ser(buf.data(), sz);
+		std::vector<u8> buf(sz + EMUCAP_FLYCAST_STATE_HEADER);
+		emucap_state_header(buf, timing_unit, timing_memory);
+		Serializer ser(buf.data() + EMUCAP_FLYCAST_STATE_HEADER, sz);
 		dc_serialize(ser);           // 2패스: 실제 직렬화
 		FILE* f = fopen(path.c_str(), "wb");
 		if (!f) { reply_err(id, "io_error", "failed to open file"); return; }
-		size_t w = fwrite(buf.data(), 1, sz, f);
+		size_t w = fwrite(buf.data(), 1, buf.size(), f);
 		fclose(f);
-		if (w != sz) { reply_err(id, "io_error", "failed to write file"); return; }
+		if (w != buf.size()) { reply_err(id, "io_error", "failed to write file"); return; }
 	} catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
 	reply_ok(id, "{\"status\":\"completed\"}");
 }
@@ -916,8 +924,15 @@ void handle_load_state(long id, const std::string& line) {
 		size_t r = fread(buf.data(), 1, (size_t)sz, f);
 		fclose(f);
 		if ((long)r != sz) { reply_err(id, "io_error", "failed to read file"); return; }
-		Deserializer deser(buf.data(), (size_t)sz);
+		u32 timing_unit, timing_memory;
+		if (!emucap_state_parse(buf, timing_unit, timing_memory) || !Sh4Interpreter::Instance) {
+			reply_err(id, "bad_params", "state lacks a valid interpreter timing continuation; create a checkpoint with this producer");
+			return;
+		}
+		Deserializer deser(buf.data() + EMUCAP_FLYCAST_STATE_HEADER,
+		                   buf.size() - EMUCAP_FLYCAST_STATE_HEADER);
 		emu.loadstate(deser);
+		Sh4Interpreter::Instance->restoreTiming(timing_unit, timing_memory);
 		// A state saved inside the vblank callback by an earlier build has no pending scanline
 		// event; schedule the next one from the restored SPG state so the machine keeps running.
 		if (!sh4_sched_is_scheduled(vblank_schid)) rescheduleSPG();
@@ -1784,11 +1799,14 @@ void emucap_service() {
 void emucap_park() {
 	g_emucap_park_pending = false;
 	try {
+		bool pacing_parked = false;
 		while (g_frozen && g_step_remaining == 0) {
+			pacing_parked = true;
 			if (g_fd < 0) { emucap_connect(); if (g_fd < 0) { usleep(2000); continue; } }
 			serve_socket_once();
 			usleep(2000);
 		}
+		if (pacing_parked) g_pacer.reanchor();
 	} catch (const std::exception& error) {
 		contain_service_exception("park", error.what());
 	} catch (...) {
@@ -1829,11 +1847,14 @@ void emucap_bp_spin(uint32_t pc) {
 	try {
 		if (g_bp_hits.size() < 4096) g_bp_hits.push_back({pc, emucap_capture_regs()});  // poll_events 드레인용(미드레인 시 폭주 방지 캡)
 		g_frozen = true;
+		bool pacing_parked = false;
 		while (g_frozen && g_step_remaining == 0) {
+			pacing_parked = true;
 			if (g_fd < 0) { emucap_connect(); if (g_fd < 0) { usleep(2000); continue; } }
 			serve_socket_once();
 			usleep(2000);
 		}
+		if (pacing_parked) g_pacer.reanchor();
 	} catch (const std::exception& error) {
 		contain_service_exception("breakpoint_spin", error.what());
 	} catch (...) {

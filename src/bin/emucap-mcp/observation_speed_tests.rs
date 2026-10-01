@@ -51,6 +51,7 @@ impl EmulatorLink for ScriptedLink {
 
 fn features() -> FeatureCapabilities {
     FeatureCapabilities {
+        temporal_cancellation: None,
         memory_batch: Some(
             MemoryBatchCapability::from_hello(
                 &json!({"max_ranges":2, "max_range_bytes":4, "max_total_bytes":8,

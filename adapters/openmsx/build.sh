@@ -155,6 +155,11 @@ REALTIME_PATCH="$HERE/patches/0005-wake-realtime-sync-for-events.patch"
   echo "ERROR: openMSX realtime patch digest does not match upstream.lock" >&2
   exit 1
 }
+# Restore this patch's owned files so an older applied revision can be upgraded in place.
+tar -xzf "$ARCHIVE" -C "$WORK" \
+  "openmsx-$OPENMSX_VERSION/src/RealTime.cc" \
+  "openmsx-$OPENMSX_VERSION/src/events/EventDistributor.cc" \
+  "openmsx-$OPENMSX_VERSION/src/events/EventDistributor.hh"
 if patch -d "$SRC" -p1 --forward --dry-run <"$REALTIME_PATCH" >/dev/null 2>&1; then
   patch -d "$SRC" -p1 --forward <"$REALTIME_PATCH"
 elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$REALTIME_PATCH" >/dev/null 2>&1; then
@@ -167,6 +172,12 @@ perl -0pi -e "s{^INSTALL_BASE\\s*[:?+]?=.*\$}{INSTALL_BASE:=$INSTALL_BASE}m" \
   "$SRC/build/custom.mk"
 grep -qF "INSTALL_BASE:=$INSTALL_BASE" "$SRC/build/custom.mk" || {
   echo "ERROR: failed to isolate the openMSX install prefix" >&2
+  exit 1
+}
+perl -0pi -e 's{^SYMLINK_FOR_BINARY\s*[:?+]?=.*$}{SYMLINK_FOR_BINARY:=false}m' \
+  "$SRC/build/custom.mk"
+grep -qxF 'SYMLINK_FOR_BINARY:=false' "$SRC/build/custom.mk" || {
+  echo "ERROR: failed to disable openMSX installation outside the work tree" >&2
   exit 1
 }
 
@@ -189,6 +200,13 @@ JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
   cd "$SRC"
   ./configure
   make -j "$JOBS"
+  if [ "$(uname)" != "Darwin" ]; then
+    # Unix executables load machine definitions and scripts from INSTALL_BASE/share.
+    # The macOS bundle already includes these resources in its build output.
+    make install DESTDIR= OPENMSX_INSTALL="$INSTALL_BASE" \
+      INSTALL_BINARY_DIR="$INSTALL_BASE/bin" INSTALL_SHARE_DIR="$INSTALL_BASE/share" \
+      INSTALL_DOC_DIR="$INSTALL_BASE/doc"
+  fi
 )
 
 if [ "$(uname)" = "Darwin" ]; then
@@ -200,7 +218,11 @@ fi
   echo "ERROR: openMSX executable was not produced" >&2
   exit 1
 }
-"$BINARY" -testconfig
+CHECK_HOME="$WORK/testconfig/home"
+CHECK_DATA="$WORK/testconfig/share"
+mkdir -p "$CHECK_HOME" "$CHECK_DATA"
+env HOME="$CHECK_HOME" OPENMSX_HOME="$CHECK_HOME" OPENMSX_USER_DATA="$CHECK_DATA" \
+  "$BINARY" -testconfig
 
 BUILD_DIR="$(dirname "$BINARY")"
 SIDECAR="$BUILD_DIR/emucap-openmsx-build.json"

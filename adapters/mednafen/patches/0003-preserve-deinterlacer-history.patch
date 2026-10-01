@@ -1,0 +1,291 @@
+--- a/src/video/Deinterlacer.h
++++ b/src/video/Deinterlacer.h
+@@ -25,6 +25,8 @@
+ namespace Mednafen
+ {
+ 
++class Stream;
++
+ class Deinterlacer
+ {
+  public:
+@@ -39,12 +41,18 @@
+  };
+ 
+  static Deinterlacer* Create(unsigned type);
++ // Decode into a separate owner; the caller commits only after the whole snapshot validates.
++ static std::unique_ptr<Deinterlacer> RestoreHistory(unsigned type, Stream* stream, uint32 max_width, uint32 max_height);
++ virtual void SaveHistory(Stream* stream) const = 0;
+ 
+  Deinterlacer();
+  virtual ~Deinterlacer();
+ 
+  virtual void Process(MDFN_Surface *surface, MDFN_Rect &DisplayRect, int32 *LineWidths, const bool field) = 0;
+  virtual void ClearState(void) = 0;
++
++ protected:
++ virtual void LoadHistory(Stream* stream, uint32 max_width, uint32 max_height) = 0;
+ };
+ 
+ }
+--- a/src/video/Deinterlacer.cpp
++++ b/src/video/Deinterlacer.cpp
+@@ -23,6 +23,7 @@
+ #include "Deinterlacer.h"
+ #include "Deinterlacer_Simple.h"
+ #include "Deinterlacer_Blend.h"
++#include "VideoHistoryIO.h"
+ 
+ namespace Mednafen
+ {
+@@ -38,4 +39,18 @@
+   return new Deinterlacer_Simple(type);
+ }
+ 
++std::unique_ptr<Deinterlacer> Deinterlacer::RestoreHistory(unsigned type, Stream* stream, uint32 max_width, uint32 max_height)
++{
++ if(type > DEINT_BLEND_RG || !max_width || !max_height
++    || max_width > VideoHistoryIO::MaxBytes / 2
++    || max_height > VideoHistoryIO::MaxBytes / sizeof(int32))
++  throw std::runtime_error("invalid deinterlacer history configuration");
++ VideoHistoryIO::ReadHeader(stream, type);
++ std::unique_ptr<Deinterlacer> result(Create(type));
++ result->LoadHistory(stream, max_width, max_height);
++ if(stream->tell() != stream->size())
++  throw std::runtime_error("trailing deinterlacer history data");
++ return result;
+ }
++
++}
+--- a/src/video/Deinterlacer_Simple.h
++++ b/src/video/Deinterlacer_Simple.h
+@@ -35,8 +35,11 @@
+  virtual void Process(MDFN_Surface *surface, MDFN_Rect &DisplayRect, int32 *LineWidths, const bool field) override;
+ 
+  virtual void ClearState(void) override;
++ virtual void SaveHistory(Stream* stream) const override;
+ 
+  private:
++
++ virtual void LoadHistory(Stream* stream, uint32 max_width, uint32 max_height) override;
+ 
+  template<typename T>
+  void InternalProcess(MDFN_Surface *surface, MDFN_Rect &DisplayRect, int32 *LineWidths, const bool field);
+--- a/src/video/Deinterlacer_Simple.cpp
++++ b/src/video/Deinterlacer_Simple.cpp
+@@ -22,6 +22,7 @@
+ #include "video-common.h"
+ #include "Deinterlacer.h"
+ #include "Deinterlacer_Simple.h"
++#include "VideoHistoryIO.h"
+ 
+ namespace Mednafen
+ {
+@@ -194,4 +195,34 @@
+  PrevDRect.h = 0;
+ }
+ 
+-}
++void Deinterlacer_Simple::SaveHistory(Stream* stream) const
++{
++ VideoHistoryIO::WriteHeader(stream, DeintType);
++ stream->put_LE<uint32>(StateValid);
++ stream->put_LE<uint32>(PrevDRect.x);
++ stream->put_LE<uint32>(PrevDRect.y);
++ stream->put_LE<uint32>(PrevDRect.w);
++ stream->put_LE<uint32>(PrevDRect.h);
++ VideoHistoryIO::WriteSurface(stream, FieldBuffer.get());
++ const uint32 rows = StateValid ? PrevDRect.h / 2 : 0;
++ if(rows > LWBuffer.size()) throw std::runtime_error("invalid weave history rows");
++ VideoHistoryIO::WriteWidths(stream, LWBuffer.data(), rows);
++}
++
++void Deinterlacer_Simple::LoadHistory(Stream* stream, uint32 max_width, uint32 max_height)
++{
++ StateValid = VideoHistoryIO::ReadBool(stream);
++ PrevDRect = VideoHistoryIO::ReadRect(stream, max_width, max_height);
++ FieldBuffer = VideoHistoryIO::ReadSurface(stream, max_width, max_height / 2);
++ if((DeintType != DEINT_WEAVE && (StateValid || FieldBuffer))
++    || (StateValid && (!FieldBuffer || PrevDRect.h < 2
++        || uint32(PrevDRect.h / 2) > uint32(FieldBuffer->h)
++        || PrevDRect.x >= FieldBuffer->w)))
++  throw std::runtime_error("inconsistent weave history");
++ const uint32 rows = StateValid ? PrevDRect.h / 2 : 0;
++ LWBuffer = VideoHistoryIO::ReadWidths(stream, rows,
++      StateValid ? FieldBuffer->w - PrevDRect.x : max_width);
++ if(FieldBuffer) LWBuffer.resize(FieldBuffer->h, 0);
++}
++
++}
+--- a/src/video/Deinterlacer_Blend.h
++++ b/src/video/Deinterlacer_Blend.h
+@@ -34,10 +34,13 @@
+ 
+  virtual void Process(MDFN_Surface* surface, MDFN_Rect& DisplayRect, int32* LineWidths, const bool field) override;
+  virtual void ClearState(void) override;
++ virtual void SaveHistory(Stream* stream) const override;
+ 
+  //
+  //
+  private:
++
++ virtual void LoadHistory(Stream* stream, uint32 max_width, uint32 max_height) override;
+ 
+  template<typename T, bool gc, unsigned cc0s, unsigned cc1s, unsigned cc2s>
+  T Blend(T a, T b);
+--- a/src/video/Deinterlacer_Blend.cpp
++++ b/src/video/Deinterlacer_Blend.cpp
+@@ -22,6 +22,7 @@
+ #include "video-common.h"
+ #include "Deinterlacer.h"
+ #include "Deinterlacer_Blend.h"
++#include "VideoHistoryIO.h"
+ 
+ namespace Mednafen
+ {
+@@ -272,4 +273,37 @@
+  prev_valid = false;
+ }
+ 
+-}
++void Deinterlacer_Blend::SaveHistory(Stream* stream) const
++{
++ VideoHistoryIO::WriteHeader(stream, WantRG ? DEINT_BLEND_RG : DEINT_BLEND);
++ stream->put_LE<uint32>(prev_valid);
++ stream->put_LE<uint32>(prev_height);
++ VideoHistoryIO::WriteSurface(stream, prev_field.get());
++ // Unused entries of the upstream allocation have never been initialized.
++ // Only the previous valid field's rows may be read by the next Process call.
++ VideoHistoryIO::WriteWidths(stream, prev_field_w.get(), prev_valid ? prev_height / 2 : 0);
++}
++
++void Deinterlacer_Blend::LoadHistory(Stream* stream, uint32 max_width, uint32 max_height)
++{
++ prev_valid = VideoHistoryIO::ReadBool(stream);
++ const auto height = stream->get_LE<uint32>();
++ if(height > max_height) throw std::runtime_error("invalid blend history height");
++ prev_height = height;
++ prev_field = VideoHistoryIO::ReadSurface(stream, max_width, max_height / 2);
++ if(prev_valid && (!prev_field || height < 2 || height / 2 > uint32(prev_field->h)))
++  throw std::runtime_error("inconsistent blend history");
++ auto widths = VideoHistoryIO::ReadWidths(stream, prev_valid ? height / 2 : 0,
++                                         prev_field ? prev_field->w : max_width);
++ if(prev_field)
++ {
++  prev_field_w.reset(new int32[prev_field->h]());
++  std::copy(widths.begin(), widths.end(), prev_field_w.get());
++  // These are intra-call scratch, initialized before use by InternalProcess.
++  lb.reset(new uint32[prev_field->w]());
++  prev_field_delay.reset(new uint32[prev_field->w]());
++  prev_w_delay = 0;
++ }
++}
++
++}
+--- a/src/video/VideoHistoryIO.h
++++ b/src/video/VideoHistoryIO.h
+@@ -0,0 +1,104 @@
++#ifndef MDFN_VIDEO_HISTORY_IO_H
++#define MDFN_VIDEO_HISTORY_IO_H
++#include <mednafen/Stream.h>
++#include "surface.h"
++#include "emucap_video_format.h"
++
++namespace Mednafen { namespace VideoHistoryIO {
++static const uint64 MaxBytes = 64ULL * 1024 * 1024;
++inline void RequireBytes(Stream* stream, uint64 count)
++{
++ const auto pos = stream->tell(), size = stream->size();
++ if(pos > size || count > size - pos)
++  throw std::runtime_error("truncated video history");
++}
++inline void WriteHeader(Stream* stream, uint32 type)
++{
++ stream->write("ECDEINT1", 8);
++ stream->put_LE<uint32>(type);
++}
++inline void ReadHeader(Stream* stream, uint32 type)
++{
++ char magic[8]; stream->read(magic, sizeof(magic));
++ if(memcmp(magic, "ECDEINT1", 8) || stream->get_LE<uint32>() != type)
++  throw std::runtime_error("incompatible deinterlacer history");
++}
++inline bool ReadBool(Stream* stream)
++{
++ const auto value = stream->get_LE<uint32>();
++ if(value > 1) throw std::runtime_error("invalid video history validity");
++ return value;
++}
++inline void WriteSurface(Stream* stream, const MDFN_Surface* surface)
++{
++ stream->put_LE<uint32>(surface ? 1 : 0);
++ if(!surface) return;
++ const unsigned opp = emucap_video_pixel_bytes(surface->format.tag);
++ if(surface->w <= 0 || surface->h <= 0 || surface->pitchinpix < surface->w
++    || uint64(surface->pitchinpix) * surface->h * opp > MaxBytes)
++  throw std::runtime_error("invalid video history surface");
++ stream->put_LE<uint32>(surface->w);
++ stream->put_LE<uint32>(surface->h);
++ stream->put_LE<uint64>(surface->format.tag);
++ std::vector<uint8> data(uint64(surface->w) * surface->h * opp);
++ for(int32 y = 0; y < surface->h; ++y)
++  for(int32 x = 0; x < surface->w; ++x)
++  {
++   const size_t index = size_t(y) * surface->pitchinpix + x;
++   uint8* dest = data.data() + (size_t(y) * surface->w + x) * opp;
++   if(opp == 2) MDFN_en16lsb(dest, surface->pixels16[index]);
++   else MDFN_en32lsb(dest, surface->pixels[index]);
++  }
++ stream->write(data.data(), data.size());
++}
++inline std::unique_ptr<MDFN_Surface> ReadSurface(Stream* stream, uint32 max_width, uint32 max_height)
++{
++ if(!ReadBool(stream)) return nullptr;
++ const auto w = stream->get_LE<uint32>(), h = stream->get_LE<uint32>();
++ const auto tag = stream->get_LE<uint64>();
++ const unsigned opp = emucap_video_pixel_bytes(tag);
++ if(!w || !h || w > max_width || h > max_height
++    || w > MaxBytes / opp || h > MaxBytes / (uint64(w) * opp))
++  throw std::runtime_error("invalid video history surface bounds");
++ const uint64 size = uint64(w) * h * opp;
++ RequireBytes(stream, size);
++ std::vector<uint8> data(size);
++ stream->read(data.data(), data.size());
++ std::unique_ptr<MDFN_Surface> result(new MDFN_Surface(nullptr, w, h, w, MDFN_PixelFormat(tag)));
++ for(size_t i = 0; i < size / opp; ++i)
++ {
++  if(opp == 2) result->pixels16[i] = MDFN_de16lsb(data.data() + i * opp);
++  else result->pixels[i] = MDFN_de32lsb(data.data() + i * opp);
++ }
++ return result;
++}
++inline void WriteWidths(Stream* stream, const int32* widths, uint32 count)
++{
++ if(count > MaxBytes / sizeof(int32)) throw std::runtime_error("invalid video history width count");
++ stream->put_LE<uint32>(count);
++ for(uint32 i = 0; i < count; ++i) stream->put_LE<uint32>(widths[i]);
++}
++inline std::vector<int32> ReadWidths(Stream* stream, uint32 count, uint32 max_width)
++{
++ if(stream->get_LE<uint32>() != count || count > MaxBytes / sizeof(int32))
++  throw std::runtime_error("invalid video history width count");
++ RequireBytes(stream, uint64(count) * sizeof(int32));
++ std::vector<int32> widths(count);
++ for(auto& width : widths)
++ {
++  const auto value = stream->get_LE<uint32>();
++  if(!value || value > max_width) throw std::runtime_error("invalid video history row width");
++  width = value;
++ }
++ return widths;
++}
++inline MDFN_Rect ReadRect(Stream* stream, uint32 max_width, uint32 max_height)
++{
++ const uint32 x = stream->get_LE<uint32>(), y = stream->get_LE<uint32>();
++ const uint32 w = stream->get_LE<uint32>(), h = stream->get_LE<uint32>();
++ if(x >= max_width || y >= max_height || w > max_width - x || h > max_height - y)
++  throw std::runtime_error("invalid video history rectangle");
++ return MDFN_Rect{int32(x), int32(y), int32(w), int32(h)};
++}
++} }
++#endif

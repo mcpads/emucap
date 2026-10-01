@@ -39,6 +39,8 @@ impl Budget {
             cancellation: self.cancellation.clone(),
             abort: None,
             max_host_ms: Some(self.check()?),
+            temporal_stop_ms: None,
+            temporal_deadline: None,
         };
         link.call_with_progress(method, json!({}), &mut |_| Ok(()), &control)
     }

@@ -489,19 +489,30 @@ pub(crate) fn make_launch(
         record_token_cleanup_error(&mut failure, token_cleanup_error);
         return failure;
     }
-    let ready_status = match wait_for_adapter_ready(link, adapter_ready_timeout(adapter), || {
-        let emulator_state = manifest.process_state();
-        let bridge_state = manifest.bridge_process_state();
-        if emulator_state != ProcessState::Alive
-            || bridge_state.is_some_and(|state| state != ProcessState::Alive)
-        {
-            Err(format!(
+    let ready_status = match wait_for_adapter_ready(
+        link,
+        adapter_ready_timeout(adapter),
+        || {
+            let emulator_state = manifest.process_state();
+            let bridge_state = manifest.bridge_process_state();
+            if emulator_state != ProcessState::Alive
+                || bridge_state.is_some_and(|state| state != ProcessState::Alive)
+            {
+                Err(format!(
                     "launch process exited before adapter hello: emulator={emulator_state:?}, bridge={bridge_state:?}"
                 ))
-        } else {
-            Ok(())
-        }
-    }) {
+            } else {
+                Ok(())
+            }
+        },
+        |status| {
+            if adapter == "dolphin" {
+                dolphin_launch::audio_output_ready(status, a.sound.unwrap_or(false))
+            } else {
+                Ok(true)
+            }
+        },
+    ) {
         Ok(status) => status,
         Err(error) => {
             let _ = manifest.terminate_owned_processes();
@@ -643,6 +654,7 @@ pub(super) fn wait_for_adapter_ready<F>(
     link: &mut (dyn EmulatorLink + Send),
     timeout: std::time::Duration,
     mut check_processes: F,
+    validate_status: impl Fn(&serde_json::Value) -> Result<bool, String>,
 ) -> Result<serde_json::Value, String>
 where
     F: FnMut() -> Result<(), String>,
@@ -654,7 +666,11 @@ where
             Ok(status)
                 if status.get("connected").and_then(serde_json::Value::as_bool) == Some(true) =>
             {
-                return Ok(status);
+                match validate_status(&status) {
+                    Ok(true) => return Ok(status),
+                    Ok(false) => format!("native output is transitioning: {status}"),
+                    Err(error) => return Err(format!("{error}; ready_status: {status}")),
+                }
             }
             Ok(status) => format!("status did not report connected=true: {status}"),
             Err(error) => error.to_string(),
@@ -976,13 +992,14 @@ pub(super) fn launch_flycast(
         name: a.name.as_deref(),
         session_token: token,
         runtime: Some(runtime),
-        mute: true,
+        mute: !a.sound.unwrap_or(false),
         gdb: false,
     };
     match emucap::launch::flycast::launch(&spec) {
         Ok(pid) => serde_json::json!({
             "launched": true,
             "adapter": "flycast",
+            "sound": a.sound.unwrap_or(false),
             "pid": pid,
             "port": port,
             "binary": binary.display().to_string(),
@@ -1039,6 +1056,7 @@ pub(super) fn launch_dolphin(
         session_token: token,
         runtime: Some(runtime),
         display,
+        sound: a.sound.unwrap_or(false),
     };
     match dolphin_launch::launch(&launch) {
         Ok(pid) => serde_json::json!({
@@ -1047,6 +1065,7 @@ pub(super) fn launch_dolphin(
             "system": system,
             "pid": pid,
             "display": display,
+            "sound": a.sound.unwrap_or(false),
             "port": port,
             "binary": binary.display().to_string(),
             "host_build": host_build,

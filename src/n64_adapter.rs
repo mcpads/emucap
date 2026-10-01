@@ -200,6 +200,7 @@ struct Api {
     debug_breakpoint_lookup: DebugBreakpointLookup,
     debug_breakpoint_consume: DebugBreakpointConsume,
     debug_decode_op: DebugDecodeOp,
+    debug_frame_resume: unsafe extern "C" fn(),
 }
 
 unsafe impl Send for Api {}

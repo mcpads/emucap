@@ -199,6 +199,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 "Xbox {operation} requires a frozen VM; pause first"
             )));
         }
+        self.extension_status()?;
         self.retry_pending_snapshot_cleanup();
         Ok(())
     }

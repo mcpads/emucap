@@ -1,15 +1,16 @@
-diff --git a/Source/Core/Core/HW/ProcessorInterface.cpp b/Source/Core/Core/HW/ProcessorInterface.cpp
-index 95320d9..fdf0844 100644
---- a/Source/Core/Core/HW/ProcessorInterface.cpp
-+++ b/Source/Core/Core/HW/ProcessorInterface.cpp
-@@ -4,5 +4,6 @@
+diff --git i/Source/Core/Core/HW/ProcessorInterface.cpp w/Source/Core/Core/HW/ProcessorInterface.cpp
+index 10cca6c..3514969 100644
+--- i/Source/Core/Core/HW/ProcessorInterface.cpp
++++ w/Source/Core/Core/HW/ProcessorInterface.cpp
+@@ -3,6 +3,7 @@
+ 
  #include "Core/HW/ProcessorInterface.h"
  
 +#include <limits>
  #include <memory>
  
  #include "Common/Assert.h"
-@@ -13,6 +14,7 @@
+@@ -11,6 +12,7 @@
  #include "Common/Logging/Log.h"
  #include "Core/Core.h"
  #include "Core/CoreTiming.h"
@@ -17,14 +18,16 @@ index 95320d9..fdf0844 100644
  #include "Core/HW/DVD/DVDInterface.h"
  #include "Core/HW/MMIO.h"
  #include "Core/HW/SystemTimers.h"
-@@ -67,4 +69,6 @@ void ProcessorInterfaceManager::Init()
+@@ -66,6 +68,8 @@ void ProcessorInterfaceManager::Init()
+   auto& core_timing = m_system.GetCoreTiming();
    m_event_type_toggle_reset_button =
        core_timing.RegisterEvent("ToggleResetButton", ToggleResetButtonCallback);
 +  m_event_type_emucap_toggle_reset_button =
 +      core_timing.RegisterEvent("EmucapToggleResetButton", EmucapToggleResetButtonCallback);
    m_event_type_ios_notify_reset_button =
        core_timing.RegisterEvent("IOSNotifyResetButton", IOSNotifyResetButtonCallback);
-@@ -265,6 +269,16 @@ void ProcessorInterfaceManager::ToggleResetButtonCallback(Core::System& system,
+   m_event_type_ios_notify_power_button =
+@@ -264,6 +268,20 @@ void ProcessorInterfaceManager::ToggleResetButtonCallback(Core::System& system,
    system.GetProcessorInterface().SetResetButton(!!userdata);
  }
  
@@ -33,7 +36,11 @@ index 95320d9..fdf0844 100644
 +{
 +  const bool pressed = (userdata & 1) != 0;
 +  const u64 token = userdata >> 1;
++  if (!EmuCap::IsResetTapActive(token))
++    return;
 +  system.GetProcessorInterface().SetResetButton(pressed);
++  if (pressed)
++    IOSNotifyResetButtonCallback(system, 0, cyclesLate);
 +  if (!pressed)
 +    EmuCap::NotifyResetTapComplete(system, token);
 +}
@@ -41,7 +48,7 @@ index 95320d9..fdf0844 100644
  void ProcessorInterfaceManager::IOSNotifyResetButtonCallback(Core::System& system, u64 userdata,
                                                               s64 cyclesLate)
  {
-@@ -301,6 +315,27 @@ void ProcessorInterfaceManager::ResetButton_Tap()
+@@ -301,6 +319,27 @@ void ProcessorInterfaceManager::ResetButton_Tap()
                              m_event_type_toggle_reset_button, false, CoreTiming::FromThread::ANY);
  }
  
@@ -49,9 +56,9 @@ index 95320d9..fdf0844 100644
 +{
 +  ASSERT(token != 0 && token <= (std::numeric_limits<u64>::max() >> 1));
 +  auto& core_timing = m_system.GetCoreTiming();
++  // Discard events restored from an earlier runtime before this token can become observable.
++  core_timing.RemoveAllEvents(m_event_type_emucap_toggle_reset_button);
 +  core_timing.ScheduleEvent(0, m_event_type_emucap_toggle_reset_button, (token << 1) | 1,
-+                            CoreTiming::FromThread::ANY);
-+  core_timing.ScheduleEvent(0, m_event_type_ios_notify_reset_button, 0,
 +                            CoreTiming::FromThread::ANY);
 +  core_timing.ScheduleEvent(m_system.GetSystemTimers().GetTicksPerSecond() / 2,
 +                            m_event_type_emucap_toggle_reset_button, token << 1,
@@ -69,10 +76,10 @@ index 95320d9..fdf0844 100644
  void ProcessorInterfaceManager::PowerButton_Tap()
  {
    if (!Core::IsRunning(m_system))
-diff --git a/Source/Core/Core/HW/ProcessorInterface.h b/Source/Core/Core/HW/ProcessorInterface.h
-index 11bcb53..185c5ea 100644
---- a/Source/Core/Core/HW/ProcessorInterface.h
-+++ b/Source/Core/Core/HW/ProcessorInterface.h
+diff --git i/Source/Core/Core/HW/ProcessorInterface.h w/Source/Core/Core/HW/ProcessorInterface.h
+index 4934147..988ba40 100644
+--- i/Source/Core/Core/HW/ProcessorInterface.h
++++ w/Source/Core/Core/HW/ProcessorInterface.h
 @@ -101,6 +101,11 @@ public:
    // Thread-safe func which sets and clears reset button state automagically
    void ResetButton_Tap();
@@ -85,7 +92,8 @@ index 11bcb53..185c5ea 100644
  
    u32 m_interrupt_cause = 0;
    u32 m_interrupt_mask = 0;
-@@ -124,8 +129,10 @@ private:
+@@ -123,10 +128,12 @@ private:
+ 
    // ID and callback for scheduling reset button presses/releases
    static void ToggleResetButtonCallback(Core::System& system, u64 userdata, s64 cyclesLate);
 +  static void EmucapToggleResetButtonCallback(Core::System& system, u64 userdata, s64 cyclesLate);
@@ -96,3 +104,4 @@ index 11bcb53..185c5ea 100644
 +  CoreTiming::EventType* m_event_type_emucap_toggle_reset_button = nullptr;
    CoreTiming::EventType* m_event_type_ios_notify_reset_button = nullptr;
    CoreTiming::EventType* m_event_type_ios_notify_power_button = nullptr;
+ 

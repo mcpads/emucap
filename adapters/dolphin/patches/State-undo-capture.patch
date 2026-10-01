@@ -1,0 +1,19 @@
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -848,7 +848,15 @@
+   auto& movie = system.GetMovie();
+   if (!movie.IsJustStartingRecordingInputFromSaveState())
+   {
+-    SaveToBuffer(system, s_undo_load_buffer);
++    Common::UniqueBuffer<u8> undo_buffer{std::size_t(s_last_state_size)};
++    const auto undo_size = SaveToBuffer(system, undo_buffer);
++    if (undo_size == 0)
++    {
++      Core::DisplayMessage("Unable to load: could not capture undo state", OSD::Duration::NORMAL);
++      return false;
++    }
++    undo_buffer.assign(undo_buffer.extract().first, undo_size);
++    s_undo_load_buffer.swap(undo_buffer);
+     const std::string dtmpath = File::GetUserPath(D_STATESAVES_IDX) + "undo.dtm";
+     if (movie.IsMovieActive())
+       movie.SaveRecording(dtmpath);

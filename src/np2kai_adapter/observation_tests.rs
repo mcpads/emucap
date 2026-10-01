@@ -97,3 +97,33 @@ fn advertised_windows_are_exactly_the_native_peek_view() {
         );
     }
 }
+
+#[test]
+fn policy_changes_and_short_parks_start_a_new_frame_schedule() {
+    let initial = Instant::now();
+    let mut pacer = limited(100);
+    pacer.frame_start(100, FRAME, initial);
+    // Native centi-percent domain: minimum, 1%, 100%, maximum.
+    for (centi_percent, period) in [
+        (1, Duration::from_secs(200)),
+        (100, Duration::from_secs(2)),
+        (10_000, FRAME),
+        (1_000_000, Duration::from_micros(200)),
+    ] {
+        let changed = initial + Duration::from_millis(3);
+        pacer.set(PacingPolicy::Limited { centi_percent });
+        assert_eq!(pacer.frame_start(101, FRAME, changed), Some(changed));
+        assert_eq!(pacer.frame_start(102, FRAME, changed), Some(changed + period));
+        let policy = pacer.policy;
+        let revision = pacer.revision;
+        pacer.reanchor();
+        let resumed = changed + Duration::from_millis(3);
+        assert_eq!(pacer.frame_start(102, FRAME, resumed), Some(resumed));
+        assert_eq!(pacer.frame_start(103, FRAME, resumed), Some(resumed + period));
+        assert_eq!(pacer.policy, policy);
+        assert_eq!(pacer.revision, revision);
+    }
+    pacer.set(PacingPolicy::Unlimited);
+    pacer.reanchor();
+    assert_eq!(pacer.frame_start(104, FRAME, initial), None);
+}

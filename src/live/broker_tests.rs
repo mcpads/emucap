@@ -164,7 +164,11 @@ fn broker_attach_preserves_contract_advertisement() {
                     "name": "nds-contracts",
                     "adapter": "desmume-nds-rust-gdb",
                     "system": "nds",
-                    "methods": ["status", "step_instructions", "call_stack"],
+                    "methods": ["status", "step", "step_instructions", "call_stack", "cancel_operation"],
+                    "temporal_cancellation_capability": {"methods":["step"],"control_service_ms":25,"stop_host_ms":1000},
+                    "producer_extension": {"nested":[1,"two",{"three":true}]},
+                    "attached_name":"producer-forged-route",
+                    "broker_registration_id":999999,
                     "contracts": crate::contracts::advertisement_value(&[
                         "nds.execution.frame-step-vblank",
                         "nds.call-stack.best-effort",
@@ -205,6 +209,11 @@ fn broker_attach_preserves_contract_advertisement() {
             "nds.call-stack.best-effort"
         ])
     );
+    assert_eq!(value["result"]["temporal_cancellation_capability"],
+        serde_json::json!({"methods":["step"],"control_service_ms":25,"stop_host_ms":1000}));
+    assert_eq!(value["result"]["producer_extension"],serde_json::json!({"nested":[1,"two",{"three":true}]}));
+    assert_eq!(value["result"]["attached_name"],"nds-contracts");
+    assert_ne!(value["result"]["broker_registration_id"],999999);
     emulator.join().unwrap();
 }
 
@@ -643,4 +652,56 @@ fn broker_persists_across_session() {
         ar2.contains("attached_name") && ar2.contains("g"),
         "재attach 복귀: {ar2}"
     );
+}
+
+#[test]
+fn broker_frontend_eof_delivers_negotiated_attachment_detach() {
+    let (ea, sa) = start_broker();
+    let (sent, received) = std::sync::mpsc::channel();
+    let producer = std::thread::spawn(move || {
+        let mut writer = TcpStream::connect(ea).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        writeln!(writer,"{}",serde_json::json!({"id":0,"ok":true,"result":{"name":"lifecycle","methods":["step"],"launch_id":"live","control_session_lifecycle":true}})).unwrap();
+        for _ in 0..3 {
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            sent.send(serde_json::from_str::<serde_json::Value>(&line).unwrap())
+                .unwrap();
+        }
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut frontend = loop {
+        let (socket, result) = attach(&sa, Some("lifecycle"));
+        if result.contains("attached_name") {
+            break socket;
+        }
+        assert!(std::time::Instant::now() < deadline, "{result}");
+        std::thread::yield_now();
+    };
+    writeln!(
+        frontend,
+        "{}",
+        serde_json::json!({"v":1,"id":1,"method":"step","params":{"frames":2}})
+    )
+    .unwrap();
+    let attached = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    let request = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(attached["_control_session"]["kind"], "attach");
+    assert_eq!(
+        request["params"]["_control_attachment"],
+        attached["_control_session"]["attachment"]
+    );
+    drop(frontend);
+    let detached = received.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(detached["_control_session"]["kind"], "detach");
+    assert_eq!(
+        detached["_control_session"]["attachment"],
+        attached["_control_session"]["attachment"]
+    );
+    producer.join().unwrap();
 }

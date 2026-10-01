@@ -9,6 +9,7 @@ use std::process::Command;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+mod lookup;
 mod termination;
 pub use termination::{
     GenerationTermination, ProcessTermination, TerminationRecord, TerminationState,

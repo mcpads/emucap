@@ -1,0 +1,41 @@
+--- a/Source/Core/Core/Movie.h
++++ b/Source/Core/Core/Movie.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <atomic>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+@@ -240,7 +241,9 @@
+   DTMHeader m_temp_header{};
+   std::vector<u8> m_temp_input;
+   u64 m_current_byte = 0;
+-  u64 m_current_frame = 0;
++  // VI writes on the CPU thread; status and native GUI readers observe without pausing it.
++  // PointerWrap already serializes atomic values as their unchanged scalar representation.
++  std::atomic<u64> m_current_frame{0};
+   u64 m_total_frames = 0;  // VI
+   u64 m_current_lag_count = 0;
+   u64 m_total_lag_count = 0;
+--- a/Source/Core/Core/Movie.cpp
++++ b/Source/Core/Core/Movie.cpp
+@@ -305,7 +305,7 @@
+ 
+ u64 MovieManager::GetCurrentFrame() const
+ {
+-  return m_current_frame;
++  return m_current_frame.load(std::memory_order_relaxed);
+ }
+ 
+ u64 MovieManager::GetTotalFrames() const
+@@ -979,7 +979,7 @@
+     PanicAlertFmtT(
+         "Warning: You loaded a save whose movie ends before the current frame in the save "
+         "(byte {0} < {1}) (frame {2} < {3}). You should load another save before continuing.",
+-        totalSavedBytes + 256, m_current_byte + 256, m_temp_header.frameCount, m_current_frame);
++        totalSavedBytes + 256, m_current_byte + 256, m_temp_header.frameCount, GetCurrentFrame());
+     afterEnd = true;
+   }
+ 

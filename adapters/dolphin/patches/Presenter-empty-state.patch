@@ -1,0 +1,12 @@
+--- a/Source/Core/VideoCommon/Present.cpp
++++ b/Source/Core/VideoCommon/Present.cpp
+@@ -1047,6 +1047,9 @@
+   p.Do(m_last_xfb_stride);
+   p.Do(m_last_xfb_height);
+ 
++  if (p.IsReadMode() && m_last_xfb_stride == 0)
++    ClearLastXfbId();
++
+   // If we're loading and there is a last XFB, re-display it.
+   if (p.IsReadMode() && m_last_xfb_stride != 0)
+   {

@@ -212,6 +212,10 @@ fn bridge_spec_binds_state_storage_and_exact_host_build() {
         .collect::<std::collections::BTreeMap<_, _>>();
     assert_eq!(Path::new(&env["EMUCAP_XEMU_HDD_PATH"]), prepared.hdd);
     assert_eq!(Path::new(&env["EMUCAP_XEMU_EEPROM_PATH"]), prepared.eeprom);
+    assert_eq!(
+        env["EMUCAP_XEMU_CLOCK_SHIFT"],
+        prepared.clock_shift.to_string()
+    );
     assert_eq!(env["EMUCAP_XEMU_HOST_COMMIT"], launch.host_build.commit);
     assert_eq!(
         env["EMUCAP_XEMU_HOST_PATCHSET_SHA256"],

@@ -1,6 +1,10 @@
 use super::input::{xbox_input_axes_json, xbox_input_buttons_json};
+use super::observation::XemuPacing;
 use super::*;
 use std::time::Instant;
+
+/// How long a stopped frame step may take to report its settled extension state.
+const FRAME_SETTLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
     pub(super) fn hello(&mut self) -> XemuResult<Value> {
@@ -50,6 +54,8 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 "max_sync_operation_ms": crate::live::temporal::MAX_SYNC_OPERATION_MS,
             },
             "host_api": status["api"],
+            "memory_batch_capability": Self::memory_batch_capability(),
+            "execution_speed_capability": Self::execution_speed_capability(),
             "machine_inputs": self.machine_identity.value(),
             "host_build": self.state_environment.host_build,
             "launch_start": self.launch_start_value(),
@@ -93,10 +99,20 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             "state_snapshot_cleanup_pending": self.pending_state_snapshot_cleanup.len(),
             "qmp_status": machine["status"],
             "frame": extension["frame-boundary"],
+            "clock_profile": extension["clock-profile"],
+            "apu_continuation": extension["apu-continuation"],
+            "scheduler_diagnostics": {
+                "virtual_ns": extension["virtual-ns"],
+                "instructions": extension["instructions"],
+                "apu_timer_calls": extension["apu-ticks"],
+                "apu_retry_calls": extension["apu-retries"],
+                "apu_completed_quanta": extension["apu-quanta"],
+            },
+            "execution_speed": XemuPacing::from_status(&extension).map(|pacing| pacing.public()),
             "frame_step": {
                 "active": extension["frame-step-active"],
                 "remaining": extension["frame-step-remaining"],
-                "boundary": "nv2a_display_update_accepted_while_running",
+                "boundary": FRAME_CLOCK,
             },
             "input_override": {
                 "engaged": input_engaged,
@@ -149,7 +165,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             "implemented_methods": METHODS,
             "execution": {
                 "units": ["frames", "instructions"],
-                "frame_boundary": "NV2A display update accepted while VM running",
+                "frame_boundary": FRAME_CLOCK,
                 "frame_step_terminal": "frozen",
                 "breakpoint_preemption": true,
             },
@@ -187,11 +203,15 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 "xemu emucap API mismatch: need {REQUIRED_HOST_API}, got {api}"
             )));
         }
+        self.verify_clock_profile(&value)?;
         for key in [
             "frame-boundary",
             "frame-step-active",
             "frame-step-remaining",
             "input-engaged",
+            "pacing-percent",
+            "pacing-revision",
+            "virtual-ns",
         ] {
             if value.get(key).is_none() {
                 return Err(XemuBridgeError::Emulator(format!(
@@ -327,20 +347,45 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         }
     }
 
-    fn wait_frame_step(
+    /// Wait for the stop that ends an armed frame step. A step that reaches the host budget is
+    /// stopped where it is and reported as interrupted with the frames it reached.
+    pub(super) fn wait_frame_step(
         &mut self,
         count: u64,
         start: u64,
         deadline: crate::live::temporal::OperationDeadline,
     ) -> XemuResult<Value> {
-        let stop = self.gdb.recv_reply()?;
-        if !is_stop_packet(&stop) {
-            return Err(XemuBridgeError::Emulator(format!(
-                "GDB frame step returned an unexpected response: {stop}"
-            )));
-        }
+        let mut deadline_stop = false;
+        let stop = loop {
+            if let Some(packet) = self.gdb.recv_nonblocking()? {
+                if !is_stop_packet(&packet) {
+                    return Err(XemuBridgeError::Emulator(format!(
+                        "GDB frame step returned an unexpected response: {packet}"
+                    )));
+                }
+                break packet;
+            }
+            if deadline.expired() {
+                deadline_stop = true;
+                let timeout = self.gdb.get_timeout()?;
+                self.gdb.set_timeout(FRAME_SETTLE_TIMEOUT)?;
+                let stop = self.gdb.interrupt();
+                let restored = self.gdb.set_timeout(timeout);
+                let packet = stop?;
+                restored?;
+                if !is_stop_packet(&packet) {
+                    return Err(XemuBridgeError::Emulator(
+                        "GDB deadline interrupt returned a non-stop reply".into(),
+                    ));
+                }
+                break packet;
+            }
+            std::thread::sleep(FRAME_STOP_POLL_INTERVAL);
+        };
+        let deadline_interrupt = deadline_stop && stop_signal(&stop) == "02";
         self.note_stop(stop, true)?;
 
+        let settle = Instant::now() + FRAME_SETTLE_TIMEOUT;
         loop {
             let extension = self.extension_status()?;
             let machine = self.machine_status()?;
@@ -364,24 +409,29 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
                 return Ok(json!({
                     "status":"completed", "unit":"frames", "count":advanced,
                     "requested":count, "start_frame":start, "end_frame":end,
-                    "clock":"nv2a_display_update_accepted_while_running", "state":"frozen"
+                    "clock":FRAME_CLOCK, "state":"frozen"
                 }));
             }
 
             if active && !running {
                 self.qmp.execute("xemu-emucap-cancel-frame-step", None)?;
+                let reason = if deadline_interrupt {
+                    "host_deadline"
+                } else {
+                    "debugger_stop"
+                };
                 let advanced = end.saturating_sub(start);
                 return Ok(json!({
-                    "status":"interrupted", "reason":"debugger_stop", "unit":"frames",
-                    "count":advanced, "requested":count, "start_frame":start, "end_frame":end,
-                    "clock":"nv2a_display_update_accepted_while_running", "state":"frozen"
+                    "status":"interrupted", "reason":reason, "unit":"frames",
+                    "count":advanced, "completed":advanced, "requested":count,
+                    "start_frame":start, "end_frame":end,
+                    "clock":FRAME_CLOCK, "state":"frozen"
                 }));
             }
 
-            if deadline.expired() {
+            if Instant::now() >= settle {
                 return Err(XemuBridgeError::Emulator(format!(
-                    "Xbox frame step exceeded {} ms after {} of {count}",
-                    crate::live::temporal::MAX_SYNC_OPERATION_MS,
+                    "Xbox frame step did not settle after its stop at {} of {count}",
                     end.saturating_sub(start)
                 )));
             }

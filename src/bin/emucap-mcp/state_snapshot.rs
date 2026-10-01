@@ -2,19 +2,14 @@ use crate::{
     args::SaveStateArgs, error_result, link_error_result, tool_output_result, SharedLink,
     ToolOutput,
 };
-use emucap::live::{link::RequestCancellation, runtime::RuntimeStore, snapshot, tools};
+use emucap::live::{runtime::RuntimeStore, snapshot, tools};
 use rmcp::{
     model::{CallToolResult, ProgressNotificationParam},
     service::{RequestContext, RoleServer},
 };
 use std::time::Duration;
 
-struct CancelOnDrop(RequestCancellation);
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
+use crate::request_ownership::{Admission, CancelOnDrop};
 
 pub async fn save(
     link: SharedLink,
@@ -27,10 +22,12 @@ pub async fn save(
             "snapshot_key and preserve_for_recording are distinct receipt classes",
         );
     }
-    let cancellation = RequestCancellation::default();
+    let cancellation = Admission::cancellation(&context);
     let _guard = CancelOnDrop(cancellation.clone());
     let worker_cancel = cancellation.clone();
+    let admission = Admission::take(&context);
     let mut worker = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         let mut link = link.lock().unwrap_or_else(|e| e.into_inner());
         if args.preserve_for_recording {
             tools::save_state_for_recording(&mut *link, &args.path)

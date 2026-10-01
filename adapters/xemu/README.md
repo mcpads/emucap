@@ -59,10 +59,28 @@ controller topology. It is deliberately same-generation-only: relaunching xemu i
 container, and a different or modified disc is rejected before mutation. Load remains frozen,
 reconciles owned breakpoints and input, and proves both QMP and GDB serviceability; a failed load is
 rolled back to the prior frozen state or marked unresolved if recovery cannot be proved.
+NV2A snapshot format 4 preserves PGRAPH command attributes and active inline vertices,
+rebuilds renderer cache state, and releases FIFO ownership on decode failures. Earlier
+native NV2A formats omit required command state and are rejected. The host API remains 3.
 The negotiated debug `probe` operation validates its bounded frame and memory request before
 mutation, then loads one such container, advances by exact NV2A boundaries, and reads the resulting
 frozen memory without a public-request gap. Breakpoint preemption returns the interrupted boundary
 and retains its event instead of being flattened into completion.
+
+Host API 2 adds frozen `read_memory_batch`: up to 64 ordered ranges and 64 KiB total from
+`main` RAM in one QMP command. All ranges are validated before the NV2A FIFO and PGRAPH writers
+are parked for the copy. Repeated and overlapping ranges retain request order. The receipt reports
+the generation, stop epoch, frame counter and guest virtual clock. Rebuild with
+`adapters/xemu/build.sh`.
+
+The experimental Xbox profile uses host API 3 and fixed instruction-count scheduling for
+`debug.execution_speed`: integer 1–1000% or unlimited, while running or frozen. Managed launch
+selects single-thread TCG with `shift=3,align=off,sleep=off`; pacing changes only host waits.
+The bridge verifies the complete native clock profile against the managed generation.
+Policy survives reset/load within the generation, and a new launch starts at 100%.
+NV2A and APU work follow guest virtual time. Host throughput can limit the achieved rate.
+This profile passed menu, matched-gameplay and rebuilt-producer lifecycle checks on hidden/muted
+macOS Apple Silicon. Remaining display/sound and platform qualification precede broader production adoption.
 
 The `main` memory type is the complete 64 MiB physical RAM region at offset zero. The `cpu` type is
 the current i386 virtual address space. The bridge bounds xemu's GDB physical-memory mode to one

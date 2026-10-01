@@ -110,6 +110,13 @@ PATCHES=(
   "$HERE/patches/0012-add-snes-bg-chr-fetch-events.patch"
   "$HERE/patches/0013-fix-snes-ppu-observation-coordinates.patch"
   "$HERE/patches/0014-add-agent-pacing-controls.patch"
+  "$HERE/patches/0015-preserve-completed-frame-preview.patch"
+  "$HERE/patches/0016-preserve-sms-raster-history.patch"
+  "$HERE/patches/0017-preserve-gamegear-lcd-frame-history.patch"
+  "$HERE/patches/0018-preserve-agent-frame-rendering.patch"
+  "$HERE/patches/0019-preserve-gba-raster-and-lcd-history.patch"
+  "$HERE/patches/0020-preserve-gb-raster-and-lcd-history.patch"
+  "$HERE/patches/0021-preserve-nes-raster-history.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

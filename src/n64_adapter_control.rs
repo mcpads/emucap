@@ -219,12 +219,12 @@ impl Mupen64PlusHost {
             )));
         }
         let frame_before = self.public_frame();
-        STATE_LOAD_RESULT.store(-1, Ordering::Release);
-        self.frame_clock_synchronized = false;
         let path_c = path_cstring(&path)?;
         check_core("STATE_LOAD", unsafe {
             (self.api.core_do_command)(M64CMD_STATE_LOAD, 0, path_c.as_ptr() as *mut c_void)
         })?;
+        STATE_LOAD_RESULT.store(-1, Ordering::Release);
+        self.frame_clock_synchronized = false;
         let stepped = match self.step(&json!({"frames":1u64, "cpu":"r4300"})) {
             Ok(stepped) => stepped,
             Err(error) => {

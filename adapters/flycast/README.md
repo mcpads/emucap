@@ -44,10 +44,13 @@ generation link while it pauses, restores state, advances exact frames, and read
 the native adapter does not need a duplicate wire verb. `status.methods` is authoritative.
 
 A frozen stop reached through a vblank parks at the end of that SH4 timeslice, after the scheduler
-tick and interrupt update, not inside the vblank callback. Nothing is in flight there, so a state
-saved or loaded while parked is the whole machine and the same state always resumes the same way.
-Parking inside the callback let the scheduler finish that tick with the pre-load timeline, so one
-saved state produced different guest memory and input outcomes from run to run.
+tick and interrupt update. This lets the restored scheduler resume without an older callback on
+the host stack. Managed snapshots also preserve the interpreter's execution-unit and memory-access
+cycle history. The native adapter writes a 24-byte `EMUCAPFC` header followed by the upstream
+snapshot payload; all header integers are little-endian (unit: u32, memory count: u32, payload
+length: u64). Raw snapshots from earlier producers lack this continuation and are rejected before
+restore. Create new checkpoints with the maintained producer. Invalid header fields or lengths
+are also rejected before changing the machine; the native payload still uses upstream validation.
 
 `read_memory_batch` reads up to 64 ranges (64 KiB) of `ram`, `vram` and `aica` at one frozen stop
 (vblank park or exec breakpoint) from their backing host arrays. `debug.execution_speed` sets an
@@ -78,8 +81,8 @@ checks the guard flag). On a hit, emucap_bp_spin stops and services the socket b
 Read/write watchpoints and `step(unit="instructions")` are refused because the required memory-access and instruction-step
 contracts are not available under the native adapter's vblank-frame freeze model.
 
-Mute: sound can be turned on with `EMUCAP_MUTE=0` (default 1 = muted). The launcher writes `aica.Volume` only in
-the emucap-owned config copy.
+MCP launch enables audio with `sound:true` (default false). The shell launcher uses
+`EMUCAP_MUTE=0`. Both write `aica.Volume` only in the emucap-owned config copy.
 
 ⚠ **screenshot works via a continuous buffer.** GetLastFrame needs the GL context (UI thread), but freeze (the park spin) blocks
 UI rendering, so a gui_runOnUiThread/deferred approach deadlocks. Instead, mainui_rend_frame copies the latest raw frame into a

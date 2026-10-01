@@ -1,0 +1,97 @@
+diff --git i/Source/Core/AudioCommon/AudioCommon.cpp w/Source/Core/AudioCommon/AudioCommon.cpp
+index 73e1094..ba7b3d4 100644
+--- i/Source/Core/AudioCommon/AudioCommon.cpp
++++ w/Source/Core/AudioCommon/AudioCommon.cpp
+@@ -23,6 +23,13 @@
+ 
+ namespace AudioCommon
+ {
++static OutputObservationOwner s_output_observation;
++
++OutputObservation GetOutputObservation()
++{
++  return s_output_observation.Read();
++}
++
+ constexpr int AUDIO_VOLUME_MIN = 0;
+ constexpr int AUDIO_VOLUME_MAX = 100;
+ 
+@@ -47,25 +54,33 @@ static std::unique_ptr<SoundStream> CreateSoundStreamForBackend(std::string_view
+ 
+ void InitSoundStream(Core::System& system)
+ {
++  const auto token = s_output_observation.BeginInitialization();
+   std::string backend = Config::Get(Config::MAIN_AUDIO_BACKEND);
++  const char* fallback = nullptr;
+   std::unique_ptr<SoundStream> sound_stream = CreateSoundStreamForBackend(backend);
+ 
+   if (!sound_stream)
+   {
+     WARN_LOG_FMT(AUDIO, "Unknown backend {}, using {} instead.", backend, GetDefaultSoundBackend());
+     backend = GetDefaultSoundBackend();
++    fallback = "requested_backend_unavailable";
+     sound_stream = CreateSoundStreamForBackend(backend);
+   }
+-
+-  if (!sound_stream || !sound_stream->Init())
++  if (sound_stream)
++    s_output_observation.Constructed(token, backend, fallback);
++  bool initialized = sound_stream && sound_stream->Init();
++  if (!initialized)
+   {
+     WARN_LOG_FMT(AUDIO, "Could not initialize backend {}, using {} instead.", backend,
+                  BACKEND_NULLSOUND);
+     sound_stream = std::make_unique<NullSound>();
+-    sound_stream->Init();
++    backend = BACKEND_NULLSOUND;
++    s_output_observation.Constructed(token, backend, "backend_initialization_failed");
++    initialized = sound_stream->Init();
+   }
+ 
+   system.SetSoundStream(std::move(sound_stream));
++  s_output_observation.Initialized(token, initialized);
+ }
+ 
+ void PostInitSoundStream(Core::System& system)
+@@ -87,7 +102,9 @@ void ShutdownSoundStream(Core::System& system)
+     StopAudioDump(system);
+ 
+   SetSoundStreamRunning(system, false);
++  const auto token = s_output_observation.BeginClose();
+   system.SetSoundStream(nullptr);
++  s_output_observation.Closed(token);
+ 
+   INFO_LOG_FMT(AUDIO, "Done shutting down sound stream");
+ }
+@@ -184,7 +201,10 @@ void SetSoundStreamRunning(Core::System& system, bool running)
+     return;
+   system.SetSoundStreamRunning(running);
+ 
+-  if (sound_stream->SetRunning(running))
++  const auto token = s_output_observation.BeginRun(running);
++  const bool success = sound_stream->SetRunning(running);
++  s_output_observation.FinishedRun(token, running, success);
++  if (success)
+     return;
+   if (running)
+     ERROR_LOG_FMT(AUDIO, "Error starting stream.");
+diff --git i/Source/Core/AudioCommon/AudioCommon.h w/Source/Core/AudioCommon/AudioCommon.h
+index bd94ba5..79c07d4 100644
+--- i/Source/Core/AudioCommon/AudioCommon.h
++++ w/Source/Core/AudioCommon/AudioCommon.h
+@@ -8,6 +8,7 @@
+ #include <vector>
+ 
+ #include "AudioCommon/Enums.h"
++#include "Core/EmuCapAudio.h"
+ #include "AudioCommon/SoundStream.h"
+ 
+ class Mixer;
+@@ -19,6 +20,7 @@ class System;
+ 
+ namespace AudioCommon
+ {
++OutputObservation GetOutputObservation();
+ void InitSoundStream(Core::System& system);
+ void PostInitSoundStream(Core::System& system);
+ void ShutdownSoundStream(Core::System& system);

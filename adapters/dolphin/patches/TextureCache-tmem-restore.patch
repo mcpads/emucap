@@ -1,0 +1,36 @@
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -136,7 +136,11 @@
+ {
+   FlushEFBCopies();
+   TMEM::InvalidateAll();
+-
++  ClearCacheEntries();
++}
++
++void TextureCacheBase::ClearCacheEntries()
++{
+   for (auto& bind : m_bound_textures)
+     bind.reset();
+   m_textures_by_hash.clear();
+@@ -701,8 +705,9 @@
+   // Since we throw away entries when not in loading mode now, we don't need to check
+   // before inserting entries into the cache, as GetEntry will always return null.
+   const bool commit_state = p.IsReadMode();
++  // TMEM was restored earlier by VideoCommon_DoState; only discard old host entries.
+   if (commit_state)
+-    Invalidate();
++    ClearCacheEntries();
+ 
+   // Preload all cache entries.
+   u32 size = 0;
+--- a/Source/Core/VideoCommon/TextureCacheBase.h
++++ b/Source/Core/VideoCommon/TextureCacheBase.h
+@@ -407,6 +407,7 @@
+   bool CheckReadbackTexture(u32 width, u32 height, AbstractTextureFormat format);
+   void DoSaveState(PointerWrap& p);
+   void DoLoadState(PointerWrap& p);
++  void ClearCacheEntries();
+ 
+   void ApplyMaterialToCacheEntry(const VideoCommon::MaterialResource& material, TCacheEntry* entry);
+ 

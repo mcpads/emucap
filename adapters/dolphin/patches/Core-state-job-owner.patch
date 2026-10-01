@@ -1,0 +1,29 @@
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -160,6 +160,9 @@
+ 
+ // Run a function on the CPU thread, asynchronously.
+ void RunOnCPUThread(Core::System& system, Common::MoveOnlyFunction<void()> function);
++// Queue native CPU work while excluding host state changes and temporary CPU guards.
++// Intended for paused state transactions; the callback must recheck its boundary.
++void RunOnCPUThreadWithHostLock(Core::System& system, Common::MoveOnlyFunction<void()> function);
+ 
+ // for calling back into UI code without introducing a dependency on it in core
+ using StateChangedCallbackFunc = std::function<void(Core::State)>;
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -872,6 +872,14 @@
+   RestoreStateAndUnlock(system, was_running);
+ }
+ 
++void RunOnCPUThreadWithHostLock(Core::System& system, Common::MoveOnlyFunction<void()> function)
++{
++  RunOnCPUThread(system, [function = std::move(function)]() mutable {
++    std::lock_guard lock(s_core_mutex);
++    function();
++  });
++}
++
+ // --- Callbacks for backends / engine ---
+ 
+ // Called from Renderer::Swap (GPU thread) when a frame is presented to the host screen.

@@ -416,15 +416,13 @@ async fn step_keeps_the_existing_exact_frozen_wire_contract() {
     let concrete = Arc::new(Mutex::new(StepWireLink::new()));
     let shared: SharedLink = concrete.clone();
     let server = Emucap::new(shared);
-    let result = server
-        .step(Parameters(StepArgs {
-            count: 2,
-            unit: emucap::live::tools::StepUnit::Frames,
-            cpu: None,
-        }))
-        .await;
-
-    assert_ne!(result.is_error, Some(true));
+    let result = temporal::tests::request(
+        server,
+        "step",
+        serde_json::json!({"count":2,"unit":"frames"}),
+    )
+    .await;
+    assert_ne!(result["isError"], true);
     let link = concrete.lock().unwrap();
     assert_eq!(link.last_method.as_deref(), Some("step"));
     assert_eq!(link.last_params, Some(serde_json::json!({"frames": 2})));

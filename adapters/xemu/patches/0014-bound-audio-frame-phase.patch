@@ -1,0 +1,22 @@
+--- a/hw/xbox/mcpx/apu/apu.c
++++ b/hw/xbox/mcpx/apu/apu.c
+@@ -312,7 +312,8 @@
+     mcpx_apu_dsp_frame(d, mixbins);
+     mcpx_apu_monitor_frame(d);
+ 
+-    d->ep_frame_div++;
++    /* EP consumes eight APU quanta per frame; retain only its phase. */
++    d->ep_frame_div = (d->ep_frame_div + 1) % 8;
+ 
+     mcpx_debug_end_frame();
+     return true;
+@@ -660,7 +661,8 @@
+     MCPXAPUState *d = opaque;
+     VoiceWorkDispatch *work = &d->vp.voice_work_dispatch;
+     if (work->queue_len < 0 || work->queue_len > MCPX_HW_MAX_VOICES ||
+-        (!d->guest_voice_pending && work->queue_len) || d->guest_fraction >= 48000) {
++        (!d->guest_voice_pending && work->queue_len) || d->guest_fraction >= 48000 ||
++        d->ep_frame_div < 0 || d->ep_frame_div >= 8) {
+         return -EINVAL;
+     }
+     for (int i = 0; i < work->queue_len; i++) {

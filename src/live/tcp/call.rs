@@ -60,6 +60,27 @@ impl TcpLink {
         mut observer: Option<&mut ProgressObserver<'_>>,
         control: Option<&ProgressCallControl>,
     ) -> Result<Value, LinkError> {
+        if let Some(control) = control.filter(|control| control.temporal_stop_ms.is_some()) {
+            let id = self.next_id;
+            self.next_id = self
+                .next_id
+                .checked_add(2)
+                .ok_or_else(|| LinkError::Protocol("request ID exhausted".into()))?;
+            let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
+            let result = super::super::temporal::wire::exchange(
+                &mut conn.reader,
+                &mut conn.writer,
+                &mut conn.pending,
+                Request::new(id, method, params),
+                id + 1,
+                control,
+                self.deferred_deadline,
+            );
+            if result.is_err() {
+                self.drop_conn();
+            }
+            return result;
+        }
         // Start the admitted host deadline before the request write. Socket reads and writes are
         // clamped to the remaining time so a short recording deadline cannot be exceeded by the
         // link's ordinary per-I/O timeout.

@@ -123,7 +123,14 @@ try {
         (Join-Path $Here "patches/0011-expose-lua-callstack.patch"),
         (Join-Path $Here "patches/0012-add-snes-bg-chr-fetch-events.patch"),
         (Join-Path $Here "patches/0013-fix-snes-ppu-observation-coordinates.patch"),
-        (Join-Path $Here "patches/0014-add-agent-pacing-controls.patch")
+        (Join-Path $Here "patches/0014-add-agent-pacing-controls.patch"),
+        (Join-Path $Here "patches/0015-preserve-completed-frame-preview.patch"),
+        (Join-Path $Here "patches/0016-preserve-sms-raster-history.patch"),
+        (Join-Path $Here "patches/0017-preserve-gamegear-lcd-frame-history.patch"),
+        (Join-Path $Here "patches/0018-preserve-agent-frame-rendering.patch"),
+        (Join-Path $Here "patches/0019-preserve-gba-raster-and-lcd-history.patch"),
+        (Join-Path $Here "patches/0020-preserve-gb-raster-and-lcd-history.patch"),
+        (Join-Path $Here "patches/0021-preserve-nes-raster-history.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {

@@ -1,0 +1,89 @@
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -306,13 +306,29 @@
+     qemu_mutex_unlock(&d->pfifo.lock);
+ }
+ 
+-void nv2a_emucap_hold_writers(bool hold)
+-{
+-    if (hold) {
+-        nv2a_lock_fifo(g_nv2a);
+-    } else {
+-        nv2a_unlock_fifo(g_nv2a);
+-    }
++const uint8_t *nv2a_emucap_begin_ram_read(bool *was_halted)
++{
++    NV2AState *d = g_nv2a;
++
++    /* Materialize existing GPU writes without executing new FIFO commands.
++     * The renderer performs downloads on its own thread/context, exactly as
++     * for save-state coherence. No GPU lock is held while waiting for it. */
++    nv2a_lock_fifo(d);
++    *was_halted = qatomic_read(&d->pfifo.halt);
++    qatomic_set(&d->pfifo.halt, true);
++    pgraph_pre_savevm_trigger(d);
++    nv2a_unlock_fifo(d);
++    bql_unlock();
++    pgraph_pre_savevm_wait(d);
++    bql_lock();
++    nv2a_lock_fifo(d);
++    return d->vram_ptr;
++}
++
++void nv2a_emucap_end_ram_read(bool was_halted)
++{
++    qatomic_set(&g_nv2a->pfifo.halt, was_halted);
++    nv2a_unlock_fifo(g_nv2a);
+ }
+ 
+ static void nv2a_reset(NV2AState *d)
+--- a/hw/xbox/nv2a/nv2a.h
++++ b/hw/xbox/nv2a/nv2a.h
+@@ -31,6 +31,7 @@
+ int nv2a_get_screen_off(void);
+ 
+ /* Park or release the NV2A FIFO and PGRAPH writers of guest RAM. BQL held. */
+-void nv2a_emucap_hold_writers(bool hold);
++const uint8_t *nv2a_emucap_begin_ram_read(bool *was_halted);
++void nv2a_emucap_end_ram_read(bool was_halted);
+ 
+ #endif
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -175,14 +175,25 @@
+     reply = g_new0(XemuEmucapMemoryBatch, 1);
+     tail = &reply->reads;
+     buffer = g_malloc(XEMU_EMUCAP_BATCH_MAX_BYTES);
+-    nv2a_emucap_hold_writers(true);
++    bool was_halted;
++    const uint8_t *ram = nv2a_emucap_begin_ram_read(&was_halted);
++    if (runstate_is_running()) {
++        nv2a_emucap_end_ram_read(was_halted);
++        g_free(buffer);
++        qapi_free_XemuEmucapMemoryBatch(reply);
++        error_setg(errp, "VM resumed during RAM coherence barrier");
++        return NULL;
++    }
+     reply->frame_boundary = current_frame_boundary();
+     reply->virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+     for (XemuEmucapMemoryRangeList *it = ranges; it; it = it->next) {
+         uint32_t length = it->value->length;
+         char *hex = g_malloc(length * 2 + 1);
+ 
+-        cpu_physical_memory_read(it->value->address, buffer, length);
++        /* The coherent backing store is stable under the writer barrier.
++         * The address-space API would re-enter surface callbacks and attempt
++         * to acquire the pgraph lock already held by this transaction. */
++        memcpy(buffer, ram + it->value->address, length);
+         for (uint32_t i = 0; i < length; i++) {
+             hex[i * 2] = "0123456789abcdef"[buffer[i] >> 4];
+             hex[i * 2 + 1] = "0123456789abcdef"[buffer[i] & 0xf];
+@@ -190,7 +201,7 @@
+         hex[length * 2] = '\0';
+         QAPI_LIST_APPEND(tail, hex);
+     }
+-    nv2a_emucap_hold_writers(false);
++    nv2a_emucap_end_ram_read(was_halted);
+     g_free(buffer);
+     return reply;
+ }

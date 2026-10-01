@@ -1,15 +1,24 @@
 diff --git a/Source/Core/Core/HW/CPU.cpp b/Source/Core/Core/HW/CPU.cpp
-index abd632d..45871dd 100644
 --- a/Source/Core/Core/HW/CPU.cpp
 +++ b/Source/Core/Core/HW/CPU.cpp
-@@ -288,4 +288,19 @@ void CPUManager::StepOpcode(Common::Event* event)
+@@ -167,6 +167,7 @@
+           // If we are still going to step, emulate the fact we just sent a step command
+           if (GDBStub::HasControl())
+           {
++            std::lock_guard sync_lock(m_state_change_lock);
+             // Make sure the previous step by gdb was serviced
+             if (m_state_cpu_step_instruction_sync &&
+                 m_state_cpu_step_instruction_sync != &gdb_step_sync_event)
+@@ -286,6 +287,23 @@
+   m_state_cpu_step_instruction_sync = event;
+   m_state_cpu_cvar.notify_one();
  }
--
--// Requires m_state_change_lock
-+bool CPUManager::CancelStepOpcode(Common::Event* event)
++bool CPUManager::ReleaseStepEvent(Common::Event* event)
 +{
 +  std::lock_guard state_lock(m_state_change_lock);
 +
++  // Even a successful Event::Wait can return before Event::Set finishes notifying. Acquiring
++  // the publisher's lock fences notification before the caller destroys the event.
 +  // A completed or superseded request no longer retains this event. In that case the caller may
 +  // restore the previous core mode only after the CPU thread has also become idle.
 +  if (m_state_cpu_step_instruction_sync != event)
@@ -21,19 +30,19 @@ index abd632d..45871dd 100644
 +  m_state_cpu_step_instruction = false;
 +  return !m_state_cpu_thread_active;
 +}
-+
-+// Requires m_state_change_lock
+ 
+ // Requires m_state_change_lock
  bool CPUManager::SetStateLocked(State s)
 diff --git a/Source/Core/Core/HW/CPU.h b/Source/Core/Core/HW/CPU.h
-index 1cd5905..d387c2e 100644
 --- a/Source/Core/Core/HW/CPU.h
 +++ b/Source/Core/Core/HW/CPU.h
-@@ -63,4 +63,7 @@ public:
+@@ -62,6 +62,9 @@
+ 
    // StepOpcode (Steps one Opcode)
    void StepOpcode(Common::Event* event = nullptr);
--
-+  // Detaches a caller-owned completion event if the step has not completed. Returns true only
-+  // when it is safe for the caller to restore CPU execution mode immediately.
-+  bool CancelStepOpcode(Common::Event* event);
-+
++  // Releases a caller-owned event on success or cancellation, fencing in-flight notification.
++  // Call before destroying the event. True means CPU mode can be restored immediately.
++  bool ReleaseStepEvent(Common::Event* event);
+ 
    // Enable or Disable Stepping.
+   void SetStepping(bool stepping);

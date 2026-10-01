@@ -1,0 +1,893 @@
+--- a/accel/tcg/tcg-accel-ops-rr.c
++++ b/accel/tcg/tcg-accel-ops-rr.c
+@@ -35,6 +35,7 @@
+ #include "tcg/startup.h"
+ #include "tcg-accel-ops.h"
+ #include "tcg-accel-ops-rr.h"
++#include "ui/xemu-emucap-pacing.h"
+ #include "tcg-accel-ops-icount.h"
+ 
+ /* Kick all RR vCPUs */
+@@ -277,6 +278,11 @@
+ 
+             if (cpu_can_run(cpu)) {
+                 int r;
++
++                xemu_emucap_pacing_wait(cpu);
++                if (!cpu_can_run(cpu) || !cpu_work_list_empty(cpu)) {
++                    break;
++                }
+ 
+                 bql_unlock();
+                 if (icount_enabled()) {
+--- a/accel/tcg/icount-common.c
++++ b/accel/tcg/icount-common.c
+@@ -36,6 +36,7 @@
+ #include "system/runstate.h"
+ #include "hw/core/cpu.h"
+ #include "exec/icount.h"
++#include "ui/xemu-emucap-pacing.h"
+ #include "system/cpu-timers-internal.h"
+ 
+ /*
+@@ -50,6 +51,18 @@
+ 
+ bool icount_align_option;
+ 
++bool xemu_emucap_clock_supported(void)
++{
++    return icount_enabled() == ICOUNT_PRECISE && !icount_sleep &&
++           !icount_align_option && icount_to_ns(1) >= 1 && icount_to_ns(1) <= 8;
++}
++
++void xemu_emucap_clock_options(bool *sleep, bool *align)
++{
++    *sleep = icount_sleep;
++    *align = icount_align_option;
++}
++
+ /* Do not count executed instructions */
+ ICountMode use_icount = ICOUNT_DISABLED;
+ 
+@@ -308,6 +321,18 @@
+     if (replay_mode != REPLAY_MODE_PLAY) {
+         if (!all_cpu_threads_idle()) {
+             return;
++        }
++
++        /* A vCPU-side vm_stop parks the CPU before the main loop settles
++         * runstate. That control stop is not a guest HLT: warping here
++         * would advance the clock beyond the captured frame boundary. */
++        if (xemu_emucap_clock_supported()) {
++            CPUState *cpu;
++            CPU_FOREACH(cpu) {
++                if (cpu_is_stopped(cpu) || cpu->stop) {
++                    return;
++                }
++            }
+         }
+ 
+         if (qtest_enabled()) {
+@@ -352,6 +377,9 @@
+          * QEMU_CLOCK_VIRTUAL.
+          */
+         if (!icount_sleep) {
++            if (!xemu_emucap_pacing_warp_ready(deadline)) {
++                return;
++            }
+             /*
+              * We never let VCPUs sleep in no sleep icount mode.
+              * If there is a pending QEMU_CLOCK_VIRTUAL timer we just advance
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -21,7 +21,10 @@
+ 
+ #include "hw/xbox/nv2a/nv2a_int.h"
+ #include "qemu/main-loop.h"
++#include "hw/core/cpu.h"
+ #include "ui/xemu-emucap.h"
++
++#define NV2A_VBLANK_PERIOD_NS 16666666
+ 
+ void nv2a_update_irq(NV2AState *d)
+ {
+@@ -194,17 +197,39 @@
+     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
+ }
+ 
++/* The host display thread presents; the guest vblank runs on guest time below. */
+ static void nv2a_vga_gfx_update(void *opaque)
+ {
+     VGACommonState *vga = opaque;
+     vga->hw_ops->gfx_update(vga);
+-
+-    NV2AState *d = container_of(vga, NV2AState, vga);
++}
++
++/*
++ * The vblank interrupt and the frame boundary are delivered on the vCPU so a frame stop parks
++ * the guest before it executes past the interrupt.
++ */
++static void nv2a_vblank_on_cpu(CPUState *cpu, run_on_cpu_data data)
++{
++    NV2AState *d = data.host_ptr;
++
+     d->pcrtc.pending_interrupts |= NV_PCRTC_INTR_0_VBLANK;
+     d->pcrtc.raster = 0;
+-
+     nv2a_update_irq(d);
+     xemu_emucap_frame_boundary();
++}
++
++static void nv2a_vblank_arm(NV2AState *d)
++{
++    d->vblank_deadline += NV2A_VBLANK_PERIOD_NS;
++    timer_mod_ns(d->vblank_timer, d->vblank_deadline);
++}
++
++static void nv2a_vblank_tick(void *opaque)
++{
++    NV2AState *d = opaque;
++
++    nv2a_vblank_arm(d);
++    async_run_on_cpu(first_cpu, nv2a_vblank_on_cpu, RUN_ON_CPU_HOST_PTR(d));
+ }
+ 
+ static void nv2a_init_memory(NV2AState *d, MemoryRegion *ram)
+@@ -376,6 +401,7 @@
+ 
+     d->exiting = true;
+ 
++    timer_free(d->vblank_timer);
+     qemu_cond_broadcast(&d->pfifo.fifo_cond);
+     qemu_thread_join(&d->pfifo.thread);
+ 
+@@ -438,6 +464,14 @@
+ static int nv2a_post_load(void *opaque, int version_id)
+ {
+     NV2AState *d = opaque;
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++
++    /* A state without a vblank phase starts a fresh period on the restored guest clock. */
++    if (!timer_pending(d->vblank_timer) ||
++        timer_expire_time_ns(d->vblank_timer) > now + NV2A_VBLANK_PERIOD_NS) {
++        d->vblank_deadline = now;
++        nv2a_vblank_arm(d);
++    }
+     qatomic_set(&d->pgraph.flush_pending, true);
+     nv2a_unlock_fifo(d);
+     return 0;
+@@ -449,6 +483,17 @@
+     .minimum_version_id = 1,
+     .fields = (VMStateField[]) {
+         // FIXME
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static const VMStateDescription vmstate_nv2a_vblank = {
++    .name = "nv2a/vblank",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_INT64(vblank_deadline, NV2AState),
++        VMSTATE_TIMER_PTR(vblank_timer, NV2AState),
+         VMSTATE_END_OF_LIST()
+     }
+ };
+@@ -577,6 +622,10 @@
+         VMSTATE_BOOL(pgraph.waiting_for_context_switch, NV2AState),
+         VMSTATE_END_OF_LIST()
+     },
++    .subsections = (const VMStateDescription * const []) {
++        &vmstate_nv2a_vblank,
++        NULL
++    },
+ };
+ 
+ static void nv2a_class_init(ObjectClass *klass, const void *data)
+@@ -627,4 +676,8 @@
+     nv2a_init_memory(d, ram);
+     nv2a_init_vga(d);
+     qemu_add_vm_change_state_handler(nv2a_vm_state_change, d);
+-}
++
++    d->vblank_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, nv2a_vblank_tick, d);
++    d->vblank_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    nv2a_vblank_arm(d);
++}
+--- a/hw/xbox/nv2a/nv2a_int.h
++++ b/hw/xbox/nv2a/nv2a_int.h
+@@ -77,7 +77,9 @@
+ 
+     VGACommonState vga;
+     GraphicHwOps hw_ops;
++    /* Guest vblank on the running virtual clock. */
+     QEMUTimer *vblank_timer;
++    int64_t vblank_deadline;
+ 
+     MemoryRegion *vram;
+     MemoryRegion vram_pci;
+--- a/qapi/xemu-emucap.json
++++ b/qapi/xemu-emucap.json
+@@ -6,8 +6,30 @@
+ ##
+ 
+ ##
++# @XemuEmucapClockProfile:
++#
++# @scheduler: effective guest scheduler kind
++#
++# @instruction-ns: fixed instruction conversion
++#
++# @multi-thread: whether TCG uses multiple CPU threads
++#
++# @sleep: native icount sleep option
++#
++# @align: native icount align option
++#
++# @devices: compiled guest device scheduling model
++##
++{ 'struct': 'XemuEmucapClockProfile',
++  'data': { 'scheduler': 'str', 'instruction-ns': 'int',
++            'multi-thread': 'bool', 'sleep': 'bool', 'align': 'bool',
++            'devices': 'str' } }
++
++##
+ # @XemuEmucapStatus:
+ #
++# @clock-profile: effective guest timing profile
++#
+ # @api: host extension API revision
+ #
+ # @frame-boundary: running-only NV2A frame boundary counter
+@@ -15,16 +37,33 @@
+ # @frame-step-active: whether a bounded frame stop is armed
+ #
+ # @frame-step-remaining: boundaries remaining before the armed stop
++#
++# @pacing-percent: limited host pacing percent, or zero for unlimited
++#
++# @pacing-revision: host policy revision
++#
++# @instructions: raw instruction counter, restored with guest time
++#
++# @apu-ticks: diagnostic timer callbacks since device creation
++#
++# @apu-retries: diagnostic pending-voice retries since device creation
++#
++# @apu-quanta: diagnostic completed DSP quanta since device creation
++#
++# @virtual-ns: guest instruction clock
+ #
+ # @input-engaged: whether port-zero emucap input owns the
+ #     guest-visible state
+ ##
+ { 'struct': 'XemuEmucapStatus',
+-  'data': { 'api': 'uint32',
++  'data': { 'api': 'uint32', 'clock-profile': 'XemuEmucapClockProfile',
+             'frame-boundary': 'uint64',
+             'frame-step-active': 'bool',
+             'frame-step-remaining': 'uint32',
+-            'input-engaged': 'bool' } }
++            'input-engaged': 'bool',
++            'pacing-percent': 'uint32', 'pacing-revision': 'uint64',
++            'virtual-ns': 'int', 'instructions': 'int',
++            'apu-ticks': 'uint64', 'apu-retries': 'uint64', 'apu-quanta': 'uint64' } }
+ 
+ ##
+ # @xemu-emucap-status:
+@@ -189,3 +228,35 @@
+ { 'command': 'xemu-emucap-read-memory-batch',
+   'data': { 'ranges': ['XemuEmucapMemoryRange'] },
+   'returns': 'XemuEmucapMemoryBatch' }
++
++##
++# @XemuEmucapPacing:
++#
++# @clock-profile: effective guest timing profile
++#
++# @percent: limited percent of real time, or 0 when unlimited
++#
++# @revision: policy revision, bumped by every applied change
++#
++# @frame-boundary: NV2A vblank counter at the reply
++##
++{ 'struct': 'XemuEmucapPacing',
++  'data': { 'percent': 'uint32',
++            'clock-profile': 'XemuEmucapClockProfile',
++            'revision': 'uint64',
++            'frame-boundary': 'uint64' } }
++
++##
++# @xemu-emucap-pacing:
++#
++# Read or change the guest-time pacing policy.  Without arguments the
++# policy is only read.
++#
++# @percent: limited percent of real time, 1 to 1000
++#
++# @unlimited: execute without a host pacing wait
++##
++{ 'command': 'xemu-emucap-pacing',
++  'data': { '*percent': 'uint32', '*unlimited': 'bool' },
++  'returns': 'XemuEmucapPacing' }
++
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include "exec/icount.h"
++#include "hw/xbox/mcpx/apu/apu.h"
+ #include "qapi/error.h"
+ #include "qemu/timer.h"
+ #include "hw/boards.h"
+@@ -17,11 +19,13 @@
+ #include "exec/cpu-common.h"
+ #include "qapi/qapi-commands-xemu-emucap.h"
+ #include "system/runstate.h"
++#include "system/tcg.h"
+ #include "xemu-emucap.h"
++#include "xemu-emucap-pacing.h"
+ #include "xemu-input.h"
+ #include "xui/xemu-hud.h"
+ 
+-#define XEMU_EMUCAP_API 2
++#define XEMU_EMUCAP_API 3
+ #define XEMU_EMUCAP_BATCH_MAX_RANGES 64
+ #define XEMU_EMUCAP_BATCH_MAX_BYTES 65536
+ #define XEMU_EMUCAP_MAX_FRAME_STEP 5000
+@@ -54,6 +58,18 @@
+ static XemuEmucapScreenshot screenshot;
+ G_LOCK_DEFINE_STATIC(xemu_emucap);
+ 
++static XemuEmucapClockProfile *clock_profile(void)
++{
++    XemuEmucapClockProfile *profile = g_new0(XemuEmucapClockProfile, 1);
++    profile->scheduler = g_strdup(icount_enabled() == ICOUNT_PRECISE ?
++                                  "precise-icount" : "unsupported");
++    profile->instruction_ns = icount_to_ns(1);
++    profile->multi_thread = qemu_tcg_mttcg_enabled();
++    profile->devices = g_strdup("nv2a-apu-virtual");
++    xemu_emucap_clock_options(&profile->sleep, &profile->align);
++    return profile;
++}
++
+ XemuEmucapStatus *qmp_xemu_emucap_status(Error **errp)
+ {
+     XemuEmucapStatus *status = g_new0(XemuEmucapStatus, 1);
+@@ -65,6 +81,13 @@
+     status->frame_step_remaining = frame_step_remaining;
+     status->input_engaged = input.engaged;
+     G_UNLOCK(xemu_emucap);
++    status->pacing_percent = xemu_emucap_pacing_percent();
++    status->pacing_revision = xemu_emucap_pacing_revision();
++    status->virtual_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    status->instructions = icount_get_raw();
++    status->clock_profile = clock_profile();
++    mcpx_apu_clock_counters(&status->apu_ticks, &status->apu_retries,
++                            &status->apu_quanta);
+     return status;
+ }
+ 
+@@ -76,6 +99,38 @@
+     value = frame_boundary;
+     G_UNLOCK(xemu_emucap);
+     return value;
++}
++
++XemuEmucapPacing *qmp_xemu_emucap_pacing(bool has_percent, uint32_t percent,
++                                         bool has_unlimited, bool unlimited,
++                                         Error **errp)
++{
++    XemuEmucapPacing *reply;
++    const char *error = NULL;
++
++    if (!xemu_emucap_clock_supported() || qemu_tcg_mttcg_enabled()) {
++        error_setg(errp, "emucap requires single TCG, fixed shift 0..3, align/sleep off");
++        return NULL;
++    }
++    if (has_percent && has_unlimited) {
++        error_setg(errp, "pass either percent or unlimited");
++        return NULL;
++    }
++    if (has_unlimited && !unlimited) {
++        error_setg(errp, "unlimited must be true; pass percent for a limited pace");
++        return NULL;
++    }
++    if ((has_percent || has_unlimited) &&
++        !xemu_emucap_pacing_set(has_unlimited, percent, &error)) {
++        error_setg(errp, "%s", error);
++        return NULL;
++    }
++    reply = g_new0(XemuEmucapPacing, 1);
++    reply->percent = xemu_emucap_pacing_percent();
++    reply->revision = xemu_emucap_pacing_revision();
++    reply->frame_boundary = current_frame_boundary();
++    reply->clock_profile = clock_profile();
++    return reply;
+ }
+ 
+ XemuEmucapMemoryBatch *qmp_xemu_emucap_read_memory_batch(
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -22,6 +22,7 @@
+ xemu_ss = ss.source_set()
+ xemu_ss.add(files(
+   'xemu-emucap.c',
++  'xemu-emucap-pacing.c',
+   'xemu-input.c',
+   'xemu-monitor.c',
+   'xemu-net.c',
+--- /dev/null
++++ b/ui/xemu-emucap-pacing.c
+@@ -0,0 +1,111 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "qemu/host-utils.h"
++#include "qemu/main-loop.h"
++#include "qemu/timer.h"
++#include "exec/icount.h"
++#include "system/cpus.h"
++#include "system/runstate.h"
++#include "xemu-emucap-pacing.h"
++
++/* BQL owns the policy and anchors. Guest time is exclusively owned by icount. */
++static struct {
++    uint32_t percent;
++    uint64_t revision;
++    int64_t host;
++    int64_t guest;
++    QEMUTimer *wake;
++} pacing = { .percent = 100 };
++
++static void anchor(void)
++{
++    pacing.host = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    pacing.guest = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++}
++
++static void vm_changed(void *opaque, bool running, RunState state)
++{
++    if (running) {
++        anchor();
++    }
++}
++
++static void wake(void *opaque)
++{
++    qemu_notify_event();
++    if (first_cpu) {
++        qemu_cpu_kick(first_cpu);
++    }
++}
++
++static void init(void)
++{
++    if (!pacing.wake) {
++        pacing.wake = timer_new_ns(QEMU_CLOCK_REALTIME, wake, NULL);
++        qemu_add_vm_change_state_handler(vm_changed, NULL);
++        anchor();
++    }
++}
++
++static int64_t wait_for(int64_t guest)
++{
++    int64_t host = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    int64_t target;
++    init();
++    if (!pacing.percent) {
++        return 0;
++    }
++    if (guest < pacing.guest) {
++        anchor();
++    }
++    target = pacing.host + muldiv64(guest - pacing.guest, 100, pacing.percent);
++    return MAX(0, target - host);
++}
++
++void xemu_emucap_pacing_wait(CPUState *cpu)
++{
++    int64_t ns;
++    if (!icount_enabled()) {
++        return;
++    }
++    while (cpu_can_run(cpu) && cpu_work_list_empty(cpu) &&
++           (ns = wait_for(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL))) > 0) {
++        qemu_cond_timedwait_bql(cpu->halt_cond,
++                           MAX(1, MIN(10, DIV_ROUND_UP(ns, SCALE_MS))));
++    }
++}
++
++bool xemu_emucap_pacing_warp_ready(int64_t deadline)
++{
++    int64_t ns = wait_for(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + deadline);
++    if (ns <= 0) {
++        return true;
++    }
++    timer_mod_ns(pacing.wake, qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + ns);
++    return false;
++}
++
++bool xemu_emucap_pacing_set(bool unlimited, uint32_t percent, const char **error)
++{
++    uint32_t next = unlimited ? 0 : percent;
++    if (!xemu_emucap_clock_supported()) {
++        *error = "pacing requires the fixed instruction clock";
++        return false;
++    }
++    if (!unlimited && (percent < 1 || percent > 1000)) {
++        *error = "percent must be between 1 and 1000";
++        return false;
++    }
++    init();
++    if (next != pacing.percent) {
++        pacing.revision++;
++        pacing.percent = next;
++    }
++    anchor();
++    timer_del(pacing.wake);
++    wake(NULL);
++    return true;
++}
++
++uint32_t xemu_emucap_pacing_percent(void) { return pacing.percent; }
++uint64_t xemu_emucap_pacing_revision(void) { return pacing.revision; }
+--- /dev/null
++++ b/ui/xemu-emucap-pacing.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef XEMU_EMUCAP_PACING_H
++#define XEMU_EMUCAP_PACING_H
++#include "hw/core/cpu.h"
++bool xemu_emucap_clock_supported(void);
++void xemu_emucap_clock_options(bool *sleep, bool *align);
++void xemu_emucap_pacing_wait(CPUState *cpu);
++bool xemu_emucap_pacing_warp_ready(int64_t deadline);
++bool xemu_emucap_pacing_set(bool unlimited, uint32_t percent, const char **error);
++uint32_t xemu_emucap_pacing_percent(void);
++uint64_t xemu_emucap_pacing_revision(void);
++#endif
+--- a/hw/xbox/mcpx/apu/apu.c
++++ b/hw/xbox/mcpx/apu/apu.c
+@@ -20,8 +20,16 @@
+  */
+ 
+ #include "apu_int.h"
++#include "exec/icount.h"
+ 
+ MCPXAPUState *g_state; // Used via debug handlers
++
++void mcpx_apu_clock_counters(uint64_t *ticks, uint64_t *retries, uint64_t *quanta)
++{
++    *ticks = g_state ? g_state->guest_tick_calls : 0;
++    *retries = g_state ? g_state->guest_retry_calls : 0;
++    *quanta = g_state ? g_state->guest_completed_quanta : 0;
++}
+ 
+ static void update_irq(MCPXAPUState *d)
+ {
+@@ -218,7 +226,7 @@
+     d->sleep_acc_us += qemu_clock_get_us(QEMU_CLOCK_REALTIME) - start_us;
+ }
+ 
+-static void se_frame(MCPXAPUState *d)
++static bool se_frame(MCPXAPUState *d)
+ {
+     mcpx_apu_update_dsp_preference(d);
+     mcpx_debug_begin_frame();
+@@ -242,18 +250,63 @@
+         d->frame_count = 0;
+         d->sleep_acc_us = 0;
+     }
+-    d->frame_count++;
+-
+     /* Buffer for all mixbins for this frame */
+     float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME] = { 0 };
+ 
+-    mcpx_apu_vp_frame(d, mixbins);
++    if (!mcpx_apu_vp_frame(d, mixbins)) {
++        mcpx_debug_end_frame();
++        return false;
++    }
++    d->frame_count++;
+     mcpx_apu_dsp_frame(d, mixbins);
+     mcpx_apu_monitor_frame(d);
+ 
+     d->ep_frame_div++;
+ 
+     mcpx_debug_end_frame();
++    return true;
++}
++
++static void mcpx_apu_guest_arm(MCPXAPUState *d)
++{
++    const uint64_t numerator = (uint64_t)NUM_SAMPLES_PER_FRAME * NANOSECONDS_PER_SECOND;
++    d->guest_deadline += numerator / 48000;
++    d->guest_fraction += numerator % 48000;
++    d->guest_deadline += d->guest_fraction / 48000;
++    d->guest_fraction %= 48000;
++    timer_mod_ns(d->guest_timer, d->guest_deadline);
++}
++
++/* icount orders every audio quantum with the other guest device deadlines. */
++static void mcpx_apu_guest_tick(void *opaque)
++{
++    MCPXAPUState *d = opaque;
++    qemu_mutex_lock(&d->lock);
++    d->guest_tick_calls++;
++    int mode = GET_MASK(d->regs[NV_PAPU_SECTL], NV_PAPU_SECTL_XCNTMODE);
++    uint32_t control = d->regs[NV_PAPU_FECTL];
++    if (mode != NV_PAPU_SECTL_XCNTMODE_OFF &&
++        !(control & (NV_PAPU_FECTL_FEMETHMODE_TRAPPED | NV_PAPU_FECTL_FEMETHMODE_HALTED))) {
++        if (d->monitor.stream && SDL_GetAudioStreamQueued(d->monitor.stream) >= d->monitor.queued_bytes_high) {
++            SDL_ClearAudioStream(d->monitor.stream);
++        }
++        if (se_frame(d)) {
++            d->guest_completed_quanta++;
++        }
++    }
++    update_irq(d);
++    d->set_irq = false;
++    if (d->guest_voice_pending) {
++        d->guest_retry_calls++;
++        /* Preserve this quantum through CPU locks and FE halt/trap states.
++         * A later callback continues it after guest CPU progress. */
++        timer_mod_ns(d->guest_timer,
++                     qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000);
++        qemu_mutex_unlock(&d->lock);
++        return;
++    }
++    mcpx_apu_guest_arm(d);
++    qemu_mutex_unlock(&d->lock);
+ }
+ 
+ static void *mcpx_apu_frame_thread(void *arg)
+@@ -266,6 +319,11 @@
+             qemu_cond_signal(&d->idle_cond);
+             qemu_cond_wait(&d->cond, &d->lock);
+             d->is_idle = false;
++            continue;
++        }
++
++        if (icount_enabled()) {
++            qemu_cond_wait(&d->cond, &d->lock);
+             continue;
+         }
+ 
+@@ -416,6 +474,11 @@
+         warn_reportf_err(local_err, "mcpx_apu_monitor_init failed: ");
+     }
+ 
++    if (icount_enabled()) {
++        d->guest_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mcpx_apu_guest_tick, d);
++        d->guest_deadline = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++        mcpx_apu_guest_arm(d);
++    }
+     qemu_add_vm_change_state_handler(mcpx_apu_vm_state_change, d);
+     qemu_thread_create(&d->apu_thread, "mcpx.apu_thread", mcpx_apu_frame_thread,
+                        d, QEMU_THREAD_JOINABLE);
+@@ -435,6 +498,9 @@
+     qemu_mutex_unlock(&d->lock);
+     bql_lock();
+ 
++    if (d->guest_timer) {
++        timer_free(d->guest_timer);
++    }
+     qemu_thread_join(&d->apu_thread);
+     mcpx_apu_vp_finalize(d);
+     mcpx_apu_monitor_finalize(d);
+@@ -522,11 +588,65 @@
+     }
+ };
+ 
++static bool apu_guest_clock_needed(void *opaque)
++{
++    return icount_enabled();
++}
++
++static const VMStateDescription vmstate_apu_voice_work = {
++    .name = "mcpx-apu/voice-work",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .fields = (const VMStateField[]) {
++        VMSTATE_INT32(voice, VoiceWorkItem),
++        VMSTATE_INT32(list, VoiceWorkItem),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static int apu_guest_clock_post_load(void *opaque, int version_id)
++{
++    MCPXAPUState *d = opaque;
++    VoiceWorkDispatch *work = &d->vp.voice_work_dispatch;
++    if (work->queue_len < 0 || work->queue_len > MCPX_HW_MAX_VOICES ||
++        (!d->guest_voice_pending && work->queue_len) || d->guest_fraction >= 48000) {
++        return -EINVAL;
++    }
++    for (int i = 0; i < work->queue_len; i++) {
++        if (work->queue[i].voice < 0 || work->queue[i].voice >= MCPX_HW_MAX_VOICES ||
++            work->queue[i].list < 0 || work->queue[i].list >= 3) {
++            return -EINVAL;
++        }
++    }
++    return 0;
++}
++
++static const VMStateDescription vmstate_apu_guest_clock = {
++    .name = "mcpx-apu/guest-clock",
++    .version_id = 1,
++    .minimum_version_id = 1,
++    .needed = apu_guest_clock_needed,
++    .post_load = apu_guest_clock_post_load,
++    .fields = (const VMStateField[]) {
++        VMSTATE_INT64(guest_deadline, MCPXAPUState),
++        VMSTATE_UINT32(guest_fraction, MCPXAPUState),
++        VMSTATE_BOOL(guest_voice_pending, MCPXAPUState),
++        VMSTATE_INT32(vp.voice_work_dispatch.queue_len, MCPXAPUState),
++        VMSTATE_STRUCT_ARRAY(vp.voice_work_dispatch.queue, MCPXAPUState,
++                             MCPX_HW_MAX_VOICES, 1,
++                             vmstate_apu_voice_work, VoiceWorkItem),
++        VMSTATE_INT32(ep_frame_div, MCPXAPUState),
++        VMSTATE_TIMER_PTR(guest_timer, MCPXAPUState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
+ static const VMStateDescription vmstate_mcpx_apu = {
+     .name = "mcpx-apu",
+     .version_id = 1,
+     .minimum_version_id = 1,
+     .pre_load = mcpx_apu_pre_load,
++    .subsections = (const VMStateDescription * const []) { &vmstate_apu_guest_clock, NULL },
+     .fields = (VMStateField[]) {
+         VMSTATE_PCI_DEVICE(parent_obj, MCPXAPUState),
+         VMSTATE_STRUCT_POINTER(gp.dsp, MCPXAPUState, vmstate_vp_dsp_state,
+--- a/hw/xbox/mcpx/apu/apu_int.h
++++ b/hw/xbox/mcpx/apu/apu_int.h
+@@ -96,6 +96,13 @@
+     uint32_t regs[0x20000];
+ 
+     int ep_frame_div;
++    QEMUTimer *guest_timer;
++    int64_t guest_deadline;
++    uint32_t guest_fraction;
++    bool guest_voice_pending;
++    uint64_t guest_tick_calls;
++    uint64_t guest_retry_calls;
++    uint64_t guest_completed_quanta;
+     int sleep_acc_us;
+     int frame_count;
+     int64_t frame_count_time_ms;
+--- a/hw/xbox/mcpx/apu/vp/vp.c
++++ b/hw/xbox/mcpx/apu/vp/vp.c
+@@ -21,6 +21,7 @@
+ 
+ #include "hw/xbox/mcpx/apu/apu_int.h"
+ #include "adpcm.h"
++#include "exec/icount.h"
+ 
+ static const struct {
+     hwaddr top, current, next;
+@@ -1806,39 +1807,48 @@
+     vwd->workers = NULL;
+ }
+ 
+-void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+-{
+-    memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+-
+-    /* Process all voices, mixing each into the affected MIXBINs */
+-    for (int list = 0; list < 3; list++) {
+-        hwaddr top, current, next;
+-        top = voice_list_regs[list].top;
+-        current = voice_list_regs[list].current;
+-        next = voice_list_regs[list].next;
+-
+-        d->regs[current] = d->regs[top];
+-        DPRINTF("list %d current voice %d\n", list, d->regs[current]);
+-
+-        for (int i = 0; d->regs[current] != 0xFFFF; i++) {
+-            /* Make sure not to get stuck... */
+-            if (i >= MCPX_HW_MAX_VOICES) {
+-                DPRINTF("Voice list contains invalid entry!\n");
+-                break;
+-            }
+-
+-            uint16_t v = d->regs[current];
+-            d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
+-                               NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
+-            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+-                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
+-                fe_method(d, SE2FE_IDLE_VOICE, v);
+-            } else {
+-                voice_work_enqueue(d, v, list);
+-            }
+-            d->regs[current] = d->regs[next];
+-        }
+-    }
++bool mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
++{
++    /* A voice lock is released by guest CPU MMIO. Retain the prepared queue
++     * across timer callbacks instead of waiting on that CPU under the BQL. */
++    if (!d->guest_voice_pending) {
++        memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
++    
++        /* Process all voices, mixing each into the affected MIXBINs */
++        for (int list = 0; list < 3; list++) {
++            hwaddr top, current, next;
++            top = voice_list_regs[list].top;
++            current = voice_list_regs[list].current;
++            next = voice_list_regs[list].next;
++    
++            d->regs[current] = d->regs[top];
++            DPRINTF("list %d current voice %d\n", list, d->regs[current]);
++    
++            for (int i = 0; d->regs[current] != 0xFFFF; i++) {
++                /* Make sure not to get stuck... */
++                if (i >= MCPX_HW_MAX_VOICES) {
++                    DPRINTF("Voice list contains invalid entry!\n");
++                    break;
++                }
++    
++                uint16_t v = d->regs[current];
++                d->regs[next] = voice_get_mask(d, v, NV_PAVS_VOICE_TAR_PITCH_LINK,
++                                   NV_PAVS_VOICE_TAR_PITCH_LINK_NEXT_VOICE_HANDLE);
++                if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
++                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE)) {
++                    fe_method(d, SE2FE_IDLE_VOICE, v);
++                } else {
++                    voice_work_enqueue(d, v, list);
++                }
++                d->regs[current] = d->regs[next];
++            }
++        }
++        d->guest_voice_pending = true;
++    }
++    if (icount_enabled() && any_queued_voice_locked(d)) {
++        return false;
++    }
++    d->guest_voice_pending = false;
+     voice_work_dispatch(d, mixbins);
+ 
+     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {
+@@ -1855,6 +1865,7 @@
+         memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
+         memset(mixbins, 0, sizeof(float[32][32]));
+     }
++    return true;
+ }
+ 
+ void mcpx_apu_vp_init(MCPXAPUState *d)
+@@ -1869,6 +1880,8 @@
+ 
+ void mcpx_apu_vp_reset(MCPXAPUState *d)
+ {
++    d->guest_voice_pending = false;
++    d->vp.voice_work_dispatch.queue_len = 0;
+     d->vp.ssl_base_page = 0;
+     d->vp.hrtf_headroom = 0;
+     memset(d->vp.ssl, 0, sizeof(d->vp.ssl));
+--- a/hw/xbox/mcpx/apu/vp/vp.h
++++ b/hw/xbox/mcpx/apu/vp/vp.h
+@@ -105,7 +105,7 @@
+ 
+ void mcpx_apu_vp_init(MCPXAPUState *d);
+ void mcpx_apu_vp_finalize(MCPXAPUState *d);
+-void mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
++bool mcpx_apu_vp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
+ void mcpx_apu_vp_reset(MCPXAPUState *d);
+ 
+ #endif
+--- a/hw/xbox/mcpx/apu/apu.h
++++ b/hw/xbox/mcpx/apu/apu.h
+@@ -24,4 +24,7 @@
+ 
+ void mcpx_apu_init(PCIBus *bus, int devfn, MemoryRegion *ram);
+ 
++/* BQL-owned diagnostic counters, not serialized guest state. */
++void mcpx_apu_clock_counters(uint64_t *ticks, uint64_t *retries, uint64_t *quanta);
++
+ #endif

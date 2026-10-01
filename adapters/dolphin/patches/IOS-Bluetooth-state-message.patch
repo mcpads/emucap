@@ -1,0 +1,16 @@
+--- a/Source/Core/Core/IOS/USB/Bluetooth/BTBase.h
++++ b/Source/Core/Core/IOS/USB/Bluetooth/BTBase.h
+@@ -17,6 +17,13 @@
+ {
+   u32 request_address = (message != nullptr) ? message->ios_request.address : 0;
+   p.Do(request_address);
++  if (!p.IsReadMode())
++    return;
++  if (request_address == 0)
++  {
++    message.reset();
++    return;
++  }
+   if (request_address != 0)
+   {
+     IOCtlVRequest request{ios.GetSystem(), request_address};

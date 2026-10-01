@@ -1,0 +1,903 @@
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -4,6 +4,7 @@
+ #include "Core/State.h"
+ 
+ #include <algorithm>
++#include <array>
+ #include <filesystem>
+ #include <locale>
+ #include <map>
+@@ -102,10 +103,13 @@
+ constexpr u32 STATE_VERSION = 192;  // Last changed in PR 14646
+ 
+ // Increase this if the StateExtendedHeader definition changes
+-constexpr u32 EXTENDED_HEADER_VERSION = 1;  // Last changed in PR 12217
++// Distinguish the presentation-preserving body from legacy extended-header version 1.
++constexpr u32 EXTENDED_HEADER_VERSION = 0x454d;
+ 
+ // Change this if we ever need to store more data in the extended header
+-constexpr u32 COMPRESSED_DATA_OFFSET = 0;
++constexpr std::array<u8, 16> PRESENTATION_SIGNATURE{
++    'E', 'M', 'U', 'C', 'A', 'P', 'P', 'S', 5, 0, 0, 0, 16, 0, 0, 0};
++constexpr u32 COMPRESSED_DATA_OFFSET = PRESENTATION_SIGNATURE.size();
+ 
+ constexpr u32 COOKIE_BASE = 0xBAADBABE;
+ 
+@@ -137,7 +141,7 @@
+ 
+ static bool ReadHeader(const std::string& filename, StateHeader& header);
+ 
+-static void DoState(Core::System& system, PointerWrap& p)
++static void DoState(Core::System& system, PointerWrap& p, bool presentation_history = true)
+ {
+   bool is_wii = system.IsWii() || system.IsMIOS();
+   const bool is_wii_currently = is_wii;
+@@ -177,7 +181,7 @@
+ 
+   // Begin with video backend, so that it gets a chance to clear its caches and writeback modified
+   // things to RAM
+-  g_video_backend->DoState(p);
++  g_video_backend->DoState(p, presentation_history);
+   p.DoMarker("video_backend");
+ 
+   // CoreTiming needs to be restored before restoring Hardware because
+@@ -223,15 +227,19 @@
+   return true;
+ }
+ 
+-static bool LoadFromBuffer(Core::System& system, std::span<u8> buffer)
++static bool LoadFromBuffer(Core::System& system, std::span<u8> buffer,
++                           bool presentation_history = true)
+ {
+   u8* ptr = buffer.data();
+   PointerWrap p(&ptr, buffer.size(), PointerWrap::Mode::Read);
+   auto& exi = system.GetExpansionInterface();
+   exi.BeginStateLoad();
+-  DoState(system, p);
+-  const bool loaded = p.IsReadMode() && !p.HasError();
++  DoState(system, p, presentation_history);
++  const bool loaded = p.IsReadMode() && !p.HasError() &&
++                      p.GetOffsetFromPreviousPosition(buffer.data()) == buffer.size();
+   exi.FinishStateLoad(loaded);
++  if (loaded)
++    g_video_backend->RestorePresentation(presentation_history);
+   return loaded;
+ }
+ 
+@@ -395,6 +403,7 @@
+   f.WriteString(header.version_string);
+ 
+   f.WriteArray(&extended_header.base_header, 1);
++  f.WriteBytes(PRESENTATION_SIGNATURE.data(), PRESENTATION_SIGNATURE.size());
+   // If StateExtendedHeader is amended to include more than the base, add WriteBytes() calls here.
+ }
+ 
+@@ -773,7 +782,8 @@
+   return success;
+ }
+ 
+-static void LoadFileStateData(const std::string& filename, Common::UniqueBuffer<u8>& ret_data)
++static void LoadFileStateData(const std::string& filename, Common::UniqueBuffer<u8>& ret_data,
++                              bool& presentation_history)
+ {
+   File::IOFile f;
+   f.Open(filename, "rb");
+@@ -790,11 +800,22 @@
+   }
+   // If StateExtendedHeader is amended to include more than the base, add ReadBytes() calls here.
+ 
+-  if (extended_header.base_header.header_version != EXTENDED_HEADER_VERSION)
+-  {
+-    PanicAlertFmt("State header corrupted");
+-    return;
+-  }
++  presentation_history = false;
++  const auto& base = extended_header.base_header;
++  if (base.header_version == EXTENDED_HEADER_VERSION)
++  {
++    std::array<u8, PRESENTATION_SIGNATURE.size()> signature{};
++    if (base.payload_offset != signature.size() ||
++        !f.ReadBytes(signature.data(), signature.size()) || signature != PRESENTATION_SIGNATURE)
++      return;
++    presentation_history = true;
++  }
++  else if (base.header_version != 1 || base.payload_offset != 0)
++  {
++    return;
++  }
++  if (base.uncompressed_size == 0)
++    return;
+ 
+   Common::UniqueBuffer<u8> buffer;
+ 
+@@ -822,6 +843,8 @@
+     }
+ 
+     const auto size = static_cast<size_t>(file_size - header_len);
++    if (size != extended_header.base_header.uncompressed_size)
++      return;
+     buffer.reset(size);
+ 
+     if (!f.ReadBytes(buffer.data(), size))
+@@ -836,6 +859,8 @@
+     return;
+   }
+ 
++  if (f.Tell() != f.GetSize())
++    return;
+   // all good
+   ret_data.swap(buffer);
+ }
+@@ -870,17 +895,18 @@
+ 
+   bool was_file_read = false;
+   bool loaded_successfully = false;
++  bool presentation_history = false;
+   LoadResult result = LoadResult::Rejected;
+ 
+   // brackets here are so buffer gets freed ASAP
+   {
+     Common::UniqueBuffer<u8> buffer;
+-    LoadFileStateData(filename, buffer);
++    LoadFileStateData(filename, buffer, presentation_history);
+ 
+     if (!buffer.empty())
+     {
+       was_file_read = true;
+-      loaded_successfully = LoadFromBuffer(system, buffer);
++      loaded_successfully = LoadFromBuffer(system, buffer, presentation_history);
+     }
+   }
+ 
+@@ -888,7 +914,7 @@
+   {
+     if (loaded_successfully)
+     {
+-      result = LoadResult::Loaded;
++      result = presentation_history ? LoadResult::Loaded : LoadResult::LoadedLegacy;
+       const std::filesystem::path temp_filename(StringToPath(filename));
+       Core::DisplayMessage(
+           fmt::format("Loaded State from {}", PathToString(temp_filename.filename())), 2000);
+--- a/Source/Core/Core/State.h
++++ b/Source/Core/Core/State.h
+@@ -107,6 +107,7 @@
+   Rejected,
+   RolledBack,
+   Unrecoverable,
++  LoadedLegacy,
+ };
+ LoadResult LoadAsSynchronous(Core::System& system, std::string filename);
+ 
+--- a/Source/Core/VideoCommon/FramebufferManager.cpp
++++ b/Source/Core/VideoCommon/FramebufferManager.cpp
+@@ -691,6 +691,9 @@
+ 
+ void FramebufferManager::DestroyReadbackPipelines()
+ {
++  m_sample_color_pipeline.reset();
++  m_sample_depth_pipeline.reset();
++  m_sample_restore_pipeline.reset();
+   m_efb_depth_resolve_pipeline.reset();
+   m_efb_depth_cache.copy_pipeline.reset();
+   m_efb_color_cache.copy_pipeline.reset();
+@@ -1097,20 +1100,40 @@
+   m_poke_vertex_format.reset();
+ }
+ 
+-void FramebufferManager::DoState(PointerWrap& p)
++void FramebufferManager::DoState(PointerWrap& p, bool require_contents)
+ {
+   FlushEFBPokes();
+   p.Do(m_prev_efb_format);
+ 
+-  bool save_efb_state = Config::Get(Config::GFX_SAVE_TEXTURE_CACHE_TO_STATE);
++  u8 save_efb_state = (require_contents || Config::Get(Config::GFX_SAVE_TEXTURE_CACHE_TO_STATE)) ? 1 : 0;
+   p.Do(save_efb_state);
++  if (save_efb_state > 1 || (require_contents && save_efb_state == 0))
++  {
++    p.SetError();
++    return;
++  }
+   if (!save_efb_state)
+     return;
+ 
++  if (require_contents)
++  {
++    u32 samples = GetEFBSamples();
++    p.Do(samples);
++    if (p.HasError() || samples == 0 || samples != GetEFBSamples())
++    {
++      p.SetError();
++      return;
++    }
++    if (samples > 1)
++    {
++      DoSampleState(p, samples);
++      return;
++    }
++  }
+   if (p.IsWriteMode() || p.IsMeasureMode())
+     DoSaveState(p);
+   else
+-    DoLoadState(p);
++    DoLoadState(p, require_contents);
+ }
+ 
+ void FramebufferManager::DoSaveState(PointerWrap& p)
+@@ -1134,7 +1157,7 @@
+   g_texture_cache->SerializeTexture(depth_texture, depth_texture_config, p);
+ }
+ 
+-void FramebufferManager::DoLoadState(PointerWrap& p)
++void FramebufferManager::DoLoadState(PointerWrap& p, bool require_contents)
+ {
+   // Invalidate any peek cache tiles.
+   InvalidatePeekCache(true);
+@@ -1147,10 +1170,31 @@
+   if (!color_tex || !depth_tex ||
+       color_tex->texture->GetLayers() != m_efb_color_texture->GetLayers())
+   {
++    if (require_contents)
++    {
++      p.SetError();
++      return;
++    }
+     WARN_LOG_FMT(VIDEO, "Failed to deserialize EFB contents. Clearing instead.");
+     g_gfx->SetAndClearFramebuffer(m_efb_framebuffer.get(), {{0.0f, 0.0f, 0.0f, 0.0f}},
+                                   g_backend_info.bSupportsReversedDepthRange ? 1.0f : 0.0f);
+     return;
++  }
++
++  if (require_contents)
++  {
++    const TextureConfig color_config(GetEFBWidth(), GetEFBHeight(), 1,
++        m_efb_color_texture->GetLayers(), 1, GetEFBColorFormat(), 0,
++        AbstractTextureType::Texture_2DArray);
++    const TextureConfig depth_config(GetEFBWidth(), GetEFBHeight(), 1,
++        m_efb_depth_texture->GetLayers(), 1, GetEFBDepthCopyFormat(), 0,
++        AbstractTextureType::Texture_2DArray);
++    if (p.HasError() || color_tex->texture->GetConfig() != color_config ||
++        depth_tex->texture->GetConfig() != depth_config)
++    {
++      p.SetError();
++      return;
++    }
+   }
+ 
+   // Size differences are okay here, since the linear filtering will downscale/upscale it.
+@@ -1171,3 +1215,144 @@
+   g_gfx->Draw(0, 3);
+   g_gfx->EndUtilityDrawing();
+ }
++
++bool FramebufferManager::CompileSampleStatePipelines()
++{
++  if (m_sample_color_pipeline && m_sample_depth_pipeline && m_sample_restore_pipeline)
++    return true;
++  AbstractPipelineConfig config = {};
++  config.vertex_shader = g_shader_cache->GetScreenQuadVertexShader();
++  config.geometry_shader = IsEFBStereo() ? g_shader_cache->GetTexcoordGeometryShader() : nullptr;
++  config.rasterization_state = RenderState::GetNoCullRasterizationState(PrimitiveType::Triangles);
++  config.depth_state = RenderState::GetNoDepthTestingDepthState();
++  config.blending_state = RenderState::GetNoBlendingBlendState();
++  config.usage = AbstractPipelineUsage::Utility;
++  auto color_shader = g_gfx->CreateShaderFromSource(ShaderStage::Pixel,
++      FramebufferShaderGen::GenerateEFBSamplePixelShader(false, false), nullptr, "EFB color sample");
++  auto depth_shader = g_gfx->CreateShaderFromSource(ShaderStage::Pixel,
++      FramebufferShaderGen::GenerateEFBSamplePixelShader(true, false), nullptr, "EFB depth sample");
++  auto restore_shader = g_gfx->CreateShaderFromSource(ShaderStage::Pixel,
++      FramebufferShaderGen::GenerateEFBSamplePixelShader(false, true), nullptr, "EFB sample restore");
++  if (!color_shader || !depth_shader || !restore_shader)
++    return false;
++  config.pixel_shader = color_shader.get();
++  config.framebuffer_state = RenderState::GetColorFramebufferState(GetEFBColorFormat());
++  auto color = g_gfx->CreatePipeline(config);
++  config.pixel_shader = depth_shader.get();
++  config.framebuffer_state = RenderState::GetColorFramebufferState(GetEFBDepthCopyFormat());
++  auto depth = g_gfx->CreatePipeline(config);
++  config.pixel_shader = restore_shader.get();
++  config.depth_state = RenderState::GetAlwaysWriteDepthState();
++  config.framebuffer_state = GetEFBFramebufferState();
++  config.framebuffer_state.per_sample_shading = true;
++  auto restore = g_gfx->CreatePipeline(config);
++  if (!color || !depth || !restore)
++    return false;
++  m_sample_color_pipeline = std::move(color);
++  m_sample_depth_pipeline = std::move(depth);
++  m_sample_restore_pipeline = std::move(restore);
++  return true;
++}
++
++void FramebufferManager::DoSampleState(PointerWrap& p, u32 samples)
++{
++  const TextureConfig color_config(GetEFBWidth(), GetEFBHeight(), 1,
++      m_efb_color_texture->GetLayers(), 1, GetEFBColorFormat(), 0,
++      AbstractTextureType::Texture_2DArray);
++  const TextureConfig depth_config(GetEFBWidth(), GetEFBHeight(), 1,
++      m_efb_depth_texture->GetLayers(), 1, GetEFBDepthCopyFormat(), 0,
++      AbstractTextureType::Texture_2DArray);
++  if (p.IsMeasureMode())
++  {
++    for (u32 i = 0; i < samples && !p.HasError(); ++i)
++    {
++      g_texture_cache->SerializeTexture(nullptr, color_config, p);
++      g_texture_cache->SerializeTexture(nullptr, depth_config, p);
++    }
++    return;
++  }
++  if (!CompileSampleStatePipelines())
++  {
++    p.SetError();
++    return;
++  }
++  if (p.IsWriteMode())
++  {
++    auto color_target = color_config;
++    auto depth_target = depth_config;
++    color_target.flags = AbstractTextureFlag_RenderTarget;
++    depth_target.flags = AbstractTextureFlag_RenderTarget;
++    auto color = g_gfx->CreateTexture(color_target, "EFB sample color staging source");
++    auto depth = g_gfx->CreateTexture(depth_target, "EFB sample depth staging source");
++    if (!color || !depth)
++    {
++      p.SetError();
++      return;
++    }
++    auto color_fb = g_gfx->CreateFramebuffer(color.get(), nullptr);
++    auto depth_fb = g_gfx->CreateFramebuffer(depth.get(), nullptr);
++    if (!color_fb || !depth_fb)
++    {
++      p.SetError();
++      return;
++    }
++    for (u32 i = 0; i < samples && !p.HasError(); ++i)
++    {
++      const std::array<s32, 4> uniforms{static_cast<s32>(i), 0, 0, 0};
++      for (bool is_depth : {false, true})
++      {
++        auto* source = is_depth ? m_efb_depth_texture.get() : m_efb_color_texture.get();
++        auto* destination = is_depth ? depth.get() : color.get();
++        g_gfx->BeginUtilityDrawing();
++        source->FinishedRendering();
++        g_gfx->SetAndDiscardFramebuffer(is_depth ? depth_fb.get() : color_fb.get());
++        g_gfx->SetViewportAndScissor(destination->GetRect());
++        g_gfx->SetPipeline(is_depth ? m_sample_depth_pipeline.get() : m_sample_color_pipeline.get());
++        g_gfx->SetTexture(0, source);
++        g_gfx->SetSamplerState(0, RenderState::GetPointSamplerState());
++        g_vertex_manager->UploadUtilityUniforms(uniforms.data(), sizeof(uniforms));
++        g_gfx->Draw(0, 3);
++        destination->FinishedRendering();
++        g_gfx->EndUtilityDrawing();
++        g_texture_cache->SerializeTexture(destination, is_depth ? depth_config : color_config, p);
++        if (p.HasError())
++          return;
++      }
++    }
++    return;
++  }
++  struct PlanePair
++  {
++    std::unique_ptr<AbstractTexture> color;
++    std::unique_ptr<AbstractTexture> depth;
++  };
++  std::vector<PlanePair> planes;
++  for (u32 i = 0; i < samples; ++i)
++  {
++    auto color = g_texture_cache->DeserializeTexture(p);
++    auto depth = g_texture_cache->DeserializeTexture(p);
++    if (p.HasError() || !color || !depth ||
++        color->texture->GetConfig() != color_config || depth->texture->GetConfig() != depth_config)
++    {
++      p.SetError();
++      return;
++    }
++    planes.push_back({std::move(color->texture), std::move(depth->texture)});
++  }
++  InvalidatePeekCache(true);
++  g_gfx->BeginUtilityDrawing();
++  g_gfx->SetAndDiscardFramebuffer(m_efb_framebuffer.get());
++  g_gfx->SetViewportAndScissor(m_efb_framebuffer->GetRect());
++  g_gfx->SetPipeline(m_sample_restore_pipeline.get());
++  g_gfx->SetSamplerState(0, RenderState::GetPointSamplerState());
++  g_gfx->SetSamplerState(1, RenderState::GetPointSamplerState());
++  for (u32 i = 0; i < samples; ++i)
++  {
++    const std::array<s32, 4> uniforms{static_cast<s32>(i), 0, 0, 0};
++    g_gfx->SetTexture(0, planes[i].color.get());
++    g_gfx->SetTexture(1, planes[i].depth.get());
++    g_vertex_manager->UploadUtilityUniforms(uniforms.data(), sizeof(uniforms));
++    g_gfx->Draw(0, 3);
++  }
++  g_gfx->EndUtilityDrawing();
++}
+--- a/Source/Core/VideoCommon/FramebufferManager.h
++++ b/Source/Core/VideoCommon/FramebufferManager.h
+@@ -129,7 +129,7 @@
+   void FlushEFBPokes();
+ 
+   // Save state load/save.
+-  void DoState(PointerWrap& p);
++  void DoState(PointerWrap& p, bool require_contents = false);
+ 
+ protected:
+   struct EFBPokeVertex
+@@ -191,8 +191,10 @@
+ 
+   std::tuple<u32, u32> CalculateTargetSize(int efb_scale);
+ 
+-  void DoLoadState(PointerWrap& p);
++  void DoLoadState(PointerWrap& p, bool require_contents);
+   void DoSaveState(PointerWrap& p);
++  void DoSampleState(PointerWrap& p, u32 samples);
++  bool CompileSampleStatePipelines();
+ 
+   float m_efb_scale = 1.0f;
+   PixelFormat m_prev_efb_format;
+@@ -212,6 +214,9 @@
+ 
+   // Pipeline for restoring the contents of the EFB from a save state
+   std::unique_ptr<AbstractPipeline> m_efb_restore_pipeline;
++  std::unique_ptr<AbstractPipeline> m_sample_color_pipeline;
++  std::unique_ptr<AbstractPipeline> m_sample_depth_pipeline;
++  std::unique_ptr<AbstractPipeline> m_sample_restore_pipeline;
+ 
+   // Format conversion shaders
+   std::array<std::unique_ptr<AbstractPipeline>, 6> m_format_conversion_pipelines;
+--- a/Source/Core/VideoCommon/FramebufferShaderGen.cpp
++++ b/Source/Core/VideoCommon/FramebufferShaderGen.cpp
+@@ -631,6 +631,28 @@
+   return code.GetBuffer();
+ }
+ 
++std::string GenerateEFBSamplePixelShader(bool depth, bool restore)
++{
++  ShaderCode code;
++  EmitUniformBufferDeclaration(code);
++  code.Write("{{ int sample_index; int pad0; int pad1; int pad2; }};\n");
++  EmitSamplerDeclarations(code, 0, restore ? 2 : 1, !restore);
++  EmitPixelMainDeclaration(code, 1, 0, depth ? "float" : "float4", "");
++  code.Write("{{\n  int3 coords = int3(int2(gl_FragCoord.xy), int(v_tex0.z));\n");
++  if (restore)
++  {
++    code.Write("  if (gl_SampleID != sample_index) discard;\n"
++               "  ocol0 = texelFetch(samp0, coords, 0);\n"
++               "  gl_FragDepth = texelFetch(samp1, coords, 0).r;\n");
++  }
++  else
++  {
++    code.Write("  ocol0 = texelFetch(samp0, coords, sample_index){};\n", depth ? ".r" : "");
++  }
++  code.Write("}}\n");
++  return code.GetBuffer();
++}
++
+ std::string GenerateEFBRestorePixelShader()
+ {
+   ShaderCode code;
+--- a/Source/Core/VideoCommon/FramebufferShaderGen.h
++++ b/Source/Core/VideoCommon/FramebufferShaderGen.h
+@@ -23,6 +23,7 @@
+ std::string GenerateFormatConversionShader(EFBReinterpretType convtype, u32 samples);
+ std::string GenerateTextureReinterpretShader(TextureFormat from_format, TextureFormat to_format);
+ std::string GenerateEFBRestorePixelShader();
++std::string GenerateEFBSamplePixelShader(bool depth, bool restore);
+ std::string GenerateImGuiVertexShader();
+ std::string GenerateImGuiPixelShader(bool linear_space_output = false);
+ 
+--- a/Source/Core/VideoCommon/Present.cpp
++++ b/Source/Core/VideoCommon/Present.cpp
+@@ -1038,7 +1038,8 @@
+     m_onscreen_ui->SetMousePress(button_mask);
+ }
+ 
+-void Presenter::DoState(PointerWrap& p)
++void Presenter::DoState(PointerWrap& p, bool presentation_history,
++                        const std::vector<RcTcacheEntry>& restored_entries)
+ {
+   p.Do(m_frame_count);
+   p.Do(m_last_xfb_ticks);
+@@ -1047,22 +1048,87 @@
+   p.Do(m_last_xfb_stride);
+   p.Do(m_last_xfb_height);
+ 
+-  if (p.IsReadMode() && m_last_xfb_stride == 0)
+-    ClearLastXfbId();
+-
+-  // If we're loading and there is a last XFB, re-display it.
+-  if (p.IsReadMode() && m_last_xfb_stride != 0)
+-  {
+-    // This technically counts as the end of the frame
+-    GetVideoEvents().after_frame_event.Trigger(Core::System::GetInstance());
+-
++  if (!presentation_history)
++  {
++    if (p.IsReadMode())
++    {
++      ReleaseXFBContentLock();
++      m_xfb_entry.reset();
++      ClearLastXfbId();
++      m_xfb_rect = {};
++      m_immediate_swap_happened_this_field.store(false, std::memory_order_relaxed);
++    }
++    return;
++  }
++
++  p.Do(m_next_swap_estimated_ticks);
++  u8 immediate = m_immediate_swap_happened_this_field.load(std::memory_order_relaxed) ? 1 : 0;
++  p.Do(immediate);
++  if (immediate > 1)
++  {
++    p.SetError();
++    return;
++  }
++  if (p.IsReadMode())
++    m_immediate_swap_happened_this_field.store(immediate != 0, std::memory_order_relaxed);
++  p.Do(m_last_xfb_id);
++  auto image_rect = m_xfb_entry ? m_xfb_rect : MathUtil::Rectangle<int>{};
++  p.Do(image_rect);
++  if (p.IsReadMode())
++    m_xfb_rect = image_rect;
++  u8 has_image = m_xfb_entry ? 1 : 0;
++  p.Do(has_image);
++  if (has_image > 1 ||
++      (has_image == 0 && (m_last_xfb_id != std::numeric_limits<u64>::max() ||
++                         image_rect.left != 0 || image_rect.top != 0 ||
++                         image_rect.right != 0 || image_rect.bottom != 0)))
++  {
++    p.SetError();
++    return;
++  }
++  if (p.IsReadMode())
++  {
++    ReleaseXFBContentLock();
++    m_xfb_entry.reset();
++    if (has_image)
++    {
++      const auto found = std::find_if(restored_entries.begin(), restored_entries.end(),
++                                      [this](const auto& entry) {
++                                        return entry->id == m_last_xfb_id;
++                                      });
++      if (found == restored_entries.end() || !(*found)->texture)
++      {
++        p.SetError();
++        return;
++      }
++      auto restored_entry = *found;
++      if (m_xfb_rect.left < 0 || m_xfb_rect.top < 0 ||
++          m_xfb_rect.right <= m_xfb_rect.left || m_xfb_rect.bottom <= m_xfb_rect.top ||
++          static_cast<u32>(m_xfb_rect.right) > restored_entry->texture->GetWidth() ||
++          static_cast<u32>(m_xfb_rect.bottom) > restored_entry->texture->GetHeight())
++      {
++        p.SetError();
++        return;
++      }
++      restored_entry->AcquireContentLock();
++      m_xfb_entry = std::move(restored_entry);
++    }
++  }
++  else if (has_image && m_xfb_entry->id != m_last_xfb_id)
++  {
++    p.SetError();
++  }
++}
++
++void Presenter::RestorePresentation(bool presentation_history)
++{
++  if (!presentation_history)
+     m_next_swap_estimated_ticks = m_last_xfb_ticks;
+-    m_next_swap_estimated_time = Clock::now();
+-
+-    m_immediate_swap_happened_this_field.store(false, std::memory_order_relaxed);
+-
+-    ImmediateSwap(m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride, m_last_xfb_height);
+-  }
++  m_next_swap_estimated_time = Clock::now();
++  if (!presentation_history && m_last_xfb_stride != 0)
++    FetchXFB(m_last_xfb_addr, m_last_xfb_width, m_last_xfb_stride, m_last_xfb_height,
++             m_last_xfb_ticks);
++  Present();
+ }
+ 
+ }  // namespace VideoCommon
+--- a/Source/Core/VideoCommon/Present.h
++++ b/Source/Core/VideoCommon/Present.h
+@@ -105,7 +105,10 @@
+ 
+   int FrameCount() const { return m_frame_count; }
+ 
+-  void DoState(PointerWrap& p);
++  void DoState(PointerWrap& p, bool presentation_history,
++               const std::vector<RcTcacheEntry>& restored_entries);
++  void RestorePresentation(bool presentation_history);
++  RcTcacheEntry GetPresentationEntry() const { return m_xfb_entry; }
+ 
+   const MathUtil::Rectangle<int>& GetTargetRectangle() const { return m_target_rectangle; }
+ 
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -556,7 +556,7 @@
+   return tex;
+ }
+ 
+-void TextureCacheBase::DoState(PointerWrap& p)
++void TextureCacheBase::DoState(PointerWrap& p, std::vector<RcTcacheEntry>& restored_entries)
+ {
+   // Flush all pending XFB copies before either loading or saving.
+   FlushEFBCopies();
+@@ -566,7 +566,7 @@
+   if (p.IsWriteMode() || p.IsMeasureMode())
+     DoSaveState(p);
+   else
+-    DoLoadState(p);
++    DoLoadState(p, restored_entries);
+ }
+ 
+ void TextureCacheBase::DoSaveState(PointerWrap& p)
+@@ -582,8 +582,8 @@
+     // We also need to store invalidated entries, as they can't be restored from RAM.
+     return entry->IsCopy() || entry->invalidated;
+   };
+-  auto AddCacheEntryToMap = [&entry_map, &entries_to_save](const RcTcacheEntry& entry) -> u32 {
+-    auto iter = entry_map.find(entry.get());
++  auto AddCacheEntryToMap = [&entry_map, &entries_to_save](TCacheEntry* entry) -> u32 {
++    auto iter = entry_map.find(entry);
+     if (iter != entry_map.end())
+       return iter->second;
+ 
+@@ -591,8 +591,8 @@
+     // same order they were collected. This is because of iterating both the address and hash maps.
+     // Therefore, the map is used for fast lookup, and the vector for ordering.
+     u32 id = static_cast<u32>(entry_map.size());
+-    entry_map.emplace(entry.get(), id);
+-    entries_to_save.push_back(entry.get());
++    entry_map.emplace(entry, id);
++    entries_to_save.push_back(entry);
+     return id;
+   };
+   auto GetCacheEntryId = [&entry_map](const TCacheEntry* entry) -> std::optional<u32> {
+@@ -611,7 +611,7 @@
+     {
+       if (ShouldSaveEntry(it.second))
+       {
+-        const u32 id = AddCacheEntryToMap(it.second);
++        const u32 id = AddCacheEntryToMap(it.second.get());
+         textures_by_address_list.emplace_back(it.first, id);
+       }
+     }
+@@ -619,7 +619,7 @@
+     {
+       if (ShouldSaveEntry(it.second))
+       {
+-        const u32 id = AddCacheEntryToMap(it.second);
++        const u32 id = AddCacheEntryToMap(it.second.get());
+         textures_by_hash_list.emplace_back(it.first, id);
+       }
+     }
+@@ -628,10 +628,72 @@
+       const auto& tentry = m_bound_textures[i];
+       if (m_bound_textures[i] && ShouldSaveEntry(tentry))
+       {
+-        const u32 id = AddCacheEntryToMap(tentry);
++        const u32 id = AddCacheEntryToMap(tentry.get());
+         bound_textures_list.emplace_back(i, id);
+       }
+     }
++  }
++
++  // Presentation is required state even when the general texture cache is optional.
++  std::set<TCacheEntry*> required_entries;
++  std::vector<TCacheEntry*> pending;
++  if (const auto presented = g_presenter->GetPresentationEntry())
++    pending.push_back(presented.get());
++  // Future XFB stitching can use copies that the previous display does not reference.
++  // StitchXFBCopy accepts any native copy, including EFB copies.
++  for (const auto& [address, entry] : m_textures_by_address)
++  {
++    if (entry->IsCopy())
++      pending.push_back(entry.get());
++  }
++  for (const auto& [hash, entry] : m_textures_by_hash)
++  {
++    if (entry->IsCopy())
++      pending.push_back(entry.get());
++  }
++  // FlushStaleBinds left only cached TMEM bindings, whose pixels can differ from RAM.
++  for (const auto& entry : m_bound_textures)
++  {
++    if (entry)
++      pending.push_back(entry.get());
++  }
++  for (size_t i = 0; i < pending.size(); ++i)
++  {
++    TCacheEntry* entry = pending[i];
++    if (!required_entries.insert(entry).second)
++      continue;
++    AddCacheEntryToMap(entry);
++    for (TCacheEntry* reference : entry->references)
++      pending.push_back(reference);
++  }
++  for (const auto& [address, entry] : m_textures_by_address)
++  {
++    if (!required_entries.contains(entry.get()))
++      continue;
++    const auto mapping = std::pair{address, AddCacheEntryToMap(entry.get())};
++    if (std::find(textures_by_address_list.begin(), textures_by_address_list.end(), mapping) ==
++        textures_by_address_list.end())
++      textures_by_address_list.push_back(mapping);
++  }
++  for (const auto& [hash, entry] : m_textures_by_hash)
++  {
++    if (!required_entries.contains(entry.get()))
++      continue;
++    const auto mapping = std::pair{hash, AddCacheEntryToMap(entry.get())};
++    if (std::find(textures_by_hash_list.begin(), textures_by_hash_list.end(), mapping) ==
++        textures_by_hash_list.end())
++      textures_by_hash_list.push_back(mapping);
++  }
++
++  for (u32 i = 0; i < m_bound_textures.size(); ++i)
++  {
++    const auto& entry = m_bound_textures[i];
++    if (!entry || !required_entries.contains(entry.get()))
++      continue;
++    const auto mapping = std::pair{i, AddCacheEntryToMap(entry.get())};
++    if (std::find(bound_textures_list.begin(), bound_textures_list.end(), mapping) ==
++        bound_textures_list.end())
++      bound_textures_list.push_back(mapping);
+   }
+ 
+   // Save the texture cache entries out in the order the were referenced.
+@@ -687,10 +749,12 @@
+   m_readback_texture.reset();
+ }
+ 
+-void TextureCacheBase::DoLoadState(PointerWrap& p)
++void TextureCacheBase::DoLoadState(PointerWrap& p, std::vector<RcTcacheEntry>& restored_entries)
+ {
+   // Helper for getting a cache entry from an ID.
+   std::map<u32, RcTcacheEntry> id_map;
++  std::set<u64> logical_ids;
++  restored_entries.clear();
+   RcTcacheEntry null_entry;
+   auto GetEntry = [&p, &id_map, &null_entry](u32 id) -> RcTcacheEntry& {
+     auto iter = id_map.find(id);
+@@ -727,8 +791,16 @@
+     entry->DoState(p);
+     if (p.HasError())
+       return;
++    if (entry->id >= m_last_entry_id || !logical_ids.insert(entry->id).second)
++    {
++      p.SetError();
++      return;
++    }
+     if (entry->texture && commit_state)
++    {
+       id_map.emplace(i, entry);
++      restored_entries.push_back(entry);
++    }
+   }
+   p.DoMarker("TextureCacheEntries");
+ 
+--- a/Source/Core/VideoCommon/TextureCacheBase.h
++++ b/Source/Core/VideoCommon/TextureCacheBase.h
+@@ -305,7 +305,7 @@
+   std::optional<TexPoolEntry> DeserializeTexture(PointerWrap& p);
+ 
+   // Save States
+-  void DoState(PointerWrap& p);
++  void DoState(PointerWrap& p, std::vector<RcTcacheEntry>& restored_entries);
+ 
+   static bool AllCopyFilterCoefsNeeded(const std::array<u32, 3>& coefficients);
+   static bool CopyFilterCanOverflow(const std::array<u32, 3>& coefficients);
+@@ -406,7 +406,7 @@
+ 
+   bool CheckReadbackTexture(u32 width, u32 height, AbstractTextureFormat format);
+   void DoSaveState(PointerWrap& p);
+-  void DoLoadState(PointerWrap& p);
++  void DoLoadState(PointerWrap& p, std::vector<RcTcacheEntry>& restored_entries);
+   void ClearCacheEntries();
+ 
+   void ApplyMaterialToCacheEntry(const VideoCommon::MaterialResource& material, TCacheEntry* entry);
+--- a/Source/Core/VideoCommon/VideoBackendBase.cpp
++++ b/Source/Core/VideoCommon/VideoBackendBase.cpp
+@@ -270,19 +270,31 @@
+   g_Config.VerifyValidity();
+ }
+ 
+-void VideoBackendBase::DoState(PointerWrap& p)
++void VideoBackendBase::DoState(PointerWrap& p, bool presentation_history)
+ {
+   auto& system = Core::System::GetInstance();
+   if (!system.IsDualCoreMode())
+   {
+-    VideoCommon_DoState(p);
++    VideoCommon_DoState(p, presentation_history);
+     return;
+   }
+ 
+-  AsyncRequests::GetInstance()->PushBlockingEvent([&] { VideoCommon_DoState(p); });
++  AsyncRequests::GetInstance()->PushBlockingEvent([&] { VideoCommon_DoState(p, presentation_history); });
+ 
+   // Let the GPU thread sleep after loading the state, so we're not spinning if paused after loading
+   // a state. The next GP burst will wake it up again.
++  system.GetFifo().GpuMaySleep();
++}
++
++void VideoBackendBase::RestorePresentation(bool presentation_history)
++{
++  auto& system = Core::System::GetInstance();
++  if (!system.IsDualCoreMode())
++  {
++    g_presenter->RestorePresentation(presentation_history);
++    return;
++  }
++  AsyncRequests::GetInstance()->PushBlockingEvent([presentation_history] { g_presenter->RestorePresentation(presentation_history); });
+   system.GetFifo().GpuMaySleep();
+ }
+ 
+--- a/Source/Core/VideoCommon/VideoBackendBase.h
++++ b/Source/Core/VideoCommon/VideoBackendBase.h
+@@ -62,7 +62,8 @@
+   static void PopulateBackendInfo(const WindowSystemInfo& wsi);
+ 
+   // Wrapper function which pushes the event to the GPU thread.
+-  void DoState(PointerWrap& p);
++  void DoState(PointerWrap& p, bool presentation_history);
++  void RestorePresentation(bool presentation_history);
+ 
+ protected:
+   // For hardware backends
+--- a/Source/Core/VideoCommon/VideoState.cpp
++++ b/Source/Core/VideoCommon/VideoState.cpp
+@@ -27,7 +27,7 @@
+ #include "VideoCommon/XFMemory.h"
+ #include "VideoCommon/XFStateManager.h"
+ 
+-void VideoCommon_DoState(PointerWrap& p)
++void VideoCommon_DoState(PointerWrap& p, bool presentation_history)
+ {
+   bool software = false;
+   p.Do(software);
+@@ -88,13 +88,30 @@
+   g_vertex_manager->DoState(p);
+   p.DoMarker("VertexManager");
+ 
+-  g_framebuffer_manager->DoState(p);
++  g_framebuffer_manager->DoState(p, presentation_history);
+   p.DoMarker("FramebufferManager");
+ 
+-  g_texture_cache->DoState(p);
++  std::vector<RcTcacheEntry> restored_entries;
++  g_texture_cache->DoState(p, restored_entries);
+   p.DoMarker("TextureCache");
+ 
+-  g_presenter->DoState(p);
++  if (p.HasError())
++    return;
++  g_presenter->DoState(p, presentation_history, restored_entries);
++  if (p.HasError())
++    return;
++  if (p.IsReadMode() && presentation_history)
++  {
++    for (const auto& entry : restored_entries)
++    {
++      if (entry.use_count() == 1)
++      {
++        p.SetError();
++        return;
++      }
++    }
++  }
++  restored_entries.clear();
+   g_frame_dumper->DoState(p);
+   p.DoMarker("Presenter");
+ 
+--- a/Source/Core/VideoCommon/VideoState.h
++++ b/Source/Core/VideoCommon/VideoState.h
+@@ -5,4 +5,4 @@
+ 
+ class PointerWrap;
+ 
+-void VideoCommon_DoState(PointerWrap& p);
++void VideoCommon_DoState(PointerWrap& p, bool presentation_history);

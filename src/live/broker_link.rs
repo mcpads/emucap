@@ -38,6 +38,7 @@ pub struct BrokerLink {
     deferred_deadline: Duration,
     attached_name: String,
     registration_id: u64,
+    attachment_id: String,
 }
 
 /// 세션 포트로 접속해 attach{name?}한다. 실패는 명시 LinkError.
@@ -82,6 +83,7 @@ fn connect_expected(
         deferred_deadline: DEFAULT_DEFERRED_DEADLINE,
         attached_name: String::new(),
         registration_id: 0,
+        attachment_id: super::temporal::fresh_identity(),
     };
     let mut params = serde_json::Map::new();
     if let Some(name) = name {
@@ -198,6 +200,29 @@ impl BrokerLink {
         mut observer: Option<&mut ProgressObserver<'_>>,
         control: Option<&ProgressCallControl>,
     ) -> Result<Value, LinkError> {
+        if let Some(control) = control.filter(|control| control.temporal_stop_ms.is_some()) {
+            let id = self.next_id;
+            self.next_id = self
+                .next_id
+                .checked_add(2)
+                .ok_or_else(|| LinkError::Protocol("request ID exhausted".into()))?;
+            let result = {
+                let mut writer = self.writer.lock().unwrap_or_else(|p| p.into_inner());
+                super::temporal::wire::exchange(
+                    &mut self.reader,
+                    &mut writer,
+                    &mut self.pending,
+                    Request::new(id, method, params),
+                    id + 1,
+                    control,
+                    self.deferred_deadline,
+                )
+            };
+            if result.is_err() {
+                self.close_session();
+            }
+            return result;
+        }
         // id 불일치 프레임을 무제한 버리면, 악성·버그 피어가 매칭 안 되는 프레임을 스트림하는 것만으로
         // raw_call을 영구 wedge시킨다(이 호출은 outer SharedLink mutex를 쥐고 있어 MCP 전체가 정지).
         // TcpLink(MAX_ID_MISMATCH)와 동일하게 상한을 둔다.
@@ -393,6 +418,10 @@ impl EmulatorLink for BrokerLink {
         self.raw_call_inner(method, params, Some(observer), Some(control))
     }
 
+    fn attachment_id(&self) -> Option<&str> {
+        Some(&self.attachment_id)
+    }
+
     fn has_exclusive_control(&self) -> bool {
         !self.attached_name.is_empty() && self.registration_id != 0
     }
@@ -488,16 +517,25 @@ impl EmulatorLink for LazyBrokerLink {
         if control.cancellation.is_cancelled() {
             return Err(LinkError::Cancelled);
         }
-        let result =
+        let link = if control.temporal_stop_ms.is_some() {
+            self.inner.as_mut().ok_or(LinkError::NotConnected)?
+        } else {
             self.ensure_connected()?
-                .raw_call_inner(method, params, Some(observer), Some(control));
-        if matches!(
-            result,
-            Err(LinkError::NotConnected | LinkError::Protocol(_) | LinkError::Cancelled)
-        ) {
+        };
+        let result = link.raw_call_inner(method, params, Some(observer), Some(control));
+        if (control.temporal_stop_ms.is_some() && result.is_err())
+            || matches!(
+                result,
+                Err(LinkError::NotConnected | LinkError::Protocol(_) | LinkError::Cancelled)
+            )
+        {
             self.inner = None;
         }
         result
+    }
+
+    fn attachment_id(&self) -> Option<&str> {
+        self.inner.as_ref().and_then(EmulatorLink::attachment_id)
     }
 
     fn supports_session_reconnect(&self) -> bool {

@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from observation_speed import ROOT, Witness, free_port, warmup  # noqa: E402
+from observation_speed import ROOT, Witness, free_port, state_call, warmup  # noqa: E402
 
 PREFERRED_BUTTONS = ('start', 'run', 'a', 'enter', 'return', 'space', 'button1', 'cross')
 PACES = [{'mode': 'limited', 'percent': 50}, {'mode': 'limited', 'percent': 400}, {'mode': 'unlimited'}]
@@ -93,27 +93,6 @@ def digest(w, batches):
             hasher.update(read['hex'].encode())
         parts.append(hasher.hexdigest()[:16])
     return hashlib.sha256(''.join(parts).encode()).hexdigest(), parts
-
-
-def instruction_units(status):
-    units = status.get('contracts', {}).get('constraints', {}).get('execution.step.units', ['instructions'])
-    return 'instructions' in units
-
-
-def state_call(w, status, name, arguments):
-    # Some hosts save and load only at a proven main-CPU instruction halt. A CPU idling at a frame
-    # boundary reaches one only after it wakes, so later attempts step further before retrying.
-    content = None
-    for count in (1, 1, 5, 23, 101, 499, 2003):
-        if instruction_units(status):
-            w.call('step', {'unit': 'instructions', 'count': count})
-        reply = w.process.request('tools/call', {'name': name, 'arguments': arguments}, timeout=300)
-        content = reply.get('result', {}).get('structuredContent', reply)
-        if not reply.get('result', {}).get('isError'):
-            return content, None
-        if 'unsafe_halt' not in json.dumps(content):
-            return None, content
-    return None, content
 
 
 class Session:

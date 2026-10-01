@@ -1,0 +1,10 @@
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -490,6 +490,7 @@
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
+     if (d->vblank_fraction >= NV2A_VBLANK_HZ) {
++        nv2a_unlock_fifo(d);
+         return -EINVAL;
+     }
+ 

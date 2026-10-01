@@ -13,6 +13,9 @@
     "CORE.CLEANUP.1"
   ],
   "expectations": [
+    {"id":"CANCEL.IDENTITY.1", "category":"invariant", "expression":"cancel_effect => exact_active(runtime, attachment, owner_id, operation_id); stale_cancel => no_native_effect"},
+    {"id":"CANCEL.ACK.1", "category":"observation", "expression":"ack_requested => stop_requested; cancel_ack => not cleanup_proof(ack); verified_parent_finish and effects_started => native_stopped and acquired_inputs_released and pending_work_invalidated"},
+    {"id":"CANCEL.OWNERSHIP.1", "category":"invariant", "expression":"admitted_parent => retain_ownership_until(verified_cleanup or generation_retired); unverified_cleanup => reject_later_mutation"},
     {"id":"MEM.BATCH.EXACT.1", "category":"invariant", "expression":"success => all_ranges_prevalidated and ordered_exact_reads and no_partial_result"},
     {"id":"MEM.BATCH.BOUNDARY.1", "category":"observation", "expression":"success => same_global_frozen_boundary(all_reads) and no_guest_read_side_effects"},
     {"id":"SPEED.PACING.1", "category":"invariant", "expression":"set_speed => host_pacing_only and no_implicit_pause_resume_or_guest_clock_change; frozen_before => frozen_after and unchanged_guest_time"},
@@ -424,6 +427,14 @@
     }
   ],
   "features": [
+    {
+      "id": "transport.temporal-control",
+      "surface": "wire",
+      "methods": ["cancel_operation", "begin_temporal_operation", "finish_temporal_operation"],
+      "temporal_classes": ["T3"],
+      "disposition": "retain",
+      "expectations": ["TIME.RESPONSE.1", "CANCEL.IDENTITY.1", "CANCEL.ACK.1", "CANCEL.OWNERSHIP.1"]
+    },
     {
       "id": "transport.hello",
       "surface": "wire",

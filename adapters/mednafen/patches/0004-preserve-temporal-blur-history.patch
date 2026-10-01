@@ -1,0 +1,170 @@
+--- a/src/video/tblur.h
++++ b/src/video/tblur.h
+@@ -32,5 +32,25 @@
+ void TBlur_Run(EmulateSpecStruct *espec);
+ bool TBlur_IsOn(void);
+ 
++class Stream;
++class TBlurHistory
++{
++ public:
++ ~TBlurHistory();
++
++ private:
++ TBlurHistory();
++ struct Data;
++ std::unique_ptr<Data> data_;
++ friend std::unique_ptr<TBlurHistory> TBlur_PrepareHistory(Stream* stream);
++ friend bool TBlur_CommitHistory(TBlurHistory& history) noexcept;
++};
++
++void TBlur_SaveHistory(Stream* stream);
++std::unique_ptr<TBlurHistory> TBlur_PrepareHistory(Stream* stream);
++// Owner-thread operation. False means configuration changed; no buffers are swapped.
++// Success leaves the old buffers in history, allowing an enclosing rollback swap.
++bool TBlur_CommitHistory(TBlurHistory& history) noexcept;
++
+ }
+ #endif
+--- a/src/video/tblur.cpp
++++ b/src/video/tblur.cpp
+@@ -23,6 +23,7 @@
+ 
+ #include <mednafen/mednafen.h>
+ #include "tblur.h"
++#include "VideoHistoryIO.h"
+ 
+ namespace Mednafen
+ {
+@@ -38,12 +39,14 @@
+ static uint64 FormatWarningGiven;
+ //static uint64 BlurBufFormat;
+ static uint32 BlurBufPitchInPix;
++static uint32 BlurBufHeight;
+ 
+ void TBlur_Init(bool accum_mode, double accum_amount, uint32 max_width, uint32 max_height)
+ {
+  try
+  {
+   BlurBufPitchInPix = max_width;
++  BlurBufHeight = max_height;
+   //BlurBufFormat = 0;
+ 
+   AccumBlurAmount = (uint32)(16384 * accum_amount / 100);
+@@ -236,4 +239,115 @@
+  return(BlurBuf || AccumBlurBuf);
+ }
+ 
+-}
++struct TBlurHistory::Data
++{
++ uint32 mode = 0, width = 0, height = 0, amount = 0;
++ std::unique_ptr<uint32[]> pixels;
++ std::unique_ptr<HQPixelEntry[]> accumulation;
++};
++
++TBlurHistory::TBlurHistory() : data_(new Data) { }
++TBlurHistory::~TBlurHistory() { }
++
++static uint32 CurrentBlurMode() noexcept
++{
++ if(BlurBuf && AccumBlurBuf) return 3;
++ return AccumBlurBuf ? 2 : (BlurBuf ? 1 : 0);
++}
++
++static bool BlurConfigurationMatches(uint32 mode, uint32 width, uint32 height, uint32 amount) noexcept
++{
++ if(mode > 2 || mode != CurrentBlurMode()) return false;
++ if(!mode) return !width && !height && !amount;
++ return width == BlurBufPitchInPix && height == BlurBufHeight
++     && amount == (mode == 2 ? AccumBlurAmount : 0);
++}
++
++static uint64 BlurHistorySize(uint32 mode, uint32 width, uint32 height, uint32 amount)
++{
++ if(!mode)
++ {
++  if(width || height || amount) throw std::runtime_error("invalid disabled blur history");
++  return 0;
++ }
++ const unsigned stride = mode == 2 ? 8 : 4;
++ if(mode > 2 || !width || !height || width > VideoHistoryIO::MaxBytes / stride
++    || height > VideoHistoryIO::MaxBytes / (uint64(width) * stride)
++    || (mode == 1 ? amount != 0 : amount > 16384))
++  throw std::runtime_error("invalid blur history geometry or coefficient");
++ return uint64(width) * height * stride;
++}
++
++void TBlur_SaveHistory(Stream* stream)
++{
++ const uint32 mode = CurrentBlurMode();
++ const uint32 width = mode ? BlurBufPitchInPix : 0;
++ const uint32 height = mode ? BlurBufHeight : 0;
++ const uint32 amount = mode == 2 ? AccumBlurAmount : 0;
++ const uint64 size = BlurHistorySize(mode, width, height, amount);
++ std::vector<uint8> bytes(size);
++ for(size_t i = 0; i < uint64(width) * height; ++i)
++ {
++  if(mode == 1) MDFN_en32lsb(bytes.data() + i * 4, BlurBuf[i]);
++  else
++  {
++   const auto& pixel = AccumBlurBuf[i];
++   MDFN_en16lsb(bytes.data() + i * 8 + 0, pixel.a);
++   MDFN_en16lsb(bytes.data() + i * 8 + 2, pixel.b);
++   MDFN_en16lsb(bytes.data() + i * 8 + 4, pixel.c);
++   MDFN_en16lsb(bytes.data() + i * 8 + 6, pixel.d);
++  }
++ }
++ stream->write("ECTBLUR1", 8);
++ stream->put_LE<uint32>(mode);
++ stream->put_LE<uint32>(width);
++ stream->put_LE<uint32>(height);
++ stream->put_LE<uint32>(amount);
++ if(size) stream->write(bytes.data(), size);
++}
++
++std::unique_ptr<TBlurHistory> TBlur_PrepareHistory(Stream* stream)
++{
++ char magic[8]; stream->read(magic, sizeof(magic));
++ if(memcmp(magic, "ECTBLUR1", 8)) throw std::runtime_error("invalid blur history header");
++ const uint32 mode = stream->get_LE<uint32>(), width = stream->get_LE<uint32>();
++ const uint32 height = stream->get_LE<uint32>(), amount = stream->get_LE<uint32>();
++ const uint64 size = BlurHistorySize(mode, width, height, amount);
++ if(!BlurConfigurationMatches(mode, width, height, amount))
++  throw std::runtime_error("incompatible blur history configuration");
++ VideoHistoryIO::RequireBytes(stream, size);
++ if(stream->size() - stream->tell() != size)
++  throw std::runtime_error("trailing blur history data");
++ std::vector<uint8> bytes(size);
++ if(size) stream->read(bytes.data(), size);
++ std::unique_ptr<TBlurHistory> history(new TBlurHistory);
++ auto& target = *history->data_;
++ target.mode = mode; target.width = width; target.height = height; target.amount = amount;
++ const size_t count = uint64(width) * height;
++ if(mode == 1) target.pixels.reset(new uint32[count]);
++ else if(mode == 2) target.accumulation.reset(new HQPixelEntry[count]);
++ for(size_t i = 0; i < count; ++i)
++ {
++  if(mode == 1) target.pixels[i] = MDFN_de32lsb(bytes.data() + i * 4);
++  else
++  {
++   auto& pixel = target.accumulation[i];
++   pixel.a = MDFN_de16lsb(bytes.data() + i * 8 + 0);
++   pixel.b = MDFN_de16lsb(bytes.data() + i * 8 + 2);
++   pixel.c = MDFN_de16lsb(bytes.data() + i * 8 + 4);
++   pixel.d = MDFN_de16lsb(bytes.data() + i * 8 + 6);
++  }
++ }
++ return history;
++}
++
++bool TBlur_CommitHistory(TBlurHistory& history) noexcept
++{
++ auto& source = *history.data_;
++ if(!BlurConfigurationMatches(source.mode, source.width, source.height, source.amount)) return false;
++ BlurBuf.swap(source.pixels);
++ AccumBlurBuf.swap(source.accumulation);
++ return true;
++}
++
++}

@@ -37,11 +37,15 @@ remains headless. The supported surface includes:
 - frozen-frame PNG capture with frame and SHA-256 provenance;
 - player-one A/B/C/D and directions with explicit ownership release; MVS adds coin/start/service,
   while AES and CD add start/select;
-- native MAME save/load while frozen on every profile. Save returns only after the pre-save
-  notifier has fired and a non-empty staged file is complete; load returns only after the
-  post-load notifier and freezes the restored machine. Step one frozen frame before judging the
-  restored screen. Control composes these operations with exact frame step and bounded RAM read
-  into an atomic public `probe`. MAME 0.288 left the CDZ CD controller state unregistered and the
+- native MAME save/load at a paused, settled scheduler boundary. Save completes after native
+  serialization and file close; load completes after native restore and postload, without
+  advancing guest time. Instruction hooks and pending anonymous timers reject with `unsafe_halt`.
+  An uncertain restore terminates control. These operations require the maintained host's
+  `settled_state_io` and `native_raster_state` capabilities. Both raster buffers, their display
+  indices and partial-update state are preserved. Native files from before raster-history
+  registration are rejected.
+  Control composes state I/O with exact frame step and bounded RAM read into an atomic public
+  `probe`. MAME 0.288 left the CDZ CD controller state unregistered and the
   driver unmarked for saves; shared MAME patch 0008 registers that state, marks CDZ save-capable
   and keeps the Neo Geo post-load hook from touching the audio ROM bank the CD models lack.
 

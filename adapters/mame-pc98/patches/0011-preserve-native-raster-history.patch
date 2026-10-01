@@ -1,0 +1,172 @@
+--- a/src/emu/screen.h
++++ b/src/emu/screen.h
+@@ -200,6 +200,16 @@
+ 	float yscale() const { return m_yscale; }
+ 	bool has_screen_update() const { return !m_screen_update_ind16.isnull() || !m_screen_update_rgb32.isnull(); }
+ 
++	bool raster_state_supported() const { return !m_state_bitmap[0].empty(); }
++
++	// Native raster-state storage is bounded by the driver's physical display geometry.
++	void set_raster_state_bounds(s32 width, s32 height)
++	{
++		assert(!configured() && width > 0 && height > 0);
++		m_state_max_width = width;
++		m_state_max_height = height;
++	}
++
+ 	// inline configuration helpers
+ 	void set_type(screen_type_enum type) { assert(!configured()); m_type = type; }
+ 	void set_orientation(int orientation) { assert(!configured()); m_orientation = orientation; }
+@@ -435,11 +445,14 @@
+ 	virtual void device_start() override ATTR_COLD;
+ 	virtual void device_reset() override ATTR_COLD;
+ 	virtual void device_stop() override ATTR_COLD;
++	virtual void device_pre_save() override;
+ 	virtual void device_post_load() override;
+ 
+ 	// internal helpers
+ 	void set_container(render_container &container) { m_container = &container; }
+ 	void realloc_screen_bitmaps();
++	bool raster_state_geometry_valid() const;
++	void publish_restored_raster();
+ 	TIMER_CALLBACK_MEMBER(vblank_begin);
+ 	TIMER_CALLBACK_MEMBER(vblank_end);
+ 	TIMER_CALLBACK_MEMBER(first_scanline_tick);
+@@ -482,6 +495,13 @@
+ 	// textures and bitmaps
+ 	texture_format      m_texformat;                // texture format
+ 	render_texture *    m_texture[2];               // 2x textures for the screen bitmap
++	// Stable native save registrations, independent of resizable live bitmap storage.
++	s32                 m_state_max_width = 0;
++	s32                 m_state_max_height = 0;
++	s32                 m_state_bitmap_width = 0;
++	s32                 m_state_bitmap_height = 0;
++	std::vector<u32>    m_state_bitmap[2];
++	std::vector<u8>     m_state_priority;
+ 	screen_bitmap       m_bitmap[2];                // 2x bitmaps for rendering
+ 	std::vector<bitmap_t *> m_scan_bitmaps[2];      // 2x bitmaps for each individual scanline
+ 	bitmap_ind8         m_priority;                 // priority bitmap
+--- a/src/emu/screen.cpp
++++ b/src/emu/screen.cpp
+@@ -888,6 +888,27 @@
+ 	save_item(NAME(m_vblank_start_time));
+ 	save_item(NAME(m_vblank_end_time));
+ 	save_item(NAME(m_frame_number));
++	if (m_state_max_width > 0 && m_state_max_height > 0)
++	{
++		if (m_type != SCREEN_TYPE_RASTER || format() != BITMAP_FORMAT_RGB32 ||
++				(m_video_attributes & (VIDEO_SELF_RENDER | VIDEO_VARIABLE_WIDTH)))
++			throw emu_fatalerror("%s: unsupported native raster-state format", tag());
++		size_t const pixels = size_t(m_state_max_width) * size_t(m_state_max_height);
++		for (unsigned i = 0; i != 2; ++i)
++		{
++			m_state_bitmap[i].resize(pixels);
++			save_item(NAME(m_state_bitmap[i]), i);
++		}
++		m_state_priority.resize(pixels);
++		save_item(NAME(m_state_priority));
++		save_item(NAME(m_state_bitmap_width));
++		save_item(NAME(m_state_bitmap_height));
++		save_item(NAME(m_curbitmap));
++		save_item(NAME(m_curtexture));
++		save_item(NAME(m_changed));
++		save_item(NAME(m_partial_scan_hpos));
++		save_item(NAME(m_partial_updates_this_frame));
++	}
+ 	if (m_oldstyle_vblank_supplied)
+ 		logerror("%s: Deprecated legacy Old Style screen configured (set_vblank_time), please use set_raw instead.\n",this->tag());
+ 
+@@ -925,9 +946,73 @@
+ //  after a save state is loaded
+ //-------------------------------------------------
+ 
++bool screen_device::raster_state_geometry_valid() const
++{
++	return m_state_bitmap_width > 0 && m_state_bitmap_height > 0
++		&& m_state_bitmap_width <= m_state_max_width && m_state_bitmap_height <= m_state_max_height
++		&& m_width > 0 && m_height > 0
++		&& m_visarea.min_x >= 0 && m_visarea.min_y >= 0
++		&& m_visarea.min_x <= m_visarea.max_x && m_visarea.min_y <= m_visarea.max_y
++		&& m_visarea.max_x < m_state_bitmap_width && m_visarea.max_y < m_state_bitmap_height
++		&& std::max(m_width, m_visarea.max_x + 1) == m_state_bitmap_width
++		&& std::max(m_height, m_visarea.max_y + 1) == m_state_bitmap_height
++		&& m_curbitmap < 2 && m_curtexture < 2;
++}
++
++void screen_device::device_pre_save()
++{
++	if (m_state_bitmap[0].empty())
++		return;
++	m_state_bitmap_width = m_bitmap[0].width();
++	m_state_bitmap_height = m_bitmap[0].height();
++	if (!raster_state_geometry_valid())
++		throw emu_fatalerror("%s: invalid native raster-state geometry", tag());
++	for (unsigned i = 0; i != 2; ++i)
++	{
++		if (m_bitmap[i].format() != BITMAP_FORMAT_RGB32 ||
++				m_bitmap[i].width() != m_state_bitmap_width || m_bitmap[i].height() != m_state_bitmap_height)
++			throw emu_fatalerror("%s: inconsistent native raster buffers", tag());
++	}
++	if (m_priority.width() != m_state_bitmap_width || m_priority.height() != m_state_bitmap_height)
++		throw emu_fatalerror("%s: inconsistent native priority buffer", tag());
++	for (unsigned i = 0; i != 2; ++i)
++	{
++		std::fill(m_state_bitmap[i].begin(), m_state_bitmap[i].end(), 0);
++		for (s32 y = 0; y != m_state_bitmap_height; ++y)
++			std::copy_n(&m_bitmap[i].as_rgb32().pix(y), m_state_bitmap_width,
++				&m_state_bitmap[i][size_t(y) * m_state_max_width]);
++	}
++	std::fill(m_state_priority.begin(), m_state_priority.end(), 0);
++	for (s32 y = 0; y != m_state_bitmap_height; ++y)
++		std::copy_n(&m_priority.pix(y), m_state_bitmap_width, &m_state_priority[size_t(y) * m_state_max_width]);
++}
++
++void screen_device::publish_restored_raster()
++{
++	// Rebind the saved presented texture without an update, swap or changed-flag reset.
++	for (unsigned i = 0; i != 2; ++i)
++		m_texture[i]->set_bitmap(m_bitmap[i], m_visarea, m_bitmap[i].texformat());
++	rgb_t color = m_color - rgb_t(0, 0xff - m_brightness, 0xff - m_brightness, 0xff - m_brightness);
++	m_container->empty();
++	m_container->add_quad(0.0f, 0.0f, 1.0f, 1.0f, color, m_texture[m_curtexture], PRIMFLAG_BLENDMODE(BLENDMODE_NONE) | PRIMFLAG_SCREENTEX(1));
++}
++
+ void screen_device::device_post_load()
+ {
++	bool const saved_raster = !m_state_bitmap[0].empty();
++	if (saved_raster && !raster_state_geometry_valid())
++		throw emu_fatalerror("%s: invalid restored raster-state geometry", tag());
+ 	realloc_screen_bitmaps();
++	if (saved_raster)
++	{
++		for (unsigned i = 0; i != 2; ++i)
++			for (s32 y = 0; y != m_state_bitmap_height; ++y)
++				std::copy_n(&m_state_bitmap[i][size_t(y) * m_state_max_width], m_state_bitmap_width,
++					&m_bitmap[i].as_rgb32().pix(y));
++		for (s32 y = 0; y != m_state_bitmap_height; ++y)
++			std::copy_n(&m_state_priority[size_t(y) * m_state_max_width], m_state_bitmap_width, &m_priority.pix(y));
++		publish_restored_raster();
++	}
+ }
+ 
+ 
+--- a/src/mame/neogeo/neogeo.cpp
++++ b/src/mame/neogeo/neogeo.cpp
+@@ -1947,6 +1947,7 @@
+ 	SCREEN(config, m_screen, SCREEN_TYPE_RASTER);
+ 	m_screen->set_raw(NEOGEO_PIXEL_CLOCK, NEOGEO_HTOTAL, NEOGEO_HBEND, NEOGEO_HBSTART, NEOGEO_VTOTAL, NEOGEO_VBEND, NEOGEO_VBSTART);
+ 	m_screen->set_screen_update(FUNC(neogeo_base_state::screen_update));
++	m_screen->set_raster_state_bounds(NEOGEO_HTOTAL, NEOGEO_VTOTAL);
+ 
+ 	/* 4096 colors * two banks * normal and shadow */
+ 	PALETTE(config, m_palette, palette_device::BLACK, 4096*2*2);
+--- a/src/frontend/mame/luaengine.cpp
++++ b/src/frontend/mame/luaengine.cpp
+@@ -1910,6 +1910,7 @@
+ 			{
+ 				return sdev.restore_presented_pixels(data.data(), data.size(), width, height);
+ 			});
++	screen_dev_type["raster_state_supported"] = sol::property(&screen_device::raster_state_supported);
+ 	screen_dev_type["screen_type"] = sol::property(&screen_device::screen_type);
+ 	screen_dev_type["width"] = sol::property([] (screen_device &sdev) { return sdev.visible_area().width(); });
+ 	screen_dev_type["height"] = sol::property([] (screen_device &sdev) { return sdev.visible_area().height(); });

@@ -28,3 +28,26 @@
  			}
  			const double ALPHA = 0.2;
  			sleepAdjust = sleepAdjust * (1 - ALPHA) + narrow_cast<double>(delta) * ALPHA;
+--- a/src/events/EventDistributor.cc
++++ b/src/events/EventDistributor.cc
+@@ -115,8 +115,8 @@
+ bool EventDistributor::sleep(unsigned us)
+ {
+ 	std::chrono::microseconds duration(us);
+-	std::unique_lock lock(cvMutex);
+-	return condition.wait_for(lock, duration) == std::cv_status::timeout;
++	std::unique_lock lock(mutex);
++	return !condition.wait_for(lock, duration, [&] { return !scheduledEvents.empty(); });
+ }
+ 
+ } // namespace openmsx
+--- a/src/events/EventDistributor.hh
++++ b/src/events/EventDistributor.hh
+@@ -85,7 +85,6 @@
+ 	using EventQueue = std::vector<Event>;
+ 	EventQueue scheduledEvents;
+ 	std::mutex mutex; // lock data structures
+-	std::mutex cvMutex; // lock condition_variable
+ 	std::condition_variable condition;
+ };
+ 

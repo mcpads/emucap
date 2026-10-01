@@ -325,6 +325,10 @@ Game Gear runs on the same adapter through the `emucap-sms.lua` entry (a Z80 cor
 handles `.sms`). Launch with `system: "gamegear"` and a `.gg` / `.sms` content path. The tool set is
 identical to SNES — only the ISA, memory types, and button names differ:
 
+SMS/GG snapshots include raster buffers, buffer selection and completed-frame history.
+Snapshots from hosts before patch 0017 lack this history and are rejected before device state changes.
+Create new checkpoints with the current compatible host.
+
 - **ISA**: Z80. `disassemble`, `call_stack`, and `get_state` are Z80 (SNES uses 65816).
 - **Buttons** (`status.input_buttons`): `up` / `down` / `left` / `right` / `one` / `two` / `pause`.
   `one` = Button 1 (B), `two` = Button 2 (A), `pause` = Start. Aliases: `start→pause`, `a→two`,
@@ -375,6 +379,10 @@ tool set is identical to SNES — only the ISA, memory types, and button names d
 GBA runs through the `emucap-gba.lua` entry (an ARM7TDMI core). Launch with `system: "gba"` and a
 `.gba` content path. The tool set matches SNES for memory / state / input / breakpoints / save-states,
 with these differences:
+
+GBA snapshots include raster buffers and completed-frame history. Hosts before patch
+0019 omit that history; their snapshots are rejected before device state changes.
+Create new checkpoints with the current compatible host.
 
 - **BIOS required**: Mesen needs a real GBA BIOS (`gba_bios.bin`, not committed to the repo). Without
   it Mesen shows a firmware prompt. The launcher provisions it headlessly from `EMUCAP_GBA_BIOS` (env)
@@ -512,3 +520,13 @@ loads a state. `preserve_for_recording` remains a separate receipt class requiri
 Development validation: `_tests/live/mesen2/instruction-snapshot-test.py CONTENT --output PRIVATE_DIR`
 issues and revalidates real evidence using the current release binaries, including after shutdown.
 Runtime evidence and snapshots are private and are not included in this repository.
+
+GB/GBC snapshots include both raster buffers, their selection and the submitted
+LCD frame history. Patch 0020 requires this payload, including linked-console
+participants; older GB/GBC and SGB snapshots without it are rejected before
+console state changes. Create new checkpoints on the patched host.
+
+NES cartridge snapshots require the raster buffers and buffer selection added by
+patch 0021. Older snapshots without that payload reject before CPU/device changes;
+VS DualSystem validates both participants before loading either. NSF's separate
+PPU implementation retains its existing state format.

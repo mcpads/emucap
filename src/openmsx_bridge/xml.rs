@@ -13,6 +13,8 @@ use crate::launch::openmsx::PreparedSession;
 use super::{tag_text, xml_escape, BridgeResult, OpenMsxBridgeError, OpenMsxControl};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CANCEL_SERVICE: Duration = Duration::from_millis(25);
+const CANCEL_CLEANUP: Duration = Duration::from_millis(500);
 const ADVANCE_TIMEOUT: Duration = Duration::from_secs(10);
 
 enum XmlEvent {
@@ -29,6 +31,9 @@ pub struct XmlControl {
     pause: Option<bool>,
     terminal: Arc<AtomicBool>,
     finished: bool,
+    command_deadline: Option<Instant>,
+    request_cancellation: crate::live::link::RequestCancellation,
+    cancellation_deadline: Option<Instant>,
 }
 
 impl XmlControl {
@@ -65,6 +70,11 @@ impl XmlControl {
             .stdin
             .take()
             .ok_or_else(|| OpenMsxBridgeError::Protocol("openMSX stdin was not piped".into()))?;
+        if let Err(error) = configure_stdin(&stdin) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
         let stdout = child
             .stdout
             .take()
@@ -123,6 +133,9 @@ impl XmlControl {
             pause: None,
             terminal,
             finished: false,
+            command_deadline: None,
+            request_cancellation: Default::default(),
+            cancellation_deadline: None,
         };
         match control.events.recv_timeout(COMMAND_TIMEOUT).map_err(|_| {
             OpenMsxBridgeError::Emulator(
@@ -143,19 +156,6 @@ impl XmlControl {
             .map_err(OpenMsxBridgeError::Io)?;
         control.stdin.flush().map_err(OpenMsxBridgeError::Io)?;
         Ok(control)
-    }
-
-    fn recv_until(&self, deadline: Instant) -> BridgeResult<XmlEvent> {
-        let timeout = deadline.saturating_duration_since(Instant::now());
-        match self.events.recv_timeout(timeout) {
-            Ok(event) => Ok(event),
-            Err(RecvTimeoutError::Timeout) => Err(OpenMsxBridgeError::Emulator(
-                "openMSX control operation timed out".into(),
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(OpenMsxBridgeError::Protocol(
-                "openMSX control event reader disconnected".into(),
-            )),
-        }
     }
 
     fn shutdown(&mut self) {
@@ -186,18 +186,76 @@ impl XmlControl {
         Arc::clone(&self.terminal)
     }
 
+    fn effective_deadline(&mut self, deadline: Instant) -> Instant {
+        if self.request_cancellation.is_cancelled() && self.cancellation_deadline.is_none() {
+            self.cancellation_deadline = Some(Instant::now() + CANCEL_CLEANUP);
+        }
+        self.cancellation_deadline
+            .map_or(deadline, |cancel| deadline.min(cancel))
+    }
+
+    fn write_until(&mut self, mut bytes: &[u8], deadline: Instant) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            let deadline = self.effective_deadline(deadline);
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "openMSX command write deadline expired",
+                ));
+            }
+            match self.stdin.write(bytes) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(1)),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn retire(&mut self) {
+        self.terminal.store(true, Ordering::Release);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.finished = true;
+    }
+
     fn command_reply(&mut self, command: &str, deadline: Instant) -> BridgeResult<String> {
         loop {
-            let event = match self.recv_until(deadline) {
+            let deadline = self.effective_deadline(deadline);
+            if Instant::now() >= deadline {
+                self.retire();
+                return Err(OpenMsxBridgeError::HostDeadline(
+                    "openMSX command deadline expired".into(),
+                ));
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(CANCEL_SERVICE);
+            let event = match self.events.recv_timeout(wait) {
                 Ok(event) => event,
-                Err(error) => {
-                    // XML replies have no request ID. Once a reply is missing, a
-                    // late reply cannot safely be assigned to a rollback command.
-                    self.terminal.store(true, Ordering::Release);
-                    self.shutdown();
-                    return Err(error);
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.retire();
+                    return Err(OpenMsxBridgeError::Protocol(
+                        "openMSX control event reader disconnected".into(),
+                    ));
                 }
             };
+            let deadline = self.effective_deadline(deadline);
+            if Instant::now() >= deadline {
+                self.retire();
+                return Err(OpenMsxBridgeError::HostDeadline(
+                    "openMSX reply arrived after command deadline".into(),
+                ));
+            }
             match event {
                 XmlEvent::Reply { ok: true, text } => return Ok(text),
                 XmlEvent::Reply { ok: false, text } => {
@@ -208,7 +266,7 @@ impl XmlControl {
                 XmlEvent::Pause(value) => self.pause = Some(value),
                 XmlEvent::Terminal(message) => {
                     self.terminal.store(true, Ordering::Release);
-                    self.shutdown();
+                    self.retire();
                     return Err(OpenMsxBridgeError::Emulator(message));
                 }
                 XmlEvent::Ready => {}
@@ -218,26 +276,51 @@ impl XmlControl {
 }
 
 impl OpenMsxControl for XmlControl {
+    fn set_request_cancellation(&mut self, cancellation: crate::live::link::RequestCancellation) {
+        self.request_cancellation = cancellation;
+        self.cancellation_deadline = None;
+    }
+    fn set_command_deadline(&mut self, deadline: Option<Instant>) {
+        self.command_deadline = deadline;
+    }
     fn command(&mut self, command: &str) -> BridgeResult<String> {
         if self.is_terminal() {
             return Err(OpenMsxBridgeError::Emulator(
                 "openMSX is no longer running".into(),
             ));
         }
+        let deadline = self
+            .command_deadline
+            .map_or(Instant::now() + COMMAND_TIMEOUT, |deadline| {
+                deadline.min(Instant::now() + COMMAND_TIMEOUT)
+            });
+        let deadline = self.effective_deadline(deadline);
+        if Instant::now() >= deadline {
+            self.retire();
+            return Err(OpenMsxBridgeError::HostDeadline(
+                "openMSX cleanup deadline expired before command".into(),
+            ));
+        }
         let wire = format!("<command>{}</command>\n", xml_escape(command));
-        if let Err(error) = self
-            .stdin
-            .write_all(wire.as_bytes())
-            .and_then(|_| self.stdin.flush())
-        {
-            self.terminal.store(true, Ordering::Release);
-            self.shutdown();
+        if let Err(error) = self.write_until(wire.as_bytes(), deadline) {
+            self.retire();
             return Err(error.into());
         }
-        self.command_reply(command, Instant::now() + COMMAND_TIMEOUT)
+        self.command_reply(command, deadline)
     }
 
     fn advance_frames(&mut self, count: u64) -> BridgeResult<()> {
+        self.advance_frames_cancellable(count, &Default::default())
+    }
+
+    fn advance_frames_cancellable(
+        &mut self,
+        count: u64,
+        cancellation: &crate::live::link::RequestCancellation,
+    ) -> BridgeResult<()> {
+        if cancellation.is_cancelled() {
+            return Err(OpenMsxBridgeError::Cancelled);
+        }
         while let Ok(event) = self.events.try_recv() {
             match event {
                 XmlEvent::Pause(value) => self.pause = Some(value),
@@ -255,14 +338,27 @@ impl OpenMsxControl for XmlControl {
             if self.pause == Some(true) {
                 return Ok(());
             }
-            let event = match self.recv_until(deadline) {
-                Err(OpenMsxBridgeError::Emulator(_)) if Instant::now() >= deadline => {
-                    return Err(OpenMsxBridgeError::HostDeadline(format!(
-                        "frame advance exceeded its {}-second host budget",
-                        ADVANCE_TIMEOUT.as_secs()
-                    )))
+            if cancellation.is_cancelled() {
+                self.effective_deadline(deadline);
+                return Err(OpenMsxBridgeError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(OpenMsxBridgeError::HostDeadline(format!(
+                    "frame advance exceeded its {}-second host budget",
+                    ADVANCE_TIMEOUT.as_secs()
+                )));
+            }
+            let wait = deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(25));
+            let event = match self.events.recv_timeout(wait) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(OpenMsxBridgeError::Protocol(
+                        "openMSX control event reader disconnected".into(),
+                    ))
                 }
-                other => other?,
             };
             match event {
                 XmlEvent::Pause(value) => self.pause = Some(value),
@@ -297,4 +393,22 @@ impl Drop for XmlControl {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+#[cfg(unix)]
+fn configure_stdin(stdin: &ChildStdin) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    // We own this pipe descriptor for the child's lifetime.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn configure_stdin(_: &ChildStdin) -> std::io::Result<()> {
+    // Non-Unix pipe writes still require a cancellable host transport before capability admission.
+    Ok(())
 }

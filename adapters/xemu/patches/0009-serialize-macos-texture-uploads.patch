@@ -1,0 +1,315 @@
+--- a/ui/xemu.c
++++ b/ui/xemu.c
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * xemu SDL display driver
+  *
+@@ -659,7 +660,7 @@
+     glBindTexture(GL_TEXTURE_2D, surface->texture);
+     glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT,
+                   surface_stride(surface) / surface_bytes_per_pixel(surface));
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGB,
+                  surface_width(surface),
+                  surface_height(surface),
+                  0, surface->glformat, surface->gltype,
+--- a/ui/xemu-thumbnail.cc
++++ b/ui/xemu-thumbnail.cc
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * xemu User Interface
+  *
+@@ -49,7 +50,7 @@
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+ 
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB,
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB,
+                  GL_UNSIGNED_BYTE, pixels.data());
+ 
+     return true;
+--- a/ui/xui/scene-components.cc
++++ b/ui/xui/scene-components.cc
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ //
+ // xemu User Interface
+ //
+@@ -224,7 +225,7 @@
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,     GL_CLAMP_TO_BORDER);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
++            xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+             stbi_image_free(data);
+ 
+             // Fix width
+--- a/ui/xui/gl-helpers.cc
++++ b/ui/xui/gl-helpers.cc
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ //
+ // xemu User Interface
+ //
+@@ -92,7 +93,7 @@
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA,
+                  GL_UNSIGNED_BYTE, NULL);
+ 
+     GLint original = GetCurrentFbo();
+@@ -154,7 +155,7 @@
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,     GL_CLAMP_TO_BORDER);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+     return tex;
+ }
+ 
+--- a/ui/console-gl.c
++++ b/ui/console-gl.c
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * QEMU graphical console -- opengl helper bits
+  *
+@@ -79,13 +80,13 @@
+     glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT,
+                   surface_stride(surface) / surface_bytes_per_pixel(surface));
+     if (epoxy_is_desktop_gl()) {
+-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB,
++        xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGB,
+                      surface_width(surface),
+                      surface_height(surface),
+                      0, surface->glformat, surface->gltype,
+                      surface_data(surface));
+     } else {
+-        glTexImage2D(GL_TEXTURE_2D, 0, surface->glformat,
++        xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, surface->glformat,
+                      surface_width(surface),
+                      surface_height(surface),
+                      0, surface->glformat, surface->gltype,
+--- a/ui/egl-helpers.c
++++ b/ui/egl-helpers.c
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * Copyright (C) 2015-2016 Gerd Hoffmann <kraxel@redhat.com>
+  *
+@@ -132,7 +133,7 @@
+ 
+     glGenTextures(1, &texture);
+     glBindTexture(GL_TEXTURE_2D, texture);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
+                  0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
+ 
+     egl_fb_setup_for_tex(fb, width, height, texture, true);
+--- a/hw/xbox/nv2a/pgraph/gl/surface.c
++++ b/hw/xbox/nv2a/pgraph/gl/surface.c
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * Geforce NV2A PGRAPH OpenGL Renderer
+  *
+@@ -300,7 +301,7 @@
+     height = texture_shape->height;
+     pgraph_apply_scaling_factor(pg, &width, &height);
+ 
+-    glTexImage2D(texture->gl_target, 0, f->gl_internal_format, width, height, 0,
++    xemu_gl_tex_image_2d(texture->gl_target, 0, f->gl_internal_format, width, height, 0,
+                  f->gl_format, f->gl_type, buf);
+     g_free(buf);
+     glBindTexture(texture->gl_target, texture->gl_texture);
+@@ -338,7 +339,7 @@
+     glTexParameteri(texture->gl_target, GL_TEXTURE_BASE_LEVEL, 0);
+     glTexParameteri(texture->gl_target, GL_TEXTURE_MAX_LEVEL, 0);
+     glTexParameteri(texture->gl_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+-    glTexImage2D(texture->gl_target, 0, f->gl_internal_format, width, height, 0,
++    xemu_gl_tex_image_2d(texture->gl_target, 0, f->gl_internal_format, width, height, 0,
+                  f->gl_format, f->gl_type, NULL);
+     glBindTexture(texture->gl_target, 0);
+     render_surface_to(d, surface, texture_unit, texture->gl_target,
+@@ -956,7 +957,7 @@
+     }
+ 
+     glBindTexture(GL_TEXTURE_2D, surface->gl_buffer);
+-    glTexImage2D(GL_TEXTURE_2D, 0, surface->fmt.gl_internal_format, width,
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, surface->fmt.gl_internal_format, width,
+                  height, 0, surface->fmt.gl_format, surface->fmt.gl_type,
+                  gl_read_buf);
+     glPixelStorei(GL_UNPACK_ALIGNMENT, prev_unpack_alignment);
+@@ -1225,7 +1226,7 @@
+             unsigned int width = entry.width ? entry.width : 1;
+             unsigned int height = entry.height ? entry.height : 1;
+             pgraph_apply_scaling_factor(pg, &width, &height);
+-            glTexImage2D(GL_TEXTURE_2D, 0, entry.fmt.gl_internal_format, width,
++            xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, entry.fmt.gl_internal_format, width,
+                          height, 0, entry.fmt.gl_format, entry.fmt.gl_type,
+                          NULL);
+             found = surface_put(d, entry.vram_addr, &entry);
+--- a/hw/xbox/nv2a/pgraph/gl/texture.c
++++ b/hw/xbox/nv2a/pgraph/gl/texture.c
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * Geforce NV2A PGRAPH OpenGL Renderer
+  *
+@@ -454,7 +455,7 @@
+                 adjusted_pitch, 0, NULL);
+             glPixelStorei(GL_UNPACK_ROW_LENGTH,
+                           converted ? 0 : adjusted_pitch / f.bytes_per_pixel);
+-            glTexImage2D(GL_TEXTURE_2D, 0, f.gl_internal_format,
++            xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, f.gl_internal_format,
+                          adjusted_width, adjusted_height, 0,
+                          f.gl_format, f.gl_type,
+                          converted ? converted : texture_data);
+@@ -507,7 +508,7 @@
+                     }
+                 }
+ 
+-                glTexImage2D(gl_target, level, GL_RGBA, tex_width, tex_height, 0,
++                xemu_gl_tex_image_2d(gl_target, level, GL_RGBA, tex_width, tex_height, 0,
+                              GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV, converted);
+                 g_free(converted);
+                 if (s.cubemap && adjusted_width != s.width) {
+@@ -541,7 +542,7 @@
+                     pixel_data += 4 * f.bytes_per_pixel + 4 * pitch;
+                 }
+ 
+-                glTexImage2D(gl_target, level, f.gl_internal_format, tex_width,
++                xemu_gl_tex_image_2d(gl_target, level, f.gl_internal_format, tex_width,
+                              tex_height, 0, f.gl_format, f.gl_type,
+                              pixel_data);
+                 if (s.cubemap && s.border) {
+--- a/hw/xbox/nv2a/pgraph/gl/display.c
++++ b/hw/xbox/nv2a/pgraph/gl/display.c
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ /*
+  * Geforce NV2A PGRAPH OpenGL Renderer
+  *
+@@ -265,7 +266,7 @@
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+     uint8_t *tex_rgba = convert_texture_data__CR8YB8CB8YA8(
+         d->vram_ptr + base + offset, in_width, in_height, in_pitch);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, in_width, in_height, 0, GL_RGBA,
++    xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0, GL_RGBA, in_width, in_height, 0, GL_RGBA,
+                  GL_UNSIGNED_BYTE, tex_rgba);
+     g_free(tex_rgba);
+     glUniform1i(r->disp_rndr.pvideo_tex_loc, 1);
+@@ -322,7 +323,7 @@
+         r->gl_display_buffer_height = height;
+         r->gl_display_buffer_format = surface->fmt.gl_format;
+         r->gl_display_buffer_type = surface->fmt.gl_type;
+-        glTexImage2D(GL_TEXTURE_2D, 0,
++        xemu_gl_tex_image_2d(GL_TEXTURE_2D, 0,
+             r->gl_display_buffer_internal_format,
+             r->gl_display_buffer_width,
+             r->gl_display_buffer_height,
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -30,6 +30,7 @@
+   'xemu-controllers.cc',
+ 
+   'xemu.c',
++  'xemu-gl-upload.c',
+   'xemu-data.c',
+   'xemu-snapshots.c',
+   'xemu-thumbnail.cc',
+--- /dev/null
++++ b/include/ui/xemu-gl-upload.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef XEMU_GL_UPLOAD_H
++#define XEMU_GL_UPLOAD_H
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* Leaf barrier for external upload code that does not use the wrapper. */
++void xemu_gl_upload_begin(void);
++void xemu_gl_upload_end(void);
++void xemu_gl_tex_image_2d(unsigned int target, int level, int internal_format,
++                        int width, int height, int border, unsigned int format,
++                        unsigned int type, const void *pixels);
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/ui/xemu-gl-upload.c
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include <epoxy/gl.h>
++#include "ui/xemu-gl-upload.h"
++
++#ifdef __APPLE__
++/* Leaf lock shared by UI and NV2A contexts. Apple GL pixel-conversion workers
++ * crashed at a null instruction address during overlapping texture uploads.
++ * Keep guest/device locks outside this wrapper and preserve every upload. */
++G_LOCK_DEFINE_STATIC(xemu_gl_upload);
++#endif
++
++void xemu_gl_upload_begin(void)
++{
++#ifdef __APPLE__
++    G_LOCK(xemu_gl_upload);
++#endif
++}
++
++void xemu_gl_upload_end(void)
++{
++#ifdef __APPLE__
++    G_UNLOCK(xemu_gl_upload);
++#endif
++}
++
++void xemu_gl_tex_image_2d(unsigned int target, int level, int internal_format,
++                        int width, int height, int border, unsigned int format,
++                        unsigned int type, const void *pixels)
++{
++    xemu_gl_upload_begin();
++    glTexImage2D(target, level, internal_format, width, height, border,
++                 format, type, pixels);
++    xemu_gl_upload_end();
++}
+--- a/ui/xui/main.cc
++++ b/ui/xui/main.cc
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ //
+ // xemu User Interface
+ //
+@@ -276,7 +277,9 @@
+         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
+     }
+ 
++    xemu_gl_upload_begin();
+     ImGui_ImplOpenGL3_NewFrame();
++    xemu_gl_upload_end();
+     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
+     ImGui_ImplSDL3_NewFrame();
+     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+--- a/ui/xui/font-manager.cc
++++ b/ui/xui/font-manager.cc
+@@ -1,3 +1,4 @@
++#include "ui/xemu-gl-upload.h"
+ //
+ // xemu User Interface
+ //
+@@ -100,7 +101,9 @@
+     }
+ 
+     ImGui_ImplOpenGL3_DestroyFontsTexture();
++    xemu_gl_upload_begin();
+     ImGui_ImplOpenGL3_CreateFontsTexture();
++    xemu_gl_upload_end();
+ }
+ 
+ void FontManager::Update()

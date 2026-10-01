@@ -1,0 +1,52 @@
+--- a/src/sound/Fir_Resampler.h
++++ b/src/sound/Fir_Resampler.h
+@@ -51,7 +51,10 @@
+ 	int input_needed( blargg_long count ) const;
+ 	
+ 	// Number of output samples available
+-	int avail() const { return avail_( write_pos - &buf [width_ * stereo] ); }
++	int avail() const {
++		const int remaining = write_pos - buf.begin() - read_span();
++		return remaining < 0 ? 0 : avail_( remaining );
++	}
+ 	
+ public:
+ 	~Fir_Resampler_();
+@@ -72,6 +75,13 @@
+ 	
+ 	Fir_Resampler_( int width, sample_t* );
+ 	int avail_( blargg_long input_count ) const;
++	// A decimation step can exceed the FIR window. Retain enough input for both
++	// convolution and the largest phase step before emitting the next sample.
++	int read_span() const {
++		const int filter_span = width_ * stereo;
++		const int phase_span = step + stereo;
++		return filter_span > phase_span ? filter_span : phase_span;
++	}
+ };
+ 
+ // Width is number of points in FIR. Must be even and 4 or more. More points give
+@@ -111,9 +121,9 @@
+ 	
+ 	count >>= 1;
+ 	
+-	if ( end_pos - in >= width * stereo )
++	if ( end_pos - in >= read_span() )
+ 	{
+-		end_pos -= width * stereo;
++		end_pos -= read_span();
+ 		do
+ 		{
+ 			count--;
+@@ -183,9 +193,9 @@
+ 	
+ 	count >>= 1;
+ 
+-	if ( end_pos - in >= width * stereo )
++	if ( end_pos - in >= read_span() )
+ 	{
+-		end_pos -= width * stereo;
++		end_pos -= read_span();
+ 		do
+ 		{
+ 			count--;

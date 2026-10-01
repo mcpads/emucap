@@ -1,0 +1,52 @@
+--- a/core/deps/SDL/src/video/cocoa/SDL_cocoaopengl.m
++++ b/core/deps/SDL/src/video/cocoa/SDL_cocoaopengl.m
+@@ -54,6 +54,9 @@
+ #define _Nullable
+ #endif
+ 
++#include "SDL_timer.h"
++#include "emucap_sdl_swap_wait.h"
++
+ static SDL_bool SDL_opengl_async_dispatch = SDL_FALSE;
+ 
+ static void SDLCALL
+@@ -90,6 +93,7 @@
+         self->window = NULL;
+         SDL_AtomicSet(&self->swapIntervalSetting, 0);
+         SDL_AtomicSet(&self->swapIntervalsPassed, 0);
++        self->swapLinkStalled = SDL_FALSE;
+         self->swapIntervalCond = SDL_CreateCond();
+         self->swapIntervalMutex = SDL_CreateMutex();
+         if (!self->swapIntervalCond || !self->swapIntervalMutex) {
+@@ -480,18 +484,10 @@
+ 
+     if (setting == 0) {
+         /* nothing to do if vsync is disabled, don't even lock */
+-    } else if (setting < 0) {  /* late swap tearing */
++    } else {
+         SDL_LockMutex(nscontext->swapIntervalMutex);
+-        while (SDL_AtomicGet(&nscontext->swapIntervalsPassed) == 0) {
+-            SDL_CondWait(nscontext->swapIntervalCond, nscontext->swapIntervalMutex);
+-        }
+-        SDL_AtomicSet(&nscontext->swapIntervalsPassed, 0);
+-        SDL_UnlockMutex(nscontext->swapIntervalMutex);
+-    } else {
+-        SDL_LockMutex(nscontext->swapIntervalMutex);
+-        do {  /* always wait here so we know we just hit a swap interval. */
+-            SDL_CondWait(nscontext->swapIntervalCond, nscontext->swapIntervalMutex);
+-        } while ((SDL_AtomicGet(&nscontext->swapIntervalsPassed) % setting) != 0);
++        emucap_sdl_wait_swap(nscontext->swapIntervalCond, nscontext->swapIntervalMutex,
++                            &nscontext->swapIntervalsPassed, setting, &nscontext->swapLinkStalled);
+         SDL_AtomicSet(&nscontext->swapIntervalsPassed, 0);
+         SDL_UnlockMutex(nscontext->swapIntervalMutex);
+     }
+--- a/core/deps/SDL/src/video/cocoa/SDL_cocoaopengl.h
++++ b/core/deps/SDL/src/video/cocoa/SDL_cocoaopengl.h
+@@ -48,6 +48,7 @@
+     @public SDL_cond *swapIntervalCond;
+     @public SDL_atomic_t swapIntervalSetting;
+     @public SDL_atomic_t swapIntervalsPassed;
++    SDL_bool swapLinkStalled;
+ }
+ 
+ - (id)initWithFormat:(NSOpenGLPixelFormat *)format

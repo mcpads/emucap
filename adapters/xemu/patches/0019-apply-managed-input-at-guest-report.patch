@@ -1,0 +1,67 @@
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -277,9 +277,9 @@
+     G_UNLOCK(xemu_emucap);
+ }
+ 
+-void xemu_emucap_apply_input(ControllerState *state)
+-{
+-    if (state != bound_controllers[0]) {
++void xemu_emucap_apply_input(unsigned port, ControllerState *state)
++{
++    if (port != 0) {
+         return;
+     }
+ 
+--- a/ui/xemu-emucap.h
++++ b/ui/xemu-emucap.h
+@@ -21,7 +21,7 @@
+ extern "C" {
+ #endif
+ 
+-void xemu_emucap_apply_input(ControllerState *state);
++void xemu_emucap_apply_input(unsigned port, ControllerState *state);
+ void xemu_emucap_frame_boundary(void);
+ bool xemu_emucap_take_screenshot_request(uint64_t *request_id);
+ void xemu_emucap_complete_screenshot(uint64_t request_id,
+--- a/ui/xemu-input.c
++++ b/ui/xemu-input.c
+@@ -29,7 +29,6 @@
+ #include "qemu/config-file.h"
+ 
+ #include "xemu-input.h"
+-#include "xemu-emucap.h"
+ #include "xemu-notifications.h"
+ #include "xemu-settings.h"
+ #include <stdio.h>
+@@ -493,7 +492,6 @@
+     } else if (state->type == INPUT_DEVICE_SDL_GAMEPAD) {
+         xemu_input_update_sdl_controller_state(state);
+     }
+-    xemu_emucap_apply_input(state);
+ 
+     state->last_input_updated_ts = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+ }
+--- a/hw/xbox/xid.c
++++ b/hw/xbox/xid.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include "xid.h"
++#include "ui/xemu-emucap.h"
+ 
+ /*
+  * http://xbox-linux.cvs.sourceforge.net/viewvc/xbox-linux/kernel-2.6/drivers/usb/input/xpad.c
+@@ -62,6 +63,12 @@
+     ControllerState *state = xemu_input_get_bound(s->device_index);
+     assert(state);
+     xemu_input_update_controller(state);
++
++    /* Native polling keeps its host-time cache. Managed input is selected at
++     * each guest report, so host polling cannot delay a press or its release. */
++    ControllerState effective = *state;
++    xemu_emucap_apply_input(s->device_index, &effective);
++    state = &effective;
+ 
+     const int button_map_analog[6][2] = {
+         { GAMEPAD_A,     CONTROLLER_BUTTON_A     },

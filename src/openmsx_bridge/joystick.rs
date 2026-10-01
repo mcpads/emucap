@@ -86,14 +86,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
                 .command(&format!("debug read emucap_joystick_override {index}"))?,
             "emucap joystick override",
         )?;
-        match encoded {
-            0 => Ok(None),
-            0x80..=0xbf => Ok(Some((encoded as u8) & 0x3f)),
-            value => Err(OpenMsxBridgeError::Protocol(format!(
-                "openMSX returned invalid joystick override status {value:#x} for port {}",
-                index + 1
-            ))),
-        }
+        super::input::decode_joystick_owner(encoded, index)
     }
 
     pub(super) fn checked_joystick_owner(&mut self, index: usize) -> BridgeResult<Option<u8>> {
@@ -106,28 +99,6 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             )));
         }
         Ok(native)
-    }
-
-    pub(super) fn checked_joystick_owners(&mut self) -> BridgeResult<[Option<u8>; 2]> {
-        Ok([
-            self.checked_joystick_owner(0)?,
-            self.checked_joystick_owner(1)?,
-        ])
-    }
-
-    pub(super) fn guest_joystick_value(&mut self, index: usize) -> BridgeResult<u8> {
-        let value = parse_decimal(
-            &self
-                .control
-                .command(&format!("debug read joystickports {index}"))?,
-            "guest joystick value",
-        )?;
-        u8::try_from(value).map_err(|_| {
-            OpenMsxBridgeError::Protocol(format!(
-                "openMSX returned invalid guest joystick value {value} for port {}",
-                index + 1
-            ))
-        })
     }
 
     fn write_joystick_owner(&mut self, index: usize, owner: Option<u8>) -> BridgeResult<()> {

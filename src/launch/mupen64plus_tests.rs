@@ -52,6 +52,12 @@ fn compatible_root_requires_pinned_metadata_and_display_plugin_only_when_visible
     std::fs::remove_file(root.join("mupen64plus-video-rice.dylib")).unwrap();
     assert!(require_compatible_root(repo.path(), &root, false).is_ok());
     assert!(require_compatible_root(repo.path(), &root, true).is_err());
+    let metadata_path = root.join("emucap-mupen64plus-build.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&metadata_path).unwrap()).unwrap();
+    metadata["host_api"] = serde_json::json!(REQUIRED_HOST_API - 1);
+    std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(require_compatible_root(repo.path(), &root, false).is_err());
 }
 
 #[test]

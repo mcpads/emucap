@@ -77,6 +77,22 @@ PATCHES=(
   "$HERE/patches/0002-preserve-bql-on-watchpoint-reentry.patch"
   "$HERE/patches/0003-defer-bql-held-watchpoint-stop.patch"
   "$HERE/patches/0004-retranslate-watchpoint-without-current-tb-invalidation.patch"
+  "$HERE/patches/0005-frozen-memory-batches.patch"
+  "$HERE/patches/0006-instruction-clock-pacing.patch"
+  "$HERE/patches/0007-cache-thread-jit-permissions.patch"
+  "$HERE/patches/0008-coherent-frozen-ram-peek.patch"
+  "$HERE/patches/0009-serialize-macos-texture-uploads.patch"
+  "$HERE/patches/0010-exclude-macos-suspend-from-pacing.patch"
+  "$HERE/patches/0011-preserve-vblank-fraction.patch"
+  "$HERE/patches/0012-clear-restored-pending-audio-scratch.patch"
+  "$HERE/patches/0013-observe-frozen-audio-continuation.patch"
+  "$HERE/patches/0014-bound-audio-frame-phase.patch"
+  "$HERE/patches/0015-bind-rtc-to-guest-clock.patch"
+  "$HERE/patches/0016-skip-hidden-window-presentation.patch"
+  "$HERE/patches/0017-quiesce-gpu-for-frozen-snapshots.patch"
+  "$HERE/patches/0018-release-gpu-lock-on-invalid-vblank-phase.patch"
+  "$HERE/patches/0019-apply-managed-input-at-guest-report.patch"
+  "$HERE/patches/0020-preserve-pgraph-command-state.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done |
   if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi |

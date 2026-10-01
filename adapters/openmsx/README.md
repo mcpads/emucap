@@ -16,14 +16,26 @@ cargo build --locked --release --bin emucap-openmsx-bridge --bin emucap-mcp
 The script downloads the exact release archive, applies the pinned upstream SDL2 compatibility
 backport and all five emucap host patches, builds only inside the ignored `work/` tree, verifies the
 generated executable with `-testconfig`, and writes every patch hash and host API 6 next to
-the binary. On macOS it uses existing Homebrew development libraries. No generated source,
+the binary. Linux builds install runtime resources inside the selected work directory.
+macOS builds include them in the app bundle and use existing Homebrew development libraries. No generated source,
 firmware, ROM, or binary is committed.
+
+Pacing waits share the event queue's mutex and predicate. A queued command returns from the
+wait immediately; a command arriving during the wait wakes it. The wait reports a completed
+delay only if its deadline expires with an empty queue. Dispatch remains on the native main
+thread, and an early wake preserves the remaining guest-time lead for the next pacing sync.
+Run `bash _tests/adapters/openmsx/event-wait-test.sh adapters/openmsx/work/openmsx-21.0`
+to exercise the actual native event queue and wait with isolated dispatcher dependencies.
 
 Launch through the MCP tool:
 
 ```text
 launch(content_path="/absolute/path/game.rom", system="msx", display=false)
 ```
+
+`sound:true` enables host audio independently of `display`; the default is muted. The bridge
+checks native `mute` readback before launch readiness, and `status.diagnostics.audio_muted`
+reports the current setting. Pacing changes host timing while preserving this audio choice.
 
 `.mx1` and `.mx2` are inferred as MSX cartridges. Generic `.rom` files require an explicit MSX
 system because that extension is shared by unrelated platforms. `msx` uses a `C-BIOS_MSX2+`

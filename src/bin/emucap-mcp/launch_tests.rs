@@ -1778,6 +1778,7 @@ struct RuntimeLaunchLink {
     lease_state: LeaseState,
     ready_state: &'static str,
     controlled_start: bool,
+    audio_output: Option<serde_json::Value>,
 }
 
 #[cfg(unix)]
@@ -1793,6 +1794,7 @@ impl RuntimeLaunchLink {
             lease_state: LeaseState::Held,
             ready_state: "running",
             controlled_start: false,
+            audio_output: None,
         }
     }
 
@@ -1833,6 +1835,9 @@ impl EmulatorLink for RuntimeLaunchLink {
                     "controlled": true,
                     "boundary": "pre_first_instruction"
                 });
+            }
+            if let Some(output) = &self.audio_output {
+                status["audio_output"] = output.clone();
             }
             Ok(status)
         }
@@ -2392,10 +2397,116 @@ fn controlled_launch_fails_closed_and_terminates_a_running_entry() {
 fn adapter_readiness_wait_is_bounded() {
     let mut link = NotConnectedPortLink::new();
     let started = std::time::Instant::now();
-    let error = wait_for_adapter_ready(&mut link, std::time::Duration::from_millis(20), || Ok(()))
-        .unwrap_err();
+    let error = wait_for_adapter_ready(
+        &mut link,
+        std::time::Duration::from_millis(20),
+        || Ok(()),
+        |_| Ok(true),
+    )
+    .unwrap_err();
     assert!(error.contains("within 20 ms"), "{error}");
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+#[cfg(unix)]
+fn adapter_readiness_checks_pending_and_failed_native_output() {
+    let mut link = RuntimeLaunchLink::new(0);
+    link.calls = 1;
+    let observations = std::cell::Cell::new(0);
+    let ready = wait_for_adapter_ready(
+        &mut link,
+        std::time::Duration::from_secs(1),
+        || Ok(()),
+        |_| {
+            observations.set(observations.get() + 1);
+            Ok(observations.get() == 2)
+        },
+    )
+    .unwrap();
+    assert_eq!(ready["connected"], true);
+    assert_eq!(observations.get(), 2);
+    let error = wait_for_adapter_ready(
+        &mut link,
+        std::time::Duration::from_millis(20),
+        || Ok(()),
+        |_| Ok(false),
+    )
+    .unwrap_err();
+    assert!(error.contains("within 20 ms"), "{error}");
+    let before = link.calls;
+    let error = wait_for_adapter_ready(
+        &mut link,
+        std::time::Duration::from_secs(1),
+        || Ok(()),
+        |_| Err("start_failed".into()),
+    )
+    .unwrap_err();
+    assert!(error.contains("start_failed") && error.contains("ready_status"));
+    assert_eq!(link.calls, before + 1);
+}
+
+#[test]
+#[cfg(unix)]
+fn dolphin_audio_failure_terminates_only_the_owned_launch_and_aborts_admission() {
+    let _guard = env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    let binary = tmp.path().join("dolphin-emu-nogui");
+    std::fs::write(&binary, b"#!/bin/sh\nexec sleep 30\n").unwrap();
+    make_executable(&binary);
+    write_dolphin_sidecar(&binary);
+    let content = tmp.path().join("game.gcm");
+    std::fs::write(&content, b"fixture").unwrap();
+    let _env = EnvRestore::new(&["EMUCAP_DOLPHIN_HEADLESS_BIN", "EMUCAP_EMU_HOME"]);
+    std::env::set_var("EMUCAP_DOLPHIN_HEADLESS_BIN", &binary);
+    std::env::set_var("EMUCAP_EMU_HOME", tmp.path().join("home"));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut link = RuntimeLaunchLink::new(port);
+    link.audio_output = Some(serde_json::json!({
+        "stream_generation": "1", "backend": "native", "initialized": true,
+        "phase": "ready", "last_run_result": "failed", "start_verified": false,
+        "failure": "start_failed"
+    }));
+    let original_token = link.token.clone();
+    let outcome = make_launch(
+        &mut link,
+        &LaunchArgs {
+            content_path: content.display().to_string(),
+            content_path2: None,
+            system: Some("gamecube".into()),
+            pc98_backend: None,
+            indirect_media_approval: None,
+            name: Some("audio-failure-test".into()),
+            display: Some(false),
+            sound: Some(true),
+            pc98_sound_board: None,
+            start_frozen: false,
+            execution_profile: None,
+            replace: false,
+        },
+    );
+    assert_eq!(outcome["launched"], false, "{outcome}");
+    assert!(
+        outcome["error"].as_str().unwrap().contains("start_failed"),
+        "{outcome}"
+    );
+    assert_eq!(link.token, original_token);
+    assert!(link.staged_token.is_none());
+    assert!(emucap::live::runtime::RuntimeStore::discover()
+        .read_current(port)
+        .unwrap()
+        .is_none());
+    let pid = outcome["launcher_outcome"]["pid"].as_u64().unwrap() as u32;
+    let process = emucap::live::runtime::capture_process(pid);
+    for _ in 0..100 {
+        if emucap::live::runtime::process_state(&process) == ProcessState::Exited {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("failed audio launch {pid} survived cleanup");
 }
 
 #[test]
@@ -2650,17 +2761,17 @@ fn launch_sound_admission_matches_the_documented_adapters() {
     assert!(adapter_supports_sound("mednafen"));
     assert!(adapter_supports_sound("mame_pc98"));
     assert!(adapter_supports_sound("xemu"));
+    assert!(adapter_supports_sound("flycast"));
+    assert!(adapter_supports_sound("openmsx"));
+    assert!(adapter_supports_sound("dolphin"));
     for adapter in [
         "mesen2",
         "mame_neogeo",
         "mupen64plus",
         "np2kai",
-        "openmsx",
-        "flycast",
         "desmume_nds",
         "ppsspp",
         "pcsx2",
-        "dolphin",
     ] {
         assert!(!adapter_supports_sound(adapter), "{adapter}");
     }

@@ -10,6 +10,14 @@ index 1b50796..177b72f 100644
  #include "Core/DolphinAnalytics.h"
  #include "Core/FifoPlayer/FifoPlayer.h"
  #include "Core/FreeLookManager.h"
+@@ -577,6 +578,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+   system.GetMovie().Init(*boot);
+   Common::ScopeGuard movie_guard([&system] { system.GetMovie().Shutdown(); });
+ 
++  EmuCap::ConfigureAudioOutput();
+   AudioCommon::InitSoundStream(system);
+   Common::ScopeGuard audio_guard([&system] { AudioCommon::ShutdownSoundStream(system); });
+ 
 @@ -673,6 +674,11 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
  
    UpdateTitle(system);

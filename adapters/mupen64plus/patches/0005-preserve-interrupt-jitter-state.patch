@@ -1,0 +1,159 @@
+--- a/src/device/r4300/r4300_core.h
++++ b/src/device/r4300/r4300_core.h
+@@ -200,6 +200,7 @@
+     uint32_t randomize_interrupt;
+ 
+     uint32_t start_address;
++    uint32_t interrupt_jitter_state;
+ };
+ 
+ #define R4300_KSEG0 UINT32_C(0x80000000)
+--- a/src/device/r4300/r4300_core.c
++++ b/src/device/r4300/r4300_core.c
+@@ -64,7 +64,8 @@
+     r4300->rdram = rdram;
+     r4300->randomize_interrupt = randomize_interrupt;
+     r4300->start_address = start_address;
+-    srand((unsigned int) time(NULL));
++    r4300->interrupt_jitter_state = (uint32_t)time(NULL);
++    if (!r4300->interrupt_jitter_state) r4300->interrupt_jitter_state = 1;
+ }
+ 
+ void poweron_r4300(struct r4300_core* r4300)
+--- a/src/device/r4300/interrupt.c
++++ b/src/device/r4300/interrupt.c
+@@ -1,3 +1,4 @@
++#include "interrupt_jitter.h"
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+  *   Mupen64plus - interrupt.c                                              *
+  *   Mupen64Plus homepage: https://mupen64plus.org/                        *
+@@ -114,16 +115,7 @@
+ 
+ unsigned int add_random_interrupt_time(struct r4300_core* r4300)
+ {
+-    if (r4300->randomize_interrupt) {
+-        unsigned int value;
+-#ifdef __MINGW32__
+-        rand_s(&value);
+-#else
+-        value = rand();
+-#endif
+-        return value % 0x40;
+-    } else
+-        return 0;
++    return interrupt_jitter_next(&r4300->interrupt_jitter_state, r4300->randomize_interrupt);
+ }
+ 
+ void add_interrupt_event(struct cp0* cp0, int type, unsigned int delay)
+--- a/src/main/savestates.c
++++ b/src/main/savestates.c
+@@ -41,6 +41,7 @@
+ #include "api/m64p_types.h"
+ #include "backends/api/storage_backend.h"
+ #include "device/device.h"
++#include "device/r4300/interrupt_jitter.h"
+ #include "main/list.h"
+ #include "main/main.h"
+ #include "osal/files.h"
+@@ -304,6 +305,16 @@
+     gzclose(f);
+     SDL_UnlockMutex(savestates_lock);
+ 
++    /* Validate the optional native extension before mutating any device. */
++    uint32_t restored_jitter = dev->r4300.interrupt_jitter_state;
++    if (version >= 0x00010200 && interrupt_jitter_decode(
++            data_0001_0200 + sizeof(data_0001_0200) - INTERRUPT_JITTER_RECORD_SIZE,
++            INTERRUPT_JITTER_RECORD_SIZE, &restored_jitter) < 0) {
++        free(savestateData);
++        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Invalid interrupt jitter state");
++        return 0;
++    }
++
+     // Parse savestate
+     dev->rdram.regs[0][RDRAM_CONFIG_REG]       = GETDATA(curr, uint32_t);
+     dev->rdram.regs[0][RDRAM_DEVICE_ID_REG]    = GETDATA(curr, uint32_t);
+@@ -954,6 +965,7 @@
+ 
+     *r4300_cp0_last_addr(&dev->r4300.cp0) = *r4300_pc(&dev->r4300);
+ 
++    dev->r4300.interrupt_jitter_state = restored_jitter;
+     free(savestateData);
+     main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "State loaded from: %s", namefrompath(filepath));
+     return 1;
+@@ -1915,6 +1927,17 @@
+     PUTDATA(curr, uint64_t, *r4300_cp0_latch((struct cp0*)&dev->r4300.cp0));
+     PUTDATA(curr, uint64_t, *r4300_cp2_latch((struct cp2*)&dev->r4300.cp2));
+ 
++    /* Never overlap the extension's existing device fields or publish an invalid state. */
++    unsigned char *jitter_record = (unsigned char *)save->data + save->size - INTERRUPT_JITTER_RECORD_SIZE;
++    if ((unsigned char *)curr > jitter_record || !interrupt_jitter_encode(
++            jitter_record, INTERRUPT_JITTER_RECORD_SIZE, dev->r4300.interrupt_jitter_state)) {
++        free(save->data);
++        free(save->filepath);
++        free(save);
++        StateChanged(M64CORE_STATE_SAVECOMPLETE, 0);
++        return 0;
++    }
++
+     init_work(&save->work, savestates_save_m64p_work);
+     queue_work(&save->work);
+ 
+--- /dev/null
++++ b/src/device/r4300/interrupt_jitter.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef M64P_INTERRUPT_JITTER_H
++#define M64P_INTERRUPT_JITTER_H
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++
++/* Instance-owned xorshift32; zero is excluded from the state domain. */
++static inline uint32_t interrupt_jitter_next(uint32_t *state, int enabled)
++{
++    if (!enabled) return 0;
++    uint32_t x = *state;
++    x ^= x << 13;
++    x ^= x >> 17;
++    x ^= x << 5;
++    *state = x;
++    return x & 63;
++}
++
++/* Last 32 bytes of the native 4096-byte extension, previously zero padding.
++ * ECJITTER + LE32 encoding + LE32 state + LE32 complement + zero reserved. */
++#define INTERRUPT_JITTER_RECORD_SIZE 32
++static inline uint32_t interrupt_jitter_read32(const unsigned char *p)
++{
++    return (uint32_t)p[0] | (uint32_t)p[1]<<8 | (uint32_t)p[2]<<16 | (uint32_t)p[3]<<24;
++}
++static inline void interrupt_jitter_write32(unsigned char *p, uint32_t x)
++{
++    for (unsigned i = 0; i < 4; ++i) p[i] = (unsigned char)(x >> (8*i));
++}
++/* 0 = legacy padding; 1 = admitted record; -1 = malformed or unknown.
++ * Failure and legacy records leave the caller's live state untouched. */
++static inline int interrupt_jitter_decode(const unsigned char *p, size_t size, uint32_t *state)
++{
++    if (size != INTERRUPT_JITTER_RECORD_SIZE) return -1;
++    unsigned nonzero = 0;
++    for (size_t i = 0; i < size; ++i) nonzero |= p[i];
++    if (!nonzero) return 0;
++    if (memcmp(p, "ECJITTER", 8) || interrupt_jitter_read32(p+8) != 1) return -1;
++    uint32_t x = interrupt_jitter_read32(p+12);
++    if (!x || interrupt_jitter_read32(p+16) != ~x) return -1;
++    for (size_t i = 20; i < size; ++i) if (p[i]) return -1;
++    *state = x;
++    return 1;
++}
++static inline int interrupt_jitter_encode(unsigned char *p, size_t size, uint32_t state)
++{
++    if (size != INTERRUPT_JITTER_RECORD_SIZE || !state) return 0;
++    memset(p, 0, size);
++    memcpy(p, "ECJITTER", 8);
++    interrupt_jitter_write32(p+8, 1);
++    interrupt_jitter_write32(p+12, state);
++    interrupt_jitter_write32(p+16, ~state);
++    return 1;
++}
++#endif

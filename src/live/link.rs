@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use crate::contracts::ContractAdvertisement;
 
@@ -163,13 +163,14 @@ pub struct Capabilities {
     /// Parsed and validated at hello. Public status advertises it only when the link is direct and
     /// bound to the exact managed generation and lease.
     pub recording: Option<super::recording_capability::RecordingCapability>,
-    /// Static batch/pacing domains parsed at hello; present exactly when the method is advertised.
+    /// Static optional domains parsed at hello; present exactly when their method is advertised.
     pub features: FeatureCapabilities,
     pub identity: EmulatorIdentity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeatureCapabilities {
+    pub temporal_cancellation: Option<super::temporal::CancellationCapability>,
     pub memory_batch: Option<super::memory_batch::MemoryBatchCapability>,
     pub execution_speed: Option<super::pacing::ExecutionSpeedCapability>,
 }
@@ -202,9 +203,16 @@ impl FeatureCapabilities {
                     .map_err(LinkError::Protocol)
             })
             .transpose()?;
+        let temporal_cancellation = paired("cancel_operation", "temporal_cancellation_capability")?
+            .map(|value| {
+                super::temporal::CancellationCapability::from_hello(value, methods)
+                    .map_err(LinkError::Protocol)
+            })
+            .transpose()?;
         Ok(Self {
             memory_batch,
             execution_speed,
+            temporal_cancellation,
         })
     }
 }
@@ -297,15 +305,20 @@ impl WorkingProgress {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct RequestCancellation(Arc<AtomicBool>);
+pub struct RequestCancellation(Arc<OnceLock<Instant>>);
 
 impl RequestCancellation {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.get_or_init(Instant::now);
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.get().is_some()
+    }
+
+    /// The first cancellation is the shared host-clock origin for all cleanup phases.
+    pub fn cancelled_at(&self) -> Option<Instant> {
+        self.0.get().copied()
     }
 }
 
@@ -321,6 +334,12 @@ pub struct ProgressCallControl {
     pub abort: Option<AbortRequest>,
     /// Host deadline through the guest-affecting adapter terminal. Progress never extends it.
     pub max_host_ms: Option<u64>,
+    /// Opt-in temporal wire mode: plain keepalives, an identity-bound cancel_operation, and
+    /// an independent stop budget. The original terminal and abort acknowledgement are drained
+    /// before returning. A transport timeout in this mode never proves cancellation completed.
+    pub temporal_stop_ms: Option<u64>,
+    /// Absolute host deadline for temporal mode, preserved across middleware and socket waits.
+    pub temporal_deadline: Option<Instant>,
 }
 
 pub type ProgressObserver<'a> = dyn FnMut(&WorkingProgress) -> Result<(), LinkError> + Send + 'a;
@@ -344,8 +363,8 @@ impl Capabilities {
 pub trait EmulatorLink {
     fn capabilities(&self) -> &Capabilities;
     fn call(&mut self, method: &str, params: Value) -> Result<Value, LinkError>;
-    /// Observe typed `working` frames and bind cancellation to this exact request. Ordinary calls
-    /// retain their existing one-response behavior through `call`.
+    /// Bind cancellation to this exact request. Recording mode reports typed progress; temporal
+    /// mode consumes plain keepalives internally. Ordinary calls retain `call` behavior.
     fn call_with_progress(
         &mut self,
         method: &str,
@@ -356,8 +375,36 @@ pub trait EmulatorLink {
         if control.cancellation.is_cancelled() {
             return Err(LinkError::Cancelled);
         }
+        if control.temporal_stop_ms.is_some() {
+            return Err(LinkError::Emulator {
+                kind: "unsupported".into(),
+                message: "this link does not implement temporal cancellation".into(),
+            });
+        }
         let _ = observer;
         self.call(method, params)
+    }
+    /// Persist a composed temporal operation before native effects. The concrete owner must
+    /// survive controller replacement; unsupported links reject before mutation.
+    fn begin_temporal_control(
+        &mut self,
+        _key: &super::reconnect::cancellation::OperationKey,
+    ) -> Result<(), LinkError> {
+        Err(LinkError::Emulator {
+            kind: "unsupported".into(),
+            message: "durable temporal ownership is unavailable".into(),
+        })
+    }
+    /// Complete only the matching parent operation. `verified=false` retains quarantine.
+    fn finish_temporal_control(
+        &mut self,
+        _key: &super::reconnect::cancellation::OperationKey,
+        _verified: bool,
+    ) -> Result<(), LinkError> {
+        Err(LinkError::Emulator {
+            kind: "unsupported".into(),
+            message: "durable temporal ownership is unavailable".into(),
+        })
     }
     /// Whether the link can discard a failed front-side session and attach the same control
     /// session again. Temporal cleanup uses this only for idempotent compensation calls after an
@@ -382,6 +429,10 @@ pub trait EmulatorLink {
     /// keep the default false so mutation cannot pass merely because no capsule port is visible.
     fn has_exclusive_control(&self) -> bool {
         false
+    }
+    /// Fresh correlation identity for the currently admitted transport attachment.
+    fn attachment_id(&self) -> Option<&str> {
+        None
     }
     /// Direct-mode search starting point. This is not a listener endpoint and must never be passed
     /// to an emulator as though it had already been reserved.

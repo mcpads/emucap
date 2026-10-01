@@ -1435,11 +1435,8 @@ fn terminal_snapshot_generation_change_never_publishes_old_generation_bytes() {
     assert_eq!(capsule.terminal.unwrap().integrity, Integrity::Unverifiable);
 }
 
-#[cfg(unix)]
 #[test]
 fn terminal_snapshot_write_failure_quarantines_without_a_complete_bundle() {
-    use std::os::unix::fs::PermissionsExt;
-
     let _env = crate::test_env::lock_env();
     let harness = harness();
     let mut link = SyntheticLink::new(
@@ -1457,26 +1454,25 @@ fn terminal_snapshot_write_failure_quarantines_without_a_complete_bundle() {
         address: 0,
         length: 4,
     }];
-    let mut made_staging_read_only = false;
+    let mut blocked_snapshot_path = false;
     let result = record_window(
         &mut link,
         harness.store.clone(),
         capture_request,
         RequestCancellation::default(),
         &mut |progress| {
-            if progress.events == 1 && !made_staging_read_only {
+            if progress.events == 1 && !blocked_snapshot_path {
                 let staging = std::fs::read_dir(harness.output.path())
                     .unwrap()
                     .filter_map(Result::ok)
                     .find(|entry| entry.file_name().to_string_lossy().contains(".staging-"))
                     .unwrap();
-                std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o500))
-                    .unwrap();
-                made_staging_read_only = true;
+                std::fs::write(staging.path().join("snapshots"), b"path obstruction").unwrap();
+                blocked_snapshot_path = true;
             }
         },
     );
-    assert!(made_staging_read_only);
+    assert!(blocked_snapshot_path);
     assert!(result.is_err());
     assert!(!std::fs::read_dir(harness.output.path())
         .unwrap()

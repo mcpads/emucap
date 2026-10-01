@@ -26,6 +26,17 @@ int main() {
             "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":65537}]}}", ranges, error),
         "oversized batch");
 
+  check(!emucap_parse_batch_ranges(
+      "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":1},{\"memory_type\":\"ram\",\"address\":0,\"length\":18446744073709551615}]}}",
+      ranges, error), "aggregate length cannot wrap below the byte limit");
+
+  check(emucap_parse_batch_ranges(
+      "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":65535},{\"memory_type\":\"ram\",\"address\":65535,\"length\":1}]}}",
+      ranges, error), "aggregate at byte limit remains accepted");
+  check(!emucap_parse_batch_ranges(
+      "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":65536},{\"memory_type\":\"ram\",\"address\":0,\"length\":1}]}}",
+      ranges, error), "aggregate one byte beyond limit is rejected");
+
   EmucapPacingRequest request;
   check(emucap_parse_pacing_request("{\"params\":{}}", request, error) && request.query, "query");
   request = {};

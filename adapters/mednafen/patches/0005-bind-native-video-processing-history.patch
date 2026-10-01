@@ -1,0 +1,134 @@
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -48,6 +48,7 @@
+ #include "state_rewind.h"
+ #include "video.h"
+ #include "video/Deinterlacer.h"
++#include "video/VideoHistoryIO.h"
+ #include "file.h"
+ #include "mempatcher.h"
+ #include "tests.h"
+@@ -288,6 +289,86 @@
+ static MDFN_PixelFormat last_pixel_format;
+ static bool PrevInterlaced;
+ static std::unique_ptr<Deinterlacer> deint;
++static unsigned deint_mode;
++
++// A prepared owner binds every temporal filter to one frame-history transaction.
++struct MDFNVideoHistory::Data
++{
++ MDFNGI* game = nullptr;
++ uint32 width = 0, height = 0, mode = 0;
++ bool previous_interlaced = false;
++ std::unique_ptr<Deinterlacer> deinterlacer;
++ std::unique_ptr<TBlurHistory> blur;
++};
++
++MDFNVideoHistory::MDFNVideoHistory() : data_(new Data) {}
++MDFNVideoHistory::~MDFNVideoHistory() = default;
++
++void MDFNI_SaveVideoHistory(Stream* stream)
++{
++ if(!MDFNGameInfo || !deint || MDFNGameInfo->fb_width <= 0 || MDFNGameInfo->fb_height <= 0)
++  throw std::runtime_error("video history owner is unavailable");
++ MemoryStream deinterlacer, blur;
++ deint->SaveHistory(&deinterlacer);
++ TBlur_SaveHistory(&blur);
++ if(deinterlacer.size() > VideoHistoryIO::MaxBytes || blur.size() > VideoHistoryIO::MaxBytes)
++  throw std::runtime_error("video history block exceeds bound");
++ stream->write("ECVPROC1", 8);
++ stream->put_LE<uint32>(MDFNGameInfo->fb_width);
++ stream->put_LE<uint32>(MDFNGameInfo->fb_height);
++ stream->put_LE<uint32>(deint_mode);
++ stream->put_LE<uint32>(PrevInterlaced);
++ stream->put_LE<uint64>(deinterlacer.size());
++ stream->put_LE<uint64>(blur.size());
++ stream->write(deinterlacer.map(), deinterlacer.size());
++ stream->write(blur.map(), blur.size());
++}
++
++std::unique_ptr<MDFNVideoHistory> MDFNI_PrepareVideoHistory(Stream* stream)
++{
++ if(!MDFNGameInfo || !deint || MDFNGameInfo->fb_width <= 0 || MDFNGameInfo->fb_height <= 0)
++  throw std::runtime_error("video history owner is unavailable");
++ char magic[8]; stream->read(magic, sizeof(magic));
++ if(memcmp(magic, "ECVPROC1", sizeof(magic)))
++  throw std::runtime_error("incompatible video processing history");
++ std::unique_ptr<MDFNVideoHistory> result(new MDFNVideoHistory);
++ auto& data = *result->data_;
++ data.game = MDFNGameInfo;
++ data.width = stream->get_LE<uint32>();
++ data.height = stream->get_LE<uint32>();
++ data.mode = stream->get_LE<uint32>();
++ data.previous_interlaced = VideoHistoryIO::ReadBool(stream);
++ if(data.width != uint32(MDFNGameInfo->fb_width) || data.height != uint32(MDFNGameInfo->fb_height)
++    || data.mode != deint_mode)
++  throw std::runtime_error("video processing configuration differs");
++ const uint64 deint_size = stream->get_LE<uint64>(), blur_size = stream->get_LE<uint64>();
++ if(deint_size > VideoHistoryIO::MaxBytes || blur_size > VideoHistoryIO::MaxBytes)
++  throw std::runtime_error("video history block exceeds bound");
++ VideoHistoryIO::RequireBytes(stream, deint_size + blur_size);
++ if(stream->size() - stream->tell() != deint_size + blur_size)
++  throw std::runtime_error("trailing video processing history");
++ MemoryStream deinterlacer(deint_size, -1), blur(blur_size, -1);
++ stream->read(deinterlacer.map(), deint_size);
++ stream->read(blur.map(), blur_size);
++ data.deinterlacer = Deinterlacer::RestoreHistory(data.mode, &deinterlacer, data.width, data.height);
++ data.blur = TBlur_PrepareHistory(&blur);
++ return result;
++}
++
++bool MDFNI_CommitVideoHistory(MDFNVideoHistory& history) noexcept
++{
++ auto& data = *history.data_;
++ if(!MDFNGameInfo || !deint || MDFNGameInfo != data.game
++    || uint32(MDFNGameInfo->fb_width) != data.width || uint32(MDFNGameInfo->fb_height) != data.height
++    || deint_mode != data.mode || !data.deinterlacer || !data.blur)
++  return false;
++ // Blur is the only remaining fallible admission. On false neither owner changes.
++ if(!TBlur_CommitHistory(*data.blur)) return false;
++ deint.swap(data.deinterlacer);
++ std::swap(PrevInterlaced, data.previous_interlaced);
++ return true;
++}
++
+ 
+ static bool FFDiscard = false; // TODO:  Setting to discard sound samples instead of increasing pitch
+ 
+@@ -309,7 +390,9 @@
+  if(!strcmp(name, "video.deinterlacer"))
+  {
+   deint.reset(nullptr);
+-  deint.reset(Deinterlacer::Create(MDFN_GetSettingUI(name)));
++  const unsigned mode = MDFN_GetSettingUI(name);
++  deint.reset(Deinterlacer::Create(mode));
++  deint_mode = mode;
+  }
+ }
+ 
+--- a/src/mednafen.h
++++ b/src/mednafen.h
+@@ -94,6 +94,23 @@
+ namespace Mednafen
+ {
+ void MDFN_StateAction(StateMem *sm, const unsigned load, const bool data_only);
++
++class MDFNVideoHistory
++{
++ public:
++ ~MDFNVideoHistory();
++ private:
++ MDFNVideoHistory();
++ struct Data;
++ std::unique_ptr<Data> data_;
++ friend std::unique_ptr<MDFNVideoHistory> MDFNI_PrepareVideoHistory(Stream* stream);
++ friend bool MDFNI_CommitVideoHistory(MDFNVideoHistory& history) noexcept;
++};
++void MDFNI_SaveVideoHistory(Stream* stream);
++std::unique_ptr<MDFNVideoHistory> MDFNI_PrepareVideoHistory(Stream* stream);
++// Game-thread operation. False leaves both owners unchanged; success retains rollback state.
++bool MDFNI_CommitVideoHistory(MDFNVideoHistory& history) noexcept;
++
+ }
+ 
+ #include "mednafen-driver.h"

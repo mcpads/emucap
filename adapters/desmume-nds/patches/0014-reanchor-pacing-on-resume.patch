@@ -1,0 +1,29 @@
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -102,6 +102,7 @@
+ static std::atomic<bool> emucap_native_unlimited{false};
+ static std::atomic<uint64_t> emucap_pace_revision{1};
+ static std::atomic<bool> emucap_pace_wake{false};
++static std::atomic<bool> emucap_pace_reanchor{false};
+ static std::atomic<uint64_t> emucap_vblank_clock{0};
+ static std::atomic<uint64_t> emucap_memory_epoch{1};
+ 
+@@ -109,6 +110,8 @@
+   typedef std::chrono::steady_clock clock;
+   static clock::time_point deadline;
+   static bool anchored = false;
++  if (emucap_pace_reanchor.exchange(false))
++    anchored = false;
+   const bool native = native_unlimited != 0;
+   if (emucap_native_unlimited.exchange(native) != native)
+     emucap_pace_revision.fetch_add(1);
+@@ -444,6 +447,9 @@
+     struct gdb_stub_state *stub = emucap_gdb_stubs[i];
+     if (stub == NULL) continue;
+ 
++    // Halted host time is not pacing credit. Publish before releasing either CPU.
++    if (stub->main_stop_flag)
++      emucap_pace_reanchor.store(true);
+     stub->emu_stub_state = gdb_stub_state::RUNNING_EMU_GDB_STATE;
+     stub->ctl_stub_state = gdb_stub_state::START_RUN_GDB_STATE;
+     stub->main_stop_flag = 0;

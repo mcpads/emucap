@@ -28,6 +28,17 @@ int main() {
   };
   for (const char* line : bad) check(!emucap_parse_batch_ranges(line, ranges, error), line);
 
+  check(!emucap_parse_batch_ranges(
+      "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":1},{\"memory_type\":\"ram\",\"address\":0,\"length\":18446744073709551615}]}}",
+      ranges, error), "aggregate length cannot wrap below the byte limit");
+
+  check(emucap_parse_batch_ranges(
+      "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":65535},{\"memory_type\":\"ram\",\"address\":65535,\"length\":1}]}}",
+      ranges, error), "aggregate at byte limit remains accepted");
+  check(!emucap_parse_batch_ranges(
+      "{\"params\":{\"ranges\":[{\"memory_type\":\"ram\",\"address\":0,\"length\":65536},{\"memory_type\":\"ram\",\"address\":0,\"length\":1}]}}",
+      ranges, error), "aggregate one byte beyond limit is rejected");
+
   EmucapPacingRequest request;
   check(emucap_parse_pacing_request("{\"params\":{}}", request, error) && request.query, "query");
   request = {};
@@ -59,6 +70,14 @@ int main() {
   EmucapPacingRequest seven;
   seven.percent = 7;
   check(emucap_pacing_confirms(seven, o), "confirm 7 percent");
+  check(emucap_pacing_policy_json(o, 3, true).find("\"host_audio_ratio\":0.25") != std::string::npos,
+        "low-speed host audio floor is disclosed without changing the guest policy");
+  for (unsigned percent = 1; percent <= EMUCAP_PACING_MAX_PERCENT; ++percent) {
+    const double speed = percent / 100.0;
+    check(emucap_audio_ratio(speed) >= 0.25, "host audio stays within native resampler domain");
+    if (percent >= 25)
+      check(emucap_audio_ratio(speed) == speed, "native-supported audio rates stay unchanged");
+  }
   o.ffsf = 1;
   check(emucap_pacing_policy_json(o, 3, false).find("\"mode\":\"custom\",\"percent\":null") != std::string::npos,
         "held fast-forward is custom");

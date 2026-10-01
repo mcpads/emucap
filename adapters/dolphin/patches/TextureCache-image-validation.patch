@@ -1,0 +1,103 @@
+--- a/Source/Core/VideoCommon/TextureConfig.cpp
++++ b/Source/Core/VideoCommon/TextureConfig.cpp
+@@ -3,6 +3,8 @@
+ 
+ #include "VideoCommon/TextureConfig.h"
+ 
++#include <bit>
++#include <limits>
+ #include <tuple>
+ 
+ #include "VideoCommon/AbstractTexture.h"
+@@ -33,3 +35,28 @@
+ {
+   return AbstractTexture::CalculateStrideForFormat(format, std::max(width >> level, 1u));
+ }
++
++std::optional<u32> TextureConfig::GetSerializedSize(u32 max_texture_size) const
++{
++  constexpr u32 max_size = std::numeric_limits<u32>::max();
++  constexpr u32 known_flags = AbstractTextureFlag_RenderTarget | AbstractTextureFlag_ComputeImage;
++  if (width == 0 || height == 0 || width > max_texture_size || height > max_texture_size ||
++      width > max_size / 8 || height > static_cast<u32>(std::numeric_limits<int>::max()) ||
++      levels == 0 || levels > static_cast<u32>(std::bit_width(std::max(width, height))) || layers == 0 || samples != 1 ||
++      format >= AbstractTextureFormat::Undefined || type > AbstractTextureType::Texture_CubeMap ||
++      (flags & ~known_flags) != 0)
++    return std::nullopt;
++
++  // Preserve the existing payload layout, including compressed-format row extents.
++  // Calculate one layer first so an untrusted layer count cannot drive a large loop.
++  u64 layer_size = 0;
++  for (u32 level = 0; level < levels; ++level)
++  {
++    layer_size += static_cast<u64>(GetMipStride(level)) * std::max(height >> level, 1u);
++    if (layer_size > max_size)
++      return std::nullopt;
++  }
++  if (layer_size == 0 || layer_size > max_size / layers)
++    return std::nullopt;
++  return static_cast<u32>(layer_size * layers);
++}
+--- a/Source/Core/VideoCommon/TextureConfig.h
++++ b/Source/Core/VideoCommon/TextureConfig.h
+@@ -5,6 +5,7 @@
+ 
+ #include <cstddef>
+ #include <functional>
++#include <optional>
+ 
+ #include "Common/CommonTypes.h"
+ #include "Common/EnumFormatter.h"
+@@ -64,6 +65,8 @@
+   MathUtil::Rectangle<int> GetMipRect(u32 level) const;
+   size_t GetStride() const;
+   size_t GetMipStride(u32 level) const;
++  // Validates snapshot configuration and its legacy serialized byte extent.
++  std::optional<u32> GetSerializedSize(u32 max_texture_size) const;
+ 
+   bool IsMultisampled() const { return samples > 1; }
+   bool IsRenderTarget() const { return (flags & AbstractTextureFlag_RenderTarget) != 0; }
+--- a/Source/Core/VideoCommon/TextureCacheBase.cpp
++++ b/Source/Core/VideoCommon/TextureCacheBase.cpp
+@@ -445,24 +445,16 @@
+   // If we're in measure mode, skip the actual readback to save some time.
+   const bool skip_readback = p.IsMeasureMode();
+   p.Do(config);
++  const auto serialized_size = config.GetSerializedSize(g_backend_info.MaxTextureSize);
++  if (!serialized_size)
++  {
++    p.SetError();
++    return;
++  }
+ 
+   if (skip_readback || CheckReadbackTexture(config.width, config.height, config.format))
+   {
+-    // First, measure the amount of memory needed.
+-    u32 total_size = 0;
+-    for (u32 layer = 0; layer < config.layers; layer++)
+-    {
+-      for (u32 level = 0; level < config.levels; level++)
+-      {
+-        u32 level_width = std::max(config.width >> level, 1u);
+-        u32 level_height = std::max(config.height >> level, 1u);
+-
+-        u32 stride = AbstractTexture::CalculateStrideForFormat(config.format, level_width);
+-        u32 size = stride * level_height;
+-
+-        total_size += size;
+-      }
+-    }
++    u32 total_size = *serialized_size;
+ 
+     // Set aside total_size bytes of space for the textures.
+     // When measuring, this will be set aside and not written to,
+@@ -520,7 +512,8 @@
+ 
+   if (!p.IsReadMode())
+     return std::nullopt;
+-  if (total_size == 0)
++  const auto expected_size = config.GetSerializedSize(g_backend_info.MaxTextureSize);
++  if (!expected_size || total_size != *expected_size)
+   {
+     p.SetError();
+     return std::nullopt;

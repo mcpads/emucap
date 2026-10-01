@@ -2,9 +2,11 @@
 
 Actively developed beta software — interfaces may still change.
 
-## 0.18.0 (release candidate)
+## 0.18.0
 
 ### Added
+- Xbox host API 3 adds frozen native RAM batches with ordered, overlapping ranges and an NV2A
+  writer barrier. Rebuild with `adapters/xemu/build.sh`.
 - openMSX frozen `read_memory_batch` reads multiple validated ranges in one native command and
   reports a native stop boundary (`runtime_generation`, `stop_epoch`, `memory_mapping_epoch`).
 - Agent-controlled openMSX host pacing through `debug` operation `execution_speed`: arbitrary
@@ -38,7 +40,7 @@ Actively developed beta software — interfaces may still change.
   pause from a running guest parks at the current vblank; both previously ran one more frame.
   Rebuild with `adapters/flycast/build.sh`.
 - Adapter builds run their git commands without fsmonitor, whose daemons held the build lock.
-- Dolphin requires host API 6; a budget-stopped advance reports `reason: "host_deadline"` instead
+- Dolphin requires host API 7; a budget-stopped advance reports `reason: "host_deadline"` instead
   of `deadline`. Dolphin builds configure from a fresh CMake cache with the bundled fmt.
 - DeSmuME paces at the DS refresh rate instead of a fixed 60 frames per second and builds
   optimized; a frame step that spends its host budget returns `interrupted` with
@@ -47,11 +49,22 @@ Actively developed beta software — interfaces may still change.
   a launch whose PINE socket path exceeds the Unix socket limit is refused with that reason.
 - PPSSPP headless debugger sessions are now paced at 100 percent instead of running unthrottled;
   set `unlimited` for the former behavior. Rebuild with `adapters/ppsspp/build.sh`.
-- Mupen64Plus requires host API 4 (core patch 0003); a pause or speed change no longer waits out a
+- Mupen64Plus requires host API 6 (core patches through 0007); a pause or speed change no longer waits out a
   slow limiter sleep, and a budget-stopped frame step returns `interrupted` with
   `reason: "host_deadline"` instead of an error. Rebuild with `adapters/mupen64plus/build.sh`.
 
+### Validation scope
+- Batch reads and pacing are implemented across the advertised adapters. Runtime checks cover
+  selected games and profiles; exhaustive fault, output and platform qualification continues.
+  Further snapshot presentation-history work, including Mednafen integration, remains open.
+
 ### Fixed
+- N64 native snapshots preserve interrupt-jitter state. Native M64P file loads validate and retain
+  their input before releasing the frozen guest, so rejected inputs preserve RAM and registers.
+  Legacy snapshots lack the historical jitter sequence; PJ64 and slot imports retain their
+  existing behavior. Rebuild the maintained Mupen64Plus host and bridge together.
+- Native pacing anchors reset after actual debugger/frame parks, preserving the first resumed
+  interval at low speed. Repairs cover MAME, DeSmuME, Mupen64Plus, Mednafen and Flycast.
 - Pacing requests reject concurrent operations before waiting on the session lock. Native pacing
   mutation failures close unverified control sessions while preserving the last confirmed policy.
 - DeSmuME, PCSX2 and PPSSPP memory batches use one native acquisition per request.

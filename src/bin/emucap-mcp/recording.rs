@@ -4,7 +4,7 @@ use emucap::bundle::recording_manifest::{
     EventArmingScope, EventClassArming, EventClassFilter, EventFilterTerm, EventStartCondition,
     EventStopCondition, InitialSnapshotRequest, RecordingOrigin, TerminalSnapshotRequest,
 };
-use emucap::live::link::{RequestCancellation, WorkingProgress};
+use emucap::live::link::WorkingProgress;
 use emucap::live::recording::{
     self, RecordWindowRequest, RecordingStateInput, RequestedRecordingLimits,
 };
@@ -22,13 +22,7 @@ use crate::{error_result, tool_output_result, SharedLink, ToolOutput};
 #[path = "recording_tests.rs"]
 mod tests;
 
-struct CancelOnDrop(RequestCancellation);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
+use crate::request_ownership::{Admission, CancelOnDrop};
 
 fn progress_notification(
     token: ProgressToken,
@@ -150,14 +144,16 @@ pub(crate) async fn run_record_window(
         }),
     };
     let total_frames = request.frames.saturating_add(request.warmup_frames);
-    let cancellation = RequestCancellation::default();
+    let cancellation = Admission::cancellation(&context);
     // If the MCP request future itself disappears, the blocking worker must still observe an
     // exact request-scoped cancellation instead of continuing as an orphaned temporal operation.
     let _cancel_on_drop = CancelOnDrop(cancellation.clone());
     let worker_cancellation = cancellation.clone();
     let (progress_tx, mut progress_rx) = tokio::sync::watch::channel(None::<WorkingProgress>);
     let worker_link = link;
+    let admission = Admission::take(&context);
     let mut worker = tokio::task::spawn_blocking(move || {
+        let _admission = admission;
         let mut link = worker_link
             .lock()
             .unwrap_or_else(|error| error.into_inner());

@@ -1,0 +1,40 @@
+--- a/hw/xbox/nv2a/pgraph/gl/renderer.c
++++ b/hw/xbox/nv2a/pgraph/gl/renderer.c
+@@ -105,9 +105,29 @@
+     glFinish();
+ }
+ 
++static void trace_surface_restore(NV2AState *d, const char *phase)
++{
++    if (!g_getenv("EMUCAP_XEMU_SURFACE_TRACE")) {
++        return;
++    }
++    PGRAPHGLState *r = d->pgraph.gl_renderer_state;
++    fprintf(stderr, "surface-restore %s scanout=%" PRIx64 " color=%" PRIx64 "\n",
++            phase, (uint64_t)d->pcrtc.start,
++            r->color_binding ? (uint64_t)r->color_binding->vram_addr : UINT64_MAX);
++    SurfaceBinding *s;
++    QTAILQ_FOREACH(s, &r->surfaces, entry) {
++        fprintf(stderr, "surface-restore binding addr=%" PRIx64
++                " color=%d w=%u h=%u pitch=%u swizzle=%d format=%u\n",
++                (uint64_t)s->vram_addr, s->color, s->width, s->height,
++                s->pitch, s->swizzle, s->shape.color_format);
++    }
++}
++
+ static void pgraph_gl_flush(NV2AState *d)
+ {
++    trace_surface_restore(d, "before-flush");
+     pgraph_gl_surface_flush(d);
++    trace_surface_restore(d, "after-flush");
+     pgraph_gl_mark_textures_possibly_dirty(d, 0, memory_region_size(d->vram));
+     pgraph_gl_update_entire_memory_buffer(d);
+     /* FIXME: Flush more? */
+@@ -153,6 +173,7 @@
+     PGRAPHState *pg = &d->pgraph;
+     PGRAPHGLState *r = pg->gl_renderer_state;
+ 
++    trace_surface_restore(d, "coherence-request");
+     qatomic_set(&r->download_dirty_surfaces_pending, true);
+     qemu_event_reset(&r->dirty_surfaces_download_complete);
+ }

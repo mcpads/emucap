@@ -1,0 +1,64 @@
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -45,6 +45,7 @@
+ DebugBreakpointLookup;
+ DebugBreakpointTriggeredBy;
+ DebugBreakpointConsume;
++DebugFrameResume;
+ DebugDecodeOp;
+ DebugGetCPUDataPtr;
+ DebugGetState;
+--- a/src/api/debugger.c
++++ b/src/api/debugger.c
+@@ -454,6 +454,12 @@
+ #endif
+ }
+ 
++/* Called only by the emulation thread after a frontend frame callback park. */
++EXPORT void CALL DebugFrameResume(void)
++{
++    main_reset_speed_limiter();
++}
++
+ EXPORT uint32_t CALL DebugVirtualToPhysical(uint32_t address)
+ {
+ #ifdef DBG
+--- a/src/api/m64p_debugger.h
++++ b/src/api/m64p_debugger.h
+@@ -214,6 +214,12 @@
+ EXPORT void CALL DebugBreakpointConsume(uint32_t *, uint32_t *);
+ #endif
+ 
++/* Emulation-thread only; call after an actual frontend frame callback park. */
++typedef void (*ptr_DebugFrameResume)(void);
++#if defined(M64P_CORE_PROTOTYPES)
++EXPORT void CALL DebugFrameResume(void);
++#endif
++
+ /* DebugVirtualToPhysical()
+  *
+  * This function is used to translate virtual addresses to physical addresses.
+--- a/src/main/main.c
++++ b/src/main/main.c
+@@ -973,8 +973,10 @@
+ 
+ /* Emulation-thread owned: discard only elapsed halted host time. */
+ static int l_SpeedLimiterReset = 0;
++static unsigned int l_SpeedLimiterResumeTime = 0;
+ void main_reset_speed_limiter(void)
+ {
++    l_SpeedLimiterResumeTime = SDL_GetTicks();
+     l_SpeedLimiterReset = 1;
+ }
+ 
+@@ -995,8 +997,8 @@
+     //if this is the first time or we are resuming from pause
+     if(StartFPSTime == 0 || !resetOnce || l_SpeedLimiterReset || lastSpeedFactor != l_SpeedFactor)
+     {
+-       StartFPSTime = CurrentFPSTime;
+-       totalVIs = 0;
++       StartFPSTime = l_SpeedLimiterReset ? l_SpeedLimiterResumeTime : CurrentFPSTime;
++       totalVIs = l_SpeedLimiterReset ? 1 : 0;
+        resetOnce = 1;
+        l_SpeedLimiterReset = 0;
+     }

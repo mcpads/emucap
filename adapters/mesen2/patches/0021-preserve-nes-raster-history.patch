@@ -1,0 +1,101 @@
+--- a/Core/NES/BaseNesPpu.h
++++ b/Core/NES/BaseNesPpu.h
+@@ -156,5 +156,6 @@
+ 	virtual uint8_t ReadRam(uint16_t addr) override { return 0; }
+ 	virtual void WriteRam(uint16_t addr, uint8_t value) override {}
+ 
++	virtual bool ValidateRasterState(Serializer& s) { return true; }
+ 	virtual void Serialize(Serializer& s) override {}
+ };
+--- a/Core/NES/NesPpu.h
++++ b/Core/NES/NesPpu.h
+@@ -95,6 +95,7 @@
+ 	__forceinline uint8_t ReadVram(uint16_t addr, MemoryOperationType type = MemoryOperationType::PpuRenderingRead);
+ 	__forceinline void WriteVram(uint16_t addr, uint8_t value);
+ 
++	bool ValidateRasterState(Serializer& s) override;
+ 	void Serialize(Serializer& s) override;
+ 
+ public:
+--- a/Core/NES/NesPpu.cpp
++++ b/Core/NES/NesPpu.cpp
+@@ -1586,6 +1586,16 @@
+ 	//Used by Zapper, gives a rough approximation of the brightness level of the specific pixel
+ 	uint16_t pixelData = (_currentOutputBuffer[y << 8 | x] & _paletteRamMask) | _intensifyColorBits;
+ 	return NesDefaultVideoFilter::GetDefaultPixelBrightness(pixelData, GetPpuModel());
++}
++
++template<class T> bool NesPpu<T>::ValidateRasterState(Serializer& s)
++{
++	uint32_t version = 0;
++	uint8_t index = 0xff;
++	return s.TryReadValue("rasterVersion", version) && version == 1
++		&& s.TryReadValue("outputBufferIndex", index) && index < 2
++		&& s.HasValueSize("outputBuffer0", NesConstants::ScreenPixelCount * sizeof(uint16_t))
++		&& s.HasValueSize("outputBuffer1", NesConstants::ScreenPixelCount * sizeof(uint16_t));
+ }
+ 
+ template<class T> void NesPpu<T>::Serialize(Serializer& s)
+@@ -1630,6 +1640,15 @@
+ 	SV(_masterClock);
+ 
+ 	if(s.GetFormat() != SerializeFormat::Map) {
++		uint32_t rasterVersion = 1;
++		uint8_t outputBufferIndex = _currentOutputBuffer == _outputBuffers[1] ? 1 : 0;
++		s.Stream(rasterVersion, "rasterVersion");
++		s.Stream(outputBufferIndex, "outputBufferIndex");
++		s.StreamArray(_outputBuffers[0], NesConstants::ScreenPixelCount, "outputBuffer0");
++		s.StreamArray(_outputBuffers[1], NesConstants::ScreenPixelCount, "outputBuffer1");
++		if(!s.IsSaving()) {
++			_currentOutputBuffer = _outputBuffers[outputBufferIndex];
++		}
+ 		//Hide these entries from the Lua API
+ 		SV(_currentTilePalette);
+ 		SV(_tile.LowByte);
+--- a/Core/NES/NesConsole.h
++++ b/Core/NES/NesConsole.h
+@@ -92,6 +92,7 @@
+ 	void SetNextFrameOverclockStatus(bool disabled);
+ 
+ 	// Inherited via IConsole
++	bool ValidateRasterState(Serializer& s);
+ 	void Serialize(Serializer& s) override;
+ 	optional<SaveStateCompatInfo> ValidateSaveStateCompatibility(Serializer& s, ConsoleType stateConsoleType) override;
+ 	void Reset() override;
+--- a/Core/NES/NesConsole.cpp
++++ b/Core/NES/NesConsole.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include "Shared/Video/VideoDecoder.h"
+ #include "NES/NesConsole.h"
+ #include "NES/NesControlManager.h"
+ #include "NES/MapperFactory.h"
+@@ -97,8 +98,28 @@
+ 	return _vsMainConsole == nullptr;
+ }
+ 
++bool NesConsole::ValidateRasterState(Serializer& s)
++{
++	s.PushNamePrefix("_ppu", -1);
++	bool valid = _ppu->ValidateRasterState(s);
++	s.PopNamePrefix();
++	if(valid && _vsSubConsole) {
++		s.PushNamePrefix("_vsSubConsole", -1);
++		valid = _vsSubConsole->ValidateRasterState(s);
++		s.PopNamePrefix();
++	}
++	return valid;
++}
++
+ void NesConsole::Serialize(Serializer& s)
+ {
++	if(!s.IsSaving() && s.GetFormat() != SerializeFormat::Map) {
++		if(!ValidateRasterState(s)) {
++			s.SetErrorFlag();
++			return;
++		}
++		_emu->GetVideoDecoder()->WaitForAsyncFrameDecode();
++	}
+ 	SV(_cpu);
+ 	SV(_ppu);
+ 	SV(_memoryManager);

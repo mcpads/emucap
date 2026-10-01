@@ -887,7 +887,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         Ok(())
     }
 
-    fn require_debugger_healthy(&self) -> BridgeResult<()> {
+    pub(super) fn require_debugger_healthy(&self) -> BridgeResult<()> {
         match &self.debugger_fatal {
             Some(reason) => Err(OpenMsxBridgeError::Emulator(format!(
                 "MSX debugger generation is terminating: {reason}"

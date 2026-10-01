@@ -1,0 +1,33 @@
+--- a/src/emu/video.cpp
++++ b/src/emu/video.cpp
+@@ -115,6 +115,7 @@
+ {
+ 	// request a callback upon exiting
+ 	machine.add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate(&video_manager::exit, this));
++	machine.add_notifier(MACHINE_NOTIFY_RESUME, machine_notify_delegate(&video_manager::resume, this));
+ 	machine.save().register_postload(save_prepost_delegate(FUNC(video_manager::postload), this));
+ 
+ 	// extract initial execution state from global configuration settings
+@@ -532,6 +533,12 @@
+ //  state has been loaded
+ //-------------------------------------------------
+ 
++// Frozen host time is not execution credit, even for a short debugger park.
++void video_manager::resume()
++{
++	m_throttle_resync = true;
++}
++
+ void video_manager::postload()
+ {
+ 	m_throttle_resync = true;
+--- a/src/emu/video.h
++++ b/src/emu/video.h
+@@ -96,6 +96,7 @@
+ private:
+ 	// internal helpers
+ 	void exit();
++	void resume();
+ 	void screenless_update_callback(s32 param);
+ 	void postload();
+ 

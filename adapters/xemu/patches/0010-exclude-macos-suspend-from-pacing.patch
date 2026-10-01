@@ -1,0 +1,33 @@
+--- a/ui/xemu-emucap-pacing.c
++++ b/ui/xemu-emucap-pacing.c
+@@ -17,9 +17,20 @@
+     QEMUTimer *wake;
+ } pacing = { .percent = 100 };
+ 
++/* Host suspend must not create catch-up work. Keep the wake timer in QEMU's
++ * own clock domain; only pacing anchors use active host time. */
++static int64_t pacing_host_now(void)
++{
++#ifdef __APPLE__
++    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++#else
++    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++#endif
++}
++
+ static void anchor(void)
+ {
+-    pacing.host = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    pacing.host = pacing_host_now();
+     pacing.guest = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ }
+ 
+@@ -49,7 +60,7 @@
+ 
+ static int64_t wait_for(int64_t guest)
+ {
+-    int64_t host = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    int64_t host = pacing_host_now();
+     int64_t target;
+     init();
+     if (!pacing.percent) {

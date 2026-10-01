@@ -1,0 +1,14 @@
+--- a/hw/xbox/mcpx/apu/apu.c
++++ b/hw/xbox/mcpx/apu/apu.c
+@@ -618,6 +618,11 @@
+             return -EINVAL;
+         }
+     }
++    if (d->guest_voice_pending) {
++        /* Pending work has prepared a queue but dispatched no voices. This
++         * host scratch buffer is not serialized and may contain later audio. */
++        memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
++    }
+     return 0;
+ }
+ 

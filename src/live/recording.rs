@@ -438,6 +438,8 @@ pub fn record_window(
             params: json!({"capture_id": capture_id, "launch_id": launch_id}),
         }),
         max_host_ms: Some(limits.max_host_ms),
+        temporal_stop_ms: None,
+        temporal_deadline: None,
     };
     let require_explicit_frames = effective.request.input_movie.is_some()
         || effective.request.initial_state.is_some()

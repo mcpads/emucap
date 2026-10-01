@@ -1,0 +1,44 @@
+--- a/core/hw/sh4/sh4_cycles.h
++++ b/core/hw/sh4/sh4_cycles.h
+@@ -53,6 +53,18 @@
+ 
+ 	int countCycles(u16 op);
+ 
++	void saveTiming(u32& unit, u32& memoryOps) const {
++		unit = static_cast<u32>(lastUnit);
++		memoryOps = static_cast<u32>(memOps);
++	}
++
++	bool restoreTiming(u32 unit, u32 memoryOps) {
++		if (unit > static_cast<u32>(CO) || memoryOps > 4) return false;
++		lastUnit = static_cast<sh4_eu>(unit);
++		memOps = static_cast<int>(memoryOps);
++		return true;
++	}
++
+ 	void reset()
+ 	{
+ 		lastUnit = CO;
+--- a/core/hw/sh4/sh4_cycles.cpp
++++ b/core/hw/sh4/sh4_cycles.cpp
+@@ -64,7 +64,7 @@
+ 	};
+ 	if (isMemOp[opcode->ex_type])
+ 	{
+-		if (++memOps < 4)
++		if (memOps < 4 && ++memOps < 4)
+ 			cycles = mmu_enabled() ? 5 : 2;
+ 	}
+ 	// TODO only for mem read?
+--- a/core/hw/sh4/sh4_interpreter.h
++++ b/core/hw/sh4/sh4_interpreter.h
+@@ -18,6 +18,9 @@
+ 	void ExecuteDelayslot_RTE();
+ 	Sh4Context *getContext() { return ctx; }
+ 
++	void saveTiming(u32& unit, u32& memoryOps) const { sh4cycles.saveTiming(unit, memoryOps); }
++	bool restoreTiming(u32 unit, u32 memoryOps) { return sh4cycles.restoreTiming(unit, memoryOps); }
++
+ 	static Sh4Interpreter *Instance;
+ 
+ protected:

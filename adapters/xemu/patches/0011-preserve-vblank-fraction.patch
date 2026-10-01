@@ -1,0 +1,59 @@
+--- a/hw/xbox/nv2a/nv2a.c
++++ b/hw/xbox/nv2a/nv2a.c
+@@ -24,7 +24,8 @@
+ #include "hw/core/cpu.h"
+ #include "ui/xemu-emucap.h"
+ 
+-#define NV2A_VBLANK_PERIOD_NS 16666666
++#define NV2A_VBLANK_HZ 60
++#define NV2A_VBLANK_MAX_PERIOD_NS DIV_ROUND_UP(NANOSECONDS_PER_SECOND, NV2A_VBLANK_HZ)
+ 
+ void nv2a_update_irq(NV2AState *d)
+ {
+@@ -220,7 +221,10 @@
+ 
+ static void nv2a_vblank_arm(NV2AState *d)
+ {
+-    d->vblank_deadline += NV2A_VBLANK_PERIOD_NS;
++    d->vblank_deadline += NANOSECONDS_PER_SECOND / NV2A_VBLANK_HZ;
++    d->vblank_fraction += NANOSECONDS_PER_SECOND % NV2A_VBLANK_HZ;
++    d->vblank_deadline += d->vblank_fraction / NV2A_VBLANK_HZ;
++    d->vblank_fraction %= NV2A_VBLANK_HZ;
+     timer_mod_ns(d->vblank_timer, d->vblank_deadline);
+ }
+ 
+@@ -482,10 +486,15 @@
+     NV2AState *d = opaque;
+     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+ 
++    if (d->vblank_fraction >= NV2A_VBLANK_HZ) {
++        return -EINVAL;
++    }
++
+     /* A state without a vblank phase starts a fresh period on the restored guest clock. */
+     if (!timer_pending(d->vblank_timer) ||
+-        timer_expire_time_ns(d->vblank_timer) > now + NV2A_VBLANK_PERIOD_NS) {
++        timer_expire_time_ns(d->vblank_timer) > now + NV2A_VBLANK_MAX_PERIOD_NS) {
+         d->vblank_deadline = now;
++        d->vblank_fraction = 0;
+         nv2a_vblank_arm(d);
+     }
+     qatomic_set(&d->pgraph.flush_pending, true);
+@@ -509,6 +518,7 @@
+     .minimum_version_id = 1,
+     .fields = (const VMStateField[]) {
+         VMSTATE_INT64(vblank_deadline, NV2AState),
++        VMSTATE_UINT32(vblank_fraction, NV2AState),
+         VMSTATE_TIMER_PTR(vblank_timer, NV2AState),
+         VMSTATE_END_OF_LIST()
+     }
+--- a/hw/xbox/nv2a/nv2a_int.h
++++ b/hw/xbox/nv2a/nv2a_int.h
+@@ -80,6 +80,7 @@
+     /* Guest vblank on the running virtual clock. */
+     QEMUTimer *vblank_timer;
+     int64_t vblank_deadline;
++    uint32_t vblank_fraction;
+ 
+     MemoryRegion *vram;
+     MemoryRegion vram_pci;

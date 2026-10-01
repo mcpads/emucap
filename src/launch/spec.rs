@@ -115,6 +115,7 @@ pub fn dolphin_spec(
     log_path: &Path,
     user_dir: &Path,
     system: &str,
+    sound: bool,
     opts: &SpecOpts,
 ) -> LaunchSpec {
     let mut spec = LaunchSpec::new(binary, log_path)
@@ -127,11 +128,11 @@ pub fn dolphin_spec(
             "--config=Dolphin.Interface.UsePanicHandlers=False".to_string(),
             "--config=Dolphin.Analytics.Enabled=False".to_string(),
             "--config=Dolphin.Analytics.PermissionAsked=True".to_string(),
-            "--config=Dolphin.DSP.Backend=No Audio Output".to_string(),
         ])
         .env("EMUCAP_PORT", opts.port.to_string())
         .env("EMUCAP_CONTENT", opts.content)
-        .env("EMUCAP_SYSTEM", system);
+        .env("EMUCAP_SYSTEM", system)
+        .env("EMUCAP_DOLPHIN_SOUND", if sound { "1" } else { "0" });
     if opts.headless {
         spec = spec.arg("--platform=headless");
     } else {

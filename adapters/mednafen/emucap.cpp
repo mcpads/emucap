@@ -16,6 +16,8 @@
 #include <mednafen/hash/sha1.h>  // sha1(EMUCAP_CONTENT 보조 해시 — get_rom_info)
 
 #include "emucap.h"
+#include "emucap_completed_frame.h"
+#include "emucap_driver_frames.h"
 #include "emucap_input.h"
 #include "emucap_json_num.h"
 #include "emucap_json_strings.h"
@@ -224,11 +226,10 @@ std::atomic<uint32_t> g_last_smpc_read_value{0};
 std::atomic<uint32_t> g_smpc_read_count{0};
 std::atomic<uint64_t> g_smpc_read_mask{0};
 
-// 스크린샷: 매 프레임 emucap_capture가 최신 프레임버퍼(espec.surface/DisplayRect/LineWidths)를 기록.
-// screenshot 메서드가 이걸 PNG로 인코딩한다(MDFNI_Emulate 직후 훅에서 캡처).
-const MDFN_Surface* g_last_surface = nullptr;
-MDFN_Rect g_last_rect = MDFN_Rect();
-const int32* g_last_lw = nullptr;
+// Completed observations own their pixels: the next Emulate call can overwrite
+// the native buffer before a CPU callback services screenshot.
+EmucapCompletedFrame g_completed_frame;
+bool g_capture_failed = false;
 
 // 레이어 enable 마스크 섀도: 코어에 getter가 없어(MDFNI_SetLayerEnableMask는 set 전용) 마지막 적용
 // 마스크를 보관해 set_layer_enable 조회에 쓴다. 코어 기본은 ~0(전체 enable). load_state/reset은 이
@@ -1573,7 +1574,9 @@ void freeze_spin_until_resume() {
   // resume까지 스핀. 단 step(g_step_remaining>0)이나 step_instructions(g_insn_remaining>0)이 들어오면
   // 빠져나와 진행시킨다 — 안 그러면 BP 히트/명령단위 freeze 상태에서 step이 게임을 못 돌려 frame hook이
   // 안 돌고 timeout 난다. 명령단위 step은 이 같은 스핀을 탈출해 continuous cb가 다음 N명령을 진행한다.
+  bool pacing_parked = false;
   while (g_frozen && g_step_remaining == 0 && g_insn_remaining == 0) {
+    pacing_parked = true;
     // A transport disconnect is not a release event. Reconnect while the GameThread remains
     // parked in this exact instruction-bound callback; returning would execute the rest of the
     // frame and silently invalidate the frozen observation point.
@@ -1587,6 +1590,7 @@ void freeze_spin_until_resume() {
     serve_socket_once();
     usleep(2000);               // 2ms — busy-spin 방지
   }
+  if (pacing_parked) emucap_ers_resync();
 }
 
 // freeze 균일화(백스톱 B2 + pause_on_hit 일관성): pause_on_hit BP가 히트하면 *무엇이 진행 중이든* 그 명령을
@@ -4170,7 +4174,9 @@ void handle(const std::string& line) {
     if (defer_psx_core_refresh(id, CORE_REFRESH_RESET)) return;
     reply_ok(id, "{\"reset\":true}");
   } else if (method == "screenshot") {
-    if (!g_last_surface) {
+    if (g_capture_failed) {
+      reply_err(id, "capture_failed", "the latest completed frame could not be captured");
+    } else if (!g_completed_frame.surface()) {
       reply_err(id, "no_frame", "no rendered frame is available yet");
     } else {
       try {
@@ -4178,7 +4184,8 @@ void handle(const std::string& line) {
         // unlink/write/read로 경합하지 않게 PID를 넣는다.
         std::string tmp = emucap_temp_file("emucap_ss_" + std::to_string((int)getpid()) + ".png");
         ::unlink(tmp.c_str());  // PNGWrite는 MODE_WRITE_SAFE(O_EXCL)라 기존 파일이면 실패 → 먼저 지운다
-        { PNGWrite pw(tmp, g_last_surface, g_last_rect, g_last_lw); }  // 생성자가 PNG를 기록
+        { PNGWrite pw(tmp, g_completed_frame.surface(), g_completed_frame.rect(),
+                      g_completed_frame.line_widths()); }
         FileStream fs(tmp, FileStream::MODE_READ);
         uint64 sz = fs.size();
         std::vector<uint8> buf((size_t)sz);
@@ -4479,6 +4486,7 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
 }  // namespace
 
 extern "C" double emucap_base_speed(void) { return g_base_percent / 100.0; }
+extern "C" double emucap_host_audio_ratio(void) { return emucap_audio_ratio(CurGameSpeed); }
 extern "C" bool emucap_unlimited(void) { return g_speed_unlimited; }
 // Below the native slow-forward floor one frame of resampled audio can exceed the driver's 500 ms
 // output buffer, so the real-time syncer paces the rest of the frame after the audio write.
@@ -4638,12 +4646,26 @@ extern "C" void emucap_apply_input(unsigned char* port0_data, unsigned port0_len
   g_input_override.apply(port0_data, port0_len);
 }
 
-// MDFNI_Emulate 직후 훅에서 최신 프레임버퍼를 기록(screenshot이 PNG로 인코딩). 타입 결합을 피하려고
-// void*로 받아 캐스팅한다(main.cpp 훅은 extern 인라인 선언으로 호출). 익명 namespace 전역 접근은 같은 파일.
-void emucap_capture(const void* surface, const void* rect, const void* line_widths) {
-  g_last_surface = (const MDFN_Surface*)surface;
-  if (rect) g_last_rect = *(const MDFN_Rect*)rect;
-  g_last_lw = (const int32*)line_widths;
+bool emucap_frame_consumer_active() {
+  return g_fd >= 0 || g_launch_start_controlled || bool(g_recording);
+}
+
+// The driver calls this before handing the rendered surface to presentation.
+// Capture failure must not escape the native game loop or expose the previous
+// image as a successful observation of this completion.
+void emucap_capture(const void* surface, const void* rect, const void* line_widths, int field) {
+  try {
+    if (!surface || !rect) throw std::runtime_error("missing completed frame");
+    g_completed_frame.capture(*static_cast<const MDFN_Surface*>(surface),
+                              *static_cast<const MDFN_Rect*>(rect),
+                              static_cast<const int32*>(line_widths), field);
+    g_capture_failed = false;
+  } catch (const std::exception& error) {
+    if (!g_capture_failed) fprintf(stderr, "emucap: frame capture failed: %s\n", error.what());
+    g_capture_failed = true;
+  } catch (...) {
+    g_capture_failed = true;
+  }
 }
 
 void emucap_pre_first_frame() {
@@ -4664,7 +4686,9 @@ void emucap_pre_first_frame() {
   // controller is not permission to execute the first guest instruction.
   g_frozen = true;
   g_launch_start_controlled = true;
+  bool pacing_parked = false;
   while (g_frozen && g_step_remaining == 0 && g_probe_id < 0 && g_insn_remaining == 0) {
+    pacing_parked = true;
     try {
       if (g_fd < 0) emucap_connect();
       if (g_fd >= 0) serve_socket_once();
@@ -4675,9 +4699,11 @@ void emucap_pre_first_frame() {
     }
     usleep(2000);
   }
+  if (pacing_parked) emucap_ers_resync();
 }
 
-// 프레임 루프에서 매 프레임(MDFNI_Emulate 직후) 호출. 논블로킹이되 frozen이면 스핀해 프레임을 막는다.
+// Called after native output, time accounting and buffer selection settle.
+// A frozen frame park has no pending output from the completed driver iteration.
 void emucap_service(uint64_t frame) {
   try {
   g_frame = frame;
@@ -4808,7 +4834,9 @@ void emucap_service(uint64_t frame) {
     // probe가 대기 중이면(g_probe_id>=0) 스핀을 빠져나가 프레임을 진행시켜야 한다(probe는 진행 필요).
     // step_instructions(g_insn_remaining>0)도 마찬가지 — 빠져나가 프레임을 진행시키면 continuous cb가
     // N명령 후 콜백 안에서 재freeze한다(pause에서 명령단위 step 진입 경로).
+    bool pacing_parked = false;
     while (g_frozen && g_step_remaining == 0 && g_probe_id < 0 && g_insn_remaining == 0) {
+      pacing_parked = true;
       serve_socket_once();
       // A dead control socket is not permission to advance one guest frame. Reconnect inside the
       // same frozen park; returning here would let MDFNI_Emulate run once before the next service
@@ -4819,6 +4847,7 @@ void emucap_service(uint64_t frame) {
       }
       usleep(2000);          // 2ms — busy-spin 방지
     }
+    if (pacing_parked) emucap_ers_resync();
   }
   } catch (const std::exception& error) {
     contain_service_exception("service", error.what());

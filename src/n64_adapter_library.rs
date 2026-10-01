@@ -23,6 +23,7 @@ pub(super) unsafe fn load_api(handle: *mut c_void) -> N64Result<Api> {
         debug_breakpoint_lookup: symbol(handle, b"DebugBreakpointLookup\0")?,
         debug_breakpoint_consume: symbol(handle, b"DebugBreakpointConsume\0")?,
         debug_decode_op: symbol(handle, b"DebugDecodeOp\0")?,
+        debug_frame_resume: symbol(handle, b"DebugFrameResume\0")?,
     })
 }
 

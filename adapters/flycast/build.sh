@@ -167,6 +167,9 @@ else
 fi
 find "$SRC" -name .git -prune -exec rm -rf {} +
 echo "→ Flycast work tree 준비: $SRC (source: $UPSTREAM)"
+patch -d "$SRC" -p1 < "$HERE/patches/0001-bound-cocoa-display-link-wait.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0002-preserve-interpreter-timing-state.patch"
+cp "$HERE/emucap_sdl_swap_wait.h" "$SRC/core/deps/SDL/src/video/cocoa/"
 
 # 공용 빌드 env 정규화(macOS homebrew LLVM 오염 걷어내기 — Apple clang/Cocoa 빌드가 깨지지 않도록).
 . "$HERE/../_common/build-env.sh"
@@ -178,16 +181,31 @@ inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 
 
 # 1. 어댑터 소스 복사
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pacing.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
+cp "$HERE/emucap_state.h" "$SRC/core/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/core/"
 echo "→ emucap.cpp/.h + input ownership + failure serializers 복사: $SRC/core/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알린다(사용자가 git
 # HEAD와 대조해 재빌드 필요 여부 확인 — build-time 임베드라 재빌드 안 하면 옛 hash 그대로). 미커밋이면 -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
+  build.sh patches/0001-bound-cocoa-display-link-wait.patch emucap_sdl_swap_wait.h \
+  patches/0002-preserve-interpreter-timing-state.patch emucap_state.h \
   emucap.cpp emucap.h emucap_input.h emucap_pacing.h emucap_failure.cpp emucap_failure.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
 BUILD_HASH="${BUILD_HASH}@flycast-${FLYCAST_COMMIT:0:12}"
+SWAP_PATCH_SHA256="$(cat "$HERE/patches/0001-bound-cocoa-display-link-wait.patch" "$HERE/emucap_sdl_swap_wait.h" | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print $1}')"
+[ "$SWAP_PATCH_SHA256" = "$(lock_value FLYCAST_SDL_SWAP_PATCH_SHA256)" ] || {
+  echo "ERROR: Flycast SDL swap patch digest mismatch: $SWAP_PATCH_SHA256" >&2
+  exit 1
+}
+BUILD_HASH="${BUILD_HASH}+sdl-${SWAP_PATCH_SHA256}"
+TIMING_PATCH_SHA256="$(cat "$HERE/patches/0002-preserve-interpreter-timing-state.patch" "$HERE/emucap_state.h" | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print $1}')"
+[ "$TIMING_PATCH_SHA256" = "$(lock_value FLYCAST_TIMING_PATCH_SHA256)" ] || {
+  echo "ERROR: Flycast timing patch digest mismatch: $TIMING_PATCH_SHA256" >&2
+  exit 1
+}
+BUILD_HASH="${BUILD_HASH}+timing-${TIMING_PATCH_SHA256}"
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/core/emucap_build.h"
 
 # 1b. 줄끝 정규화(LF). 아래 perl 앵커는 `..."\n`처럼 LF를 가정하는데, Windows에서 core.autocrlf=true로
@@ -427,7 +445,7 @@ if [ ! -f "$SRC/build/CMakeCache.txt" ]; then
   if [ "$(uname -s)" = "Darwin" ]; then
     # env는 emucap_scrub_build_env가 이미 정규화. -DCMAKE_*_COMPILER로 Apple clang까지 명시 고정.
     cmake -S "$SRC" -B "$SRC/build" -DCMAKE_BUILD_TYPE=Release -DENABLE_GDB_SERVER=ON -DUSE_VULKAN=OFF \
-      -DUSE_BREAKPAD=OFF -DCMAKE_OSX_ARCHITECTURES=arm64 \
+      -DUSE_BREAKPAD=OFF -DUSE_HOST_SDL=OFF -DCMAKE_OSX_ARCHITECTURES=arm64 \
       -DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
       -DCMAKE_OBJC_COMPILER=/usr/bin/clang -DCMAKE_OBJCXX_COMPILER=/usr/bin/clang++
   else
@@ -438,6 +456,10 @@ if [ ! -f "$SRC/build/CMakeCache.txt" ]; then
   touch "$STAMP"
 fi
 echo "→ cmake --build (-j$JOBS)"
+if [ "$(uname -s)" = "Darwin" ] && ! grep -q '^USE_HOST_SDL:BOOL=OFF$' "$SRC/build/CMakeCache.txt"; then
+  echo "ERROR: macOS Flycast requires bundled SDL for the maintained display-link repair; reconfigure with USE_HOST_SDL=OFF" >&2
+  exit 1
+fi
 cmake --build "$SRC/build" -j"$JOBS"
 if [ -x "$SRC/build/Flycast.app/Contents/MacOS/Flycast" ]; then
   echo "✓ 빌드 완료: $SRC/build/Flycast.app/Contents/MacOS/Flycast"

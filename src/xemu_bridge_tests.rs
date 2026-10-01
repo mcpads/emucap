@@ -70,6 +70,8 @@ struct FakeGdb {
     replies: VecDeque<(String, GdbResult<String>)>,
     receive_replies: VecDeque<GdbResult<String>>,
     asynchronous: VecDeque<GdbResult<Option<String>>>,
+    /// Stop packets the stub sends once the guest continues.
+    after_continue: VecDeque<String>,
     calls: Vec<String>,
     terminal: bool,
     stop_observed: Option<Rc<Cell<bool>>>,
@@ -81,6 +83,7 @@ impl FakeGdb {
             replies: VecDeque::new(),
             receive_replies: VecDeque::new(),
             asynchronous: VecDeque::new(),
+            after_continue: VecDeque::new(),
             calls: Vec::new(),
             terminal: false,
             stop_observed: None,
@@ -115,11 +118,21 @@ impl GdbTransport for FakeGdb {
 
     fn send_no_reply(&mut self, payload: &str) -> GdbResult<()> {
         self.calls.push(payload.into());
+        if payload == "c" {
+            let stops = std::mem::take(&mut self.after_continue);
+            self.asynchronous
+                .extend(stops.into_iter().map(|stop| Ok(Some(stop))));
+        }
         Ok(())
     }
 
     fn interrupt(&mut self) -> GdbResult<String> {
-        Ok("S02".into())
+        if let Some(observed) = &self.stop_observed {
+            observed.set(true);
+        }
+        self.receive_replies
+            .pop_front()
+            .unwrap_or_else(|| Ok("S02".into()))
     }
 
     fn recv_reply(&mut self) -> GdbResult<String> {
@@ -136,7 +149,13 @@ impl GdbTransport for FakeGdb {
     }
 
     fn recv_nonblocking(&mut self) -> GdbResult<Option<String>> {
-        self.asynchronous.pop_front().unwrap_or(Ok(None))
+        let packet = self.asynchronous.pop_front().unwrap_or(Ok(None));
+        if let (Ok(Some(stop)), Some(observed)) = (&packet, &self.stop_observed) {
+            if is_stop_packet(stop) {
+                observed.set(true);
+            }
+        }
+        packet
     }
 
     fn is_terminal(&self) -> bool {
@@ -147,10 +166,14 @@ impl GdbTransport for FakeGdb {
 fn extension(frame: u64, active: bool, remaining: u64, input: bool) -> Value {
     json!({
         "api":REQUIRED_HOST_API,
+        "clock-profile":XemuClockProfile::candidate(0).unwrap(),
         "frame-boundary":frame,
         "frame-step-active":active,
         "frame-step-remaining":remaining,
         "input-engaged":input,
+        "pacing-percent":100,
+        "pacing-revision":0,
+        "virtual-ns":frame * 16_666_666,
     })
 }
 
@@ -168,6 +191,7 @@ fn state_environment(root: &Path) -> XemuStateEnvironment {
         std::fs::write(&eeprom, [0_u8; 256]).unwrap();
     }
     XemuStateEnvironment {
+        clock_profile: XemuClockProfile::candidate(0).unwrap(),
         hdd,
         eeprom,
         host_build: XemuHostBuildIdentity {
@@ -252,6 +276,7 @@ fn save_state_container(root: &Path, state_path: &Path) -> Value {
     let mut bridge = state_bridge(
         FakeQmp::new(vec![
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(root)),
             ("snapshot-save", json!({})),
             ("query-jobs", concluded_job("emucap-save-1", "save")),
@@ -271,6 +296,7 @@ fn save_state_container(root: &Path, state_path: &Path) -> Value {
 fn load_state_replies(root: &Path, frame: u64) -> Vec<(&'static str, Value)> {
     vec![
         ("query-status", machine(false)),
+        ("xemu-emucap-status", extension(0, false, 0, false)),
         ("query-block", state_block_layout(root)),
         ("snapshot-save", json!({})),
         ("query-jobs", concluded_job("emucap-save-1", "save")),
@@ -317,7 +343,7 @@ fn result(response: Response) -> Value {
 fn frame_step_gdb(stop: &str) -> FakeGdb {
     let registers = hex::encode([0_u8; 64]);
     let mut gdb = FakeGdb::with_replies(vec![("g", &registers)]);
-    gdb.receive_replies.push_back(Ok(stop.into()));
+    gdb.after_continue.push_back(stop.into());
     gdb
 }
 
@@ -583,6 +609,7 @@ fn load_state_restores_eeprom_and_proves_both_transports_while_frozen() {
     let mut bridge = state_bridge(
         FakeQmp::new(vec![
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(temp.path())),
             ("snapshot-save", json!({})),
             ("query-jobs", concluded_job("emucap-save-1", "save")),
@@ -636,6 +663,7 @@ fn load_state_rejects_foreign_generation_before_snapshot_mutation() {
     let mut bridge = state_bridge(
         FakeQmp::new(vec![
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(temp.path())),
         ]),
         FakeGdb::empty(),
@@ -661,6 +689,7 @@ fn load_state_rejects_changed_disc_before_snapshot_mutation() {
     let mut bridge = state_bridge(
         FakeQmp::new(vec![
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(temp.path())),
         ]),
         FakeGdb::empty(),
@@ -686,6 +715,7 @@ fn cached_disc_identity_is_invalidated_by_same_generation_file_drift() {
     let mut bridge = state_bridge(
         FakeQmp::new(vec![
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(temp.path())),
             ("snapshot-save", json!({})),
             ("query-jobs", concluded_job("emucap-save-1", "save")),
@@ -693,6 +723,7 @@ fn cached_disc_identity_is_invalidated_by_same_generation_file_drift() {
             ("query-status", machine(false)),
             ("xemu-emucap-status", extension(42, false, 0, false)),
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(temp.path())),
         ]),
         FakeGdb::empty(),
@@ -722,6 +753,7 @@ fn failed_load_restores_the_prior_frozen_snapshot_and_keeps_control_serviceable(
     let mut bridge = state_bridge(
         FakeQmp::new(vec![
             ("query-status", machine(false)),
+            ("xemu-emucap-status", extension(0, false, 0, false)),
             ("query-block", state_block_layout(temp.path())),
             ("snapshot-save", json!({})),
             ("query-jobs", concluded_job("emucap-save-1", "save")),
@@ -810,7 +842,7 @@ fn probe_loads_advances_reads_and_returns_one_frozen_transaction() {
         ("m1000,4", "deadbeef"),
         ("Qqemu.PhyMemMode:0", "OK"),
     ]);
-    gdb.receive_replies.push_back(Ok("S02".into()));
+    gdb.after_continue.push_back("S02".into());
     let mut bridge = state_bridge(FakeQmp::new(qmp), gdb, temp.path());
 
     let probed = result(bridge.handle_request(Request::new(
@@ -859,8 +891,7 @@ fn probe_breakpoint_stop_preempts_target_and_reads_the_interrupted_boundary() {
         ("m1000,4", "01020304"),
         ("Qqemu.PhyMemMode:0", "OK"),
     ]);
-    gdb.receive_replies
-        .push_back(Ok("T05watch:80001000;".into()));
+    gdb.after_continue.push_back("T05watch:80001000;".into());
     let mut bridge = state_bridge(FakeQmp::new(qmp), gdb, temp.path());
 
     let probed = result(bridge.handle_request(Request::new(
@@ -1232,4 +1263,292 @@ fn debug_runstate_queries_one_gdb_stop_and_does_not_duplicate_it() {
     let second = result(bridge.handle_request(Request::new(11, "poll_events", json!({}))));
     assert!(second["events"].as_array().unwrap().is_empty());
     assert_eq!(bridge.gdb.calls, ["g"]);
+}
+
+#[test]
+fn frame_step_at_the_host_budget_stops_and_reports_the_reached_frames() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut gdb = FakeGdb::empty();
+    gdb.asynchronous.push_back(Ok(None));
+    let mut bridge = bridge(
+        FakeQmp::new(vec![
+            ("xemu-emucap-status", extension(401, true, 59, false)),
+            ("query-status", machine(false)),
+            ("xemu-emucap-cancel-frame-step", json!({})),
+        ]),
+        gdb,
+        temp.path(),
+    );
+    let expired = crate::live::temporal::OperationDeadline::after(Duration::ZERO);
+    let interrupted = bridge.wait_frame_step(60, 400, expired).unwrap();
+    assert_eq!(interrupted["status"], "interrupted");
+    assert_eq!(interrupted["reason"], "host_deadline");
+    assert_eq!(interrupted["completed"], 1);
+    assert_eq!(interrupted["state"], "frozen");
+    bridge.qmp.assert_drained();
+}
+
+#[test]
+fn execution_speed_applies_and_reads_back_the_native_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = bridge(
+        FakeQmp::new(vec![
+            (
+                "xemu-emucap-pacing",
+                json!({"percent":100, "revision":0, "frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+            ),
+            (
+                "xemu-emucap-pacing",
+                json!({"percent":50, "revision":1, "frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+            ),
+            ("query-status", machine(true)),
+        ]),
+        FakeGdb::empty(),
+        temp.path(),
+    );
+    let changed = result(bridge.handle_request(Request::new(
+        120,
+        "execution_speed",
+        json!({"mode":"limited", "percent":50}),
+    )));
+    assert_eq!(changed["status"], "completed");
+    assert_eq!(changed["state"], "running");
+    assert_eq!(changed["previous"]["percent"], 100);
+    assert_eq!(changed["execution_speed"]["mode"], "limited");
+    assert_eq!(changed["execution_speed"]["percent"], 50);
+    assert_eq!(
+        bridge.qmp.calls[1].1.as_ref().unwrap(),
+        &json!({"percent": 50})
+    );
+    bridge.qmp.assert_drained();
+}
+
+#[test]
+fn memory_batch_reads_at_one_frozen_native_boundary() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = bridge(
+        FakeQmp::new(vec![
+            ("query-status", machine(false)),
+            (
+                "xemu-emucap-read-memory-batch",
+                json!({"frame-boundary":7, "virtual-ns":116_666_662u64, "reads":["deadbeef", "00"]}),
+            ),
+            ("query-status", machine(true)),
+        ]),
+        FakeGdb::empty(),
+        temp.path(),
+    );
+    let batch = result(bridge.handle_request(Request::new(
+        121,
+        "read_memory_batch",
+        json!({"ranges":[
+            {"memory_type":"main", "address":0x1000, "length":4},
+            {"memory_type":"main", "address":0x20, "length":1},
+        ]}),
+    )));
+    assert_eq!(batch["reads"][0]["hex"], "deadbeef");
+    assert_eq!(batch["reads"][1]["address"], 0x20);
+    assert_eq!(batch["boundary"]["stop_epoch"], "f7#s0");
+    assert_eq!(batch["total_bytes"], 5);
+    assert_eq!(
+        bridge.qmp.calls[1].1.as_ref().unwrap()["ranges"][0],
+        json!({"address":0x1000, "length":4})
+    );
+
+    let running = bridge.handle_request(Request::new(
+        122,
+        "read_memory_batch",
+        json!({"ranges":[{"memory_type":"main", "address":0, "length":4}]}),
+    ));
+    assert!(!running.ok);
+    bridge.qmp.assert_drained();
+}
+
+#[test]
+fn pacing_mutation_failure_closes_control_without_stale_rollback() {
+    for failure_at in 1..=2 {
+        let temp = tempfile::tempdir().unwrap();
+        let mut qmp = FakeQmp::new(vec![
+            (
+                "xemu-emucap-pacing",
+                json!({"percent":100,"revision":0,"frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+            ),
+            (
+                "xemu-emucap-pacing",
+                json!({"percent":50,"revision":1,"frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+            ),
+            ("query-status", machine(false)),
+        ]);
+        qmp.replies.truncate(failure_at + 1);
+        qmp.replies[failure_at].1 = Err(QmpError::Io(std::io::Error::other("injected failure")));
+        let mut bridge = bridge(qmp, FakeGdb::empty(), temp.path());
+        let response = bridge.handle_request(Request::new(
+            130,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("last verified policy"));
+        assert!(bridge.backend_terminal());
+        assert!(
+            !bridge
+                .handle_request(Request::new(131, "resume", json!({})))
+                .ok
+        );
+        bridge.qmp.assert_drained();
+    }
+}
+
+#[test]
+fn batch_rejects_non_hex_native_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut bridge = bridge(
+        FakeQmp::new(vec![
+            ("query-status", machine(false)),
+            (
+                "xemu-emucap-read-memory-batch",
+                json!({"frame-boundary":7,"virtual-ns":10,"reads":["zz"]}),
+            ),
+        ]),
+        FakeGdb::empty(),
+        temp.path(),
+    );
+    let response = bridge.handle_request(Request::new(
+        132,
+        "read_memory_batch",
+        json!({"ranges":[{"memory_type":"main","address":0,"length":1}]}),
+    ));
+    assert!(!response.ok);
+    bridge.qmp.assert_drained();
+}
+
+#[test]
+fn deadline_race_consumes_breakpoint_stop_before_qmp_and_preserves_its_reason() {
+    let temp = tempfile::tempdir().unwrap();
+    let observed = Rc::new(Cell::new(false));
+    let mut gdb = FakeGdb::empty().mark_stop_observed(Rc::clone(&observed));
+    gdb.receive_replies
+        .push_back(Ok("T05watch:80001000;".into()));
+    let qmp = FakeQmp::new(vec![
+        ("xemu-emucap-status", extension(401, true, 59, false)),
+        ("query-status", json!({"running":false,"status":"debug"})),
+        ("xemu-emucap-cancel-frame-step", json!({})),
+    ])
+    .require_stop_before_call(0, observed);
+    let mut bridge = bridge(qmp, gdb, temp.path());
+    let expired = crate::live::temporal::OperationDeadline::after(Duration::ZERO);
+    let reply = bridge.wait_frame_step(60, 400, expired).unwrap();
+    assert_eq!(reply["reason"], "debugger_stop");
+    assert_eq!(bridge.events[0]["watch_address"], 0x80001000u64);
+    bridge.qmp.assert_drained();
+}
+
+#[test]
+fn clock_profile_admission_binds_every_candidate_to_its_generation() {
+    for shift in 0..=3 {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = XemuClockProfile::candidate(shift).unwrap();
+        let mut reply = extension(0, false, 0, false);
+        reply["clock-profile"] = serde_json::to_value(&profile).unwrap();
+        let mut bridge = bridge(
+            FakeQmp::new(vec![("xemu-emucap-status", reply)]),
+            FakeGdb::empty(),
+            temp.path(),
+        );
+        bridge.state_environment.clock_profile = profile;
+        bridge.extension_status().unwrap();
+        assert!(!bridge.control_unverified);
+        bridge.qmp.assert_drained();
+    }
+    for value in ["", "-1", "4", "auto", "1.5", "256"] {
+        assert!(qualification_shift(Some(value)).is_err());
+    }
+    assert_eq!(qualification_shift(None).unwrap(), 3);
+}
+
+#[test]
+fn incompatible_clock_profiles_stop_control_before_state_mutation() {
+    let mut variants = vec![Value::Null, json!({})];
+    let valid = serde_json::to_value(XemuClockProfile::candidate(0).unwrap()).unwrap();
+    let mut missing_rtc = valid.clone();
+    missing_rtc.as_object_mut().unwrap().remove("rtc-clock");
+    variants.push(missing_rtc);
+    for (field, value) in [
+        ("scheduler", json!("adaptive-icount")),
+        ("instruction-ns", json!(2)),
+        ("multi-thread", json!(true)),
+        ("sleep", json!(true)),
+        ("align", json!(true)),
+        ("devices", json!("host-clock")),
+        ("rtc-clock", json!("host")),
+        ("rtc-clock", Value::Null),
+        ("instruction-ns", json!("1")),
+    ] {
+        let mut changed = valid.clone();
+        changed[field] = value;
+        variants.push(changed);
+    }
+    for operation in ["save_state", "load_state"] {
+        for profile in &variants {
+            let temp = tempfile::tempdir().unwrap();
+            let mut reply = extension(0, false, 0, false);
+            reply["clock-profile"] = profile.clone();
+            if profile.is_null() {
+                reply.as_object_mut().unwrap().remove("clock-profile");
+            }
+            let mut bridge = bridge(
+                FakeQmp::new(vec![
+                    ("query-status", machine(false)),
+                    ("xemu-emucap-status", reply),
+                ]),
+                FakeGdb::empty(),
+                temp.path(),
+            );
+            let response = bridge.handle_request(Request::new(
+                900,
+                operation,
+                json!({"path":temp.path().join("unread-state.json")}),
+            ));
+            assert!(response.error.is_some());
+            assert!(bridge.control_unverified);
+            assert_eq!(bridge.qmp.calls.len(), 2);
+            bridge.qmp.assert_drained();
+        }
+    }
+}
+
+#[test]
+fn speed_profile_drift_is_rejected_before_set_or_after_unverified_mutation() {
+    for drift_after_set in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let reply = |shift, percent| {
+            json!({"percent":percent,"revision":0,"frame-boundary":0,
+            "clock-profile":XemuClockProfile::candidate(shift).unwrap()})
+        };
+        let replies = if drift_after_set {
+            vec![
+                ("xemu-emucap-pacing", reply(0, 100)),
+                ("xemu-emucap-pacing", reply(1, 50)),
+            ]
+        } else {
+            vec![("xemu-emucap-pacing", reply(1, 100))]
+        };
+        let mut bridge = bridge(FakeQmp::new(replies), FakeGdb::empty(), temp.path());
+        let response = bridge.handle_request(Request::new(
+            901,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(response.error.is_some());
+        assert!(bridge.control_unverified);
+        assert!(bridge.qmp.calls[0].1.is_none());
+        if drift_after_set {
+            assert_eq!(bridge.qmp.calls[1].1, Some(json!({"percent":50})));
+        }
+        bridge.qmp.assert_drained();
+    }
 }

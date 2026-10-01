@@ -332,4 +332,36 @@ fn recovery_never_mutates_a_replaced_staging_directory() {
     assert!(PathBuf::from(&capsule.staging_path).is_dir());
 }
 
+#[test]
+fn recovery_requires_directory_creation_identity() {
+    for missing in [false, true] {
+        let (_temp, store, port, launch_id, lease) = setup();
+        let output = tempfile::tempdir().unwrap();
+        let repository = CaptureCapsuleRepository::new(store.clone(), port, &launch_id);
+        repository
+            .create(preparation(output.path(), lease.clone()))
+            .unwrap();
+        let capsule = repository.read().unwrap().unwrap();
+        store
+            .update_capture_json(port, &launch_id, |current: Option<CaptureCapsule>| {
+                let mut current = current.unwrap();
+                current.lease.holder = capture_process(u32::MAX - 1);
+                // Keep path/device/inode identical: only the directory lifetime
+                // differs, or the old capsule has no lifetime evidence.
+                current.staging_identity.created_at = if missing {
+                    None
+                } else {
+                    Some(std::time::UNIX_EPOCH)
+                };
+                Ok(current)
+            })
+            .unwrap();
+        assert!(matches!(
+            repository.reconcile(&lease, None, Some(failed_terminal())),
+            Err(CaptureCapsuleError::RecoveryBlocked(_))
+        ));
+        assert!(PathBuf::from(&capsule.staging_path).is_dir());
+    }
+}
+
 use std::path::PathBuf;

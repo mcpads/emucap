@@ -71,6 +71,10 @@ PATCHES=(
   "$HERE/patches/0001-fail-closed-core-worker-init.patch"
   "$HERE/patches/0002-consume-breakpoint-latch.patch"
   "$HERE/patches/0003-slice-speed-limiter-wait.patch"
+  "$HERE/patches/0004-reanchor-limiter-after-pause.patch"
+  "$HERE/patches/0005-preserve-interrupt-jitter-state.patch"
+  "$HERE/patches/0006-frame-resume-pacing-hook.patch"
+  "$HERE/patches/0007-prepare-native-state-load-before-resume.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -87,15 +91,22 @@ fi
 # Restore every locally patched source from the verified archive before applying the patch stack.
 # This prevents an ignored generated tree from silently contributing hand edits to a signed build.
 PATCHED_MEMBERS=(
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/r4300_core.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/r4300_core.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/interrupt.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/frontend.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/api_export.ver"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/debugger.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/m64p_debugger.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/main.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/main.h"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/debugger/dbg_debugger.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/workqueue.c"
 )
+# Added headers are not archive members; recreate them from the maintained patches.
+rm -f "$SRC/source/mupen64plus-core/src/device/r4300/interrupt_jitter.h"
 tar -xzf "$ARCHIVE" -C "$WORK" "${PATCHED_MEMBERS[@]}"
 CORE_SRC="$SRC/source/mupen64plus-core"
 for source_patch in "${PATCHES[@]}"; do

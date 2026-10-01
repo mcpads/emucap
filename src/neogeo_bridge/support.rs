@@ -22,6 +22,7 @@ pub(super) fn error_kind(error: &BridgeError) -> &'static str {
     match error {
         BridgeError::BadParams(_) => "bad_params",
         BridgeError::BadState(_) => "bad_state",
+        BridgeError::UnsafeHalt(_) => "unsafe_halt",
         BridgeError::UnknownMethod(_) => "unknown_method",
         BridgeError::Emulator(_) | BridgeError::Gdb(GdbError::Emulator(_)) => "emulator_error",
         BridgeError::Io(_) | BridgeError::Gdb(_) => "bridge_error",

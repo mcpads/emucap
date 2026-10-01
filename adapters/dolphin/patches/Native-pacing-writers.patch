@@ -1,0 +1,81 @@
+diff --git a/Source/Core/DolphinQt/HotkeyScheduler.cpp b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+--- a/Source/Core/DolphinQt/HotkeyScheduler.cpp
++++ b/Source/Core/DolphinQt/HotkeyScheduler.cpp
+@@ -519,20 +519,26 @@
+ 
+       if (IsHotkey(HK_DECREASE_EMULATION_SPEED))
+       {
+-        auto speed = Config::Get(Config::MAIN_EMULATION_SPEED) - 0.1;
+-        if (speed > 0)
+-        {
++        {
++          Config::SettingsTransaction transaction;
++          auto speed = Config::Get(Config::MAIN_EMULATION_SPEED) - 0.1;
++          if (speed > 0)
++          {
++            speed = (speed >= 0.95 && speed <= 1.05) ? 1.0 : speed;
++            Config::SetCurrent(Config::MAIN_EMULATION_SPEED, speed);
++          }
++        }
++        ShowEmulationSpeed();
++      }
++
++      if (IsHotkey(HK_INCREASE_EMULATION_SPEED))
++      {
++        {
++          Config::SettingsTransaction transaction;
++          auto speed = Config::Get(Config::MAIN_EMULATION_SPEED) + 0.1;
+           speed = (speed >= 0.95 && speed <= 1.05) ? 1.0 : speed;
+           Config::SetCurrent(Config::MAIN_EMULATION_SPEED, speed);
+         }
+-        ShowEmulationSpeed();
+-      }
+-
+-      if (IsHotkey(HK_INCREASE_EMULATION_SPEED))
+-      {
+-        auto speed = Config::Get(Config::MAIN_EMULATION_SPEED) + 0.1;
+-        speed = (speed >= 0.95 && speed <= 1.05) ? 1.0 : speed;
+-        Config::SetCurrent(Config::MAIN_EMULATION_SPEED, speed);
+         ShowEmulationSpeed();
+       }
+ 
+diff --git a/Source/Core/Core/AchievementManager.cpp b/Source/Core/Core/AchievementManager.cpp
+--- a/Source/Core/Core/AchievementManager.cpp
++++ b/Source/Core/Core/AchievementManager.cpp
+@@ -415,6 +415,7 @@
+ void AchievementManager::SetHardcoreMode()
+ {
+   rc_client_set_hardcore_enabled(m_client, Config::Get(Config::RA_HARDCORE_ENABLED));
++  Config::SettingsTransaction transaction;
+   if (Config::Get(Config::RA_HARDCORE_ENABLED))
+   {
+     if (Config::Get(Config::MAIN_EMULATION_SPEED) < 1.0f)
+diff --git a/Source/Core/Core/CoreTiming.cpp b/Source/Core/Core/CoreTiming.cpp
+--- a/Source/Core/Core/CoreTiming.cpp
++++ b/Source/Core/Core/CoreTiming.cpp
+@@ -157,13 +157,19 @@
+ 
+   m_correct_time_drift = Config::Get(Config::MAIN_CORRECT_TIME_DRIFT);
+ 
+-  if (AchievementManager::GetInstance().IsHardcoreModeActive() &&
+-      Config::Get(Config::MAIN_EMULATION_SPEED) < 1.0f &&
+-      Config::Get(Config::MAIN_EMULATION_SPEED) > 0.0f)
+-  {
+-    Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
++  const bool hardcore = AchievementManager::GetInstance().IsHardcoreModeActive();
++  bool clamped = false;
++  {
++    Config::SettingsTransaction transaction;
++    const float speed = Config::Get(Config::MAIN_EMULATION_SPEED);
++    if (hardcore && speed < 1.0f && speed > 0.0f)
++    {
++      Config::SetCurrent(Config::MAIN_EMULATION_SPEED, 1.0f);
++      clamped = true;
++    }
++  }
++  if (clamped)
+     OSD::AddMessage("Minimum speed is 100% in Hardcore Mode");
+-  }
+ 
+   UpdateSpeedLimit(GetTicks(), Config::Get(Config::MAIN_EMULATION_SPEED));
+ 

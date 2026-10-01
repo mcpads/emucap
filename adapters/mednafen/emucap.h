@@ -21,9 +21,13 @@ inline bool emucap_progress_due(
 }
 
 void emucap_service(uint64_t frame);
+// Active frame consumers require every guest frame to be rendered; the user's
+// ordinary frameskip setting remains unchanged.
+bool emucap_frame_consumer_active();
 // Called before the first MDFNI_Emulate invocation. When the managed launcher requested a frozen
 // entry, it connects and services control without allowing any guest instruction to execute.
 void emucap_pre_first_frame();
+extern "C" double emucap_host_audio_ratio(void);
 // 입력 주입: 주입 입력이 있으면 포트0 버퍼를 덮어쓴다. namespace Mednafen 안(mednafen.cpp)과
 // 밖(드라이버) 양쪽에서 호출하므로 extern "C"로 linkage를 고정한다(C++ mangling 불일치 방지).
 extern "C" void emucap_apply_input(unsigned char* port0_data, unsigned port0_len);
@@ -35,7 +39,7 @@ extern "C" void emucap_smpc_read_store(unsigned addr, unsigned value, const unsi
 // breakpoints, so md/vdp.cpp calls this directly for VRAM/CRAM/VSRAM/register writes.
 extern "C" void emucap_md_vdp_write(const char* memory_type, unsigned address, unsigned length, unsigned value,
                                     unsigned pc, const char* source, unsigned source_address);
-// MDFNI_Emulate 직후 훅에서 호출: 최신 프레임버퍼를 기록(screenshot용). 타입 결합 회피로 void*.
+// MDFNI_Emulate 직후 훅에서 호출: 완료 화면을 복사해 소유(screenshot용). 타입 결합 회피로 void*.
 // 인자는 const MDFN_Surface* / const MDFN_Rect* / const int32*(LineWidths).
-void emucap_capture(const void* surface, const void* rect, const void* line_widths);
+void emucap_capture(const void* surface, const void* rect, const void* line_widths, int field);
 #endif

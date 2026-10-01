@@ -12,6 +12,9 @@ use std::time::Duration;
 use super::protocol::{read_ndjson_frame, ProtocolError, Request, Response};
 use super::runtime::{capture_process, process_state, ProcessIdentity, ProcessState};
 
+pub mod cancellation;
+pub mod owned;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const WORKING_INTERVAL: Duration = Duration::from_secs(1);
@@ -145,12 +148,77 @@ fn serve_reconnecting_controlled_inner<F, P>(
     port: u16,
     label: &str,
     mut handle: F,
-    mut terminal_probe: P,
+    terminal_probe: P,
     max_sessions: Option<usize>,
 ) -> io::Result<()>
 where
     F: FnMut(Request) -> BridgeReply + Send,
     P: FnMut() -> Option<String>,
+{
+    serve_reconnecting_cancellable_inner(
+        port,
+        label,
+        move |request, _| handle(request),
+        terminal_probe,
+        max_sessions,
+        None,
+    )
+}
+
+/// Opt in only after the handler implements bounded native cancellation and retirement.
+pub fn serve_reconnecting_cancellable<F, P>(
+    port: u16,
+    label: &str,
+    handle: F,
+    terminal_probe: P,
+    admission: cancellation::TemporalAdmission,
+) -> io::Result<()>
+where
+    F: FnMut(Request, super::link::RequestCancellation) -> BridgeReply + Send,
+    P: FnMut() -> Option<String>,
+{
+    serve_reconnecting_cancellable_inner(port, label, handle, terminal_probe, None, Some(admission))
+}
+
+fn serve_reconnecting_cancellable_inner<F, P>(
+    port: u16,
+    label: &str,
+    mut handle: F,
+    mut terminal_probe: P,
+    max_sessions: Option<usize>,
+    admission: Option<cancellation::TemporalAdmission>,
+) -> io::Result<()>
+where
+    F: FnMut(Request, super::link::RequestCancellation) -> BridgeReply + Send,
+    P: FnMut() -> Option<String>,
+{
+    reconnect_sessions(
+        port,
+        label,
+        &mut terminal_probe,
+        max_sessions,
+        |stream, probe| {
+            serve_one_cancellable(
+                stream,
+                &mut handle,
+                probe,
+                WORKING_INTERVAL,
+                admission.as_ref(),
+            )
+        },
+    )
+}
+
+fn reconnect_sessions<P, F>(
+    port: u16,
+    label: &str,
+    terminal_probe: &mut P,
+    max_sessions: Option<usize>,
+    mut serve: F,
+) -> io::Result<()>
+where
+    P: FnMut() -> Option<String>,
+    F: FnMut(TcpStream, &mut P) -> io::Result<SessionEnd>,
 {
     let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut delay = MIN_RETRY;
@@ -174,7 +242,7 @@ where
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         stream.set_read_timeout(Some(LIFECYCLE_POLL_INTERVAL))?;
         eprintln!("[{label}] emucap connected");
-        let end = serve_one_controlled(stream, &mut handle, &mut terminal_probe, WORKING_INTERVAL);
+        let end = serve(stream, terminal_probe);
         sessions += 1;
         if let Ok(SessionEnd::DependencyTerminal(reason)) = &end {
             eprintln!("[{label}] dependency ended ({reason}); exiting bridge");
@@ -220,6 +288,7 @@ where
     .map(|_| ())
 }
 
+#[cfg(test)]
 fn serve_one_controlled<F, P>(
     stream: TcpStream,
     handle: &mut F,
@@ -228,6 +297,26 @@ fn serve_one_controlled<F, P>(
 ) -> io::Result<SessionEnd>
 where
     F: FnMut(Request) -> BridgeReply + Send,
+    P: FnMut() -> Option<String>,
+{
+    serve_one_cancellable(
+        stream,
+        &mut |request, _| handle(request),
+        terminal_probe,
+        working_interval,
+        None,
+    )
+}
+
+fn serve_one_cancellable<F, P>(
+    stream: TcpStream,
+    handle: &mut F,
+    terminal_probe: &mut P,
+    working_interval: Duration,
+    admission: Option<&cancellation::TemporalAdmission>,
+) -> io::Result<SessionEnd>
+where
+    F: FnMut(Request, super::link::RequestCancellation) -> BridgeReply + Send,
     P: FnMut() -> Option<String>,
 {
     let mut reader = BufReader::new(stream.try_clone()?);
@@ -255,8 +344,58 @@ where
         }
         match serde_json::from_str::<Request>(line.trim()) {
             Ok(request) => {
-                let completion =
-                    serve_request_controlled(&mut writer, handle, request, working_interval)?;
+                if request.method == "cancel_operation" && admission.is_some() {
+                    write_response(
+                        &mut writer,
+                        &Response {
+                            id: request.id,
+                            ok: true,
+                            error: None,
+                            result: Some(serde_json::json!({"status":"not_active"})),
+                        },
+                    )?;
+                    continue;
+                }
+                let key = match admission.map(|rules| rules.admit(&request)).transpose() {
+                    Ok(key) => key.flatten(),
+                    Err(message) => {
+                        write_response(
+                            &mut writer,
+                            &Response {
+                                id: request.id,
+                                ok: false,
+                                result: None,
+                                error: Some(ProtocolError {
+                                    kind: "bad_params".into(),
+                                    message,
+                                }),
+                            },
+                        )?;
+                        continue;
+                    }
+                };
+                let completion = if let Some(key) = key {
+                    let completed = cancellation::execute_cancellable(
+                        &mut reader,
+                        &mut writer,
+                        &mut pending,
+                        request,
+                        &key,
+                        working_interval,
+                        &mut *handle,
+                    )?;
+                    RequestCompletion {
+                        directive: completed.directive,
+                        write_error: completed.transport_error,
+                    }
+                } else {
+                    serve_request_controlled(
+                        &mut writer,
+                        &mut |request| handle(request, super::link::RequestCancellation::default()),
+                        request,
+                        working_interval,
+                    )?
+                };
                 if completion.directive == BridgeDirective::Terminate {
                     return Ok(SessionEnd::DependencyTerminal(
                         "backend reported a terminal transport state".into(),

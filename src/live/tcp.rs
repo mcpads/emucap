@@ -51,6 +51,7 @@ const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
 const DEFAULT_DEFERRED_DEADLINE: Duration = Duration::from_secs(300);
 
 struct Conn {
+    attachment_id: String,
     reader: BufReader<TcpStream>,
     writer: TcpStream,
     /// 부분 수신한 응답 frame. 요청 타임아웃 뒤에도 이어 읽되 protocol payload cap을 넘기지 않는다.
@@ -413,6 +414,7 @@ fn handshake_stream(
 
     Ok((
         Conn {
+            attachment_id: super::temporal::fresh_identity(),
             reader,
             writer,
             pending: Vec::new(),
@@ -822,8 +824,20 @@ impl EmulatorLink for TcpLink {
         if control.cancellation.is_cancelled() {
             return Err(LinkError::Cancelled);
         }
-        self.ensure_connected()?;
+        if control.temporal_stop_ms.is_some() {
+            if self.conn.is_none() {
+                return Err(LinkError::NotConnected);
+            }
+        } else {
+            self.ensure_connected()?;
+        }
         self.raw_call_inner(method, params, Some(observer), Some(control))
+    }
+
+    fn attachment_id(&self) -> Option<&str> {
+        self.conn
+            .as_ref()
+            .map(|connection| connection.attachment_id.as_str())
     }
 
     fn supports_session_reconnect(&self) -> bool {
