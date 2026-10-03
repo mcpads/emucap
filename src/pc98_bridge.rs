@@ -236,6 +236,12 @@ struct Breakpoint {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
+    #[error("producer operation is busy")]
+    Busy,
+    #[error("operation cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Unsupported(String),
     #[error("{0}")]
     BadParams(String),
     #[error("{0}")]
@@ -271,6 +277,9 @@ pub struct Bridge<G> {
     /// Set when a pacing transaction could not be verified or restored; the control channel is
     /// then no longer presented as healthy.
     control_fatal: Option<String>,
+    request_cancellation: Option<crate::live::link::RequestCancellation>,
+    owned_control: bool,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
 }
 
 impl<G: GdbTransport> Bridge<G> {
@@ -292,7 +301,21 @@ impl<G: GdbTransport> Bridge<G> {
             pointer_relative: None,
             mame_features: None,
             control_fatal: None,
+            request_cancellation: None,
+            owned_control: false,
+            producer_ownership: None,
         }
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        req: Request,
+        cancellation: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = Some(cancellation);
+        let response = self.handle_request(req);
+        self.request_cancellation = None;
+        response
     }
 
     pub fn handle_request(&mut self, req: Request) -> Response {
@@ -365,8 +388,10 @@ mod execution;
 mod machine;
 mod media;
 mod observation;
+mod owned_frame;
 mod service;
 mod support;
+mod temporal_owner;
 use support::*;
 
 #[cfg(test)]

@@ -33,6 +33,9 @@ impl<G: GdbTransport> Bridge<G> {
                 "unsupported PC-98 step unit: {unit}"
             )));
         }
+        if let Some(cancellation) = self.request_cancellation.clone() {
+            return self.owned_frame_step(frames, cancellation);
+        }
         let stop = self.frames_op("framestep", frames)?;
         self.frozen = true;
         if let Some(raw) = stop {

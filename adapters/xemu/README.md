@@ -77,6 +77,9 @@ The experimental Xbox profile uses host API 3 and fixed instruction-count schedu
 `debug.execution_speed`: integer 1–1000% or unlimited, while running or frozen. Managed launch
 selects single-thread TCG with `shift=3,align=off,sleep=off`; pacing changes only host waits.
 The bridge verifies the complete native clock profile against the managed generation.
+Pacing transaction version 1 returns previous and final policies from one BQL-owned command;
+older hosts are rejected before a set. Malformed or lost results retire uncertain control with
+available evidence. A bridge-side cached policy is never used for rollback.
 Policy survives reset/load within the generation, and a new launch starts at 100%.
 NV2A and APU work follow guest virtual time. Host throughput can limit the achieved rate.
 This profile passed menu, matched-gameplay and rebuilt-producer lifecycle checks on hidden/muted

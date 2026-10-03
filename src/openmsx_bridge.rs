@@ -35,10 +35,10 @@ mod joystick;
 mod media;
 #[path = "openmsx_bridge/observation.rs"]
 mod observation;
-#[path = "openmsx_bridge/temporal_owner.rs"]
-mod temporal_owner;
 #[path = "openmsx_bridge/state.rs"]
 mod state;
+#[path = "openmsx_bridge/temporal_owner.rs"]
+mod temporal_owner;
 #[path = "openmsx_bridge/xml.rs"]
 mod xml;
 

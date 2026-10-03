@@ -1,0 +1,91 @@
+--- a/src/wswan/gfx.cpp
++++ b/src/wswan/gfx.cpp
+@@ -43,6 +43,8 @@
+ 
+ static uint8 wsLine;                 /*current scanline*/
+ static uint8 weppy;
++// Completion belongs to the saved scanline, including suspended CPU slices.
++static bool line_frame_complete;
+ 
+ static uint8 SpriteTable[2][0x80][4];
+ static uint32 SpriteCountCache[2];
+@@ -502,12 +504,16 @@
+ bool wsExecuteLine(MDFN_Surface *surface, bool skip)
+ {
+ 	static const void* const WEP_Tab[4] = { &&WEP0, &&WEP1, &&WEP2, &&WEP3 };	// The things we do for debugger step mode save states!  If we ever add more entries, remember to change the mask stuff in StateAction
+-        bool ret;
+-
+-	weppy = 0;
++        if(weppy)
++        {
++         // The saved slice already includes its cycle budget. Finish that
++         // remainder before dispatching its saved post-CPU phase.
++         v30mz_execute(0);
++         goto *WEP_Tab[weppy];
++        }
+         WEP0: ;
+ 
+-	ret = false;
++        line_frame_complete = false;
+ 
+          #ifdef WANT_DEBUGGER
+          if(GfxDecode_Buf && GfxDecode_Line >=0 && wsLine == GfxDecode_Line)
+@@ -534,7 +540,7 @@
+         if(wsLine == 144)
+         {
+ 		FrameWhichActive = !FrameWhichActive;
+-                ret = true;
++                line_frame_complete = true;
+                 WSwan_Interrupt(WSINT_VBLANK);
+                 //printf("VBlank: %d\n", wsLine);
+                 if(VBCounter && (BTimerControl & 0x04))
+@@ -590,7 +596,7 @@
+ 	RTC_Clock(256);
+ 
+ 	weppy = 0;
+-        return(ret);
++        return(line_frame_complete);
+ }
+ 
+ void WSwan_SetLayerEnableMask(uint64 mask)
+@@ -914,6 +920,7 @@
+ void WSwan_GfxReset(void)
+ {
+  weppy = 0;
++ line_frame_complete = false;
+  wsLine=0;
+  wsSetVideo(0,true);
+ 
+@@ -960,6 +967,10 @@
+ 
+ void WSwan_GfxStateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++ // Old frame-boundary states have no suspended line. The enclosing exact
++ // snapshot format separately admits the history required for partial frames.
++ if(load)
++  line_frame_complete = false;
+  SFORMAT StateRegs[] =
+  {
+   SFVARN(wsMonoPal, "wsMonoPal"),
+@@ -1008,6 +1019,7 @@
+   SFVAR(VideoMode),
+ 
+   SFVAR(weppy),
++  SFVAR(line_frame_complete),
+   SFEND
+  };
+ 
+--- a/src/wswan/v30mz.cpp
++++ b/src/wswan/v30mz.cpp
+@@ -1112,6 +1112,11 @@
+ 
+   if(cpu_hook)
+    cpu_hook(I.pc);
++  // A callback load may replace this slice with an exhausted frame boundary.
++  // Return to the restored graphics phase before fetching another instruction.
++  if(v30mz_ICount <= 0)
++   return;
++  SETOLDCSIP();
+   #endif
+ 
+   DoOP(FETCHOP);

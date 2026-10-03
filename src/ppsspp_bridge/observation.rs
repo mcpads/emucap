@@ -128,9 +128,43 @@ impl<T: WsTransport> PpssppBridge<T> {
             SpeedRequest::Unlimited => json!({ "unlimited": true }),
             SpeedRequest::Limited { centi_percent } => json!({ "percent": centi_percent / 100 }),
         };
-        let before = self.native_pacing(json!({}))?;
-        let outcome: BridgeResult<Value> = (|| {
-            let after = self.native_pacing(set)?;
+        // Probe before mutation: an older host must not accept a set whose transaction
+        // semantics this bridge cannot verify. This observation is not `previous`.
+        let probe = self.ws.call("emucap.pacing", json!({}))?;
+        let observed = PpssppPacing::parse(&probe).ok_or_else(|| {
+            BridgeError::Emulator("invalid native pacing capability probe".into())
+        })?;
+        if probe.get("transaction_version").and_then(Value::as_u64) != Some(1) {
+            return Err(BridgeError::Unsupported(
+                "native pacing transaction version 1 is required; rebuild the PSP host".into(),
+            ));
+        }
+        let mut native_result = None;
+        let outcome: BridgeResult<Option<Value>> = (|| {
+            let raw = self.ws.call("emucap.pacing", set)?;
+            native_result = Some(raw.clone());
+            let invalid =
+                || BridgeError::Emulator("invalid native pacing transaction result".into());
+            if raw.get("transaction_version").and_then(Value::as_u64) != Some(1)
+                || raw.get("clock_domain").and_then(Value::as_str) != Some("psp_vblank")
+            {
+                return Err(invalid());
+            }
+            let before = raw
+                .get("previous")
+                .and_then(PpssppPacing::parse)
+                .ok_or_else(invalid)?;
+            let after = PpssppPacing::parse(&raw).ok_or_else(invalid)?;
+            if raw.get("begin_vblank").and_then(Value::as_u64) != Some(before.vblank) {
+                return Err(invalid());
+            }
+            match raw.get("outcome").and_then(Value::as_str) {
+                Some("rejected") if before.network_forced && before.public() == after.public() => {
+                    return Ok(None);
+                }
+                Some("completed") if before.revision != after.revision => {}
+                _ => return Err(invalid()),
+            }
             let state = if self.cpu_is_stepping()? {
                 "frozen"
             } else {
@@ -146,14 +180,20 @@ impl<T: WsTransport> PpssppBridge<T> {
             capability
                 .verify_change(request, &reply)
                 .map_err(BridgeError::Emulator)?;
-            Ok(reply)
+            Ok(Some(reply))
         })();
-        outcome.map_err(|error| {
-            // Separate native requests cannot exclude a concurrent human policy change.
-            // Do not overwrite it with a stale rollback or continue on an unknown policy.
+        let verified = outcome.map_err(|error| {
+            // A later external write may follow the native transaction. Never overwrite
+            // it with the pre-probe policy when response/state verification fails.
             self.control_unverified = true;
-            BridgeError::Emulator(format!("execution_speed unverified: {error}; last verified policy: {}; guest progress may have occurred", before.public()))
-        })
+            BridgeError::Emulator(format!(
+                "execution_speed unverified: {error}; last observed policy: {}; native transaction: {:?}; guest progress may have occurred",
+                observed.public(), native_result
+            ))
+        })?;
+        verified.ok_or_else(|| BridgeError::BadState(
+            "network policy prevents speed control; native transaction rejected without mutation".into(),
+        ))
     }
 
     pub(super) fn read_memory_batch(&mut self, params: &Value) -> BridgeResult<Value> {

@@ -1,0 +1,567 @@
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -15,6 +15,7 @@
+ #include "SIO/Pad/Pad.h"
+ #include "SIO/Sio.h"
+ #include "PINE.h"
++#include "EmuCapFrameOperation.h"
+ #include "VMManager.h"
+ #include "Counters.h"
+ #include "common/Error.h"
+@@ -211,6 +212,12 @@
+ 		MsgEmuCapPacing = 0x95, /**< Returns the agent pacing readback and the frame counter. */
+ 		MsgEmuCapSetPacing = 0x96, /**< Sets a percent of the guest rate, or 0 for unlimited. */
+ 		MsgEmuCapMemoryBatch = 0x97, /**< One frozen EE RAM acquisition. */
++		MsgEmuCapFrameProtocol = 0x98,
++		MsgEmuCapFrameBegin = 0x99,
++		MsgEmuCapFramePoll = 0x9A,
++		MsgEmuCapFrameCancel = 0x9B,
++		MsgEmuCapFrameFinish = 0x9C,
++		MsgEmuCapOwnedPause = 0x9D,
+ 		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+ 	};
+ 
+@@ -298,7 +305,9 @@
+ 	template <typename T>
+ 	static T FromSpan(std::span<u8> span, int i)
+ 	{
+-		return *(T*)(&span[i]);
++		T value;
++		std::memcpy(&value, &span[i], sizeof(value));
++		return value;
+ 	}
+ 
+ 	/**
+@@ -311,14 +320,70 @@
+ 				 (reply_len + reply_size) >= MAX_IPC_RETURN_SIZE);
+ 	}
+ 
++	static EmuCap::FrameOperations s_frame_operations;
++	struct EmuCapFrameHost
++	{
++		EmuCap::FrameOperations::Clock::time_point Now() const { return EmuCap::FrameOperations::Clock::now(); }
++		bool Valid() const { return VMManager::HasValidVM(); }
++		bool Paused() const { return VMManager::GetState() == VMState::Paused; }
++		bool Running() const { return VMManager::GetState() == VMState::Running; }
++		bool Parked() const { return VMManager::IsEmucapExecutionParkedOnCPUThread(); }
++		u64 Frame() const { return VMManager::GetEmucapFrameBoundaryCount(); }
++		u64 Epoch() const { return VMManager::GetEmucapMemoryEpoch(); }
++		u32 Remaining() const { return VMManager::GetEmucapFrameAdvanceRemaining(); }
++		void ClearTarget() { VMManager::CancelFrameAdvance(); }
++		void Start(u32 count) { VMManager::FrameAdvance(count); }
++		void Pause() { VMManager::SetPaused(true); }
++	};
++
++	static void ServiceEmuCapFrame(const EmuCap::FrameOperations::Ticket& ticket)
++	{
++		EmuCapFrameHost host;
++		s_frame_operations.Service(host, ticket);
++	}
++
++	void ServiceEmuCapFrameOnCPUThread()
++	{
++		ServiceEmuCapFrame({});
++	}
++
++	void InvalidateEmuCapFrameOnCPUThread()
++	{
++		s_frame_operations.Invalidate();
++	}
++
++	static void QueueEmuCapFrameService(const EmuCap::FrameOperations::Ticket& ticket)
++	{
++		Host::RunOnCPUThread([ticket]() { ServiceEmuCapFrame(ticket); }, false);
++	}
++
++	static bool WriteEmuCapFrameReceipt(const EmuCap::FrameOperations::Ticket& ticket,
++		std::vector<u8>& buffer, u32& offset)
++	{
++		EmuCap::FrameReceipt receipt;
++		if (!s_frame_operations.Read(ticket, receipt)) return false;
++		ToResultVector(buffer, receipt.id, offset);
++		ToResultVector(buffer, receipt.generation, offset + 8);
++		ToResultVector(buffer, receipt.start, offset + 16);
++		ToResultVector(buffer, receipt.end, offset + 24);
++		ToResultVector(buffer, receipt.requested, offset + 32);
++		ToResultVector(buffer, receipt.count, offset + 36);
++		ToResultVector(buffer, static_cast<u32>(receipt.phase), offset + 40);
++		ToResultVector(buffer, static_cast<u32>(receipt.reason), offset + 44);
++		offset += 48;
++		return true;
++	}
++
+ 	static void ClearEmuCapState()
+ 	{
++		const auto ticket = s_frame_operations.Detach();
+ 		if (!VMManager::HasValidVM())
+ 		{
+ 			s_emucap_breakpoints.clear();
+ 			return;
+ 		}
+-		Host::RunOnCPUThread([]() {
++		Host::RunOnCPUThread([ticket]() {
++			ServiceEmuCapFrame(ticket);
+ 			for (const EmuCapBreakpoint& breakpoint : s_emucap_breakpoints)
+ 			{
+ 				if (breakpoint.kind == 0)
+@@ -738,7 +803,15 @@
+ 		//        |  return value (VLE)
+ 		//        |  |
+ 		// reply: XX ZZ ZZ ZZ ZZ
+-		switch ((IPCCommand)buf[buf_cnt - 1])
++		const auto command = static_cast<IPCCommand>(buf[buf_cnt - 1]);
++		// The socket remains responsive, but legacy mutations/CPU dispatch cannot
++		// interleave with an owned frame operation or consume its breakpoint hits.
++		if (s_frame_operations.OwnsExecution() && command != MsgEmuCapVersion &&
++			command != MsgStatus && command != MsgEmuCapFrameProtocol &&
++			command != MsgEmuCapFramePoll && command != MsgEmuCapFrameCancel &&
++			command != MsgEmuCapFrameFinish)
++			goto error;
++		switch (command)
+ 		{
+ 			case MsgRead8:
+ 			{
+@@ -963,6 +1036,54 @@
+ 					goto error;
+ 				ToResultVector(ret_buffer, static_cast<u32>(EMUCAP_HOST_API), ret_cnt);
+ 				ret_cnt += 4;
++				break;
++			}
++			case MsgEmuCapFrameProtocol:
++			{
++				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16, buf_size)) goto error;
++				ToResultVector(ret_buffer, 1u, ret_cnt); // extension revision
++				ToResultVector(ret_buffer, 1u, ret_cnt + 4); // CPU VSync-start domain
++				ToResultVector(ret_buffer, 5000u, ret_cnt + 8);
++				ToResultVector(ret_buffer, 250000u, ret_cnt + 12);
++				ret_cnt += 16;
++				break;
++			}
++			case MsgEmuCapOwnedPause:
++			{
++				if (!SafetyChecks(buf_cnt, 4, ret_cnt, 48, buf_size)) goto error;
++				const auto ticket = s_frame_operations.BeginPause(FromSpan<u32>(buf, buf_cnt),
++					EmuCap::FrameOperations::Clock::now());
++				buf_cnt += 4;
++				if (!ticket) goto error;
++				QueueEmuCapFrameService(ticket);
++				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
++				break;
++			}
++			case MsgEmuCapFrameBegin:
++			{
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 48, buf_size)) goto error;
++				const auto ticket = s_frame_operations.Begin(FromSpan<u32>(buf, buf_cnt),
++					FromSpan<u32>(buf, buf_cnt + 4), EmuCap::FrameOperations::Clock::now());
++				buf_cnt += 8;
++				if (!ticket) goto error;
++				QueueEmuCapFrameService(ticket);
++				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
++				break;
++			}
++			case MsgEmuCapFramePoll:
++			case MsgEmuCapFrameCancel:
++			case MsgEmuCapFrameFinish:
++			{
++				if (!SafetyChecks(buf_cnt, 8, ret_cnt, 48, buf_size)) goto error;
++				const auto ticket = s_frame_operations.Find(FromSpan<u64>(buf, buf_cnt));
++				buf_cnt += 8;
++				if (!ticket) goto error;
++				if (command == MsgEmuCapFrameCancel && !s_frame_operations.Cancel(ticket)) goto error;
++				if (command == MsgEmuCapFrameFinish && !s_frame_operations.Finish(ticket)) goto error;
++				// Polling is read-only. Native scheduler ticks settle progress/deadlines
++				// even when the client stops sending queries.
++				if (command != MsgEmuCapFramePoll) QueueEmuCapFrameService(ticket);
++				if (!WriteEmuCapFrameReceipt(ticket, ret_buffer, ret_cnt)) goto error;
+ 				break;
+ 			}
+ 			case MsgEmuCapPause:
+--- a/pcsx2/PINE.h
++++ b/pcsx2/PINE.h
+@@ -14,6 +14,9 @@
+ 
+ namespace PINEServer
+ {
++	void ServiceEmuCapFrameOnCPUThread();
++	void InvalidateEmuCapFrameOnCPUThread();
++
+ 	bool IsInitialized();
+ 	int GetSlot();
+ 
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -181,6 +181,7 @@
+ static std::string s_elf_override;
+ static std::string s_input_profile_name;
+ static u32 s_frame_advance_count = 0;
++static u64 s_emucap_frame_boundary_count = 0;
+ static bool s_fast_boot_requested = false;
+ static bool s_gs_open_on_initialize = false;
+ static bool s_thread_affinities_set = false;
+@@ -1335,6 +1336,7 @@
+ 	// (or make it thread-local, but that seems silly.)
+ 	Host::CancelGameListRefresh();
+ 
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	s_state.store(VMState::Initializing, std::memory_order_release);
+ 	s_vm_thread_handle = Threading::ThreadHandle::GetForCallingThread();
+ 	Host::OnVMStarting();
+@@ -1625,6 +1627,7 @@
+ 
+ void VMManager::Shutdown(bool save_resume_state)
+ {
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	// we'll probably already be stopping (this is how Qt calls shutdown),
+ 	// but just in case, so any of the stuff we call here knows we don't have a valid VM.
+ 	s_state.store(VMState::Stopping, std::memory_order_release);
+@@ -1722,6 +1725,7 @@
+ 
+ void VMManager::Reset(bool force)
+ {
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	++s_emucap_memory_epoch;
+ 	pxAssert(HasValidVM());
+ 
+@@ -1855,6 +1859,7 @@
+ 
+ bool VMManager::DoLoadState(const char* filename, Error* error)
+ {
++	PINEServer::InvalidateEmuCapFrameOnCPUThread();
+ 	++s_emucap_memory_epoch;
+ 	if (GSDumpReplayer::IsReplayingDump())
+ 	{
+@@ -2284,6 +2289,7 @@
+ 			break;
+ 		Threading::Sleep(static_cast<int>(std::min<s64>(msec - 1, 10)));
+ 		Host::PumpMessagesOnCPUThread();
++		PINEServer::ServiceEmuCapFrameOnCPUThread();
+ 		if (IsExecutionInterrupted() || s_limiter_restarted)
+ 			return;
+ 	}
+@@ -2302,6 +2308,9 @@
+ {
+ 	UpdateTargetSpeed();
+ }
++
++u64 VMManager::GetEmucapFrameBoundaryCount() { return s_emucap_frame_boundary_count; }
++u32 VMManager::GetEmucapFrameAdvanceRemaining() { return s_frame_advance_count; }
+ 
+ u32 VMManager::CancelFrameAdvance()
+ {
+@@ -2754,6 +2763,10 @@
+ 
+ void VMManager::Execute()
+ {
++	// Qt processes queued CPU commands after selecting its Running branch.
++	// A command may have parked the VM before this stale branch reaches Execute.
++	if (GetState() != VMState::Running)
++		return;
+ 	++s_emucap_execution_depth;
+ 	ScopedGuard emucap_execution = [] { --s_emucap_execution_depth; };
+ 	// Check for interpreter<->recompiler switches.
+@@ -2765,12 +2778,16 @@
+ 		vtlb_ResetFastmem();
+ 	}
+ 
+-	// Execute until we're asked to stop.
+-	Cpu->Execute();
++	// Execute until we're asked to stop; setup callbacks may also have paused.
++	if (GetState() == VMState::Running)
++		Cpu->Execute();
++	emucap_execution.Run();
++	PINEServer::ServiceEmuCapFrameOnCPUThread();
+ }
+ 
+ void VMManager::IdlePollUpdate()
+ {
++	PINEServer::ServiceEmuCapFrameOnCPUThread();
+ 	Achievements::IdleUpdate();
+ 
+ 	PollDiscordPresence();
+@@ -2909,6 +2926,7 @@
+ 
+ void VMManager::Internal::VSyncOnCPUThread()
+ {
++	++s_emucap_frame_boundary_count;
+ 	Pad::UpdateMacroButtons();
+ 
+ 	Patch::ApplyVsyncPatches();
+@@ -2932,6 +2950,7 @@
+ 
+ void VMManager::Internal::PollInputOnCPUThread()
+ {
++	PINEServer::ServiceEmuCapFrameOnCPUThread();
+ 	Host::PumpMessagesOnCPUThread();
+ 	InputManager::PollSources();
+ 
+--- a/pcsx2/VMManager.h
++++ b/pcsx2/VMManager.h
+@@ -216,6 +216,9 @@
+ 
+ 	/// Runs the virtual machine for the specified number of video frames, and then automatically pauses.
+ 	// CPU-thread only. Discard pending advance so later resume cannot consume stale work.
++	// CPU-thread-only VSync-start clock and active target progress.
++	u64 GetEmucapFrameBoundaryCount();
++	u32 GetEmucapFrameAdvanceRemaining();
+ 	u32 CancelFrameAdvance();
+ 	void FrameAdvance(u32 num_frames = 1);
+ 
+--- /dev/null
++++ b/pcsx2/EmuCapFrameOperation.h
+@@ -0,0 +1,256 @@
++// SPDX-License-Identifier: GPL-3.0+
++#pragma once
++
++#include <chrono>
++#include <cstdint>
++#include <limits>
++#include <memory>
++#include <mutex>
++
++// PINE exchanges copy receipts under the mutex; only Service() calls the CPU host.
++// No host call holds the mutex, so a stalled CPU/GS cannot stall a receipt query.
++namespace EmuCap
++{
++enum class FramePhase : uint32_t { Queued, Running, Stopping, Terminal, Finishing, Finished, Fault };
++enum class FrameReason : uint32_t { Completed, Cancelled, Deadline, ExternalStop, Rejected, Invalidated, CounterMismatch };
++struct FrameReceipt
++{
++	uint64_t id = 0, generation = 0, start = 0, end = 0;
++	uint32_t requested = 0, count = 0;
++	FramePhase phase = FramePhase::Queued;
++	FrameReason reason = FrameReason::Completed;
++};
++
++class FrameOperations
++{
++public:
++	using Clock = std::chrono::steady_clock;
++	struct Record
++	{
++		FrameReceipt receipt;
++		Clock::time_point deadline;
++		uint64_t terminal_epoch = 0;
++		bool cancel = false, detached = false, pause_only = false;
++	};
++	using Ticket = std::shared_ptr<Record>;
++
++	Ticket Begin(uint32_t count, uint32_t budget_ms, Clock::time_point now)
++	{
++		return Reserve(count, budget_ms, now, false);
++	}
++
++	Ticket BeginPause(uint32_t budget_ms, Clock::time_point now)
++	{
++		return Reserve(0, budget_ms, now, true);
++	}
++
++private:
++	Ticket Reserve(uint32_t count, uint32_t budget_ms, Clock::time_point now, bool pause_only)
++	{
++		std::lock_guard lock(m_mutex);
++		if ((!pause_only && !count) || count > 5000 || !budget_ms || budget_ms > 250000 ||
++			(m_current && m_current->receipt.phase != FramePhase::Finished) ||
++			m_next_id == std::numeric_limits<uint64_t>::max())
++			return {};
++		auto ticket = std::make_shared<Record>();
++		ticket->pause_only = pause_only;
++		ticket->receipt.id = ++m_next_id;
++		ticket->receipt.generation = m_generation;
++		ticket->receipt.requested = count;
++		ticket->deadline = now + std::chrono::milliseconds(budget_ms);
++		m_current = ticket;
++		return ticket;
++	}
++
++public:
++	Ticket Find(uint64_t id)
++	{
++		std::lock_guard lock(m_mutex);
++		return m_current && m_current->receipt.id == id ? m_current : Ticket{};
++	}
++
++	bool Read(const Ticket& ticket, FrameReceipt& receipt)
++	{
++		std::lock_guard lock(m_mutex);
++		if (!ticket || ticket != m_current) return false;
++		receipt = ticket->receipt;
++		return true;
++	}
++
++	bool Cancel(const Ticket& ticket)
++	{
++		std::lock_guard lock(m_mutex);
++		if (!ticket || ticket != m_current) return false;
++		ticket->cancel = true;
++		return true;
++	}
++
++	bool Finish(const Ticket& ticket)
++	{
++		std::lock_guard lock(m_mutex);
++		if (!ticket || ticket != m_current) return false;
++		auto& phase = ticket->receipt.phase;
++		if (phase == FramePhase::Terminal) phase = FramePhase::Finishing;
++		return phase == FramePhase::Finishing || phase == FramePhase::Finished;
++	}
++
++	bool OwnsExecution()
++	{
++		std::lock_guard lock(m_mutex);
++		return m_current && m_current->receipt.phase != FramePhase::Finished;
++	}
++
++	Ticket Detach()
++	{
++		std::lock_guard lock(m_mutex);
++		if (m_current) { m_current->cancel = true; m_current->detached = true; }
++		return m_current;
++	}
++
++	// Called on the CPU thread before reset/load/shutdown/initialization mutates a VM.
++	void Invalidate()
++	{
++		std::lock_guard lock(m_mutex);
++		++m_generation;
++		if (m_current && m_current->receipt.phase != FramePhase::Finished)
++		{
++			m_current->receipt.phase = FramePhase::Fault;
++			m_current->receipt.reason = FrameReason::Invalidated;
++		}
++	}
++
++	// CPU thread only. An empty expected ticket is used by native scheduler ticks.
++	// Queued callbacks always supply their original ticket, never a bare "current".
++	template <class Host>
++	void Service(Host& host, const Ticket& expected = {})
++	{
++		if (m_servicing) return;
++		Ticket ticket;
++		FrameReceipt receipt;
++		bool cancel, detached, pause_only;
++		Clock::time_point deadline;
++		uint64_t terminal_epoch;
++		{
++			std::lock_guard lock(m_mutex);
++			ticket = m_current;
++			if (!ticket || (expected && expected != ticket)) return;
++			receipt = ticket->receipt;
++			cancel = ticket->cancel; detached = ticket->detached; pause_only = ticket->pause_only;
++			deadline = ticket->deadline; terminal_epoch = ticket->terminal_epoch;
++		}
++		if (receipt.phase == FramePhase::Fault) return;
++		if (receipt.phase == FramePhase::Finished)
++		{
++			if (detached) { std::lock_guard lock(m_mutex); if (ticket == m_current) m_current.reset(); }
++			return;
++		}
++		m_servicing = true;
++		{
++			auto fault = [&](FrameReason reason) { receipt.phase = FramePhase::Fault; receipt.reason = reason; };
++			if (!host.Valid()) fault(FrameReason::Invalidated);
++			else if (receipt.phase == FramePhase::Finishing ||
++				(detached && receipt.phase == FramePhase::Terminal))
++			{
++				if (!host.Parked() || host.Frame() != receipt.end || host.Epoch() != terminal_epoch)
++					fault(FrameReason::Invalidated);
++				else receipt.phase = FramePhase::Finished;
++			}
++			else if (receipt.phase == FramePhase::Queued)
++			{
++				if (pause_only)
++				{
++					// Cleanup does not manufacture a zero-frame advance. It owns a
++					// pause and samples its clock only after execution has unwound.
++					if (host.Now() >= deadline) fault(FrameReason::Deadline);
++					else
++					{
++						if (host.Running()) host.Pause();
++						if (host.Parked())
++						{
++							host.ClearTarget();
++							receipt.start = receipt.end = host.Frame();
++							receipt.phase = FramePhase::Terminal;
++							terminal_epoch = host.Epoch();
++						}
++					}
++				}
++				else if (!host.Paused()) fault(FrameReason::Rejected);
++				else if (host.Parked())
++				{
++					receipt.start = receipt.end = host.Frame();
++					if (cancel || host.Now() >= deadline)
++					{
++						receipt.phase = FramePhase::Terminal;
++						receipt.reason = cancel ? FrameReason::Cancelled : FrameReason::Deadline;
++						terminal_epoch = host.Epoch();
++					}
++					else
++					{
++						host.ClearTarget();
++						host.Start(receipt.requested);
++						if (!host.Running()) fault(FrameReason::Rejected);
++						else receipt.phase = FramePhase::Running;
++					}
++				}
++			}
++			else if (receipt.phase == FramePhase::Running || receipt.phase == FramePhase::Stopping)
++			{
++				const uint64_t end = host.Frame();
++				const uint32_t remaining = host.Remaining();
++				if (end < receipt.start || end - receipt.start > receipt.requested ||
++					remaining > receipt.requested || end - receipt.start != receipt.requested - remaining)
++					fault(FrameReason::CounterMismatch);
++				else
++				{
++					receipt.end = end;
++					receipt.count = static_cast<uint32_t>(end - receipt.start);
++					if (host.Running() && (cancel || host.Now() >= deadline))
++					{
++						receipt.phase = FramePhase::Stopping;
++						receipt.reason = cancel ? FrameReason::Cancelled : FrameReason::Deadline;
++						host.Pause();
++					}
++					if (host.Parked())
++					{
++						host.ClearTarget();
++						if (receipt.count == receipt.requested) receipt.reason = FrameReason::Completed;
++						else if (receipt.phase != FramePhase::Stopping) receipt.reason = FrameReason::ExternalStop;
++						receipt.phase = FramePhase::Terminal;
++						terminal_epoch = host.Epoch();
++					}
++				}
++			}
++			// Disconnect has no caller left to request finish. Settle it at this
++			// verified boundary; a paused Qt loop need not schedule another tick.
++			{ std::lock_guard lock(m_mutex); detached = ticket->detached; }
++			if (detached && receipt.phase == FramePhase::Terminal)
++			{
++				if (!host.Parked() || host.Frame() != receipt.end || host.Epoch() != terminal_epoch)
++					fault(FrameReason::Invalidated);
++				else receipt.phase = FramePhase::Finished;
++			}
++			{
++				std::lock_guard lock(m_mutex);
++				// Lifecycle hooks may have invalidated the record inside a host call.
++				if (ticket == m_current && receipt.generation == m_generation &&
++					ticket->receipt.phase != FramePhase::Fault)
++				{
++					// A concurrent Finish request cannot be overwritten by a terminal poll.
++					if (ticket->receipt.phase == FramePhase::Finishing && receipt.phase == FramePhase::Terminal)
++						receipt.phase = FramePhase::Finishing;
++					ticket->receipt = receipt;
++					ticket->terminal_epoch = terminal_epoch;
++					if (ticket->detached && receipt.phase == FramePhase::Finished) m_current.reset();
++				}
++			}
++		}
++		m_servicing = false;
++	}
++
++private:
++	std::mutex m_mutex;
++	Ticket m_current;
++	uint64_t m_next_id = 0, m_generation = 1;
++	bool m_servicing = false; // CPU thread only.
++};
++} // namespace EmuCap

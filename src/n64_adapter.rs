@@ -28,14 +28,18 @@ mod lifecycle;
 mod observation;
 #[path = "n64_adapter_prepare.rs"]
 mod prepare;
+#[path = "n64_adapter_temporal_owner.rs"]
+mod temporal_owner;
 
 #[cfg(test)]
 use frame::wait_frame_gate;
 use frame::{
     arm_frame_gate, cancel_frame_gate, frame_gate_is_blocked, release_frame_gate, reset_frame_gate,
-    wait_frame_gate_or_debug_update, FrameGateTrigger, FrameWaitOutcome,
+    validate_observed_frame, wait_frame_gate_or_debug_update, FrameGateTrigger, FrameWaitOutcome,
 };
-use library::{cstr, load_api, open_library, path_cstring, platform_library, symbol};
+use library::{
+    close_library, cstr, load_api, open_library, path_cstring, platform_library, symbol,
+};
 use lifecycle::{
     current_readiness, debug_init_callback, debug_log_callback, debug_update_callback,
     debug_vi_callback, reset_observation_state, state_callback,
@@ -168,6 +172,7 @@ type DebugGetState = unsafe extern "C" fn(c_int) -> c_int;
 type DebugStep = unsafe extern "C" fn() -> c_int;
 type DebugGetCpuDataPtr = unsafe extern "C" fn(c_int) -> *mut c_void;
 type DebugMemRead8 = unsafe extern "C" fn(u32) -> u8;
+type DebugMemReadRdram = unsafe extern "C" fn(u32, *mut u8, u32) -> c_int;
 type DebugMemWrite8 = unsafe extern "C" fn(u32, u8);
 type DebugBreakpointCommand =
     unsafe extern "C" fn(c_int, u32, *mut debug::NativeBreakpoint) -> c_int;
@@ -195,12 +200,15 @@ struct Api {
     debug_step: DebugStep,
     debug_get_cpu_data_ptr: DebugGetCpuDataPtr,
     debug_mem_read8: DebugMemRead8,
+    debug_mem_read_rdram: DebugMemReadRdram,
     debug_mem_write8: DebugMemWrite8,
     debug_breakpoint_command: DebugBreakpointCommand,
     debug_breakpoint_lookup: DebugBreakpointLookup,
     debug_breakpoint_consume: DebugBreakpointConsume,
     debug_decode_op: DebugDecodeOp,
     debug_frame_resume: unsafe extern "C" fn(),
+    core_emucap_pacing:
+        unsafe extern "C" fn(u32, u32, i32, *mut observation::NativePacingResult, u32) -> c_int,
 }
 
 unsafe impl Send for Api {}
@@ -212,6 +220,10 @@ pub enum N64Error {
     BadParams(String),
     #[error("{0}")]
     BadState(String),
+    #[error("another parent operation owns native control")]
+    Busy,
+    #[error("operation cancelled")]
+    Cancelled,
     #[error("unsupported N64 method: {0}")]
     Unsupported(String),
     #[error("Mupen64Plus {operation} failed with error {code}")]
@@ -249,6 +261,8 @@ pub struct Mupen64PlusHost {
     display: bool,
     frozen: bool,
     frame_paused: bool,
+    request_cancellation: crate::live::link::RequestCancellation,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
     frame_clock_synchronized: bool,
     held_buttons: BTreeSet<String>,
     breakpoints: BTreeMap<u64, debug::PublicBreakpoint>,
@@ -305,6 +319,17 @@ impl Mupen64PlusHost {
         EXECUTION_TERMINAL
             .load(Ordering::Acquire)
             .then(|| "Mupen64Plus execution terminated".to_string())
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        request: Request,
+        cancellation: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = cancellation;
+        let response = self.handle_request(request);
+        self.request_cancellation = Default::default();
+        response
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {
@@ -627,6 +652,8 @@ impl Mupen64PlusHost {
                     "breakpoint_id":event["id"],
                     "event":event,
                     "unit":"instructions",
+                    "count":expected,
+                    "requested":count,
                     "completed":expected,
                     "state":"frozen",
                 }));
@@ -677,12 +704,20 @@ impl Mupen64PlusHost {
         let mut frame_before_verified = self.frame_clock_synchronized;
         let mut current_frame = frame_before;
         for index in 0..count {
+            if self.request_cancellation.is_cancelled() {
+                // Entry is a verified frozen boundary, or the previous iteration's held gate.
+                self.frozen = true;
+                return Ok(
+                    json!({"status":"interrupted", "reason":"cancelled", "unit":"frames",
+                    "count":index,"requested":count,"completed":index,"frame":self.public_frame(),"state":"frozen"}),
+                );
+            }
             // A paced advance stops at the reached frame once its host budget is spent.
             if index > 0 && deadline.remaining_timeout().is_none() {
                 self.frozen = true;
                 return Ok(json!({
                     "status": "interrupted", "reason": "host_deadline", "unit": "frames",
-                    "count": count, "completed": index, "cpu": "r4300",
+                    "count": index, "requested": count, "completed": index, "cpu": "r4300",
                     "frame": current_frame, "state": "frozen",
                 }));
             }
@@ -727,8 +762,63 @@ impl Mupen64PlusHost {
                         return Err(error);
                     }
                 };
-            let observed = match wait_frame_gate_or_debug_update(timeout, debug_before) {
+            let observed = match wait_frame_gate_or_debug_update(
+                timeout,
+                debug_before,
+                Some(&self.request_cancellation),
+            ) {
                 Ok(FrameWaitOutcome::Frame(observed)) => observed,
+                Ok(FrameWaitOutcome::Cancelled) => {
+                    let stopped = frame::park_after_cancellation(
+                        debug_before, RECOVERY_DEADLINE,
+                        || check_core("DebugSetRunState(cancellation)", unsafe {
+                            (self.api.debug_set_run_state)(M64P_DBG_RUNSTATE_PAUSED)
+                        }),
+                        || unsafe { (self.api.debug_get_state)(M64P_DBG_RUN_STATE) }
+                            == M64P_DBG_RUNSTATE_PAUSED,
+                    );
+                    let completed = match stopped {
+                        Ok(FrameWaitOutcome::Frame(observed)) => {
+                            if let Err(error) = validate_observed_frame(
+                                trigger,
+                                observed_before_verified,
+                                observed_before,
+                                observed,
+                            ) {
+                                return Err(self.stop_generation_with_unresolved_effect(
+                                    "cancel frame step",
+                                    &error,
+                                ));
+                            }
+                            self.frame_paused = true;
+                            self.frame_clock_synchronized = true;
+                            index + 1
+                        }
+                        Ok(FrameWaitOutcome::DebugUpdate(_)) => {
+                            self.frame_paused = false;
+                            index
+                        }
+                        Ok(FrameWaitOutcome::Cancelled) => {
+                            unreachable!("stop verification never reports intent")
+                        }
+                        Err(error) => {
+                            return Err(self.stop_generation_with_unresolved_effect(
+                                "cancel frame step",
+                                &error,
+                            ))
+                        }
+                    };
+                    self.frozen = true;
+                    if let Err(error) = self.drain_debug_update() {
+                        return Err(self.stop_generation_with_unresolved_effect(
+                            "cancel frame step events",
+                            &error,
+                        ));
+                    }
+                    return Ok(json!({"status":"interrupted", "reason":"cancelled",
+                        "unit":"frames", "count":completed, "requested":count, "completed":completed,
+                        "frame":self.public_frame(), "state":"frozen"}));
+                }
                 Ok(FrameWaitOutcome::DebugUpdate(update)) => {
                     cancel_frame_gate();
                     if let Some(event) = self.drain_debug_update()? {
@@ -740,6 +830,8 @@ impl Mupen64PlusHost {
                             "breakpoint_id":event["id"],
                             "event":event,
                             "unit":"frames",
+                            "count":index,
+                            "requested":count,
                             "completed":index,
                             "state":"frozen",
                         }));
@@ -759,7 +851,7 @@ impl Mupen64PlusHost {
                     if deadline.expired() {
                         return Ok(json!({
                             "status": "interrupted", "reason": "host_deadline", "unit": "frames",
-                            "count": count, "completed": index, "cpu": "r4300",
+                            "count": index, "requested": count, "completed": index, "cpu": "r4300",
                             "frame": FRAME_COUNT.load(Ordering::Acquire), "state": "frozen",
                         }));
                     }
@@ -840,11 +932,8 @@ impl Mupen64PlusHost {
             )));
         }
         let offset = required_num(params, "address")?;
-        let address = rdram_address(params, length)?;
-        let mut data = Vec::with_capacity(length as usize);
-        for index in 0..length {
-            data.push(unsafe { (self.api.debug_mem_read8)((address + index) as u32) });
-        }
+        rdram_address(params, length)?;
+        let data = self.read_rdram_bytes(offset, length)?;
         Ok(json!({"address":offset, "length":length, "hex":hex::encode(data)}))
     }
 
@@ -1075,33 +1164,12 @@ fn remaining_step_timeout(
         .ok_or(N64Error::Timeout(operation))
 }
 
-fn validate_observed_frame(
-    trigger: FrameGateTrigger,
-    observed_before_verified: bool,
-    observed_before: u64,
-    observed: u64,
-) -> N64Result<()> {
-    if trigger == FrameGateTrigger::NextFrame
-        && observed_before_verified
-        && observed != observed_before + 1
-    {
-        return Err(N64Error::BadState(format!(
-            "N64 frame step mismatch: expected {}, observed {observed}",
-            observed_before + 1
-        )));
-    }
-    if observed_before_verified && observed <= observed_before {
-        return Err(N64Error::BadState(format!(
-            "N64 frame boundary did not advance: before {observed_before}, observed {observed}"
-        )));
-    }
-    Ok(())
-}
-
 fn error_kind(error: &N64Error) -> &'static str {
     match error {
         N64Error::BadParams(_) => "bad_params",
         N64Error::BadState(_) => "bad_state",
+        N64Error::Busy => "busy",
+        N64Error::Cancelled => "cancelled",
         N64Error::Unsupported(_) => "unsupported",
         N64Error::Core { .. } | N64Error::Timeout(_) | N64Error::GenerationStopped { .. } => {
             "emulator_error"
@@ -1110,66 +1178,9 @@ fn error_kind(error: &N64Error) -> &'static str {
     }
 }
 
-fn parse_num(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(value) => value.as_u64(),
-        Value::String(value) => {
-            let value = value.trim();
-            if let Some(value) = value.strip_prefix("0x").or_else(|| value.strip_prefix('$')) {
-                u64::from_str_radix(value, 16).ok()
-            } else {
-                value.parse().ok()
-            }
-        }
-        _ => None,
-    }
-}
-
-fn required_num(params: &Value, key: &str) -> N64Result<u64> {
-    params
-        .get(key)
-        .and_then(parse_num)
-        .ok_or_else(|| N64Error::BadParams(format!("missing or invalid param: {key}")))
-}
-
-fn optional_num(params: &Value, key: &str) -> N64Result<Option<u64>> {
-    match params.get(key) {
-        Some(value) => parse_num(value)
-            .map(Some)
-            .ok_or_else(|| N64Error::BadParams(format!("invalid numeric param: {key}"))),
-        None => Ok(None),
-    }
-}
-
-fn rdram_address(params: &Value, length: u64) -> N64Result<u64> {
-    let memory_type = params
-        .get("memory_type")
-        .and_then(Value::as_str)
-        .unwrap_or("rdram");
-    if memory_type != "rdram" {
-        return Err(N64Error::BadParams(format!(
-            "unsupported N64 memory_type: {memory_type}"
-        )));
-    }
-    let offset = required_num(params, "address")?;
-    if !matches!(offset.checked_add(length), Some(end) if end <= RDRAM_SIZE) {
-        return Err(N64Error::BadParams(format!(
-            "rdram access out of range: offset {offset:#x}+{length:#x} exceeds {RDRAM_SIZE:#x}"
-        )));
-    }
-    RDRAM_BASE
-        .checked_add(offset)
-        .ok_or_else(|| N64Error::BadParams("RDRAM address overflow".into()))
-}
-
-fn require_r4300(params: &Value) -> N64Result<()> {
-    match params.get("cpu").and_then(Value::as_str) {
-        None | Some("main" | "r4300" | "maincpu") => Ok(()),
-        Some(cpu) => Err(N64Error::BadParams(format!(
-            "N64 execution control currently supports the R4300 CPU only, got {cpu}"
-        ))),
-    }
-}
+#[path = "n64_adapter_params.rs"]
+mod params;
+use params::*;
 
 #[cfg(test)]
 #[path = "n64_adapter_tests.rs"]

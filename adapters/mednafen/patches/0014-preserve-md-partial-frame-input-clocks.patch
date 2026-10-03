@@ -1,0 +1,14 @@
+--- a/src/md/system.cpp
++++ b/src/md/system.cpp
+@@ -189,7 +189,10 @@
+ 
+  MDFNMP_ApplyPeriodicCheats();
+ 
+- MDIO_BeginTimePeriod(md_timestamp);
++ // A restored partial frame already owns its input-device clock origins.
++ // BeginTimePeriod would discard elapsed handshake time since the last access.
++ if(md_timestamp == 0)
++  MDIO_BeginTimePeriod(0);
+ 
+  MDINPUT_Frame();
+ 

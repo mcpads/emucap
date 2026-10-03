@@ -6,6 +6,19 @@
 
 emucap_build_process_start() {
   local pid="$1"
+  # MSYS2/Cygwin PIDs differ from Windows PIDs, and their ps lacks -o lstart.
+  # Use the native process creation time so PID reuse remains distinguishable.
+  if [ -r "/proc/$pid/winpid" ]; then
+    local winpid ticks
+    winpid="$(tr -d '\r\n' <"/proc/$pid/winpid")"
+    case "$winpid" in ''|*[!0-9]*) return 1 ;; esac
+    ticks="$(powershell.exe -NoLogo -NoProfile -NonInteractive -Command \
+      "(Get-Process -Id $winpid -ErrorAction Stop).StartTime.ToUniversalTime().Ticks" \
+      2>/dev/null | tr -d '\r\n')" || return 1
+    case "$ticks" in ''|*[!0-9]*) return 1 ;; esac
+    printf 'windows:%s:%s\n' "$winpid" "$ticks"
+    return 0
+  fi
   if [ -r "/proc/$pid/stat" ] && [ -r /proc/sys/kernel/random/boot_id ]; then
     local start boot
     start="$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | awk '{print $20}')"

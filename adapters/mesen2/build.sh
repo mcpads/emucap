@@ -117,6 +117,11 @@ PATCHES=(
   "$HERE/patches/0019-preserve-gba-raster-and-lcd-history.patch"
   "$HERE/patches/0020-preserve-gb-raster-and-lcd-history.patch"
   "$HERE/patches/0021-preserve-nes-raster-history.patch"
+  "$HERE/patches/0022-reanchor-pacing-after-native-parks.patch"
+  "$HERE/patches/0023-add-native-control-service-and-progress.patch"
+  "$HERE/patches/0024-preserve-gba-input-observation.patch"
+  "$HERE/patches/0025-fix-windows-native-build.patch"
+  "$HERE/patches/0026-publish-windows-input-devices-before-use.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for patch in "${PATCHES[@]}"; do cat "$patch"; done | shasum -a 256 | awk '{print $1}')"

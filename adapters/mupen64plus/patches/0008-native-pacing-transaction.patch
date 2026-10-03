@@ -1,0 +1,559 @@
+--- a/src/main/main.c
++++ b/src/main/main.c
+@@ -120,9 +120,7 @@
+ /** static (local) variables **/
+ static int   l_CurrentFrame = 0;         // frame counter
+ static int   l_TakeScreenshot = 0;       // Tell OSD Rendering callback to take a screenshot just before drawing the OSD
+-static int   l_SpeedFactor = 100;        // percentage of nominal game speed at which emulator is running
+ static int   l_FrameAdvance = 0;         // variable to check if we pause on next frame
+-static int   l_MainSpeedLimit = 1;       // insert delay during vi_interrupt to keep speed at real-time
+ 
+ static osd_message_t *l_msgVol = NULL;
+ static osd_message_t *l_msgFF = NULL;
+@@ -455,112 +453,201 @@
+     return event_set_core_defaults();
+ }
+ 
+-void main_speeddown(int percent)
+-{
+-    if (netplay_is_init())
+-        return;
+-
+-    if (l_SpeedFactor - percent > 10)  /* 10% minimum speed */
+-    {
+-        l_SpeedFactor -= percent;
+-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "%s %d%%", "Playback speed:", l_SpeedFactor);
+-        audio.setSpeedFactor(l_SpeedFactor);
+-        StateChanged(M64CORE_SPEED_FACTOR, l_SpeedFactor);
+-    }
+-}
+-
+-void main_speedup(int percent)
+-{
+-    if (netplay_is_init())
+-        return;
+-
+-    if (l_SpeedFactor + percent < 300) /* 300% maximum speed */
+-    {
+-        l_SpeedFactor += percent;
+-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "%s %d%%", "Playback speed:", l_SpeedFactor);
+-        audio.setSpeedFactor(l_SpeedFactor);
+-        StateChanged(M64CORE_SPEED_FACTOR, l_SpeedFactor);
+-    }
+-}
++/* Native owner: every policy writer and scheduling reader participates here. */
++static SDL_mutex* l_PacingMutex;
++static m64p_emucap_policy l_Pacing = {100, 1, 0, 0, 0, 0, 1};
++static int l_SavedSpeedFactor = 100;
++/* These mirrors are emulation-thread-only, never part of the policy owner. */
++static int l_AudioSpeedFactor = -1;
++static int l_FastForwardShown = 0;
++
++int main_pacing_init(void)
++{
++    l_PacingMutex = SDL_CreateMutex();
++    if (!l_PacingMutex) return 0;
++    l_Pacing = (m64p_emucap_policy){100, 1, 0, 0, 0, 0, 1};
++    l_SavedSpeedFactor = 100;
++    l_AudioSpeedFactor = -1;
++    l_FastForwardShown = 0;
++    return 1;
++}
++
++void main_pacing_shutdown(void)
++{
++    SDL_DestroyMutex(l_PacingMutex);
++    l_PacingMutex = NULL;
++}
++
++m64p_emucap_policy main_pacing_read(void)
++{
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy policy = l_Pacing;
++    SDL_UnlockMutex(l_PacingMutex);
++    return policy;
++}
++
++static void pacing_advance(const m64p_emucap_policy* previous)
++{
++    if (previous->factor != l_Pacing.factor || previous->limiter != l_Pacing.limiter ||
++        previous->fast_forward != l_Pacing.fast_forward || previous->netplay != l_Pacing.netplay ||
++        previous->netplay_lag != l_Pacing.netplay_lag)
++        ++l_Pacing.revision;
++}
++
++void main_pacing_set_netplay(int active)
++{
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    l_Pacing.netplay = !!active;
++    pacing_advance(&previous);
++    SDL_UnlockMutex(l_PacingMutex);
++}
++
++void main_pacing_set_netplay_lag(int lag)
++{
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    l_Pacing.netplay_lag = !!lag;
++    pacing_advance(&previous);
++    SDL_UnlockMutex(l_PacingMutex);
++}
++
++/* The netplay worker's lag decision and limiter update form one publication. */
++void main_pacing_netplay_limiter(int lag)
++{
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    l_Pacing.netplay_lag = !!lag;
++    l_Pacing.limiter = !lag;
++    pacing_advance(&previous);
++    SDL_UnlockMutex(l_PacingMutex);
++}
++
++m64p_error main_pacing_transaction(uint32_t operation, int32_t percent,
++                                 m64p_emucap_pacing_result* result)
++{
++    if (operation > 1 || percent < 0 || percent > 1000)
++        return M64ERR_INPUT_INVALID;
++    SDL_LockMutex(l_PacingMutex);
++    result->version = 1;
++    result->outcome = 0;
++    result->previous = l_Pacing;
++    if (operation == 1) {
++        if (l_Pacing.netplay) result->outcome = 1;
++        else {
++            /* Cancel saved hotkey state: its later key release must not undo this change. */
++            if (l_Pacing.fast_forward) l_Pacing.factor = l_SavedSpeedFactor;
++            l_Pacing.fast_forward = 0;
++            if (percent) l_Pacing.factor = percent;
++            l_Pacing.limiter = percent != 0;
++            pacing_advance(&result->previous);
++        }
++    }
++    result->applied = l_Pacing;
++    SDL_UnlockMutex(l_PacingMutex);
++    /* immutable event; reentrant observers may publish a later transition */
++    if (result->previous.factor != result->applied.factor)
++        StateChanged(M64CORE_SPEED_FACTOR, result->applied.factor);
++    return M64ERR_SUCCESS;
++}
++
++static void main_speed_adjust(int percent)
++{
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    int64_t next = (int64_t)l_Pacing.factor + percent;
++    if (!l_Pacing.netplay && (percent < 0 ? next > 10 : next < 300)) l_Pacing.factor = (int)next;
++    pacing_advance(&previous);
++    m64p_emucap_policy applied = l_Pacing;
++    SDL_UnlockMutex(l_PacingMutex);
++    if (applied.factor != previous.factor) {
++        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Playback speed: %d%%", applied.factor);
++        StateChanged(M64CORE_SPEED_FACTOR, applied.factor);
++    }
++}
++
++void main_speeddown(int percent) { if (percent > 0) main_speed_adjust(-percent); }
++void main_speedup(int percent) { if (percent > 0) main_speed_adjust(percent); }
+ 
+ static void main_speedset(int percent)
+ {
+-    if (netplay_is_init())
+-        return;
+-
+-    if (percent < 1 || percent > 1000)
+-    {
+-        DebugMessage(M64MSG_WARNING, "Invalid speed setting %i percent", percent);
+-        return;
+-    }
+-    // disable fast-forward if it's enabled
+-    main_set_fastforward(0);
+-    // set speed
+-    l_SpeedFactor = percent;
+-    main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "%s %d%%", "Playback speed:", l_SpeedFactor);
+-    audio.setSpeedFactor(l_SpeedFactor);
+-    StateChanged(M64CORE_SPEED_FACTOR, l_SpeedFactor);
++    if (percent < 1 || percent > 1000) return;
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    if (!l_Pacing.netplay) {
++        l_Pacing.factor = percent;
++        l_Pacing.fast_forward = 0;
++        pacing_advance(&previous);
++    }
++    m64p_emucap_policy applied = l_Pacing;
++    SDL_UnlockMutex(l_PacingMutex);
++    if (applied.factor != previous.factor)
++        StateChanged(M64CORE_SPEED_FACTOR, applied.factor);
+ }
+ 
+ void main_set_fastforward(int enable)
+ {
+-    if (netplay_is_init())
+-        return;
+-
+-    static int ff_state = 0;
+-    static int SavedSpeedFactor = 100;
+-
+-    if (enable && !ff_state)
+-    {
+-        ff_state = 1; /* activate fast-forward */
+-        SavedSpeedFactor = l_SpeedFactor;
+-        l_SpeedFactor = 250;
+-        audio.setSpeedFactor(l_SpeedFactor);
+-        StateChanged(M64CORE_SPEED_FACTOR, l_SpeedFactor);
+-        // set fast-forward indicator
+-        l_msgFF = osd_new_message(OSD_TOP_RIGHT, "Fast Forward");
+-        osd_message_set_static(l_msgFF);
+-        osd_message_set_user_managed(l_msgFF);
+-    }
+-    else if (!enable && ff_state)
+-    {
+-        ff_state = 0; /* de-activate fast-forward */
+-        l_SpeedFactor = SavedSpeedFactor;
+-        audio.setSpeedFactor(l_SpeedFactor);
+-        StateChanged(M64CORE_SPEED_FACTOR, l_SpeedFactor);
+-        // remove message
+-        osd_delete_message(l_msgFF);
+-        l_msgFF = NULL;
+-    }
+-
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    if (!l_Pacing.netplay && !!enable != l_Pacing.fast_forward) {
++        if (enable) { l_SavedSpeedFactor = l_Pacing.factor; l_Pacing.factor = 250; }
++        else l_Pacing.factor = l_SavedSpeedFactor;
++        l_Pacing.fast_forward = !!enable;
++        pacing_advance(&previous);
++    }
++    m64p_emucap_policy applied = l_Pacing;
++    SDL_UnlockMutex(l_PacingMutex);
++    if (applied.factor != previous.factor)
++        StateChanged(M64CORE_SPEED_FACTOR, applied.factor);
+ }
+ 
+ static void main_set_speedlimiter(int enable)
+ {
+-    if (netplay_is_init() && !netplay_lag())
+-        return;
+-
+-    l_MainSpeedLimit = enable ? 1 : 0;
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    if (!l_Pacing.netplay || l_Pacing.netplay_lag) l_Pacing.limiter = !!enable;
++    pacing_advance(&previous);
++    SDL_UnlockMutex(l_PacingMutex);
+ }
+ 
+ void main_speedlimiter_toggle(void)
+ {
+-    if (netplay_is_init())
+-        return;
+-
+-    l_MainSpeedLimit = !l_MainSpeedLimit;
+-    main_set_speedlimiter(l_MainSpeedLimit);
+-
+-    if (l_MainSpeedLimit) /* fix naturally occuring audio desync */
+-    {
+-        main_toggle_pause();
+-        SDL_Delay(1000);
+-        main_toggle_pause();
+-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Speed limiter enabled");
+-    }
+-
+-    else
+-        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Speed limiter disabled");
++    SDL_LockMutex(l_PacingMutex);
++    m64p_emucap_policy previous = l_Pacing;
++    if (!l_Pacing.netplay) l_Pacing.limiter = !l_Pacing.limiter;
++    pacing_advance(&previous);
++    m64p_emucap_policy applied = l_Pacing;
++    SDL_UnlockMutex(l_PacingMutex);
++    if (applied.limiter != previous.limiter) {
++        /* Preserve the native hotkey's audio resync outside the policy owner. */
++        if (applied.limiter) {
++            main_toggle_pause();
++            SDL_Delay(1000);
++            main_toggle_pause();
++        }
++        main_message(M64MSG_STATUS, OSD_BOTTOM_LEFT, "Speed limiter %s", applied.limiter ? "enabled" : "disabled");
++    }
++}
++
++/* Called only by the emulation thread, with no owner lock around plugin/OSD calls. */
++static void main_pacing_service(void)
++{
++    m64p_emucap_policy policy = main_pacing_read();
++    if (policy.factor != l_AudioSpeedFactor) {
++        audio.setSpeedFactor(policy.factor);
++        l_AudioSpeedFactor = policy.factor;
++    }
++    if (policy.fast_forward != l_FastForwardShown) {
++        if (policy.fast_forward) {
++            l_msgFF = osd_new_message(OSD_TOP_RIGHT, "Fast Forward");
++            osd_message_set_static(l_msgFF);
++            osd_message_set_user_managed(l_msgFF);
++        } else {
++            osd_delete_message(l_msgFF);
++            l_msgFF = NULL;
++        }
++        l_FastForwardShown = policy.fast_forward;
++    }
+ }
+ 
+ static int main_is_paused(void)
+@@ -703,10 +790,10 @@
+             *rval = savestates_get_slot();
+             break;
+         case M64CORE_SPEED_FACTOR:
+-            *rval = l_SpeedFactor;
++            *rval = main_pacing_read().factor;
+             break;
+         case M64CORE_SPEED_LIMITER:
+-            *rval = l_MainSpeedLimit;
++            *rval = main_pacing_read().limiter;
+             break;
+         case M64CORE_VIDEO_SIZE:
+         {
+@@ -962,13 +1049,14 @@
+ }
+ 
+ /* emucap: a debugger or core pause, a disabled limiter or a speed change ends a limiter wait. */
+-static int emucap_limiter_wait_interrupted(int speed_factor)
++static int emucap_limiter_wait_interrupted(uint64_t revision)
+ {
+ #ifdef DBG
+     if (g_DebuggerActive && g_dbg_runstate == M64P_DBG_RUNSTATE_PAUSED)
+         return 1;
+ #endif
+-    return g_rom_pause || !l_MainSpeedLimit || l_SpeedFactor != speed_factor;
++    m64p_emucap_policy policy = main_pacing_read();
++    return g_rom_pause || !policy.limiter || policy.revision != revision;
+ }
+ 
+ /* Emulation-thread owned: discard only elapsed halted host time. */
+@@ -982,6 +1070,8 @@
+ 
+ static void apply_speed_limiter(void)
+ {
++    const m64p_emucap_policy policy = main_pacing_read();
++    static uint64_t lastPolicyRevision = 0;
+     static unsigned long totalVIs = 0;
+     static int resetOnce = 0;
+     static int lastSpeedFactor = 100;
+@@ -991,11 +1081,11 @@
+ 
+     // calculate frame duration based upon ROM setting (50/60hz) and mupen64plus speed adjustment
+     const double VILimitMilliseconds = 1000.0 / g_dev.vi.expected_refresh_rate;
+-    const double SpeedFactorMultiple = defaultSpeedFactor/l_SpeedFactor;
++    const double SpeedFactorMultiple = defaultSpeedFactor/policy.factor;
+     const double AdjustedLimit = VILimitMilliseconds * SpeedFactorMultiple;
+ 
+     //if this is the first time or we are resuming from pause
+-    if(StartFPSTime == 0 || !resetOnce || l_SpeedLimiterReset || lastSpeedFactor != l_SpeedFactor)
++    if(StartFPSTime == 0 || !resetOnce || l_SpeedLimiterReset || lastSpeedFactor != policy.factor || lastPolicyRevision != policy.revision)
+     {
+        StartFPSTime = l_SpeedLimiterReset ? l_SpeedLimiterResumeTime : CurrentFPSTime;
+        totalVIs = l_SpeedLimiterReset ? 1 : 0;
+@@ -1007,7 +1097,8 @@
+         ++totalVIs;
+     }
+ 
+-    lastSpeedFactor = l_SpeedFactor;
++    lastSpeedFactor = policy.factor;
++    lastPolicyRevision = policy.revision;
+ 
+ #if defined(PROFILE)
+     timed_section_start(TIMED_SECTION_IDLE);
+@@ -1031,13 +1122,13 @@
+ 
+     /* resetOnce discards the old VI anchor on the next call. */
+ 
+-    if(l_MainSpeedLimit && sleepTime > 0 && sleepTime < maxSleepNeeded*SpeedFactorMultiple)
++    if(policy.limiter && sleepTime > 0 && sleepTime < maxSleepNeeded*SpeedFactorMultiple)
+     {
+         while(sleepTime >= 0) {
+             /* emucap: sleep in slices of at most 10 ms so control is not held behind a long
+              * wait at a slow speed. */
+             SDL_Delay((unsigned int) (sleepTime < 10 ? sleepTime : 10));
+-            if (emucap_limiter_wait_interrupted(lastSpeedFactor)) {
++            if (emucap_limiter_wait_interrupted(lastPolicyRevision)) {
+                 resetOnce = 0;
+                 break;
+             }
+@@ -1096,6 +1187,7 @@
+ 
+     gs_apply_cheats(&g_cheat_ctx);
+ 
++    main_pacing_service();
+     apply_speed_limiter();
+     main_check_inputs();
+ 
+--- a/src/main/main.h
++++ b/src/main/main.h
+@@ -26,6 +26,7 @@
+ #include <stdint.h>
+ 
+ #include "api/m64p_types.h"
++#include "api/m64p_emucap_pacing.h"
+ #include "main/cheat.h"
+ #include "device/device.h"
+ #include "osal/preproc.h"
+@@ -105,5 +106,15 @@
+ m64p_error open_pif(const unsigned char* pifimage, unsigned int size);
+ m64p_error close_pif(void);
+ 
++
++
++
++/* Core lifetime and native pacing owner. No callbacks while its mutex is held. */
++int main_pacing_init(void);
++void main_pacing_shutdown(void);
++m64p_error main_pacing_transaction(uint32_t, int32_t, m64p_emucap_pacing_result*);
++m64p_emucap_policy main_pacing_read(void);
++void main_pacing_set_netplay(int);
++void main_pacing_set_netplay_lag(int);
++void main_pacing_netplay_limiter(int);
+ #endif /* __MAIN_H__ */
+-
+--- a/src/main/netplay.c
++++ b/src/main/netplay.c
+@@ -34,14 +34,12 @@
+ #include <netinet/ip.h>
+ #endif
+ 
+-static int l_canFF;
+ static int l_netplay_controller;
+ static int l_netplay_control[4];
+ static UDPsocket l_udpSocket;
+ static TCPsocket l_tcpSocket;
+ static int l_udpChannel;
+ static int l_spectator;
+-static int l_netplay_is_init = 0;
+ static uint32_t l_vi_counter;
+ static uint8_t l_status;
+ static uint32_t l_reg_id;
+@@ -122,9 +120,9 @@
+         l_player_lag[i] = 0;
+     }
+ 
+-    l_canFF = 0;
++    main_pacing_set_netplay_lag(0);
+     l_netplay_controller = 0;
+-    l_netplay_is_init = 1;
++    main_pacing_set_netplay(1);
+     l_spectator = 1;
+     l_vi_counter = 0;
+     l_status = 0;
+@@ -165,7 +163,7 @@
+         l_tcpSocket = NULL;
+         l_udpSocket = NULL;
+         l_udpChannel = -1;
+-        l_netplay_is_init = 0;
++        main_pacing_set_netplay(0);
+         SDLNet_Quit();
+         return M64ERR_SUCCESS;
+     }
+@@ -173,7 +171,7 @@
+ 
+ int netplay_is_init()
+ {
+-    return l_netplay_is_init;
++    return main_pacing_read().netplay;
+ }
+ 
+ static uint8_t buffer_size(uint8_t control_id)
+@@ -353,13 +351,11 @@
+     //buffer_size is the local buffer size
+     if (l_player_lag[control_id] > 0 && buffer_size(control_id) > l_buffer_target)
+     {
+-        l_canFF = 1;
+-        main_core_state_set(M64CORE_SPEED_LIMITER, 0);
++        main_pacing_netplay_limiter(1);
+     }
+     else
+     {
+-        main_core_state_set(M64CORE_SPEED_LIMITER, 1);
+-        l_canFF = 0;
++        main_pacing_netplay_limiter(0);
+     }
+ 
+     if (netplay_ensure_valid(control_id))
+@@ -419,7 +415,7 @@
+ 
+ int netplay_lag()
+ {
+-    return l_canFF;
++    return main_pacing_read().netplay_lag;
+ }
+ 
+ int netplay_next_controller()
+--- a/src/api/frontend.c
++++ b/src/api/frontend.c
+@@ -127,6 +127,15 @@
+         return M64ERR_NO_MEMORY;
+     }
+ 
++    if (!main_pacing_init()) {
++        workqueue_shutdown();
++        romdatabase_close();
++        release_mem_base(g_mem_base);
++        g_mem_base = NULL;
++        ConfigShutdown();
++        savestates_deinit();
++        return M64ERR_NO_MEMORY;
++    }
+     l_CoreInit = 1;
+     return M64ERR_SUCCESS;
+ }
+@@ -141,6 +150,8 @@
+     ConfigShutdown();
+     workqueue_shutdown();
+     savestates_deinit();
++
++    main_pacing_shutdown();
+ 
+     /* if the calling code is using SDL, don't shut it down */
+     if (!l_CallerUsingSDL)
+@@ -480,3 +491,13 @@
+ }
+ 
+ 
++
++/* ABI admission precedes every read or mutation. */
++EXPORT m64p_error CALL CoreEmucapPacing(uint32_t version, uint32_t operation, int32_t percent,
++                                      m64p_emucap_pacing_result* result, uint32_t result_size)
++{
++    if (!l_CoreInit) return M64ERR_NOT_INIT;
++    if (version != 1) return M64ERR_INCOMPATIBLE;
++    if (!result || result_size != sizeof(*result)) return M64ERR_INPUT_INVALID;
++    return main_pacing_transaction(operation, percent, result);
++}
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -41,6 +41,7 @@
+ CoreOverrideVidExt;
+ CoreShutdown;
+ CoreStartup;
++CoreEmucapPacing;
+ DebugBreakpointCommand;
+ DebugBreakpointLookup;
+ DebugBreakpointTriggeredBy;
+--- /dev/null
++++ b/src/api/m64p_emucap_pacing.h
+@@ -0,0 +1,14 @@
++/* Versioned host pacing snapshots. All fields have fixed-width ABI types. */
++#ifndef M64P_EMUCAP_PACING_H
++#define M64P_EMUCAP_PACING_H
++#include <stdint.h>
++typedef struct {
++    int32_t factor, limiter, fast_forward, netplay, netplay_lag;
++    uint32_t reserved;
++    uint64_t revision;
++} m64p_emucap_policy;
++typedef struct {
++    uint32_t version, outcome; /* 0 completed, 1 unchanged native rejection */
++    m64p_emucap_policy previous, applied;
++} m64p_emucap_pacing_result;
++#endif

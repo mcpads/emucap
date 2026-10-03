@@ -1,0 +1,56 @@
+--- a/src/hw_cpu/v810/v810_cpu.cpp
++++ b/src/hw_cpu/v810/v810_cpu.cpp
+@@ -629,7 +629,10 @@
+ /* Make sure class member variable v810_timestamp is synchronized to our local copy, since we'll read it externally if a system
+    reset/power occurs when in step mode or similar.
+ */
+-#define RB_CPUHOOK_DBG(n) { if(CPUHook) { v810_timestamp = timestamp_rl; CPUHook(timestamp_rl, n); } }
++extern "C" bool emucap_native_restore_pending(void);
++extern "C" bool emucap_native_restore_service(bool instruction_ready);
++
++#define RB_CPUHOOK_DBG(n) { if(CPUHook && !IPendingCache) { v810_timestamp = timestamp_rl; CPUHook(timestamp_rl, n); } }
+ 
+ void V810::Run_Accurate_Debug(int32 MDFN_FASTCALL (*event_handler)(const v810_timestamp_t timestamp))
+ {
+--- a/src/hw_cpu/v810/v810_oploop.inc
++++ b/src/hw_cpu/v810/v810_oploop.inc
+@@ -43,6 +43,9 @@
+      #endif
+      uint32 tmpop;
+ 
++     #ifdef RB_DEBUGMODE
++     RestoredDispatch:
++     #endif
+      assert(timestamp_rl <= next_event_ts);
+ 
+      if(!IPendingCache)
+@@ -68,6 +71,29 @@
+         P_REG[0] = 0; //Zero the Zero Reg!!!
+ 
+ 	RB_CPUHOOK(RB_GETPC());
++
++        #ifdef RB_DEBUGMODE
++        if(emucap_native_restore_pending())
++        {
++         bool instruction_ready;
++         do
++         {
++          // The native state owner has rebuilt PC/cache/event bindings. Refresh
++          // suspended locals before issuing the replacement acknowledgement.
++          timestamp_rl = v810_timestamp;
++          old_PC = RB_GETPC();
++          instruction_ready = Running && timestamp_rl < next_event_ts
++                           && !Halted && !in_bstr && !IPendingCache;
++         } while(emucap_native_restore_service(instruction_ready));
++         if(!Running)
++         {
++          v810_timestamp = timestamp_rl;
++          return;
++         }
++         if(!instruction_ready)
++          goto RestoredDispatch;
++        }
++        #endif
+ 
+ 	{
+ 	 //printf("%08x\n", RB_GETPC());

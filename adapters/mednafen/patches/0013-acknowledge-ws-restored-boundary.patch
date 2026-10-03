@@ -1,0 +1,28 @@
+--- a/src/wswan/v30mz.cpp
++++ b/src/wswan/v30mz.cpp
+@@ -37,6 +37,7 @@
+ #include "debug.h"
+ 
+ extern "C" void emucap_native_idle_service(void);
++extern "C" bool emucap_native_restore_service(bool instruction_ready);
+ 
+ namespace MDFN_IEN_WSWAN
+ {
+@@ -1049,6 +1050,7 @@
+ {
+  v30mz_ICount += cycles;
+ 
++ check_halt:
+  if(InHLT)
+  {
+   SETOLDCSIP();
+@@ -1112,6 +1114,9 @@
+ 
+   if(cpu_hook)
+    cpu_hook(I.pc);
++  while(emucap_native_restore_service(!InHLT && v30mz_ICount > 0)) {}
++  if(InHLT)
++   goto check_halt;
+   // A callback load may replace this slice with an exhausted frame boundary.
+   // Return to the restored graphics phase before fetching another instruction.
+   if(v30mz_ICount <= 0)

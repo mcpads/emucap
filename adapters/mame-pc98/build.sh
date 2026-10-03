@@ -128,7 +128,15 @@ fi
 echo "-> Extracting fresh source"
 safe_rm_rf_under_work "$SRC"
 mkdir -p "$SRC"
-tar xf "$TARBALL" -C "$SRC" --strip-components=1
+tar_args=(xf "$TARBALL" -C "$SRC" --strip-components=1)
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    # zstd's CLI test fixtures contain dangling executable symlinks. MSYS2's
+    # unprivileged symlink emulation cannot extract them; MAME uses libzstd only.
+    tar_args+=(--exclude='*/3rdparty/zstd/tests/cli-tests')
+    ;;
+esac
+tar "${tar_args[@]}"
 
 for source_patch in "${PATCHES[@]}"; do
   echo "-> Applying $(basename "$source_patch")"
@@ -155,6 +163,9 @@ fi
 )
 
 raw_bin="$SRC/mame"
+case "$(uname -s)" in
+  MINGW*|MSYS*) raw_bin="$SRC/mame.exe" ;;
+esac
 if [ ! -x "$raw_bin" ]; then
   raw_bin="$(find "$SRC" -maxdepth 2 -type f -perm -111 -name 'mame*' | sort | head -n 1 || true)"
 fi
@@ -162,6 +173,18 @@ if [ -z "$raw_bin" ] || [ ! -f "$raw_bin" ] || [ ! -x "$raw_bin" ]; then
   echo "ERROR: built MAME binary not found under $SRC" >&2
   exit 1
 fi
+
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    # The Windows managed launcher starts an executable, not the Unix wrapper.
+    if [ -e "$WORK/mame.exe" ] || [ -L "$WORK/mame.exe" ]; then
+      safe_rm_rf_under_work "$WORK/mame.exe"
+    fi
+    cp "$raw_bin" "$WORK/mame.exe"
+    echo "$BUILD_LABEL build ready: $WORK/mame.exe, source=$SRC"
+    exit 0
+    ;;
+esac
 
 if [ -e "$RAW_LINK" ] || [ -L "$RAW_LINK" ]; then
   safe_rm_rf_under_work "$RAW_LINK"

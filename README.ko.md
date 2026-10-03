@@ -8,13 +8,13 @@
 PlayStation·PC Engine·PC-FX·Mega Drive/Genesis·WonderSwan/WSC·Neo Geo Pocket/Color), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
 PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME과 선택형
 NP2kai 호환 backend(PC-98), MAME(실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
-원본 Xbox는 고정된 xemu 포크로 실험 지원한다. 고정된 openMSX 21.0 source에 emucap host patch
-네 개를 적용한 build와 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware MSX1/MSX2/MSX2+
+원본 Xbox는 고정된 xemu 포크로 실험 지원한다. 고정된 openMSX 21.0 source에 emucap host patch를
+적용한 build와 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware MSX1/MSX2/MSX2+
 카트리지 profile도 제공한다.
 
-**v0.18.0 — 베타.** 이 저장소는 계속 활발히 개발 중이며 이후 릴리스에서 인터페이스와
-동작이 바뀔 수 있다. 어댑터 가용성은 호스트 환경에 따라 다르며 `status`가 실제로 사용할 수
-있는 기능을 보고한다.
+**v1.0.0-rc.1 — 출시 후보.** 1.x에서 유지할 공개 계약은
+[COMPATIBILITY.md](COMPATIBILITY.md)에 정의한다. 연결된 런타임의 `status`가 실제 가용 기능을
+보고하며, 실험적 프로필은 명시된 지원 범위를 유지한다.
 
 Core와 별도 표시가 없는 프로젝트 source는 GPL-2.0-or-later다. 에뮬레이터 native patch stack은
 adapter별 upstream license 경계를 따른다. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 참고한다.
@@ -84,7 +84,7 @@ emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전
 
 - **제어 MCP**(`emucap-mcp`) — 에뮬레이터 조작 엔진. 메모리·상태·화면을 읽고, 입력·세이브스테이트·
   브레이크포인트를 제어하고 선택적 분석 결과를 *반환*한다. 정적 도구 목록은 간결한 기본
-  리모컨이다. 버튼·키 입력은 `tap`, 마우스 조작은 `pointer(operation="describe")`, 지속 입력·터치와
+  리모컨이다. 버튼·키 입력은 `tap`, 마우스 조작은 `pointer(operation="describe")`, 디버거 호출 사이에 유지할 입력·터치와
   복합·기기별 디버거 기능은 `debug(operation="describe")`, 재현성 분석은
   `analysis(operation="describe")`로 연다. 각 서랍은
   현재 runtime의 operation과 schema만 반환하며 실행도 같은 도구가 맡는다. 메모리 쓰기·disassembly·
@@ -92,7 +92,8 @@ emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전
   frozen 상태와 `status.media_devices`의 device ID를 요구한다. 정확한 guest-time 전진은 frozen으로
   돌아오는 `step`을 사용한다. 어댑터의 free-running frame wait는 호환용 wire 동작으로만 남고 MCP
   에이전트에게는 노출하지 않는다.
-  정확한 bounded 버튼 입력은 입력권을 반환하고 frozen으로 끝나는 direct `tap`을 쓴다. Guest가 계속
+  `tap`은 하나 이상의 버튼을 `press_frames` 동안 함께 누르고 해제한 뒤, `after_frames`만큼
+  진행하고 frozen으로 끝난다. 짧은 누름과 길게 누르기 모두 이 방식으로 처리한다. Guest가 계속
   실행되는 실시간 pulse는 runtime이 지원할 때만 디버그 서랍의 `pulse_while_running`으로 명시적으로 연다.
 - **추적 MCP**(`emucap-track-mcp`) — 실험 원장(`.emucap/`). run을 시작(`run_start`)·기록(`log_*`)·
   질의(`query_runs`/`compare_runs`/`summarize_runs`)한다. **에뮬레이터를 모른다**(emulator-less). 제어
@@ -100,8 +101,8 @@ emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전
 
 0.17로 업데이트할 때는 해당 코어 패키지를 설치하거나 릴리스를 빌드한 뒤, 두 MCP 서버를
 재연결하고 도구 목록을 갱신한다.
-버튼·키 입력은 `tap`, 마우스 조작은 `pointer`, 지속 입력과 터치는 `debug`로 옮겨졌다.
-원천 수정 적용을 위해 openMSX 호스트(API 5)와 PPSSPP 호스트도 다시 빌드한다.
+버튼·키 입력은 `tap`, 마우스 조작은 `pointer`, 디버거 호출 사이에 유지할 입력과 터치는 `debug`로 옮겨졌다.
+원천 수정 적용을 위해 openMSX 호스트(API 6)와 PPSSPP 호스트도 다시 빌드한다.
 저장 상태 호환 조건과 나머지 변경은 [변경 기록](CHANGELOG.md)을 참고한다.
 
 **Claude Code:**
@@ -343,7 +344,7 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   → `adapters/mupen64plus/README.md`
 - **openMSX MSX profile (실험적)** — `adapters/openmsx/build.sh`를 실행하고
   `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 기록된 upstream compatibility backport와
-  emucap host patch 네 개를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 per-port
+  emucap host patch를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 per-port
   `HOME`에서 실행하며 사용자의 emulator profile을 읽지 않는다. `msx`는 C-BIOS MSX2+,
   `msx1`·`msx2`·`msx2p`는 사용자가 제공한 실제 firmware
   profile이다. 카트리지 범위는 Z80 상태·명령 step, headless/visible exact frame step, 제한된

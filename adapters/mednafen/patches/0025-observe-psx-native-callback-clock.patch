@@ -1,0 +1,47 @@
+--- a/src/psx/debug.cpp
++++ b/src/psx/debug.cpp
+@@ -34,6 +34,14 @@
+ static void (*CPUHook)(uint32, bool) = NULL;
+ static bool CPUHookContinuous = false;
+ 
++static const unsigned REG_CPU_TIMESTAMP = 0x10000;
++static pscpu_timestamp_t CallbackTimestamp = 0;
++struct CallbackTimestampScope
++{
++ explicit CallbackTimestampScope(pscpu_timestamp_t timestamp) { CallbackTimestamp = timestamp; }
++ ~CallbackTimestampScope() { CallbackTimestamp = 0; }
++};
++
+ static void (*LogFunc)(const char*, const char*);
+ 
+ struct PSX_BPOINT
+@@ -191,6 +199,7 @@
+  if(CPUHookContinuous && CPUHook)
+  {
+   ForceEventUpdates(timestamp);
++  CallbackTimestampScope clock_scope(timestamp);
+   CPUHook(PC, FoundBPoint);
+  }
+ 
+@@ -637,6 +646,7 @@
+ 
+ static const RegType Regs_CPU[] =
+ {
++        { REG_CPU_TIMESTAMP, "TStamp", "CPU timestamp in current execution origin (read-only)", 4 },
+ 	{ PS_CPU::GSREG_PC, 	   "PC", "PC", 4 },
+ 	{ PS_CPU::GSREG_PC_NEXT,   "NPC", "Next PC", 4 },
+ 	{ PS_CPU::GSREG_IN_BD_SLOT, "INBD", "In Branch Delay Slot", 1 },
+@@ -690,11 +700,13 @@
+ 
+ static uint32 GetRegister_CPU(const unsigned int id, char *special, const uint32 special_len)
+ {
++ if(id == REG_CPU_TIMESTAMP) return CallbackTimestamp;
+  return(CPU->GetRegister(id, special, special_len));
+ }
+ 
+ static void SetRegister_CPU(const unsigned int id, uint32 value)
+ {
++ if(id == REG_CPU_TIMESTAMP) return;
+  CPU->SetRegister(id, value);
+ }
+ 

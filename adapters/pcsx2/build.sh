@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the pinned PCSX2 fork used by the PlayStation 2 PINE adapter.
+# Build the patched pinned PCSX2 upstream used by the PlayStation 2 PINE adapter.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -11,13 +11,16 @@ PATCHSET_SHA256="$(
   cd "$HERE"
   find patches -type f -name '*.patch' -print0 |
     LC_ALL=C sort -z |
-    xargs -0 shasum -a 256 |
-    shasum -a 256 |
+    while IFS= read -r -d '' source_patch; do
+      digest="$(shasum -a 256 -b "$source_patch" | awk '{print $1}')"
+      printf '%s  %s\n' "$digest" "$source_patch"
+    done |
+    shasum -a 256 -b |
     awk '{print $1}'
 )"
 if [ "$PCSX2_PATCHSET_SHA256" != "pending" ] &&
    [ "$PATCHSET_SHA256" != "$PCSX2_PATCHSET_SHA256" ]; then
-  echo "ERROR: patchset digest differs from upstream.lock" >&2
+  echo "ERROR: patchset digest differs from upstream.lock: expected=$PCSX2_PATCHSET_SHA256 actual=$PATCHSET_SHA256" >&2
   exit 1
 fi
 
@@ -38,10 +41,14 @@ fi
 git -C "$SRC" fetch --depth 1 origin "$PCSX2_COMMIT"
 git -C "$SRC" checkout --detach "$PCSX2_COMMIT"
 git -C "$SRC" checkout -- \
+  .github/workflows/scripts/windows/build-dependencies.bat \
+  3rdparty/winwil/include/wil/win32_helpers.h \
   pcsx2/DebugTools/Breakpoints.cpp \
   pcsx2/DebugTools/Breakpoints.h \
+  pcsx2/GS/Renderers/DX12/D3D12ShaderCache.h \
   pcsx2/Interpreter.cpp \
   pcsx2/PINE.cpp \
+  pcsx2/PINE.h \
   pcsx2/Pcsx2Config.cpp \
   pcsx2/SIO/Sio.cpp \
   pcsx2/SIO/Sio.h \
@@ -50,6 +57,7 @@ git -C "$SRC" checkout -- \
   pcsx2/VMManager.cpp \
   pcsx2/VMManager.h \
   pcsx2/x86/ix86-32/iR5900.cpp
+rm -f "$SRC/pcsx2/EmuCapFrameOperation.h"
 for patch in "$HERE"/patches/*.patch; do
   echo "applying $(basename "$patch")"
   git -C "$SRC" apply --check "$patch"
@@ -70,14 +78,15 @@ PATCHES_TREE="$(git -C "$PATCHES_SRC" rev-parse "$PCSX2_PATCHES_COMMIT:patches")
 }
 PATCHES_ARCHIVE="$SRC/bin/resources/patches.zip"
 PATCHES_MTIME="$(git -C "$PATCHES_SRC" show -s --format=%cI "$PCSX2_PATCHES_COMMIT")"
-git -C "$PATCHES_SRC" archive \
-  --format=zip \
+# Store entries without compressor-version differences and force LF/UTC metadata.
+TZ=UTC git -c core.autocrlf=false -c core.eol=lf -C "$PATCHES_SRC" archive \
+  --format=zip -0 \
   --mtime="$PATCHES_MTIME" \
   "$PCSX2_PATCHES_COMMIT:patches" \
   >"$PATCHES_ARCHIVE.tmp"
-PATCHES_ARCHIVE_SHA256="$(shasum -a 256 "$PATCHES_ARCHIVE.tmp" | awk '{print $1}')"
+PATCHES_ARCHIVE_SHA256="$(shasum -a 256 -b "$PATCHES_ARCHIVE.tmp" | awk '{print $1}')"
 [ "$PATCHES_ARCHIVE_SHA256" = "$PCSX2_PATCHES_ARCHIVE_SHA256" ] || {
-  echo "ERROR: generated PCSX2 patches archive differs from upstream.lock" >&2
+  echo "ERROR: generated PCSX2 patches archive differs from upstream.lock: expected=$PCSX2_PATCHES_ARCHIVE_SHA256 actual=$PATCHES_ARCHIVE_SHA256" >&2
   exit 1
 }
 mv "$PATCHES_ARCHIVE.tmp" "$PATCHES_ARCHIVE"
@@ -123,8 +132,23 @@ if [ "$(uname)" = "Darwin" ]; then
   )
 fi
 
-cmake -S "$SRC" -B "$BUILD" "${COMMON_ARGS[@]}"
-cmake --build "$BUILD" --target pcsx2-qt -j "$JOBS"
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+      -File "$(cygpath -w "$HERE/build-windows.ps1")" \
+      -Source "$(cygpath -w "$SRC")" -Build "$(cygpath -w "$BUILD")" \
+      -MsysRoot "$(cygpath -w /)" -Jobs "$JOBS"
+    ;;
+  *)
+    cmake -S "$SRC" -B "$BUILD" "${COMMON_ARGS[@]}"
+    cmake --build "$BUILD" --target pcsx2-qt -j "$JOBS"
+    ;;
+esac
+if [ "$(uname)" = "Darwin" ]; then
+  # Relinking restores dependency-prefix paths. Redeploy the bundle before signing
+  # so its executable and plugins load the same Qt libraries.
+  cmake --build "$BUILD" --target pcsx2-postprocess-bundle -j "$JOBS"
+fi
 cargo build --manifest-path "$ROOT/Cargo.toml" --release --bin emucap-pcsx2-bridge
 
 PCSX2_BIN=

@@ -1,0 +1,97 @@
+--- a/Core/Shared/EmuSettings.cpp
++++ b/Core/Shared/EmuSettings.cpp
+@@ -1,6 +1,6 @@
+ #include "pch.h"
+ #include <cerrno>
+-#include <cstdlib>
++#include "Utilities/EmucapEnvironment.h"
+ #include <random>
+ #include "Shared/EmuSettings.h"
+ #include "Shared/KeyManager.h"
+@@ -17,12 +17,12 @@
+ 	_flags = 0;
+ 	_debuggerFlags = 0;
+ 
+-	const char* fixedSeed = std::getenv("EMUCAP_REPEATABLE_SEED");
+-	if(fixedSeed) {
++	const std::string fixedSeed = ReadEmucapEnvironment("EMUCAP_REPEATABLE_SEED");
++	if(!fixedSeed.empty()) {
+ 		char* end = nullptr;
+ 		errno = 0;
+-		unsigned long seed = std::strtoul(fixedSeed, &end, 10);
+-		if(errno == 0 && end != fixedSeed && *end == '\0' && seed <= UINT32_MAX) {
++		unsigned long seed = std::strtoul(fixedSeed.c_str(), &end, 10);
++		if(errno == 0 && end != fixedSeed.c_str() && *end == '\0' && seed <= UINT32_MAX) {
+ 			_mt = std::mt19937((uint32_t)seed);
+ 		} else {
+ 			std::random_device rd;
+--- a/Core/SNES/Coprocessors/SPC7110/Rtc4513.cpp
++++ b/Core/SNES/Coprocessors/SPC7110/Rtc4513.cpp
+@@ -1,6 +1,6 @@
+ #include "pch.h"
+ #include <cerrno>
+-#include <cstdlib>
++#include "Utilities/EmucapEnvironment.h"
+ #include <time.h>
+ #include "SNES/Coprocessors/SPC7110/Rtc4513.h"
+ #include "Shared/Emulator.h"
+@@ -12,12 +12,12 @@
+ 
+ static uint64_t CurrentUnixTime()
+ {
+-	const char* fixedTime = std::getenv("EMUCAP_FIXED_UNIX_TIME");
+-	if(fixedTime) {
++	const std::string fixedTime = ReadEmucapEnvironment("EMUCAP_FIXED_UNIX_TIME");
++	if(!fixedTime.empty()) {
+ 		char* end = nullptr;
+ 		errno = 0;
+-		unsigned long long value = std::strtoull(fixedTime, &end, 10);
+-		if(errno == 0 && end != fixedTime && *end == '\0') {
++		unsigned long long value = std::strtoull(fixedTime.c_str(), &end, 10);
++		if(errno == 0 && end != fixedTime.c_str() && *end == '\0') {
+ 			return (uint64_t)value;
+ 		}
+ 	}
+--- a/Core/Shared/SaveStateManager.cpp
++++ b/Core/Shared/SaveStateManager.cpp
+@@ -1,4 +1,5 @@
+ #include "pch.h"
++#include <limits>
+ #include "Utilities/FolderUtilities.h"
+ #include "Utilities/ZipWriter.h"
+ #include "Utilities/ZipReader.h"
+@@ -119,9 +120,10 @@
+ 	RenderedFrame completed;
+ 	double scale = _emu->GetVideoDecoder()->GetLastFrameScale();
+ 	vector<uint16_t> pixels;
+-	if(_emu->GetVideoDecoder()->CopySnapshotFrame(completed, pixels)) {
++	if(_emu->GetVideoDecoder()->CopySnapshotFrame(completed, pixels)
++		&& pixels.size() <= std::numeric_limits<uint32_t>::max() / sizeof(uint16_t)) {
+ 		frame.FrameBuffer = reinterpret_cast<uint8_t*>(pixels.data());
+-		frame.FrameBufferSize = pixels.size() * sizeof(uint16_t);
++		frame.FrameBufferSize = static_cast<uint32_t>(pixels.size() * sizeof(uint16_t));
+ 		frame.Width = completed.Width;
+ 		frame.Height = completed.Height;
+ 		scale = completed.Scale;
+--- /dev/null
++++ b/Utilities/EmucapEnvironment.h
+@@ -0,0 +1,19 @@
++#pragma once
++#include <cstdlib>
++#include <memory>
++#include <string>
++
++// Retain an owned value across parsing, including the Windows CRT environment API.
++inline std::string ReadEmucapEnvironment(const char* name)
++{
++#ifdef _WIN32
++	char* value = nullptr;
++	size_t length = 0;
++	const auto error = _dupenv_s(&value, &length, name);
++	std::unique_ptr<char, decltype(&std::free)> owned(value, &std::free);
++	return error == 0 && value ? std::string(value) : std::string();
++#else
++	const char* value = std::getenv(name);
++	return value ? std::string(value) : std::string();
++#endif
++}

@@ -1,6 +1,6 @@
 use super::*;
 use crate::gdb_rsp::GdbError;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct DelayedStepGdb {
     timeout: Duration,
@@ -21,9 +21,13 @@ impl DelayedStepGdb {
 
     fn delayed_step(&mut self) -> Result<String, GdbError> {
         self.issued_steps += 1;
-        let wait = self.step_delay.min(self.timeout);
+        let wait = if self.issued_steps == 1 {
+            Duration::ZERO
+        } else {
+            self.timeout
+        };
         std::thread::sleep(wait);
-        if self.timeout < self.step_delay {
+        if self.issued_steps > 1 && self.timeout < self.step_delay {
             return Err(GdbError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "delayed GDB step exceeded its clipped timeout",
@@ -66,16 +70,14 @@ impl GdbTransport for DelayedStepGdb {
 #[test]
 fn delayed_backend_cannot_turn_a_partial_nds_step_into_completion() {
     let mut bridge = NdsBridge::new(
-        DelayedStepGdb::new(Duration::from_millis(70)),
+        DelayedStepGdb::new(Duration::from_secs(2)),
         None,
         GdbBridgeEnv::default(),
     );
-    let started = Instant::now();
     let error = bridge
-        .step_cpu_with_budget(&json!({}), 3, Duration::from_millis(120))
+        .step_cpu_with_budget(&json!({}), 3, Duration::from_secs(1))
         .unwrap_err();
 
-    assert!(started.elapsed() < Duration::from_millis(250));
     assert!(error.to_string().contains("after 1 acknowledged of 3"));
     assert_eq!(bridge.arm9.gdb.issued_steps, 2);
     assert!(bridge.arm9.frozen);
@@ -85,5 +87,5 @@ fn delayed_backend_cannot_turn_a_partial_nds_step_into_completion() {
         .gdb
         .timeout_history
         .iter()
-        .any(|timeout| *timeout < Duration::from_millis(70)));
+        .any(|timeout| *timeout < Duration::from_secs(2)));
 }

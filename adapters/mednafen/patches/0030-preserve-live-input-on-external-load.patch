@@ -1,0 +1,31 @@
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -18,4 +18,5 @@
+ #include "mednafen.h"
+ #include "drivers/emucap_frame_call.h"
++#include "drivers/emucap_live_input.h"
+ 
+ static EmucapFrameCall EmucapOutputCall;
+@@ -313,4 +314,22 @@
+ }
+ 
++static EmucapLiveInput::Views EmucapInputViews() noexcept
++{
++ EmucapLiveInput::Views views;
++ for(unsigned i = 0; i < views.size(); ++i)
++  views[i] = {PortDevice[i], PortData[i], PortDataLen[i]};
++ return views;
++}
++
++EmucapLiveInput emucap_capture_live_input()
++{
++ return EmucapLiveInput::capture(MDFNGameInfo, EmucapInputViews());
++}
++
++bool emucap_restore_live_input(const EmucapLiveInput& input) noexcept
++{
++ return input.restore(MDFNGameInfo, EmucapInputViews());
++}
++
+ static QTRecord *qtrecorder = NULL;
+ static WAVRecord *wavrecorder = NULL;

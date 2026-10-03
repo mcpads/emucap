@@ -160,3 +160,23 @@ pub(crate) fn read_ndjson_chunk(
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
+
+/// Make the existing backpressure peers exercise a partial write on Windows too.
+/// Winsock can accept one oversized send into its own buffer even when the peer never reads.
+#[cfg(all(test, windows))]
+pub(crate) fn disable_test_send_buffer(socket: &std::net::TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_SNDBUF};
+    let bytes = 0i32;
+    // SAFETY: the socket is live and the option points to an initialized DWORD-sized value.
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as _,
+            SOL_SOCKET,
+            SO_SNDBUF,
+            (&bytes as *const i32).cast(),
+            std::mem::size_of_val(&bytes) as i32,
+        )
+    };
+    assert_eq!(result, 0, "failed to disable test send buffering");
+}

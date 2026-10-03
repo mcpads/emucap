@@ -1250,12 +1250,25 @@ fn debug_runstate_queries_one_gdb_stop_and_does_not_duplicate_it() {
         .extend([Ok(None), Ok(Some("T05thread:01;".into())), Ok(None)]);
     let mut bridge = bridge(
         FakeQmp::new(vec![
+            (
+                "xemu-emucap-pacing",
+                json!({"transaction-version":1,"previous-percent":100,"previous-revision":1,"start-frame-boundary":5,"percent":100,"revision":1,"frame-boundary":5,"clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+            ),
+            (
+                "xemu-emucap-pacing",
+                json!({"transaction-version":1,"previous-percent":100,"previous-revision":1,"start-frame-boundary":5,"percent":50,"revision":2,"frame-boundary":5,"clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+            ),
+            ("query-status", machine(false)),
             ("query-status", json!({"running":false, "status":"debug"})),
             ("query-status", json!({"running":false, "status":"debug"})),
         ]),
         gdb,
         temp.path(),
     );
+    let changed = bridge
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap();
+    assert_eq!(changed["state"], "frozen");
     let first = result(bridge.handle_request(Request::new(10, "poll_events", json!({}))));
     assert_eq!(first["events"].as_array().unwrap().len(), 1);
     assert_eq!(first["events"][0]["signal"], "05");
@@ -1295,11 +1308,11 @@ fn execution_speed_applies_and_reads_back_the_native_policy() {
         FakeQmp::new(vec![
             (
                 "xemu-emucap-pacing",
-                json!({"percent":100, "revision":0, "frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+                json!({"transaction-version":1,"previous-percent":100,"previous-revision":0,"start-frame-boundary":5,"percent":100,"revision":0, "frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
             ),
             (
                 "xemu-emucap-pacing",
-                json!({"percent":50, "revision":1, "frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+                json!({"transaction-version":1,"previous-percent":100,"previous-revision":0,"start-frame-boundary":5,"percent":50,"revision":1, "frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
             ),
             ("query-status", machine(true)),
         ]),
@@ -1371,11 +1384,11 @@ fn pacing_mutation_failure_closes_control_without_stale_rollback() {
         let mut qmp = FakeQmp::new(vec![
             (
                 "xemu-emucap-pacing",
-                json!({"percent":100,"revision":0,"frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+                json!({"transaction-version":1,"previous-percent":100,"previous-revision":0,"start-frame-boundary":5,"percent":100,"revision":0,"frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
             ),
             (
                 "xemu-emucap-pacing",
-                json!({"percent":50,"revision":1,"frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
+                json!({"transaction-version":1,"previous-percent":100,"previous-revision":0,"start-frame-boundary":5,"percent":50,"revision":1,"frame-boundary":5, "clock-profile":XemuClockProfile::candidate(0).unwrap()}),
             ),
             ("query-status", machine(false)),
         ]);
@@ -1392,7 +1405,7 @@ fn pacing_mutation_failure_closes_control_without_stale_rollback() {
             .error
             .unwrap()
             .message
-            .contains("last verified policy"));
+            .contains("pre-command observation"));
         assert!(bridge.backend_terminal());
         assert!(
             !bridge
@@ -1404,26 +1417,47 @@ fn pacing_mutation_failure_closes_control_without_stale_rollback() {
 }
 
 #[test]
-fn batch_rejects_non_hex_native_payload() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut bridge = bridge(
-        FakeQmp::new(vec![
-            ("query-status", machine(false)),
-            (
-                "xemu-emucap-read-memory-batch",
-                json!({"frame-boundary":7,"virtual-ns":10,"reads":["zz"]}),
-            ),
-        ]),
-        FakeGdb::empty(),
-        temp.path(),
-    );
-    let response = bridge.handle_request(Request::new(
-        132,
-        "read_memory_batch",
-        json!({"ranges":[{"memory_type":"main","address":0,"length":1}]}),
-    ));
-    assert!(!response.ok);
-    bridge.qmp.assert_drained();
+fn batch_rejects_malformed_native_payload_without_partial_publication() {
+    let cases = [
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["aa","zzzz"]}),
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["aa","bbb"]}),
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["aa","bb"]}),
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["aa"]}),
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["aa","bbbb","cc"]}),
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["bbbb","aa"]}),
+        json!({"frame-boundary":7,"virtual-ns":10,"reads":["aa",null]}),
+        json!({"virtual-ns":10,"reads":["aa","bbbb"]}),
+        json!({"frame-boundary":7,"virtual-ns":-1,"reads":["aa","bbbb"]}),
+    ];
+    for bad in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let mut bridge = bridge(
+            FakeQmp::new(vec![
+                ("query-status", machine(false)),
+                ("xemu-emucap-read-memory-batch", bad.clone()),
+                ("query-status", machine(false)),
+                (
+                    "xemu-emucap-read-memory-batch",
+                    json!({"frame-boundary":7,"virtual-ns":10,"reads":["cc","ddee"]}),
+                ),
+            ]),
+            FakeGdb::empty(),
+            temp.path(),
+        );
+        let ranges = json!({"ranges":[
+            {"memory_type":"main","address":0,"length":1},
+            {"memory_type":"main","address":16,"length":2}
+        ]});
+        let rejected =
+            bridge.handle_request(Request::new(132, "read_memory_batch", ranges.clone()));
+        assert!(!rejected.ok, "accepted {bad}");
+        assert!(rejected.result.is_none(), "partial publication for {bad}");
+        // A fully consumed, correlated QMP reply does not leave a pending wire response.
+        let next = result(bridge.handle_request(Request::new(133, "read_memory_batch", ranges)));
+        assert_eq!(next["reads"][0]["hex"], "cc");
+        assert_eq!(next["reads"][1]["hex"], "ddee");
+        bridge.qmp.assert_drained();
+    }
 }
 
 #[test]
@@ -1526,7 +1560,7 @@ fn speed_profile_drift_is_rejected_before_set_or_after_unverified_mutation() {
     for drift_after_set in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let reply = |shift, percent| {
-            json!({"percent":percent,"revision":0,"frame-boundary":0,
+            json!({"transaction-version":1,"previous-percent":100,"previous-revision":0,"start-frame-boundary":0,"percent":percent,"revision":0,"frame-boundary":0,
             "clock-profile":XemuClockProfile::candidate(shift).unwrap()})
         };
         let replies = if drift_after_set {
@@ -1551,4 +1585,224 @@ fn speed_profile_drift_is_rejected_before_set_or_after_unverified_mutation() {
         }
         bridge.qmp.assert_drained();
     }
+}
+
+#[test]
+fn pacing_confirmation_rejects_native_noop_clamp_and_override() {
+    for percent in [100, 25, 0, 1001, 50] {
+        let temp = tempfile::tempdir().unwrap();
+        let reply = |percent, revision| {
+            json!({"transaction-version":1,"previous-percent":100,"previous-revision":if percent == 100 {revision} else {revision-1},"start-frame-boundary":5,"percent":percent,"revision":revision,
+            "frame-boundary":5,"clock-profile":XemuClockProfile::candidate(0).unwrap()})
+        };
+        let mut replies = vec![
+            ("xemu-emucap-pacing", reply(100, 1)),
+            ("xemu-emucap-pacing", reply(percent, 2)),
+        ];
+        if percent <= 1000 {
+            replies.push(("query-status", machine(false)));
+        }
+        let qmp = FakeQmp::new(replies);
+        let mut bridge = bridge(qmp, FakeGdb::empty(), temp.path());
+        let response = bridge.handle_request(Request::new(
+            901,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert_eq!(response.ok, percent == 50, "{percent}");
+        assert_eq!(bridge.backend_terminal(), percent != 50, "{percent}");
+        assert_eq!(bridge.qmp.calls[1].1, Some(json!({"percent":50})));
+        if percent != 50 {
+            assert!(response.result.is_none());
+            let calls = bridge.qmp.calls.len();
+            assert!(
+                !bridge
+                    .handle_request(Request::new(902, "resume", json!({})))
+                    .ok
+            );
+            assert_eq!(bridge.qmp.calls.len(), calls);
+        }
+        bridge.qmp.assert_drained();
+    }
+}
+
+#[test]
+fn pacing_rejects_unverified_qmp_execution_state() {
+    for status in [
+        json!({}),
+        json!({"running":null,"status":"debug"}),
+        json!({"running":"false","status":"debug"}),
+        json!({"running":false}),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let policy = |percent| {
+            json!({"transaction-version":1,"previous-percent":100,"previous-revision":if percent == 100 {1} else {0},"start-frame-boundary":5,"percent":percent,"revision":1,
+            "frame-boundary":5,"clock-profile":XemuClockProfile::candidate(0).unwrap()})
+        };
+        let qmp = FakeQmp::new(vec![
+            ("xemu-emucap-pacing", policy(100)),
+            ("xemu-emucap-pacing", policy(50)),
+            ("query-status", status),
+        ]);
+        let mut host = bridge(qmp, FakeGdb::empty(), temp.path());
+        let response = host.handle_request(Request::new(
+            1,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(!response.ok && response.result.is_none());
+        assert!(host.backend_terminal());
+        let calls = host.qmp.calls.len();
+        assert!(!host.handle_request(Request::new(2, "resume", json!({}))).ok);
+        assert_eq!(host.qmp.calls.len(), calls);
+        host.qmp.assert_drained();
+    }
+}
+
+fn transaction_policy(percent: u64, previous: u64, revision: u64) -> Value {
+    json!({"transaction-version":1,"percent":percent,
+        "previous-percent":previous,"previous-revision":revision,
+        "revision":revision.wrapping_add(u64::from(percent != previous)),
+        "start-frame-boundary":5,"frame-boundary":5,
+        "clock-profile":XemuClockProfile::candidate(0).unwrap()})
+}
+
+#[test]
+fn pacing_previous_belongs_to_native_transaction() {
+    let temp = tempfile::tempdir().unwrap();
+    let qmp = FakeQmp::new(vec![
+        ("xemu-emucap-pacing", transaction_policy(100, 100, 1)),
+        ("xemu-emucap-pacing", transaction_policy(50, 250, 9)),
+        ("query-status", machine(false)),
+    ]);
+    let mut host = bridge(qmp, FakeGdb::empty(), temp.path());
+    let changed = result(host.handle_request(Request::new(
+        1,
+        "execution_speed",
+        json!({"mode":"limited","percent":50}),
+    )));
+    assert_eq!(changed["previous"]["percent"], 250);
+    assert_eq!(changed["previous"]["policy_revision"], "9");
+    assert_eq!(changed["execution_speed"]["policy_revision"], "10");
+    host.qmp.assert_drained();
+}
+
+#[test]
+fn pacing_feature_version_is_admitted_before_mutation() {
+    for version in [Value::Null, json!(0), json!(2), json!("1")] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut probe = transaction_policy(100, 100, 0);
+        probe["transaction-version"] = version;
+        let mut host = bridge(
+            FakeQmp::new(vec![("xemu-emucap-pacing", probe)]),
+            FakeGdb::empty(),
+            temp.path(),
+        );
+        assert!(
+            !host
+                .handle_request(Request::new(
+                    1,
+                    "execution_speed",
+                    json!({"mode":"limited","percent":50})
+                ))
+                .ok
+        );
+        assert!(!host.backend_terminal());
+        assert_eq!(host.qmp.calls.len(), 1);
+        assert!(host.qmp.calls[0].1.is_none());
+        host.qmp.assert_drained();
+    }
+}
+
+#[test]
+fn pacing_malformed_transaction_retires_control() {
+    for (key, value) in [
+        ("transaction-version", json!(2)),
+        ("previous-percent", json!(1001)),
+        ("previous-revision", json!(10)),
+        ("revision", json!(0)),
+        ("start-frame-boundary", json!(6)),
+        ("frame-boundary", Value::Null),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut transaction = transaction_policy(50, 250, 9);
+        transaction[key] = value;
+        let mut host = bridge(
+            FakeQmp::new(vec![
+                ("xemu-emucap-pacing", transaction_policy(100, 100, 0)),
+                ("xemu-emucap-pacing", transaction),
+            ]),
+            FakeGdb::empty(),
+            temp.path(),
+        );
+        let response = host.handle_request(Request::new(
+            1,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .contains("native_result=Some"));
+        assert!(host.backend_terminal());
+        assert_eq!(host.qmp.calls.len(), 2);
+        host.qmp.assert_drained();
+    }
+}
+
+#[test]
+fn batch_epochs_separate_same_clock_load_dispatch() {
+    // Reset and load pass through the same pre-effect dispatcher retirement.
+    assert!(!observation::OBSERVATION_METHODS.contains(&"reset"));
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("epoch.json");
+    save_state_container(temp.path(), &path);
+    let mut replies = Vec::new();
+    for load in [false, true] {
+        if load {
+            replies.extend(load_state_replies(temp.path(), 7));
+        }
+        for _ in 0..2 {
+            replies.push(("query-status", machine(false)));
+            replies.push((
+                "xemu-emucap-read-memory-batch",
+                json!({"frame-boundary":7,"virtual-ns":100,"reads":["aa"]}),
+            ));
+        }
+    }
+    let registers = hex::encode([0u8; 64]);
+    let mut host = state_bridge(
+        FakeQmp::new(replies),
+        FakeGdb::with_replies(vec![("g", &registers)]),
+        temp.path(),
+    );
+    let mut previous = None;
+    for load in [false, true] {
+        if load {
+            let r = host.handle_request(Request::new(1, "load_state", json!({"path":path})));
+            assert!(r.ok, "{:?}", r.error);
+        }
+        let mut current = None;
+        for _ in 0..2 {
+            let r = host.handle_request(Request::new(
+                2,
+                "read_memory_batch",
+                json!({"ranges":[{"memory_type":"main","address":0,"length":1}]}),
+            ));
+            assert!(r.ok, "{:?}", r.error);
+            let b = r.result.unwrap()["boundary"].clone();
+            assert_eq!(b["clocks"][0]["value"], 7);
+            if let Some(ref old) = current {
+                assert_eq!(old, &b);
+            }
+            current = Some(b);
+        }
+        if let Some(old) = previous {
+            assert_ne!(Some(old), current);
+        }
+        previous = current;
+    }
+    host.qmp.assert_drained();
 }

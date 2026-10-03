@@ -212,3 +212,11 @@ inline EmucapSnapshotParseStatus emucap_parse_snapshot_specs(
     }
   }
 }
+
+// CPU memory peeks exclude the device I/O aperture. The expansion ROM at
+// 0x80780000 is backed by memory and remains readable.
+inline bool emucap_pcfx_cpu_peek_range(std::uint64_t address, std::uint64_t length) {
+  if (!length || address >= 0x100000000ULL || length > 0x100000000ULL - address)
+    return false;
+  return address + length <= 0x80000000ULL || address >= 0x80780000ULL;
+}

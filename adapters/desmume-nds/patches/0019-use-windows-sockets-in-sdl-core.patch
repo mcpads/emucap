@@ -1,0 +1,62 @@
+--- a/desmume/src/wifi.cpp
++++ b/desmume/src/wifi.cpp
+@@ -28,12 +28,12 @@
+ #include <registers.h>
+ #include <rthreads/rthreads.h>
+ 
+-#ifdef HOST_WINDOWS
++#ifdef _WIN32
+ #include <winsock2.h>
+ #include <ws2tcpip.h>
+ #define socket_t    SOCKET
+ #define sockaddr_t  SOCKADDR
+-#ifndef WXPORT
++#if defined(HOST_WINDOWS) && !defined(WXPORT)
+ #include "windriver.h"
+ #endif
+ #define PCAP_DEVICE_NAME description
+@@ -59,11 +59,11 @@
+ 
+ // Some platforms need HAVE_REMOTE to work with libpcap, but
+ // Apple platforms are not among them.
+-#ifndef __APPLE__
++#if !defined(__APPLE__) && (!defined(_WIN32) || defined(HOST_WINDOWS))
+ #define HAVE_REMOTE
+ #endif
+ 
+-#ifdef HOST_WINDOWS
++#ifdef _WIN32
+ #define WPCAP
+ #endif
+ 
+@@ -3224,7 +3224,7 @@
+ 	// Do nothing.
+ }
+ 
+-#ifndef HOST_WINDOWS
++#ifndef _WIN32
+ 
+ int POSIXPCapInterface::findalldevs(void** alldevs, char* errbuf)
+ {
+@@ -3805,7 +3805,7 @@
+ 
+ 	_packetCaptureFile = NULL;
+ 
+-	#ifndef HOST_WINDOWS
++	#ifndef _WIN32
+ 	_pcap = new POSIXPCapInterface;
+ 	_isSocketsSupported = true;
+ 	#else
+--- a/desmume/src/frontend/posix/meson.build
++++ b/desmume/src/frontend/posix/meson.build
+@@ -94,6 +94,10 @@
+   '../../../src/libretro-common/include',
+   '../../../src/frontend',
+ )
++
++if host_machine.system() == 'windows'
++  includes = [includes, include_directories('../windows/winpcap')]
++endif
+ 
+ libdesmume_src = [
+   '../../armcpu.cpp',

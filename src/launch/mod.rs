@@ -419,6 +419,41 @@ pub(crate) fn copy_file_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     crate::path_safety::atomic_copy_file(src, dst).map(|_| ())
 }
 
+/// Preserve Windows' executable-relative dependency lookup in an isolated runtime.
+pub(crate) fn copy_adjacent_dlls(binary: &Path, destination: &Path) -> std::io::Result<()> {
+    if !binary
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(binary.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "binary has no parent directory",
+        )
+    })?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+        {
+            if !entry.file_type()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "native dependency must be a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            copy_file_replace(&path, &destination.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())

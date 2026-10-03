@@ -1,0 +1,123 @@
+--- a/Source/Core/Core/HW/CPU.h
++++ b/Source/Core/Core/HW/CPU.h
+@@ -110,7 +110,8 @@
+   // PauseAndLock(), as while the CPU is in the run loop, it won't execute the function.
+   void AddCPUThreadJob(Common::MoveOnlyFunction<void()> function);
+   // No pause, wait, job execution or guest progress; callback retains CPU admission locks.
+-  bool EmucapWithParkedCPU(const std::function<bool(uint64_t)>& callback);
++  bool EmucapWithParkedCPU(const std::function<bool(uint64_t)>& callback,
++                           const char** rejected_by = nullptr);
+ 
+ private:
+   void FlushStepSyncEventLocked();
+--- a/Source/Core/Core/HW/CPU.cpp
++++ b/Source/Core/Core/HW/CPU.cpp
+@@ -439,15 +439,23 @@
+   m_pending_jobs.push(std::move(function));
+ }
+ 
+-bool CPUManager::EmucapWithParkedCPU(const std::function<bool(uint64_t)>& callback)
++bool CPUManager::EmucapWithParkedCPU(const std::function<bool(uint64_t)>& callback,
++                                    const char** rejected_by)
+ {
+   std::unique_lock stepping_lock(m_stepping_lock, std::try_to_lock);
+-  if (!stepping_lock) return false;
++  const auto reject = [&](const char* reason) {
++    if (rejected_by) *rejected_by = reason;
++    return false;
++  };
++  if (!stepping_lock) return reject("cpu_stepping_lock");
+   std::unique_lock state_lock(m_state_change_lock, std::try_to_lock);
+-  if (!state_lock || m_state != State::Stepping || m_state_cpu_thread_active ||
+-      m_state_cpu_step_instruction || m_state_paused_and_locked || !m_pending_jobs.empty() ||
+-      (m_emucap_job_active && !Core::IsCPUThread()))
+-    return false;
++  if (!state_lock) return reject("cpu_state_lock");
++  if (m_state != State::Stepping) return reject("cpu_not_stepping");
++  if (m_state_cpu_thread_active) return reject("cpu_active");
++  if (m_state_cpu_step_instruction) return reject("cpu_pending_step");
++  if (m_state_paused_and_locked) return reject("cpu_pause_owner");
++  if (!m_pending_jobs.empty()) return reject("cpu_pending_jobs");
++  if (m_emucap_job_active && !Core::IsCPUThread()) return reject("cpu_job_active");
+   return callback(m_emucap_memory_epoch);
+ }
+ 
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -101,7 +101,8 @@
+ // from the CPU thread. If the parameter is a pointer, the function has a fallback for being called
+ // from the wrong thread (with the argument being set to nullptr).
+ // No guest work is completed by this callback acquisition; zero means unverified park.
+-u64 EmucapWithParkedMemory(System& system, u64 expected_epoch, const std::function<void()>& callback);
++u64 EmucapWithParkedMemory(System& system, u64 expected_epoch,
++                           const std::function<void()>& callback, const char** rejected_by = nullptr);
+ 
+ class CPUThreadGuard final
+ {
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -1087,19 +1087,23 @@
+ }
+ 
+ u64 EmucapWithParkedMemory(System& system, u64 expected_epoch,
+-                           const std::function<void()>& callback)
++                           const std::function<void()>& callback, const char** rejected_by)
+ {
+   u64 verified = 0;
++  const auto reject = [&](const char* reason) {
++    if (rejected_by) *rejected_by = reason;
++    return false;
++  };
+   system.GetCPU().EmucapWithParkedCPU([&](u64 epoch) {
+-    if (expected_epoch && expected_epoch != epoch) return false;
++    if (expected_epoch && expected_epoch != epoch) return reject("memory_epoch_changed");
+     auto* dsp = system.GetDSP().GetDSPEmulator();
+-    if (!dsp || !dsp->EmucapTryLockIdle()) return false;
++    if (!dsp || !dsp->EmucapTryLockIdle()) return reject("dsp_not_idle");
+     Common::ScopeGuard unlock([&] { dsp->EmucapUnlockIdle(); });
+-    if (!system.GetFifo().EmucapMemoryIdle()) return false;
++    if (!system.GetFifo().EmucapMemoryIdle(rejected_by)) return false;
+     callback();
+     verified = epoch;
+     return true;
+-  });
++  }, rejected_by);
+   return verified;
+ }
+ 
+--- a/Source/Core/VideoCommon/Fifo.h
++++ b/Source/Core/VideoCommon/Fifo.h
+@@ -53,7 +53,7 @@
+   void Prepare();  // Must be called from the CPU thread.
+   void DoState(PointerWrap& f);
+   void PauseAndLock();
+-  bool EmucapMemoryIdle() const;
++  bool EmucapMemoryIdle(const char** rejected_by = nullptr) const;
+   void RestoreState(bool was_running);
+   void UpdateWantDeterminism(bool want);
+   bool UseDeterministicGPUThread() const { return m_use_deterministic_gpu_thread; }
+--- a/Source/Core/VideoCommon/Fifo.cpp
++++ b/Source/Core/VideoCommon/Fifo.cpp
+@@ -67,9 +67,19 @@
+   p.Do(m_syncing_suspended);
+ }
+ 
+-bool FifoManager::EmucapMemoryIdle() const
+-{
+-  return !m_emu_running_state.IsSet() && m_gpu_mainloop.IsDone();
++bool FifoManager::EmucapMemoryIdle(const char** rejected_by) const
++{
++  if (m_emu_running_state.IsSet())
++  {
++    if (rejected_by) *rejected_by = "fifo_running";
++    return false;
++  }
++  if (!m_gpu_mainloop.IsDone())
++  {
++    if (rejected_by) *rejected_by = "fifo_pending_work";
++    return false;
++  }
++  return true;
+ }
+ 
+ void FifoManager::PauseAndLock()

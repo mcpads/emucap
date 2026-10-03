@@ -136,7 +136,7 @@ fn generation_preparation_copies_mutable_state_and_writes_isolated_config() {
     assert!(config.contains("show_welcome = false"));
     assert!(config.contains("[audio]\nvolume_limit = 0.0"));
     assert!(config.contains("[input.bindings]\nport1 = \"keyboard\""));
-    assert!(config.contains(&prepared.hdd.display().to_string()));
+    assert!(config.contains(&prepared.hdd.display().to_string().replace('\\', "\\\\")));
     assert!(!config.contains(&firmware.root.display().to_string()));
 }
 

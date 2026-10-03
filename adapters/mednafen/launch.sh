@@ -351,6 +351,12 @@ if [ -n "$MEDNAFEN_BINARY_SHA256" ]; then
   export EMUCAP_MEDNAFEN_PATCHSET_SHA256="$MEDNAFEN_PATCHSET_SHA256"
 fi
 export MEDNAFEN_HOME="$RUN_DIR"
+case "$(uname -s 2>/dev/null || echo unknown)" in
+  MINGW*|MSYS*|CYGWIN*)
+    export MEDNAFEN_NOPOPUPS=1
+    export MEDNAFEN_NOSTDREDIR=1
+    ;;
+esac
 if [ -n "$NAME" ]; then
   export EMUCAP_NAME="$NAME"
 fi

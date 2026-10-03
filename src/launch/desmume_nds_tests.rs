@@ -129,9 +129,14 @@ fn resolve_binary_uses_repo_local_build_headless() {
     let _env = EnvGuard::new(&["EMUCAP_DESMUME_BIN"]);
     std::env::remove_var("EMUCAP_DESMUME_BIN");
     let dir = tempfile::tempdir().unwrap();
-    let cli = dir.path().join(
-        "adapters/desmume-nds/work/src/desmume/src/frontend/posix/build-headless/cli/desmume-cli",
-    );
+    let cli = dir
+        .path()
+        .join("adapters/desmume-nds/work/src/desmume/src/frontend/posix/build-headless/cli")
+        .join(if cfg!(windows) {
+            "desmume-cli.exe"
+        } else {
+            "desmume-cli"
+        });
     std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
     std::fs::write(&cli, b"fake desmume-cli").unwrap();
     #[cfg(unix)]

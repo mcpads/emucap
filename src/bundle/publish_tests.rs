@@ -136,6 +136,11 @@ fn write_exact(staging: &mut RecordingStaging, frames: u64) -> u64 {
 fn publishes_and_reverifies_a_canonical_input_movie_member() {
     let root = tempfile::tempdir().unwrap();
     let mut staging = RecordingStaging::prepare(root.path(), "capture-movie").unwrap();
+    fs::write(
+        staging.staging_path().join(RECOVERY_OWNER_MEMBER),
+        "local-owner",
+    )
+    .unwrap();
     let movie = b"0:right\n1:a,b\n";
     let identity = InputMovieIdentity {
         format: crate::input_movie::INPUT_MOVIE_FORMAT.into(),
@@ -161,6 +166,7 @@ fn publishes_and_reverifies_a_canonical_input_movie_member() {
         fs::read(published.bundle_path.join("input.movie")).unwrap(),
         movie
     );
+    assert!(!published.bundle_path.join(RECOVERY_OWNER_MEMBER).exists());
     assert!(verified
         .manifest
         .members

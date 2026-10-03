@@ -1,0 +1,9 @@
+--- a/Source/Core/Core/State.cpp
++++ b/Source/Core/Core/State.cpp
+@@ -110,5 +110,5 @@
+ constexpr std::array<u8, 16> PRESENTATION_SIGNATURE{
+     'E', 'M', 'U', 'C', 'A', 'P', 'P', 'S', 5, 0, 0, 0, 16, 0, 0, 0};
+-constexpr u32 COMPRESSED_DATA_OFFSET = PRESENTATION_SIGNATURE.size();
++constexpr u32 COMPRESSED_DATA_OFFSET = static_cast<u32>(PRESENTATION_SIGNATURE.size());
+ 
+ constexpr u32 COOKIE_BASE = 0xBAADBABE;

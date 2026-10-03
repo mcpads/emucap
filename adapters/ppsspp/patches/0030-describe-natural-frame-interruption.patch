@@ -1,0 +1,13 @@
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -170,8 +170,8 @@
+ 	if (!frameOperation_.empty())
+ 		json.writeString("operation_id", frameOperation_);
+ 	json.writeString("status", result.status == EmucapFrameStepStatus::Completed ? "completed" : "interrupted");
+-	if (!frameStopReason_.empty() && result.status != EmucapFrameStepStatus::Completed)
+-		json.writeString("reason", frameStopReason_);
++	if (result.status != EmucapFrameStepStatus::Completed)
++		json.writeString("reason", frameStopReason_.empty() ? "native_halt" : frameStopReason_);
+ 	json.writeString("unit", "frames");
+ 	json.writeUint("count", result.requested);
+ 	json.writeUint("completed", result.completed);

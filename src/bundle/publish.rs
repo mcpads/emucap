@@ -1,3 +1,5 @@
+pub(crate) const RECOVERY_OWNER_MEMBER: &str = ".emucap-capture-owner";
+
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -481,14 +483,14 @@ impl RecordingStaging {
             self.capture_id,
             ulid::Ulid::generate().to_string().to_ascii_lowercase()
         ));
-        fs::rename(&self.staging_path, &quarantine)?;
-        File::open(&self.output_root)?.sync_all()?;
+        crate::path_safety::rename_directory(&self.staging_path, &quarantine)?;
+        crate::path_safety::sync_directory(&self.output_root)?;
         Ok(quarantine)
     }
 
     pub fn discard(self) -> Result<(), PublishError> {
         fs::remove_dir_all(&self.staging_path)?;
-        File::open(&self.output_root)?.sync_all()?;
+        crate::path_safety::sync_directory(&self.output_root)?;
         Ok(())
     }
 
@@ -589,7 +591,12 @@ impl RecordingStaging {
             return Err(PublishError::Io(error));
         }
         drop(manifest_file);
-        if let Err(error) = File::open(&self.staging_path).and_then(|file| file.sync_all()) {
+        match fs::remove_file(self.staging_path.join(RECOVERY_OWNER_MEMBER)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(PublishError::Io(error)),
+        }
+        if let Err(error) = crate::path_safety::sync_directory(&self.staging_path) {
             return Err(PublishError::Io(error));
         }
         if fs::symlink_metadata(&self.destination_path).is_ok() {
@@ -599,11 +606,13 @@ impl RecordingStaging {
         if fault == PublishFault::Rename {
             return Err(PublishError::Injected("rename"));
         }
-        if let Err(error) = fs::rename(&self.staging_path, &self.destination_path) {
+        if let Err(error) =
+            crate::path_safety::rename_directory(&self.staging_path, &self.destination_path)
+        {
             return Err(PublishError::Io(error));
         }
         self.staging_path = self.destination_path.clone();
-        if let Err(error) = File::open(&self.output_root).and_then(|file| file.sync_all()) {
+        if let Err(error) = crate::path_safety::sync_directory(&self.output_root) {
             return Err(PublishError::Io(error));
         }
         Ok(PublishedRecording {

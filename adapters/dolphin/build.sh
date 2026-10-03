@@ -50,6 +50,7 @@ git -C "$SRC" checkout -- \
   Source/Core/VideoCommon/Present.h \
   Source/Core/VideoCommon/VideoBackendBase.cpp \
   Source/Core/VideoCommon/VideoBackendBase.h \
+  Source/Core/VideoCommon/VideoConfig.cpp \
   Source/Core/VideoCommon/VideoState.cpp \
   Source/Core/VideoCommon/VideoState.h \
   Source/Core/Common/Config/ConfigInfo.h \
@@ -58,6 +59,7 @@ git -C "$SRC" checkout -- \
   Source/Core/Common/Config/Layer.cpp \
   Source/Core/Common/Config/Config.cpp \
   Source/Core/Common/ChunkFile.h \
+  Source/Core/Common/x64CPUDetect.cpp \
   Source/Core/VideoCommon/TextureCacheBase.cpp \
   Source/Core/VideoCommon/TextureCacheBase.h \
   Source/Core/VideoCommon/TextureConfig.cpp \
@@ -67,6 +69,9 @@ git -C "$SRC" checkout -- \
   Source/Core/DolphinQt/Config/SDLHints/SDLHintsWindow.cpp \
   Source/Core/Core/CMakeLists.txt \
   Source/Core/Core/DSPEmulator.h \
+  Source/Core/Core/HW/DSPLLE/DSPLLE.cpp \
+  Source/Core/VideoCommon/Fifo.cpp \
+  Source/Core/VideoCommon/Fifo.h \
   Source/Core/Core/HW/DSPLLE/DSPLLE.h \
   Source/Core/Core/Core.cpp \
   Source/Core/Core/Core.h \
@@ -106,6 +111,9 @@ git -C "$SRC" clean -fdq -- \
   Source/Core/Core/EmuCapInput.cpp \
   Source/Core/Core/EmuCapInput.h \
   Source/Core/Core/EmuCapTemporal.h \
+  Source/Core/Core/EmuCapOwner.h \
+  Source/Core/Core/EmuCapWire.h \
+  Source/Core/Core/EmuCapOwned.inl \
   Source/Core/Core/EmuCapPacing.h \
   Source/Core/Core/EmuCapAudio.h
 cp "$HERE/EmuCap.cpp" "$SRC/Source/Core/Core/EmuCap.cpp"
@@ -113,6 +121,9 @@ cp "$HERE/EmuCap.h" "$SRC/Source/Core/Core/EmuCap.h"
 cp "$HERE/EmuCapInput.cpp" "$SRC/Source/Core/Core/EmuCapInput.cpp"
 cp "$HERE/EmuCapInput.h" "$SRC/Source/Core/Core/EmuCapInput.h"
 cp "$HERE/EmuCapTemporal.h" "$SRC/Source/Core/Core/EmuCapTemporal.h"
+cp "$HERE/EmuCapOwner.h" "$SRC/Source/Core/Core/EmuCapOwner.h"
+cp "$HERE/EmuCapWire.h" "$SRC/Source/Core/Core/EmuCapWire.h"
+cp "$HERE/EmuCapOwned.inl" "$SRC/Source/Core/Core/EmuCapOwned.inl"
 cp "$HERE/EmuCapPacing.h" "$SRC/Source/Core/Core/EmuCapPacing.h"
 cp "$HERE/EmuCapAudio.h" "$SRC/Source/Core/Core/EmuCapAudio.h"
 for patch in "$HERE"/patches/*.patch; do
@@ -150,7 +161,7 @@ cmake --build "$HEADLESS_BUILD" --target dolphin-nogui -j "$JOBS"
 PATCHSET_SHA256="$(
   cd "$HERE"
   {
-    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h EmuCapPacing.h EmuCapAudio.h
+    shasum -a 256 EmuCap.cpp EmuCap.h EmuCapInput.cpp EmuCapInput.h EmuCapTemporal.h EmuCapPacing.h EmuCapAudio.h EmuCapOwner.h EmuCapWire.h EmuCapOwned.inl
     find patches -type f -name '*.patch' -print0 |
       LC_ALL=C sort -z |
       xargs -0 shasum -a 256

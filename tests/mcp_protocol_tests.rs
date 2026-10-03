@@ -113,7 +113,13 @@ fn spawn_analysis_adapter(port: u16) -> (JoinHandle<()>, Arc<Mutex<Vec<String>>>
         let mut writer = stream.try_clone().expect("clone fake adapter stream");
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
-        while reader.read_line(&mut line).expect("read control request") != 0 {
+        loop {
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                Err(error) => panic!("read control request: {error}"),
+            }
             let request: Value = serde_json::from_str(line.trim()).expect("control request JSON");
             line.clear();
             let method = request["method"].as_str().expect("control method");
@@ -861,7 +867,9 @@ fn bootstrap_redacts_terminal_content_until_status_is_requested() {
     let store = RuntimeStore::new(root.path().join("sessions"));
     let prepared = store.prepare(port).expect("prepare terminal generation");
     let secret_content = root.path().join("private/previous-game.sfc");
-    let mut exited_process = Command::new("/usr/bin/true")
+    let mut exited_process = Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--list")
+        .stdout(Stdio::null())
         .spawn()
         .expect("spawn short-lived process");
     let exited_pid = exited_process.id();

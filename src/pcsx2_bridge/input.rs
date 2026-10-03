@@ -119,7 +119,7 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
     }
 }
 
-fn require_port_zero(params: &Value) -> BridgeResult<()> {
+pub(super) fn require_port_zero(params: &Value) -> BridgeResult<()> {
     let port = optional_num(params, "port")?.unwrap_or(0);
     if port != 0 {
         return Err(Pcsx2BridgeError::BadParams(format!(
@@ -129,7 +129,7 @@ fn require_port_zero(params: &Value) -> BridgeResult<()> {
     Ok(())
 }
 
-fn buttons_to_mask(raw: Option<&Value>) -> BridgeResult<(u32, Vec<String>)> {
+pub(super) fn buttons_to_mask(raw: Option<&Value>) -> BridgeResult<(u32, Vec<String>)> {
     let Some(raw) = raw else {
         return Ok((0, Vec::new()));
     };

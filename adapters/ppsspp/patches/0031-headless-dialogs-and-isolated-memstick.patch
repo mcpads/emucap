@@ -1,0 +1,53 @@
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -86,12 +86,32 @@
+ 	return -1;
+ }
+ float System_GetPropertyFloat(SystemProperty prop) { return -1.0f; }
++static void ConfigureMemstick(const Path &exePath) {
++	if (const char *managedRoot = getenv("EMUCAP_PPSSPP_MEMSTICK"); managedRoot && *managedRoot) {
++		g_Config.memStickDirectory = Path(managedRoot);
++		File::CreateFullPath(g_Config.memStickDirectory);
++		CreateSysDirectories();
++		return;
++	}
++#if PPSSPP_PLATFORM(WINDOWS)
++	// Mount a filesystem
++	g_Config.memStickDirectory = exePath / "memstick";
++	File::CreateDir(g_Config.memStickDirectory);
++	CreateSysDirectories();
++#elif !PPSSPP_PLATFORM(ANDROID)
++	g_Config.memStickDirectory = Path(std::string(getenv("HOME"))) / ".ppsspp";
++#endif
++}
++
+ bool System_GetPropertyBool(SystemProperty prop) {
+ 	switch (prop) {
+ 		case SYSPROP_CAN_JIT:
+ 			return true;
+-		case SYSPROP_SKIP_UI:
+-			return true;
++		case SYSPROP_SKIP_UI: {
++			// Managed screenshots include guest system dialogs, even without a window.
++			const char *managedRoot = getenv("EMUCAP_PPSSPP_MEMSTICK");
++			return !(managedRoot && *managedRoot);
++		}
+ 		default:
+ 			return false;
+ 	}
+@@ -634,14 +654,7 @@
+ 	Path exePath = File::GetExeDirectory();
+ 	g_Config.flash0Directory = exePath / "assets/flash0";
+ 
+-#if PPSSPP_PLATFORM(WINDOWS)
+-	// Mount a filesystem
+-	g_Config.memStickDirectory = exePath / "memstick";
+-	File::CreateDir(g_Config.memStickDirectory);
+-	CreateSysDirectories();
+-#elif !PPSSPP_PLATFORM(ANDROID)
+-	g_Config.memStickDirectory = Path(std::string(getenv("HOME"))) / ".ppsspp";
+-#endif
++	ConfigureMemstick(exePath);
+ 
+ 	// Try to find the flash0 directory.  Often this is from a subdirectory.
+ 	Path nextPath = exePath;

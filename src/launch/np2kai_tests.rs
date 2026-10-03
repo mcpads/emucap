@@ -15,6 +15,10 @@ fn default_paths_stay_inside_the_np2kai_adapter() {
     let root = Path::new("/repo");
     assert!(default_core_path(root).starts_with(root.join("adapters/np2kai/work")));
     assert!(default_build_info_path(root).starts_with(root.join("adapters/np2kai/work")));
+    assert_eq!(
+        default_core_path(root).extension().unwrap(),
+        std::env::consts::DLL_EXTENSION
+    );
 }
 
 #[test]

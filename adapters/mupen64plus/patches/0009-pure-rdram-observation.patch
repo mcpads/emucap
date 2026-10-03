@@ -1,0 +1,35 @@
+--- a/src/api/debugger.c
++++ b/src/api/debugger.c
+@@ -288,6 +288,22 @@
+ #endif
+ }
+ 
++/* The host owns a completed debugger/frame barrier throughout this copy.
++ * Read storage directly: execution handlers may fire watchpoints even while the
++ * host frame callback is parked and the native debugger remains RUNNING. */
++EXPORT m64p_error CALL DebugMemReadRdram(uint32_t offset, uint8_t* output, uint32_t length)
++{
++    const struct rdram* rdram = &g_dev.rdram;
++    if (!rdram->dram || !rdram->dram_size) return M64ERR_INVALID_STATE;
++    if (offset > rdram->dram_size || length > rdram->dram_size - offset ||
++        (length && !output)) return M64ERR_INPUT_INVALID;
++    for (uint32_t i = 0; i < length; ++i) {
++        const uint32_t address = offset + i;
++        output[i] = (uint8_t)(rdram->dram[address >> 2] >> ((3 - (address & 3)) * 8));
++    }
++    return M64ERR_SUCCESS;
++}
++
+ EXPORT unsigned char CALL DebugMemRead8(unsigned int address)
+ {
+ #ifdef DBG
+--- a/src/api/api_export.ver
++++ b/src/api/api_export.ver
+@@ -57,6 +57,7 @@
+ DebugMemRead32;
+ DebugMemRead64;
+ DebugMemRead8;
++DebugMemReadRdram;
+ DebugMemWrite16;
+ DebugMemWrite32;
+ DebugMemWrite64;

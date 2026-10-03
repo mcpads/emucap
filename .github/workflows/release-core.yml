@@ -4,15 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (the corresponding release must be a draft)
-        required: true
+        description: Existing release tag (omit for validation only)
+        required: false
         type: string
+      validate_only:
+        description: Validate this branch without a tag or publication
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-core-${{ inputs.tag }}
+  group: release-core-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -28,49 +32,25 @@ jobs:
         shell: bash
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          VALIDATE_ONLY: ${{ inputs.validate_only }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          revision=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          if [ "$VALIDATE_ONLY" = true ]; then
+            revision=$(git rev-parse HEAD)
+          else
+            [[ "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+            revision=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          fi
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
 
   build:
     needs: resolve
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-          - os: macos-14
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          path: packaging
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.resolve.outputs.revision }}
-          path: source
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Build only the four core executables
-        working-directory: source
-        run: cargo build --locked --release --target ${{ matrix.target }} --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
-      - name: Package and validate on the target OS
-        run: python packaging/_tests/release/package_core.py --source source --target ${{ matrix.target }} --version ${{ inputs.tag }} --revision ${{ needs.resolve.outputs.revision }} --output artifacts
-      - uses: actions/upload-artifact@v4
-        with:
-          name: core-${{ matrix.target }}
-          path: artifacts/*
-          if-no-files-found: error
+    uses: ./.github/workflows/core-validation.yml
+    with:
+      revision: ${{ needs.resolve.outputs.revision }}
+      version: ${{ inputs.tag }}
 
   publish:
+    if: ${{ !inputs.validate_only }}
     needs: [resolve, build]
     runs-on: ubuntu-22.04
     permissions:
@@ -100,4 +80,8 @@ jobs:
           cat *.sha256 > SHA256SUMS
           sha256sum --check SHA256SUMS
           gh release upload "$RELEASE_TAG" *.tar.gz *.zip *.json SHA256SUMS
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          if [[ "$RELEASE_TAG" == *-rc.* ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$RELEASE_TAG" --draft=false --prerelease=false --latest
+          fi

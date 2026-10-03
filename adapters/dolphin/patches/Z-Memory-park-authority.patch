@@ -1,0 +1,207 @@
+--- a/Source/Core/Core/HW/CPU.h
++++ b/Source/Core/Core/HW/CPU.h
+@@ -4,6 +4,8 @@
+ #pragma once
+ 
+ #include <condition_variable>
++#include <cstdint>
++#include <functional>
+ #include <mutex>
+ #include <queue>
+ 
+@@ -107,6 +109,8 @@
+   // Adds a job to be executed during on the CPU thread. This should be combined with
+   // PauseAndLock(), as while the CPU is in the run loop, it won't execute the function.
+   void AddCPUThreadJob(Common::MoveOnlyFunction<void()> function);
++  // No pause, wait, job execution or guest progress; callback retains CPU admission locks.
++  bool EmucapWithParkedCPU(const std::function<bool(uint64_t)>& callback);
+ 
+ private:
+   void FlushStepSyncEventLocked();
+@@ -139,6 +143,8 @@
+   std::condition_variable m_state_cpu_idle_cvar;
+   // When m_state changes / m_state_paused_and_locked becomes false (for CPU Thread only)
+   std::condition_variable m_state_cpu_cvar;
++  uint64_t m_emucap_memory_epoch = 1;
++  bool m_emucap_job_active = false;
+   bool m_state_cpu_thread_active = false;
+   bool m_state_paused_and_locked = false;
+   bool m_state_system_request_stepping = false;
+--- a/Source/Core/Core/HW/CPU.cpp
++++ b/Source/Core/Core/HW/CPU.cpp
+@@ -61,9 +61,11 @@
+   {
+     auto callback = std::move(m_pending_jobs.front());
+     m_pending_jobs.pop();
++    m_emucap_job_active = true;
+     state_lock.unlock();
+     callback();
+     state_lock.lock();
++    m_emucap_job_active = false;
+   }
+ }
+ 
+@@ -126,6 +128,7 @@
+     switch (m_state)
+     {
+     case State::Running:
++      ++m_emucap_memory_epoch;
+       m_state_cpu_thread_active = true;
+       state_lock.unlock();
+ 
+@@ -192,6 +195,7 @@
+         continue;
+ 
+       // Do step
++      ++m_emucap_memory_epoch;
+       m_state_cpu_thread_active = true;
+       state_lock.unlock();
+ 
+@@ -283,6 +287,7 @@
+   if (m_state_cpu_step_instruction_sync && m_state_cpu_step_instruction_sync != event)
+     m_state_cpu_step_instruction_sync->Set();
+ 
++  ++m_emucap_memory_epoch;
+   m_state_cpu_step_instruction = true;
+   m_state_cpu_step_instruction_sync = event;
+   m_state_cpu_cvar.notify_one();
+@@ -312,6 +317,7 @@
+     return false;
+   if (s == State::Stepping)
+     m_system.GetPowerPC().GetBreakPoints().ClearTemporary();
++  ++m_emucap_memory_epoch;
+   m_state = s;
+   return true;
+ }
+@@ -429,7 +435,20 @@
+ void CPUManager::AddCPUThreadJob(Common::MoveOnlyFunction<void()> function)
+ {
+   std::unique_lock state_lock(m_state_change_lock);
++  ++m_emucap_memory_epoch;
+   m_pending_jobs.push(std::move(function));
+ }
+ 
++bool CPUManager::EmucapWithParkedCPU(const std::function<bool(uint64_t)>& callback)
++{
++  std::unique_lock stepping_lock(m_stepping_lock, std::try_to_lock);
++  if (!stepping_lock) return false;
++  std::unique_lock state_lock(m_state_change_lock, std::try_to_lock);
++  if (!state_lock || m_state != State::Stepping || m_state_cpu_thread_active ||
++      m_state_cpu_step_instruction || m_state_paused_and_locked || !m_pending_jobs.empty() ||
++      (m_emucap_job_active && !Core::IsCPUThread()))
++    return false;
++  return callback(m_emucap_memory_epoch);
++}
++
+ }  // namespace CPU
+--- a/Source/Core/Core/DSPEmulator.h
++++ b/Source/Core/Core/DSPEmulator.h
+@@ -19,6 +19,9 @@
+   virtual bool IsLLE() const = 0;
+   // Observe under Core::CPUThreadGuard, including DSP/FIFO ownership.
+   virtual bool HasWorkerThread() const { return false; }
++  // CPU admission must already be locked. HLE has no independent guest writer.
++  virtual bool EmucapTryLockIdle() { return true; }
++  virtual void EmucapUnlockIdle() {}
+ 
+   virtual bool Initialize(bool wii, bool dsp_thread) = 0;
+   virtual void Shutdown() = 0;
+--- a/Source/Core/Core/HW/DSPLLE/DSPLLE.h
++++ b/Source/Core/Core/HW/DSPLLE/DSPLLE.h
+@@ -28,6 +28,8 @@
+   bool HasWorkerThread() const override { return m_dsp_thread.joinable(); }
+   void DoState(PointerWrap& p) override;
+   void PauseAndLock() override;
++  bool EmucapTryLockIdle() override;
++  void EmucapUnlockIdle() override;
+   void UnpauseAndUnlock() override;
+ 
+   void DSP_WriteMailBoxHigh(bool cpu_mailbox, u16 value) override;
+--- a/Source/Core/Core/HW/DSPLLE/DSPLLE.cpp
++++ b/Source/Core/Core/HW/DSPLLE/DSPLLE.cpp
+@@ -284,6 +284,23 @@
+   return 12600;  // TO BE TWEAKED
+ }
+ 
++bool DSPLLE::EmucapTryLockIdle()
++{
++  if (!m_dsp_thread_mutex.try_lock()) return false;
++  if (m_cycle_count.load() != 0)
++  {
++    m_dsp_thread_mutex.unlock();
++    return false;
++  }
++  return true;
++}
++
++void DSPLLE::EmucapUnlockIdle()
++{
++  // Observation must not signal or schedule the DSP worker.
++  m_dsp_thread_mutex.unlock();
++}
++
+ void DSPLLE::PauseAndLock()
+ {
+   m_dsp_thread_mutex.lock();
+--- a/Source/Core/VideoCommon/Fifo.h
++++ b/Source/Core/VideoCommon/Fifo.h
+@@ -53,6 +53,7 @@
+   void Prepare();  // Must be called from the CPU thread.
+   void DoState(PointerWrap& f);
+   void PauseAndLock();
++  bool EmucapMemoryIdle() const;
+   void RestoreState(bool was_running);
+   void UpdateWantDeterminism(bool want);
+   bool UseDeterministicGPUThread() const { return m_use_deterministic_gpu_thread; }
+--- a/Source/Core/VideoCommon/Fifo.cpp
++++ b/Source/Core/VideoCommon/Fifo.cpp
+@@ -65,6 +65,11 @@
+ 
+   p.Do(m_sync_ticks);
+   p.Do(m_syncing_suspended);
++}
++
++bool FifoManager::EmucapMemoryIdle() const
++{
++  return !m_emu_running_state.IsSet() && m_gpu_mainloop.IsDone();
+ }
+ 
+ void FifoManager::PauseAndLock()
+--- a/Source/Core/Core/Core.h
++++ b/Source/Core/Core/Core.h
+@@ -100,6 +100,9 @@
+ // Some functions use a parameter of this type to indicate that the function should only be called
+ // from the CPU thread. If the parameter is a pointer, the function has a fallback for being called
+ // from the wrong thread (with the argument being set to nullptr).
++// No guest work is completed by this callback acquisition; zero means unverified park.
++u64 EmucapWithParkedMemory(System& system, u64 expected_epoch, const std::function<void()>& callback);
++
+ class CPUThreadGuard final
+ {
+ public:
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -1086,6 +1086,23 @@
+   ControlReference::SetInputGate(focus_passes && full_focus_passes);
+ }
+ 
++u64 EmucapWithParkedMemory(System& system, u64 expected_epoch,
++                           const std::function<void()>& callback)
++{
++  u64 verified = 0;
++  system.GetCPU().EmucapWithParkedCPU([&](u64 epoch) {
++    if (expected_epoch && expected_epoch != epoch) return false;
++    auto* dsp = system.GetDSP().GetDSPEmulator();
++    if (!dsp || !dsp->EmucapTryLockIdle()) return false;
++    Common::ScopeGuard unlock([&] { dsp->EmucapUnlockIdle(); });
++    if (!system.GetFifo().EmucapMemoryIdle()) return false;
++    callback();
++    verified = epoch;
++    return true;
++  });
++  return verified;
++}
++
+ CPUThreadGuard::CPUThreadGuard(Core::System& system)
+     : m_system(system), m_was_cpu_thread(IsCPUThread())
+ {

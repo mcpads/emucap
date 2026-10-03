@@ -1,0 +1,74 @@
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -1994,4 +1994,30 @@
+ }
+ 
++static void PrepareFrameFormat(EmulateSpecStruct *espec)
++{
++ if(!espec->CustomPalette)
++ {
++  espec->CustomPalette = CustomPalette;
++  espec->CustomPaletteNumEntries = CustomPaletteNumEntries;
++ }
++
++ if(last_pixel_format != espec->surface->format)
++ {
++  espec->VideoFormatChanged = true;
++
++  last_pixel_format = espec->surface->format;
++ }
++
++ if(fabs(espec->SoundRate - last_sound_rate) >= 0.5)
++ {
++  //puts("Rate Change");
++  espec->SoundFormatChanged = true;
++  last_sound_rate = espec->SoundRate;
++
++  ff_resampler.buffer_size((espec->SoundRate / 2) * 2);
++ }
++
++}
++
+ static void PrepareFrameOutput(EmulateSpecStruct *espec)
+ {
+@@ -2006,9 +2032,5 @@
+  volume_save = 1;
+ 
+- if(!espec->CustomPalette)
+- {
+-  espec->CustomPalette = CustomPalette;
+-  espec->CustomPaletteNumEntries = CustomPaletteNumEntries;
+- }
++ PrepareFrameFormat(espec);
+ 
+  // Initialize some espec member data to zero, to catch some types of bugs.
+@@ -2022,20 +2044,4 @@
+  espec->SoundBufSize = 0;
+ 
+- if(last_pixel_format != espec->surface->format)
+- {
+-  espec->VideoFormatChanged = true;
+-
+-  last_pixel_format = espec->surface->format;
+- }
+-
+- if(fabs(espec->SoundRate - last_sound_rate) >= 0.5)
+- {
+-  //puts("Rate Change");
+-  espec->SoundFormatChanged = true;
+-  last_sound_rate = espec->SoundRate;
+-
+-  ff_resampler.buffer_size((espec->SoundRate / 2) * 2);
+- }
+-
+  // We want to record movies without any dropped video frames and without fast-forwarding sound distortion and without custom volume.
+  // The same goes for WAV recording(sans the dropped video frames bit :b).
+@@ -2085,5 +2091,7 @@
+ {
+  EmucapFrameCall::Scope output_call(EmucapOutputCall, *espec, MDFNGameInfo->soundchan);
+- if(!output_call.restored())
++ if(output_call.restored())
++  PrepareFrameFormat(espec);
++ else
+   PrepareFrameOutput(espec);
+ 

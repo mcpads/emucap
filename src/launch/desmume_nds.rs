@@ -19,9 +19,13 @@ pub fn resolve_binary(repo_root: &Path) -> Option<PathBuf> {
         let p = PathBuf::from(explicit);
         return is_runnable_file(&p).then_some(p);
     }
-    let local = repo_root.join(
-        "adapters/desmume-nds/work/src/desmume/src/frontend/posix/build-headless/cli/desmume-cli",
-    );
+    let local = repo_root
+        .join("adapters/desmume-nds/work/src/desmume/src/frontend/posix/build-headless/cli")
+        .join(if cfg!(windows) {
+            "desmume-cli.exe"
+        } else {
+            "desmume-cli"
+        });
     is_runnable_file(&local).then_some(local)
 }
 

@@ -1659,6 +1659,9 @@ fn occupied_graceful_returns_diagnostic_not_error() {
 
 #[test]
 fn occupied_graceful_own_stale_token_labeled_not_foreign() {
+    let _guard = env_lock();
+    let _restore = EnvRestore::new(&["EMUCAP_SESSION_ID"]);
+    std::env::set_var("EMUCAP_SESSION_ID", "launch-owned-token-test");
     // 토큰파일 유실로 자기 에뮬이 mismatch난 경우: foreign 오라벨 금지(무한 재연결 루프 방지).
     let occupant = EmulatorIdentity {
         system: Some("ss".into()),

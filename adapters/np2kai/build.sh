@@ -58,6 +58,9 @@ PATCHES=(
   "$HERE/patches/0004-include-integer-abs-declaration.patch"
   "$HERE/patches/0005-preserve-high-resolution-timer-state.patch"
   "$HERE/patches/0006-add-side-effect-free-memory-peek.patch"
+  "$HERE/patches/0007-preflight-native-peek-ranges.patch"
+  "$HERE/patches/0008-initialize-wide-graphics-setting.patch"
+  "$HERE/patches/0009-export-windows-debug-api.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256_path /dev/stdin)"
 if [ "$ACTUAL_PATCHSET_SHA256" != "$NP2KAI_PATCHSET_SHA256" ]; then
@@ -96,7 +99,8 @@ done
 case "$(uname -s)" in
   Darwin) PLATFORM=osx; CORE="$SRC/sdl/np2kai_libretro.dylib" ;;
   Linux) PLATFORM=unix; CORE="$SRC/sdl/np2kai_libretro.so" ;;
-  *) echo "ERROR: the supported NP2kai build currently targets macOS and Linux" >&2; exit 2 ;;
+  MINGW*|MSYS*) PLATFORM=win; CORE="$SRC/sdl/np2kai_libretro.dll" ;;
+  *) echo "ERROR: NP2kai requires macOS, Linux, or Windows MSYS2" >&2; exit 2 ;;
 esac
 
 MAKE_ENV=(
@@ -140,15 +144,15 @@ for forbidden_define in \
   reject_define "$forbidden_define"
 done
 
-if rg -n '/sound/fmgen/|/sound/mame/|/fpu/fpemul_dosbox|/fpu/fpemul_softfloat\.c$|/fpu/softfloat/|/wab/tgui9680\.c$' "$SOURCES"; then
+if grep -En '/sound/fmgen/|/sound/mame/|/fpu/fpemul_dosbox|/fpu/fpemul_softfloat\.c$|/fpu/softfloat/|/wab/tgui9680\.c$' "$SOURCES"; then
   echo "ERROR: restricted source entered the NP2kai compile manifest" >&2
   exit 1
 fi
-rg -q '/sound/mamebsd/' "$SOURCES" || {
+grep -q '/sound/mamebsd/' "$SOURCES" || {
   echo "ERROR: BSD MAME sound implementation is absent from the compile manifest" >&2
   exit 1
 }
-rg -q '/fpu/softfloat3/' "$SOURCES" || {
+grep -q '/fpu/softfloat3/' "$SOURCES" || {
   echo "ERROR: SoftFloat 3 is absent from the compile manifest" >&2
   exit 1
 }
@@ -180,6 +184,8 @@ DEBUG_SYMBOLS="$(nm -g "$CORE")"
 for required_symbol in \
   emucap_np2_debug_api_version \
   emucap_np2_read_memory \
+  emucap_np2_peek_memory \
+  emucap_np2_validate_peek_ranges \
   emucap_np2_write_memory \
   emucap_np2_get_regs \
   emucap_np2_step_instruction \

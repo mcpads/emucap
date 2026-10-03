@@ -11,6 +11,7 @@ use crate::live::protocol::Request;
 struct FakeGdb {
     replies: VecDeque<String>,
     async_packets: VecDeque<String>,
+    async_after_send: Option<(String, String)>,
     sent: Vec<String>,
     timeout: Duration,
     timeout_changes: Vec<Duration>,
@@ -27,6 +28,7 @@ impl FakeGdb {
         Self {
             replies: replies.iter().map(|v| (*v).into()).collect(),
             async_packets: VecDeque::new(),
+            async_after_send: None,
             sent: Vec::new(),
             timeout: Duration::from_secs(5),
             timeout_changes: Vec::new(),
@@ -68,6 +70,14 @@ impl FakeGdb {
 impl GdbTransport for FakeGdb {
     fn send(&mut self, payload: &str) -> GdbResult<String> {
         self.sent.push(payload.into());
+        if self
+            .async_after_send
+            .as_ref()
+            .is_some_and(|(trigger, _)| trigger == payload)
+        {
+            let (_, stop) = self.async_after_send.take().unwrap();
+            self.async_packets.push_back(stop);
+        }
         if payload == "qEmucap,features" {
             return Ok(self.features.clone());
         }
@@ -1199,13 +1209,15 @@ fn state_io_rejections_preserve_control_but_uncertain_restore_is_terminal() {
 #[test]
 fn memory_batches_advertise_each_supported_pause_owner() {
     for native_state_io in [false, true] {
-        let mut gdb = FakeGdb::default();
-        gdb.features = if native_state_io {
-            "peek_block,settled_state_io"
-        } else {
-            "peek_block"
-        }
-        .into();
+        let gdb = FakeGdb {
+            features: if native_state_io {
+                "peek_block,settled_state_io"
+            } else {
+                "peek_block"
+            }
+            .into(),
+            ..FakeGdb::default()
+        };
         let mut bridge = NeoGeoBridge::new(gdb, GdbBridgeEnv::default(), "neogeo_aes").unwrap();
         let hello = bridge.hello().unwrap();
         let kinds = hello["memory_batch_capability"]["halt_kinds"]
@@ -1218,5 +1230,157 @@ fn memory_batches_advertise_each_supported_pause_owner() {
             kinds.iter().any(|kind| kind == "settled_scheduler"),
             native_state_io
         );
+    }
+}
+
+#[test]
+fn native_batch_rejection_publishes_no_partial_result() {
+    for system in ["neogeo_aes", "neogeo_mvs", "neogeo_cd"] {
+        for bad in [
+            "OK|2@1.5|30|0102",
+            "OK|2@1.5|30|0102,zz",
+            "OK|2@1.5|30|0102,ff,00",
+        ] {
+            let mut bridge = featured(system, &[bad, "OK|2@1.5|30|aabb,cc"]);
+            let params = json!({"ranges":[
+                {"memory_type":"ram","address":16,"length":2},
+                {"memory_type":"ram","address":0,"length":1}
+            ]});
+            let rejected =
+                bridge.handle_request(Request::new(901, "read_memory_batch", params.clone()));
+            assert!(!rejected.ok && rejected.result.is_none(), "{system}: {bad}");
+            let next = bridge.handle_request(Request::new(902, "read_memory_batch", params));
+            assert!(next.ok, "{:?}", next.error);
+            let value = next.result.unwrap();
+            assert_eq!(value["reads"][0]["hex"], "aabb");
+            assert_eq!(value["reads"][1]["hex"], "cc");
+        }
+    }
+}
+
+#[test]
+fn unverified_pacing_transaction_retires_control() {
+    for bad in [
+        "broken",
+        "E77",
+        "1|1|1000|1.0|0|0|0.1;broken;1@2.0|9;1@2.0|9",
+    ] {
+        let mut bridge = featured("neogeo_aes", &[bad]);
+        let reply = bridge.handle_request(Request::new(
+            901,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(!reply.ok && reply.result.is_none(), "{bad}");
+        assert!(bridge.backend_terminal(), "{bad}");
+    }
+}
+
+#[test]
+fn pacing_preserves_breakpoint_arriving_before_or_during_transaction() {
+    for system in ["neogeo_aes", "neogeo_mvs", "neogeo_cd"] {
+        for (pending_before, boundary_after) in
+            [(true, "1@2.0|9"), (false, "1@2.0|9"), (false, "2@2.1|10")]
+        {
+            let transaction = format!(
+                "1|1|1000|1.0|0|0|0.017734;2|1|500|1.0|0|0|0.017734;1@2.0|9;{boundary_after}"
+            );
+            let mut bridge = if pending_before {
+                featured(system, &["BP:4", "BP:5", &transaction])
+            } else {
+                featured(system, &["BP:4", &transaction, "BP:5"])
+            };
+            let armed = bridge.handle_request(request(
+                1,
+                "set_breakpoint",
+                json!({"kind":"exec","start":0x100,"end":0x100,"pause_on_hit":true}),
+            ));
+            assert_eq!(armed.result.unwrap()["id"], 1);
+            let regs: Vec<u8> = (0..REG_NAMES.len() as u32)
+                .flat_map(u32::to_le_bytes)
+                .collect();
+            bridge.gdb.async_after_send = Some((
+                format!("qEmucap,setpacing,{}", hex::encode("limited|500")),
+                format!("T05hwbreak:00010000;idx:4;seq:1;regs:{}", hex::encode(regs)),
+            ));
+            if pending_before {
+                let (_, stop) = bridge.gdb.async_after_send.take().unwrap();
+                bridge.gdb.async_packets.push_back(stop);
+            }
+            bridge.frozen = false;
+            let value = bridge
+                .execution_speed(&json!({"mode":"limited","percent":50}))
+                .unwrap();
+            assert_eq!(value["state"], "frozen", "{system}");
+            assert_eq!(value["execution_speed"]["percent"], 50);
+            let events = bridge
+                .handle_request(request(2, "poll_events", json!({})))
+                .result
+                .unwrap();
+            assert_eq!(events["events"].as_array().unwrap().len(), 1);
+            let event = &events["events"][0];
+            assert_eq!(event["id"], 1);
+            assert_eq!(event["address"], 0x100);
+            assert_eq!(event["rearmed"], true);
+            assert!(bridge.gdb.replies.is_empty());
+            assert!(bridge.gdb.async_packets.is_empty());
+            assert!(!bridge
+                .gdb
+                .sent
+                .iter()
+                .any(|s| matches!(s.as_str(), "c" | "s" | "interrupt")));
+        }
+    }
+}
+
+#[test]
+fn pacing_retires_control_when_the_concurrent_stop_cannot_be_attributed() {
+    let mut bridge = featured(
+        "neogeo_aes",
+        &["1|1|1000|1.0|0|0|0.017734;2|1|500|1.0|0|0|0.017734;1@2.0|9;1@2.0|9"],
+    );
+    bridge.frozen = false;
+    bridge.gdb.async_after_send = Some((
+        format!("qEmucap,setpacing,{}", hex::encode("limited|500")),
+        "T05hwbreak:00010000;idx:999;seq:1;".into(),
+    ));
+    assert!(bridge
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .is_err());
+    assert!(bridge.backend_terminal());
+    let dispatched = bridge.gdb.sent.len();
+    assert!(!bridge.handle_request(request(3, "resume", json!({}))).ok);
+    assert_eq!(bridge.gdb.sent.len(), dispatched);
+}
+
+#[test]
+fn batch_rejection_precedes_native_dispatch() {
+    for system in ["neogeo_mvs", "neogeo_aes", "neogeo_cd"] {
+        let mut bridge =
+            NeoGeoBridge::new(FakeGdb::default(), GdbBridgeEnv::default(), system).unwrap();
+        bridge.frozen = true;
+        let before = bridge.gdb.sent.clone();
+        let good = json!({"memory_type":"ram","address":0,"length":1});
+        let invalid = [
+            json!({"memory_type":"ram","address":0,"length":0}),
+            json!({"memory_type":"ram","address":-1,"length":1}),
+            json!({"memory_type":"ram","address":u64::MAX,"length":2}),
+            json!({"memory_type":"ram","address":0,"length":65536}),
+            json!({"memory_type":"device","address":0,"length":1}),
+        ];
+        let mut requests: Vec<Value> = invalid
+            .into_iter()
+            .map(|last| json!([good, last]))
+            .collect();
+        requests.push(json!([]));
+        requests.push(Value::Array(vec![good; 65]));
+        for ranges in requests {
+            assert!(matches!(
+                bridge.read_memory_batch(&json!({"ranges":ranges})),
+                Err(BridgeError::BadParams(_))
+            ));
+            assert_eq!(bridge.gdb.sent, before);
+            assert!(bridge.frozen);
+        }
     }
 }

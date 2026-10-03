@@ -35,6 +35,9 @@ struct FakeControl {
     batch_reply: Option<String>,
     /// Native `apply_policy` error text, such as a restored or unrestored partial update.
     pacing_apply_error: Option<String>,
+    pacing_apply_reply: Option<String>,
+    lose_policy_reply: bool,
+    stop_after_policy: Option<(bool, bool, String)>,
     /// Values the native setter actually keeps, modelling a silent clamp.
     pacing_clamp: Option<[String; 4]>,
     restore_failure: bool,
@@ -79,6 +82,9 @@ impl FakeControl {
             policy_revision: 0,
             batch_reply: None,
             pacing_apply_error: None,
+            pacing_apply_reply: None,
+            lose_policy_reply: false,
+            stop_after_policy: None,
             pacing_clamp: None,
             restore_failure: false,
             external_write_after_apply: false,
@@ -118,6 +124,7 @@ impl OpenMsxControl for FakeControl {
         }
         let result = match command {
             "::emucap::policy" => self.policy(),
+            "::emucap::observe_policy" => format!("{};{}", self.boundary(), self.policy()),
             "::emucap::boundary" => self.boundary(),
             command if command.starts_with("::emucap::apply_policy ") => {
                 if let Some(error) = &self.pacing_apply_error {
@@ -131,7 +138,15 @@ impl OpenMsxControl for FakeControl {
                 self.policy_revision += 4;
                 let reply = [before, previous, self.policy(), self.boundary()].join(";");
                 self.policy_revision += u64::from(self.external_write_after_apply);
-                reply
+                if let Some((paused, breaked, event)) = self.stop_after_policy.take() {
+                    self.paused = paused;
+                    self.breaked = breaked;
+                    self.debugger_drain = event;
+                }
+                if self.lose_policy_reply {
+                    return Err(OpenMsxBridgeError::Protocol("lost apply reply".into()));
+                }
+                self.pacing_apply_reply.clone().unwrap_or(reply)
             }
             command if command.starts_with("::emucap::restore_policy ") => {
                 let args: Vec<_> = command.split_whitespace().skip(1).collect();
@@ -144,7 +159,7 @@ impl OpenMsxControl for FakeControl {
                 }
                 self.pacing = [args[1].into(), args[2].into(), args[3].into(), args[4].into()];
                 self.policy_revision += 4;
-                self.policy()
+                format!("{};{}", self.policy(), self.boundary())
             }
             command if command.starts_with("set emucap_batch [list [::emucap::boundary]];") => {
                 if let Some(reply) = &self.batch_reply { return Ok(reply.clone()); }
@@ -482,7 +497,8 @@ fn fixture_with_failure(
         fail_once,
         prepared.session.media.mounted_path.clone(),
     );
-    let bridge = OpenMsxBridge::new(control, &prepared.session, temp.path(), display, false).unwrap();
+    let bridge =
+        OpenMsxBridge::new(control, &prepared.session, temp.path(), display, false).unwrap();
     (bridge, commands, temp)
 }
 
@@ -1503,8 +1519,10 @@ fn launch_rejects_acknowledged_but_unapplied_audio_policy() {
     let mut control = bridge.control;
     control.ignore_mute_write = true;
     let initialized = OpenMsxBridge::new(control, &bridge.session, temp.path(), false, true);
-    assert!(matches!(initialized, Err(OpenMsxBridgeError::Emulator(message))
-        if message.contains("did not apply")));
+    assert!(
+        matches!(initialized, Err(OpenMsxBridgeError::Emulator(message))
+        if message.contains("did not apply"))
+    );
 }
 
 #[test]

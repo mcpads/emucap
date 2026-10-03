@@ -133,6 +133,10 @@ const ACTIVE_EXCEPTIONS: &[&str] = &[
 pub enum Np2kaiError {
     #[error("{0}")]
     BadParams(String),
+    #[error("active native operation")]
+    Busy,
+    #[error("request cancelled")]
+    Cancelled,
     #[error("{0}")]
     BadState(String),
     #[error("unsupported NP2kai method: {0}")]
@@ -198,6 +202,9 @@ pub struct Np2kaiHost {
     trace_rows: Vec<Value>,
     dropped_trace: u64,
     pacer: observation::FramePacer,
+    request_cancellation: crate::live::link::RequestCancellation,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
+    control_unverified: bool,
     /// Bumped by every operation that can change guest memory or mapping at one frame count.
     boundary_seq: u64,
 }
@@ -354,6 +361,9 @@ impl Np2kaiHost {
             trace_rows: Vec::new(),
             dropped_trace: 0,
             pacer: observation::FramePacer::new(),
+            request_cancellation: Default::default(),
+            producer_ownership: None,
+            control_unverified: false,
             boundary_seq: 0,
         })
     }
@@ -369,6 +379,28 @@ impl Np2kaiHost {
             let _ = self.run_one_frame()?;
         }
         Ok(())
+    }
+
+    pub fn backend_terminal(&self) -> bool {
+        self.control_unverified
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        request: Request,
+        token: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = token;
+        let response = self.handle_request(request);
+        if response
+            .error
+            .as_ref()
+            .is_some_and(|e| e.kind == "emulator_error" || e.kind == "adapter_error")
+        {
+            self.control_unverified = true;
+        }
+        self.request_cancellation = Default::default();
+        response
     }
 
     pub fn handle_request(&mut self, request: Request) -> Response {
@@ -451,3 +483,6 @@ impl Drop for Np2kaiHost {
 #[cfg(test)]
 #[path = "np2kai_adapter_tests.rs"]
 mod tests;
+
+pub mod dispatch;
+mod temporal_owner;

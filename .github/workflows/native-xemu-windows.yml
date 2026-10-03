@@ -1,0 +1,66 @@
+name: Native xemu Windows build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, next]
+    paths:
+      - 'adapters/xemu/**'
+      - 'adapters/_common/**'
+      - '!**/*.md'
+      - '.github/workflows/native-xemu-windows.yml'
+  pull_request:
+    paths:
+      - 'adapters/xemu/**'
+      - 'adapters/_common/**'
+      - '!**/*.md'
+      - '.github/workflows/native-xemu-windows.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-xemu-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    container:
+      # Upstream xemu's x86_64 Windows GCC toolchain, resolved from sha-2881edd.
+      image: ghcr.io/xemu-project/xemu-win64-toolchain-gcc@sha256:5bb480ccba1009cc45d2de3e9f49456b83cc7f003b354dcdd361525f64637832
+    defaults:
+      run:
+        shell: bash
+    env:
+      CROSSPREFIX: x86_64-w64-mingw32.static-
+      CROSSAR: x86_64-w64-mingw32.static-gcc-ar
+      EMUCAP_XEMU_PLATFORM: win64-cross
+      EMUCAP_BUILD_JOBS: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build pinned Windows source
+        run: |
+          set -euo pipefail
+          bash adapters/xemu/build.sh 2>&1 | tee native-build.log
+          test -f adapters/xemu/work/xemu/dist/xemu.exe
+          sha256sum adapters/xemu/work/xemu/dist/xemu.exe > native-binary.sha256
+      - name: Retain native runtime payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-runtime-xemu-windows-x86_64
+          path: adapters/xemu/work/xemu/dist/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-evidence-xemu-windows-x86_64
+          path: |
+            native-build.log
+            native-binary.sha256
+            adapters/xemu/work/xemu/dist/emucap-xemu-build.json
+          retention-days: 7
+          if-no-files-found: warn

@@ -162,21 +162,28 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// `game.status.paused` is not it).
     pub(super) fn cpu_is_stepping(&mut self) -> BridgeResult<bool> {
         let status = self.ws.call("cpu.status", json!({}))?;
-        Ok(Self::cpu_stepping_from_reply(&status))
+        Self::cpu_stepping_from_reply(&status)
     }
 
-    fn cpu_stepping_from_reply(status: &Value) -> bool {
+    fn cpu_stepping_from_reply(status: &Value) -> BridgeResult<bool> {
+        if status.get("memory_park_version").and_then(Value::as_u64) != Some(1) {
+            return Err(BridgeError::Unsupported(
+                "native memory park proof v1 is required; rebuild the PSP host".into(),
+            ));
+        }
         status
             .get("stepping")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
+            .ok_or_else(|| {
+                BridgeError::Emulator("invalid cpu.status: stepping must be a boolean".into())
+            })
     }
 
     fn cpu_is_stepping_with_timeout(&mut self, timeout: Duration) -> BridgeResult<bool> {
         let status = self
             .ws
             .call_with_timeout("cpu.status", json!({}), timeout)?;
-        Ok(Self::cpu_stepping_from_reply(&status))
+        Self::cpu_stepping_from_reply(&status)
     }
 
     /// kind `exec` → `cpu.breakpoint.add {address, enabled, condition?}`; kind `read`/`write` →
@@ -438,6 +445,10 @@ impl<T: WsTransport> PpssppBridge<T> {
     /// state-change, so no ack event ever arrives) — calling it unconditionally would hang the
     /// bridge waiting for an ack that never comes.
     pub(super) fn pause(&mut self, _params: &Value) -> BridgeResult<Value> {
+        if self.request_cancellation.is_some() && self.owned_control {
+            self.verify_owned_halt()?;
+            return Ok(json!({"state":"frozen"}));
+        }
         if !self.cpu_is_stepping()? {
             self.ws.call("cpu.stepping", json!({}))?;
         }
@@ -489,19 +500,45 @@ impl<T: WsTransport> PpssppBridge<T> {
         let deadline = crate::live::temporal::OperationDeadline::after(
             crate::live::temporal::MAX_SYNC_OPERATION_TIME,
         );
-        let status_timeout = deadline.remaining_timeout().ok_or_else(|| {
-            BridgeError::Emulator("frame step deadline expired before CPU status".into())
-        })?;
-        if !self.cpu_is_stepping_with_timeout(status_timeout)? {
-            let pause_timeout = deadline.remaining_timeout().ok_or_else(|| {
-                BridgeError::Emulator("frame step deadline expired before halting the CPU".into())
+        let status_timeout = deadline
+            .remaining_timeout()
+            .map(|budget| {
+                if self.request_cancellation.is_some() {
+                    budget.min(Duration::from_secs(1))
+                } else {
+                    budget
+                }
+            })
+            .ok_or_else(|| {
+                BridgeError::Emulator("frame step deadline expired before CPU status".into())
             })?;
+        if !self.cpu_is_stepping_with_timeout(status_timeout)? {
+            let pause_timeout = deadline
+                .remaining_timeout()
+                .map(|budget| {
+                    if self.request_cancellation.is_some() {
+                        budget.min(Duration::from_secs(1))
+                    } else {
+                        budget
+                    }
+                })
+                .ok_or_else(|| {
+                    BridgeError::Emulator(
+                        "frame step deadline expired before halting the CPU".into(),
+                    )
+                })?;
             self.ws
                 .call_with_timeout("cpu.stepping", json!({}), pause_timeout)?;
         }
         let frame_timeout = deadline.remaining_timeout().ok_or_else(|| {
             BridgeError::Emulator("frame step deadline expired before backend advance".into())
         })?;
+        if let Some(cancellation) = self.request_cancellation.as_ref() {
+            let response = self
+                .ws
+                .frame_step_cancellable(count, frame_timeout, cancellation)?;
+            return normalize_frame_progress(response, count);
+        }
         let response = self.ws.call_with_timeout(
             "emucap.frameStep",
             json!({ "count": count }),
@@ -513,7 +550,7 @@ impl<T: WsTransport> PpssppBridge<T> {
                 crate::live::temporal::MAX_SYNC_OPERATION_TIME.as_millis()
             )));
         }
-        Ok(response)
+        normalize_frame_progress(response, count)
     }
 
     /// `cpu.stepInto`, called `count` times (PPSSPP has no step-count parameter — see
@@ -770,4 +807,27 @@ impl<T: WsTransport> PpssppBridge<T> {
         }
         Ok(out)
     }
+}
+
+// The native WebSocket uses `count` for the request and `completed` for progress.
+// The adapter protocol reports actual progress in `count` for every stop outcome.
+fn normalize_frame_progress(mut reply: Value, requested: u64) -> BridgeResult<Value> {
+    let completed = reply["completed"].as_u64();
+    let status = reply["status"].as_str();
+    if reply["count"].as_u64() != Some(requested)
+        || !completed.is_some_and(|n| n <= requested)
+        || !matches!(status, Some("completed" | "interrupted"))
+        || (status == Some("completed") && completed != Some(requested))
+        || (status == Some("interrupted")
+            && !reply["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()))
+    {
+        return Err(BridgeError::Emulator(
+            "invalid native frame progress".into(),
+        ));
+    }
+    reply["requested"] = json!(requested);
+    reply["count"] = json!(completed.unwrap());
+    Ok(reply)
 }

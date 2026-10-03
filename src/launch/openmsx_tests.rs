@@ -31,6 +31,7 @@ fn write_pinned_build(repo: &Path) -> PathBuf {
          OPENMSX_RASTER_PATCH_SHA256=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\n\
          OPENMSX_DISK_STATE_PATCH_SHA256=ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\n\
          OPENMSX_REALTIME_PATCH_SHA256=1111111111111111111111111111111111111111111111111111111111111111\n\
+         OPENMSX_CONSOLE_PATCH_SHA256=2222222222222222222222222222222222222222222222222222222222222222\n\
          OPENMSX_HOST_API=6\n",
     )
     .unwrap();
@@ -53,6 +54,7 @@ fn write_pinned_build(repo: &Path) -> PathBuf {
             raster_patch_sha256: "e".repeat(64),
             disk_state_patch_sha256: "f".repeat(64),
             realtime_patch_sha256: "1".repeat(64),
+            console_patch_sha256: "2".repeat(64),
             native_patch: true,
         })
         .unwrap(),

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::spec::{dolphin_spec, SpecOpts};
 
-pub const REQUIRED_HOST_API: u32 = 7;
+pub const REQUIRED_HOST_API: u32 = 8;
 
 /// Admit native output evidence, or wait for an in-flight native transition. Stream evidence
 /// describes actual native call results; it does not promise physical device audibility.
@@ -193,8 +193,8 @@ pub fn local_build_candidates(root: &Path, display: bool) -> Vec<PathBuf> {
     } else {
         vec![
             source.join("build-emucap-headless/Binaries/dolphin-emu-nogui"),
-            source.join("build-emucap-headless/Binaries/Dolphin.exe"),
-            source.join("Binary/x64/Dolphin.exe"),
+            source.join("build-emucap-headless/Binaries/DolphinNoGUI.exe"),
+            source.join("Binary/x64/DolphinNoGUI.exe"),
         ]
     }
 }
@@ -209,7 +209,11 @@ pub fn default_install_candidates(display: bool) -> Vec<PathBuf> {
     }
     #[cfg(windows)]
     {
-        let _ = display;
+        let name = if display {
+            "Dolphin.exe"
+        } else {
+            "DolphinNoGUI.exe"
+        };
         for key in [
             "LOCALAPPDATA",
             "ProgramFiles",
@@ -217,8 +221,8 @@ pub fn default_install_candidates(display: bool) -> Vec<PathBuf> {
             "USERPROFILE",
         ] {
             if let Some(base) = std::env::var_os(key).map(PathBuf::from) {
-                candidates.push(base.join("Dolphin-x64/Dolphin.exe"));
-                candidates.push(base.join("Programs/Dolphin/Dolphin.exe"));
+                candidates.push(base.join("Dolphin-x64").join(name));
+                candidates.push(base.join("Programs/Dolphin").join(name));
             }
         }
     }
@@ -260,7 +264,11 @@ pub fn resolve_binary(root: &Path, display: bool) -> Option<PathBuf> {
         return Some(default);
     }
     let executable = if cfg!(windows) {
-        "Dolphin.exe"
+        if display {
+            "Dolphin.exe"
+        } else {
+            "DolphinNoGUI.exe"
+        }
     } else if display {
         "dolphin-emu"
     } else {
@@ -361,6 +369,23 @@ pub fn prepare_runtime_binary(source_binary: &Path, port: u16) -> std::io::Resul
         })?;
         let destination = runtime_dir.join(executable_name);
         super::copy_file_replace(source_binary, &destination)?;
+        super::copy_adjacent_dlls(source_binary, &runtime_dir)?;
+        if source_binary
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+        {
+            let source_dir = source_binary.parent().unwrap();
+            for name in ["Sys", "QtPlugins"] {
+                let source = source_dir.join(name);
+                if source.is_dir() {
+                    super::copy_dir_replace(&source, &runtime_dir.join(name))?;
+                }
+            }
+            let qt_config = source_dir.join("qt.conf");
+            if qt_config.is_file() {
+                super::copy_file_replace(&qt_config, &runtime_dir.join("qt.conf"))?;
+            }
+        }
         let sidecar = build_metadata_path(source_binary);
         if sidecar.is_file() {
             super::copy_file_replace(&sidecar, &runtime_dir.join("emucap-dolphin-build.json"))?;

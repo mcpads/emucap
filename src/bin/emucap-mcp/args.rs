@@ -566,9 +566,9 @@ fn two() -> u64 {
 pub(crate) struct TapArgs {
     #[serde(default)]
     pub(crate) port: u64,
+    /// Buttons/keys pressed together for the entire press_frames duration.
     pub(crate) buttons: Vec<String>,
-    /// Frames for which to press the buttons. Default: 2, a short tap below
-    /// typical auto-repeat timing.
+    /// Frames to hold all buttons/keys before release, including long holds. Default: 2.
     #[serde(default = "two", deserialize_with = "deser_input_frames")]
     pub(crate) press_frames: u64,
     /// Frames to advance after release. Default: 0. A positive value composes

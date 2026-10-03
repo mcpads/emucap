@@ -22,7 +22,8 @@ def body(text, signature):
 reset = ''
 if 'void main_reset_speed_limiter(' in main:
     reset = 'static int l_SpeedLimiterReset = 0;\nstatic unsigned int l_SpeedLimiterResumeTime = 0;\n' + body(main, 'void main_reset_speed_limiter(')
-preamble = r'''
+header = (a.source / 'api/m64p_emucap_pacing.h').read_text()
+preamble = header + r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <assert.h>
@@ -36,11 +37,16 @@ preamble = r'''
 #define BPT_CHECK_FLAG(a,b) 0
 static int g_DebuggerActive=1,g_dbg_runstate=2,g_rom_pause=0;
 static int l_MainSpeedLimit=1,l_SpeedFactor=100;
+static uint64_t policy_revision=1;
+static int change_during_wait;
+static m64p_emucap_policy main_pacing_read(void) {
+ m64p_emucap_policy p={0}; p.factor=l_SpeedFactor; p.limiter=l_MainSpeedLimit; p.revision=policy_revision; return p;
+}
 static struct {struct {double expected_refresh_rate;} vi;} g_dev={{60}};
 static unsigned now=100,waited=0,park_ms=0,previousPC,breakpointAccessed,breakpointFlag;
 static int sem_pending_steps,g_Breakpoints[1];
 unsigned SDL_GetTicks(void){return now;}
-void SDL_Delay(unsigned ms){now+=ms?ms:1;waited+=ms?ms:1;}
+void SDL_Delay(unsigned ms){now+=ms?ms:1;waited+=ms?ms:1; if(change_during_wait){++policy_revision;change_during_wait=0;}}
 void SDL_SemWait(int ignored){now+=park_ms;g_dbg_runstate=M64P_DBG_RUNSTATE_RUNNING;}
 void DebuggerCallback(int kind,unsigned pc){}
 int check_breakpoints(unsigned pc){return -1;}
@@ -76,6 +82,9 @@ int main(void){
   now+=10000;apply_speed_limiter();apply_speed_limiter();
   waited=0;apply_speed_limiter();assert(waited >= expected-1 && waited <= expected+1);
  }
+ // An intervening policy change ending at the same tuple ends the old wait.
+ l_SpeedFactor=1; ++policy_revision; main_reset_speed_limiter();
+ waited=0; change_during_wait=1; apply_speed_limiter(); assert(waited<=10);
  if(failures)return 1;
  puts("N64 debugger/core pause reanchor and no-park deadline preservation passed");
 }

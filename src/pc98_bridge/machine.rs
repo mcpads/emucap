@@ -23,6 +23,10 @@ impl<G: GdbTransport> Bridge<G> {
     }
 
     pub(super) fn pause(&mut self) -> BridgeResult<Value> {
+        if self.request_cancellation.is_some() && self.owned_control {
+            self.verify_owned_halt()?;
+            return Ok(json!({"state":"frozen"}));
+        }
         if !self.frozen {
             // Preserve a breakpoint stop that arrived just before this explicit pause. The raw
             // 0x03 interrupt itself returns one stop packet, which the transport consumes and ACKs.
@@ -83,6 +87,23 @@ impl<G: GdbTransport> Bridge<G> {
     pub(super) fn set_input(&mut self, params: &Value) -> BridgeResult<Value> {
         require_input_port_zero(params)?;
         let buttons = normalize_buttons(params.get("buttons"))?;
+        if self.request_cancellation.is_some() && self.owned_control {
+            match self.frame_exchange("setinput", &buttons.join(",")) {
+                Ok(reply) if reply == "OK" => return Ok(json!({"buttons":buttons})),
+                // The native resolver rejects unknown fields before clearing or applying input.
+                Ok(reply) if reply.starts_with("E08:") => {
+                    return Err(BridgeError::BadParams(format!(
+                        "unavailable native input: {}",
+                        &reply[4..]
+                    )));
+                }
+                result => {
+                    let error = format!("native input application unverified: {result:?}");
+                    self.control_fatal = Some(error.clone());
+                    return Err(BridgeError::Emulator(error));
+                }
+            }
+        }
         if let Err(err) = self.lua_cmd("setinput", Some(&buttons.join(","))) {
             return Err(self.explain_input_failure(err, &buttons));
         }

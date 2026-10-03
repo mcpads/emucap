@@ -252,6 +252,10 @@ pub enum BridgeError {
     BadParams(String),
     #[error("{0}")]
     BadState(String),
+    #[error("another parent operation owns native control")]
+    Busy,
+    #[error("operation cancelled")]
+    Cancelled,
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("unsupported on psp: {0}")]
@@ -322,6 +326,9 @@ pub struct PpssppBridge<T> {
     /// stop without changing the VBlank clock.
     boundary_seq: u64,
     control_unverified: bool,
+    owned_control: bool,
+    request_cancellation: Option<crate::live::link::RequestCancellation>,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
 }
 
 impl<T: WsTransport> PpssppBridge<T> {
@@ -365,11 +372,25 @@ impl<T: WsTransport> PpssppBridge<T> {
             held_buttons: None,
             boundary_seq: 0,
             control_unverified: false,
+            owned_control: false,
+            request_cancellation: None,
+            producer_ownership: None,
         }
     }
 
     pub fn backend_terminal(&self) -> bool {
         self.control_unverified || self.ws.is_terminal()
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        req: Request,
+        cancellation: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = Some(cancellation);
+        let response = self.handle_request(req);
+        self.request_cancellation = None;
+        response
     }
 
     pub fn handle_request(&mut self, req: Request) -> Response {
@@ -439,6 +460,7 @@ mod input_state;
 mod observation;
 mod service;
 mod support;
+mod temporal_owner;
 use support::*;
 
 #[cfg(test)]

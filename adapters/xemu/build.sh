@@ -6,6 +6,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/../_common/build-lock.sh"
 . "$HERE/../_common/build-env.sh"
 . "$HERE/upstream.lock"
+BUILD_PLATFORM="${EMUCAP_XEMU_PLATFORM:-native}"
+PLATFORM_ARGS=()
+case "$BUILD_PLATFORM" in
+  native) ;;
+  win64-cross) PLATFORM_ARGS=(-p win64-cross) ;;
+  *) echo "ERROR: unknown xemu build platform: $BUILD_PLATFORM" >&2; exit 2 ;;
+esac
 
 DEFAULT_WORK="$HERE/work"
 WORK_INPUT="${EMUCAP_XEMU_WORK:-$DEFAULT_WORK}"
@@ -93,6 +100,8 @@ PATCHES=(
   "$HERE/patches/0018-release-gpu-lock-on-invalid-vblank-phase.patch"
   "$HERE/patches/0019-apply-managed-input-at-guest-report.patch"
   "$HERE/patches/0020-preserve-pgraph-command-state.patch"
+  "$HERE/patches/0021-pacing-transaction.patch"
+  "$HERE/patches/0022-nonunwinding-windows-tcg-exit.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done |
   if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi |
@@ -131,7 +140,7 @@ PYTHON="$(choose_python || true)"
   echo "       Set EMUCAP_XEMU_PYTHON to a compatible python3 executable." >&2
   exit 1
 }
-if [ "$(uname -s)" = "Darwin" ] && ! command -v dylibbundler >/dev/null 2>&1; then
+if [ "$(uname -s)" = "Darwin" ] && [ "$BUILD_PLATFORM" = native ] && ! command -v dylibbundler >/dev/null 2>&1; then
   echo "ERROR: xemu macOS packaging requires dylibbundler" >&2
   exit 1
 fi
@@ -141,10 +150,10 @@ export PATH="$(dirname "$PYTHON"):$PATH"
 JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 (
   cd "$SRC"
-  ./build.sh -j"$JOBS"
+  ./build.sh "${PLATFORM_ARGS[@]}" -j"$JOBS"
 )
 
-if [ "$(uname -s)" = "Darwin" ]; then
+if [ "$(uname -s)" = "Darwin" ] && [ "$BUILD_PLATFORM" = native ]; then
   BIN="$SRC/dist/xemu.app/Contents/MacOS/xemu"
   [ -x "$BIN" ] || { echo "ERROR: xemu app was not produced" >&2; exit 1; }
   RPATH="@executable_path/../Libraries/$(uname -m)/"
@@ -163,6 +172,9 @@ if [ "$(uname -s)" = "Darwin" ]; then
   codesign --verify --deep --strict "$SRC/dist/xemu.app"
 else
   BIN="$SRC/dist/xemu"
+  case "$BUILD_PLATFORM:$(uname -s)" in
+    win64-cross:*|*:MINGW*|*:MSYS*) BIN="$SRC/dist/xemu.exe" ;;
+  esac
   [ -x "$BIN" ] || { echo "ERROR: xemu executable was not produced" >&2; exit 1; }
 fi
 

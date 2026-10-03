@@ -162,6 +162,7 @@ fn pacing_requests_are_normalized_and_admitted_before_forwarding() {
     let shared: SharedLink = concrete.clone();
     for args in [
         speed(Some(ExecutionSpeedMode::Limited), Some(300.0)),
+        speed(Some(ExecutionSpeedMode::Limited), Some(400.0001)),
         speed(Some(ExecutionSpeedMode::Limited), None),
         speed(Some(ExecutionSpeedMode::Unlimited), Some(100.0)),
         speed(None, Some(50.0)),
@@ -231,4 +232,33 @@ fn routed_speed_rejects_busy_before_status_or_capability_queries() {
     );
     assert_eq!(error_code(&result).as_deref(), Some("busy"));
     drop(guard);
+}
+
+#[test]
+fn routed_speed_rejects_stale_capability_before_native_mutation() {
+    for revision in [None, Some("previous-generation-revision")] {
+        let concrete = Arc::new(Mutex::new(ScriptedLink::new(
+            features(),
+            json!({"connected":true,"state":"frozen"}),
+        )));
+        let shared: SharedLink = concrete.clone();
+        let server = crate::Emucap::new(shared);
+        let result = crate::debug_surface::execute_speed(
+            &server,
+            crate::args::RoutedOperationArgs {
+                operation: "execution_speed".into(),
+                arguments: Some(
+                    serde_json::from_value(json!({"mode":"limited","percent":50})).unwrap(),
+                ),
+                known_capability_revision: revision.map(str::to_owned),
+            },
+        );
+        assert_eq!(error_code(&result).as_deref(), Some("bad_state"));
+        let link = concrete.lock().unwrap();
+        assert!(
+            link.calls.iter().all(|(method, _)| method == "status"),
+            "stale capability reached native control: {:?}",
+            link.calls
+        );
+    }
 }

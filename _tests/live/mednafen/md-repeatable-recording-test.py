@@ -20,6 +20,7 @@ LIVE_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(LIVE_ROOT / "mesen2"))
 
 from support import McpProcess, ROOT  # noqa: E402
+from recording_events import check_frame_sequence, normalized_events
 
 
 PROFILE = "mednafen_md_repeatable"
@@ -34,7 +35,7 @@ def free_port() -> int:
     return port
 
 
-def record_window_call(status: dict, output_root: Path, movie: Path) -> dict:
+def record_window_call(status: dict, output_root: Path, movie: Path, frames: int = 2) -> dict:
     revision = status.get("capability_revision")
     if not isinstance(revision, str) or not revision:
         raise RuntimeError(f"status has no capability revision: {status}")
@@ -43,7 +44,7 @@ def record_window_call(status: dict, output_root: Path, movie: Path) -> dict:
         "known_capability_revision": revision,
         "arguments": {
             "output_root": str(output_root),
-            "frames": 2,
+            "frames": frames,
             "origin": "reset_release",
             "input_path": str(movie),
             "event_classes": ["frame_boundary", "frame_completed"],
@@ -67,42 +68,6 @@ def require_repeatable_status(status: dict) -> None:
     }
     if repeatability != expected:
         raise RuntimeError(f"repeatability capability differs: {repeatability}")
-
-
-def normalized_events(bundle: Path) -> tuple[list[dict], str]:
-    manifest = json.loads((bundle / "manifest.json").read_text())
-    terminal = manifest.get("terminal", {})
-    if (
-        terminal.get("operation_outcome") != "completed"
-        or terminal.get("integrity") != "complete"
-    ):
-        raise RuntimeError(f"recording did not complete with integrity: {terminal}")
-    events = [
-        json.loads(line)
-        for line in (bundle / "events/segment-000.ndjson").read_text().splitlines()
-    ]
-    f_start = manifest["scope"]["f_start"]
-    clock_origins: dict[str, int] = {}
-    normalized = []
-    for event in events:
-        clock = event["clock"]
-        domain = clock["domain"]
-        clock_origins.setdefault(domain, clock["tick"])
-        normalized.append(
-            {
-                "sequence": event["sequence"],
-                "class": event["class"],
-                "contract_sha256": event["contract_sha256"],
-                "frame": event["frame"] - f_start,
-                "clock": {
-                    "domain": domain,
-                    "tick": clock["tick"] - clock_origins[domain],
-                },
-                "payload": event["payload"],
-            }
-        )
-    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
-    return normalized, hashlib.sha256(encoded).hexdigest()
 
 
 def read_ram(mcp: McpProcess) -> str:
@@ -135,7 +100,14 @@ def main() -> int:
     parser.add_argument("--expected-server-build", help="Exact audited candidate identity; defaults to the current clean commit")
     parser.add_argument("--output", type=Path, help="Retain private recording artifacts in a new directory")
     parser.add_argument("--wall-delay", type=float, default=0.75)
+    parser.add_argument("--frames", type=int, default=2)
+    parser.add_argument("--sound", action="store_true")
+    parser.add_argument("--display", action="store_true")
+    parser.add_argument("--paces", type=int, nargs="*", default=[],
+                        help="Additional recording rates in percent; 0 selects unlimited")
     args = parser.parse_args()
+    assert all(0 <= rate <= 10000 for rate in args.paces)
+    assert 1 <= args.frames <= 300
 
     rom = Path(args.rom).resolve()
     binary = (
@@ -162,7 +134,7 @@ def main() -> int:
         output_root = home / "bundles"
         output_root.mkdir()
         movie = home / "empty.movie"
-        movie.write_text("0:\n1:\n")
+        movie.write_text("".join(f"{frame}:\n" for frame in range(args.frames)))
         env = os.environ.copy()
         env.update(
             {
@@ -192,7 +164,8 @@ def main() -> int:
                     "content_path": str(rom),
                     "system": "md",
                     "name": "md-repeatable-state-restore",
-                    "display": False,
+                    "display": args.display,
+                    "sound": args.sound,
                     "execution_profile": "repeatable",
                 },
                 timeout=60,
@@ -207,6 +180,11 @@ def main() -> int:
             try:
                 status = mcp.tool("status", {})
                 require_repeatable_status(status)
+                (home / "identity.json").write_text(json.dumps({
+                    "launch": launched, "status": status,
+                    "sha256": {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                               for p in (binary, mcp_binary)},
+                }, indent=2))
                 entry_frame = status.get("frame")
                 time.sleep(args.wall_delay)
                 delayed = mcp.tool("status", {})
@@ -214,7 +192,7 @@ def main() -> int:
                     raise RuntimeError(f"wall delay became guest time: {status} -> {delayed}")
 
                 first = mcp.tool(
-                    "debug", record_window_call(delayed, output_root, movie), timeout=90
+                    "debug", record_window_call(delayed, output_root, movie, args.frames), timeout=90
                 )
                 first_events, first_event_hash = normalized_events(Path(first["bundle_path"]))
                 first_ram = read_ram(mcp)
@@ -222,7 +200,7 @@ def main() -> int:
 
                 status = mcp.tool("status", {})
                 second = mcp.tool(
-                    "debug", record_window_call(status, output_root, movie), timeout=90
+                    "debug", record_window_call(status, output_root, movie, args.frames), timeout=90
                 )
                 second_events, second_event_hash = normalized_events(Path(second["bundle_path"]))
                 second_ram = read_ram(mcp)
@@ -233,6 +211,34 @@ def main() -> int:
                 terminal = mcp.tool("status", {})
                 if terminal.get("state") != "frozen":
                     raise RuntimeError(f"recording did not finish frozen: {terminal}")
+                check_frame_sequence(first_events, args.frames)
+                pace_runs = []
+                for rate in args.paces:
+                    policy = ({"mode": "limited", "percent": rate} if rate else
+                              {"mode": "unlimited"})
+                    status = mcp.tool("status", {})
+                    changed = mcp.tool("debug", {
+                        "operation": "execution_speed",
+                        "known_capability_revision": status["capability_revision"],
+                        "arguments": policy,
+                    })
+                    effective = changed["execution_speed"]
+                    assert all(effective.get(k) == v for k, v in policy.items()), changed
+                    mutate_ram(mcp, read_ram(mcp))
+                    before = mcp.tool("status", {})
+                    recorded = mcp.tool("debug", record_window_call(before, output_root, movie, args.frames), timeout=90)
+                    events, event_hash = normalized_events(Path(recorded["bundle_path"]))
+                    after = mcp.tool("status", {})
+                    current_ram = read_ram(mcp)
+                    row = dict(policy=policy, effective=effective, recording=recorded,
+                               event_count=len(events), event_sha256=event_hash,
+                               events_match=events == first_events, ram_matches=current_ram == first_ram,
+                               terminal=after)
+                    pace_runs.append(row)
+                    (home / "pacing.json").write_text(json.dumps(pace_runs, indent=2))
+                    assert row["events_match"] and row["ram_matches"], row
+                    assert after["state"] == "frozen"
+                    assert after["execution_speed"] == before["execution_speed"]
             finally:
                 stopped = mcp.tool("stop", {"launch_id": launch_id}, timeout=20)
                 (home / "repeatable-stop.json").write_text(json.dumps(stopped, indent=2))
@@ -271,6 +277,7 @@ def main() -> int:
                         "between_recording_mutation": replacement,
                         "terminal_state": "frozen",
                         "ordinary_launch_state": "running",
+                        "pacing_runs": len(pace_runs),
                     },
                     separators=(",", ":"),
                 )

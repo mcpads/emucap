@@ -238,6 +238,37 @@ struct LiveNp2kaiFixture {
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
+#[test]
+#[ignore = "requires a built NP2kai core, PC-98 firmware, and an HDI test image"]
+fn live_batch_epochs_separate_same_clock_replacement() {
+    let mut fixture = live_np2kai_host();
+    let path = fixture.runtime.path().join("epoch.state");
+    let host = &mut fixture.host;
+    host.step(&json!({"count": 1, "unit": "frames"})).unwrap();
+    host.save_state(&json!({"path":path})).unwrap();
+    let params = json!({"ranges":[{"memory_type":"ram","address":0,"length":1}]});
+    let mut previous = host.read_memory_batch(&params).unwrap()["boundary"].clone();
+    for operation in ["load", "load", "reset"] {
+        if operation == "load" {
+            host.load_state(&json!({"path":path})).unwrap();
+        } else {
+            host.reset().unwrap();
+        }
+        let current = host.read_memory_batch(&params).unwrap()["boundary"].clone();
+        assert_eq!(current["clocks"], previous["clocks"]);
+        assert_ne!(current["stop_epoch"], previous["stop_epoch"]);
+        assert_ne!(
+            current["memory_mapping_epoch"],
+            previous["memory_mapping_epoch"]
+        );
+        assert_eq!(
+            host.read_memory_batch(&params).unwrap()["boundary"],
+            current
+        );
+        previous = current;
+    }
+}
+
 fn live_np2kai_host() -> LiveNp2kaiFixture {
     static LIVE_CORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let lock = LIVE_CORE_LOCK
@@ -291,4 +322,20 @@ fn live_np2kai_host() -> LiveNp2kaiFixture {
         hdi,
         _lock: lock,
     }
+}
+
+#[test]
+fn file_identity_hashing_fits_a_small_host_thread_stack() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input.bin");
+    let bytes = vec![0xa5_u8; 2 * 1024 * 1024 + 17];
+    fs::write(&path, &bytes).unwrap();
+    let expected = hex::encode(Sha256::digest(&bytes));
+    let observed = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || sha256_file(&path).unwrap())
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(observed, expected);
 }

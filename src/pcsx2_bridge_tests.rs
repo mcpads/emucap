@@ -53,7 +53,9 @@ impl PineTransport for FakePine {
 
 impl Drop for FakePine {
     fn drop(&mut self) {
-        assert!(self.expected.is_empty(), "unconsumed PINE expectations");
+        if !std::thread::panicking() {
+            assert!(self.expected.is_empty(), "unconsumed PINE expectations");
+        }
     }
 }
 
@@ -70,6 +72,10 @@ fn bridge(expectations: Vec<(Vec<u8>, BridgeResult<Vec<u8>>)>) -> Pcsx2Bridge<Fa
         Some("token".into()),
     )
     .unwrap()
+}
+
+fn absolute_state_path(name: &str) -> String {
+    std::env::temp_dir().join(name).to_str().unwrap().to_owned()
 }
 
 fn pine_string(value: &str) -> Vec<u8> {
@@ -305,7 +311,7 @@ fn frozen_only_operations_fail_before_mutating_the_emulator() {
     let save = bridge.handle_request(Request::new(
         13,
         "save_state",
-        json!({"path":"/tmp/ps2-running.p2s"}),
+        json!({"path":absolute_state_path("ps2-running.p2s")}),
     ));
     assert_eq!(save.error.unwrap().kind, "bad_state");
 }
@@ -353,7 +359,7 @@ fn parses_disassembly_rows_and_little_endian_bytes() {
 
 #[test]
 fn savestate_paths_must_be_absolute_and_are_length_prefixed() {
-    let path = "/tmp/ps2-state.p2s";
+    let path = absolute_state_path("ps2-state.p2s");
     let mut request = vec![MSG_EMUCAP_SAVE_STATE];
     request.extend_from_slice(&(path.len() as u32).to_le_bytes());
     request.extend_from_slice(path.as_bytes());
@@ -374,7 +380,7 @@ fn savestate_paths_must_be_absolute_and_are_length_prefixed() {
 
 #[test]
 fn probe_restores_advances_and_reads_in_one_frozen_request() {
-    let path = "/tmp/ps2-probe.p2s";
+    let path = absolute_state_path("ps2-probe.p2s");
     let mut load = vec![MSG_EMUCAP_LOAD_STATE];
     load.extend_from_slice(&(path.len() as u32).to_le_bytes());
     load.extend_from_slice(path.as_bytes());
@@ -414,15 +420,15 @@ fn probe_rejects_invalid_inputs_before_pausing_or_loading() {
             "memory_type":"ee", "address":0, "length":1
         }),
         json!({
-            "state":"/tmp/base.p2s", "frame":MAX_SYNC_ADVANCE_COUNT + 1,
+            "state":absolute_state_path("base.p2s"), "frame":MAX_SYNC_ADVANCE_COUNT + 1,
             "memory_type":"ee", "address":0, "length":1
         }),
         json!({
-            "state":"/tmp/base.p2s", "frame":0,
+            "state":absolute_state_path("base.p2s"), "frame":0,
             "memory_type":"ee", "address":PCSX2_EE_RAM_SIZE - 1, "length":2
         }),
         json!({
-            "state":"/tmp/base.p2s", "frame":0,
+            "state":absolute_state_path("base.p2s"), "frame":0,
             "memory_type":"ee", "address":0, "length":0
         }),
     ] {
@@ -1031,8 +1037,22 @@ fn poll_events_returns_exact_access_and_frozen_register_snapshot() {
     for register in 0u64..34 {
         events.extend_from_slice(&register.to_le_bytes());
     }
+    let mut applied = nominal_pacing_payload();
+    applied[4..8].copy_from_slice(&5_000u32.to_le_bytes());
+    applied[8..12].copy_from_slice(&0.5f32.to_bits().to_le_bytes());
+    let mut setter = vec![0x96];
+    setter.extend_from_slice(&50u32.to_le_bytes());
     let mut bridge = bridge(vec![
         (set, Ok(vec![])),
+        (vec![0x95], Ok(nominal_pacing_payload())),
+        (
+            setter,
+            Ok(pacing_transaction_payload(
+                nominal_pacing_payload(),
+                applied,
+            )),
+        ),
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
         (vec![MSG_EMUCAP_POLL_EVENTS], Ok(events)),
     ]);
     bridge.handle_request(Request::new(
@@ -1041,6 +1061,12 @@ fn poll_events_returns_exact_access_and_frozen_register_snapshot() {
         json!({"kind":"read", "memory_type":"ee", "start":0x200, "end":0x20f}),
     ));
 
+    // A native breakpoint stop remains pending while pacing is changed.
+    let changed = bridge
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap();
+    assert_eq!(changed["state"], "frozen");
+    assert_eq!(changed["execution_speed"]["percent"], 50);
     let polled = bridge.handle_request(Request::new(35, "poll_events", json!({})));
     let result = polled.result.unwrap();
     assert_eq!(result["dropped"], 3);
@@ -1135,7 +1161,7 @@ fn frame_step_accepts_shared_limit_and_preserves_partial_outcomes() {
 
 #[test]
 fn interrupted_probe_does_not_read_memory_or_claim_completion() {
-    let path = "/tmp/base.p2s";
+    let path = absolute_state_path("base.p2s");
     let mut load = vec![MSG_EMUCAP_LOAD_STATE];
     load.extend_from_slice(&(path.len() as u32).to_le_bytes());
     load.extend_from_slice(path.as_bytes());
@@ -1208,31 +1234,59 @@ fn long_pine_exchange_uses_its_budget_then_restores_normal_timeout() {
 
 #[test]
 fn pacing_readback_failure_closes_control_after_native_mutation() {
-    let mut setter = vec![0x96];
-    setter.extend_from_slice(&50u32.to_le_bytes());
-    let mut host = bridge(vec![
-        (vec![0x95], Ok(nominal_pacing_payload())),
-        (setter, Ok(vec![])),
-        (vec![0x95], Ok(vec![0])),
-    ]);
-    let error = host
-        .execution_speed(&json!({"mode":"limited","percent":50}))
-        .unwrap_err();
-    assert!(error.to_string().contains("unverified"));
-    assert!(error.to_string().contains("last verified policy"));
-    assert!(host.backend_terminal());
+    let valid = |nominal: u32, target: f32| {
+        let mut payload = nominal_pacing_payload();
+        payload[4..8].copy_from_slice(&nominal.to_le_bytes());
+        payload[8..12].copy_from_slice(&target.to_bits().to_le_bytes());
+        payload
+    };
+    for (after, healthy) in [
+        (vec![0], false),
+        (valid(10_000, 1.0), false), // native setter did not apply
+        (valid(5_000, 1.0), false),  // effective target overrides nominal
+        (valid(5_000, f32::NAN), false),
+        (valid(5_000, 0.5), true),
+    ] {
+        let mut setter = vec![0x96];
+        setter.extend_from_slice(&50u32.to_le_bytes());
+        let parsed =
+            after.len() == 28 && f32::from_le_bytes(after[8..12].try_into().unwrap()).is_finite();
+        let mut exchanges = vec![
+            (vec![0x95], Ok(nominal_pacing_payload())),
+            (
+                setter,
+                Ok(pacing_transaction_payload(
+                    nominal_pacing_payload(),
+                    after.clone(),
+                )),
+            ),
+        ];
+        if parsed {
+            exchanges.push((vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())));
+        }
+        let mut host = bridge(exchanges);
+        let outcome = host.execution_speed(&json!({"mode":"limited","percent":50}));
+        assert_eq!(outcome.is_ok(), healthy);
+        assert_eq!(host.backend_terminal(), !healthy);
+        if let Err(error) = outcome {
+            assert!(error.to_string().contains("unverified"));
+            assert!(error.to_string().contains("pre-command observation"));
+        }
+        assert!(host.pine.expected.is_empty());
+    }
 }
 
 #[test]
-fn memory_batch_uses_one_native_acquisition_and_rejects_short_payload() {
-    for short in [false, true] {
+fn memory_batch_uses_one_native_acquisition_and_rejects_malformed_payload() {
+    for length in [0usize, 7, 15, 16, 18, 19, 20] {
         let mut body = vec![0x97];
         for n in [2u32, 16, 2, 0, 1] {
             body.extend_from_slice(&n.to_le_bytes());
         }
         let mut payload = 7u64.to_le_bytes().to_vec();
         payload.extend_from_slice(&123u64.to_le_bytes());
-        payload.extend_from_slice(if short { &[1, 2][..] } else { &[1, 2, 255][..] });
+        payload.extend_from_slice(&[1, 2, 255]);
+        payload.resize(length, 0);
         let mut host = bridge(vec![
             (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
             (body, Ok(payload)),
@@ -1241,7 +1295,7 @@ fn memory_batch_uses_one_native_acquisition_and_rejects_short_payload() {
             {"memory_type":"ee","address":16,"length":2},
             {"memory_type":"ee","address":0,"length":1}
         ]}));
-        if short {
+        if length != 19 {
             assert!(result.is_err());
             assert!(host.backend_terminal());
         } else {
@@ -1249,5 +1303,156 @@ fn memory_batch_uses_one_native_acquisition_and_rejects_short_payload() {
             assert_eq!(reply["reads"][0]["hex"], "0102");
             assert_eq!(reply["reads"][1]["hex"], "ff");
         }
+    }
+}
+
+fn pacing_transaction_payload(before: Vec<u8>, mut after: Vec<u8>) -> Vec<u8> {
+    if after.len() == 28 {
+        let revision = u64::from_le_bytes(before[12..20].try_into().unwrap())
+            .wrapping_add(u64::from(before[..12] != after[..12]));
+        after[12..20].copy_from_slice(&revision.to_le_bytes());
+    }
+    [0u32.to_le_bytes().to_vec(), before, after].concat()
+}
+
+#[test]
+fn pacing_previous_is_native_transaction_policy() {
+    let probe = nominal_pacing_payload();
+    let mut previous = probe.clone();
+    previous[4..8].copy_from_slice(&25_000u32.to_le_bytes());
+    previous[8..12].copy_from_slice(&2.5f32.to_le_bytes());
+    let mut final_policy = probe.clone();
+    final_policy[4..8].copy_from_slice(&5_000u32.to_le_bytes());
+    final_policy[8..12].copy_from_slice(&0.5f32.to_le_bytes());
+    let mut setter = vec![0x96];
+    setter.extend_from_slice(&50u32.to_le_bytes());
+    let mut host = bridge(vec![
+        (vec![0x95], Ok(probe)),
+        (
+            setter,
+            Ok(pacing_transaction_payload(previous, final_policy)),
+        ),
+        (vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())),
+    ]);
+    let reply = host
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap();
+    assert_eq!(reply["previous"]["percent"], 250);
+    assert_eq!(reply["execution_speed"]["percent"], 50);
+    assert!(!host.backend_terminal());
+    assert!(host.pine.expected.is_empty());
+}
+
+#[test]
+fn pacing_transaction_failure_retires_control_without_rollback() {
+    let before = nominal_pacing_payload();
+    let valid = pacing_transaction_payload(before.clone(), before.clone());
+    let mut cases = vec![
+        Ok(vec![]),
+        Err(Pcsx2BridgeError::Protocol("reply lost".into())),
+    ];
+    for offset in [0, 4, 12, 16, 24, 32, 40, 44, 52] {
+        let mut malformed = valid.clone();
+        malformed[offset..offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(Ok(malformed));
+    }
+    for payload in cases {
+        let mut setter = vec![0x96];
+        setter.extend_from_slice(&100u32.to_le_bytes());
+        let mut host = bridge(vec![(vec![0x95], Ok(before.clone())), (setter, payload)]);
+        let outcome = host.execution_speed(&json!({"mode":"limited","percent":100}));
+        assert!(outcome.is_err());
+        assert!(host.backend_terminal());
+        assert!(host.pine.expected.is_empty());
+    }
+}
+
+#[test]
+fn pacing_legacy_host_is_rejected_before_control() {
+    let host = Pcsx2Bridge::with_identity(
+        FakePine::new(vec![(
+            vec![MSG_EMUCAP_VERSION],
+            Ok(7u32.to_le_bytes().to_vec()),
+        )]),
+        None,
+        Some("old-ps2".into()),
+        Some("token".into()),
+    );
+    assert!(host.is_err());
+}
+
+#[test]
+fn pacing_verified_native_restoration_keeps_control_healthy() {
+    let before = nominal_pacing_payload();
+    let mut restored = pacing_transaction_payload(before.clone(), before.clone());
+    restored[..4].copy_from_slice(&1u32.to_le_bytes());
+    restored[44..52].copy_from_slice(&3u64.to_le_bytes());
+    let mut setter = vec![0x96];
+    setter.extend_from_slice(&50u32.to_le_bytes());
+    let mut host = bridge(vec![(vec![0x95], Ok(before)), (setter, Ok(restored))]);
+    let error = host
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap_err();
+    assert!(error.to_string().contains("failed_restored"));
+    assert!(!host.backend_terminal());
+    assert_eq!(host.native_pacing().unwrap().public()["percent"], 100);
+}
+
+#[test]
+fn batch_epochs_separate_same_clock_load_and_reset_dispatch() {
+    let mut batch = vec![0x97];
+    for v in [1u32, 0, 1] {
+        batch.extend_from_slice(&v.to_le_bytes());
+    }
+    let payload = [
+        7u64.to_le_bytes().to_vec(),
+        123u64.to_le_bytes().to_vec(),
+        vec![0xaa],
+    ]
+    .concat();
+    let path = absolute_state_path("epoch.p2s");
+    let mut load = vec![MSG_EMUCAP_LOAD_STATE];
+    load.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    load.extend_from_slice(path.as_bytes());
+    let mut replies = Vec::new();
+    for op in [None, Some("load_state"), Some("reset"), Some("load_state")] {
+        if op == Some("load_state") {
+            replies.push((vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())));
+            replies.push((load.clone(), Ok(vec![])));
+        }
+        if op == Some("reset") {
+            replies.push((vec![MSG_EMUCAP_RESET], Ok(123u32.to_le_bytes().to_vec())));
+        }
+        for _ in 0..2 {
+            replies.push((vec![MSG_STATUS], Ok(1u32.to_le_bytes().to_vec())));
+            replies.push((batch.clone(), Ok(payload.clone())));
+        }
+    }
+    let mut host = bridge(replies);
+    let mut previous = None;
+    for op in [None, Some("load_state"), Some("reset"), Some("load_state")] {
+        if let Some(method) = op {
+            let r = host.handle_request(Request::new(1, method, json!({"path":path})));
+            assert!(r.ok, "{:?}", r.error);
+        }
+        let mut current = None;
+        for _ in 0..2 {
+            let r = host.handle_request(Request::new(
+                2,
+                "read_memory_batch",
+                json!({"ranges":[{"memory_type":"ee","address":0,"length":1}]}),
+            ));
+            assert!(r.ok, "{:?}", r.error);
+            let b = r.result.unwrap()["boundary"].clone();
+            assert_eq!(b["clocks"][0]["value"], 123);
+            if let Some(ref old) = current {
+                assert_eq!(old, &b);
+            }
+            current = Some(b);
+        }
+        if let Some(old) = previous {
+            assert_ne!(Some(old), current);
+        }
+        previous = current;
     }
 }

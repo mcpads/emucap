@@ -79,9 +79,13 @@ stack, and builds:
 The headless target is required. The GUI target is best-effort and may be skipped with
 `EMUCAP_DOLPHIN_BUILD_GUI=0`.
 
-On Windows, `build.ps1` applies the same pinned patch stack with Visual Studio 2022 and writes the
-same metadata sidecar expected by the native launcher. This source path is kept in sync, but its
+On Windows, `build.ps1` discovers Visual Studio 2022 or Build Tools, builds
+`DolphinNoGUI.exe` for headless launches and `Dolphin.exe` for visible launches under
+`adapters/dolphin/work/dolphin-src`, and writes the same metadata sidecar expected by the native
+launcher. `-Src` selects the build checkout and `-Jobs` sets parallel projects (default 2). This source path is kept in sync, but its
 runtime behavior has not been verified in this repository's current macOS test environment.
+The isolated Windows runtime retains adjacent DLLs, `Sys`, `QtPlugins`, and
+`qt.conf`; each session receives a separate user directory.
 
 Unix builds also run `test-settings.sh` against the patched native configuration sources. To
 repeat it, use `bash adapters/dolphin/test-settings.sh`; set `EMUCAP_SANITIZERS=thread` or

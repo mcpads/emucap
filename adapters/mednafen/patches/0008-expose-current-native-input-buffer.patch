@@ -1,0 +1,35 @@
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -281,6 +281,32 @@
+ 
+ MDFNGI* MDFNGameInfo = NULL;
+ 
++// Emulation-owner access only. Resolve the current device buffer on each call;
++// MDFNI_SetInput and game close may replace/free it between control requests.
++extern "C" bool emucap_native_input_read(unsigned port, unsigned short* value)
++{
++ if(port != 0 || !value || !MDFNGameInfo || !PortData[port] || !PortDataLen[port])
++  return false;
++ *value = PortData[port][0];
++ if(PortDataLen[port] > 1)
++  *value |= (unsigned short)PortData[port][1] << 8;
++ return true;
++}
++
++extern "C" bool emucap_native_input_write(unsigned port, unsigned short mask, unsigned short buttons, unsigned short* observed)
++{
++ if(port != 0 || !observed || !MDFNGameInfo || !PortData[port] || !PortDataLen[port]
++    || (mask & ~buttons) || (PortDataLen[port] == 1 && (mask & 0xFF00)))
++  return false;
++ unsigned short previous = 0;
++ if(!emucap_native_input_read(port, &previous)) return false;
++ const unsigned short merged = (previous & ~buttons) | mask;
++ PortData[port][0] = merged & 0xFF;
++ if(PortDataLen[port] > 1)
++  PortData[port][1] = merged >> 8;
++ return emucap_native_input_read(port, observed) && (*observed & buttons) == mask;
++}
++
+ static QTRecord *qtrecorder = NULL;
+ static WAVRecord *wavrecorder = NULL;
+ static Fir_Resampler<16> ff_resampler;

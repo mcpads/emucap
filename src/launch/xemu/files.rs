@@ -177,7 +177,7 @@ fn open_regular_no_follow(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(u64, String)> {
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     let mut size = 0_u64;
     loop {
         let count = reader.read(&mut buffer)?;
@@ -222,7 +222,7 @@ pub(super) fn copy_verified(
         .open(destination)?;
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = input.read(&mut buffer)?;
         if count == 0 {

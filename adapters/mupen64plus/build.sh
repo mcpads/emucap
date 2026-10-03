@@ -75,6 +75,10 @@ PATCHES=(
   "$HERE/patches/0005-preserve-interrupt-jitter-state.patch"
   "$HERE/patches/0006-frame-resume-pacing-hook.patch"
   "$HERE/patches/0007-prepare-native-state-load-before-resume.patch"
+  "$HERE/patches/0008-native-pacing-transaction.patch"
+  "$HERE/patches/0009-pure-rdram-observation.patch"
+  "$HERE/patches/0010-use-standard-debugger-integer-types.patch"
+  "$HERE/patches/0011-link-mingw-binutils-dependencies.patch"
 )
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | shasum -a 256 | awk '{print $1}')"
@@ -91,6 +95,8 @@ fi
 # Restore every locally patched source from the verified archive before applying the patch stack.
 # This prevents an ignored generated tree from silently contributing hand edits to a signed build.
 PATCHED_MEMBERS=(
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/projects/unix/Makefile"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/debugger/dbg_decoder.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/r4300_core.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/r4300_core.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/device/r4300/interrupt.c"
@@ -99,6 +105,7 @@ PATCHED_MEMBERS=(
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/debugger.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/api/m64p_debugger.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/main.c"
+  "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/netplay.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/main.h"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/debugger/dbg_debugger.c"
   "mupen64plus-bundle-src-$M64P_VERSION/source/mupen64plus-core/src/main/savestates.c"
@@ -107,6 +114,7 @@ PATCHED_MEMBERS=(
 )
 # Added headers are not archive members; recreate them from the maintained patches.
 rm -f "$SRC/source/mupen64plus-core/src/device/r4300/interrupt_jitter.h"
+rm -f "$SRC/source/mupen64plus-core/src/api/m64p_emucap_pacing.h"
 tar -xzf "$ARCHIVE" -C "$WORK" "${PATCHED_MEMBERS[@]}"
 CORE_SRC="$SRC/source/mupen64plus-core"
 for source_patch in "${PATCHES[@]}"; do
@@ -162,6 +170,9 @@ JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 )
 
 CORE="$SRC/test/libmupen64plus.dylib"
+case "$(uname -s)" in
+  MINGW*|MSYS*) CORE="$SRC/test/mupen64plus.dll" ;;
+esac
 if [ ! -f "$CORE" ]; then
   CORE="$SRC/test/libmupen64plus.so.2"
 fi
@@ -170,15 +181,17 @@ fi
   exit 1
 }
 
-if [ "$(uname)" = "Darwin" ]; then
-  CORE_SYMBOLS="$(nm -gU "$CORE")"
-else
-  CORE_SYMBOLS="$(nm -D "$CORE")"
-fi
-printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugSetCallbacks$'
-printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugStep$'
-printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugBreakpointConsume$'
-printf '%s\n' "$CORE_SYMBOLS" | grep -q '[ _]DebugDecodeOp$'
+case "$(uname -s)" in
+  Darwin) CORE_SYMBOLS="$(nm -gU "$CORE")" ;;
+  MINGW*|MSYS*) CORE_SYMBOLS="$(nm -g "$CORE")" ;;
+  *) CORE_SYMBOLS="$(nm -D "$CORE")" ;;
+esac
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugSetCallbacks$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugStep$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugBreakpointConsume$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugDecodeOp$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]CoreEmucapPacing$' >/dev/null
+printf '%s\n' "$CORE_SYMBOLS" | grep '[ _]DebugMemReadRdram$' >/dev/null
 
 ROM="$SRC/test/m64p_test_rom.v64"
 ROM_SHA="$(sha256_path "$ROM")"

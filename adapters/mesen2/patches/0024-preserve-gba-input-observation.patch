@@ -1,0 +1,48 @@
+--- a/Core/GBA/GbaControlManager.h
++++ b/Core/GBA/GbaControlManager.h
+@@ -30,6 +30,7 @@
+ 	shared_ptr<BaseControlDevice> CreateControllerDevice(ControllerType type, uint8_t port) override;
+ 	void UpdateControlDevices() override;
+ 	uint8_t ReadInputPort(uint32_t addr);
++	uint8_t PeekInputPort(uint32_t addr) const;
+ 	__noinline bool CheckInputCondition();
+ 	void WriteInputPort(GbaAccessModeVal mode, uint32_t addr, uint8_t value);
+ 	void Serialize(Serializer& s) override;
+--- a/Core/GBA/GbaControlManager.cpp
++++ b/Core/GBA/GbaControlManager.cpp
+@@ -90,6 +90,14 @@
+ 
+ uint8_t GbaControlManager::ReadInputPort(uint32_t addr)
+ {
++	if(!(addr & 0x02)) {
++		SetInputReadFlag();
++	}
++	return PeekInputPort(addr);
++}
++
++uint8_t GbaControlManager::PeekInputPort(uint32_t addr) const
++{
+ 	if(addr & 0x02) {
+ 		if(addr & 0x01) {
+ 			return BitUtilities::GetBits<0>(_state.KeyControl);
+@@ -97,7 +105,6 @@
+ 			return BitUtilities::GetBits<8>(_state.KeyControl);
+ 		}
+ 	} else {
+-		SetInputReadFlag();
+ 		return (addr & 0x01) ? (_state.ActiveKeys >> 8) : (uint8_t)_state.ActiveKeys;
+ 	}
+ }
+--- a/Core/GBA/GbaMemoryManager.cpp
++++ b/Core/GBA/GbaMemoryManager.cpp
+@@ -785,7 +785,9 @@
+ 
+ 		case 0x04:
+ 			if(addr < 0x3FF) {
+-				if((addr >= 0x120 && addr <= 0x12B) || (addr >= 0x134 && addr <= 0x159)) {
++				if(addr >= 0x130 && addr <= 0x133) {
++					return _controlManager->PeekInputPort(addr);
++				} else if((addr >= 0x120 && addr <= 0x12B) || (addr >= 0x134 && addr <= 0x159)) {
+ 					return _serial->ReadRegister(addr, true);
+ 				} else {
+ 					return ReadRegister(addr);

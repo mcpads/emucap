@@ -11,11 +11,13 @@ index d343d4b..3ae5b4b 100644
      <ClInclude Include="Core\Debugger\BranchWatch.h" />
      <ClInclude Include="Core\Debugger\CodeTrace.h" />
      <ClInclude Include="Core\Debugger\DebugInterface.h" />
-@@ -926,6 +927,8 @@
+@@ -926,6 +927,10 @@
      <ClCompile Include="Core\Core.cpp" />
      <ClCompile Include="Core\CoreTiming.cpp" />
      <ClCompile Include="Core\CPUThreadConfigCallback.cpp" />
-+    <ClCompile Include="Core\EmuCap.cpp" />
++    <ClCompile Include="Core\EmuCap.cpp">
++      <AdditionalIncludeDirectories>$(ExternalsDir)tinygltf\tinygltf;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++    </ClCompile>
 +    <ClCompile Include="Core\EmuCapInput.cpp" />
      <ClCompile Include="Core\Debugger\BranchWatch.cpp" />
      <ClCompile Include="Core\Debugger\CodeTrace.cpp" />

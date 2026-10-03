@@ -1,0 +1,13 @@
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -2994,6 +2994,10 @@
+ 	if (EmuConfig.EmulationSpeed == old_config.EmulationSpeed)
+ 		return;
+ 
++	// A changed native nominal setting is the latest writer of that policy.
++	if (EmuConfig.EmulationSpeed.NominalScalar != old_config.EmulationSpeed.NominalScalar)
++		s_emucap_nominal_speed = 0.0f;
++
+ 	Console.WriteLn("Updating emulation speed configuration");
+ 	UpdateTargetSpeed();
+ }

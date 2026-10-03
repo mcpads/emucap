@@ -18,12 +18,22 @@ fn write_root(repo: &Path) -> PathBuf {
         ),
     )
     .unwrap();
-    for name in [
-        "libmupen64plus.dylib",
-        "mupen64plus-rsp-hle.dylib",
-        "mupen64plus-input-sdl.dylib",
-        "mupen64plus-video-rice.dylib",
-    ] {
+    let names = if cfg!(windows) {
+        [
+            "mupen64plus.dll",
+            "mupen64plus-rsp-hle.dll",
+            "mupen64plus-input-sdl.dll",
+            "mupen64plus-video-rice.dll",
+        ]
+    } else {
+        [
+            "libmupen64plus.dylib",
+            "mupen64plus-rsp-hle.dylib",
+            "mupen64plus-input-sdl.dylib",
+            "mupen64plus-video-rice.dylib",
+        ]
+    };
+    for name in names {
         std::fs::write(root.join(name), b"fixture").unwrap();
     }
     std::fs::write(
@@ -49,7 +59,7 @@ fn compatible_root_requires_pinned_metadata_and_display_plugin_only_when_visible
     let repo = tempfile::tempdir().unwrap();
     let root = write_root(repo.path());
     assert!(require_compatible_root(repo.path(), &root, true).is_ok());
-    std::fs::remove_file(root.join("mupen64plus-video-rice.dylib")).unwrap();
+    std::fs::remove_file(library_path(&root, "mupen64plus-video-rice").unwrap()).unwrap();
     assert!(require_compatible_root(repo.path(), &root, false).is_ok());
     assert!(require_compatible_root(repo.path(), &root, true).is_err());
     let metadata_path = root.join("emucap-mupen64plus-build.json");
@@ -64,7 +74,7 @@ fn compatible_root_requires_pinned_metadata_and_display_plugin_only_when_visible
 fn compatible_root_requires_the_input_plugin_in_every_mode() {
     let repo = tempfile::tempdir().unwrap();
     let root = write_root(repo.path());
-    std::fs::remove_file(root.join("mupen64plus-input-sdl.dylib")).unwrap();
+    std::fs::remove_file(library_path(&root, "mupen64plus-input-sdl").unwrap()).unwrap();
     assert!(require_compatible_root(repo.path(), &root, false).is_err());
     assert!(require_compatible_root(repo.path(), &root, true).is_err());
 }

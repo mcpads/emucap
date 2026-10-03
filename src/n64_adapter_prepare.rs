@@ -38,7 +38,7 @@ impl Drop for PreparationGuard {
             unsafe {
                 let _ = (self.api.core_detach_plugin)(plugin.kind);
                 let _ = (plugin.shutdown)();
-                libc::dlclose(plugin.handle);
+                close_library(plugin.handle);
             }
         }
         if self.rom_open {
@@ -53,7 +53,7 @@ impl Drop for PreparationGuard {
         }
         if !self.core_handle.is_null() {
             unsafe {
-                libc::dlclose(self.core_handle);
+                close_library(self.core_handle);
             }
         }
     }
@@ -71,7 +71,7 @@ impl Mupen64PlusHost {
         let api = match unsafe { load_api(core_handle) } {
             Ok(api) => api,
             Err(error) => {
-                unsafe { libc::dlclose(core_handle) };
+                unsafe { close_library(core_handle) };
                 return Err(error);
             }
         };
@@ -132,28 +132,28 @@ impl Mupen64PlusHost {
             let startup = match unsafe { symbol::<PluginStartup>(handle, b"PluginStartup\0") } {
                 Ok(startup) => startup,
                 Err(error) => {
-                    unsafe { libc::dlclose(handle) };
+                    unsafe { close_library(handle) };
                     return Err(error);
                 }
             };
             let shutdown = match unsafe { symbol::<PluginShutdown>(handle, b"PluginShutdown\0") } {
                 Ok(shutdown) => shutdown,
                 Err(error) => {
-                    unsafe { libc::dlclose(handle) };
+                    unsafe { close_library(handle) };
                     return Err(error);
                 }
             };
             if let Err(error) = check_core("PluginStartup", unsafe {
                 startup(core_handle, ptr::null_mut(), debug_log_callback)
             }) {
-                unsafe { libc::dlclose(handle) };
+                unsafe { close_library(handle) };
                 return Err(error);
             }
             if kind == M64PLUGIN_INPUT {
                 if let Err(error) = control::configure_input(&api) {
                     unsafe {
                         let _ = shutdown();
-                        libc::dlclose(handle);
+                        close_library(handle);
                     }
                     return Err(error);
                 }
@@ -163,7 +163,7 @@ impl Mupen64PlusHost {
             }) {
                 unsafe {
                     let _ = shutdown();
-                    libc::dlclose(handle);
+                    close_library(handle);
                 }
                 return Err(error);
             }
@@ -206,6 +206,8 @@ impl Mupen64PlusHost {
             display,
             frozen: false,
             frame_paused: false,
+            request_cancellation: Default::default(),
+            producer_ownership: None,
             frame_clock_synchronized: false,
             held_buttons: BTreeSet::new(),
             breakpoints: BTreeMap::new(),

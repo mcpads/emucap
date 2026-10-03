@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+extern "C" bool emucap_native_restore_service(bool instruction_ready);
+
 namespace {
 
 std::vector<EmucapNgpExecRange> ngp_exec_breakpoints;
@@ -254,16 +256,28 @@ uint32 NGPDBG_Peek32(uint32 address) {
 }
 
 void NGPDBG_InstructionBoundary(uint32 boundary_pc) {
-  if (!ngp_cpu_hook) return;
-  const uint32 masked_pc = emucap_ngp_mask_pc(boundary_pc);
-  const bool matched = std::any_of(
-      ngp_exec_breakpoints.begin(),
-      ngp_exec_breakpoints.end(),
-      [masked_pc](const EmucapNgpExecRange& range) {
-        return emucap_ngp_exec_matches(range, masked_pc);
-      });
-  if (matched || ngp_cpu_hook_continuous)
-    ngp_cpu_hook(masked_pc, matched);
+  for (;;) {
+    if (!ngp_cpu_hook) return;
+    const uint32 masked_pc = emucap_ngp_mask_pc(boundary_pc);
+    const bool matched = std::any_of(
+        ngp_exec_breakpoints.begin(),
+        ngp_exec_breakpoints.end(),
+        [masked_pc](const EmucapNgpExecRange& range) {
+          return emucap_ngp_exec_matches(range, masked_pc);
+        });
+    if (matched || ngp_cpu_hook_continuous)
+      ngp_cpu_hook(masked_pc, matched);
+    // The interpreter has not fetched an opcode or cached execution operands yet.
+    // Discard this invocation's PC/match and acknowledge replacement without
+    // manufacturing another instruction callback or advancing the guest.
+    while (emucap_native_restore_service(FrameActive)) {}
+    if (FrameActive) return;
+    // A completed-frame origin resumes before frame input/clock initialization.
+    // Re-enter the real instruction callback after initialization, so a request
+    // from its Continuation park does not count an unexecuted instruction.
+    BeginFrame();
+    boundary_pc = pc;
+  }
 }
 
 void NGPDBG_Init(void) {

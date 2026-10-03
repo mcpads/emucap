@@ -75,3 +75,6 @@ void emucap_capture_fatal_sh4(
 
 // UI shutdown can arrive on another thread while the emulation thread is quarantined.
 void emucap_notify_shutdown() noexcept;
+
+// Renderer-thread failure publication; does not access socket-owner state.
+void emucap_renderer_failed(const char* reason) noexcept;

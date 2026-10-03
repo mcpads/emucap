@@ -59,6 +59,9 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
     launcher sets this env (plus `HOME`/`XDG_CONFIG_HOME`) to the emucap-owned per-port run dir, so a
     HITL session never touches the user's real config/saves/control mappings even if they configured a
     custom memory stick in their own PPSSPP.
+  - `patches/0031-headless-dialogs-and-isolated-memstick.patch` retains the guest system
+    dialog atlas during managed headless capture and honors the generation's
+    `EMUCAP_PPSSPP_MEMSTICK` on Windows and other hosts before creating save directories.
   - `patches/0007-emucap-headless-no-sdl-fatal.patch` lets `PPSSPPHeadless` configure and build
     without SDL3; the optional GUI target remains available when SDL3 and SDL3_ttf are installed.
   - `patches/0008-emucap-correlate-async-debugger-acks.patch` echoes request tickets on
@@ -67,6 +70,14 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
   - `patches/0009-emucap-vblank-frame-step.patch` adds `emucap.frameStep`, an exact advance from
     one frozen PSP VBlank-start boundary to another. A debugger stop preempts the request and
     returns its partial count; completion does not claim that a host frame was presented.
+  - `patches/0016-emucap-deferred-frame-control.patch` keeps frame-step responses deferred
+    while the debugger services requests. An optional `operation_id` admits a matching
+    same-connection `emucap.frameStep.cancel`; `emucap.frameStep.capability` reports protocol v1.
+    The original ticket returns verified partial
+    progress after the CPU stops. Disconnect cleans up the pending native frame owner. Managed bridges
+    negotiate this protocol and advertise frame-operation cancellation with a 4-second
+    cleanup budget. Parent cleanup verifies native CPU inactivity and releases owned input
+    on cancellation or controller disconnect; instruction stepping retains its existing path.
   - `patches/0010-emucap-stepping-reason.patch` preserves the native stop reason and related
     address after PPSSPP clears the pending step command, so breakpoint events no longer need to
     infer every stop from PC or hit-count deltas.
@@ -80,6 +91,15 @@ emucap Core ──emucap protocol (TCP)──▶ emucap-ppsspp-bridge ──WebS
   handles this with a send-then-wait-for-a-different-event primitive, not a naive call/reply demux.
 
 ## Build
+
+On Windows, run `adapters/ppsspp/build.ps1` with Visual Studio 2022 C++ tools and
+CMake. It builds `work/ppsspp/build-headless/Release/PPSSPPHeadless.exe`, stages
+runtime assets beside it, and writes build metadata. `-Jobs` sets parallel build
+jobs (default 2). `EMUCAP_PPSSPP_WORK` selects an empty or emucap-owned work root;
+`EMUCAP_PPSSPP_SRC` supplies a read-only clone origin. The native Windows Headless
+target links its Media Foundation GUID and common-control dependencies explicitly.
+
+On macOS or Linux:
 
 ```sh
 adapters/ppsspp/build.sh

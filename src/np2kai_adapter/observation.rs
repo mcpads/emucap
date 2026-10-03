@@ -81,6 +81,7 @@ impl FramePacer {
 pub(super) enum AdvanceStop {
     Breakpoint,
     HostDeadline,
+    Cancelled,
 }
 
 impl AdvanceStop {
@@ -89,6 +90,7 @@ impl AdvanceStop {
             None => Value::Null,
             Some(Self::Breakpoint) => json!("breakpoint"),
             Some(Self::HostDeadline) => json!("host_deadline"),
+            Some(Self::Cancelled) => json!("cancelled"),
         }
     }
 }
@@ -202,6 +204,10 @@ impl Np2kaiHost {
         let mut completed = 0;
         let mut stop = None;
         while completed < count {
+            if self.request_cancellation.is_cancelled() {
+                stop = Some(AdvanceStop::Cancelled);
+                break;
+            }
             if let Some(start) = self
                 .pacer
                 .frame_start(self.frame, frame_duration, Instant::now())
@@ -210,7 +216,10 @@ impl Np2kaiHost {
                     stop = Some(AdvanceStop::HostDeadline);
                     break;
                 }
-                std::thread::sleep(start.saturating_duration_since(Instant::now()));
+                if !wait_for_frame_start(start, &self.request_cancellation) {
+                    stop = Some(AdvanceStop::Cancelled);
+                    break;
+                }
             }
             if !per_frame(self)? {
                 stop = Some(AdvanceStop::Breakpoint);
@@ -251,6 +260,26 @@ impl Np2kaiHost {
                 "read_memory_batch requires an initialized machine; step once first".into(),
             ));
         }
+        // Static windows describe possible views. Native mode decides whether
+        // every range is readable now, before any guest payload is acquired.
+        let native_ranges: Vec<super::ffi::PeekRange> = ranges
+            .iter()
+            .map(|range| {
+                let region = memory_region(&range.memory_type).expect("admitted memory type");
+                super::ffi::PeekRange {
+                    address: region.base + range.address as u32,
+                    length: range.length as u32,
+                }
+            })
+            .collect();
+        if unsafe {
+            (self.api.debug_validate_peek_ranges)(native_ranges.as_ptr(), native_ranges.len())
+        } == 0
+        {
+            return Err(Np2kaiError::BadParams(
+                "batch contains a range outside the current native peek view".into(),
+            ));
+        }
         let mut reads = Vec::with_capacity(ranges.len());
         for (index, range) in ranges.iter().enumerate() {
             let region = memory_region(&range.memory_type).ok_or_else(|| {
@@ -286,3 +315,20 @@ impl Np2kaiHost {
 #[cfg(test)]
 #[path = "observation_tests.rs"]
 mod tests;
+
+// The guest owner stays outside retro_run throughout this host-only wait.
+fn wait_for_frame_start(
+    start: Instant,
+    cancellation: &crate::live::link::RequestCancellation,
+) -> bool {
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= start {
+            return true;
+        }
+        std::thread::sleep((start - now).min(Duration::from_millis(10)));
+    }
+}

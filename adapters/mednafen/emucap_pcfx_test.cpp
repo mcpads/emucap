@@ -3,6 +3,16 @@
 #include <cassert>
 
 int main() {
+  assert(emucap_pcfx_cpu_peek_range(0, 1));
+  assert(emucap_pcfx_cpu_peek_range(0x7FFFFFFF, 1));
+  assert(!emucap_pcfx_cpu_peek_range(0x7FFFFFFF, 2));
+  assert(!emucap_pcfx_cpu_peek_range(0x80000000, 1));
+  assert(!emucap_pcfx_cpu_peek_range(0x8077FFFF, 2));
+  assert(emucap_pcfx_cpu_peek_range(0x80780000, 1));
+  assert(emucap_pcfx_cpu_peek_range(0xFFFFFFFF, 1));
+  assert(!emucap_pcfx_cpu_peek_range(0xFFFFFFFF, 2));
+  assert(!emucap_pcfx_cpu_peek_range(0, 0));
+  assert(!emucap_pcfx_cpu_peek_range(0, UINT64_MAX));
   assert(emucap_v810_classify(0xAC00) == EmucapV810CallKind::call);
   assert(emucap_v810_classify(0x181F) == EmucapV810CallKind::return_from_call);
   assert(emucap_v810_classify(0x1803) == EmucapV810CallKind::other);

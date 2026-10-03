@@ -43,6 +43,7 @@ pub struct BuildMetadata {
     pub raster_patch_sha256: String,
     pub disk_state_patch_sha256: String,
     pub realtime_patch_sha256: String,
+    pub console_patch_sha256: String,
     pub native_patch: bool,
 }
 
@@ -199,6 +200,8 @@ pub fn require_compatible_build(repo_root: &Path, binary: &Path) -> io::Result<B
             == required_lock_value(&lock, "OPENMSX_DISK_STATE_PATCH_SHA256")?
         && metadata.realtime_patch_sha256
             == required_lock_value(&lock, "OPENMSX_REALTIME_PATCH_SHA256")?
+        && metadata.console_patch_sha256
+            == required_lock_value(&lock, "OPENMSX_CONSOLE_PATCH_SHA256")?
         && metadata.native_patch;
     if !matches_lock {
         return Err(io::Error::new(

@@ -1,0 +1,206 @@
+--- a/Core/Shared/EventType.h
++++ b/Core/Shared/EventType.h
+@@ -26,6 +26,7 @@
+ 	SnesPpuCgramLookup,
+ 	SnesPpuBgChrFetch,
+ 	PacingIdle,
++	ControlIdle,
+ 
+ 	LastValue
+ };
+--- a/Core/Debugger/Debugger.h
++++ b/Core/Debugger/Debugger.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "pch.h"
++#include <chrono>
+ #include "Utilities/SimpleLock.h"
+ #include "Debugger/DebugUtilities.h"
+ #include "Debugger/DebugTypes.h"
+@@ -96,6 +97,22 @@
+ 	bool Decrement = false;
+ };
+ 
++// Host-owned observation clocks. They are not serialized guest state and are
++// meaningful only within this debugger generation. PPU units match native
++// PpuStepCount decrements, not presentation frames or Lua startFrame events.
++struct AgentControlState
++{
++	uint64_t Generation = 0;
++	uint64_t InstructionBoundaries = 0;
++	uint64_t HaltedCpuSteps = 0;
++	uint64_t PpuCycles = 0;
++	uint64_t MonotonicMs = 0;
++	int32_t InstructionRemaining = -1;
++	int32_t PpuRemaining = -1;
++	StepType Type = StepType::Step;
++	bool Halted = false;
++};
++
+ class Debugger
+ {
+ private:
+@@ -132,6 +149,14 @@
+ 	DebugControllerState _inputOverrides[8] = {};
+ 
+ 	bool _waitForBreakResume = false;
++	static atomic<uint64_t> _nextAgentGeneration;
++	const uint64_t _agentGeneration = ++_nextAgentGeneration;
++	uint64_t _agentInstructionBoundaries = 0;
++	uint64_t _agentHaltedCpuSteps = 0;
++	uint64_t _agentPpuCycles = 0;
++	uint32_t _agentServiceTicks = 0;
++	std::chrono::steady_clock::time_point _agentLastService = std::chrono::steady_clock::now();
++	void ServiceAgentControl();
+ 
+ 	void Reset();
+ 
+@@ -236,6 +261,7 @@
+ 	CpuType GetMainCpuType() { return _mainCpuType; }
+ 	IDebugger* GetCpuDebugger(CpuType cpuType);
+ 	IDebugger* GetMainDebugger();
++	AgentControlState GetAgentControlState();
+ 
+ 	TraceLogFileSaver* GetTraceLogFileSaver() { return _traceLogSaver.get(); }
+ 	MemoryDumper* GetMemoryDumper() { return _memoryDumper.get(); }
+--- a/Core/Debugger/Debugger.cpp
++++ b/Core/Debugger/Debugger.cpp
+@@ -226,6 +226,10 @@
+ 
+ 	debugger->IgnoreBreakpoints = false;
+ 	debugger->AllowChangeProgramCounter = true;
++	if(type == _mainCpuType) {
++		_agentInstructionBoundaries++;
++		ServiceAgentControl();
++	}
+ 
+ 	switch(type) {
+ 		case CpuType::Snes: GetDebugger<type, SnesDebugger>()->ProcessInstruction(); break;
+@@ -386,6 +390,11 @@
+ 	dbg->AllowChangeProgramCounter = true;
+ 	dbg->InstructionProgress.CurrentCycle = 0;
+ 
++	if(type == _mainCpuType) {
++		_agentHaltedCpuSteps++;
++		ServiceAgentControl();
++	}
++
+ 	//Process cpu step requests as if each call to ProcessHaltedCpu is an instruction
+ 	StepRequest* req = dbg->GetStepRequest();
+ 	req->ProcessCpuExec();
+@@ -454,6 +463,10 @@
+ {
+ 	if(_debuggers[(int)type].Debugger->IsStepBack()) {
+ 		return;
++	}
++	if(type == _mainCpuType) {
++		_agentPpuCycles++;
++		ServiceAgentControl();
+ 	}
+ 
+ 	switch(type) {
+@@ -772,6 +785,42 @@
+ 	}
+ 
+ 	_waitForBreakResume = false;
++}
++
++atomic<uint64_t> Debugger::_nextAgentGeneration{0};
++
++void Debugger::ServiceAgentControl()
++{
++	// Avoid a host clock read for every guest tick. CPU and PPU paths both
++	// participate, including CPU wait/stop loops serviced by the PPU.
++	if((++_agentServiceTicks & 255) != 0) return;
++	auto now = std::chrono::steady_clock::now();
++	if(now - _agentLastService < std::chrono::milliseconds(10)) return;
++	_agentLastService = now;
++	if(_scriptManager->HasEventCallback(EventType::ControlIdle)) {
++		// On the emulation owner. This event admits control intent, not a
++		// stopped-state or safe-serialization claim.
++		ProcessEvent(EventType::ControlIdle, _mainCpuType);
++	}
++}
++
++AgentControlState Debugger::GetAgentControlState()
++{
++	AgentControlState result;
++	result.Generation = _agentGeneration;
++	result.InstructionBoundaries = _agentInstructionBoundaries;
++	result.HaltedCpuSteps = _agentHaltedCpuSteps;
++	result.PpuCycles = _agentPpuCycles;
++	result.MonotonicMs = std::chrono::duration_cast<std::chrono::milliseconds>(
++		std::chrono::steady_clock::now().time_since_epoch()).count();
++	// A scheduled resume clears _waitForBreakResume before this callback
++	// returns. It must immediately revoke the old halt proof.
++	result.Halted = _executionStopped && _waitForBreakResume && !_suspendRequestCount;
++	StepRequest* step = GetMainDebugger()->GetStepRequest();
++	result.InstructionRemaining = step->StepCount;
++	result.PpuRemaining = step->PpuStepCount;
++	result.Type = step->Type;
++	return result;
+ }
+ 
+ bool Debugger::IsPaused()
+--- a/Core/Debugger/LuaApi.h
++++ b/Core/Debugger/LuaApi.h
+@@ -64,6 +64,7 @@
+ 	static int Reset(lua_State* lua);
+ 	static int PowerCycle(lua_State* lua);
+ 	static int GetPacing(lua_State* lua);
++	static int GetControlState(lua_State* lua);
+ 	static int SetPacing(lua_State* lua);
+ 	static int EndPacingWait(lua_State* lua);
+ 	static int Stop(lua_State* lua);
+--- a/Core/Debugger/LuaApi.cpp
++++ b/Core/Debugger/LuaApi.cpp
+@@ -134,6 +134,7 @@
+ 		{ "reset", LuaApi::Reset },
+ 		{ "powerCycle", LuaApi::PowerCycle },
+ 		{ "getPacing", LuaApi::GetPacing },
++		{ "getControlState", LuaApi::GetControlState },
+ 		{ "setPacing", LuaApi::SetPacing },
+ 		{ "endPacingWait", LuaApi::EndPacingWait },
+ 		{ "stop", LuaApi::Stop },
+@@ -785,6 +786,25 @@
+ 	lua_pushboolvalue(maximumSpeed, settings->CheckFlag(EmulationFlags::MaximumSpeed));
+ 	lua_pushboolvalue(turbo, settings->CheckFlag(EmulationFlags::Turbo));
+ 	lua_pushboolvalue(rewind, settings->CheckFlag(EmulationFlags::Rewind));
++}
++
++int LuaApi::GetControlState(lua_State* lua)
++{
++	LuaCallHelper l(lua);
++	checkparams();
++	checkinitdone();
++	AgentControlState state = _debugger->GetAgentControlState();
++	lua_newtable(lua);
++	lua_pushintvalue(generation, state.Generation);
++	lua_pushintvalue(instructionBoundaries, state.InstructionBoundaries);
++	lua_pushintvalue(haltedCpuSteps, state.HaltedCpuSteps);
++	lua_pushintvalue(ppuCycles, state.PpuCycles);
++	lua_pushintvalue(monotonicMs, state.MonotonicMs);
++	lua_pushintvalue(instructionRemaining, state.InstructionRemaining);
++	lua_pushintvalue(ppuRemaining, state.PpuRemaining);
++	lua_pushintvalue(stepType, (int)state.Type);
++	lua_pushboolvalue(halted, state.Halted);
++	return 1;
+ }
+ 
+ int LuaApi::GetPacing(lua_State* lua)
+--- a/UI/Debugger/Documentation/LuaDocumentation.json
++++ b/UI/Debugger/Documentation/LuaDocumentation.json
+@@ -345,6 +345,13 @@
+ 		{ "name": "signed", "type": "Bool", "description": "When true, the return value is a 32-bit signed value." }
+ 	],
+ 	"returnValue": { "type": "Int", "description": "A 32-bit (signed or unsigned) value." }
++},
++{
++	"name": "getControlState",
++	"category": "Emulation",
++	"description": "Returns debugger-generation-scoped instruction-boundary and PPU-cycle counters, remaining native step counters, monotonic host milliseconds and an observed debugger halt flag. These host counters are not save-state fields. Native instruction stepping also counts halted-CPU service iterations; those are exposed separately as haltedCpuSteps and must not be described as executed opcodes. A controlIdle callback receives control-service opportunities on the emulation owner while executing; it does not prove a halt or safe serialization.",
++	"parameters": [],
++	"returnValue": { "type": "Table", "description": "generation, instructionBoundaries, haltedCpuSteps, ppuCycles, instructionRemaining, ppuRemaining, stepType, monotonicMs and halted. A scheduled resume immediately clears halted." }
+ },
+ {
+ 	"name": "getPacing",

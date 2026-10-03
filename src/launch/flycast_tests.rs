@@ -38,12 +38,25 @@ fn runtime_binary_uses_emucap_owned_plain_exe_dir() {
     let source_cfg = src.path().join("emu.cfg");
     std::fs::write(&source_bin, "fake flycast").unwrap();
     std::fs::write(&source_cfg, "[config]\naica.Volume = 100\n").unwrap();
+    std::fs::write(src.path().join("SDL2.dll"), b"dependency").unwrap();
+    std::fs::write(src.path().join("OPENGL32.DLL"), b"renderer").unwrap();
+    std::fs::write(src.path().join("unrelated.txt"), b"private").unwrap();
 
     let prepared = super::prepare_runtime_binary(&source_bin, iso.path()).unwrap();
 
     assert_eq!(prepared.portable_dir, iso.path().join("portable"));
     assert_eq!(prepared.binary, iso.path().join("portable/Flycast.exe"));
     assert!(prepared.binary.is_file());
+    assert_eq!(
+        std::fs::read(prepared.portable_dir.join("SDL2.dll")).unwrap(),
+        b"dependency"
+    );
+    assert_eq!(
+        std::fs::read(prepared.portable_dir.join("OPENGL32.DLL")).unwrap(),
+        b"renderer"
+    );
+    assert!(!prepared.portable_dir.join("unrelated.txt").exists());
+    assert!(!prepared.portable_dir.join("emu.cfg").exists());
     assert_eq!(
         std::fs::read_to_string(&source_cfg).unwrap(),
         "[config]\naica.Volume = 100\n"

@@ -1,0 +1,14 @@
+--- a/desmume/src/saves.cpp
++++ b/desmume/src/saves.cpp
+@@ -779,7 +779,11 @@
+ 			#else
+ 			static const char PSS = '/';
+ 			#endif
++			#if defined(_WIN32) && !defined(HOST_WINDOWS)
++			mkdir(dirname.c_str());
++			#else
+ 			mkdir(dirname.c_str(),0777);
++			#endif
+ 			
+ 			int cur_index = -1; // setup index, -1 in case it is first instance
+ 			if (max_index == -1) { // If not set

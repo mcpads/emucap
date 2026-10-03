@@ -691,6 +691,95 @@ fn immediately_bound_link_keeps_zero_as_the_search_base() {
 }
 
 #[test]
+fn dropping_idle_preaccept_releases_its_listener() {
+    let _env = SessionEnv::with(Some("drop-preaccept"));
+    #[cfg(unix)]
+    let before = open_descriptor_count();
+    for _ in 0..8 {
+        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_millis(50));
+        assert!(matches!(
+            link.call("status", serde_json::json!({})),
+            Err(LinkError::NotConnected)
+        ));
+        let addr = link.local_addr();
+        drop(link);
+        let rebound = std::net::TcpListener::bind(addr);
+        assert!(
+            rebound.is_ok(),
+            "dropped preaccept still owns {addr}: {rebound:?}"
+        );
+    }
+    #[cfg(unix)]
+    eprintln!(
+        "idle preaccept descriptor count: {before} -> {}",
+        open_descriptor_count()
+    );
+}
+
+// Diagnostic only: parallel tests may own descriptors. The isolated audit runs
+// one test process; no /dev/fd directory is opened and counted as a socket leak.
+#[cfg(unix)]
+fn open_descriptor_count() -> usize {
+    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+    assert!(limit > 0);
+    (0..limit)
+        .filter(|fd| unsafe { libc::fcntl(*fd as libc::c_int, libc::F_GETFD) } >= 0)
+        .count()
+}
+
+#[test]
+fn dropping_stalled_preaccept_interrupts_the_handshake() {
+    let _env = SessionEnv::with(Some("drop-stalled-preaccept"));
+    for _ in 0..4 {
+        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(30));
+        assert!(matches!(
+            link.call("status", serde_json::json!({})),
+            Err(LinkError::NotConnected)
+        ));
+        let peer = TcpStream::connect(link.local_addr()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut reader = BufReader::new(peer);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        assert!(hello.contains("\"hello\""));
+        // The peer never replies. Teardown must not wait for the 30-second
+        // application handshake timeout, and must close every stream clone.
+        let started = std::time::Instant::now();
+        drop(link);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    }
+}
+
+#[test]
+fn dropping_completed_preaccept_releases_the_queued_connection() {
+    let _env = SessionEnv::with(Some("drop-queued-preaccept"));
+    for _ in 0..8 {
+        let mut link = tcp::lazy("127.0.0.1:0", Duration::from_secs(2));
+        assert!(matches!(
+            link.call("status", serde_json::json!({})),
+            Err(LinkError::NotConnected)
+        ));
+        let peer = TcpStream::connect(link.local_addr()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut reader = BufReader::new(peer);
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(reader.get_mut(), &hello, &["status"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !link.preaccept_finished() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The successful connection is queued in the channel but has never
+        // been taken by a subsequent Core request.
+        assert!(!link.has_conn());
+        drop(link);
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    }
+}
+
+#[test]
 fn tcp_link_preaccepts_after_not_connected_status() {
     use super::link::EmulatorLink;
     let _env = lock_env();
@@ -1870,6 +1959,8 @@ fn tcp_link_write_timeout_poisons_conn() {
     let (rel_tx, rel_rx) = std::sync::mpsc::channel();
     let h = std::thread::spawn(move || fake_lua_hello_then_never_read(addr, tx, rel_rx));
     rx.recv().unwrap();
+    #[cfg(windows)]
+    link.disable_test_send_buffer();
     // 큰 params로 요청 한 줄을 수십 MB로 만들어 송신 버퍼(+peer recv 버퍼)를 넘긴다 → write_all 스톨.
     let big = "x".repeat(32 * 1024 * 1024);
     let r = link.call("read_memory", serde_json::json!({ "blob": big }));
@@ -1959,8 +2050,10 @@ fn tcp_progress_is_typed_and_cancellation_sends_one_exact_abort() {
     let _env = lock_env();
     let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
     let addr = link.local_addr().to_string();
+    let (ready, connected) = std::sync::mpsc::channel();
     let h = std::thread::spawn(move || {
         let stream = TcpStream::connect(addr).unwrap();
+        ready.send(()).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
         let mut hello = String::new();
@@ -2016,6 +2109,7 @@ fn tcp_progress_is_typed_and_cancellation_sends_one_exact_abort() {
         .unwrap();
     });
 
+    connected.recv_timeout(Duration::from_secs(5)).unwrap();
     let cancellation = RequestCancellation::default();
     let trigger = cancellation.clone();
     let control = ProgressCallControl {
@@ -2110,7 +2204,12 @@ fn tcp_temporal_cancellation_drains_terminal_before_next_call() {
         let mut ready = String::new();
         reader.read_line(&mut ready).unwrap();
         let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
-        writeln!(writer,"{}",serde_json::json!({"id":ready["id"],"ok":true,"result":{"state":"frozen"}})).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id":ready["id"],"ok":true,"result":{"state":"frozen"}})
+        )
+        .unwrap();
         super::temporal::wire::tests::peer(reader, writer, trigger, true);
     });
     link.call("status", serde_json::json!({})).unwrap();
@@ -2178,4 +2277,64 @@ fn tcp_parent_deadline_closes_a_partial_reply_without_reconnecting() {
         Err(LinkError::NotConnected)
     ));
     assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[test]
+fn invalid_socket_configuration_on_a_connected_peer_remains_a_protocol_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    let error = stream.set_read_timeout(Some(Duration::ZERO)).unwrap_err();
+    assert!(matches!(
+        tcp::socket_config_error(&stream, error),
+        LinkError::Protocol(_)
+    ));
+    drop(peer);
+}
+
+#[test]
+fn tcp_temporal_rejection_preserves_attachment_for_cleanup() {
+    let _env = lock_env();
+    let mut link = tcp::bind("127.0.0.1:0", Duration::from_secs(2)).unwrap();
+    let addr = link.local_addr().to_string();
+    let control = super::temporal::wire::tests::control();
+    let worker = std::thread::spawn(move || {
+        let mut writer = TcpStream::connect(addr).unwrap();
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let mut hello = String::new();
+        reader.read_line(&mut hello).unwrap();
+        write_hello_response(&mut writer, &hello, &["step", "status"]);
+        let mut ready = String::new();
+        reader.read_line(&mut ready).unwrap();
+        let ready: serde_json::Value = serde_json::from_str(&ready).unwrap();
+        writeln!(
+            writer,
+            "{}",
+            serde_json::json!({"id":ready["id"],"ok":true,"result":{"state":"frozen"}})
+        )
+        .unwrap();
+        super::temporal::wire::tests::rejected_input_peer(reader, writer);
+    });
+    link.call("status", serde_json::json!({})).unwrap();
+    let result = link
+        .call_with_progress(
+            "set_input",
+            serde_json::json!({"buttons":["invalid"],"_temporal_owner":control.abort.as_ref().unwrap().params}),
+            &mut |_| panic!("plain temporal keepalive is not recording progress"),
+            &control,
+        )
+        .unwrap_err();
+    assert!(matches!(result, LinkError::Emulator { ref kind, .. } if kind == "bad_params"));
+    link.call_with_progress(
+        "set_input",
+        serde_json::json!({"buttons":[],"_temporal_owner":control.abort.as_ref().unwrap().params}),
+        &mut |_| Ok(()),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["state"],
+        "frozen"
+    );
+    worker.join().unwrap();
 }

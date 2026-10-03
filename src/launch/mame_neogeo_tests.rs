@@ -121,15 +121,22 @@ fn headless_spec_uses_isolated_home_and_neogeo_profile() {
     };
     let spec = mame_spec(&launch, "game", 48822).unwrap();
     assert!(spec.args.windows(2).any(|v| v == ["-video", "none"]));
+    assert_eq!(
+        spec.args.iter().any(|v| v == "-videodriver"),
+        !cfg!(windows)
+    );
     assert!(spec.args.iter().any(|v| v == "-noreadconfig"));
     assert!(spec
         .env
         .iter()
         .any(|(key, value)| { key == "EMUCAP_MAME_PROFILE" && value == "neogeo_mvs" }));
-    assert!(spec.args.iter().any(|v| v.contains("mame-neogeo/47822")));
+    assert!(spec
+        .args
+        .iter()
+        .any(|v| Path::new(v).ends_with("mame-neogeo/47822")));
     let bridge = bridge_spec(&launch, gdb_port(launch.port).unwrap()).unwrap();
     assert!(bridge.env.iter().any(|(key, value)| {
-        key == "EMUCAP_ADAPTER_HOME" && value.contains("mame-neogeo/47822")
+        key == "EMUCAP_ADAPTER_HOME" && Path::new(value).ends_with("mame-neogeo/47822")
     }));
 }
 
@@ -258,7 +265,7 @@ fn aes_spec_uses_software_list_cartridge_and_a_separate_home() {
     assert!(spec
         .args
         .iter()
-        .any(|value| value.contains("mame-neogeo-aes/47824")));
+        .any(|value| Path::new(value).ends_with("mame-neogeo-aes/47824")));
 }
 
 #[test]
@@ -342,5 +349,5 @@ fn cd_spec_uses_cdz_driver_cdrom_media_and_a_separate_home() {
     assert!(spec
         .args
         .iter()
-        .any(|value| value.contains("mame-neogeo-cd/47825")));
+        .any(|value| Path::new(value).ends_with("mame-neogeo-cd/47825")));
 }

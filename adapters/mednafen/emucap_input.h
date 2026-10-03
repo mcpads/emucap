@@ -23,14 +23,15 @@ class EmucapInputOverride {
     return static_cast<uint16_t>(state_.load(std::memory_order_acquire));
   }
 
-  void apply(unsigned char* data, unsigned length) const {
+  void apply(unsigned char* data, unsigned length, uint16_t buttons = 0xFFFF) const {
     if (!data || length == 0) return;
     const uint32_t state = state_.load(std::memory_order_acquire);
     if ((state & kEngaged) == 0) return;
 
-    const uint16_t mask = static_cast<uint16_t>(state);
-    data[0] = static_cast<unsigned char>(mask & 0xFF);
-    if (length > 1) data[1] = static_cast<unsigned char>((mask >> 8) & 0xFF);
+    const uint16_t previous = data[0] | (length > 1 ? uint16_t(data[1]) << 8 : 0);
+    const uint16_t merged = (previous & ~buttons) | (static_cast<uint16_t>(state) & buttons);
+    data[0] = static_cast<unsigned char>(merged & 0xFF);
+    if (length > 1) data[1] = static_cast<unsigned char>((merged >> 8) & 0xFF);
   }
 
  private:

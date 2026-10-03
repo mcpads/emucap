@@ -130,7 +130,12 @@ try {
         (Join-Path $Here "patches/0018-preserve-agent-frame-rendering.patch"),
         (Join-Path $Here "patches/0019-preserve-gba-raster-and-lcd-history.patch"),
         (Join-Path $Here "patches/0020-preserve-gb-raster-and-lcd-history.patch"),
-        (Join-Path $Here "patches/0021-preserve-nes-raster-history.patch")
+        (Join-Path $Here "patches/0021-preserve-nes-raster-history.patch"),
+        (Join-Path $Here "patches/0022-reanchor-pacing-after-native-parks.patch"),
+        (Join-Path $Here "patches/0023-add-native-control-service-and-progress.patch"),
+        (Join-Path $Here "patches/0024-preserve-gba-input-observation.patch"),
+        (Join-Path $Here "patches/0025-fix-windows-native-build.patch"),
+        (Join-Path $Here "patches/0026-publish-windows-input-devices-before-use.patch")
     )
     $patchStream = [System.IO.MemoryStream]::new()
     try {
@@ -161,7 +166,7 @@ try {
     $VsWhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio/Installer/vswhere.exe"
     $MsBuild = $null
     if (Test-Path -LiteralPath $VsWhere) {
-        $MsBuild = (& $VsWhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1)
+        $MsBuild = (& $VsWhere -latest -products "*" -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\amd64\MSBuild.exe" | Select-Object -First 1)
     }
     if (-not $MsBuild) {
         $command = Get-Command msbuild -ErrorAction SilentlyContinue
@@ -172,21 +177,22 @@ try {
     Write-Host "Building MesenCE locally with Visual Studio Release/x64"
     Get-ChildItem -Recurse -File -Filter "emucap-mesen-build.json" -Path (Join-Path $Source "bin") -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
-    Invoke-Native $MsBuild @((Join-Path $Source "Mesen.sln"), "/m", "/t:Rebuild", "/p:Configuration=Release", "/p:Platform=x64")
+    Invoke-Native $MsBuild @((Join-Path $Source "Mesen.sln"), "/restore", "/m", "/t:Rebuild", "/p:Configuration=Release", "/p:Platform=x64")
     $Binary = Get-ChildItem -Recurse -File -Filter "Mesen.exe" -Path (Join-Path $Source "bin/win-x64/Release") |
         Select-Object -First 1
     if (-not $Binary) { throw "Mesen build completed without Mesen.exe under bin/win-x64/Release" }
 
     $Metadata = Join-Path $Binary.DirectoryName "emucap-mesen-build.json"
     $BinarySha256 = (Get-FileHash -LiteralPath $Binary.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-    @{
+    $MetadataJson = @{
         upstream = $MesenRepo
         tag = $MesenTag
         commit = $MesenCommit
         host_api = $MesenHostApi
         patchset_sha256 = $MesenPatchsetHash
         binary_sha256 = $BinarySha256
-    } | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $Metadata
+    } | ConvertTo-Json
+    [System.IO.File]::WriteAllText($Metadata, $MetadataJson, [System.Text.UTF8Encoding]::new($false))
 
     Write-Host "OK: $($Binary.FullName)"
     Write-Host "metadata: $Metadata"

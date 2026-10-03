@@ -104,7 +104,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         }
     }
 
-    fn native_pacing(&mut self, arguments: Option<Value>) -> XemuResult<(XemuPacing, u64)> {
+    fn native_pacing(&mut self, arguments: Option<Value>) -> XemuResult<(XemuPacing, u64, Value)> {
         let reply = self.qmp.execute("xemu-emucap-pacing", arguments)?;
         self.verify_clock_profile(&reply)?;
         let pacing = XemuPacing::from_reply(&reply).ok_or_else(|| {
@@ -116,7 +116,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             .ok_or_else(|| {
                 XemuBridgeError::Emulator("pacing reply omitted frame-boundary".into())
             })?;
-        Ok((pacing, frame))
+        Ok((pacing, frame, reply))
     }
 
     pub(super) fn execution_speed(&mut self, params: &Value) -> XemuResult<Value> {
@@ -145,9 +145,51 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             SpeedRequest::Unlimited => json!({"unlimited": true}),
             SpeedRequest::Limited { centi_percent } => json!({"percent": centi_percent / 100}),
         };
-        let (before, _) = self.native_pacing(None)?;
+        let (observed, _, probe) = self.native_pacing(None)?;
+        if probe.get("transaction-version").and_then(Value::as_u64) != Some(1) {
+            return Err(XemuBridgeError::Unsupported(
+                "native pacing transaction version 1 is required".into(),
+            ));
+        }
+        let mut native_result = None;
         let outcome: XemuResult<Value> = (|| {
-            let (after, frame) = self.native_pacing(Some(set))?;
+            let transaction = self.qmp.execute("xemu-emucap-pacing", Some(set))?;
+            native_result = Some(transaction.clone());
+            self.verify_clock_profile(&transaction)?;
+            let invalid = || XemuBridgeError::Emulator("invalid native pacing transaction".into());
+            let after = XemuPacing::from_reply(&transaction).ok_or_else(invalid)?;
+            let frame = transaction
+                .get("frame-boundary")
+                .and_then(Value::as_u64)
+                .ok_or_else(invalid)?;
+            let before = XemuPacing {
+                percent: transaction
+                    .get("previous-percent")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(invalid)?,
+                revision: transaction
+                    .get("previous-revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(invalid)?,
+            };
+            let start_frame = transaction
+                .get("start-frame-boundary")
+                .and_then(Value::as_u64)
+                .ok_or_else(invalid)?;
+            if transaction
+                .get("transaction-version")
+                .and_then(Value::as_u64)
+                != Some(1)
+                || before.percent > PACING_MAX_PERCENT
+                || after.percent > PACING_MAX_PERCENT
+                || after.revision
+                    != before
+                        .revision
+                        .wrapping_add(u64::from(before.percent != after.percent))
+                || frame < start_frame
+            {
+                return Err(invalid());
+            }
             let state = if self.is_running()? {
                 "running"
             } else {
@@ -156,6 +198,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
             let reply = json!({
                 "status": "completed", "state": state,
                 "previous": before.public(), "execution_speed": after.public(), "frame": frame,
+                "clock_domain": "xbox.nv2a_vblank",
             });
             capability
                 .verify_change(request, &reply)
@@ -164,7 +207,7 @@ impl<Q: QmpTransport, G: GdbTransport> XemuBridge<Q, G> {
         })();
         outcome.map_err(|error| {
             self.control_unverified = true;
-            XemuBridgeError::Emulator(format!("execution_speed unverified: {error}; last verified policy: {}; guest progress may have occurred", before.public()))
+            XemuBridgeError::Emulator(format!("execution_speed unverified: {error}; pre-command observation: {}; native_result={native_result:?}; guest progress may have occurred", observed.public()))
         })
     }
 

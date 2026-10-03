@@ -20,7 +20,8 @@ requests to retain current execution state with a compact catalog response.
 
 ## Operate
 
-Use `tap` for button/key input. Describe `pointer` for mouse controls or `debug` for specialized
+Use `tap` for button/key input, including long holds and simultaneous buttons: `press_frames` sets
+the hold duration and `after_frames` the advance after release. Describe `pointer` for mouse controls or `debug` for specialized
 controls, then execute with the returned schema and `known_capability_revision`. Describe
 `analysis` for optional analysis. Tool descriptions and live responses supply operational details.
 

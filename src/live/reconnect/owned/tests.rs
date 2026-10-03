@@ -49,13 +49,12 @@ impl OwnedHandler for Native {
         Ok(BridgeDirective::Continue)
     }
 }
-fn fixture(
-    fail_cleanup: bool,
-) -> (
+type OwnedSessionFixture = (
     TcpStream,
     Arc<Mutex<Vec<String>>>,
     std::thread::JoinHandle<io::Result<SessionEnd>>,
-) {
+);
+fn fixture(fail_cleanup: bool) -> OwnedSessionFixture {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
     let server = listener.accept().unwrap().0;

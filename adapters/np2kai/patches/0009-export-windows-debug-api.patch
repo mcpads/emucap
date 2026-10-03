@@ -1,0 +1,73 @@
+--- a/sdl/libretro/emucap_debug.h
++++ b/sdl/libretro/emucap_debug.h
+@@ -3,6 +3,12 @@
+ 
+ #include <stddef.h>
+ #include <stdint.h>
++
++#ifdef _WIN32
++#define EMUCAP_NP2_API __declspec(dllexport)
++#else
++#define EMUCAP_NP2_API
++#endif
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -63,36 +69,36 @@
+   char text[256];
+ };
+ 
+-uint32_t emucap_np2_debug_api_version(void);
+-int emucap_np2_read_memory(uint32_t address, uint8_t *output, size_t length);
++EMUCAP_NP2_API uint32_t emucap_np2_debug_api_version(void);
++EMUCAP_NP2_API int emucap_np2_read_memory(uint32_t address, uint8_t *output, size_t length);
+ /* Debugger view without guest effects: no wait-state clock charge and no GRCG/EGC
+  * processing. Graphics planes are read raw from the current access page. Returns 0
+  * when any byte lies outside the supported view; the caller then discards output. */
+ struct emucap_np2_peek_range { uint32_t address; uint32_t length; };
+ /* Validate the complete batch against the current native view without reading
+  * payload. The frontend keeps the emulation owner parked through copy. */
+-int emucap_np2_validate_peek_ranges(const struct emucap_np2_peek_range *ranges,
++EMUCAP_NP2_API int emucap_np2_validate_peek_ranges(const struct emucap_np2_peek_range *ranges,
+                                   size_t count);
+-int emucap_np2_peek_memory(uint32_t address, uint8_t *output, size_t length);
+-int emucap_np2_write_memory(uint32_t address, const uint8_t *input, size_t length);
+-int emucap_np2_get_regs(struct emucap_np2_regs *output);
+-int emucap_np2_step_instruction(void);
+-int emucap_np2_disassemble(uint32_t address, char *text, size_t text_size,
++EMUCAP_NP2_API int emucap_np2_peek_memory(uint32_t address, uint8_t *output, size_t length);
++EMUCAP_NP2_API int emucap_np2_write_memory(uint32_t address, const uint8_t *input, size_t length);
++EMUCAP_NP2_API int emucap_np2_get_regs(struct emucap_np2_regs *output);
++EMUCAP_NP2_API int emucap_np2_step_instruction(void);
++EMUCAP_NP2_API int emucap_np2_disassemble(uint32_t address, char *text, size_t text_size,
+                            uint32_t *next_address, uint8_t *bytes,
+                            size_t *byte_count);
+-int emucap_np2_set_breakpoint(const struct emucap_np2_breakpoint *breakpoint);
+-int emucap_np2_clear_breakpoint(uint64_t id);
+-void emucap_np2_clear_all_breakpoints(void);
+-int emucap_np2_poll_event(struct emucap_np2_event *event);
+-uint64_t emucap_np2_take_dropped_events(void);
+-void emucap_np2_set_trace(int enabled);
+-int emucap_np2_poll_trace(struct emucap_np2_trace *trace);
+-uint64_t emucap_np2_take_dropped_trace(void);
+-int emucap_np2_stop_requested(void);
+-void emucap_np2_clear_stop(void);
+-void emucap_np2_reset_event(void);
+-int emucap_np2_change_hdd(const char *path);
+-const char *emucap_np2_current_hdd(void);
++EMUCAP_NP2_API int emucap_np2_set_breakpoint(const struct emucap_np2_breakpoint *breakpoint);
++EMUCAP_NP2_API int emucap_np2_clear_breakpoint(uint64_t id);
++EMUCAP_NP2_API void emucap_np2_clear_all_breakpoints(void);
++EMUCAP_NP2_API int emucap_np2_poll_event(struct emucap_np2_event *event);
++EMUCAP_NP2_API uint64_t emucap_np2_take_dropped_events(void);
++EMUCAP_NP2_API void emucap_np2_set_trace(int enabled);
++EMUCAP_NP2_API int emucap_np2_poll_trace(struct emucap_np2_trace *trace);
++EMUCAP_NP2_API uint64_t emucap_np2_take_dropped_trace(void);
++EMUCAP_NP2_API int emucap_np2_stop_requested(void);
++EMUCAP_NP2_API void emucap_np2_clear_stop(void);
++EMUCAP_NP2_API void emucap_np2_reset_event(void);
++EMUCAP_NP2_API int emucap_np2_change_hdd(const char *path);
++EMUCAP_NP2_API const char *emucap_np2_current_hdd(void);
+ 
+ int emucap_debug_instruction(void);
+ void emucap_debug_memory(uint32_t address, uint32_t size, uint32_t value,

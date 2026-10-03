@@ -1,0 +1,11 @@
+diff --git a/pcsx2-qt/QtUtils.cpp b/pcsx2-qt/QtUtils.cpp
+--- a/pcsx2-qt/QtUtils.cpp
++++ b/pcsx2-qt/QtUtils.cpp
+@@ -4,6 +4,7 @@
+ #include "QtUtils.h"
+ 
+ #include <QtCore/QCoreApplication>
++#include <QtCore/QDir>
+ #include <QtCore/QFileInfo>
+ #include <QtCore/QLocale>
+ #include <QtCore/QtGlobal>

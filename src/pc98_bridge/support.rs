@@ -2,6 +2,9 @@ use super::*;
 
 pub(super) fn error_kind(err: &BridgeError) -> &'static str {
     match err {
+        BridgeError::Busy => "busy",
+        BridgeError::Cancelled => "cancelled",
+        BridgeError::Unsupported(_) => "unsupported",
         BridgeError::BadParams(_) => "bad_params",
         BridgeError::BadState(_) => "bad_state",
         BridgeError::UnknownMethod(_) => "unknown_method",
@@ -1104,7 +1107,7 @@ pub(super) fn segmented_pc(cs: u64, ip: u64) -> u64 {
 pub(super) fn sha1_file(path: &Path) -> std::io::Result<String> {
     let mut h = Sha1::new();
     let mut file = File::open(path)?;
-    let mut buf = [0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {

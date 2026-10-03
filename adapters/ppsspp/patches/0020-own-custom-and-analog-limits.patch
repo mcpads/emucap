@@ -1,0 +1,278 @@
+diff --git a/Core/CoreParameter.h b/Core/CoreParameter.h
+--- a/Core/CoreParameter.h
++++ b/Core/CoreParameter.h
+@@ -17,6 +17,8 @@
+ 
+ #pragma once
+ 
++#include "Core/EmucapPacing.h"
++
+ #include <string>
+ 
+ #include "Common/File/Path.h"
+@@ -30,12 +32,7 @@
+ 	GPUCORE_VULKAN = 4,
+ };
+ 
+-enum class FPSLimit {
+-	NORMAL = 0,
+-	CUSTOM1 = 1,
+-	CUSTOM2 = 2,
+-	ANALOG = 3,
+-};
++
+ 
+ class FileLoader;
+ 
+@@ -75,8 +72,6 @@
+ 	// Can be modified at runtime. Do not belong here.
+ 	// Launch default only. Runtime fast-forward is owned by EmucapPacingOwner.
+ 	bool initialFastForward = false;
+-	FPSLimit fpsLimit = FPSLimit::NORMAL;
+-	int analogFpsLimit = 0;
+ 
+ 	bool updateRecent = true;
+ 
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -2,12 +2,21 @@
+ 
+ #include <cstdint>
+ #include <mutex>
++
++enum class FPSLimit {
++	NORMAL = 0,
++	CUSTOM1 = 1,
++	CUSTOM2 = 2,
++	ANALOG = 3,
++};
+ 
+ // Host pacing state. Readers take a value snapshot and release the lock before
+ // any core, audio, UI, socket or lifecycle operation.
+ struct EmucapPacingSnapshot {
+     int percent = 100;
+     bool fastForward = false;
++    FPSLimit fpsLimit = FPSLimit::NORMAL;
++    int analogFpsLimit = 0;
+     uint32_t revision = 0;
+ };
+ 
+@@ -48,6 +57,38 @@
+         return {previous, policy_};
+     }
+ 
++    bool ChangeLimit(FPSLimit expected, FPSLimit next) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        if (policy_.fpsLimit != expected)
++            return false;
++        policy_.fpsLimit = next;
++        ++policy_.revision;
++        return true;
++    }
++
++    void CycleLimit(bool custom1Enabled, bool custom2Enabled) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        const auto previous = policy_.fpsLimit;
++        if (previous == FPSLimit::NORMAL && custom1Enabled)
++            policy_.fpsLimit = FPSLimit::CUSTOM1;
++        else if (previous == FPSLimit::CUSTOM1 && custom2Enabled)
++            policy_.fpsLimit = FPSLimit::CUSTOM2;
++        else if (previous == FPSLimit::CUSTOM1 || previous == FPSLimit::CUSTOM2)
++            policy_.fpsLimit = FPSLimit::NORMAL;
++        if (policy_.fpsLimit != previous)
++            ++policy_.revision;
++    }
++
++    bool SetAnalogLimit(int fps) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        if (policy_.fpsLimit != FPSLimit::NORMAL && policy_.fpsLimit != FPSLimit::ANALOG)
++            return false;
++        policy_.analogFpsLimit = fps;
++        policy_.fpsLimit = fps == 60 ? FPSLimit::NORMAL : FPSLimit::ANALOG;
++        ++policy_.revision;
++        return true;
++    }
++
+ private:
+     bool initialized_ = false;
+     mutable std::mutex mutex_;
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -41,6 +41,9 @@
+ void __DisplayInitializeEmucapPacing(bool fastForward);
+ void __DisplaySetEmucapFastForward(bool value);
+ bool __DisplayGetEmucapFastForward();
++bool __DisplayChangeEmucapLimit(FPSLimit expected, FPSLimit next);
++void __DisplayCycleEmucapLimit(bool custom1Enabled, bool custom2Enabled);
++bool __DisplaySetEmucapAnalogLimit(int fps);
+ int __DisplayGetEmucapSpeed();
+ // Changes whenever the agent speed changes, so a wait computed for the old target can end.
+ uint32_t __DisplayEmucapPacingGeneration();
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -376,6 +376,18 @@
+     return emucapPacing.Read().fastForward;
+ }
+ 
++bool __DisplayChangeEmucapLimit(FPSLimit expected, FPSLimit next) {
++    return emucapPacing.ChangeLimit(expected, next);
++}
++
++void __DisplayCycleEmucapLimit(bool custom1Enabled, bool custom2Enabled) {
++    emucapPacing.CycleLimit(custom1Enabled, custom2Enabled);
++}
++
++bool __DisplaySetEmucapAnalogLimit(int fps) {
++    return emucapPacing.SetAnalogLimit(fps);
++}
++
+ void __DisplaySetEmucapSpeed(int percent) {
+ 	emucapPacing.SetPercent(percent);
+ }
+@@ -411,12 +423,12 @@
+ 	if (pacing.fastForward)
+ 		return 0;
+ 	// Can't slow down in hardcore mode.
+-	if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM1)
++	if (pacing.fpsLimit == FPSLimit::CUSTOM1)
+ 		return fixRate(g_Config.iFpsLimit1);
+-	if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM2)
++	if (pacing.fpsLimit == FPSLimit::CUSTOM2)
+ 		return fixRate(g_Config.iFpsLimit2);
+-	if (PSP_CoreParameter().fpsLimit == FPSLimit::ANALOG)
+-		return fixRate(PSP_CoreParameter().analogFpsLimit);
++	if (pacing.fpsLimit == FPSLimit::ANALOG)
++		return fixRate(pacing.analogFpsLimit);
+ 	const int percent = pacing.percent;
+ 	return percent == 0 ? 0.0 : framerate * percent / 100.0;
+ }
+@@ -601,7 +613,7 @@
+ 	static bool hasNotifiedSlow = false;
+ 	if (!g_Config.bHideSlowWarnings &&
+ 		!hasNotifiedSlow &&
+-		PSP_CoreParameter().fpsLimit == FPSLimit::NORMAL &&
++		__DisplayGetEmucapPacing().fpsLimit == FPSLimit::NORMAL &&
+ 		DisplayIsRunningSlow() && g_Config.bSoftwareRendering) {
+ #ifndef _DEBUG
+ 		auto err = GetI18NCategory(I18NCat::ERRORS);
+diff --git a/UI/EmuScreen.cpp b/UI/EmuScreen.cpp
+--- a/UI/EmuScreen.cpp
++++ b/UI/EmuScreen.cpp
+@@ -735,7 +735,7 @@
+ static void ShowFpsLimitNotice() {
+ 	int fpsLimit = 60;
+ 
+-	switch (PSP_CoreParameter().fpsLimit) {
++	switch (__DisplayGetEmucapPacing().fpsLimit) {
+ 	case FPSLimit::CUSTOM1:
+ 		fpsLimit = g_Config.iFpsLimit1;
+ 		break;
+@@ -1004,14 +1004,7 @@
+ 	case VIRTKEY_SPEED_TOGGLE:
+ 		if (down) {
+ 			if (!NetworkWarnUserIfOnlineAndCantSpeed()) {
+-				// Cycle through enabled speeds.
+-				if (PSP_CoreParameter().fpsLimit == FPSLimit::NORMAL && g_Config.iFpsLimit1 >= 0) {
+-					PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM1;
+-				} else if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM1 && g_Config.iFpsLimit2 >= 0) {
+-					PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM2;
+-				} else if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM1 || PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM2) {
+-					PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
+-				}
++				__DisplayCycleEmucapLimit(g_Config.iFpsLimit1 >= 0, g_Config.iFpsLimit2 >= 0);
+ 
+ 				ShowFpsLimitNotice();
+ 			}
+@@ -1102,26 +1095,22 @@
+ 
+ 	case VIRTKEY_SPEED_CUSTOM1:
+ 		if (down && !NetworkWarnUserIfOnlineAndCantSpeed()) {
+-			if (PSP_CoreParameter().fpsLimit == FPSLimit::NORMAL) {
+-				PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM1;
++			if (__DisplayChangeEmucapLimit(FPSLimit::NORMAL, FPSLimit::CUSTOM1)) {
+ 				ShowFpsLimitNotice();
+ 			}
+ 		} else {
+-			if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM1) {
+-				PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
++			if (__DisplayChangeEmucapLimit(FPSLimit::CUSTOM1, FPSLimit::NORMAL)) {
+ 				ShowFpsLimitNotice();
+ 			}
+ 		}
+ 		break;
+ 	case VIRTKEY_SPEED_CUSTOM2:
+ 		if (down && !NetworkWarnUserIfOnlineAndCantSpeed()) {
+-			if (PSP_CoreParameter().fpsLimit == FPSLimit::NORMAL) {
+-				PSP_CoreParameter().fpsLimit = FPSLimit::CUSTOM2;
++			if (__DisplayChangeEmucapLimit(FPSLimit::NORMAL, FPSLimit::CUSTOM2)) {
+ 				ShowFpsLimitNotice();
+ 			}
+ 		} else {
+-			if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM2) {
+-				PSP_CoreParameter().fpsLimit = FPSLimit::NORMAL;
++			if (__DisplayChangeEmucapLimit(FPSLimit::CUSTOM2, FPSLimit::NORMAL)) {
+ 				ShowFpsLimitNotice();
+ 			}
+ 		}
+@@ -1151,10 +1140,6 @@
+ 	static constexpr float DEADZONE_THRESHOLD = 0.2f;
+ 	static constexpr float DEADZONE_SCALE = 1.0f / (1.0f - DEADZONE_THRESHOLD);
+ 
+-	FPSLimit &limitMode = PSP_CoreParameter().fpsLimit;
+-	// If we're using an alternate speed already, let that win.
+-	if (limitMode != FPSLimit::NORMAL && limitMode != FPSLimit::ANALOG)
+-		return;
+ 	// Don't even try if the limit is invalid.
+ 	if (g_Config.iAnalogFpsLimit <= 0)
+ 		return;
+@@ -1165,10 +1150,8 @@
+ 	// If target is above 60, value is how much to speed up over 60.  Otherwise, it's how much slower.
+ 	// So normalize the target.
+ 	int target = g_Config.iAnalogFpsLimit - 60;
+-	PSP_CoreParameter().analogFpsLimit = 60 + (int)(target * value);
+-
+-	// If we've reset back to normal, turn it off.
+-	limitMode = PSP_CoreParameter().analogFpsLimit == 60 ? FPSLimit::NORMAL : FPSLimit::ANALOG;
++	__DisplaySetEmucapAnalogLimit(60 + (int)(target * value));
++
+ }
+ 
+ InputMode EmuScreen::PassInputToMapper() const {
+diff --git a/Core/HLE/__sceAudio.cpp b/Core/HLE/__sceAudio.cpp
+--- a/Core/HLE/__sceAudio.cpp
++++ b/Core/HLE/__sceAudio.cpp
+@@ -427,7 +427,8 @@
+ 
+ 	if (g_Config.bEnableSound) {
+ 		float multiplier = Volume100ToMultiplier(std::clamp(g_Config.iGameVolume, 0, VOLUMEHI_FULL));
+-		if (PSP_CoreParameter().fpsLimit != FPSLimit::NORMAL || __DisplayGetEmucapFastForward()) {
++        const auto pacing = __DisplayGetEmucapPacing();
++		if (pacing.fpsLimit != FPSLimit::NORMAL || pacing.fastForward) {
+ 			if (g_Config.iAltSpeedVolume != -1) {
+ 				// Multiply in the alt speed volume instead of replacing like before.
+ 				multiplier *= Volume100ToMultiplier(g_Config.iAltSpeedVolume);
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -226,13 +226,14 @@
+ 			return req.Fail("network policy prevents speed control");
+ 		__DisplaySetEmucapSpeed((int)percent);
+ 	}
+-	const int percent = __DisplayGetEmucapSpeed();
+-	const bool fastForward = __DisplayGetEmucapFastForward();
+-	const int fpsLimit = (int)PSP_CoreParameter().fpsLimit;
++    const auto pacing = __DisplayGetEmucapPacing();
++	const int percent = pacing.percent;
++	const bool fastForward = pacing.fastForward;
++	const int fpsLimit = (int)pacing.fpsLimit;
+ 	const bool networkForced = !NetworkAllowSpeedControl();
+ 	static std::string lastKey;
+ 	static uint32_t revision = 0;
+-	const std::string key = StringFromFormat("%d|%d|%d|%d", percent, fastForward, fpsLimit, networkForced);
++	const std::string key = StringFromFormat("%d|%d|%d|%d|%u", percent, fastForward, fpsLimit, networkForced, pacing.revision);
+ 	if (key != lastKey) {
+ 		lastKey = key;
+ 		revision++;

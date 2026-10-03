@@ -1,0 +1,114 @@
+--- a/src/wswan/main.cpp
++++ b/src/wswan/main.cpp
+@@ -84,5 +84,5 @@
+ static unsigned PortDeviceType;
+ 
+-static void Emulate(EmulateSpecStruct *espec)
++void BindFrameOutput(EmulateSpecStruct *espec)
+ {
+  espec->DisplayRect.x = 0;
+@@ -96,4 +96,10 @@
+  if(espec->SoundFormatChanged)
+   WSwan_SetSoundRate(espec->SoundRate);
++
++}
++
++static void Emulate(EmulateSpecStruct *espec)
++{
++ BindFrameOutput(espec);
+ 
+  WSButtonStatus = MDFN_de16lsb(PortDeviceData);
+--- a/src/ngp/neopop.cpp
++++ b/src/ngp/neopop.cpp
+@@ -89,8 +89,6 @@
+ }
+ 
+-static void Emulate(EmulateSpecStruct *espec)
+-{
+-	bool MeowMeow = 0;
+-
++void BindFrameOutput(EmulateSpecStruct *espec)
++{
+ 	espec->DisplayRect.x = 0;
+ 	espec->DisplayRect.y = 0;
+@@ -104,4 +102,12 @@
+ 	 MDFNNGPC_SetSoundRate(espec->SoundRate);
+ 
++
++}
++
++static void Emulate(EmulateSpecStruct *espec)
++{
++	bool MeowMeow = 0;
++
++ BindFrameOutput(espec);
+ 
+ 	BeginFrame();
+--- a/src/pcfx/pcfx.cpp
++++ b/src/pcfx/pcfx.cpp
+@@ -238,12 +238,6 @@
+ 
+ 
+-static void Emulate(EmulateSpecStruct *espec)
+-{
+- //printf("%d\n", PCFX_V810.v810_timestamp);
+-
+- FXINPUT_Frame();
+-
+- MDFNMP_ApplyPeriodicCheats();
+-
++void BindFrameOutput(EmulateSpecStruct *espec)
++{
+  if(espec->VideoFormatChanged)
+   KING_SetPixelFormat(espec->surface->format); //.Rshift, espec->surface->format.Gshift, espec->surface->format.Bshift);
+@@ -254,4 +248,16 @@
+ 
+  KING_StartFrame(fx_vdc_chips, espec);	//espec->surface, &espec->DisplayRect, espec->LineWidths, espec->skip);
++
++}
++
++static void Emulate(EmulateSpecStruct *espec)
++{
++ //printf("%d\n", PCFX_V810.v810_timestamp);
++
++ FXINPUT_Frame();
++
++ MDFNMP_ApplyPeriodicCheats();
++
++ BindFrameOutput(espec);
+ 
+  v810_timestamp_t v810_timestamp;
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -2718,4 +2718,14 @@
+ bool emucap_restored_frame_output_active() noexcept { return EmucapOutputCall.restored_active(); }
+ 
++#ifdef WANT_WSWAN_EMU
++namespace MDFN_IEN_WSWAN { void BindFrameOutput(Mednafen::EmulateSpecStruct*); }
++#endif
++#ifdef WANT_NGP_EMU
++namespace MDFN_IEN_NGP { void BindFrameOutput(Mednafen::EmulateSpecStruct*); }
++#endif
++#ifdef WANT_PCFX_EMU
++namespace MDFN_IEN_PCFX { void BindFrameOutput(Mednafen::EmulateSpecStruct*); }
++#endif
++
+ void emucap_resume_frame_output()
+ {
+@@ -2728,4 +2738,16 @@
+   spec.InterlaceOn = spec.InterlaceField = false;
+   Mednafen::PrepareFrameOutput(&spec);
++  // The suspended core has already passed its ordinary output-binding entry.
++  // Rebind from restored native state before allowing guest work.
++#ifdef WANT_WSWAN_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "wswan")) MDFN_IEN_WSWAN::BindFrameOutput(&spec);
++#endif
++#ifdef WANT_NGP_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "ngp")) MDFN_IEN_NGP::BindFrameOutput(&spec);
++#endif
++#ifdef WANT_PCFX_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "pcfx")) MDFN_IEN_PCFX::BindFrameOutput(&spec);
++#endif
++
+  });
+ }

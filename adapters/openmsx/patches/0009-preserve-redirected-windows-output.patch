@@ -1,0 +1,16 @@
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -33,6 +33,13 @@
+ // enable console output on Windows
+ static void EnableConsoleOutput()
+ {
++    // XML control and managed logs own inherited pipes/files. Attaching a console
++    // and reopening CONOUT$ would silently replace those transport handles.
++    const auto redirected = [](DWORD stream) {
++        const DWORD type = GetFileType(GetStdHandle(stream));
++        return type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK;
++    };
++    if (redirected(STD_OUTPUT_HANDLE) || redirected(STD_ERROR_HANDLE)) return;
+     if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+         freopen("CONOUT$", "w", stdout);
+         freopen("CONOUT$", "w", stderr);

@@ -1,0 +1,356 @@
+diff --git a/Core/Core.cpp b/Core/Core.cpp
+--- a/Core/Core.cpp
++++ b/Core/Core.cpp
+@@ -40,6 +40,7 @@
+ #include "Core/MIPS/MIPS.h"
+ #include "Core/MIPS/MIPSAnalyst.h"
+ #include "Core/HLE/sceDisplay.h"
++#include "Core/HLE/sceIo.h"
+ #include "Core/HLE/sceNetAdhoc.h"
+ #include "Core/MIPS/MIPSTracer.h"
+ 
+@@ -50,6 +51,28 @@
+ // Step command to execute next
+ static std::recursive_mutex g_stepMutex;
+ static std::atomic<uint64_t> g_emucapMemoryEpoch{1};
++// Protected by g_stepMutex. Only the unwound CPU owner issues/polls the fence.
++static uint64_t g_emucapFenceEpoch = 0;
++static uint64_t g_emucapIoFence = 0;
++static std::atomic<uint64_t> g_emucapPublishedMemoryEpoch{0};
++
++void Core_EmucapInvalidateMemoryPark() {
++	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
++	g_emucapPublishedMemoryEpoch.store(0, std::memory_order_release);
++	++g_emucapMemoryEpoch;
++}
++
++static bool Core_EmucapPollMemoryPark(bool publish = true) {
++	const uint64_t epoch = g_emucapMemoryEpoch.load();
++	if (g_emucapFenceEpoch != epoch) {
++		g_emucapPublishedMemoryEpoch.store(0, std::memory_order_release);
++		g_emucapFenceEpoch = epoch;
++		g_emucapIoFence = __IoBeginMemoryFence();
++	}
++	const bool ready = __IoMemoryFenceComplete(g_emucapIoFence);
++	if (ready && publish) g_emucapPublishedMemoryEpoch.store(epoch, std::memory_order_release);
++	return ready;
++}
+ 
+ struct CPUStepCommand {
+ 	CPUStepType type;
+@@ -97,11 +120,19 @@
+ // This is called on EmuThread before RunLoop.
+ static bool Core_ProcessStepping(MIPSDebugInterface *cpu);
+ 
++bool Core_EmucapMemoryParked() {
++	const uint64_t epoch = g_emucapPublishedMemoryEpoch.load(std::memory_order_acquire);
++	return epoch != 0 && epoch == g_emucapMemoryEpoch.load() &&
++		coreState == CORE_STEPPING_CPU && !Core_IsActive() &&
++		epoch == g_emucapMemoryEpoch.load();
++}
++
+ BreakReason Core_BreakReason() {
+ 	return g_breakReason;
+ }
+ 
+ bool Core_EmucapBeginFrameStep(u32 count, u64 startVblank) {
++	if (!Core_EmucapMemoryParked()) return false;
+ 	std::lock_guard<std::mutex> guard(g_emucapFrameStepMutex);
+ 	if (count == 0 || coreState != CORE_STEPPING_CPU || g_emucapFrameStep.status == EmucapFrameStepStatus::Running)
+ 		return false;
+@@ -222,8 +253,10 @@
+ 	if (stage == CoreLifecycle::STARTING) {
+ 		Core_ResetException();
+ 	}
+-	if (stage == CoreLifecycle::STOPPING || stage == CoreLifecycle::MEMORY_REINITING)
++	if (stage == CoreLifecycle::STARTING || stage == CoreLifecycle::STOPPING || stage == CoreLifecycle::MEMORY_REINITING) {
++		Core_EmucapInvalidateMemoryPark();
+ 		Core_EmucapCancelFrameStep();
++	}
+ 
+ 	for (auto func : lifecycleFuncs) {
+ 		func(stage);
+@@ -347,6 +380,7 @@
+ 		_dbg_assert_(stepSize != 0);
+ 		break;
+ 	}
++	Core_EmucapInvalidateMemoryPark();
+ 	g_cpuStepCommand = { type, stepSize };
+ 	// The next stepping notification belongs to this debugger command, not to the reason that
+ 	// originally halted the CPU.  Keeping the old reason here can make a completed single-step look
+@@ -449,7 +483,10 @@
+ }
+ 
+ static bool Core_ProcessStepping(MIPSDebugInterface *cpu) {
++	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+ 	Core_StateProcessed();
++	// Yield to host service while a previously admitted I/O operation still writes RAM.
++	if (coreState == CORE_STEPPING_CPU && !Core_EmucapPollMemoryPark(g_cpuStepCommand.empty())) return true;
+ 
+ 	// Check if there's any pending save state actions.
+ 	SaveState::Process();
+@@ -483,8 +520,7 @@
+ 		lastSteppingCounter = steppingCounter;
+ 	}
+ 
+-	// Need to check inside the lock to avoid races.
+-	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
++	// g_stepMutex remains held from CPU-owner entry through state/step processing.
+ 
+ 	if (coreState != CORE_STEPPING_CPU || g_cpuStepCommand.empty()) {
+ 		return true;
+@@ -502,6 +538,9 @@
+ 		steppingCounter++;
+ 	++g_emucapMemoryEpoch;
+ 	}
++
++	// A newly queued guest I/O write keeps this stop unpublished.
++	if (coreState == CORE_STEPPING_CPU) Core_EmucapPollMemoryPark();
+ 
+ 	// Update disasm dialog.
+ 	System_Notify(SystemNotification::MEM_VIEW);
+@@ -555,8 +594,8 @@
+ 
+ // Free-threaded (or at least should be)
+ void Core_Resume() {
+-	++g_emucapMemoryEpoch;
+ 	std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
++	Core_EmucapInvalidateMemoryPark();
+ 	// If the current PC is on a breakpoint, the user doesn't want to do nothing.
+ 	if (currentMIPS) {
+ 		g_breakpoints.SetSkipFirst(currentMIPS->pc);
+@@ -742,8 +781,13 @@
+ 
+ // Serialize a debugger observation against resume and instruction stepping. Never pauses/resumes.
+ bool Core_EmucapWithHaltedCPU(const std::function<bool(uint64_t)> &read) {
++    // A pending writer is not something an observation may wait into completion.
++    const uint64_t epoch = g_emucapPublishedMemoryEpoch.load(std::memory_order_acquire);
++    if (!epoch || !Core_EmucapMemoryParked()) return false;
++    // An already parked CPU still services host work under this mutex. Serialize
++    // with that short ownership interval, then reject any intervening transition.
+     std::lock_guard<std::recursive_mutex> guard(g_stepMutex);
+-    if (coreState != CORE_STEPPING_CPU || !g_cpuStepCommand.empty()) return false;
+-    if (Core_IsActive()) return false;
+-    return read(g_emucapMemoryEpoch.load());
+-}
++    if (!g_cpuStepCommand.empty() || !Core_EmucapMemoryParked() ||
++        epoch != g_emucapMemoryEpoch.load()) return false;
++    return read(epoch);
++}
+diff --git a/Core/Core.h b/Core/Core.h
+--- a/Core/Core.h
++++ b/Core/Core.h
+@@ -228,3 +228,7 @@
+ const char *ExceptionTypeAsString(MIPSExceptionType type);
+ const char *MemoryExceptionTypeAsString(MemoryExceptionType type);
+ const char *ExecExceptionTypeAsString(ExecExceptionType type);
++
++// Version 1: CPU unwind and completion of previously admitted guest RAM writers.
++bool Core_EmucapMemoryParked();
++void Core_EmucapInvalidateMemoryPark();
+diff --git a/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp b/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
+--- a/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
++++ b/Core/Debugger/WebSocket/CPUCoreSubscriber.cpp
+@@ -112,7 +112,9 @@
+ 
+ 	const bool pspInited = PSP_GetBootState() == BootState::Complete;
+ 
+-	json.writeBool("stepping", pspInited && Core_IsStepping() && coreState != CORE_POWERDOWN);
++	json.writeUint("memory_park_version", 1);
++	json.writeBool("stepping", pspInited && Core_EmucapMemoryParked());
++	json.writeBool("stop_pending", pspInited && coreState == CORE_STEPPING_CPU && !Core_EmucapMemoryParked());
+ 	json.writeBool("paused", GetUIState() != UISTATE_INGAME);
+ 	// Avoid NULL deference.
+ 	json.writeUint("pc", pspInited ? currentMIPS->pc : 0);
+diff --git a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+--- a/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SaveStateSubscriber.cpp
+@@ -31,6 +31,7 @@
+ #include <mutex>
+ #include <string>
+ #include <string_view>
++#include <thread>
+ 
+ #include "Common/File/Path.h"
+ #include "Core/Core.h"
+@@ -48,6 +49,16 @@
+ }
+ 
+ namespace {
++
++// Runs on the debugger thread; the CPU owner continues its nonblocking fence polling.
++static bool WaitForLoadedMemoryPark(std::chrono::steady_clock::time_point deadline) {
++	while (!Core_EmucapMemoryParked()) {
++		if (coreState != CORE_STEPPING_CPU || std::chrono::steady_clock::now() >= deadline)
++			return false;
++		std::this_thread::sleep_for(std::chrono::milliseconds(1));
++	}
++	return true;
++}
+ 
+ struct SaveStateWait {
+ 	std::mutex m;
+@@ -117,6 +128,9 @@
+ 	if (wait->status == SaveState::Status::FAILURE)
+ 		return req.Fail(wait->message.empty() ? (isSave ? "Failed to save state" : "Failed to load state") : wait->message);
+ 
++	if (!isSave && !WaitForLoadedMemoryPark(std::chrono::steady_clock::now() + std::chrono::seconds(2)))
++		return req.Fail("emucap memory park unverified after state load");
++
+ 	JsonWriter &json = req.Respond();
+ 	json.writeString("path", path);
+ 	if (!isSave)
+diff --git a/Core/Debugger/WebSocket/SteppingBroadcaster.cpp b/Core/Debugger/WebSocket/SteppingBroadcaster.cpp
+--- a/Core/Debugger/WebSocket/SteppingBroadcaster.cpp
++++ b/Core/Debugger/WebSocket/SteppingBroadcaster.cpp
+@@ -88,7 +88,8 @@
+ 	if (PSP_GetBootState() == BootState::Complete) {
+ 		int steppingCounter = Core_GetSteppingCounter();
+ 		// We ignore CORE_POWERDOWN as a stepping state.
+-		if (coreState == CORE_STEPPING_CPU && steppingCounter != lastCounter_) {
++		if (coreState == CORE_STEPPING_CPU && !Core_EmucapMemoryParked()) return;
++		if (coreState == CORE_STEPPING_CPU && (steppingCounter != lastCounter_ || !steppingTickets_.empty())) {
+ 			std::string ticket;
+ 			if (!steppingTickets_.empty()) {
+ 				ticket = std::move(steppingTickets_.front());
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -82,7 +82,8 @@
+ 		JsonWriter &json = req.Respond();
+ 		json.writeUint("version", 1);
+ 		json.writeBool("connection_owned", true);
+-		json.writeBool("inactive_cpu", coreState == CORE_STEPPING_CPU && Core_IsInactive());
++		json.writeUint("memory_park_version", 1);
++		json.writeBool("inactive_cpu", Core_EmucapMemoryParked());
+ 	};
+ 	map["emucap.frameStep"] = [p](DebuggerRequest &req) { p->Frame(req); };
+ 	map["emucap.frameStep.cancel"] = [p](DebuggerRequest &req) { p->CancelFrame(req); };
+@@ -95,7 +96,7 @@
+ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
+ 	if (emucapFrameOwner)
+ 		return req.Fail("another frame advance owns native control");
+-	if (!currentDebugMIPS->isAlive() || coreState != CORE_STEPPING_CPU || !Core_IsInactive())
++	if (!currentDebugMIPS->isAlive() || !Core_EmucapMemoryParked())
+ 		return req.Fail("CPU must be inactive at an instruction halt before emucap.frameStep");
+ 	uint32_t count = 0;
+ 	if (!req.ParamU32("count", &count))
+@@ -152,7 +153,7 @@
+ 		frameStopping_ = true;
+ 		frameStopDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+ 	}
+-	if (!Core_IsInactive()) {
++	if (!Core_EmucapMemoryParked()) {
+ 		if (frameStopping_ && std::chrono::steady_clock::now() >= frameStopDeadline_)
+ 			std::abort();  // Dedicated producer cannot certify its native stop.
+ 		return;
+@@ -186,7 +187,7 @@
+ 	if (emucapFrameOwner != this)
+ 		return;
+ 	RequestFrameStop("connection_lost");
+-	while (!Core_IsInactive()) {
++	while (!Core_EmucapMemoryParked()) {
+ 		if (std::chrono::steady_clock::now() >= frameStopDeadline_)
+ 			std::abort();
+ 		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+diff --git a/Core/HLE/sceIo.cpp b/Core/HLE/sceIo.cpp
+--- a/Core/HLE/sceIo.cpp
++++ b/Core/HLE/sceIo.cpp
+@@ -579,6 +579,9 @@
+ 		DEBUG_LOG(Log::sceIo, "sceKernelWaitEventFlagCB: Resuming lock wait for callback");
+ 	}
+ }
++
++u64 __IoBeginMemoryFence() { return ioManager.BeginMemoryFence(); }
++bool __IoMemoryFenceComplete(u64 fence) { return ioManager.MemoryFenceComplete(fence); }
+ 
+ static void __IoManagerThread() {
+ 	SetCurrentThreadName("IO");
+diff --git a/Core/HLE/sceIo.h b/Core/HLE/sceIo.h
+--- a/Core/HLE/sceIo.h
++++ b/Core/HLE/sceIo.h
+@@ -46,3 +46,7 @@
+ void Register_StdioForKernel();
+ void Register_StdioForUser();
+ 
++
++// CPU-owner stop fence; preserves guest I/O results and notifications.
++u64 __IoBeginMemoryFence();
++bool __IoMemoryFenceComplete(u64 fence);
+diff --git a/Core/HW/AsyncIOManager.h b/Core/HW/AsyncIOManager.h
+--- a/Core/HW/AsyncIOManager.h
++++ b/Core/HW/AsyncIOManager.h
+@@ -18,6 +18,7 @@
+ #pragma once
+ 
+ #include <mutex>
++#include <atomic>
+ #include <condition_variable>
+ #include <deque>
+ #include <map>
+@@ -32,6 +33,7 @@
+ 	IO_EVENT_INVALID,
+ 	IO_EVENT_SYNC,
+ 	IO_EVENT_FINISH,
++	IO_EVENT_MEMORY_FENCE,
+ 	IO_EVENT_READ,
+ 	IO_EVENT_WRITE,
+ };
+@@ -39,6 +41,7 @@
+ struct AsyncIOEvent {
+ 	AsyncIOEvent(AsyncIOEventType t) : type(t) {}
+ 	AsyncIOEventType type;
++	u64 memoryFence = 0;
+ 	u32 handle;
+ 	u8 *buf;
+ 	size_t bytes;
+@@ -88,6 +91,18 @@
+ 	bool HasResult(u32 handle);
+ 	bool WaitResult(u32 handle, AsyncIOResult &result);
+ 	u64 ResultFinishTicks(u32 handle);
++
++	// Covers the popped/in-flight last event as well as queued I/O.
++	u64 BeginMemoryFence() {
++		AsyncIOEvent ev = IO_EVENT_MEMORY_FENCE;
++		ev.memoryFence = ++memoryFenceIssued_;
++		ScheduleEvent(ev);
++		return ev.memoryFence;
++	}
++
++	bool MemoryFenceComplete(u64 fence) const {
++		return fence != 0 && memoryFenceCompleted_.load(std::memory_order_acquire) >= fence;
++	}
+ 
+ 	void SetThreadEnabled(bool threadEnabled) {
+ 		threadEnabled_ = threadEnabled;
+@@ -246,6 +261,10 @@
+ 			globalticks = 0;
+ 			break;
+ 
++		case IO_EVENT_MEMORY_FENCE:
++			memoryFenceCompleted_.store(ev.memoryFence, std::memory_order_release);
++			break;
++
+ 		case IO_EVENT_SYNC:
+ 			// Nothing special to do, this event it just to wait on, see SyncThread.
+ 			break;
+@@ -263,6 +282,8 @@
+ 
+ 	void EventResult(u32 handle, const AsyncIOResult &result);
+ 
++	std::atomic<u64> memoryFenceIssued_{0};
++	std::atomic<u64> memoryFenceCompleted_{0};
+ 	bool threadEnabled_ = false;
+ 	bool eventsRunning_ = false;
+ 	bool eventsHaveRun_ = false;
+diff --git a/Core/SaveState.cpp b/Core/SaveState.cpp
+--- a/Core/SaveState.cpp
++++ b/Core/SaveState.cpp
+@@ -801,6 +801,7 @@
+ 		if (!needsProcess)
+ 			return;
+ 		needsProcess = false;
++		Core_EmucapInvalidateMemoryPark();
+ 
+ 		if (!__KernelIsRunning()) {
+ 			ERROR_LOG(Log::SaveState, "Savestate failure: Unable to load without kernel, this should never happen.");

@@ -1,0 +1,92 @@
+--- a/src/pce/huc6280.cpp
++++ b/src/pce/huc6280.cpp
+@@ -35,6 +35,8 @@
+ #ifdef WANT_DEBUGGER
+  #include <trio/trio.h>
+ #endif
++
++extern "C" bool emucap_native_restore_service(bool instruction_ready);
+ 
+ namespace MDFN_IEN_PCE
+ {
+@@ -598,10 +600,16 @@
+           TimerSync();
+           CalcNextEvent();
+           if(CPUHook(PC))
+-	  {
+-	   if(in_block_move)
+-	    goto IBM_Dispatch;
+-	  }
++          {
++           // Replacement ended the old debugger invocation. Reconcile the
++           // trace origin before acknowledging; do not execute restored work.
++           do { old_PC = PC; }
++           while(emucap_native_restore_service(runrunrun && !in_block_move));
++           if(!runrunrun)
++            return;
++           if(in_block_move)
++            goto IBM_Dispatch;
++          }
+          }
+ 
+ 	 if(IRQSample | IRQlow)
+--- a/src/pce/debug.cpp
++++ b/src/pce/debug.cpp
+@@ -348,6 +348,16 @@
+  {
+   vce->Update(HuCPU.Timestamp());
+   CPUCB(PC, FoundBPoint);
++ }
++
++ // The old PC and decoded breakpoint operands belong to the abandoned
++ // invocation. No old-PC logging may consume the newly restored machine.
++ if(MachineStateChanged)
++ {
++  MachineStateChanged = false;
++  PCE_InDebug--;
++  assert(!PCE_InDebug);
++  return true;
+  }
+ 
+  if(PC == 0xe060 && PCE_LoggingOn && PCE_IsCD)
+--- a/src/pce/pce.cpp
++++ b/src/pce/pce.cpp
+@@ -1008,7 +1008,7 @@
+  };
+ 
+ #ifdef WANT_DEBUGGER
+- PCEDBG_MachineStateChanged();
++ if(load) PCEDBG_MachineStateChanged();
+ #endif
+ 
+  MDFNSS_StateAction(sm, load, data_only, StateRegs, "MAIN");
+--- a/src/pce/vce.cpp
++++ b/src/pce/vce.cpp
+@@ -879,7 +879,7 @@
+ 
+ void VCE::StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
+- if(load) { last_ts = 0; cd_event = 1; }
++ if(load) { last_ts = 0; cd_event = 1; FrameDone = false; }
+  SFORMAT VCE_StateRegs[] =
+  {
+   SFVARN(CR, "VCECR"),
+@@ -887,6 +887,7 @@
+   SFVAR(cd_event),
+ 
+   SFVAR(ws_counter),
++  SFVAR(FrameDone),
+ 
+   SFVARN(ctaddress, "ctaddress"),
+   SFVARN(color_table, "color_table"),
+@@ -932,6 +933,10 @@
+   if(scanline < 0)
+    scanline = 0;
+ 
++  // Rebind the derived pointer to the restored scanline on the current owned
++  // render surface. Skipped frames retain their null output binding.
++  scanline_out_ptr = fb ? &fb[(scanline % 263) * pitch32] : NULL;
++
+   if(hblank_counter < 1)
+    hblank_counter = 1;
+   else if(hblank_counter > 1365)

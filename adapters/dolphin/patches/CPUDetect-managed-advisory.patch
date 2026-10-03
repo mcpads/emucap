@@ -1,0 +1,27 @@
+--- a/Source/Core/Common/x64CPUDetect.cpp
++++ b/Source/Core/Common/x64CPUDetect.cpp
+@@ -10,6 +10,8 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
+ #include <string>
+ #include <thread>
+ 
+@@ -82,6 +84,15 @@
+ 
+   // The process is not native; could use IsWow64Process2 to get native machine type, but for now
+   // we can assume it is arm64.
++  // Managed startup has no operator to acknowledge a dialog before main(). Keep the
++  // architecture advisory visible in its native log instead of blocking the adapter.
++  const char* emucap_port = std::getenv("EMUCAP_PORT");
++  if (emucap_port && *emucap_port)
++  {
++    std::fputs("Dolphin: x64 build running under CPU emulation; an ARM64 build is recommended.\n",
++               stderr);
++    return;
++  }
+   PanicAlertFmtT("This build of Dolphin is not natively compiled for your CPU.\n"
+                  "Please run the ARM64 build of Dolphin for a better experience.");
+ }

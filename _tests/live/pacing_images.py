@@ -48,6 +48,9 @@ def main():
     try:
         w.process.initialize()
         plan = w.call('launch_plan', profile['launch_plan'])
+        if not plan['ready_to_launch'] and plan.get('next_action', {}).get('kind') == 'review_input':
+            (out / 'reviewed_media.json').write_text(json.dumps(plan['next_action']['review'], indent=2))
+            plan = w.call('launch_plan', plan['next_action']['then_call']['arguments'])
         assert plan['ready_to_launch'], plan
         session = Session(w, {**plan['preferred_launcher']['args'], **profile.get('launch', {})})
         status = session.start()

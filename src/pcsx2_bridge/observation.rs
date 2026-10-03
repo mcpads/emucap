@@ -17,7 +17,7 @@ const LIMITER_NOMINAL: u32 = 0;
 const LIMITER_UNLIMITED: u32 = 3;
 
 /// Native pacing readback: limiter mode, nominal speed in hundredths of a percent, the effective
-/// target speed, an observed-change revision, and the frame counter.
+/// target speed, a native policy revision, and the frame counter.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Pcsx2Pacing {
     pub(super) mode: u32,
@@ -43,6 +43,33 @@ impl Pcsx2Pacing {
         })
     }
 
+    fn transaction(payload: &[u8]) -> BridgeResult<(u32, Self, Self)> {
+        let invalid = || Pcsx2BridgeError::Protocol("invalid pacing transaction".into());
+        if payload.len() != 60 {
+            return Err(invalid());
+        }
+        let outcome = u32::from_le_bytes(payload[..4].try_into().unwrap());
+        let before = Self::parse(&payload[4..32]).ok_or_else(invalid)?;
+        let after = Self::parse(&payload[32..]).ok_or_else(invalid)?;
+        let changed = before.mode != after.mode
+            || before.nominal_centi != after.nominal_centi
+            || before.target != after.target;
+        if before.mode > LIMITER_UNLIMITED
+            || after.mode > LIMITER_UNLIMITED
+            || !before.target.is_finite()
+            || !after.target.is_finite()
+            || before.target < 0.0
+            || after.target < 0.0
+            || before.frame != after.frame
+            || outcome > 1
+            || (outcome == 0 && after.revision != before.revision.wrapping_add(u64::from(changed)))
+            || (outcome == 1 && (changed || after.revision.wrapping_sub(before.revision) > 2))
+        {
+            return Err(invalid());
+        }
+        Ok((outcome, before, after))
+    }
+
     /// Nominal is limited at its configured percent; turbo, slow motion and a fast-boot override
     /// replace it and read back as `custom`.
     pub(super) fn public(&self) -> Value {
@@ -51,13 +78,22 @@ impl Pcsx2Pacing {
             .is_multiple_of(100)
             .then_some(self.nominal_centi as u64 / 100);
         let (mode, percent) = match self.mode {
-            LIMITER_UNLIMITED => ("unlimited", Value::Null),
-            LIMITER_NOMINAL if self.target > 0.0 => match percent_whole {
-                Some(percent) if (PACING_MIN_PERCENT..=PACING_MAX_PERCENT).contains(&percent) => {
-                    ("limited", json!(percent))
+            LIMITER_UNLIMITED if self.target == 0.0 => ("unlimited", Value::Null),
+            LIMITER_NOMINAL
+                if self.target.is_finite()
+                    && self.target > 0.0
+                    && (f64::from(self.target) * 10_000.0).round()
+                        == f64::from(self.nominal_centi) =>
+            {
+                match percent_whole {
+                    Some(percent)
+                        if (PACING_MIN_PERCENT..=PACING_MAX_PERCENT).contains(&percent) =>
+                    {
+                        ("limited", json!(percent))
+                    }
+                    _ => ("custom", Value::Null),
                 }
-                _ => ("custom", Value::Null),
-            },
+            }
             _ => ("custom", Value::Null),
         };
         json!({
@@ -140,16 +176,27 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             SpeedRequest::Unlimited => 0,
             SpeedRequest::Limited { centi_percent } => (centi_percent / 100) as u32,
         };
-        let before = self.native_pacing()?;
+        let observed = self.native_pacing()?;
+        let mut restored = false;
+        let mut native_result = None;
         let outcome: BridgeResult<Value> = (|| {
-            self.command(MSG_EMUCAP_SET_PACING, &target.to_le_bytes())?;
-            let after = self.native_pacing()?;
+            let payload = self.command(MSG_EMUCAP_SET_PACING, &target.to_le_bytes())?;
+            native_result = Some(hex::encode(&payload));
+            let (outcome, before, after) = Pcsx2Pacing::transaction(&payload)?;
+            if outcome == 1 {
+                restored = true;
+                return Err(Pcsx2BridgeError::Emulator(format!(
+                    "execution_speed failed_restored: native effective policy rejected target; previous={}; restored={}; clock_domain=pcsx2.frame; frame_interval=[{},{}]",
+                    before.public(), after.public(), before.frame, after.frame
+                )));
+            }
             let reply = json!({
                 "status": "completed",
                 "state": self.emulator_state()?,
                 "previous": before.public(),
                 "execution_speed": after.public(),
                 "frame": after.frame,
+                "clock_domain": "pcsx2.frame",
             });
             capability
                 .verify_change(request, &reply)
@@ -157,10 +204,12 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             Ok(reply)
         })();
         outcome.map_err(|error| {
-            // Separate native requests cannot exclude a concurrent human policy change.
-            // Do not overwrite it with a stale rollback or continue on an unknown policy.
+            if restored {
+                return error;
+            }
+            // A pre-command observation is diagnostic, never transaction previous or rollback authority.
             self.control_unverified = true;
-            Pcsx2BridgeError::Emulator(format!("execution_speed unverified: {error}; last verified policy: {}; guest progress may have occurred", before.public()))
+            Pcsx2BridgeError::Emulator(format!("execution_speed unverified: {error}; pre-command observation: {}; native_result={native_result:?}; clock_domain=pcsx2.frame; guest progress may have occurred", observed.public()))
         })
     }
 

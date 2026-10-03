@@ -1,0 +1,116 @@
+name: Native adapter builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      adapter:
+        description: Build all adapters or retry one corrected recipe
+        type: choice
+        default: all
+        options: [all, mesen2, dolphin, ppsspp]
+  push:
+    branches: [main, next]
+    paths:
+      - 'adapters/mesen2/**'
+      - 'adapters/dolphin/**'
+      - 'adapters/ppsspp/**'
+      - '!**/*.md'
+      - '_tests/release/native_build*'
+      - '.github/workflows/native-adapters.yml'
+  pull_request:
+    paths:
+      - 'adapters/mesen2/**'
+      - 'adapters/dolphin/**'
+      - 'adapters/ppsspp/**'
+      - '!**/*.md'
+      - '_tests/release/native_build*'
+      - '.github/workflows/native-adapters.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-adapters-${{ github.ref }}${{ inputs.adapter && inputs.adapter != 'all' && format('-{0}', inputs.adapter) || '' }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        adapter: ${{ fromJSON(inputs.adapter && inputs.adapter != 'all' && format('["{0}"]', inputs.adapter) || '["mesen2", "dolphin", "ppsspp"]') }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Patch hashes are byte identities; never convert checkout line endings.
+          fetch-depth: 1
+      - name: Restore canonical checkout bytes
+        run: |
+          git config core.autocrlf false
+          git rm --cached -r .
+          git reset --hard HEAD
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Identify build environment
+        run: |
+          if (-not $env:ImageVersion) { throw 'Missing runner image version' }
+          "NATIVE_TOOLCHAIN=windows-2022/$env:ImageVersion/dotnet-$(dotnet --version)" >> $env:GITHUB_ENV
+      - name: Check reuse invariants
+        run: python _tests/release/native_build_tests.py
+      - id: inputs
+        name: Hash native inputs
+        run: python _tests/release/native_build.py identity --adapter '${{ matrix.adapter }}' --toolchain "$env:NATIVE_TOOLCHAIN"
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: native-payload
+          key: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}
+      - id: verify
+        name: Verify retained payload
+        run: |
+          if (Test-Path native-payload) {
+            python _tests/release/native_build.py verify --adapter '${{ matrix.adapter }}' --toolchain "$env:NATIVE_TOOLCHAIN"
+            if ($LASTEXITCODE -eq 0) { 'reused=true' >> $env:GITHUB_OUTPUT; exit 0 }
+            Remove-Item native-payload -Recurse -Force
+          }
+          'reused=false' >> $env:GITHUB_OUTPUT
+          exit 0
+      - name: Build pinned native source
+        if: steps.verify.outputs.reused != 'true'
+        run: |
+          & './adapters/${{ matrix.adapter }}/build.ps1' *> native-build.log
+          if ($LASTEXITCODE -ne 0) { Get-Content native-build.log -Tail 80; exit 1 }
+          python _tests/release/native_build.py stage --adapter '${{ matrix.adapter }}' --toolchain "$env:NATIVE_TOOLCHAIN"
+      - uses: actions/cache/save@v4
+        if: success() && steps.cache.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        with:
+          path: native-payload
+          key: native-${{ matrix.adapter }}-${{ steps.inputs.outputs.key }}
+      - name: Retain native runtime payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-runtime-${{ matrix.adapter }}-windows-x86_64
+          path: native-payload/
+          include-hidden-files: true
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-evidence-${{ matrix.adapter }}-windows-x86_64
+          path: |
+            native-payload/NATIVE-BUILD.json
+            native-build.log
+          retention-days: 7
+          if-no-files-found: warn

@@ -686,7 +686,9 @@ fn change_media_failure_reports_rollback_and_current_slot() {
     let error = response.error.unwrap();
     assert_eq!(error.kind, "emulator_error");
     assert!(error.message.contains("rollback=restored"));
-    assert!(error.message.contains(previous.to_str().unwrap()));
+    let (_, current) = error.message.split_once("; current=").unwrap();
+    let current: Value = serde_json::from_str(current).unwrap();
+    assert_eq!(current["path"], previous.to_str().unwrap());
 }
 
 #[test]
@@ -2388,3 +2390,35 @@ fn empty_device_payload_does_not_finalize_unrestored_devices() {
 
 #[path = "pc98_bridge/observation_tests.rs"]
 mod observation;
+
+#[test]
+fn native_batch_rejection_publishes_no_partial_result() {
+    let command = format!("qEmucap,peekbatch,{}", hex::encode("10:2,0:1"));
+    for bad in [
+        "OK|2@1.5|30|0102",
+        "OK|2@1.5|30|0102,zz",
+        "OK|2@1.5|30|0102,ff,00",
+    ] {
+        let mut bridge = Bridge::new(
+            FakeGdb::from_pairs(vec![
+                ("?".into(), "S05".into()),
+                (command.clone(), bad.into()),
+                (command.clone(), "OK|2@1.5|30|aabb,cc".into()),
+            ]),
+            GdbBridgeEnv::default(),
+        );
+        let params = json!({"ranges":[
+            {"memory_type":"ram","address":16,"length":2},
+            {"memory_type":"ram","address":0,"length":1}
+        ]});
+        let rejected =
+            bridge.handle_request(Request::new(901, "read_memory_batch", params.clone()));
+        assert!(!rejected.ok && rejected.result.is_none(), "{bad}");
+        let next = bridge.handle_request(Request::new(902, "read_memory_batch", params));
+        assert!(next.ok, "{:?}", next.error);
+        let value = next.result.unwrap();
+        assert_eq!(value["reads"][0]["hex"], "aabb");
+        assert_eq!(value["reads"][1]["hex"], "cc");
+        assert!(bridge.gdb.replies.is_empty());
+    }
+}

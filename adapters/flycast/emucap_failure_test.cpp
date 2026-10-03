@@ -168,6 +168,7 @@ int main()
 	std::ifstream file(output, std::ios::binary);
 	const std::string read((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
 	assert(read == json);
+	file.close();
 #ifndef _WIN32
 	struct stat status{};
 	assert(::stat(output.c_str(), &status) == 0);

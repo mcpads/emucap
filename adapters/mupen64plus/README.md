@@ -32,11 +32,13 @@ main-CPU result.
 Both modes expose frozen `read_memory_batch` over RDRAM and `debug` operation `execution_speed`,
 which sets and reads back the core's speed factor (1–1000 percent) and speed limiter. Core patch
 0003 sleeps the limiter wait in 10 ms slices that end on a pause or speed change.
-The maintained host requires API 6 and patches through 0007. Actual frame/debugger parks
+The maintained host requires API 8 and patches through 0009. Actual frame/debugger parks
 reanchor pacing on resume. New native snapshots preserve interrupt-jitter state; native M64P
 file loads validate and retain their bytes before releasing the guest. Rejected inputs preserve
 the frozen state. Legacy snapshots cannot restore an absent jitter history; PJ64 and slot
-imports retain their existing behavior. Rebuild the host and bridge together.
+imports retain their existing behavior. RDRAM observations use a bounded storage-only native
+copy at the existing frozen boundary, preserving read watchpoints and debugger state.
+Rebuild the host and bridge together.
 
 Visible launch additionally advertises rendered-frame stepping, bounded `run_frames`,
 `press_buttons`, PNG screenshot, native save/load, and Control-composed atomic state/frame/memory

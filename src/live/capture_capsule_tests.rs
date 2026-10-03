@@ -316,7 +316,7 @@ fn recovery_never_mutates_a_replaced_staging_directory() {
         .create(preparation(output.path(), lease.clone()))
         .unwrap();
     let capsule = repository.read().unwrap().unwrap();
-    fs::remove_dir(&capsule.staging_path).unwrap();
+    fs::remove_dir_all(&capsule.staging_path).unwrap();
     fs::create_dir(&capsule.staging_path).unwrap();
     store
         .update_capture_json(port, &launch_id, |current: Option<CaptureCapsule>| {
@@ -330,6 +330,54 @@ fn recovery_never_mutates_a_replaced_staging_directory() {
         Err(CaptureCapsuleError::RecoveryBlocked(_))
     ));
     assert!(PathBuf::from(&capsule.staging_path).is_dir());
+}
+
+#[test]
+fn recovery_requires_the_retained_staging_owner_even_when_metadata_matches() {
+    for damage in [
+        "missing_capsule_owner",
+        "missing_file",
+        "different_owner",
+        "oversized_file",
+    ] {
+        let (_temp, store, port, launch_id, lease) = setup();
+        let output = tempfile::tempdir().unwrap();
+        let repository = CaptureCapsuleRepository::new(store.clone(), port, &launch_id);
+        repository
+            .create(preparation(output.path(), lease.clone()))
+            .unwrap();
+        let capsule = repository.read().unwrap().unwrap();
+        let owner = PathBuf::from(&capsule.staging_path)
+            .join(crate::bundle::publish::RECOVERY_OWNER_MEMBER);
+        match damage {
+            "missing_file" => fs::remove_file(&owner).unwrap(),
+            "different_owner" => fs::write(&owner, "0".repeat(26)).unwrap(),
+            "oversized_file" => fs::write(&owner, "0".repeat(27)).unwrap(),
+            _ => {}
+        }
+        assert!(capsule
+            .staging_identity
+            .matches(PathBuf::from(&capsule.staging_path).as_path())
+            .unwrap());
+        store
+            .update_capture_json(port, &launch_id, |current: Option<CaptureCapsule>| {
+                let mut current = current.unwrap();
+                current.lease.holder = capture_process(u32::MAX - 1);
+                if damage == "missing_capsule_owner" {
+                    current.staging_owner = None;
+                }
+                Ok(current)
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                repository.reconcile(&lease, None, Some(failed_terminal())),
+                Err(CaptureCapsuleError::RecoveryBlocked(_))
+            ),
+            "{damage}"
+        );
+        assert!(PathBuf::from(&capsule.staging_path).is_dir());
+    }
 }
 
 #[test]

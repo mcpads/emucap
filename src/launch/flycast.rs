@@ -174,6 +174,7 @@ pub fn prepare_runtime_binary(
         })?;
         let binary = portable_dir.join(exe_name);
         super::copy_file_replace(source_binary, &binary)?;
+        super::copy_adjacent_dlls(source_binary, &portable_dir)?;
         binary
     };
 

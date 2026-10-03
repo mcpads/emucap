@@ -1,0 +1,13 @@
+--- a/desmume/src/frontend/posix/meson.build
++++ b/desmume/src/frontend/posix/meson.build
+@@ -39,6 +39,10 @@
+ endif
+ 
+ dependencies = [dep_glib2, dep_sdl, dep_zlib, dep_threads]
++if host_machine.system() == 'windows'
++  compiler = meson.get_compiler('cpp')
++  dependencies += compiler.find_library('ws2_32')
++endif
+ # wifi.cpp always references libpcap symbols (POSIXPCapInterface), independent of
+ # the wifi feature, so link libpcap whenever it is available on the host.
+ if dep_pcap.found()

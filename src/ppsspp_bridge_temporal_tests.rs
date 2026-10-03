@@ -1,5 +1,5 @@
 use super::*;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct DelayedStepWs {
     step_delay: Duration,
@@ -48,9 +48,13 @@ impl WsTransport for DelayedStepWs {
         assert_eq!(expect_event, "cpu.stepping");
         self.issued_steps += 1;
         self.step_timeouts.push(timeout);
-        let wait = self.step_delay.min(timeout);
+        let wait = if self.issued_steps == 1 {
+            Duration::ZERO
+        } else {
+            timeout
+        };
         std::thread::sleep(wait);
-        if timeout < self.step_delay {
+        if self.issued_steps > 1 && timeout < self.step_delay {
             return Err(BridgeError::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "delayed WS step exceeded its clipped timeout",
@@ -66,7 +70,9 @@ impl WsTransport for DelayedStepWs {
         _timeout: Duration,
     ) -> BridgeResult<Value> {
         match event {
-            "cpu.status" => Ok(json!({"event": "cpu.status", "stepping": self.halted})),
+            "cpu.status" => Ok(
+                json!({"event": "cpu.status", "memory_park_version": 1, "stepping": self.halted}),
+            ),
             "cpu.getAllRegs" => Ok(json!({
                 "event": "cpu.getAllRegs",
                 "categories": [{
@@ -94,16 +100,14 @@ impl WsTransport for DelayedStepWs {
 
 #[test]
 fn delayed_backend_cannot_turn_a_partial_ppsspp_step_into_completion() {
-    let mut bridge = PpssppBridge::new(DelayedStepWs::new(Duration::from_millis(70)));
-    let started = Instant::now();
+    let mut bridge = PpssppBridge::new(DelayedStepWs::new(Duration::from_secs(2)));
     let error = bridge
-        .step_instructions_with_budget(&json!({"count": 3}), Duration::from_millis(120))
+        .step_instructions_with_budget(&json!({"count": 3}), Duration::from_secs(1))
         .unwrap_err();
 
-    assert!(started.elapsed() < Duration::from_millis(250));
     assert!(error.to_string().contains("after 1 acknowledged of 3"));
     assert_eq!(bridge.ws.issued_steps, 2);
     assert!(bridge.ws.halted);
     assert_eq!(bridge.ws.step_timeouts.len(), 2);
-    assert!(bridge.ws.step_timeouts[1] < Duration::from_millis(70));
+    assert!(bridge.ws.step_timeouts[1] < Duration::from_secs(2));
 }

@@ -76,3 +76,13 @@ GRCG/EGC processing; in-view `read_memory` uses it too. `debug.execution_speed` 
 frontend's pacing (0.01–10000 percent or unlimited, launch default 100). Running frames and
 frame steps, input pulses and pointer moves all follow it; a synchronous advance that would
 outlive its host budget stops with `reason: "host_deadline"`.
+
+
+Managed launches support frame-request cancellation through authenticated parent
+operations. The frontend checks cancellation during host pacing waits, completes
+any entered native call on its owning thread, then verifies cleared callback
+input before releasing the parent. Partial replies report actual progress in
+`count` and retain the target in `requested`. Controller loss uses the same cleanup
+and leaves unfinished parent recovery to the replacement controller. Unverified
+or late owner replies retire control. The advertised control-service bound is
+50 ms and the stop/cleanup bound is 5000 ms.

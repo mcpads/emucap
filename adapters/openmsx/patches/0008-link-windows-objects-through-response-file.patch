@@ -1,0 +1,15 @@
+--- a/build/main.mk
++++ b/build/main.mk
+@@ -506,7 +506,12 @@
+ ifeq ($(OPENMSX_SUBSET),)
+ 	$(SUM) "Linking $(notdir $@)..."
+ 	$(CMD)mkdir -p $(@D)
++  ifneq ($(filter mingw%,$(OPENMSX_TARGET_OS)),)
++	$(file >$(OBJECTS_PATH)/link-objects.rsp,$(foreach object,$^,"$(object)"))
++	$(CMD)+$(CXX) -o $@ $(CXXFLAGS) @$(OBJECTS_PATH)/link-objects.rsp $(LINK_FLAGS)
++  else
+ 	$(CMD)+$(CXX) -o $@ $(CXXFLAGS) $^ $(LINK_FLAGS)
++  endif
+   ifeq ($(STRIP_SEPARATE),true)
+ 	$(SUM) "Stripping $(notdir $@)..."
+ 	$(CMD)strip $@

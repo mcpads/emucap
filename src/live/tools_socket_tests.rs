@@ -135,10 +135,15 @@ fn run_reconnecting_projection_adapter(
     addr: String,
     disconnect_on: usize,
     state: Arc<Mutex<SocketProjectionState>>,
+    ready: std::sync::mpsc::Sender<()>,
 ) {
+    let mut ready = Some(ready);
     let mut injected = false;
     loop {
         let stream = TcpStream::connect(&addr).unwrap();
+        if let Some(ready) = ready.take() {
+            ready.send(()).unwrap();
+        }
         stream.set_nodelay(true).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
@@ -271,9 +276,11 @@ fn tap_reclaims_input_after_real_socket_disconnect_at_each_boundary() {
         let addr = link.local_addr().to_string();
         let state = Arc::new(Mutex::new(SocketProjectionState::default()));
         let adapter_state = Arc::clone(&state);
+        let (ready, connected) = std::sync::mpsc::channel();
         let adapter = std::thread::spawn(move || {
-            run_reconnecting_projection_adapter(addr, disconnect_on, adapter_state)
+            run_reconnecting_projection_adapter(addr, disconnect_on, adapter_state, ready)
         });
+        connected.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let result = tap(&mut link, 0, &["a".into()], 2, 0);
         assert_eq!(
@@ -326,9 +333,11 @@ fn hold_until_reclaims_input_after_real_socket_disconnect_at_each_boundary() {
         let addr = link.local_addr().to_string();
         let state = Arc::new(Mutex::new(SocketProjectionState::default()));
         let adapter_state = Arc::clone(&state);
+        let (ready, connected) = std::sync::mpsc::channel();
         let adapter = std::thread::spawn(move || {
-            run_reconnecting_projection_adapter(addr, disconnect_on, adapter_state)
+            run_reconnecting_projection_adapter(addr, disconnect_on, adapter_state, ready)
         });
+        connected.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let result = hold_until(&mut link, 0, &["down".into()], "test", 0, 1, 1);
         assert_eq!(

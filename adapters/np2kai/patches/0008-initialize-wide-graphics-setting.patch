@@ -1,0 +1,10 @@
+--- a/pccore.c
++++ b/pccore.c
+@@ -349,6 +349,7 @@
+     100,
+     OEMTEXT(""),
+     0,
++    0, /* gdcwovrg */
+ #if defined(SUPPORT_DEBUGSS)
+     0,
+ #endif

@@ -1,0 +1,48 @@
+--- a/src/wswan/sound.cpp
++++ b/src/wswan/sound.cpp
+@@ -404,6 +404,9 @@
+ 
+ void WSwan_SoundStateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++ // Legacy native states describe a completed frame with a zero sound origin.
++ if(load)
++  last_ts = 0;
+  SFORMAT StateRegs[] =
+  {
+   SFVAR(period),
+@@ -423,6 +426,7 @@
+   SFVAR(period_counter),
+   SFVAR(sample_pos),
+   SFVAR(nreg),
++  SFVAR(last_ts),
+   SFEND
+  };
+ 
+@@ -447,6 +451,7 @@
+ 
+ void WSwan_SoundReset(void)
+ {
++ last_ts = 0;
+  memset(period, 0, sizeof(period));
+  memset(volume, 0, sizeof(volume));
+  voice_volume = 0;
+--- a/src/wswan/v30mz.cpp
++++ b/src/wswan/v30mz.cpp
+@@ -1147,6 +1147,9 @@
+ 
+ void v30mz_StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++ // Legacy native states use a completed-frame CPU/sound origin.
++ if(load)
++  v30mz_timestamp = 0;
+  uint16 PSW;
+ 
+  SFORMAT StateRegs[] =
+@@ -1155,6 +1158,7 @@
+   SFPTR16N(I.regs.w, 8, "regs"),
+   SFPTR16N(I.sregs, 4, "sregs"),
+ 
++  SFVAR(v30mz_timestamp),
+   SFVARN(v30mz_ICount, "ICount"),
+   SFVARN(InHLT, "InHLT"),
+   SFVARN(prefix_base, "prefix_base"),

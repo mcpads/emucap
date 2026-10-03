@@ -26,6 +26,7 @@ upstream Mednafen locally to patch and build it.
 ### Build dependencies (the agent installs these — the user does nothing here)
 - brew: `flac libsndfile lzo musepack sdl2-compat zstd gettext`, `pkg-config`, clang.
 - `build.sh` fetches and builds Mednafen itself, so there is no separate emulator install for the user.
+- Request decoding uses the MIT-licensed nlohmann JSON header pinned by URL and SHA-256 in `json.lock`; the build downloads and verifies it automatically.
 
 ### BIOS files — the USER must supply these (agent: relay this as a checklist)
 
@@ -98,7 +99,8 @@ path, and pass it to the MCP `launch` tool (or `launch.sh` only as the legacy fa
 
 `read_memory_batch` reads up to 64 ranges (64 KiB) at one frozen stop, frame-boundary or CPU
 callback, through the debugger address spaces that `read_memory` uses. Saturn `physical` is not
-a window. `debug.execution_speed` sets the driver's normal speed (integer 1–10000 percent, or
+a window. PC-FX CPU observations exclude device I/O at `0x80000000..0x8077FFFF`.
+`debug.execution_speed` sets the driver's normal speed (integer 1–10000 percent, or
 unlimited); a held fast- or slow-forward key, netplay, or `nothrottle` without sound reads back as
 `custom`. Frame waits sleep in 10 ms slices: read-only requests are answered during a wait, so
 polling never advances a slow guest, and other requests end the wait. Frame steps, deferred frame
@@ -228,8 +230,11 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
 - **Saturn (14 kinds)**: `workraml` (1MB) · `workramh` (1MB) · `vdp1vram` (512KB) · `vdp2vram` (512KB) ·
   `vdp1fb0`/`vdp1fb1` · `scspram` (512KB) · `cram` (4KB, VDP2 palette — stored raw; interpret index/color
   format via CRAM_Mode) · `backup` (32KB) · `physical` (SH-2 external bus), etc.
-- **PSX (4 kinds)**: `cpu` (32-bit CPU bus — auto-decodes KUSEG/KSEG0/KSEG1 mirrors · scratchpad · BIOS · HW;
+- **PSX (4 kinds)**: `cpu` (32-bit CPU bus — auto-decodes KUSEG/KSEG0/KSEG1 mirrors · scratchpad · BIOS · implemented system-control registers;
   exec BP and value reads happen here) · `ram` (main RAM 2MB direct) · `spu` (SPU RAM 512KB) · `gpu` (VRAM 1MB).
+  CPU reads reject native unimplemented device registers at `0x1f801024..0x1f802fff`
+  and their KSEG0/KSEG1 aliases, including crossing ranges. Connected batch windows
+  advertise the same exclusions; VRAM and sound RAM use `gpu` and `spu`.
   MIPS is little-endian, so multi-byte value assembly is LE. Exec breakpoint ranges accept any
   equivalent KUSEG/KSEG0/KSEG1 address and fold only the native comparison; the public address and
   hit-time raw PC remain unchanged.
@@ -239,7 +244,8 @@ fixed-width values. Decimal and quoted or unquoted `0x` forms are accepted. A ne
   HuC6280 is little-endian. `pce_fast` has no Debugger and does not expose these address spaces.
 - **PC-FX (`pcfx`, V810 little-endian)**: `cpu` (32-bit physical bus) · `ram` (2 MiB) ·
   `backup` (32 KiB) · `exbackup` (128 KiB) · `bios` (1 MiB) · `track*` (data-track views) ·
-  KING/VDC/VCE auxiliary spaces. Writable dedicated RAM/video spaces use their debugger-backed
+  KING/VDC/VCE auxiliary spaces. CPU reads preserve RAM timing history; memory reads, batches
+  and pattern scans reject the device I/O aperture `0x80000000..0x8077FFFF`. Writable dedicated RAM/video spaces use their debugger-backed
   put handlers; `cpu`, `bios`, and `track*` are rejected before mutation. Exec BP uses aligned absolute
   V810 addresses. Read/write BP accepts `cpu`, linear `ram`, and `bios` offsets; the interleaved
   `backup`/`exbackup` views require an exact physical `cpu` address. V810 trace and register
@@ -324,14 +330,32 @@ not a BitOffset but a ConfigOrder; the actual raw bit is determined by the core'
   `step(unit="instructions")`
   (instruction-granularity advance via the fork's per-instruction CPU callback; SS is 1 instruction
   of the active CPU).
+- **Owned cancellation**: identified launches on callback-capable cores advertise frame/instruction
+  cancellation with a 50 ms native service bound and a 5-second stop/cleanup budget.
+  MCP cancellation verifies a native stop and releases request-owned input before
+  admitting follow-up execution. Controller process loss triggers the same native
+  cleanup and retains the interrupted MCP operation in quarantine.
 - **Unsupported or system-dependent**: set_breakpoint kind `nmi`/`irq`/`dma` is unsupported.
   `break_on_reset` is advertised only for cartridge systems with a meaningful reset vector. Runtime
   `status.methods` is authoritative; `watch_register`, `set_trace`/`get_trace`, and `call_stack` are supported when
   the selected core exposes a debugger.
   **Behavior differences**: `get_state(groups=[...])` applies a case-insensitive filter to the
   runtime register groups listed by `status.state_groups`; omit `groups` or pass `[]` for all groups.
+  PSX `g0.TStamp` is read-only: native CPU cycles in the current execution origin at an
+  instruction halt, and zero between frames. Load/reset and frame completion rebase this clock;
+  it is not a cumulative session counter.
   Unknown groups fail with `bad_params`. Input `port` is limited to port 0. `save_state`/`load_state`
-  work both frozen and running; a PlayStation load/reset issued from an instruction-bound halt is
+  work both frozen and running. Saves validate complete state bytes before replacing the file;
+  write failures preserve the previous checkpoint. Symlink and non-file destinations are rejected.
+  New saves bind native state to raster, filter, completed-image and active-frame output
+  history in one digest-checked file. Loads return `output_history: "restored"`, or
+  `"unavailable"` for legacy native-only files. This field does not qualify internal
+  resampler/input history. Loads preserve current frontend input and ownership;
+  saved device input resumes at its native sampling phase. State loads stage files
+  up to 512 MiB with a 128 MiB native
+  prefix; framing, identity and history admission errors return `io_error` with the
+  existing halt intact. A failure after native restoration starts
+  returns `restore_unverified` and requires a new managed process. A PlayStation load/reset issued from an instruction-bound halt is
   acknowledged only after the restored CPU callback boundary is serviceable. `poll_events` returns at minimum `{pc}` and access
   BPs also carry `{kind,address,length,value}` where possible. MD VDP write BP events also carry `memory_type`,
   `source` (`data_port`/`dma_vbus`/`dma_fill`/`dma_copy`/`control_port`), and for the DMA family a `source_address`
@@ -423,3 +447,10 @@ PSG routing restoration does not execute the abandoned oscillator timeline. Queu
 is discarded, so continuity of already buffered sound across a load is not promised.
 Legacy frame-boundary states use zero for the previously omitted clocks. Legacy instruction
 snapshots did not contain enough timing information to reconstruct their exact saved execution.
+
+### WonderSwan restore clocks
+
+Native states preserve both the V30 frame timestamp and the PSG's last processed
+timestamp. Their restored difference drives sound-device continuation. Legacy states
+default both clocks to zero; older instruction snapshots cannot reconstruct omitted
+clock history. This does not preserve queued host playback samples.

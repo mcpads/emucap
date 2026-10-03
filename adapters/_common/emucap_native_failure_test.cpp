@@ -11,6 +11,7 @@
 #include <direct.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
 #else
 #include <sys/stat.h>
 #include <unistd.h>
@@ -79,7 +80,14 @@ int main() {
   assert(bounded.size() <= EMUCAP_NATIVE_FAILURE_FILE_CAP);
   assert(bounded.find("\"truncated\":true") != std::string::npos);
 
+#ifdef _WIN32
+  char temp_path[MAX_PATH + 1];
+  const DWORD temp_size = GetTempPathA(sizeof(temp_path), temp_path);
+  assert(temp_size > 0 && temp_size < sizeof(temp_path));
+  const char* tmp = temp_path;
+#else
   const char* tmp = std::getenv("TMPDIR");
+#endif
   const std::string root =
       std::string(tmp != nullptr && tmp[0] != '\0' ? tmp : "/tmp")
       + "/emucap native failure $()-" + std::to_string(process_id());
@@ -93,6 +101,7 @@ int main() {
   const std::string read(
       (std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
   assert(read == json);
+  file.close();
 #ifndef _WIN32
   struct stat status {};
   assert(::stat(output.c_str(), &status) == 0);

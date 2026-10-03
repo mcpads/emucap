@@ -1,0 +1,38 @@
+--- a/build/msysutils.py
++++ b/build/msysutils.py
+@@ -1,7 +1,8 @@
+ from io import open
+ from os import environ
+ from os.path import isfile
+-from subprocess import PIPE, Popen
++from subprocess import PIPE, Popen, check_output
++from shutil import which
+ import sys
+ 
+ def _determineMounts():
+@@ -48,6 +49,8 @@
+ 	return mounts
+ 
+ def msysPathToNative(path):
++	if 'MSYSTEM' in environ:
++		return check_output(['cygpath', '-m', path], text=True).strip()
+ 	if path.startswith('/'):
+ 		if len(path) == 2 or (len(path) > 2 and path[2] == '/'):
+ 			# Support drive letters as top-level dirs.
+@@ -62,12 +65,14 @@
+ 		return path
+ 
+ def msysActive():
+-	return environ.get('OSTYPE') == 'msys' or 'MSYSCON' in environ
++	return environ.get('OSTYPE') == 'msys' or 'MSYSCON' in environ or 'MSYSTEM' in environ
+ 
+ def msysShell():
++	if 'MSYSTEM' in environ:
++		return which('sh') or 'sh.exe'
+ 	return environ.get('SHELL') or 'sh.exe'
+ 
+-if msysActive():
++if msysActive() and 'MSYSTEM' not in environ:
+ 	msysMounts = _determineMounts()
+ else:
+ 	msysMounts = None

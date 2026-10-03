@@ -93,7 +93,8 @@ LUA_DIR="$(cd "$(dirname "$LUA")" 2>/dev/null && pwd -P || true)"
 if [ "$LUA_DIR" = "$HERE" ]; then
   if [ -n "$(git -C "$HERE" status --porcelain -- \
     emucap-core.lua emucap_deferred.lua emucap_dump.lua emucap_freeze_state.lua emucap_native_callstack.lua emucap_memory.lua \
-    emucap_step.lua \
+    emucap_step.lua emucap_json.lua emucap_input.lua emucap_owner.lua emucap_control_wire.lua emucap_rx.lua \
+    emucap_control.lua emucap_control_advance.lua \
     emucap_tx.lua emucap_state_io.lua emucap_snapshot.lua emucap_recording.lua \
     "$(basename "$LUA")" 2>/dev/null)" ]; then
     EMUCAP_BUILD_HASH="${EMUCAP_BUILD_HASH}-dirty"

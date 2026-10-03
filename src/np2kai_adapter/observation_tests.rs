@@ -113,17 +113,66 @@ fn policy_changes_and_short_parks_start_a_new_frame_schedule() {
         let changed = initial + Duration::from_millis(3);
         pacer.set(PacingPolicy::Limited { centi_percent });
         assert_eq!(pacer.frame_start(101, FRAME, changed), Some(changed));
-        assert_eq!(pacer.frame_start(102, FRAME, changed), Some(changed + period));
+        assert_eq!(
+            pacer.frame_start(102, FRAME, changed),
+            Some(changed + period)
+        );
         let policy = pacer.policy;
         let revision = pacer.revision;
         pacer.reanchor();
         let resumed = changed + Duration::from_millis(3);
         assert_eq!(pacer.frame_start(102, FRAME, resumed), Some(resumed));
-        assert_eq!(pacer.frame_start(103, FRAME, resumed), Some(resumed + period));
+        assert_eq!(
+            pacer.frame_start(103, FRAME, resumed),
+            Some(resumed + period)
+        );
         assert_eq!(pacer.policy, policy);
         assert_eq!(pacer.revision, revision);
     }
     pacer.set(PacingPolicy::Unlimited);
     pacer.reanchor();
     assert_eq!(pacer.frame_start(104, FRAME, initial), None);
+}
+
+#[test]
+fn cancelled_pacing_wait_never_enters_the_next_frame() {
+    let token = crate::live::link::RequestCancellation::default();
+    token.cancel();
+    assert!(!wait_for_frame_start(Instant::now(), &token));
+    assert!(!wait_for_frame_start(
+        Instant::now() + Duration::from_secs(200),
+        &token
+    ));
+}
+
+#[test]
+fn long_pacing_wait_services_cancellation_without_waiting_for_guest_time() {
+    let token = crate::live::link::RequestCancellation::default();
+    let signal = token.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        ready_tx.send(()).unwrap();
+        tx.send(wait_for_frame_start(
+            Instant::now() + Duration::from_secs(200),
+            &token,
+        ))
+        .unwrap();
+    });
+    ready_rx.recv().unwrap();
+    std::thread::sleep(Duration::from_millis(30));
+    signal.cancel();
+    assert!(!rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("host pacing wait ignored cancellation"));
+    worker.join().unwrap();
+}
+
+#[test]
+fn reached_frame_start_without_cancellation_is_admitted() {
+    assert!(wait_for_frame_start(Instant::now(), &Default::default()));
+    assert_eq!(
+        AdvanceStop::reason(Some(AdvanceStop::Cancelled)),
+        json!("cancelled")
+    );
 }

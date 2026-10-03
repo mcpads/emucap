@@ -1013,7 +1013,7 @@ fn lock_with_deadline(file: &File, timeout: std::time::Duration) -> io::Result<(
     loop {
         match fs2::FileExt::try_lock_exclusive(file) {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+            Err(e) if e.raw_os_error() == fs2::lock_contended_error().raw_os_error() => {
                 if std::time::Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::WouldBlock,

@@ -1,0 +1,13 @@
+--- a/pcsx2/PINE.cpp
++++ b/pcsx2/PINE.cpp
+@@ -1184,8 +1184,8 @@
+ 				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 16 + total, buf_size)) goto error;
+ 				bool success = false;
+ 				Host::RunOnCPUThread([&]() {
+-					if (VMManager::GetState() != VMState::Paused || !eeMem) return;
+-					// Paused VM has drained VU/GS workers; all copies run in one owner task.
++					if (!VMManager::IsEmucapExecutionParkedOnCPUThread() || !eeMem) return;
++					// Completed park has drained VU/GS and unwound CPU execution. Never drain here.
+ 					ToResultVector(ret_buffer, VMManager::GetEmucapMemoryEpoch(), ret_cnt);
+ 					ToResultVector(ret_buffer, static_cast<u64>(g_FrameCount), ret_cnt + 8);
+ 					u32 offset = ret_cnt + 16;

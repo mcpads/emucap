@@ -403,7 +403,7 @@ pub(super) fn path_cstring(path: &Path) -> Np2kaiResult<CString> {
 pub(super) fn sha256_file(path: &Path) -> Np2kaiResult<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -454,6 +454,8 @@ pub(super) fn state_sidecar(path: &Path) -> PathBuf {
 
 pub(super) fn error_kind(error: &Np2kaiError) -> &'static str {
     match error {
+        Np2kaiError::Busy => "busy",
+        Np2kaiError::Cancelled => "cancelled",
         Np2kaiError::BadParams(_) => "bad_params",
         Np2kaiError::BadState(_) => "bad_state",
         Np2kaiError::Unsupported(_) => "unsupported",

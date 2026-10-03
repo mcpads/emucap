@@ -28,8 +28,9 @@ through each by exact filename/path and confirm before proceeding:
    tool. `launch.sh` is a legacy fallback.
 
 **OS reality:** macOS (arm64) is the tested runtime path; Linux is experimental; Windows is **BETA**. The Rust
-launcher handles Flycast's Windows config model by copying `Flycast.exe` into an emucap-owned portable directory
-and writing `emu.cfg` next to that copy. Building Flycast itself on Windows is still unverified here.
+launcher copies `Flycast.exe` and its adjacent DLLs into an emucap-owned portable directory
+and writes `emu.cfg` next to that copy. Native Windows CI builds pass; managed Windows game
+execution remains under qualification.
 
 ## Native adapter
 

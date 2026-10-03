@@ -1,0 +1,61 @@
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -157,7 +157,7 @@
+ static bool emucap_running_safe_packet(const uint8_t *packet) {
+   if (strcmp((const char *)packet, "qEmucap,haltstate") == 0) return true;
+   static const char *const prefixes[] = {
+-    "qEmucap,batch:", "qEmucap,pacing", "QEmucap,pacing:", "qEmucap,inputstatus", "qEmucap,touchstatus",
++    "qEmucap,rateInfo", "QEmucap,rate:", "qEmucap,batch:", "qEmucap,pacing", "QEmucap,pacing:", "qEmucap,inputstatus", "qEmucap,touchstatus",
+   };
+   for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+     if (strncmp((const char *)packet, prefixes[i], strlen(prefixes[i])) == 0)
+@@ -1299,7 +1299,7 @@
+   DEBUG_LOG("Processing packet %c\n", packet[0]);
+   gdbstub_mutex_lock();
+ 
+-  if (strchr("cCsSMXGPZzQ", packet[0]) != NULL && strncmp((const char *)packet, "QEmucap,pacing:", 15) != 0) ++emucap_memory_epoch;
++  if (strchr("cCsSMXGPZzQ", packet[0]) != NULL && strncmp((const char *)packet, "QEmucap,pacing:", 15) != 0 && strncmp((const char *)packet, "QEmucap,rate:", 13) != 0) ++emucap_memory_epoch;
+   switch( packet[0]) {
+   case 3:
+     /* The break command */
+@@ -1348,6 +1348,14 @@
+     }
+     else if ( strncmp( (const char *)packet, "qEmucap,framestepstatus", 23) == 0) {
+       send_size = emucap_format_frame_step_status((char *)out_ptr, BUFMAX);
++    }
++    // Versioned policy observation; distinct from the legacy prefix-matched query.
++    else if (strcmp((const char *)packet, "qEmucap,rateInfo") == 0) {
++      const auto policy = emucap_pacing.Read();
++      send_size = snprintf((char *)out_ptr, BUFMAX, "1;%x,%x,%llx,%llx",
++        (unsigned)policy.percent, policy.nativeUnlimited ? 1u : 0u,
++        (unsigned long long)policy.revision,
++        (unsigned long long)emucap_vblank_clock.load());
+     }
+     // Pacing readback: <percent, 0=unlimited>,<native unlimited 0/1>,<revision>,<VBlank clock>, hex.
+     else if ( strncmp( (const char *)packet, "qEmucap,pacing", 14) == 0) {
+@@ -1408,6 +1416,25 @@
+       emucap_apply_input( &packet[14]);
+       strcpy( (char *)out_ptr, "OK");
+       send_size = 2;
++    }
++    // One owner transaction. VBlank samples bracket the policy operation.
++    else if (strncmp((const char *)packet, "QEmucap,rate:", 13) == 0) {
++      const uint8_t *p = &packet[13];
++      uint32_t percent = 0;
++      if (strlen((const char *)p) > 8 || !hexToInt(&p, &percent) || *p != 0 || percent > 10000) {
++        strcpy((char *)out_ptr, "E01"); send_size = 3;
++      } else {
++        const uint64_t before_clock = emucap_vblank_clock.load();
++        const auto change = emucap_pacing.Apply(percent);
++        const uint64_t after_clock = emucap_vblank_clock.load();
++        emucap_pace_wake.store(true);
++        send_size = snprintf((char *)out_ptr, BUFMAX,
++          "1;%x,%x,%llx,%llx;%x,%x,%llx,%llx",
++          (unsigned)change.previous.percent, change.previous.nativeUnlimited ? 1u : 0u,
++          (unsigned long long)change.previous.revision, (unsigned long long)before_clock,
++          (unsigned)change.applied.percent, change.applied.nativeUnlimited ? 1u : 0u,
++          (unsigned long long)change.applied.revision, (unsigned long long)after_clock);
++      }
+     }
+     // emucap pacing: QEmucap,pacing:<hex percent> sets 1..10000 percent of the DS refresh, 0 is
+     // unlimited. Replies OK, or E01 outside the domain.

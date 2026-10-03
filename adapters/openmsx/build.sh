@@ -167,6 +167,49 @@ elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$REALTIME_PATCH" >/dev/null 2>&
   exit 1
 fi
 
+PKG_CONFIG_PATCH="$HERE/patches/0006-build-pkg-config-with-current-toolchains.patch"
+[ "$(sha256_path "$PKG_CONFIG_PATCH")" = "$OPENMSX_PKG_CONFIG_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX pkg-config patch digest does not match upstream.lock" >&2
+  exit 1
+}
+tar -xzf "$ARCHIVE" -C "$WORK" \
+  "openmsx-$OPENMSX_VERSION/build/3rdparty.mk" \
+  "openmsx-$OPENMSX_VERSION/build/libraries.py"
+if patch -d "$SRC" -p1 --forward --dry-run <"$PKG_CONFIG_PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward <"$PKG_CONFIG_PATCH"
+elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$PKG_CONFIG_PATCH" >/dev/null 2>&1; then
+  echo "ERROR: openMSX pkg-config patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+
+MSYS2_PATCH="$HERE/patches/0007-recognize-msys2-native-python.patch"
+[ "$(sha256_path "$MSYS2_PATCH")" = "$OPENMSX_MSYS2_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX MSYS2 patch digest does not match upstream.lock" >&2
+  exit 1
+}
+tar -xzf "$ARCHIVE" -C "$WORK" "openmsx-$OPENMSX_VERSION/build/msysutils.py"
+patch -d "$SRC" -p1 --forward <"$MSYS2_PATCH"
+
+LINK_RESPONSE_PATCH="$HERE/patches/0008-link-windows-objects-through-response-file.patch"
+[ "$(sha256_path "$LINK_RESPONSE_PATCH")" = "$OPENMSX_LINK_RESPONSE_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX link response patch digest does not match upstream.lock" >&2
+  exit 1
+}
+tar -xzf "$ARCHIVE" -C "$WORK" "openmsx-$OPENMSX_VERSION/build/main.mk"
+patch -d "$SRC" -p1 --forward <"$LINK_RESPONSE_PATCH"
+
+CONSOLE_PATCH="$HERE/patches/0009-preserve-redirected-windows-output.patch"
+[ "$(sha256_path "$CONSOLE_PATCH")" = "$OPENMSX_CONSOLE_PATCH_SHA256" ] || {
+  echo "ERROR: openMSX console patch digest does not match upstream.lock" >&2
+  exit 1
+}
+if patch -d "$SRC" -p1 --forward --dry-run <"$CONSOLE_PATCH" >/dev/null 2>&1; then
+  patch -d "$SRC" -p1 --forward <"$CONSOLE_PATCH"
+elif ! patch -d "$SRC" -p1 --reverse --dry-run <"$CONSOLE_PATCH" >/dev/null 2>&1; then
+  echo "ERROR: openMSX console patch is neither applicable nor already applied" >&2
+  exit 1
+fi
+
 INSTALL_BASE="$SRC/install"
 perl -0pi -e "s{^INSTALL_BASE\\s*[:?+]?=.*\$}{INSTALL_BASE:=$INSTALL_BASE}m" \
   "$SRC/build/custom.mk"
@@ -198,22 +241,44 @@ fi
 JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 (
   cd "$SRC"
-  ./configure
-  make -j "$JOBS"
-  if [ "$(uname)" != "Darwin" ]; then
+  case "$(uname -s)" in
+    MINGW*|MSYS*)
+      # Upstream's standalone Windows target bundles its pinned dependencies
+      # and machine definitions beside the executable.
+      pkg-config --exists glib-2.0 || {
+        echo "ERROR: the Windows build requires the MSYS2 GLib development package" >&2
+        exit 1
+      }
+      # bindist's destination is already relative. Keep its child directories
+      # relative too: MSYS otherwise rewrites /share and /doc to drive paths
+      # before native Python concatenates them with the staging destination.
+      if ! make -j "$JOBS" staticbindist INSTALL_SHARE_DIR=share INSTALL_DOC_DIR=doc; then
+        find derived -path '*/config/probe.log' -type f -exec cat {} \;
+        exit 1
+      fi
+      ;;
+    *)
+      ./configure
+      make -j "$JOBS"
+      ;;
+  esac
+  case "$(uname -s)" in
+    Darwin|MINGW*|MSYS*) ;;
+    *)
     # Unix executables load machine definitions and scripts from INSTALL_BASE/share.
     # The macOS bundle already includes these resources in its build output.
     make install DESTDIR= OPENMSX_INSTALL="$INSTALL_BASE" \
       INSTALL_BINARY_DIR="$INSTALL_BASE/bin" INSTALL_SHARE_DIR="$INSTALL_BASE/share" \
       INSTALL_DOC_DIR="$INSTALL_BASE/doc"
-  fi
+      ;;
+  esac
 )
 
-if [ "$(uname)" = "Darwin" ]; then
-  BINARY="$(find "$SRC/derived" -type f -path '*/openMSX.app/Contents/MacOS/openmsx' -print -quit)"
-else
-  BINARY="$(find "$SRC/derived" -type f -name openmsx -perm -u+x -print -quit)"
-fi
+case "$(uname -s)" in
+  Darwin) BINARY="$(find "$SRC/derived" -type f -path '*/openMSX.app/Contents/MacOS/openmsx' -print -quit)" ;;
+  MINGW*|MSYS*) BINARY="$(find "$SRC/derived" -type f -path '*/bindist/*' -name openmsx.exe -print -quit)" ;;
+  *) BINARY="$(find "$SRC/derived" -type f -name openmsx -perm -u+x -print -quit)" ;;
+esac
 [ -n "$BINARY" ] && [ -x "$BINARY" ] || {
   echo "ERROR: openMSX executable was not produced" >&2
   exit 1
@@ -237,7 +302,11 @@ SIDECAR="$BUILD_DIR/emucap-openmsx-build.json"
   printf '  "frame_probe_patch_sha256": "%s",\n' "$OPENMSX_FRAME_PROBE_PATCH_SHA256"
   printf '  "raster_patch_sha256": "%s",\n' "$OPENMSX_RASTER_PATCH_SHA256"
   printf '  "disk_state_patch_sha256": "%s",\n' "$OPENMSX_DISK_STATE_PATCH_SHA256"
+  printf '  "pkg_config_patch_sha256": "%s",\n' "$OPENMSX_PKG_CONFIG_PATCH_SHA256"
+  printf '  "msys2_patch_sha256": "%s",\n' "$OPENMSX_MSYS2_PATCH_SHA256"
   printf '  "realtime_patch_sha256": "%s",\n' "$OPENMSX_REALTIME_PATCH_SHA256"
+  printf '  "console_patch_sha256": "%s",\n' "$OPENMSX_CONSOLE_PATCH_SHA256"
+  printf '  "link_response_patch_sha256": "%s",\n' "$OPENMSX_LINK_RESPONSE_PATCH_SHA256"
   printf '  "native_patch": true\n'
   printf '}\n'
 } >"$SIDECAR"
