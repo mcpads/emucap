@@ -1,7 +1,7 @@
 # emucap
 
 emucap lets agents observe and control supported emulators. Installation and core packages are
-in `README.md`; adapter prerequisites and builds are in `adapters/*/README.md`.
+in `AGENT_GUIDE.md`; adapter prerequisites and builds are in `adapters/*/README.md`.
 
 Register both MCP servers with their release binaries:
 

@@ -136,7 +136,7 @@ def main():
             "The four core executables are in `target/release/`. Keep this directory tree intact.\n"
             "Run `sh tools/register-codex-mcp.sh` (macOS/Linux) or "
             "`pwsh -File tools/register-codex-mcp.ps1` (Windows), then reconnect both MCP servers.\n"
-            "The core build step in README can be skipped. Adapter bridges and emulator hosts "
+            "The core build step in AGENT_GUIDE.md can be skipped. Adapter bridges and emulator hosts "
             "are separate builds; follow the selected adapter's README. Rust and C/C++ tools "
             "may still be required for those builds. No emulator, firmware or game is bundled.\n"
             "Apple Silicon binaries are not Developer ID signed or notarized.\n")

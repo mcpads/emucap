@@ -1,379 +1,77 @@
-# emucap — emulator monitor + HITL adaptor
+# emucap
 
-> English: [README.md](README.md)
+**AI 에이전트가 에뮬레이터 속 게임을 보고, 조작하고, 디버깅하도록 연결합니다.**
 
-레트로 게임 패치 디버깅을 위한 MCP 인프라. 실행 중인 에뮬레이터의 메모리·상태·화면을 AI
-에이전트가 읽고 제어해, 사람이 설명한 문제를 분석하도록 돕는다. 공통 Core + 어댑터로 여러
-에뮬레이터를 지원한다 — Mesen2(SNES·Game Gear·Game Boy·GBC·GBA·NES), Mednafen 포크(Saturn·
-PlayStation·PC Engine·PC-FX·Mega Drive/Genesis·WonderSwan/WSC·Neo Geo Pocket/Color), Flycast(Dreamcast), DeSmuME 포크(Nintendo DS),
-PPSSPP 포크(PSP), PCSX2 포크(PlayStation 2), Dolphin 포크(GameCube·Wii), MAME과 선택형
-NP2kai 호환 backend(PC-98), MAME(실험적 Neo Geo MVS/AES/CD), 실험적 Mupen64Plus frontend(Nintendo 64).
-원본 Xbox는 고정된 xemu 포크로 실험 지원한다. 고정된 openMSX 21.0 source에 emucap host patch를
-적용한 build와 별도 Rust XML bridge로 C-BIOS MSX2+ 및 실제 firmware MSX1/MSX2/MSX2+
-카트리지 profile도 제공한다.
+[English](README.md) · [릴리스](https://github.com/mcpads/emucap/releases) · [에이전트 가이드](AGENT_GUIDE.ko.md)
 
-**v1.0.0-rc.1 — 출시 후보.** 1.x에서 유지할 공개 계약은
-[COMPATIBILITY.md](COMPATIBILITY.md)에 정의한다. 연결된 런타임의 `status`가 실제 가용 기능을
-보고하며, 실험적 프로필은 명시된 지원 범위를 유지한다.
+emucap은 Claude Code, Codex 같은 MCP 지원 에이전트를 레트로 게임 에뮬레이터에
+연결합니다. 에이전트에게 특정 장면을 플레이하거나, 버그를 재현하거나, 게임 내부의
+동작을 조사하도록 요청할 수 있습니다. 에이전트는 여러 에뮬레이터에서 같은 인터페이스로
+화면을 보고, 버튼을 누르고, 프레임을 진행하고, 메모리를 읽습니다.
 
-Core와 별도 표시가 없는 프로젝트 source는 GPL-2.0-or-later다. 에뮬레이터 native patch stack은
-adapter별 upstream license 경계를 따른다. [LICENSE](LICENSE)와 [NOTICE](NOTICE)를 참고한다.
+## 할 수 있는 일
 
-## 플랫폼
+- **플레이와 관찰:** 화면 캡처, 버튼 누르기와 길게 유지하기, 마우스 조작,
+  지원되는 런타임의 배속 조절.
+- **문제 재현:** 체크포인트 저장, 입력 재생, 결과 비교.
+- **게임 내부 조사:** 메모리와 레지스터 읽기, 중단점 설정, 명령어 단위 실행.
+- **실험 기록:** 별도의 Tracking MCP로 실행 결과와 발견 사항을 기록하고 비교.
 
-Rust Core(두 MCP)와 Rust `launch` 도구는 크로스플랫폼이다(macOS Apple Silicon+Intel, Linux,
-Windows). 에뮬레이터별 build/launch 요구사항은 OS마다 다르다 — 자동화가 모자라면 에이전트가
-upstream 설치 절차로 에뮬레이터를 준비해 emucap에 연결하고, 호스트에서 실제로 쓸 수 있는 도구는
-`status`가 보고한다. Windows에서는 Unix shell launcher보다 Rust `launch` 도구와 문서화된 env
-override를 우선한다.
+게임 경로와 함께 에이전트에게 이렇게 요청할 수 있습니다.
 
-## Agent에게 설치를 맡기기
+> “이 게임을 열고 시작 전에 멈춰줘.”
+>
+> “체크포인트를 저장하고, 오른쪽을 60프레임 누른 뒤 화면을 보여줘.”
+>
+> “플레이어가 피해를 받을 때 이 메모리 주소를 바꾸는 코드를 찾아줘.”
 
-이 저장소는 **에이전트(Claude Code·Codex 등)가 설치를 직접 수행**하도록 만들어졌다. 비개발자는
-저장소를 받은 뒤 에이전트에게 이렇게 말하면 된다:
+제공되는 기능은 에뮬레이터와 시스템에 따라 다릅니다. 연결된 런타임이 `status`로
+가용 기능을 알려주므로 에이전트가 그에 맞춰 조작합니다.
 
-> "이 저장소 README의 'Agent 설치 절차'대로 emucap을 설치하고 MCP 서버로 등록해줘."
+## 시작하기
 
-에이전트가 릴리스 Core를 먼저 설치하고, 선택한 게임에 필요한 어댑터를 준비한다.
+에이전트에게 이 저장소와 사용할 게임을 알려주세요.
 
-**에이전트가 사용자의 인터페이스다.** 사용자가 터미널, 빌드 도구, 에뮬레이터 설정을 모른다고 가정한다.
-명령은 에이전트가 직접 실행하고, GUI 클릭이 필요한 단계는 메뉴 위치와 버튼 이름을 짧게 안내한 뒤
-확인하고 진행한다. 사용자의 OS에 맞춰 절차를 조정한다.
+> “AGENT_GUIDE.ko.md에 따라 emucap을 설치하고 MCP 서버로 등록해줘.
+> 이 게임에 필요한 어댑터도 준비해줘.”
 
-### 1. Core 설치 방식 선택
+에이전트가 코어를 설치하고, 선택한 에뮬레이터의 어댑터를 준비하고, 연결을 확인합니다.
+게임과 필요한 BIOS·펌웨어는 사용자가 준비합니다.
 
-호스트 OS와 CPU 아키텍처를 확인한다. 릴리스 버전을 설치할 때는
-[GitHub Releases](https://github.com/mcpads/emucap/releases)의 해당 코어 패키지를 우선한다.
+[GitHub Releases](https://github.com/mcpads/emucap/releases)에서 **Windows x86-64,
+Linux x86-64, macOS Apple Silicon**용 코어 패키지를 제공합니다.
+Intel macOS는 소스 빌드로 사용할 수 있습니다. 에뮬레이터 어댑터는 별도로 준비하며,
+운영체제에 따라 빌드 요구사항과 제공 기능이 다릅니다.
 
-| 호스트 | 패키지 타깃 |
+직접 설치하려면 [설치 절차](AGENT_GUIDE.ko.md#1-core-설치-방식-선택)를 참고하세요.
+코어는 에뮬레이터를 조작하는 **Control**과 실험을 기록하는 **Tracking**, 두 MCP 서버를
+제공합니다. Tracking은 선택 사항이며 에이전트가 필요에 따라 함께 사용합니다.
+
+## 지원 시스템
+
+| 에뮬레이터 | 시스템 |
 | --- | --- |
-| Windows x86-64 | `x86_64-pc-windows-msvc.zip` |
-| Linux x86-64 | `x86_64-unknown-linux-gnu.tar.gz` |
-| macOS Apple Silicon | `aarch64-apple-darwin.tar.gz` |
+| Mesen2 | NES, SNES, Master System, Game Gear, Game Boy / Color, GBA |
+| Mednafen | PlayStation, Saturn, PC Engine, PC-FX, Mega Drive / Genesis, WonderSwan / Color, Neo Geo Pocket / Color |
+| Flycast | Dreamcast |
+| DeSmuME | Nintendo DS |
+| PPSSPP | PSP |
+| PCSX2 | PlayStation 2 |
+| Dolphin | GameCube, Wii |
+| MAME / NP2kai | PC-98 |
+| MAME | Neo Geo MVS / AES / CD — 실험 지원 |
+| Mupen64Plus | Nintendo 64 — 실험 지원 |
+| openMSX | MSX1 / MSX2 / MSX2+ — 실험 지원 |
+| xemu | 원본 Xbox — 실험 지원 |
 
-파일명 앞에는 `emucap-<version>-`이 붙는다. Intel macOS처럼 일치하는 패키지가 없는 호스트나
-특정 소스 커밋을 개발하는 경우에는 소스 빌드를 선택한다.
+설치 방법과 프로필별 지원 범위는 [어댑터 가이드](AGENT_GUIDE.ko.md#에뮬레이터별-어댑터-필요할-때-에이전트가-설치)를
+참고하세요. 제어와 관찰에 에뮬레이터 내부 수정이 필요한 경우 emucap이 소스 패치를 유지합니다.
 
-### 2. Core 설치
+## 프로젝트 상태
 
-**사전 빌드 패키지:** 같은 릴리스에서 선택한 압축 파일, `SHA256SUMS`, 해당 JSON manifest를
-내려받는다. 압축 파일의 SHA-256을 `SHA256SUMS`의 해당 항목과 비교한다(macOS는
-`shasum -a 256`, Linux는 `sha256sum`, PowerShell은 `Get-FileHash -Algorithm SHA256`).
-압축 전체를 계속 사용할 설치 디렉터리에 해제한다. `target/release/`, `tools/`, `adapters/`를
-함께 유지하고, 이후 등록 명령은 그 디렉터리에서 실행한다. `PREBUILT-CORE.md`는 패키지 구성을,
-`CORE-BUILD.json`은 소스 커밋과 바이너리 해시를 기록한다. Windows에서는
-[Visual C++ x64 재배포 패키지](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist)가 필요하다.
-여기까지 끝나면 3단계로 진행한다. 컴파일러는 이후 선택한 어댑터가 요구할 때 준비한다.
+**1.0.0-rc.1은 출시 후보입니다.** 1.x의 공개 호환성 계약은
+[COMPATIBILITY.md](COMPATIBILITY.md), 변경 사항은 [CHANGELOG.md](CHANGELOG.md)에 있습니다.
 
-**소스 빌드:** 설치할 릴리스 태그 또는 개발 커밋을 체크아웃한다. Git, Rust 1.88 이상,
-SQLite 번들 빌드용 C 컴파일러를 준비한다. macOS는 Xcode Command Line Tools, Linux는 배포판의
-C 빌드 도구, Windows는 MSVC C++ Build Tools를 사용한다. 저장소 루트에서 코어 네 개를 빌드한다.
-
-```sh
-cargo build --locked --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
-```
-
-두 경로 모두 `target/release/`에 `emucap-mcp`(제어 MCP), `emucap-track-mcp`(추적 MCP),
-`emucap`(번들·추적 CLI), `emucap-broker`(다중 세션 broker)를 준비한다(Windows는 `.exe`).
-어댑터 브리지와 에뮬레이터 호스트는 선택한 시스템의 `adapters/<adapter>/README.md`와
-빌드 요구사항에 따라 별도로 준비한다.
-
-### 3. MCP 서버 등록 (두 MCP)
-
-emucap은 **두 MCP**로 나뉘어 있고 **둘 다 등록한다** — 에이전트가 둘을 조립한다(§3계층).
-
-- **제어 MCP**(`emucap-mcp`) — 에뮬레이터 조작 엔진. 메모리·상태·화면을 읽고, 입력·세이브스테이트·
-  브레이크포인트를 제어하고 선택적 분석 결과를 *반환*한다. 정적 도구 목록은 간결한 기본
-  리모컨이다. 버튼·키 입력은 `tap`, 마우스 조작은 `pointer(operation="describe")`, 디버거 호출 사이에 유지할 입력·터치와
-  복합·기기별 디버거 기능은 `debug(operation="describe")`, 재현성 분석은
-  `analysis(operation="describe")`로 연다. 각 서랍은
-  현재 runtime의 operation과 schema만 반환하며 실행도 같은 도구가 맡는다. 메모리 쓰기·disassembly·
-  call stack·breakpoint·event polling은 디버거 기본 기능이라 direct tool로 유지한다. 실행 중 매체 교체도 direct이며
-  frozen 상태와 `status.media_devices`의 device ID를 요구한다. 정확한 guest-time 전진은 frozen으로
-  돌아오는 `step`을 사용한다. 어댑터의 free-running frame wait는 호환용 wire 동작으로만 남고 MCP
-  에이전트에게는 노출하지 않는다.
-  `tap`은 하나 이상의 버튼을 `press_frames` 동안 함께 누르고 해제한 뒤, `after_frames`만큼
-  진행하고 frozen으로 끝난다. 짧은 누름과 길게 누르기 모두 이 방식으로 처리한다. Guest가 계속
-  실행되는 실시간 pulse는 runtime이 지원할 때만 디버그 서랍의 `pulse_while_running`으로 명시적으로 연다.
-- **추적 MCP**(`emucap-track-mcp`) — 실험 원장(`.emucap/`). run을 시작(`run_start`)·기록(`log_*`)·
-  질의(`query_runs`/`compare_runs`/`summarize_runs`)한다. **에뮬레이터를 모른다**(emulator-less). 제어
-  MCP에 *얹혀* 실험을 남기는 add-on이라, 켜지 않아도 제어 MCP는 그대로 동작한다.
-
-0.17로 업데이트할 때는 해당 코어 패키지를 설치하거나 릴리스를 빌드한 뒤, 두 MCP 서버를
-재연결하고 도구 목록을 갱신한다.
-버튼·키 입력은 `tap`, 마우스 조작은 `pointer`, 디버거 호출 사이에 유지할 입력과 터치는 `debug`로 옮겨졌다.
-원천 수정 적용을 위해 openMSX 호스트(API 6)와 PPSSPP 호스트도 다시 빌드한다.
-저장 상태 호환 조건과 나머지 변경은 [변경 기록](CHANGELOG.md)을 참고한다.
-
-**Claude Code:**
-
-```sh
-claude mcp add emucap-control -- "$(pwd)/target/release/emucap-mcp"
-claude mcp add emucap-track   -- "$(pwd)/target/release/emucap-track-mcp"
-```
-
-**Codex**:
-
-```sh
-tools/register-codex-mcp.sh
-```
-
-Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다. 스크립트는
-`target/release/`에 설치된 바이너리를 사용해 `emucap`과 `emucap-track`을 등록한다.
-
-필요 시 환경변수로 조정한다: `EMUCAP_PORT`(제어 MCP, 기본 47800, 점유 중이면 자동으로 다음 포트),
-`EMUCAP_TRACK_ROOT`(추적 MCP의 실험 원장 위치, 기본 작업 repo git root의 `.emucap`).
-
-등록 후 에이전트 세션을 재연결(`/mcp`)한다. **두 MCP가 각자 `bootstrap`을 노출하므로** 제어 MCP의
-`bootstrap`(에뮬 진입)과 추적 MCP의 `bootstrap`(원장 진입)이 모두 도구 목록에 보여야 한다.
-두 서버가 보고하는 버전을 확인하고, 제어 MCP의 `status.server_build`를 패키지의
-`CORE-BUILD.json` 소스 커밋 또는 소스 빌드의 대상 커밋과 비교한다. 도구 목록이나 식별자가
-다르면 등록된 실행 파일 경로를 확인하고 선택한 릴리스 바이너리에 재연결한다.
-
-### 3b. 3계층과 에이전트 조립
-
-세 계층이 조화를 이루되 서로 독립이다(비유: ②추적 MCP는 MLflow, ①제어 MCP는 TensorFlow):
-
-1. **에뮬레이터 조작**(제어 MCP) — 도메인-무관 라이브 제어 엔진. 그 자체로 완결(추적 없이도 디버그 가능).
-2. **실험 관리**(추적 MCP) — add-on. ①을 *몰라도 되고*, ①에 얹혀 실험을 기록·질의한다.
-3. **응용/방법론**(예: 로컬라이제이션 패치 방법론 skill) — ①·②를 *조립*하는 최상층. **이 자리는
-   교체 가능**하다(다국어 패치·팬게임·AI TAS 등 무엇이 들어와도 아래 두 계층을 그대로 쓴다).
-
-두 MCP는 서로를 호출하지 않는다 — **에이전트가 조립한다**:
-
-- **rom_sha1 전달**: 제어 MCP의 `get_rom_info`(`.rom_sha1`)로 불투명한 추적 식별자를 읽어 추적
-  MCP의 `run_start(rom_sha1=…)`에 그대로 넘긴다. 관리형 descriptor media는 에뮬레이터 시작 전에
-  진입 파일과 loader가 선언한 모든 파일을 pre-launch `content_identity`로 묶으며, 호환용 `rom_sha1`에는
-  그 SHA-256 식별자를 담는다.
-  복합 미디어의 설명 파일만 따로 해시해서는 안 된다.
-  `connection_ref`(제어 MCP `status`의 연결 이름 또는 `"port:N"`)를 함께 넘기면 같은 연결의 직전
-  미종료 run이 자동 마감된다.
-- **반환된 식별자는 그대로 사용**: `rom_sha1`, `run_id`, `finding_id`를 경로나 별도 이름으로
-  가공하지 않는다. 관리 식별자는 영문·숫자를 단일 하이픈으로만 연결하며 경로 문법, 점, underscore는
-  물론 플랫폼 예약 장치명도 파일시스템 접근 전에 거부한다.
-- **분석 verb는 반환만**: 필요할 때 `analysis(operation="describe")`를 호출하고 같은 도구로
-  선택한 `regression_run`/`verify_determinism` operation을 실행한다. 제어 MCP가 에뮬을 구동해
-  결과를 *반환*할 뿐 원장에 쓰지 않는다. 남기려면 그 결과를 추적 MCP의 `log_gate`(예:
-  `determinism_replay`의 `kind=machine` 판정)·`log_metric`으로 기록한다.
-- **프레임 경계 탐색은 debug `probe` operation을 조립**: 같은 베이스 상태에서 원자적 probe를 반복해 프레임
-  범위를 이분한다. 각 호출이 상태 복원·진행·판정을 한 번에 수행하므로 호출 사이 지연은 결과를 바꾸지 않는다.
-  유지보수 어댑터가 native transaction을 제공하거나, Control이 generation link를 잡은 채 검증된
-  pause/resume/load/exact-step/read를 조합한다. 실제 호출 가능한 결과만 live `status.methods`에 나타난다.
-- **개입은 명시 기록**: `write_memory`/`load_state`/`reset`/입력 같은 상태변경을 제어 MCP가 자동
-  기록하지 않으므로, 재현 충실도(repro_status)를 위해 추적 MCP의 `log_intervention`으로 직접 남긴다.
-
-### 4. 첫 동작 (에이전트가 bootstrap으로 시작)
-
-설치 경로와 선택한 시스템을 바탕으로 해당 어댑터 README에 따라 브리지와 에뮬레이터 호스트를
-준비한 뒤 managed launch로 진행한다. Core 설치는 MCP 서버를 준비하는 단계이며, 어댑터의
-실행 준비 여부는 별도로 확인한다.
-
-모든 emucap 작업은 `bootstrap`으로 시작한다. 에이전트에게 "emucap `bootstrap`을 호출해줘"라고
-하면, 기본 응답이 `listener.port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을
-간결하게 돌려준다. 전체 routing catalog는 `bootstrap(include=["systems"])`, build/runtime 경로는
-`bootstrap(include=["installation"])`으로 명시적으로 요청한다. 기본 응답은 살아 있는 managed runtime
-개수만 포함한다. 기존 generation을 이어갈 때만 `bootstrap(include=["runtimes"])`을 요청하면,
-stable host session ID가 없는 client도 반환된 lease의 exact `launch_id`로 `reattach`할 수 있다. runtime
-파일을 직접 편집할 필요가 없다. 이후
-`launch_plan(content_path, system?)`이 검증된 MCP `launch` 도구 인자를 돌려준다.
-에이전트는 adapter readiness까지 기다리는 `launch`를 호출한 뒤 `status`로 live identity와 runtime
-identity를 확인한다. Launcher script는 개발자용 진입점이지 managed lifecycle의 대체 경로가 아니다.
-
-관리형 CUE·GDI·CCD·TOC·M3U는 닫힌 미디어 그래프다. Descriptor를 선택하면 그 진입 파일 하나만
-읽도록 허용된다. `launch_plan`은 간접 파일의 metadata·내용·해시를 읽기 전에 정확한 상대 경로를
-`review_input`으로 반환한다. 각 이름이 선택한 미디어에 속하는지 검토한 뒤 서버가 만든
-`indirect_media_approval`을 그대로 되돌려 보낸다. 중첩 M3U는 다음 descriptor frontier를 한 번 더
-검토할 수 있다. 참조는 이식 가능한 상대 경로이고 진입 파일 디렉터리 아래의 symlink가 아닌 실제
-일반 파일이어야 한다. 검토나 그래프 검증이 실패하면 에뮬레이터 시작 전에 거부된다.
-`content_identity_binding: "prelaunch"`는 이 identity가 mutable source의 snapshot이나 실제 loader
-소비 증명이 아님을 밝힌다.
-
-일반 launch는 guest가 이미 실행 중인 상태로 반환할 수 있다. 첫 후속 동작에 네트워크·에이전트 지연이
-guest time으로 섞이면 안 될 때는 `start_frozen: true`를 요청한다. 지원하는 launcher는 adapter가
-frozen guest 경계에 연결된 뒤에만 성공한다. 이는 launch 이후 guest time을 닫는 계약이며 power-on RAM,
-RTC, save 같은 초기 조건의 동일성을 뜻하지 않는다. 그러한 producer-owned 조건은 live capability가
-광고하는 `execution_profile: "repeatable"`을 별도로 선택하며,
-`record_window(require_repeatable: true)`는 선택한 recording origin이 해당 조건을 지원하지 않으면 reset,
-input, guest advance 전에 거부한다.
-Mesen SNES의 격리 runtime을 갱신할 때는 일반 profile의 battery save와 portable data를 보존한다.
-Repeatable profile은 별도의 폐기 가능한 portable root를 사용하므로, 깨끗한 초기 조건을 만들기 위해
-일반 profile이나 사용자의 표준 Mesen 저장을 삭제하지 않는다. Mednafen Mega Drive도 별도의 폐기 가능한
-home과 같은 opt-in 협상 방식을 사용한다. 첫 guest 명령 전에 제한된 상태를 캡처하고, 허용된 각
-`reset_release` 기록 전에 복원하므로 같은 프로세스에서 앞서 수행한 실행이나 debugger 쓰기가 선언되지
-않은 기록 입력으로 섞이지 않는다. 일반 Mednafen profile과 저장 파일은 바뀌지 않는다.
-
-`listener.base_port`는 direct mode에서 빈 포트를 찾기 시작하는 값일 뿐이며 다른 살아 있는 MCP 세션이
-이미 사용 중일 수 있다. Launcher는 실제로 할당된 `listener.port` 또는 full `status`의
-`listening_port`만 사용한다. Emulator generation을 `stop`해도 그 세션의 MCP listener는 닫히지 않으며,
-MCP 세션이 끝날 때 반환된다.
-
-연결된 첫 full `status`는 `capability_revision`을 반환한다. 반복 확인에서는 이를
-`known_capability_revision`으로 보내면 capability catalog가 바뀌지 않았을 때 그 묶음만 생략하고,
-현재 execution·continuity·generation·ownership 상태는 계속 반환한다.
-
-전체 status에 `recording_capability`가 있을 때는 debug `record_window` operation이 에이전트·네트워크 지연을 guest
-time에 섞지 않고 유한한 guest-frame 구간을 소유할 수 있다. 현재 workspace 안의 기존 absolute
-`output_root`와 frame 수를 주면 emulator를 frozen으로 되돌리고 검증된 bundle path와 manifest hash를
-반환한다. event class와 limit의 권위는 live capability다. 지원하지 않는 adapter는 hook을 설치하거나
-guest를 진행하지 않고 거부한다. 선택적 origin·입력 무비·event stop도 그 exact capability가 광고할
-때만 쓸 수 있으며, 생략하면 기존 next-frame bounded 동작을 유지한다.
-현재 유지보수 Mesen SNES는 PPU 프레임 정지의 CPU 실행 중간 상태를 직렬화할 수 없어 `state_load` origin을
-광고하지 않는다. 프레임 정지 뒤 일반 save/load를 하려면 명시적으로 한 명령어를 step하고 안전한
-halt인지 확인한다. 안전하지 않은 상태 I/O는 파일 접근이나 guest 변경 전에 거부한다.
-`recording_capability.state_load`가 광고될 때 절대 경로와 `preserve_for_recording=true`를 준 frozen
-`save_state` 응답은 producer가 관리하는 `snapshot_receipt`도 반환한다. 이후
-`record_window(origin="state_load")`는 caller가 적은 path·digest·경계
-주장이 아니라 그 receipt의 불투명한 `snapshot_id`만 받는다. 증명된 frame boundary에서 만든 receipt만
-허용된다. Core는 관리 중인 byte와 runtime generation·hash를 다시 검증해 bundle에 복사하고, adapter에
-load와 window를 한 transaction으로 보낸다. Adapter는 정확한 frame 좌표를 복원하고 dense input movie,
-hook, sink를 모두 소유한 뒤에만 guest 실행을 풀며, 끝에는 다시 frozen을 반환한다. Instruction boundary
-receipt는 성공한 save 사실은 나타내지만 frame window에는 쓸 수 없다. `preserve_for_recording`을 생략하거나
-false로 두면 기존 save 동작은 바뀌지 않고, `state_load`를 사용하지 않는 load·recording 동작도 바뀌지 않는다.
-발생률이 높은 event class는 정수 payload field별 filter capability를 추가로 광고할 수 있다. 선택적
-class별 half-open range는 선언한 관측 범위만 좁히며, 제외된 callback은 drop으로 세지 않는다. 범위
-안의 event는 기존 sequence·limit·integrity 규칙을 그대로 따르고, 광고되지 않은 field와 잘못된
-범위는 guest mutation 전에 거절된다.
-`recording_capability.warmup`이 있으면 `warmup_frames` 동안 producer 기본 transaction class는 계속
-기록하고 observation event 발행은 정확한 guest frame 경계까지 미룬다.
-`warmup.selectable_event_scopes`에 있는 class는 `event_arming_overrides`로 광고된 scope를 선택할 수 있고,
-생략하면 producer 기본값을 유지한다. 선택한 scope는 stream과 event·byte·drop 회계 구간을 정하며 native
-emulator hook의 설치 여부까지 약속하지 않는다. 입력 무비는 두 구간을 한 요청 안에서 모두 포함한다.
-선택한 event가 `startable`이면 `start_on`으로 첫 occurrence에 observation 시작을 맞출 수 있다.
-`initial_snapshots`는 capability가 광고한 callback-safe memory type과 상한을 추가로 요구하며, Core가
-별도 인증 binary sink로 받아 manifest의 exact anchor event와 member hash를 묶는다. 선택적 terminal snapshot은
-`recording_capability.terminal_snapshots`의 상한과 `status.memory_regions`의 정확한 유한 영역이 모두
-있을 때만 쓸 수 있다. Core가 arming 전에 모든 범위를 검증하고 terminal frame이 frozen인 동안만
-읽어 hash가 있는 bundle member로 게시한다. 이 필드를 생략하면 추가 memory read가 없다.
-`recording_capability.terminal_state`가 광고한 profile 하나를 선택하면 같은 frozen 종점의 producer
-정의 상태를 canonical JSON member 하나로 보존할 수 있다. 소비자 schema는 emucap에 들어오지 않는다.
-Control MCP가 재시작되어도
-`status.recording_capture`가 bounded
-active/terminal capsule을 이어 보여주며 event bytes와 private staging path는 status에 넣지 않는다.
-
-timeout이나 `connected: false`는 transport 상태이지 에뮬레이터 종료의 증거가 아니다.
-재실행하기 전에 `status.continuity.runtime_binding`·`status.runtime_instance` 또는
-`status.stale_runtime_instance`·`get_failure_context`를 확인한다.
-자동 재부착은 같은 stable control identity로 한정한다. 그 밖에는 bootstrap runtime discovery에서
-명시적으로 available인 exact generation을 골라 `reattach(launch_id=...)`하고, 의도적으로 교체할 때만 identity가 검증되는
-`launch(..., replace: true)`를 쓴다. Flycast fatal quarantine에서는 먼저 보존 문맥을 읽고,
-`status.methods`가 광고할 때만 debug `dismiss_failure` operation을 호출한다.
-
-managed emulator를 종료할 때는 `status.runtime_instance.launch_id`를 읽고
-`stop(launch_id=...)`을 호출한다. 제어 MCP가 current generation, 제어 lease,
-process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 종료까지 기다린다.
-실패 증거는 보존하며, stale generation이나 broker 소유·unmanaged process는 추측해서
-종료하지 않는다.
-
-## 에뮬레이터별 어댑터 (필요할 때 에이전트가 설치)
-
-하나만 먼저 골라 시작하면 된다. MesenCE는 guest를 전진시키지 않는 native debugger halt에서 요청을
-처리해야 하므로 로컬 소스 빌드를 사용한다.
-
-- **Mesen2 (SNES·Game Gear·Game Boy·GBC·GBA·NES)** — `adapters/mesen2/build.sh`(Windows:
-  `build.ps1`)를 실행한다. 고정 MesenCE 2.2.1을 Git에서 제외된 빌드 디렉터리에 받고 GPLv3 patch stack을
-  적용해 로컬에서 빌드하며 에뮬레이터 바이너리는 배포하지 않는다. 시스템별 Lua 엔트리로 처리한다
-  (SNES는 65816, Game Gear/Master System은 Z80, Game Boy/GBC는 SM83, GBA는 ARM7, NES는 6502). GBA는
-  실 BIOS(`gba_bios.bin`, 비커밋)가 필요하고 SNES/Game Gear/GB/GBC/NES는 필요 없다. 수정되지 않은
-  Mesen 빌드는 native halt service와 안전한 savestate event가 없어 live control에서 명시적으로 거부한다.
-  → `adapters/mesen2/README.md`
-- **Mednafen (Saturn·PSX·PCE·PC-FX·MD·WonderSwan/WSC·Neo Geo Pocket/Color)** — `adapters/mednafen/build.sh`로 포크를 빌드한다(SDL 필요:
-  macOS `brew install sdl2`, Linux `libsdl2-dev`). 소스 archive와 checksum을 고정하며 한 바이너리가
-  일곱 시스템 계열을 처리한다. PSX·PCE-CD·PC-FX는 BIOS가 필요하다(저장소에 커밋하지 않음).
-  PC-FX는 version 1.00 BIOS를 명시적으로 검증하고 emucap 소유 Mednafen profile로 실행한다.
-  Neo Geo Pocket/Color는 patch된 `ngp` 모듈을 공유한다. 범위를 제한한 TLCS-900/H debugger가
-  부작용 없는 RAM/ROM/BIOS view, RAM 쓰기, 정확한 명령 step, 안전한 disassemble과 exec-only
-  breakpoint를 제공한다. Sound Z80 상태, read/write breakpoint, trace, call stack은 제외한다.
-  → `adapters/mednafen/README.md`
-- **Flycast (Dreamcast)** — `adapters/flycast/build.sh`로 빌드한다. 빌드는 emucap 소유 work tree에서
-  수행하고 commit과 recursive submodule graph를 고정한다. `FLYCAST_SRC`가 있으면 읽기 전용 Git object
-  source로만 쓴다. → `adapters/flycast/README.md`
-- **DeSmuME (Nintendo DS)** — `adapters/desmume-nds/build.sh`로 headless 포크를 빌드한다(meson/ninja/
-  SDL2/glib 필요). NDS BIOS는 필요 없다(HLE direct-boot). 듀얼 CPU(ARM9/ARM7)마다 GDB 스텁이 붙는
-  PC-98 어댑터와 같은 구도다. → `adapters/desmume-nds/README.md`
-- **PPSSPP (PSP)** — `adapters/ppsspp/build.sh`로 headless 포크를 빌드한다(CMake·C++ 툴체인 필요).
-  PSP 펌웨어는 필요 없다. 어댑터는 PPSSPP 자체 디버거 프로토콜에 붙는 순수 WebSocket 클라이언트라
-  GDB 스텁 없이 headless 프로세스 + 브리지 둘로만 뜬다. → `adapters/ppsspp/README.md`
-- **PCSX2 (PlayStation 2)** — `adapters/pcsx2/build.sh`로 고정된 포크를 빌드하고,
-  `EMUCAP_PCSX2_BIOS`에 사용자가 준비한 BIOS 덤프의 절대경로를 지정한다. 격리된 headless 실행에서
-  EE 메모리·레지스터·패턴 검색·덤프, 프레임 스텝, 디스어셈블, frozen 세이브스테이트,
-  스크린샷·컨트롤러 입력, 레지스터 스냅샷을 포함한 정지형 EE 브레이크포인트,
-  best-effort 콜스택, 원자적 state/frame/memory probe와 동기식 리셋을 bounded PINE 브리지로 지원한다.
-  → `adapters/pcsx2/README.md`
-- **Dolphin (GameCube·Wii)** — `adapters/dolphin/build.sh`(Windows: `build.ps1`)로 고정된 native
-  포크를 빌드한다. 기본 실행은 headless이고 GUI 빌드가 있으면 `display: true`로 DolphinQt 창을 연다.
-  PowerPC 메모리·레지스터, 정확한 명령 스텝, 디스어셈블, best-effort 콜스택, 레지스터 스냅샷을
-  포함한 실행 브레이크포인트, 시간 제한이 있는 스크린샷, 동기식 세이브스테이트를 지원한다.
-  GameCube는 port-0 컨트롤러 입력, Wii는 Emulated Wii Remote 1의 core button 입력을 지원한다.
-  Wii IR·motion·extension은 지원 범위가 아니다.
-  → `adapters/dolphin/README.md`
-- **MAME PC-98** — `adapters/mame-pc98/build.sh`로 MAME을 소스에서 빌드한다(시간이 오래
-  걸리고 디스크를 많이 쓴다). 고정된 빌드는 키보드 입력과 상대 포인터 이동, frozen 클릭·드래그를
-  제공하며 창에 연결된 네이티브 마우스 입력권을 지속적으로 차지하지 않는다.
-  → `adapters/mame-pc98/README.md`
-- **NP2kai PC-98 HDI 호환 backend(선택형)** — `adapters/np2kai/build.sh`를 실행하고
-  `emucap-np2kai`를 빌드한 뒤 합법적으로 준비한 firmware 경로를
-  `EMUCAP_NP2KAI_FIRMWARE`로 지정한다. `pc98_backend: "np2kai"`를 명시해야 선택되며,
-  생략하면 계속 MAME을 사용한다. 패치된 core와 direct host는 MAME PC-98과 같은 Control/Debug
-  method 전체를 제공한다. 제한된 memory 접근·dump, breakpoint·event, register state,
-  instruction step, disassemble, trace·best-effort call stack, 정확한 frame, 입력, screenshot,
-  native state, 검증된 `hdd0` 교체가 포함된다. 단, 기기 의미는 동일하다고 가장하지 않는다.
-  NP2kai는 headless이며 host audio launch와 `hdd0` eject가 없고, disassemble은 현재 CPU mode로
-  제한되며 breakpoint memory snapshot은 일시정지되는 hit에서만 캡처한다. 이 backend는 `.hdi`만
-  받는다. read breakpoint는 권위 있는 접근 값을 제공하지 않으며, write breakpoint만 값 필터를
-  지원한다.
-  → `adapters/np2kai/README.md`
-- **MAME Neo Geo MVS/AES/CD (실험적)** — `adapters/mame-neogeo/build.sh`로 전용 고정 MAME subset을
-  빌드하고 `emucap-mame-neogeo-bridge`를 빌드한다. MVS는 사용자가 준비한 `neogeo.zip` BIOS와
-  해당 MAME 버전에 맞는 게임 ROM set을 사용한다. AES는 `aes.zip`과 ZIP stem이 고정된 MAME
-  Neo Geo software list의 AES 호환 항목을 가리키는 cartridge set을 사용한다. CD는 공식 BIOS가 든
-  `neocdz.zip`과 모든 참조 track이 존재하는 CUE entry file을 사용하며 콘텐츠 identity는 전체
-  CUE graph를 포함한다. 세 profile 모두 제한된 RAM, 68000 상태·명령 스텝, 프레임 제어,
-  exec/read/write breakpoint와 hit-time 증거, disassemble, frozen-frame 스크린샷과 port-0
-  입력, native save/load(CDZ는 유지보수 MAME patch로)를 제공한다. 파일 확장자만 보고 어느
-  Neo Geo profile로도 자동 판정하지 않는다.
-  → `adapters/mame-neogeo/README.md`
-- **Mupen64Plus Nintendo 64 (실험적, Unix)** — `adapters/mupen64plus/build.sh`를 실행하고
-  `emucap-mupen64plus`를 빌드한다. 일반 카트리지 ROM은 BIOS가 필요 없다. 현재 pure interpreter로
-  격리된 headless/창 실행, pause/resume, R4300 명령 스텝, CPU 상태, frozen RDRAM 제한 읽기·쓰기를
-  지원한다. 두 모드 모두 port-0 입력 hold와 명시적인 native 입력권 반환을 제공한다. 창 실행은
-  callback barrier를 이용한 정확한 rendered-frame 스텝, 제한된 입력 pulse, 현재 PNG 캡처,
-  완료를 확인하는 native save/load도 제공한다. 두 모드는 모두 동기식 reset, R4300
-  exec/read/write breakpoint와 hit-time 증거, event polling, disassemble을 제공한다.
-  headless는 rendered-frame 기능을 노출하지 않는다.
-  RSP 상태는 이 profile의 범위가 아니다.
-  → `adapters/mupen64plus/README.md`
-- **openMSX MSX profile (실험적)** — `adapters/openmsx/build.sh`를 실행하고
-  `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 기록된 upstream compatibility backport와
-  emucap host patch를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 per-port
-  `HOME`에서 실행하며 사용자의 emulator profile을 읽지 않는다. `msx`는 C-BIOS MSX2+,
-  `msx1`·`msx2`·`msx2p`는 사용자가 제공한 실제 firmware
-  profile이다. 카트리지 범위는 Z80 상태·명령 step, headless/visible exact frame step, 제한된
-  CPU memory/main RAM/VRAM 접근, frozen save/load, keyboard-matrix와 2-port joystick 입력,
-  exec/read/write breakpoint, event polling, disassemble을 제공한다. Screenshot은
-  `display: true`에서만 제공한다. MSX2 디스크는 제한된 부팅·입력·캡처와 게스트 쓰기를 포함한
-  세대 간 상태 복원을 검증했다. 다른 디스크 profile과 cassette runtime은 아직 검증하지 않았고
-  turboR/R800은 미구현이다.
-  일반 `.rom` 파일은 MSX system ID를 명시한다. → `adapters/openmsx/README.md`
-- **xemu 원본 Xbox (실험적)** — `adapters/xemu/build.sh`로 고정된 GPLv2 포크를 빌드하고
-  `emucap-xemu-bridge`를 빌드한다. 사용자가 준비한 MCPX·flash ROM·HDD template 디렉터리를
-  `EMUCAP_XEMU_FIRMWARE`로 지정하며 EEPROM은 선택 사항이다. 관리형 실행은 기기 입력을 세대별
-  격리 디렉터리로 복사하고 사용자의 일반 xemu profile을 열지 않는다. 제어된 frozen 시작,
-  CPU 상태·메모리, 정확한 frame·instruction step, 기본 무음이며 display와 독립적인 sound 선택,
-  버튼·아날로그 입력과 native 입력권 반환, screenshot, reset,
-  disc 교체, breakpoint, disassemble, best-effort call stack과 frozen save/load를 지원한다. State
-  container는 내부 VM/HDD snapshot을 해당 generation의 EEPROM, exact disc, host build, controller
-  topology와 함께 묶으며 같은 관리형 launch generation 안에서만 유효하다. 협상형 debug 기능은 같은
-  generation 안에서 state load·정확한 frame 진행·frozen memory read를 한 요청으로 묶는 원자적 probe도
-  제공한다.
-  대표 game XISO smoke에서 실제 게임 메뉴 진입, confirm·방향 입력 소비와 `sound:true`의 가청
-  출력을 확인했다. 이는 전체 게임 호환성을 보장한다는 뜻은 아니다.
-  → `adapters/xemu/README.md`
-
-## 더 보기
-
-- 무엇을·왜 만드나, 그리고 바이너리 → `CLAUDE.md`
-- 에뮬레이터별 메모리 타입·버튼 이름·브레이크포인트·실행 트러블슈팅 → 각 `adapters/*/README.md`
-- 바이너리: `emucap`(케이스 번들 `finalize`/`inspect`), `emucap-mcp`(제어 MCP — 실행 중 에뮬레이터
-  조작, stdio), `emucap-track-mcp`(추적 MCP — 실험 원장, emulator-less, stdio),
-  `emucap-broker`(다중 세션 연결 공유), N64 frontend, 그리고 빌드 절에 적은 PC-98/Neo Geo/NDS/PSP/PS2/MSX/Xbox
-  launch bridge.
+코어와 별도 표시가 없는 소스의 라이선스는 **GPL-2.0-or-later**입니다.
+에뮬레이터 패치는 각 원본 프로젝트의 라이선스를 따릅니다.
+[LICENSE](LICENSE)와 [NOTICE](NOTICE)를 참고하세요.
