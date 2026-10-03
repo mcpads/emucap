@@ -224,8 +224,9 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     }
 
     pub(super) fn drain_breakpoint_packets(&mut self) -> BridgeResult<()> {
+        self.finish_owned_stops()?;
         for _ in 0..256 {
-            let Some(packet) = self.gdb.recv_nonblocking()? else {
+            let Some(packet) = self.owned_aware_poll()? else {
                 break;
             };
             if is_breakpoint_stop(&packet) {
@@ -428,9 +429,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 }),
                 snapshot.length,
             )?;
-            let raw = self
-                .gdb
-                .send(&format!("m{absolute:x},{:x}", snapshot.length))?;
+            let raw = self.owned_aware_send(&format!("m{absolute:x},{:x}", snapshot.length))?;
             let bytes = hex::decode(raw.trim())
                 .map_err(|_| BridgeError::Emulator("invalid MAME snapshot bytes".into()))?;
             if bytes.len() as u64 != snapshot.length {

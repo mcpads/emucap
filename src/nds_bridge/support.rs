@@ -37,6 +37,9 @@ pub(super) fn override_status_json(remaining: Option<i64>) -> Value {
 
 pub(super) fn error_kind(err: &NdsBridgeError) -> &'static str {
     match err {
+        NdsBridgeError::Busy => "busy",
+        NdsBridgeError::Cancelled => "cancelled",
+        NdsBridgeError::BadState(_) => "bad_state",
         NdsBridgeError::BadParams(_) => "bad_params",
         NdsBridgeError::UnknownMethod(_) => "unknown_method",
         NdsBridgeError::Unsupported(_) => "unsupported",
@@ -468,7 +471,7 @@ pub(super) fn le_hex_to_u32(hex: &str) -> Option<u32> {
 pub(super) fn sha1_file(path: &Path) -> std::io::Result<String> {
     let mut hasher = Sha1::new();
     let mut file = File::open(path)?;
-    let mut buf = [0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {

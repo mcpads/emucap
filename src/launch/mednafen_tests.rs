@@ -13,8 +13,11 @@ fn make_executable(path: &Path) {
 #[test]
 fn copy_run_binary_replaces_existing_copy() {
     let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("src");
-    let dst = dir.path().join("dst");
+    let src = dir.path().join("mednafen.exe");
+    let runtime = dir.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    let dst = runtime.join("mednafen.exe");
+    std::fs::write(dir.path().join("SDL2.dll"), b"dependency").unwrap();
     std::fs::write(&src, b"new").unwrap();
     std::fs::write(&dst, b"old").unwrap();
 
@@ -22,6 +25,10 @@ fn copy_run_binary_replaces_existing_copy() {
 
     assert_eq!(std::fs::read(&dst).unwrap(), b"new");
     assert_eq!(std::fs::read(&src).unwrap(), b"new");
+    assert_eq!(
+        std::fs::read(runtime.join("SDL2.dll")).unwrap(),
+        b"dependency"
+    );
 }
 
 #[test]

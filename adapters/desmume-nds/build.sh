@@ -33,6 +33,14 @@ PATCH11="$HERE/patches/0011-emucap-vblank-frame-step.patch"
 PATCH12="$HERE/patches/0012-emucap-agent-pacing.patch"
 PATCH13="$HERE/patches/0013-emucap-memory-batch.patch"
 PATCH14="$HERE/patches/0014-reanchor-pacing-on-resume.patch"
+PATCH15="$HERE/patches/0015-emucap-shared-halt-proof.patch"
+PATCH16="$HERE/patches/0016-coherent-pacing-owner.patch"
+PATCH17="$HERE/patches/0017-pacing-transaction-response.patch"
+PATCH18="$HERE/patches/0018-link-windows-debugger-sockets.patch"
+PATCH19="$HERE/patches/0019-use-windows-sockets-in-sdl-core.patch"
+PATCH20="$HERE/patches/0020-use-windows-mkdir-in-sdl-core.patch"
+PATCH21="$HERE/patches/0021-select-windows-jit-memory.patch"
+PATCH22="$HERE/patches/0022-preserve-render-history.patch"
 WORK_INPUT="${EMUCAP_DESMUME_WORK:-$HERE/work}"
 [ ! -L "$WORK_INPUT" ] || { echo "ERROR: DeSmuME work path must not be a symlink: $WORK_INPUT" >&2; exit 1; }
 mkdir -p "$WORK_INPUT"
@@ -58,14 +66,14 @@ JOBS="${DESMUME_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}"
 if command -v shasum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13" "$PATCH14"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13" "$PATCH14" "$PATCH15" "$PATCH16" "$PATCH17" "$PATCH18" "$PATCH19" "$PATCH20" "$PATCH21" "$PATCH22"; do
       cat "$patch"
     done | shasum -a 256 | awk '{print $1}'
   )"
 elif command -v sha256sum >/dev/null 2>&1; then
   ACTUAL_PATCHSET_SHA256="$(
     for patch in "$PATCH" "$PATCH2" "$PATCH3" "$PATCH4" "$PATCH5" \
-      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13" "$PATCH14"; do
+      "$PATCH6" "$PATCH7" "$PATCH8" "$PATCH9" "$PATCH10" "$PATCH11" "$PATCH12" "$PATCH13" "$PATCH14" "$PATCH15" "$PATCH16" "$PATCH17" "$PATCH18" "$PATCH19" "$PATCH20" "$PATCH21" "$PATCH22"; do
       cat "$patch"
     done | sha256sum | awk '{print $1}'
   )"
@@ -117,6 +125,8 @@ fi
 #    idempotent by construction — every build reproduces the same patched tree.
 cd "$SRC"
 git checkout -- .
+# Patch-owned added source; preserve unrelated untracked build artifacts.
+rm -f desmume/src/gdbstub/EmucapPacing.h
 for entry in \
   "$PATCH|headless patch (0001)" \
   "$PATCH2|emucap hooks patch (0002)" \
@@ -131,7 +141,15 @@ for entry in \
   "$PATCH11|emucap VBlank frame-step patch (0011)" \
   "$PATCH12|emucap agent pacing patch (0012)" \
   "$PATCH13|emucap memory batch patch (0013)" \
-  "$PATCH14|resume pacing anchor patch (0014)"; do
+  "$PATCH14|resume pacing anchor patch (0014)" \
+  "$PATCH15|shared scheduler halt proof patch (0015)" \
+  "$PATCH16|coherent pacing owner patch (0016)" \
+  "$PATCH17|pacing transaction response patch (0017)" \
+  "$PATCH18|Windows debugger socket linkage patch (0018)" \
+  "$PATCH19|Windows SDL core socket selection patch (0019)" \
+  "$PATCH20|Windows SDL core directory creation patch (0020)" \
+  "$PATCH21|Windows JIT memory selection patch (0021)" \
+  "$PATCH22|Exact geometry render history patch (0022)"; do
   patch="${entry%%|*}"
   label="${entry#*|}"
   echo "→ applying $label"
@@ -160,5 +178,6 @@ echo "→ ninja (-j$JOBS)"
 ninja -C "$BUILD" -j"$JOBS"
 
 BIN="$BUILD/cli/desmume-cli"
+case "$(uname -s)" in MINGW*|MSYS*) BIN="$BIN.exe" ;; esac
 [ -x "$BIN" ] || { echo "ERROR: build did not produce $BIN" >&2; exit 1; }
 echo "OK: $BIN"

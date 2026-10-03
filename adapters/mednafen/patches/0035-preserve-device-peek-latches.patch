@@ -1,0 +1,35 @@
+--- a/src/md/cart/map_eeprom.cpp
++++ b/src/md/cart/map_eeprom.cpp
+@@ -514,7 +514,7 @@
+         uint16 sram_address = (slave_mask | word_address) & 0xffff;
+         sda_out = (sram[sram_address] >> (8 - cycles)) & 1;
+ 
+-        if (cycles == 8)
++        if (cycles == 8 && !MD_HackyHackyMode)
+         {
+           /* WORD ADDRESS is incremented (roll up at maximum array size) */
+           word_address ++;
+--- a/src/pce/pcecd.cpp
++++ b/src/pce/pcecd.cpp
+@@ -557,7 +557,8 @@
+    case 0x2: ret = _Port[2];
+ 	     break;
+ 
+-   case 0x3: bBRAMEnabled = false;
++   case 0x3: if(!PeekMode)
++              bBRAMEnabled = false;
+ 
+ 	     /* switch left/right of digitized cd playback */
+ 	     ret = _Port[0x3];
+--- a/src/pce/pce.cpp
++++ b/src/pce/pce.cpp
+@@ -191,7 +191,8 @@
+ 
+ 		ret = PCECD_Read(HuCPU.Timestamp(), A, next_cd_event, PCE_InDebug);
+ 
+-		vce->SetCDEvent(next_cd_event);
++		if(!PCE_InDebug)
++		 vce->SetCDEvent(next_cd_event);
+ 
+ 		return(ret);
+ 	       }

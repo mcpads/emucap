@@ -1,0 +1,12 @@
+--- a/.github/workflows/scripts/windows/build-dependencies.bat
++++ b/.github/workflows/scripts/windows/build-dependencies.bat
+@@ -333,8 +333,7 @@
+ 
+ :error
+ echo Failed with error #%errorlevel%.
+-pause
+-exit %errorlevel%
++exit /B 1
+ 
+ :downloadfile
+ if not exist "%~1" (

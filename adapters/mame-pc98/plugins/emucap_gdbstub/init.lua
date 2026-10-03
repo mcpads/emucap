@@ -282,6 +282,8 @@ function emucap_gdbstub.startplugin()
   -- that cannot reach its target in time stops at the reached frame and reports DEADLINE.
   local frame_wait_deadline
   local frame_wait_requested
+  local frame_owner
+  local current_frame
   local next_frame_wait_deadline_ms
   local throttle_wait_hook
   -- Bumped by every request that can change memory, registers or the stop at one emulated time.
@@ -295,6 +297,7 @@ function emucap_gdbstub.startplugin()
   local pending_save
   local pending_load
   local pending_settled_stop
+  local pending_interrupt_reply
   local settled_pause_owned = false
   local control_unverified = false
   local pending_reset_reply = false
@@ -314,6 +317,14 @@ function emucap_gdbstub.startplugin()
   -- breakpoint/stop/reset으로 중단될 때 입력만 남아 네이티브 키보드를 덮지 않게 한 곳에서 해제한다.
   local function clear_frame_wait()
     local release_input = frame_wait_release_input
+    if frame_owner and frame_wait_target then
+      local done = current_frame() - frame_owner.start_frame
+      if done < 0 or done > frame_owner.requested then
+        control_unverified = true
+      else
+        frame_owner.completed = done
+      end
+    end
     frame_wait_target = nil
     frame_wait_stop = false
     frame_wait_screen_start = nil
@@ -326,9 +337,46 @@ function emucap_gdbstub.startplugin()
     end
   end
 
+  local function frame_reply(payload)
+    if not frame_owner then
+      ack_packet(socket, payload)
+      return
+    end
+    if not frame_owner.result then
+      frame_owner.result = payload == "OK" and "completed" or "interrupted"
+      frame_owner.reason = payload == "OK" and "none"
+        or payload:match("^DEADLINE:") and "host_deadline"
+        or payload == "CANCELLED" and "cancelled" or "native_stop"
+    end
+    -- Preserve native breakpoint attribution as an asynchronous stop, not a second reply.
+    if payload:match("^[ST]%x%x") then packet(socket, payload) end
+  end
+
+  local function owned_frame_is_stopped()
+    return frame_owner and frame_owner.result and not control_unverified
+      and not pending_settled_stop and manager.machine.paused and not running and not frame_wait_target
+  end
+
+  local function owned_frame_payload()
+    local owner = frame_owner
+    local state = "running"
+    if control_unverified then
+      state = "unverified"
+    elseif owner.result then
+      state = owned_frame_is_stopped() and owner.result or "stopping"
+    end
+    local done = owner.completed
+    if frame_wait_target then
+      done = current_frame() - owner.start_frame
+      if done < 0 or done > owner.requested then state = "unverified" end
+    end
+    return table.concat({"FRAME", owner.id, state, tostring(done),
+      tostring(owner.requested), owner.reason or "none"}, "|")
+  end
+
   local function native_state_io_available()
     local machine = manager.machine
-    return is_neogeo_profile and machine.state_file_io ~= nil
+    return machine.state_file_io ~= nil
       and machine.state_io_boundary ~= nil
   end
 
@@ -336,6 +384,10 @@ function emucap_gdbstub.startplugin()
     running = false
     hold_requested = false
     pending_settled_stop = reply
+    if frame_owner and not reply.interrupt then
+      reply.owned = true
+      frame_reply(reply.payload)
+    end
     if not manager.machine.paused then
       emu.pause()
       settled_pause_owned = true
@@ -747,7 +799,7 @@ function emucap_gdbstub.startplugin()
         stop_payload = "S05"
       end
       if reply_to_frame_wait then
-        ack_packet(socket, stop_payload)
+        frame_reply(stop_payload)
       else
         packet(socket, stop_payload)
       end
@@ -786,8 +838,13 @@ function emucap_gdbstub.startplugin()
     if point then
       running = false
       local reply_to_frame_wait = frame_wait_target ~= nil
-      clear_frame_wait()
       local pause_on_hit = breaks.pause and breaks.pause[point]
+      if frame_owner and not pause_on_hit then
+        reply_to_frame_wait = false
+        running = true
+      else
+        clear_frame_wait()
+      end
       local addr = breaks.byidx[point]
       local payload
       if addr then
@@ -802,7 +859,7 @@ function emucap_gdbstub.startplugin()
         payload = "S05"
       end
       if reply_to_frame_wait then
-        ack_packet(socket, payload)
+        frame_reply(payload)
       else
         packet(socket, payload)
       end
@@ -826,9 +883,14 @@ function emucap_gdbstub.startplugin()
     if point then
       running = false
       local reply_to_frame_wait = frame_wait_target ~= nil
-      clear_frame_wait()
       local wp = watches.byidx[point]
       local pause_on_hit = wp and wp.pause_on_hit
+      if frame_owner and not pause_on_hit then
+        reply_to_frame_wait = false
+        running = true
+      else
+        clear_frame_wait()
+      end
       local payload
       if wp then
         -- use wpclear (not wpdisable) so re-arm at same address succeeds
@@ -841,7 +903,7 @@ function emucap_gdbstub.startplugin()
         payload = "S05"
       end
       if reply_to_frame_wait then
-        ack_packet(socket, payload)
+        frame_reply(payload)
       else
         packet(socket, payload)
       end
@@ -860,9 +922,14 @@ function emucap_gdbstub.startplugin()
     if point then
       running = false
       local reply_to_frame_wait = frame_wait_target ~= nil
-      clear_frame_wait()
       local rp = regpoints.byidx[point]
       local pause_on_hit = rp and rp.pause_on_hit
+      if frame_owner and not pause_on_hit then
+        reply_to_frame_wait = false
+        running = true
+      else
+        clear_frame_wait()
+      end
       local payload
       if rp then
         -- use rpclear (not rpdisable) so the registerpoint can be re-set
@@ -873,7 +940,7 @@ function emucap_gdbstub.startplugin()
         payload = "S05"
       end
       if reply_to_frame_wait then
-        ack_packet(socket, payload)
+        frame_reply(payload)
       else
         packet(socket, payload)
       end
@@ -958,6 +1025,22 @@ function emucap_gdbstub.startplugin()
       emu.pause()
       paused_here = true
     end
+    if pending_interrupt_reply then
+      if not manager.machine or not manager.machine.paused then
+        control_unverified = true
+        in_frozen_socket_service = false
+        pending_interrupt_reply = nil
+        error("native pause was not established for interrupt")
+      end
+      local reply = pending_interrupt_reply
+      pending_interrupt_reply = nil
+      local sent, send_error = pcall(packet, socket, reply)
+      if not sent then
+        control_unverified = true
+        in_frozen_socket_service = false
+        error(send_error)
+      end
+    end
     trace("svcfrozen enter execstate=" .. tostring(debugger and debugger.execution_state) .. " running=" .. tostring(running) .. " fwt=" .. tostring(frame_wait_target) .. " paused_here=" .. tostring(paused_here))
     -- 홀드 가드는 machine.paused로 판단한다(execution_state가 아님) — emu.pause()가 debugger.execution_state를
     -- stop→run으로 뒤집어(디버그 트레이스), execution_state를 가드로 쓰면 첫 이터레이션에 즉시 탈출하는 자기모순이
@@ -994,9 +1077,10 @@ function emucap_gdbstub.startplugin()
         idle_briefly()
       end
     end
-    -- 스핀 탈출 = 재개(step/continue/frame-wait). 우리가 pause했으면 실제 머신을 unpause해 진행시킨다
-    -- (debugger execution_state="run"/go만으론 emu.pause된 머신이 안 도므로 emu.unpause가 필수).
-    if paused_here and not control_unverified and manager.machine and manager.machine.paused then
+    -- Release our pause only for an admitted resume/step/frame request. A transport
+    -- failure also leaves this loop, but cannot authorize guest execution.
+    if paused_here and (running or frame_wait_target) and not control_unverified
+        and manager.machine and manager.machine.paused then
       emu.unpause()
     end
     trace("svcfrozen exit execstate=" .. tostring(debugger and debugger.execution_state) .. " running=" .. tostring(running) .. " fwt=" .. tostring(frame_wait_target) .. " paused_here=" .. tostring(paused_here))
@@ -1054,7 +1138,7 @@ function emucap_gdbstub.startplugin()
     return screen and screen.raster_state_supported == true
   end
 
-  local function current_frame()
+  current_frame = function()
     local screen = first_screen()
     if screen then
       local frame = screen.frame_number
@@ -1067,7 +1151,7 @@ function emucap_gdbstub.startplugin()
   end
 
   local function start_frame_wait(frames, stop_on_done, release_input_on_done)
-    if frame_wait_target then
+    if frame_wait_target or frame_owner then
       return false
     end
     frames = math.max(tonumber(frames) or 1, 1)
@@ -1110,7 +1194,7 @@ function emucap_gdbstub.startplugin()
         running = false
         debugger.execution_state = "stop"
         hold_requested = true
-        ack_packet(socket, "E15")
+        frame_reply("E15")
         return
       end
       done = frame_now - frame_wait_screen_start
@@ -1132,7 +1216,7 @@ function emucap_gdbstub.startplugin()
           debugger.execution_state = "stop"
           hold_requested = true
         end
-        ack_packet(socket, "DEADLINE:" .. tostring(done))
+        frame_reply("DEADLINE:" .. tostring(done))
       end
       return
     end
@@ -1153,24 +1237,28 @@ function emucap_gdbstub.startplugin()
       local map = regmaps[cpu.shortname]
       ack_packet(socket, "HEX:" .. (read_program_hex(probe.addr, probe.len) or "") .. "|FRAME:" .. tostring(current_frame()) .. "|REGS:" .. regs_payload(map))
     else
-      ack_packet(socket, "OK")
+      frame_reply("OK")
     end
   end)
 
   clear_inputs = function()
     local first_error
+    local remaining = {}
     for field, _ in pairs(active_input_fields) do
       local ok, err = pcall(function() field:clear_value() end)
-      if not ok and not first_error then
-        first_error = err
+      if not ok then
+        remaining[field] = true
+        first_error = first_error or err
       end
     end
-    active_input_fields = {}
-    active_input_keys = {}
+    active_input_fields = remaining
     release_input_frame = nil
     if first_error then
+      -- Preserve failed releases and prohibit another operation from claiming clean input.
+      control_unverified = true
       return false, first_error
     end
+    active_input_keys = {}
     return true
   end
 
@@ -1191,17 +1279,15 @@ function emucap_gdbstub.startplugin()
     end
     for _, binding in ipairs(resolved) do
       local field = binding.field
-      local set_ok, set_error = pcall(function() field:set_value(1) end)
-      if not set_ok then
-        for active, _ in pairs(active_input_fields) do
-          pcall(function() active:clear_value() end)
-        end
-        active_input_fields = {}
-        active_input_keys = {}
-        return false, nil, "input field could not be engaged: " .. tostring(binding.key) .. ": " .. tostring(set_error)
-      end
+      -- A native setter can fail after applying the override. Track before dispatch.
       active_input_fields[field] = true
       active_input_keys[binding.key] = true
+      local set_ok, set_error = pcall(function() field:set_value(1) end)
+      if not set_ok then
+        local released, release_error = clear_inputs()
+        return false, nil, "input field could not be engaged: " .. tostring(binding.key)
+          .. ": " .. tostring(set_error) .. (released and "" or "; release failed: " .. tostring(release_error))
+      end
     end
     return true
   end
@@ -1458,20 +1544,93 @@ function emucap_gdbstub.startplugin()
       return false
     end
 
-    if name == "frame" then
+    if frame_owner then
+      local observation = name == "frame" or name == "haltstate" or name == "pacing" or name == "features"
+        or name == "inputstatus" or name == "inputfields" or name == "pointerstatus"
+        or name == "mediastatus" or name == "framepoll" or name == "framecancel" or name == "framefinish"
+      if not observation then
+        ack_packet(socket, "E09")
+        return true
+      end
+    end
+
+    if name == "haltstate" then
+      local frozen = manager.machine.paused and not running and not frame_wait_target
+        and not frame_owner and not pending_settled_stop and not control_unverified
+      ack_packet(socket, frozen and "frozen" or "running")
+      return true
+    elseif name == "framebegin" then
+      local spec = hex_to_string(rest or "") or ""
+      local id, count, budget = spec:match("^([%w_%-]+):(%d+):(%d+)$")
+      count, budget = tonumber(count), tonumber(budget)
+      if (is_neogeo_profile and not native_state_io_available()) or not id or #id > 128 or not count or count < 1 or count > 5000
+          or not budget or budget < 100 or budget > 240000 then
+        ack_packet(socket, "E00")
+      elseif frame_owner or frame_wait_target or running or not manager.machine.paused then
+        ack_packet(socket, "E09")
+      else
+        local start = current_frame()
+        next_frame_wait_deadline_ms = budget
+        if not start_frame_wait(count, true) then
+          next_frame_wait_deadline_ms = nil
+          ack_packet(socket, "E09")
+        else
+          frame_owner = { id = id, requested = count, completed = 0, start_frame = start }
+          ack_packet(socket, owned_frame_payload())
+        end
+      end
+      return true
+    elseif name == "framepoll" or name == "framecancel" or name == "framefinish" then
+      local id = hex_to_string(rest or "")
+      if not frame_owner or id ~= frame_owner.id then
+        ack_packet(socket, "E00")
+        return true
+      end
+      if name == "framecancel" and not frame_owner.result then
+        clear_frame_wait()
+        if native_state_io_available() then
+          -- Pause now, then let the current native scheduler stack unwind. Polling
+          -- cannot report a terminal while the settled-stop callback is pending.
+          request_settled_stop({ payload = "CANCELLED" })
+          ack_packet(socket, owned_frame_payload())
+        else
+          frame_reply("CANCELLED")
+          running = false
+          hold_requested = true
+          debugger.execution_state = "stop"
+          ack_packet(socket, owned_frame_payload())
+          service_frozen_socket()
+        end
+      elseif name == "framefinish" then
+        local result = owned_frame_payload()
+        if not owned_frame_is_stopped() then
+          ack_packet(socket, "E09")
+        else
+          frame_owner = nil
+          ack_packet(socket, result)
+        end
+      else
+        ack_packet(socket, owned_frame_payload())
+      end
+      return true
+    elseif name == "frame" then
       ack_packet(socket, tostring(current_frame()))
       return true
     elseif name == "features" then
       local space = cpu and cpu.spaces["program"]
       local video = manager.machine.video
       local features = {}
+      if not is_neogeo_profile or native_state_io_available() then
+        features[#features + 1] = "owned_frames_v1"
+        features[#features + 1] = "halt_state_v1"
+      end
       if native_state_io_available() then
         features[#features + 1] = "settled_state_io"
       end
       if native_raster_state_available() then
         features[#features + 1] = "native_raster_state"
       end
-      if space and space.read_peek_block then
+      if space and space.read_peek_block and space.validate_peek_block then
         features[#features + 1] = "peek_block"
       end
       if video.set_throttle_wait_hook then
@@ -1506,8 +1665,14 @@ function emucap_gdbstub.startplugin()
         end
       end)
       if not ok then
-        local restored = pcall(apply_native_pacing, previous_native.throttled,
-          previous_native.speed, previous_native.rate)
+        local restored = pcall(function()
+          apply_native_pacing(previous_native.throttled, previous_native.speed, previous_native.rate)
+          local actual = native_pacing()
+          if actual.throttled ~= previous_native.throttled
+              or actual.speed ~= previous_native.speed or actual.rate ~= previous_native.rate then
+            error("previous pacing settings were not restored")
+          end
+        end)
         ack_packet(socket, "E1D:" .. (restored and "restored" or "unrestored") .. ":" .. string_to_hex(tostring(err)))
         return true
       end
@@ -1550,16 +1715,43 @@ function emucap_gdbstub.startplugin()
         return true
       end
       local space = cpu.spaces["program"]
-      if not space.read_peek_block then
+      if not space.read_peek_block or not space.validate_peek_block then
         ack_packet(socket, "E1F")
         return true
       end
       local before = boundary_token()
+      local ranges, total = {}, 0
+      -- Parse the complete request before native translation or payload access.
+      if spec == "" or spec:sub(-1) == "," then
+        ack_packet(socket, "E1C")
+        return true
+      end
+      for item in (spec .. ","):gmatch("(.-),") do
+        local address, length = item:match("^(%x+):(%x+)$")
+        if not address or #address > 8 or #length > 8 then
+          ack_packet(socket, "E1C")
+          return true
+        end
+        address, length = tonumber(address, 16), tonumber(length, 16)
+        if not address or not length or address > 0xffffffff or length < 1
+            or length > 0x10000 or address + length > 0x100000000
+            or #ranges >= 64 or total + length > 0x10000 then
+          ack_packet(socket, "E1C")
+          return true
+        end
+        total = total + length
+        ranges[#ranges + 1] = {address, length}
+      end
+      for _, range in ipairs(ranges) do
+        if not space:validate_peek_block(range[1], range[2]) then
+          ack_packet(socket, "E1C")
+          return true
+        end
+      end
       local parts = {}
-      for address, length in spec:gmatch("(%x+):(%x+)") do
-        length = tonumber(length, 16)
-        local bytes = space:read_peek_block(tonumber(address, 16), length)
-        if not bytes or #bytes ~= length then
+      for _, range in ipairs(ranges) do
+        local bytes = space:read_peek_block(range[1], range[2])
+        if not bytes or #bytes ~= range[2] then
           ack_packet(socket, "E1C")
           return true
         end
@@ -2231,13 +2423,25 @@ function emucap_gdbstub.startplugin()
       if native_state_io_available() and debugger.execution_state ~= "stop"
           and not in_frozen_socket_service then
         clear_frame_wait()
+        if frame_owner then frame_reply("CANCELLED") end
         request_settled_stop({ payload = "S05", interrupt = true })
         return
       end
+      -- Cancelling a legacy PC-98 wait must remove its target before entering the
+      -- frozen socket loop, otherwise that target immediately releases the pause.
+      if not is_neogeo_profile or frame_owner then
+        clear_frame_wait()
+        if frame_owner then frame_reply("CANCELLED") end
+      end
       debugger.execution_state = "stop"
       running = false
-      hold_requested = true  -- explicit pause 의도 → note_stop이 홀드한다(내부 스톱과 구분)
-      packet(socket, "S05")
+      hold_requested = true
+      if not is_neogeo_profile and not in_frozen_socket_service then
+        pending_interrupt_reply = "S05"
+        service_frozen_socket()
+      else
+        packet(socket, "S05")
+      end
       return
     end
 
@@ -2249,6 +2453,9 @@ function emucap_gdbstub.startplugin()
     local map = regmaps[cpu.shortname]
 
     if handle_emucap(payload) then
+      return
+    elseif frame_owner and (cmd == "c" or cmd == "s" or cmd == "M" or cmd == "G" or cmd == "Z" or cmd == "z") then
+      ack_packet(socket, "E09")
       return
     elseif cmd == "?" then
       ack_packet(socket, "S05")
@@ -2349,7 +2556,8 @@ function emucap_gdbstub.startplugin()
   -- Requests after which memory, registers or the stop may differ at one emulated time.
   local boundary_operations = {
     pause = true, M = true, G = true, s = true, c = true,
-    framestep = true, runframes = true, press = true, pointermove = true, stop = true,
+    framestep = true, runframes = true, framebegin = true, framecancel = true, framefinish = true,
+    press = true, pointermove = true, stop = true,
     stateload = true, load = true, loadsync = true, loaditems = true, loadpixels = true,
     finishload = true, regload = true, reset = true, resetsync = true, mediachange = true,
   }
@@ -2400,7 +2608,7 @@ function emucap_gdbstub.startplugin()
   -- from ending the wait and advancing a slow guest early; any other request ends the wait so
   -- it is handled at the frame boundary.
   local mid_wait_operations = {
-    frame = true, pacing = true, features = true, mediastatus = true,
+    frame = true, framepoll = true, haltstate = true, pacing = true, features = true, mediastatus = true,
     inputstatus = true, inputfields = true, pointerstatus = true,
   }
 
@@ -2436,7 +2644,18 @@ function emucap_gdbstub.startplugin()
       if not payload then
         return false
       end
-      if not mid_wait_operations[request_operation(payload)] then
+      local operation = request_operation(payload)
+      local reject_owned = false
+      if frame_owner then
+        if operation == "framebegin" or operation == "framefinish" then
+          reject_owned = true
+        elseif operation == "framecancel" then
+          local encoded = payload:match("^qEmucap,framecancel,?(.*)$")
+          reject_owned = hex_to_string(encoded or "") ~= frame_owner.id
+        end
+      end
+      -- A stale key or conflicting owner request must not release a slow pacing wait.
+      if not mid_wait_operations[operation] and not reject_owned then
         return true
       end
       if not handle_payload_safely(next_packet()) then
@@ -2461,7 +2680,11 @@ function emucap_gdbstub.startplugin()
         payload = "HEX:" .. (read_program_hex(probe.addr, probe.len) or "")
           .. "|FRAME:" .. tostring(current_frame()) .. "|REGS:" .. regs_payload(regmaps[cpu.shortname])
       end
-      if reply.interrupt then packet(socket, payload) else ack_packet(socket, payload) end
+      if reply.interrupt then
+        packet(socket, payload)
+      elseif not reply.owned then
+        ack_packet(socket, payload)
+      end
       service_frozen_socket()
       return
     end

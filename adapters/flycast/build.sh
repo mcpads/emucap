@@ -169,6 +169,7 @@ find "$SRC" -name .git -prune -exec rm -rf {} +
 echo "→ Flycast work tree 준비: $SRC (source: $UPSTREAM)"
 patch -d "$SRC" -p1 < "$HERE/patches/0001-bound-cocoa-display-link-wait.patch"
 patch -d "$SRC" -p1 < "$HERE/patches/0002-preserve-interpreter-timing-state.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0003-renderer-observation-fence.patch"
 cp "$HERE/emucap_sdl_swap_wait.h" "$SRC/core/deps/SDL/src/video/cocoa/"
 
 # 공용 빌드 env 정규화(macOS homebrew LLVM 오염 걷어내기 — Apple clang/Cocoa 빌드가 깨지지 않도록).
@@ -181,7 +182,7 @@ inject_check() {  # 주입이 실제로 들어갔는지 검증(조용한 실패 
 
 # 1. 어댑터 소스 복사
 cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pacing.h" "$HERE/emucap_failure.cpp" "$HERE/emucap_failure.h" "$SRC/core/"
-cp "$HERE/emucap_state.h" "$SRC/core/"
+cp "$HERE/emucap_state.h" "$HERE/emucap_render_fence.h" "$SRC/core/"
 cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_failure.h" "$SRC/core/"
 echo "→ emucap.cpp/.h + input ownership + failure serializers 복사: $SRC/core/"
 # 빌드 hash: 이 .app이 어느 emucap 커밋에서 빌드됐는지 hello/status.emulator_build로 알린다(사용자가 git
@@ -190,6 +191,7 @@ BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)
 git -C "$HERE" diff --quiet HEAD -- \
   build.sh patches/0001-bound-cocoa-display-link-wait.patch emucap_sdl_swap_wait.h \
   patches/0002-preserve-interpreter-timing-state.patch emucap_state.h \
+  patches/0003-renderer-observation-fence.patch emucap_render_fence.h \
   emucap.cpp emucap.h emucap_input.h emucap_pacing.h emucap_failure.cpp emucap_failure.h \
   ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
   2>/dev/null || BUILD_HASH="${BUILD_HASH}-dirty"
@@ -206,6 +208,13 @@ TIMING_PATCH_SHA256="$(cat "$HERE/patches/0002-preserve-interpreter-timing-state
   exit 1
 }
 BUILD_HASH="${BUILD_HASH}+timing-${TIMING_PATCH_SHA256}"
+FENCE_PATCH_SHA256="$(cat "$HERE/patches/0003-renderer-observation-fence.patch" "$HERE/emucap_render_fence.h" | { if command -v shasum >/dev/null 2>&1; then shasum -a 256; else sha256sum; fi; } | awk '{print $1}')"
+[ "$FENCE_PATCH_SHA256" = "$(lock_value FLYCAST_FENCE_PATCH_SHA256)" ] || {
+  echo "ERROR: Flycast renderer fence patch digest mismatch: $FENCE_PATCH_SHA256" >&2
+  exit 1
+}
+BUILD_HASH="${BUILD_HASH}+fence-${FENCE_PATCH_SHA256}"
+
 printf '#define EMUCAP_BUILD_HASH "%s"\n' "$BUILD_HASH" > "$SRC/core/emucap_build.h"
 
 # 1b. 줄끝 정규화(LF). 아래 perl 앵커는 `..."\n`처럼 LF를 가정하는데, Windows에서 core.autocrlf=true로
@@ -432,7 +441,11 @@ echo "→ MoltenVK post-build 복사 가드(if USE_VULKAN)"
 
 # 4. 빌드(증분). build/ 없으면 configure(연구문서의 플래그). Unix Makefiles라 CMakeLists 변경 시
 #    cmake --build가 자동 재구성하며 새 파일을 잡는다.
-JOBS="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+JOBS="${EMUCAP_BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 4)}"
+if ! [[ "$JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: EMUCAP_BUILD_JOBS must be a positive integer" >&2
+  exit 1
+fi
 # emucap의 정규화된 env로 configure한 build/만 재사용한다. CMakeCache는 있는데 스탬프가 없는 트리는 오염된
 #   env로 굳었을 수 있어 clean 재생성한다(오염 캐시는 OBJC 컴파일 규칙 누락으로 generate가 깨진다).
 STAMP="$SRC/build/.emucap_configured"

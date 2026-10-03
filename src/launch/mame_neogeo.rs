@@ -400,12 +400,14 @@ pub fn mame_spec(launch: &Launch<'_>, driver: &str, gdb_port: u16) -> std::io::R
         "none".into(),
     ]);
     if !launch.display {
+        // Native Windows MAME has no SDL video-driver option.
+        if !cfg!(windows) {
+            args.extend(["-videodriver", "dummy"].map(String::from));
+        }
         args.extend(
             [
                 "-video",
                 "none",
-                "-videodriver",
-                "dummy",
                 "-keyboardprovider",
                 "none",
                 "-mouseprovider",

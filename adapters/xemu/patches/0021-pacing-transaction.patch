@@ -1,0 +1,71 @@
+--- a/ui/xemu-emucap.c
++++ b/ui/xemu-emucap.c
+@@ -14,6 +14,7 @@
+ #include "hw/xbox/mcpx/apu/apu.h"
+ #include "qapi/error.h"
+ #include "qemu/timer.h"
++#include "qemu/main-loop.h"
+ #include "hw/boards.h"
+ #include "hw/xbox/nv2a/nv2a.h"
+ #include "exec/cpu-common.h"
+@@ -124,6 +125,10 @@
+ {
+     XemuEmucapPacing *reply;
+     const char *error = NULL;
++    uint32_t previous_percent;
++    uint64_t previous_revision, start_frame;
++
++    assert(bql_locked());
+ 
+     if (!xemu_emucap_clock_supported() || qemu_tcg_mttcg_enabled()) {
+         error_setg(errp, "emucap requires single TCG, fixed shift 0..3, align/sleep off");
+@@ -137,12 +142,19 @@
+         error_setg(errp, "unlimited must be true; pass percent for a limited pace");
+         return NULL;
+     }
++    previous_percent = xemu_emucap_pacing_percent();
++    previous_revision = xemu_emucap_pacing_revision();
++    start_frame = current_frame_boundary();
+     if ((has_percent || has_unlimited) &&
+         !xemu_emucap_pacing_set(has_unlimited, percent, &error)) {
+         error_setg(errp, "%s", error);
+         return NULL;
+     }
+     reply = g_new0(XemuEmucapPacing, 1);
++    reply->transaction_version = 1;
++    reply->previous_percent = previous_percent;
++    reply->previous_revision = previous_revision;
++    reply->start_frame_boundary = start_frame;
+     reply->percent = xemu_emucap_pacing_percent();
+     reply->revision = xemu_emucap_pacing_revision();
+     reply->frame_boundary = current_frame_boundary();
+--- a/qapi/xemu-emucap.json
++++ b/qapi/xemu-emucap.json
+@@ -266,6 +266,14 @@
+ ##
+ # @XemuEmucapPacing:
+ #
++# @transaction-version: policy transaction format (1)
++#
++# @previous-percent: percent immediately before this operation
++#
++# @previous-revision: policy revision before this operation
++#
++# @start-frame-boundary: NV2A vblank counter before policy application
++#
+ # @clock-profile: effective guest timing profile
+ #
+ # @percent: limited percent of real time, or 0 when unlimited
+@@ -275,7 +283,11 @@
+ # @frame-boundary: NV2A vblank counter at the reply
+ ##
+ { 'struct': 'XemuEmucapPacing',
+-  'data': { 'percent': 'uint32',
++  'data': { 'transaction-version': 'uint32',
++            'previous-percent': 'uint32',
++            'previous-revision': 'uint64',
++            'start-frame-boundary': 'uint64',
++            'percent': 'uint32',
+             'clock-profile': 'XemuEmucapClockProfile',
+             'revision': 'uint64',
+             'frame-boundary': 'uint64' } }

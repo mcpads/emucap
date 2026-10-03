@@ -1,0 +1,86 @@
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -126,6 +126,7 @@
+ 	} m_tr;
+ 
+ protected:
++	bool m_restored_display_pending[2] = {};
+ 	static constexpr int INVALID_ALPHA_MINMAX = 500;
+ 
+ 	GSVertex m_v = {};
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -148,6 +148,7 @@
+ 
+ void GSState::Reset(bool hardware_reset)
+ {
++	m_restored_display_pending[0] = m_restored_display_pending[1] = false;
+ 	Flush(GSFlushReason::RESET);
+ 
+ 	// FIXME: bios logo not shown cut in half after reset, missing graphics in GoW after first FMV
+@@ -2999,8 +3000,8 @@
+ 
+ 	Flush(GSFlushReason::SAVESTATE);
+ 
+-	if (GSConfig.UserHacks_ReadTCOnClose)
+-		ReadbackTextureCache();
++	// A native snapshot must include writes still resident in hardware targets.
++	ReadbackTextureCache();
+ 
+ 	u8* data = fd->data;
+ 
+@@ -3223,6 +3224,7 @@
+ 	g_perfmon.SetFrame(0);
+ 
+ 	ResetPCRTC();
++	m_restored_display_pending[0] = m_restored_display_pending[1] = true;
+ 
+ 	return 0;
+ }
+--- a/pcsx2/GS/Renderers/HW/GSTextureCache.h
++++ b/pcsx2/GS/Renderers/HW/GSTextureCache.h
+@@ -509,7 +509,7 @@
+ 	Target* CreateTarget(GIFRegTEX0 TEX0, const GSVector2i& size, const GSVector2i& valid_size, float scale, int type, bool used = true, u32 fbmask = 0,
+ 		bool is_frame = false, bool preload = GSConfig.PreloadFrameWithGSData, bool preserve_target = true,
+ 		const GSVector4i draw_rc = GSVector4i::zero(), GSTextureCache::Source* src = nullptr);
+-	Target* LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback);
++	Target* LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback, bool restored_memory = false);
+ 
+ 	/// Looks up a target in the cache, and only returns it if the BP/BW match exactly.
+ 	Target* GetExactTarget(u32 BP, u32 BW, int type, u32 end_bp);
+--- a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
++++ b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+@@ -3841,7 +3841,7 @@
+ 	return hw_clear.value_or(false);
+ }
+ 
+-GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback)
++GSTextureCache::Target* GSTextureCache::LookupDisplayTarget(GIFRegTEX0 TEX0, const GSVector2i& size, float scale, bool is_feedback, bool restored_memory)
+ {
+ 	Target* dst = LookupTarget(TEX0, size, scale, RenderTarget, true, 0, true);
+ 	if (dst)
+@@ -3849,7 +3849,7 @@
+ 
+ 	// Didn't find a target, check if the frame was uploaded.
+ 
+-	bool can_create = is_feedback;
++	bool can_create = is_feedback || restored_memory;
+ 	GSVector2i new_size = size;
+ 
+ 	if (!is_feedback && GSRendererHW::GetInstance()->m_draw_transfers.size() > 0)
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -163,9 +163,12 @@
+ 	TEX0.TBW = curFramebuffer.FBW;
+ 	TEX0.PSM = curFramebuffer.PSM;
+ 
+-	if (GSTextureCache::Target* rt = g_texture_cache->LookupDisplayTarget(TEX0, framebufferSize, GetTextureScaleFactor(), false))
++	if (GSTextureCache::Target* rt = g_texture_cache->LookupDisplayTarget(TEX0, framebufferSize, GetTextureScaleFactor(), false, m_restored_display_pending[index]))
+ 	{
+ 		rt->Update();
++		m_restored_display_pending[index] = false;
++		if (i < 0)
++			m_restored_display_pending[0] = false;
+ 		t = rt->m_texture;
+ 		scale = rt->m_scale;
+ 

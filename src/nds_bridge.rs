@@ -239,6 +239,12 @@ struct NdsBreakpoint {
 pub enum NdsBridgeError {
     #[error("{0}")]
     BadParams(String),
+    #[error("active native operation")]
+    Busy,
+    #[error("request cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    BadState(String),
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("unsupported on nds (planned): {0}")]
@@ -276,6 +282,9 @@ pub struct NdsBridge<G> {
     /// stop without changing the VBlank clock.
     boundary_seq: u64,
     control_unverified: bool,
+    owned_control: bool,
+    request_cancellation: Option<crate::live::link::RequestCancellation>,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
 }
 
 impl<G: GdbTransport> NdsBridge<G> {
@@ -289,7 +298,21 @@ impl<G: GdbTransport> NdsBridge<G> {
             events: Vec::new(),
             boundary_seq: 0,
             control_unverified: false,
+            owned_control: false,
+            request_cancellation: None,
+            producer_ownership: None,
         }
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        req: Request,
+        token: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = Some(token);
+        let result = self.handle_request(req);
+        self.request_cancellation = None;
+        result
     }
 
     pub fn handle_request(&mut self, req: Request) -> Response {
@@ -312,6 +335,10 @@ impl<G: GdbTransport> NdsBridge<G> {
             "clear_breakpoint" => self.clear_breakpoint(&req.params),
             "list_breakpoints" => self.list_breakpoints(),
             "clear_all_breakpoints" => self.clear_all_breakpoints(),
+            "pause" if self.owned_control && self.request_cancellation.is_some() => self
+                .pause_target(&req.params)
+                .and_then(|_| self.verify_owned_halt())
+                .map(|_| json!({"state":"frozen","cpus":{"arm9":"frozen","arm7":"frozen"}})),
             "pause" => self.pause(&req.params),
             "resume" => self.resume(&req.params),
             "poll_events" => self.poll_events(&req.params),
@@ -365,8 +392,10 @@ mod cpu;
 mod debug;
 mod input_state;
 mod observation;
+mod owned_frame;
 mod service;
 mod support;
+mod temporal_owner;
 use support::*;
 
 #[cfg(test)]

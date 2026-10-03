@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 #[derive(Default)]
 struct FakeWs {
     replies: VecDeque<(String, Value)>,
+    scripted_errors: std::collections::HashMap<String, String>,
     pending_events: VecDeque<Value>,
     /// Every `(event, params)` pair seen, in order — lets a test assert the bridge computed
     /// the right PPSSPP request (address/size/base64/...), not just the right event name.
@@ -51,10 +52,13 @@ impl WsTransport for FakeWs {
         if event == "emucap.pacing" && self.replies.front().is_none_or(|(next, _)| next != event) {
             return Ok(
                 json!({"percent": 100, "fast_forward": false, "fps_limit": 0,
-                "network_forced": false, "revision": 1, "vblank": 0}),
+                "network_forced": false, "revision": 1, "vblank": 0, "transaction_version":1}),
             );
         }
         self.calls.push((event.to_string(), params));
+        if let Some(message) = self.scripted_errors.remove(event) {
+            return Err(BridgeError::Emulator(message));
+        }
         let Some((expected, reply)) = self.replies.pop_front() else {
             return Err(BridgeError::Emulator(format!(
                 "unexpected fake WS call: {event}"
@@ -172,7 +176,7 @@ fn status_reports_connected_and_version() {
         ),
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
     ]));
     let resp = bridge.handle_request(Request::new(1, "status", json!({})));
@@ -204,7 +208,7 @@ fn status_reports_stepping_cpu_as_frozen_even_when_game_status_paused_is_false()
         ),
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0x08804128u32,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0x08804128u32,"ticks":0}),
         ),
     ]));
     let resp = bridge.handle_request(Request::new(1, "status", json!({})));
@@ -230,7 +234,7 @@ fn step_frame_request_uses_exact_vblank_command_and_reports_frozen_terminal() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         ("cpu.stepping", json!({"event":"cpu.stepping"})),
         (
@@ -266,17 +270,44 @@ fn step_frame_request_uses_exact_vblank_command_and_reports_frozen_terminal() {
 }
 
 #[test]
+fn step_frame_rejects_unexplained_or_inconsistent_native_progress() {
+    for fault in ["missing_reason", "too_many", "false_completed"] {
+        let mut terminal = json!({
+            "event":"emucap.frameStep", "status":"interrupted", "reason":"native_halt",
+            "unit":"frames", "count":120, "completed":7, "state":"frozen"
+        });
+        match fault {
+            "missing_reason" => {
+                terminal.as_object_mut().unwrap().remove("reason");
+            }
+            "too_many" => terminal["completed"] = json!(121),
+            _ => terminal["status"] = json!("completed"),
+        }
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[
+            (
+                "cpu.status",
+                json!({"event":"cpu.status","memory_park_version":1,"stepping":true}),
+            ),
+            ("emucap.frameStep", terminal),
+        ]));
+        let response = bridge.handle_request(Request::new(1, "step", json!({"frames":120})));
+        assert!(!response.ok, "{fault}: {response:?}");
+    }
+}
+
+#[test]
 fn step_frame_preserves_breakpoint_preemption_as_interrupted_partial_result() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "emucap.frameStep",
             json!({
                 "event":"emucap.frameStep",
                 "status":"interrupted",
+                "reason":"native_halt",
                 "unit":"frames",
                 "count":120,
                 "completed":7,
@@ -291,6 +322,9 @@ fn step_frame_preserves_breakpoint_preemption_as_interrupted_partial_result() {
     let result = resp.result.unwrap();
     assert_eq!(result["status"], "interrupted");
     assert_eq!(result["completed"], 7);
+    assert_eq!(result["count"], 7);
+    assert_eq!(result["requested"], 120);
+    assert_eq!(result["reason"], "native_halt");
     assert_eq!(result["state"], "frozen");
     assert_eq!(
         bridge.ws.calls.len(),
@@ -315,7 +349,7 @@ fn step_wire_method_with_instructions_unit_dispatches_to_stepping() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "cpu.stepping",
@@ -541,7 +575,10 @@ fn find_pattern_scans_a_frozen_window_and_returns_region_offsets() {
     let b64 =
         base64::engine::general_purpose::STANDARD.encode([0xaa_u8, 0xbb, 0x00, 0xaa, 0xbb, 0x00]);
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
-        ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
+        (
+            "cpu.status",
+            json!({"event":"cpu.status", "memory_park_version":1,"stepping":true}),
+        ),
         ("memory.read", json!({"event":"memory.read", "base64":b64})),
     ]));
     let response = bridge.handle_request(Request::new(
@@ -565,12 +602,18 @@ fn find_pattern_scans_a_frozen_window_and_returns_region_offsets() {
 fn probe_restores_advances_and_reads_before_returning() {
     let b64 = base64::engine::general_purpose::STANDARD.encode([0x12_u8, 0x34]);
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
-        ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
+        (
+            "cpu.status",
+            json!({"event":"cpu.status", "memory_park_version":1,"stepping":true}),
+        ),
         (
             "savestate.load",
             json!({"event":"savestate.load","state":"frozen"}),
         ),
-        ("cpu.status", json!({"event":"cpu.status", "stepping":true})),
+        (
+            "cpu.status",
+            json!({"event":"cpu.status", "memory_park_version":1,"stepping":true}),
+        ),
         (
             "emucap.frameStep",
             json!({
@@ -868,7 +911,10 @@ fn disassemble_requires_address() {
 #[test]
 fn call_stack_maps_ppsspp_native_mips_backtrace() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
-        ("cpu.status", json!({"event":"cpu.status","stepping":true})),
+        (
+            "cpu.status",
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true}),
+        ),
         (
             "hle.backtrace",
             json!({
@@ -895,7 +941,7 @@ fn call_stack_maps_ppsspp_native_mips_backtrace() {
 fn call_stack_rejects_running_before_backtrace_mutation() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
         "cpu.status",
-        json!({"event":"cpu.status","stepping":false}),
+        json!({"event":"cpu.status","memory_park_version":1,"stepping":false}),
     )]));
     let response = bridge.handle_request(Request::new(1, "call_stack", json!({})));
     assert!(!response.ok);
@@ -1330,7 +1376,7 @@ fn pause_sends_cpu_stepping_when_running() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "cpu.stepping",
@@ -1350,7 +1396,7 @@ fn pause_is_a_noop_when_already_stepping() {
     // no "cpu.stepping" reply queued, so this test would fail loudly if the guard were missing.
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
         "cpu.status",
-        json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+        json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0,"ticks":0}),
     )]));
     let resp = bridge.handle_request(Request::new(1, "pause", json!({})));
     assert!(resp.ok, "{:?}", resp.error);
@@ -1363,7 +1409,7 @@ fn resume_sends_cpu_resume_when_stepping() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0,"ticks":0}),
         ),
         ("cpu.resume", json!({"event":"cpu.resume"})),
     ]));
@@ -1377,7 +1423,7 @@ fn resume_sends_cpu_resume_when_stepping() {
 fn resume_is_a_noop_when_already_running() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
         "cpu.status",
-        json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+        json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
     )]));
     let resp = bridge.handle_request(Request::new(1, "resume", json!({})));
     assert!(resp.ok, "{:?}", resp.error);
@@ -1401,7 +1447,7 @@ fn step_instructions_pauses_first_when_running_then_steps_and_reports_state() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "cpu.stepping",
@@ -1456,7 +1502,7 @@ fn step_instructions_skips_pre_pause_when_already_stepping() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "cpu.stepping",
@@ -2231,7 +2277,7 @@ fn status_reports_bridge_owned_persistent_input_after_set() {
         ),
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
     ]));
     let set = bridge.handle_request(Request::new(
@@ -2261,7 +2307,7 @@ fn status_reports_native_input_after_empty_set() {
         ),
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
     ]));
     let set = bridge.handle_request(Request::new(1, "set_input", json!({"buttons": []})));
@@ -2282,7 +2328,7 @@ fn press_buttons_maps_uniform_name_to_psp_and_sends_duration() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "input.buttons.press",
@@ -2321,7 +2367,7 @@ fn press_buttons_defaults_frames_to_one() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "input.buttons.press",
@@ -2346,7 +2392,7 @@ fn press_buttons_timeout_releases_inputs_and_surfaces_error() {
     let mut ws = FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         ("input.buttons.send", json!({"event":"input.buttons.send"})),
     ]);
@@ -2381,7 +2427,7 @@ fn press_buttons_ignores_a_stale_off_ticket_ack() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "input.buttons.press",
@@ -2412,7 +2458,7 @@ fn press_buttons_ignores_a_stale_off_ticket_ack() {
 fn press_buttons_rejects_while_cpu_halted() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[(
         "cpu.status",
-        json!({"event":"cpu.status","stepping":true,"paused":false,"pc":0,"ticks":0}),
+        json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false,"pc":0,"ticks":0}),
     )]));
     let resp = bridge.handle_request(Request::new(1, "press_buttons", json!({"buttons": ["a"]})));
     assert!(!resp.ok);
@@ -2443,7 +2489,7 @@ fn press_buttons_accepts_frames_at_the_cap() {
     let mut bridge = PpssppBridge::new(FakeWs::with(&[
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false,"pc":0,"ticks":0}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false,"pc":0,"ticks":0}),
         ),
         (
             "input.buttons.press",
@@ -2604,6 +2650,54 @@ fn load_state_calls_savestate_load_with_path() {
 }
 
 #[test]
+fn load_state_unverified_memory_park_retires_control() {
+    use crate::live::control_session::{Attachment, EventKind, SessionEvent};
+    use crate::live::reconnect::{owned::OwnedHandler, BridgeDirective};
+    let mut ws = FakeWs::default();
+    ws.scripted_errors.insert(
+        "savestate.load".into(),
+        "emucap memory park unverified after state load".into(),
+    );
+    let mut bridge = PpssppBridge::new(ws);
+    bridge.launch_id = Some("runtime".into());
+    let attachment = Attachment {
+        broker_instance: "broker".into(),
+        registration: 1,
+        session: 1,
+    };
+    bridge
+        .apply_control_session(SessionEvent {
+            runtime: "runtime".into(),
+            attachment: attachment.clone(),
+            kind: EventKind::Attach,
+        })
+        .unwrap();
+    let reply = bridge.request(
+        &attachment,
+        Request::new(1, "load_state", json!({"path": "/tmp/x.ppst"})),
+        Default::default(),
+    );
+    assert!(!reply.response.ok);
+    assert!(bridge.backend_terminal());
+    assert_eq!(reply.directive, BridgeDirective::Terminate);
+}
+
+#[test]
+fn load_state_rejected_file_preserves_control() {
+    let mut ws = FakeWs::default();
+    ws.scripted_errors
+        .insert("savestate.load".into(), "state file missing".into());
+    let mut bridge = PpssppBridge::new(ws);
+    let response = bridge.handle_request(Request::new(
+        1,
+        "load_state",
+        json!({"path": "/tmp/missing.ppst"}),
+    ));
+    assert!(!response.ok);
+    assert!(!bridge.control_unverified);
+}
+
+#[test]
 fn load_state_rejects_missing_or_running_native_completion() {
     for state in [Value::Null, json!("running")] {
         let mut bridge = PpssppBridge::new(FakeWs::with(&[(
@@ -2634,7 +2728,7 @@ fn reset_calls_game_reset_with_reboot_budget_and_reports_post_reset_pc() {
         ("game.reset", json!({"event":"game.reset"})),
         (
             "cpu.status",
-            json!({"event":"cpu.status","stepping":true,"paused":false}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":true,"paused":false}),
         ),
         ("cpu.getAllRegs", gpr_only_pc(0x0880_4128)),
     ]));
@@ -2665,7 +2759,7 @@ fn reset_display_session_reports_async_reboot_not_false_completed_while_running(
     for _ in 0..RESET_HALT_POLLS {
         replies.push((
             "cpu.status",
-            json!({"event":"cpu.status","stepping":false,"paused":false}),
+            json!({"event":"cpu.status","memory_park_version":1,"stepping":false,"paused":false}),
         ));
     }
     let mut bridge = PpssppBridge::new(FakeWs::with(&replies));
@@ -2882,15 +2976,25 @@ fn get_rom_info_rejects_missing_content_file() {
 }
 
 #[test]
-fn native_memory_batch_reads_once_and_rejects_incomplete_reply() {
-    for short in [false, true] {
+fn native_memory_batch_reads_once_and_rejects_malformed_reply() {
+    let cases = [
+        json!({"epoch":7,"frame":123,"hex":"0102ff"}),
+        json!({"epoch":7,"frame":123,"hex":"0102"}),
+        json!({"epoch":7,"frame":123,"hex":"0102f"}),
+        json!({"epoch":7,"frame":123,"hex":"0102fg"}),
+        json!({"epoch":7,"frame":123,"hex":"0102ffff"}),
+        json!({"epoch":7,"frame":123,"hex":null}),
+        json!({"frame":123,"hex":"0102ff"}),
+        json!({"epoch":7,"frame":-1,"hex":"0102ff"}),
+    ];
+    for (index, native) in cases.into_iter().enumerate() {
         let mut host = PpssppBridge::with_content(
             FakeWs::with(&[
-                ("cpu.status", json!({"stepping":true})),
                 (
-                    "emucap.memoryBatch",
-                    json!({"epoch":7,"frame":123,"hex":if short {"0102"} else {"0102ff"}}),
+                    "cpu.status",
+                    json!({"memory_park_version":1,"stepping":true}),
                 ),
+                ("emucap.memoryBatch", native),
             ]),
             None,
         );
@@ -2899,7 +3003,7 @@ fn native_memory_batch_reads_once_and_rejects_incomplete_reply() {
             {"memory_type":"main","address":0,"length":1}
         ]}));
         assert_eq!(host.ws.calls[1].1["ranges"], "10,2;0,1");
-        if short {
+        if index != 0 {
             assert!(result.is_err());
             assert!(host.backend_terminal());
         } else {
@@ -2912,19 +3016,378 @@ fn native_memory_batch_reads_once_and_rejects_incomplete_reply() {
 
 #[test]
 fn pacing_invalid_post_set_readback_closes_control() {
-    let before = json!({"percent":100,"fast_forward":false,"fps_limit":0,"network_forced":false,"revision":1,"vblank":0});
-    let mut host = PpssppBridge::with_content(
-        FakeWs::with(&[
-            ("emucap.pacing", before),
-            ("emucap.pacing", json!({"percent":50})),
-        ]),
-        None,
+    let before = json!({"percent":100,"fast_forward":false,"fps_limit":0,"network_forced":false,"revision":1,"vblank":0,"transaction_version":1});
+    for (field, value, healthy) in [
+        ("malformed", json!(null), false),
+        ("percent", json!(100), false),
+        ("fast_forward", json!(true), false),
+        ("fps_limit", json!(30), false),
+        ("network_forced", json!(true), false),
+        ("percent", json!(50), true),
+    ] {
+        let mut after = before.clone();
+        after["percent"] = json!(50);
+        after[field] = value;
+        let malformed = field == "malformed";
+        if malformed {
+            after = json!({"percent":50});
+        }
+        if !malformed {
+            after["revision"] = json!(2);
+            after["previous"] = before.clone();
+            after["outcome"] = json!("completed");
+            after["clock_domain"] = json!("psp_vblank");
+            after["begin_vblank"] = json!(0);
+        }
+        let mut replies = vec![("emucap.pacing", before.clone()), ("emucap.pacing", after)];
+        if !malformed {
+            replies.push((
+                "cpu.status",
+                json!({"memory_park_version":1,"stepping":true}),
+            ));
+        }
+        let mut host = PpssppBridge::with_content(FakeWs::with(&replies), None);
+        let outcome = host.execution_speed(&json!({"mode":"limited","percent":50}));
+        assert_eq!(outcome.is_ok(), healthy, "{field}");
+        assert_eq!(host.backend_terminal(), !healthy, "{field}");
+        if let Err(error) = outcome {
+            assert!(error.to_string().contains("unverified"));
+        }
+        assert!(host.ws.replies.is_empty());
+        assert_eq!(host.ws.calls.len(), if malformed { 2 } else { 3 });
+    }
+}
+
+#[test]
+fn pacing_requires_verified_execution_state_after_mutation() {
+    for status in [
+        json!({}),
+        json!({"memory_park_version":1,"stepping":null}),
+        json!({"memory_park_version":1,"stepping":"false"}),
+    ] {
+        let pacing = transaction_pacing_reply;
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[
+            ("emucap.pacing", pacing(100)),
+            ("emucap.pacing", pacing(50)),
+            ("cpu.status", status.clone()),
+        ]));
+        assert!(
+            bridge
+                .execution_speed(&json!({"mode":"limited","percent":50}))
+                .is_err(),
+            "{status}"
+        );
+        assert!(bridge.backend_terminal());
+        assert!(bridge.ws.replies.is_empty());
+        // The executable owns terminal-channel retirement after this response.
+    }
+}
+
+#[test]
+fn pacing_keeps_a_pending_psp_breakpoint_and_reports_frozen() {
+    let pacing = transaction_pacing_reply;
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("cpu.breakpoint.add", json!({"event":"cpu.breakpoint.add"})),
+        ("emucap.pacing", pacing(100)),
+        ("emucap.pacing", pacing(50)),
+        (
+            "cpu.status",
+            json!({"memory_park_version":1,"stepping":true}),
+        ),
+        ("cpu.getAllRegs", gpr_only_pc(0x0880_4004)),
+    ]));
+    assert!(
+        bridge
+            .handle_request(Request::new(
+                1,
+                "set_breakpoint",
+                json!({"address":0x0880_4004u32})
+            ))
+            .ok
     );
-    assert!(host
+    bridge.ws.push_event(
+        json!({"event":"cpu.stepping","pc":0x0880_4004u32,"ticks":42,
+        "reason":"cpu.breakpoint","relatedAddress":0x0880_4004u32}),
+    );
+    let result = bridge
         .execution_speed(&json!({"mode":"limited","percent":50}))
-        .unwrap_err()
-        .to_string()
-        .contains("unverified"));
-    assert!(host.backend_terminal());
-    assert_eq!(host.ws.calls.len(), 2);
+        .unwrap();
+    assert_eq!(result["state"], "frozen");
+    let result = bridge
+        .handle_request(Request::new(2, "poll_events", json!({})))
+        .result
+        .unwrap();
+    assert_eq!(result["events"].as_array().unwrap().len(), 1);
+    assert_eq!(result["events"][0]["breakpoint_id"], 1);
+    assert_eq!(result["events"][0]["address"], 0x0880_4004u32);
+    assert!(bridge.ws.replies.is_empty());
+    assert!(!bridge.ws.calls.iter().any(|(name, _)| matches!(
+        name.as_str(),
+        "cpu.resume" | "cpu.stepping" | "cpu.stepInto"
+    )));
+}
+
+fn owned_parent_fixture(
+    ws: FakeWs,
+) -> (
+    PpssppBridge<FakeWs>,
+    crate::live::control_session::Attachment,
+    crate::live::reconnect::cancellation::OperationKey,
+) {
+    use crate::live::control_session::{Attachment, EventKind, SessionEvent};
+    use crate::live::reconnect::cancellation::OperationKey;
+    let mut bridge = PpssppBridge::with_content(ws, None);
+    bridge.launch_id = Some("runtime".into());
+    bridge.owned_control = true;
+    let attachment = Attachment {
+        broker_instance: "broker".into(),
+        registration: 1,
+        session: 1,
+    };
+    bridge
+        .apply_control_session(SessionEvent {
+            runtime: "runtime".into(),
+            attachment: attachment.clone(),
+            kind: EventKind::Attach,
+        })
+        .unwrap();
+    let key = OperationKey {
+        runtime: "runtime".into(),
+        owner_id: "owner".into(),
+        operation_id: "parent".into(),
+    };
+    bridge
+        .begin_temporal_operation(&attachment, key.clone())
+        .unwrap();
+    (bridge, attachment, key)
+}
+
+#[test]
+fn owned_parent_finish_verifies_inactive_cpu_releases_input_and_is_idempotent() {
+    let (mut bridge, attachment, key) = owned_parent_fixture(FakeWs::with(&[
+        ("input.buttons.send", json!({})),
+        (
+            "emucap.frameStep.capability",
+            json!({"memory_park_version":1,"inactive_cpu":true}),
+        ),
+        ("input.buttons.send", json!({})),
+    ]));
+    let response = bridge
+        .handle_parent_request(
+            &attachment,
+            &key,
+            Request {
+                v: 1,
+                id: 1,
+                method: "set_input".into(),
+                params: json!({"buttons":["a"]}),
+            },
+            Default::default(),
+        )
+        .unwrap();
+    assert!(response.ok);
+    let terminal = bridge.finish_temporal_operation(&attachment, &key).unwrap();
+    assert_eq!(terminal["cleanup_verified"], true);
+    assert_eq!(terminal["released_ports"], json!([0]));
+    assert_eq!(bridge.held_buttons, Some(vec![]));
+    assert!(bridge.ws.calls.last().unwrap().1["buttons"]
+        .as_object()
+        .unwrap()
+        .values()
+        .all(|v| v == false));
+    let calls = bridge.ws.calls.len();
+    assert_eq!(
+        bridge.finish_temporal_operation(&attachment, &key).unwrap(),
+        terminal
+    );
+    assert_eq!(bridge.ws.calls.len(), calls);
+}
+
+#[test]
+fn parent_cleanup_missing_stop_proof_retires_control_without_successful_release() {
+    let (mut bridge, attachment, key) = owned_parent_fixture(FakeWs::with(&[
+        ("input.buttons.send", json!({})),
+        (
+            "emucap.frameStep.capability",
+            json!({"memory_park_version":1,"stepping":true}),
+        ),
+    ]));
+    assert!(
+        bridge
+            .handle_parent_request(
+                &attachment,
+                &key,
+                Request {
+                    v: 1,
+                    id: 1,
+                    method: "set_input".into(),
+                    params: json!({"buttons":["a"]})
+                },
+                Default::default()
+            )
+            .unwrap()
+            .ok
+    );
+    assert!(bridge.finish_temporal_operation(&attachment, &key).is_err());
+    assert!(bridge.backend_terminal());
+    assert_eq!(bridge.held_buttons, Some(vec!["a".into()]));
+}
+
+#[test]
+fn parent_rejects_implicit_instruction_step_before_native_effect() {
+    let (mut bridge, attachment, key) = owned_parent_fixture(FakeWs::default());
+    let error = bridge
+        .handle_parent_request(
+            &attachment,
+            &key,
+            Request {
+                v: 1,
+                id: 1,
+                method: "step".into(),
+                params: json!({"count":2}),
+            },
+            Default::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, BridgeError::Unsupported(_)));
+    assert!(bridge.ws.calls.is_empty());
+    let terminal = bridge.finish_temporal_operation(&attachment, &key).unwrap();
+    assert_eq!(terminal["effects_started"], false);
+}
+
+fn transaction_pacing_reply(percent: u64) -> Value {
+    json!({"percent":percent,"fast_forward":false,"fps_limit":0,"network_forced":false,
+        "revision":2,"vblank":0,"transaction_version":1,"outcome":"completed",
+        "clock_domain":"psp_vblank","begin_vblank":0,
+        "previous":{"percent":100,"fast_forward":false,"fps_limit":0,
+            "network_forced":false,"revision":1,"vblank":0}})
+}
+
+#[test]
+fn pacing_uses_transaction_previous_instead_of_preliminary_observation() {
+    let mut applied = transaction_pacing_reply(200);
+    applied["previous"]["percent"] = json!(250);
+    applied["previous"]["revision"] = json!(9);
+    applied["revision"] = json!(10);
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[
+        ("emucap.pacing", transaction_pacing_reply(100)),
+        ("emucap.pacing", applied),
+        (
+            "cpu.status",
+            json!({"memory_park_version":1,"stepping":true}),
+        ),
+    ]));
+    let reply = bridge
+        .execution_speed(&json!({"mode":"limited","percent":200}))
+        .unwrap();
+    assert_eq!(reply["previous"]["percent"], 250);
+    assert_eq!(reply["previous"]["policy_revision"], "9");
+}
+
+#[test]
+fn pacing_old_host_is_rejected_before_mutation() {
+    let mut old = transaction_pacing_reply(100);
+    old.as_object_mut().unwrap().remove("transaction_version");
+    let mut bridge = PpssppBridge::new(FakeWs::with(&[("emucap.pacing", old)]));
+    assert!(matches!(
+        bridge.execution_speed(&json!({"mode":"limited","percent":200})),
+        Err(BridgeError::Unsupported(_))
+    ));
+    assert_eq!(bridge.ws.calls.len(), 1);
+    assert_eq!(bridge.ws.calls[0].1, json!({}));
+    assert!(!bridge.backend_terminal());
+}
+
+#[test]
+fn pacing_native_network_rejection_is_recoverable_only_with_unchanged_policy() {
+    for changed in [false, true] {
+        let mut rejected = transaction_pacing_reply(100);
+        rejected["outcome"] = json!("rejected");
+        rejected["revision"] = json!(1);
+        rejected["network_forced"] = json!(true);
+        rejected["previous"]["network_forced"] = json!(true);
+        if changed {
+            rejected["percent"] = json!(50);
+        }
+        let mut bridge = PpssppBridge::new(FakeWs::with(&[
+            ("emucap.pacing", transaction_pacing_reply(100)),
+            ("emucap.pacing", rejected),
+        ]));
+        assert!(bridge
+            .execution_speed(&json!({"mode":"limited","percent":200}))
+            .is_err());
+        assert_eq!(bridge.backend_terminal(), changed);
+        assert!(bridge.ws.replies.is_empty());
+        assert_eq!(bridge.ws.calls.len(), 2);
+    }
+}
+
+#[test]
+fn memory_park_old_host_is_rejected_before_batch_or_pause() {
+    for method in ["pause", "read_memory_batch"] {
+        let mut bridge =
+            PpssppBridge::new(FakeWs::with(&[("cpu.status", json!({"stepping":true}))]));
+        let params = if method == "read_memory_batch" {
+            json!({"ranges":[{"memory_type":"main","address":0,"length":1}]})
+        } else {
+            json!({})
+        };
+        let result = bridge.handle_request(Request::new(1, method, params));
+        assert!(!result.ok);
+        assert_eq!(bridge.ws.calls.len(), 1);
+    }
+}
+
+#[test]
+fn batch_epochs_separate_same_clock_load_dispatch() {
+    // Reset and load pass through the same pre-effect dispatcher retirement.
+    assert!(!OBSERVATION_METHODS.contains(&"reset"));
+    let mut replies = Vec::new();
+    for load in [false, true, true] {
+        if load {
+            replies.push(("savestate.load", json!({"state":"frozen"})));
+        }
+        for _ in 0..2 {
+            replies.push((
+                "cpu.status",
+                json!({"memory_park_version":1,"stepping":true}),
+            ));
+            replies.push((
+                "emucap.memoryBatch",
+                json!({"epoch":7,"frame":123,"hex":"aa"}),
+            ));
+        }
+    }
+    let mut host = PpssppBridge::new(FakeWs::with(&replies));
+    let mut previous = None;
+    for load in [false, true, true] {
+        if load {
+            let r = host.handle_request(Request::new(
+                1,
+                "load_state",
+                json!({"path":"/tmp/epoch.ppst"}),
+            ));
+            assert!(r.ok, "{:?}", r.error);
+        }
+        let mut current = None;
+        for _ in 0..2 {
+            let r = host.handle_request(Request::new(
+                2,
+                "read_memory_batch",
+                json!({"ranges":[{"memory_type":"main","address":0,"length":1}]}),
+            ));
+            assert!(r.ok, "{:?}", r.error);
+            let b = r.result.unwrap()["boundary"].clone();
+            assert_eq!(b["clocks"][0]["value"], 123);
+            if let Some(ref old) = current {
+                assert_eq!(old, &b);
+            }
+            current = Some(b);
+        }
+        if let Some(old) = previous {
+            assert_ne!(Some(old), current);
+        }
+        previous = current;
+    }
+    assert!(host.ws.replies.is_empty());
 }

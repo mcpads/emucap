@@ -1,0 +1,17 @@
+--- a/src/pcfx/pcfx.cpp
++++ b/src/pcfx/pcfx.cpp
+@@ -460,9 +460,11 @@
+ 
+    if((sector | (disc << 24)) != GAS_SectorCacheWhich)
+    {
+-    if(!(*cdifs)[disc]->ReadSectors(GAS_SectorCache, sector, 1))
+-     memset(GAS_SectorCache, 0, 2048);
+-
++    uint8 sector_data[2048];
++    if(!(*cdifs)[disc]->ReadSectors(sector_data, sector, 1))
++     throw MDFN_Error(0, "CD track sector read failed.");
++
++    memcpy(GAS_SectorCache, sector_data, sizeof(sector_data));
+     GAS_SectorCacheWhich = sector | (disc << 24);
+    }
+ 

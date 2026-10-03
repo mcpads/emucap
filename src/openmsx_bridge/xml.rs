@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,34 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const CANCEL_SERVICE: Duration = Duration::from_millis(25);
 const CANCEL_CLEANUP: Duration = Duration::from_millis(500);
 const ADVANCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Match the public transport budget; XML batch payloads are hex, not inline images.
+const MAX_CONTROL_LINE_BYTES: usize = crate::live::protocol::MAX_NDJSON_FRAME_BYTES;
+
+fn read_control_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+    let mut line = String::new();
+    // One delimiter plus one excess byte lets us distinguish exact-limit success.
+    let count = reader
+        .take((MAX_CONTROL_LINE_BYTES + 2) as u64)
+        .read_line(&mut line)?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let payload = count - usize::from(line.ends_with('\n'));
+    if payload > MAX_CONTROL_LINE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "openMSX control line exceeds 8 MiB",
+        ));
+    }
+    if !line.ends_with('\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "truncated openMSX control line",
+        ));
+    }
+    Ok(Some(line))
+}
 
 enum XmlEvent {
     Ready,
@@ -84,17 +112,15 @@ impl XmlControl {
         let (sender, events) = mpsc::channel();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line) {
-                    Ok(0) => {
+                match read_control_line(&mut reader) {
+                    Ok(None) => {
                         reader_terminal.store(true, Ordering::Release);
                         let _ = sender
                             .send(XmlEvent::Terminal("openMSX control channel closed".into()));
                         break;
                     }
-                    Ok(_) => {
+                    Ok(Some(line)) => {
                         let trimmed = line.trim_start();
                         if trimmed.contains("<openmsx-output>") {
                             let _ = sender.send(XmlEvent::Ready);

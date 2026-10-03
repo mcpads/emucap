@@ -48,10 +48,13 @@ impl<T: WsTransport> PpssppBridge<T> {
             let psp_name = psp_button_name(name).expect("PSP_INPUT_BUTTONS names all map");
             buttons_obj.insert(psp_name.into(), json!(requested.iter().any(|r| r == name)));
         }
-        self.ws.call(
-            "input.buttons.send",
-            json!({ "buttons": Value::Object(buttons_obj) }),
-        )?;
+        let input = json!({ "buttons": Value::Object(buttons_obj) });
+        if self.request_cancellation.is_some() {
+            self.ws
+                .call_with_timeout("input.buttons.send", input, Duration::from_millis(500))?;
+        } else {
+            self.ws.call("input.buttons.send", input)?;
+        }
         self.held_buttons = Some(requested.clone());
         Ok(json!({ "buttons": requested }))
     }
@@ -175,11 +178,18 @@ impl<T: WsTransport> PpssppBridge<T> {
     pub(super) fn load_state(&mut self, params: &Value) -> BridgeResult<Value> {
         let path = required_str(params, "path")?.to_string();
         // Same dedicated budget as save_state — the fork's load handler shares the 15s wait.
-        let result = self.ws.call_with_timeout(
-            "savestate.load",
-            json!({ "path": path.clone() }),
-            SAVESTATE_READ_TIMEOUT,
-        )?;
+        let result = self
+            .ws
+            .call_with_timeout(
+                "savestate.load",
+                json!({ "path": path.clone() }),
+                SAVESTATE_READ_TIMEOUT,
+            )
+            .inspect_err(|error| {
+                if error.to_string().contains("emucap memory park unverified") {
+                    self.control_unverified = true;
+                }
+            })?;
         if result.get("state").and_then(Value::as_str) != Some("frozen") {
             return Err(BridgeError::BadState(
                 "native savestate.load did not confirm a frozen machine".into(),

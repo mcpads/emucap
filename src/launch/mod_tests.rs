@@ -414,3 +414,55 @@ fn invalid_unsigned_pids_are_never_probed_or_signalled() {
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     assert!(!predicate_called);
 }
+
+#[cfg(windows)]
+fn hold_directory_without_delete_share(path: &Path) -> std::fs::File {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE; deliberately no DELETE.
+        .custom_flags(0x02000000) // FILE_FLAG_BACKUP_SEMANTICS permits a directory handle.
+        .open(path)
+        .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_directory_replacement_waits_for_released_windows_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(src.join("new"), b"new").unwrap();
+    std::fs::write(dst.join("old"), b"old").unwrap();
+    let held = hold_directory_without_delete_share(&dst);
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(held);
+    });
+    copy_dir_replace(&src, &dst).unwrap();
+    release.join().unwrap();
+    assert_eq!(std::fs::read(dst.join("new")).unwrap(), b"new");
+    assert!(!dst.join("old").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn persistent_windows_directory_lock_preserves_previous_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    let dst = dir.path().join("dst");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::create_dir(&dst).unwrap();
+    std::fs::write(src.join("new"), b"new").unwrap();
+    std::fs::write(dst.join("old"), b"old").unwrap();
+    let held = hold_directory_without_delete_share(&dst);
+    let started = std::time::Instant::now();
+    assert!(copy_dir_replace(&src, &dst).is_err());
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    assert_eq!(std::fs::read(dst.join("old")).unwrap(), b"old");
+    assert!(!dst.join("new").exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    drop(held);
+}

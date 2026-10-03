@@ -65,13 +65,13 @@ impl Drop for Mupen64PlusHost {
                 unsafe {
                     let _ = (self.api.core_detach_plugin)(plugin.kind);
                     let _ = (plugin.shutdown)();
-                    libc::dlclose(plugin.handle);
+                    close_library(plugin.handle);
                 }
             }
             unsafe {
                 let _ = (self.api.core_do_command)(M64CMD_ROM_CLOSE, 0, ptr::null_mut());
                 let _ = (self.api.core_shutdown)();
-                libc::dlclose(self.core_handle);
+                close_library(self.core_handle);
             }
             return;
         }
@@ -93,13 +93,13 @@ impl Drop for Mupen64PlusHost {
                 unsafe {
                     let _ = (self.api.core_detach_plugin)(plugin.kind);
                     let _ = (plugin.shutdown)();
-                    libc::dlclose(plugin.handle);
+                    close_library(plugin.handle);
                 }
             }
             unsafe {
                 let _ = (self.api.core_do_command)(M64CMD_ROM_CLOSE, 0, ptr::null_mut());
                 let _ = (self.api.core_shutdown)();
-                libc::dlclose(self.core_handle);
+                close_library(self.core_handle);
             }
         }
     }

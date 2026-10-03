@@ -5,7 +5,7 @@ pub(crate) const SERVER_INSTRUCTIONS: &str = r#"Debug through the connected emul
 
 Start with `bootstrap()` and follow `primary_action`. Full `status` supplies names, limits and capabilities; refresh after reconnect or generation change. Compose operations when `contracts.state=validated`.
 
-Use `tap` for button/key input. Describe `pointer` for mouse controls or `debug` for specialized controls, then execute with the returned schema and `known_capability_revision`. Describe `analysis` for optional analysis.
+Use `tap` for button/key input, including long holds and simultaneous buttons: `press_frames` sets the hold duration and `after_frames` the advance after release. Describe `pointer` for mouse controls or `debug` for specialized controls, then execute with the returned schema and `known_capability_revision`. Describe `analysis` for optional analysis.
 
 ## Manage the runtime
 

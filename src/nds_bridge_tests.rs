@@ -40,8 +40,15 @@ impl FakeGdb {
 impl GdbTransport for FakeGdb {
     fn send(&mut self, payload: &str) -> Result<String, GdbError> {
         // Status reads pacing on every call; answer it outside the scripted exchange.
-        if payload == "qEmucap,pacing" {
+        if payload == "qEmucap,pacing"
+            && self.replies.front().is_none_or(|(next, _)| next != payload)
+        {
             return Ok("64,0,1,0".into());
+        }
+        if payload == "qEmucap,rateInfo"
+            && self.replies.front().is_none_or(|(next, _)| next != payload)
+        {
+            return Ok("1;64,0,1,0".into());
         }
         self.calls.push(payload.into());
         let Some((expected, reply)) = self.replies.pop_front() else {
@@ -1808,9 +1815,37 @@ fn native_memory_batch_reads_discontinuous_ram_once() {
 }
 
 #[test]
+fn native_memory_batch_rejects_malformed_reply_and_closes_control() {
+    for native in [
+        "7,7b:0102",
+        "7,7b:0102f",
+        "7,7b:0102fg",
+        "7,7b:0102ffff",
+        "7,7b:",
+        "7:0102ff",
+        "z,7b:0102ff",
+        "7,-1:0102ff",
+        "7,7b:0102ff:00",
+    ] {
+        let mut host = NdsBridge::new(
+            FakeGdb::with(&[("?", "S05"), ("qEmucap,batch:10,2;0,1", native)]),
+            None,
+            GdbBridgeEnv::default(),
+        );
+        let result = host.read_memory_batch(&json!({"ranges":[
+            {"memory_type":"main","address":16,"length":2},
+            {"memory_type":"main","address":0,"length":1}
+        ]}));
+        assert!(result.is_err(), "accepted {native}");
+        assert!(host.backend_terminal(), "control reusable after {native}");
+        assert_eq!(host.arm9.gdb.calls, ["?", "qEmucap,batch:10,2;0,1"]);
+    }
+}
+
+#[test]
 fn pacing_setter_failure_closes_control_without_blind_rollback() {
     let mut host = NdsBridge::new(
-        FakeGdb::with(&[("?", "S05"), ("QEmucap,pacing:32", "E03")]),
+        FakeGdb::with(&[("?", "S05"), ("QEmucap,rate:32", "E03")]),
         None,
         GdbBridgeEnv::default(),
     );
@@ -1820,4 +1855,275 @@ fn pacing_setter_failure_closes_control_without_blind_rollback() {
         .to_string()
         .contains("unverified"));
     assert!(host.backend_terminal());
+}
+
+#[test]
+fn pacing_confirmation_rejects_native_noop_clamp_and_override() {
+    for (after, healthy) in [
+        ("broken", false),
+        ("64,0,2,0", false),
+        ("19,0,2,0", false),
+        ("32,1,2,0", false),
+        ("32,0,2,0", true),
+    ] {
+        let mut host = NdsBridge::new(
+            FakeGdb::with(&[
+                ("?", "S05"),
+                ("qEmucap,rateInfo", "1;64,0,1,0"),
+                ("QEmucap,rate:32", &format!("1;64,0,1,0;{after}")),
+            ]),
+            None,
+            GdbBridgeEnv::default(),
+        );
+        let response = host.handle_request(Request::new(
+            901,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert_eq!(response.ok, healthy, "{after}");
+        assert_eq!(host.backend_terminal(), !healthy, "{after}");
+        assert!(host.arm9.gdb.replies.is_empty());
+        if !healthy {
+            assert!(response.result.is_none());
+            // The executable maps backend_terminal to BridgeReply::terminate_with;
+            // NdsBridge itself does not own the socket server's next-request loop.
+            assert_eq!(host.arm9.gdb.calls.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn pacing_preserves_arm7_breakpoint_arriving_before_or_during_set() {
+    for delay in [0, 1] {
+        let regs = arm_regs_hex(&[(15, 0x0380_0000)], 0);
+        let arm9 = FakeGdb::with(&[
+            ("?", "S05"),
+            ("qEmucap,rateInfo", "1;64,0,1,0"),
+            ("QEmucap,rate:32", "1;64,0,1,0;32,0,2,0"),
+        ]);
+        let arm7 = FakeGdb::with(&[("?", "S05"), ("Z0,3800000,4", "OK"), ("g", &regs)]);
+        let mut host = NdsBridge::new(arm9, Some(arm7), GdbBridgeEnv::default());
+        let set = host.handle_request(Request::new(1, "set_breakpoint",
+            json!({"kind":"exec","cpu":"arm7","memory_type":"arm7","start":0x0380_0000,"end":0x0380_0000,"pause_on_hit":true})));
+        let id = set.result.unwrap()["id"].clone();
+        host.set_scheduler_frozen(false);
+        let arm7 = host.arm7.as_mut().unwrap();
+        arm7.gdb.nonblocking.push_back("S05".into());
+        arm7.gdb.nonblocking_delay = delay;
+        let response = host.handle_request(Request::new(
+            2,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(
+            response.result.unwrap()["state"],
+            "frozen",
+            "stop delay {delay}"
+        );
+        assert!(host.arm9.frozen && host.arm7.as_ref().unwrap().frozen);
+        let events = host
+            .handle_request(Request::new(3, "poll_events", json!({})))
+            .result
+            .unwrap();
+        let hit = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["breakpoint_id"] == id)
+            .expect("ARM7 hit retained");
+        assert_eq!(hit["cpu"], "arm7");
+        assert_eq!(hit["address"], 0x0380_0000);
+        for cpu in [&host.arm9, host.arm7.as_ref().unwrap()] {
+            assert_eq!(cpu.gdb.interrupts, 0);
+            assert!(!cpu.gdb.calls.iter().any(|call| call == "c" || call == "s"));
+            assert!(cpu.gdb.replies.is_empty());
+        }
+    }
+}
+
+#[test]
+fn pacing_previous_is_native_transaction_value_not_probe() {
+    let mut host = NdsBridge::new(
+        FakeGdb::with(&[
+            ("?", "S05"),
+            ("qEmucap,rateInfo", "1;64,0,1,0"),
+            ("QEmucap,rate:32", "1;fa,0,8,5;32,0,9,5"),
+        ]),
+        None,
+        GdbBridgeEnv::default(),
+    );
+    let reply = host
+        .execution_speed(&json!({"mode":"limited","percent":50}))
+        .unwrap();
+    assert_eq!(reply["previous"]["percent"], 250);
+    assert_eq!(reply["previous"]["policy_revision"], "8");
+    assert_eq!(reply["frame"], 5);
+}
+
+#[test]
+fn pacing_old_host_rejected_before_mutation() {
+    let mut host = NdsBridge::new(
+        FakeGdb::with(&[("?", "S05"), ("qEmucap,rateInfo", "")]),
+        None,
+        GdbBridgeEnv::default(),
+    );
+    assert!(matches!(
+        host.execution_speed(&json!({"mode":"limited","percent":50})),
+        Err(NdsBridgeError::Unsupported(_))
+    ));
+    assert!(!host.backend_terminal());
+    assert_eq!(host.arm9.gdb.calls, ["?", "qEmucap,rateInfo"]);
+}
+
+#[test]
+fn pacing_transaction_identity_fields_are_required_after_set() {
+    for raw in [
+        "OK",
+        "2;64,0,1,0;32,0,2,0",
+        "1;broken;32,0,2,0",
+        "1;64,0,1,0;32,0,1,0",
+        "1;64,0,1,0;32,0,2,0;extra",
+    ] {
+        let mut host = NdsBridge::new(
+            FakeGdb::with(&[
+                ("?", "S05"),
+                ("qEmucap,rateInfo", "1;64,0,1,0"),
+                ("QEmucap,rate:32", raw),
+            ]),
+            None,
+            GdbBridgeEnv::default(),
+        );
+        let error = host
+            .execution_speed(&json!({"mode":"limited","percent":50}))
+            .unwrap_err();
+        assert!(host.backend_terminal(), "{raw}");
+        assert!(error.to_string().contains("native transaction"));
+        assert_eq!(host.arm9.gdb.calls.len(), 3);
+    }
+}
+
+#[test]
+fn status_transport_failure_cannot_publish_cached_frozen_state() {
+    struct StatusFailure {
+        fail_at: &'static str,
+        transport_error: bool,
+        calls: Vec<String>,
+    }
+    impl GdbTransport for StatusFailure {
+        fn send(&mut self, packet: &str) -> Result<String, GdbError> {
+            self.calls.push(packet.into());
+            if packet == "?" {
+                return Ok("S05".into());
+            }
+            if packet == self.fail_at {
+                return if self.transport_error {
+                    Err(GdbError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "status park query timed out",
+                    )))
+                } else {
+                    Ok("E01".into())
+                };
+            }
+            Ok(if packet == "qEmucap,pacing" {
+                "64,0,1,7"
+            } else {
+                "0"
+            }
+            .into())
+        }
+        fn send_no_reply(&mut self, _: &str) -> Result<(), GdbError> {
+            panic!("status must not resume")
+        }
+        fn interrupt(&mut self) -> Result<String, GdbError> {
+            panic!("status must not interrupt")
+        }
+    }
+    for (index, packet) in [
+        "qEmucap,inputstatus",
+        "qEmucap,touchstatus",
+        "qEmucap,pacing",
+    ]
+    .iter()
+    .enumerate()
+    {
+        for transport_error in [false, true] {
+            let wire = StatusFailure {
+                fail_at: packet,
+                transport_error,
+                calls: Vec::new(),
+            };
+            let mut bridge = NdsBridge::new(wire, None, GdbBridgeEnv::default());
+            let reply = bridge.handle_request(Request::new(1, "status", json!({})));
+            assert_eq!(reply.ok, !transport_error);
+            assert_eq!(bridge.backend_terminal(), transport_error);
+            if transport_error {
+                assert!(reply.result.is_none());
+                assert!(reply
+                    .error
+                    .unwrap()
+                    .message
+                    .contains("status park query timed out"));
+                assert_eq!(
+                    bridge.arm9.gdb.calls.len(),
+                    index + 2,
+                    "must preserve the first timeout without issuing more native queries"
+                );
+            } else {
+                assert_eq!(
+                    reply.result.unwrap()["state"],
+                    "frozen",
+                    "a correlated unsupported optional field does not invalidate stop authority"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn batch_epochs_separate_same_clock_load_and_reset_dispatch() {
+    let load = format!("QEmucap,loadstate:{}", hex::encode("/tmp/epoch.dsv"));
+    let mut replies = vec![("?".into(), "S05".into())];
+    for operation in [
+        None,
+        Some(load.as_str()),
+        Some("QEmucap,reset"),
+        Some(load.as_str()),
+    ] {
+        if let Some(command) = operation {
+            replies.push((command.into(), "OK".into()));
+        }
+        for _ in 0..2 {
+            replies.push(("qEmucap,batch:0,1".into(), "7,7b:aa".into()));
+        }
+    }
+    let mut host = NdsBridge::new(FakeGdb::from_pairs(replies), None, GdbBridgeEnv::default());
+    let mut previous = None;
+    for operation in [None, Some("load_state"), Some("reset"), Some("load_state")] {
+        if let Some(method) = operation {
+            let r = host.handle_request(Request::new(1, method, json!({"path":"/tmp/epoch.dsv"})));
+            assert!(r.ok, "{:?}", r.error);
+        }
+        let mut current = None;
+        for _ in 0..2 {
+            let r = host.handle_request(Request::new(
+                2,
+                "read_memory_batch",
+                json!({"ranges":[{"memory_type":"main","address":0,"length":1}]}),
+            ));
+            assert!(r.ok, "{:?}", r.error);
+            let b = r.result.unwrap()["boundary"].clone();
+            assert_eq!(b["clocks"][0]["value"], 123);
+            if let Some(ref stable) = current {
+                assert_eq!(stable, &b);
+            }
+            current = Some(b);
+        }
+        if let Some(old) = previous {
+            assert_ne!(Some(old), current);
+        }
+        previous = current;
+    }
+    assert!(host.arm9.gdb.replies.is_empty());
 }

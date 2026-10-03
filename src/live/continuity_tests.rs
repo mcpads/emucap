@@ -622,10 +622,12 @@ fn live_foreign_lease_rejects_mutation_without_calling_inner_link() {
     );
     let mut link = ObservedLink::with_store(inner, store);
 
-    assert!(matches!(
-        link.call("write_memory", serde_json::json!({})),
-        Err(LinkError::Busy)
-    ));
+    for method in ["write_memory", "execution_speed"] {
+        assert!(matches!(
+            link.call(method, serde_json::json!({"mode":"limited","percent":50})),
+            Err(LinkError::Busy)
+        ));
+    }
     assert_eq!(link.continuity().lease.state, LeaseState::Occupied);
     assert_eq!(link.inner.outcomes.len(), 1, "inner mutation must not run");
 
@@ -1222,7 +1224,8 @@ fn broker_lease_wait_cannot_restart_a_temporal_dispatch_deadline() {
     fs2::FileExt::unlock(&lock).unwrap();
     let result = worker.join().unwrap();
     assert!(
-        matches!(result,Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_unverified")
+        matches!(result,Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_unverified"),
+        "{result:?}"
     );
     assert!(closed.load(Ordering::SeqCst));
 }

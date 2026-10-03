@@ -1,0 +1,62 @@
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -156,6 +156,10 @@
+ 
+ static std::atomic<VMState> s_state{VMState::Shutdown};
+ static bool s_cpu_implementation_changed = false;
++// CPU-thread-only nesting guards. Paused is published before pause hooks finish,
++// and those hooks may still be running inside Execute().
++static unsigned s_emucap_execution_depth = 0;
++static unsigned s_emucap_state_transition_depth = 0;
+ static Threading::ThreadHandle s_vm_thread_handle;
+ 
+ static std::deque<std::thread> s_save_state_threads;
+@@ -265,8 +269,16 @@
+ 	s_session_resume_timestamp = static_cast<u64>(Common::Timer::GetCurrentValue());
+ }
+ 
++bool VMManager::IsEmucapExecutionParkedOnCPUThread()
++{
++	return GetState() == VMState::Paused && s_emucap_execution_depth == 0 &&
++		s_emucap_state_transition_depth == 0;
++}
++
+ void VMManager::SetState(VMState state)
+ {
++	++s_emucap_state_transition_depth;
++	ScopedGuard emucap_transition = [] { --s_emucap_state_transition_depth; };
+ 	++s_emucap_memory_epoch;
+ 	// Some state transitions aren't valid.
+ 	const VMState old_state = s_state.load(std::memory_order_acquire);
+@@ -308,7 +320,9 @@
+ 	}
+ 	else if (state == VMState::Stopping && old_state == VMState::Running)
+ 	{
+-		// If stopping, break execution as soon as possible.
++		// ExitExecution can leave through the CPU fastjmp boundary.
++		// Release this scope before that non-local exit.
++		emucap_transition.Run();
+ 		Cpu->ExitExecution();
+ 	}
+ }
+@@ -2740,6 +2754,8 @@
+ 
+ void VMManager::Execute()
+ {
++	++s_emucap_execution_depth;
++	ScopedGuard emucap_execution = [] { --s_emucap_execution_depth; };
+ 	// Check for interpreter<->recompiler switches.
+ 	if (std::exchange(s_cpu_implementation_changed, false))
+ 	{
+--- a/pcsx2/VMManager.h
++++ b/pcsx2/VMManager.h
+@@ -66,6 +66,9 @@
+ namespace VMManager
+ {
+ 	u64 GetEmucapMemoryEpoch();
++	/// CPU thread only: guest execution has unwound and pause hooks have returned.
++	/// Operation ownership must separately exclude concurrent lifecycle mutations.
++	bool IsEmucapExecutionParkedOnCPUThread();
+ 	/// The number of usable save state slots.
+ 	static constexpr s32 NUM_SAVE_STATE_SLOTS = 10;
+ 

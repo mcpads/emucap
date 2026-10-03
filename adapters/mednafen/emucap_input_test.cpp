@@ -31,5 +31,15 @@ int main() {
   unsigned char short_port[1] = {0};
   input.apply(short_port, 1);
   assert(short_port[0] == 0x34);
+  // Controller mode/padding bits share the button bytes on some devices.
+  // PCE mode_select (bit 12) is not an injectable button.
+  unsigned char configured[4] = {0xFF, 0x90, 0xA5, 0x5A};
+  input.engage(1);
+  input.apply(configured, 4, 0x0FFF);
+  assert(configured[0] == 1 && configured[1] == 0x90);
+  assert(configured[2] == 0xA5 && configured[3] == 0x5A);
+  input.engage(0);
+  input.apply(configured, 4, 0x0FFF);
+  assert(configured[0] == 0 && configured[1] == 0x90);
   return 0;
 }

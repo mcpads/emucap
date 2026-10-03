@@ -1,0 +1,10 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2965,6 +2965,6 @@
+ 	target_link_libraries(PPSSPPHeadless ${COCOA_LIBRARY} ${QUARTZ_CORE_LIBRARY} ${IOKIT_LIBRARY} ${LinkCommon})
+ 	if(WIN32)
+-		target_link_libraries(PPSSPPHeadless d2d1 dwrite d3d11)
++		target_link_libraries(PPSSPPHeadless d2d1 dwrite d3d11 comctl32 mfuuid)
+ 	endif()
+ 	setup_target_project(PPSSPPHeadless headless)
+ endif()

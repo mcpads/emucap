@@ -68,7 +68,7 @@ pub fn centi_percent(percent: f64) -> Option<u64> {
     let scaled = percent * CENTI as f64;
     let rounded = scaled.round();
     // Absorb binary floating-point representation error only; never round a real fraction.
-    if (scaled - rounded).abs() > 1e-6 * rounded.max(1.0) || rounded < 1.0 {
+    if (scaled - rounded).abs() > 4.0 * f64::EPSILON * scaled.max(1.0) || rounded < 1.0 {
         return None;
     }
     let centi = rounded as u64;

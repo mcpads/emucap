@@ -47,6 +47,12 @@ pub fn mednafen_spec(
     }
     spec = spec.args(["-sound", if mednafen.sound { "1" } else { "0" }]);
     spec = spec.env("MEDNAFEN_HOME", runtime_home.to_string_lossy().into_owned());
+    #[cfg(windows)]
+    {
+        spec = spec
+            .env("MEDNAFEN_NOPOPUPS", "1")
+            .env("MEDNAFEN_NOSTDREDIR", "1");
+    }
     if mednafen.start_frozen || mednafen.repeatable {
         spec = spec.env("EMUCAP_START_FROZEN", "1");
     }
@@ -245,12 +251,14 @@ pub fn mame_spec(binary: &Path, log_path: &Path, o: &MameOpts) -> LaunchSpec {
         "-mouse".into(),
     ];
     if o.headless {
+        // Native Windows MAME has no SDL video-driver option.
+        if !cfg!(windows) {
+            args.extend(["-videodriver", "dummy"].map(String::from));
+        }
         args.extend(
             [
                 "-video",
                 "none",
-                "-videodriver",
-                "dummy",
                 "-window",
                 "-nomaximize",
                 "-keyboardprovider",

@@ -165,3 +165,33 @@ fn cancellation_consumes_pending_reply_before_cleanup_and_keeps_its_deadline() {
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(control.is_terminal());
 }
+
+#[test]
+fn control_lines_preserve_exact_limit_and_next_reply() {
+    let first = "x".repeat(MAX_CONTROL_LINE_BYTES) + "\n";
+    let input = first.clone() + "<reply result=\"ok\">ready</reply>\n";
+    let mut reader = BufReader::with_capacity(37, input.as_bytes());
+    assert_eq!(read_control_line(&mut reader).unwrap(), Some(first));
+    assert_eq!(
+        read_control_line(&mut reader).unwrap().unwrap(),
+        "<reply result=\"ok\">ready</reply>\n"
+    );
+    assert_eq!(read_control_line(&mut reader).unwrap(), None);
+}
+
+#[test]
+fn control_lines_reject_oversize_truncation_and_invalid_utf8() {
+    for suffix in ["", "\n"] {
+        let input = "x".repeat(MAX_CONTROL_LINE_BYTES + 1) + suffix;
+        let error = read_control_line(&mut input.as_bytes()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+    assert_eq!(
+        read_control_line(&mut &b"<reply"[..]).unwrap_err().kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+    assert_eq!(
+        read_control_line(&mut &b"\xff\n"[..]).unwrap_err().kind(),
+        io::ErrorKind::InvalidData
+    );
+}

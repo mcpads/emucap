@@ -416,6 +416,8 @@ fn broker_link_write_timeout_poisons() {
         let _ = rel_rx.recv();
     });
     let mut link = broker_link::connect(&addr, None, Duration::from_millis(200)).unwrap();
+    #[cfg(windows)]
+    link.disable_test_send_buffer();
     // 큰 params로 요청 한 줄을 수십 MB로 만들어 송신+broker recv 버퍼를 넘긴다 → write_all 스톨.
     let big = "x".repeat(32 * 1024 * 1024);
     let r = link.call("read_memory", serde_json::json!({ "blob": big }));
@@ -667,4 +669,45 @@ fn broker_parent_deadline_closes_a_partial_reply_without_reconnecting() {
         ),
         Err(LinkError::NotConnected)
     ));
+}
+
+#[test]
+fn broker_temporal_rejection_preserves_attachment_for_cleanup() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let control = super::temporal::wire::tests::control();
+    let worker =
+        std::thread::spawn(move || {
+            let (mut writer, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(writer.try_clone().unwrap());
+            let mut attach = String::new();
+            reader.read_line(&mut attach).unwrap();
+            let attach: serde_json::Value = serde_json::from_str(&attach).unwrap();
+            writeln!(writer,"{}",serde_json::json!({"id":attach["id"],"ok":true,"result":{
+            "attached_name":"temporal", "broker_registration_id":1, "methods":["step","status"]
+        }})).unwrap();
+            super::temporal::wire::tests::rejected_input_peer(reader, writer);
+        });
+    let mut link = broker_link::connect(&addr, None, Duration::from_secs(2)).unwrap();
+    let result = link
+        .call_with_progress(
+            "set_input",
+            serde_json::json!({"buttons":["invalid"],"_temporal_owner":control.abort.as_ref().unwrap().params}),
+            &mut |_| panic!("plain temporal keepalive is not recording progress"),
+            &control,
+        )
+        .unwrap_err();
+    assert!(matches!(result, LinkError::Emulator { ref kind, .. } if kind == "bad_params"));
+    link.call_with_progress(
+        "set_input",
+        serde_json::json!({"buttons":[],"_temporal_owner":control.abort.as_ref().unwrap().params}),
+        &mut |_| Ok(()),
+        &control,
+    )
+    .unwrap();
+    assert_eq!(
+        link.call("status", serde_json::json!({})).unwrap()["state"],
+        "frozen"
+    );
+    worker.join().unwrap();
 }

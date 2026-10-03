@@ -464,6 +464,31 @@ fn unique_output_sibling(parent: &Path, file_name: &str, label: &str) -> PathBuf
     ))
 }
 
+/// Flush directory entries on Unix. Windows publication uses a write-through move
+/// after flushing every member file; opening a directory as a regular file is invalid.
+pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+pub(crate) fn rename_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        move_path_windows(source, destination, false)
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
+    }
+}
+
 #[cfg(not(windows))]
 pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
     fs::rename(source, destination)
@@ -471,11 +496,21 @@ pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::
 
 #[cfg(windows)]
 pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    move_path_windows(source, destination, true)
+}
+
+#[cfg(windows)]
+fn move_path_windows(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
+    // std::fs handles long Windows paths internally; raw Win32 calls need the
+    // verbatim parent explicitly. Resolve the parent so a new destination and
+    // the source's final component keep their existing rename semantics.
+    let source = windows_move_path(source)?;
+    let destination = windows_move_path(destination)?;
     let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
     let destination: Vec<u16> = destination
         .as_os_str()
@@ -487,7 +522,12 @@ pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::
         MoveFileExW(
             source.as_ptr(),
             destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            MOVEFILE_WRITE_THROUGH
+                | if replace {
+                    MOVEFILE_REPLACE_EXISTING
+                } else {
+                    0
+                },
         )
     };
     if ok == 0 {
@@ -495,4 +535,19 @@ pub(crate) fn replace_file_atomically(source: &Path, destination: &Path) -> io::
     } else {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn windows_move_path(path: &Path) -> io::Result<PathBuf> {
+    let path = std::path::absolute(path)?;
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "move path has no final component",
+        )
+    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "move path has no parent"))?;
+    Ok(fs::canonicalize(parent)?.join(name))
 }

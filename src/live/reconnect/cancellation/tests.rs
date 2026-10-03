@@ -93,7 +93,12 @@ fn exact_identity_only_and_cleanup_precedes_original_terminal() {
         );
         assert!(observed_rx.try_recv().is_err());
     }
-    send(&mut client, 5, "set_execution_speed", serde_json::json!({}));
+    send(
+        &mut client,
+        5,
+        "execution_speed",
+        serde_json::json!({"mode":"unlimited"}),
+    );
     assert_eq!(receive(&mut reader, 5).error.unwrap().kind, "busy");
     for id in [6, 7] {
         send(
@@ -268,7 +273,12 @@ fn session_rejects_wrong_runtime_then_cancels_and_accepts_next_request() {
         receive(&mut reader, 5).result.unwrap()["status"],
         "not_active"
     );
-    send(&mut client, 6, "status", serde_json::json!({}));
+    send(
+        &mut client,
+        6,
+        "execution_speed",
+        serde_json::json!({"mode":"unlimited"}),
+    );
     assert!(receive(&mut reader, 6).ok);
     assert_eq!(calls.load(Ordering::SeqCst), 2);
     drop(reader);

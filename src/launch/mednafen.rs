@@ -348,6 +348,15 @@ pub struct Launch<'a> {
 
 fn copy_run_binary(src: &Path, dst: &Path) -> std::io::Result<()> {
     super::copy_file_replace(src, dst)?;
+    super::copy_adjacent_dlls(
+        src,
+        dst.parent().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                "runtime binary has no parent directory",
+            )
+        })?,
+    )?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

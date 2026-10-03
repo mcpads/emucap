@@ -1,0 +1,219 @@
+--- a/src/md/system.cpp
++++ b/src/md/system.cpp
+@@ -18,4 +18,5 @@
+ 
+ #include "shared.h"
++#include "../drivers/emucap_frame_call.h"
+ #include "cart/cart.h"
+ #include "cd/cd.h"
+@@ -196,9 +197,14 @@
+ }
+ 
++void BindFrameInput(void)
++{
++ MDFNMP_ApplyPeriodicCheats();
++ MDINPUT_Frame();
++}
++
+ static void Emulate(EmulateSpecStruct *espec)
+ {
+  //printf("%016llx %016llx %016llx\n", z80_tstates, last_z80_tstates, z80.interrupts_enabled_at);
+ 
+- MDFNMP_ApplyPeriodicCheats();
+ 
+  // A restored partial frame already owns its input-device clock origins.
+@@ -207,5 +213,6 @@
+   MDIO_BeginTimePeriod(0);
+ 
+- MDINPUT_Frame();
++ if(!emucap_restored_frame_output_active())
++  BindFrameInput();
+ 
+  if(espec->VideoFormatChanged)
+--- a/src/wswan/main.cpp
++++ b/src/wswan/main.cpp
+@@ -20,4 +20,5 @@
+ 
+ #include "wswan.h"
++#include "../drivers/emucap_frame_call.h"
+ #include <mednafen/hash/md5.h>
+ #include <mednafen/mempatcher.h>
+@@ -99,11 +100,18 @@
+ }
+ 
+-static void Emulate(EmulateSpecStruct *espec)
+-{
+- BindFrameOutput(espec);
+-
++void BindFrameInput(void)
++{
+  WSButtonStatus = MDFN_de16lsb(PortDeviceData);
+  
+  MDFNMP_ApplyPeriodicCheats();
++
++}
++
++static void Emulate(EmulateSpecStruct *espec)
++{
++ BindFrameOutput(espec);
++
++ if(!emucap_restored_frame_output_active())
++  BindFrameInput();
+ 
+  while(!wsExecuteLine(espec->surface, espec->skip))
+--- a/src/pcfx/pcfx.cpp
++++ b/src/pcfx/pcfx.cpp
+@@ -21,4 +21,5 @@
+ 
+ #include "pcfx.h"
++#include "../drivers/emucap_frame_call.h"
+ #include "soundbox.h"
+ #include "input.h"
+@@ -251,11 +252,18 @@
+ }
+ 
++void BindFrameInput(void)
++{
++ FXINPUT_Frame();
++
++ MDFNMP_ApplyPeriodicCheats();
++
++}
++
+ static void Emulate(EmulateSpecStruct *espec)
+ {
+  //printf("%d\n", PCFX_V810.v810_timestamp);
+ 
+- FXINPUT_Frame();
+-
+- MDFNMP_ApplyPeriodicCheats();
++ if(!emucap_restored_frame_output_active())
++  BindFrameInput();
+ 
+  BindFrameOutput(espec);
+--- a/src/psx/psx.cpp
++++ b/src/psx/psx.cpp
+@@ -21,4 +21,5 @@
+ 
+ #include "psx.h"
++#include "../drivers/emucap_frame_call.h"
+ #include "mdec.h"
+ #include "frontio.h"
+@@ -1116,4 +1117,17 @@
+ 
+ 
++namespace MDFN_IEN_PSX {
++void BindFrameInput(void)
++{
++ MDFNGameInfo->mouse_sensitivity = MDFN_GetSettingF("psx.input.mouse_sensitivity");
++
++ MDFNMP_ApplyPeriodicCheats();
++
++
++ FIO->UpdateInput();
++}
++
++}
++
+ static void Emulate(EmulateSpecStruct *espec)
+ {
+@@ -1132,13 +1146,10 @@
+  }
+ 
+- MDFNGameInfo->mouse_sensitivity = MDFN_GetSettingF("psx.input.mouse_sensitivity");
+-
+- MDFNMP_ApplyPeriodicCheats();
+-
+-
+- espec->MasterCycles = 0;
+- espec->SoundBufSize = 0;
+-
+- FIO->UpdateInput();
++ if(!emucap_restored_frame_output_active())
++ {
++  BindFrameInput();
++  espec->MasterCycles = 0;
++  espec->SoundBufSize = 0;
++ }
+  GPU_StartFrame(psf_loader ? NULL : espec);
+  SPU->StartFrame(espec->SoundRate, MDFN_GetSettingUI("psx.spu.resamp_quality"));
+--- a/src/pce/pce.cpp
++++ b/src/pce/pce.cpp
+@@ -17,4 +17,5 @@
+ 
+ #include "pce.h"
++#include "../drivers/emucap_frame_call.h"
+ #include "vce.h"
+ #include <mednafen/hw_sound/pce_psg/pce_psg.h>
+@@ -837,8 +838,10 @@
+  es = espec;
+ 
+- espec->MasterCycles = 0;
+- espec->SoundBufSize = 0;
+-
+- MDFNMP_ApplyPeriodicCheats();
++ if(!emucap_restored_frame_output_active())
++ {
++  espec->MasterCycles = 0;
++  espec->SoundBufSize = 0;
++  MDFNMP_ApplyPeriodicCheats();
++ }
+ 
+  if(apply_formats && espec->VideoFormatChanged)
+@@ -875,4 +878,5 @@
+  //for(int i = 0; i < 2; i++)
+  bool rp_rv;
++ bool resumed_input = emucap_restored_frame_output_active();
+  do
+  {
+@@ -882,5 +886,7 @@
+   //printf("ST: %d\n", HuCPU.Timestamp());
+ 
+-  INPUT_Frame();
++  if(!resumed_input)
++   INPUT_Frame();
++  resumed_input = false;
+ 
+   //vce->RunFrame(espec->surface, &espec->DisplayRect, espec->LineWidths, IsHES ? 1 : espec->skip);
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -2746,5 +2746,5 @@
+ 
+ #ifdef WANT_WSWAN_EMU
+-namespace MDFN_IEN_WSWAN { void BindFrameOutput(Mednafen::EmulateSpecStruct*); }
++namespace MDFN_IEN_WSWAN { void BindFrameOutput(Mednafen::EmulateSpecStruct*); void BindFrameInput(void); }
+ #endif
+ #ifdef WANT_NGP_EMU
+@@ -2752,5 +2752,12 @@
+ #endif
+ #ifdef WANT_PCFX_EMU
+-namespace MDFN_IEN_PCFX { void BindFrameOutput(Mednafen::EmulateSpecStruct*); }
++namespace MDFN_IEN_PCFX { void BindFrameOutput(Mednafen::EmulateSpecStruct*); void BindFrameInput(void); }
++#endif
++
++#ifdef WANT_MD_EMU
++namespace MDFN_IEN_MD { void BindFrameInput(void); }
++#endif
++#ifdef WANT_PSX_EMU
++namespace MDFN_IEN_PSX { void BindFrameInput(void); }
+ #endif
+ 
+@@ -2765,4 +2772,18 @@
+   spec.InterlaceOn = spec.InterlaceField = false;
+   Mednafen::PrepareFrameOutput(&spec);
++  // A new frame consumes current frontend input once, after acknowledgement.
++#ifdef WANT_MD_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "md")) MDFN_IEN_MD::BindFrameInput();
++#endif
++#ifdef WANT_PSX_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "psx")) MDFN_IEN_PSX::BindFrameInput();
++#endif
++#ifdef WANT_WSWAN_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "wswan")) MDFN_IEN_WSWAN::BindFrameInput();
++#endif
++#ifdef WANT_PCFX_EMU
++  if(!strcmp(Mednafen::MDFNGameInfo->shortname, "pcfx")) MDFN_IEN_PCFX::BindFrameInput();
++#endif
++
+   // The suspended core has already passed its ordinary output-binding entry.
+   // Rebind from restored native state before allowing guest work.

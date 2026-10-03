@@ -1,0 +1,25 @@
+--- a/src/wswan/v30mz.cpp
++++ b/src/wswan/v30mz.cpp
+@@ -35,6 +35,8 @@
+ #include "v30mz.h"
+ #include "v30mz-private.h"
+ #include "debug.h"
++
++extern "C" void emucap_native_idle_service(void);
+ 
+ namespace MDFN_IEN_WSWAN
+ {
+@@ -1058,10 +1060,9 @@
+    if(tmp > 0)
+     CLK(tmp);
+ 
+-   #ifdef WANT_DEBUGGER
+-   if(cpu_hook)
+-    cpu_hook(I.pc);
+-   #endif
++   // This interval consumed idle clocks, not an instruction. Service the owner
++   // without fabricating a CPU instruction boundary or advancing its count.
++   emucap_native_idle_service();
+    return;
+   }
+  }

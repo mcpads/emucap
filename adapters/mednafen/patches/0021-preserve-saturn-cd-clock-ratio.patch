@@ -1,0 +1,10 @@
+--- a/src/ss/cdb.cpp
++++ b/src/ss/cdb.cpp
+@@ -4285,6 +4285,7 @@
+   SFVAR(CalcedActualSize),
+ 
+   SFVAR(lastts),
++  SFVAR(CDB_ClockRatio),
+   SFVAR(CommandPhase),
+   //SFVAR(CommandYield),
+   SFVAR(CommandClockCounter),

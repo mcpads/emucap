@@ -1,23 +1,9 @@
-diff --git a/src/emu/screen.h b/src/emu/screen.h
---- a/src/emu/screen.h
-+++ b/src/emu/screen.h
-@@ -402,6 +402,8 @@ public:
- 	// pixel-level access
- 	u32 pixel(s32 x, s32 y);
- 	void pixels(u32* buffer);
-+	void presented_pixels(u32 *buffer);
-+	bool restore_presented_pixels(void const *buffer, size_t bytes, u32 width, u32 height);
- 
- 	// updating
- 	int partial_updates() const { return m_partial_updates_this_frame; }
-diff --git a/src/emu/screen.cpp b/src/emu/screen.cpp
 --- a/src/emu/screen.cpp
 +++ b/src/emu/screen.cpp
-@@ -1568,6 +1568,65 @@ void screen_device::pixels(u32 *buffer)
- }
+@@ -1768,6 +1768,65 @@
  
  
-+//-------------------------------------------------
+ //-------------------------------------------------
 +//  presented_pixels - copy the last bitmap that was
 +//  published to the render texture
 +//-------------------------------------------------
@@ -76,29 +62,32 @@ diff --git a/src/emu/screen.cpp b/src/emu/screen.cpp
 +}
 +
 +
- //-------------------------------------------------
++//-------------------------------------------------
  //  update_quads - set up the quads for this
  //  screen
-diff --git a/src/frontend/mame/luaengine.cpp b/src/frontend/mame/luaengine.cpp
+ //-------------------------------------------------
+--- a/src/emu/screen.h
++++ b/src/emu/screen.h
+@@ -402,6 +402,8 @@
+ 	// pixel-level access
+ 	u32 pixel(s32 x, s32 y);
+ 	void pixels(u32* buffer);
++	void presented_pixels(u32 *buffer);
++	bool restore_presented_pixels(void const *buffer, size_t bytes, u32 width, u32 height);
+ 
+ 	// updating
+ 	int partial_updates() const { return m_partial_updates_this_frame; }
 --- a/src/frontend/mame/luaengine.cpp
 +++ b/src/frontend/mame/luaengine.cpp
-@@ -1492,5 +1492,6 @@ void lua_engine::initialize()
+@@ -1492,6 +1492,7 @@
+ 	machine_type["vector_devices"] = sol::property([] (running_machine &m) { return devenum<vector_device_enumerator>(m.root_device()); });
  	machine_type["palettes"] = sol::property([] (running_machine &m) { return devenum<palette_interface_enumerator>(m.root_device()); });
  	machine_type["screens"] = sol::property([] (running_machine &m) { return devenum<screen_device_enumerator>(m.root_device()); });
 +	machine_type.set_function("finish_state_load", [] (running_machine &m) { m.save().dispatch_postload(); });
  	machine_type["cassettes"] = sol::property([] (running_machine &m) { return devenum<cassette_device_enumerator>(m.root_device()); });
  	machine_type["images"] = sol::property([] (running_machine &m) { return devenum<image_interface_enumerator>(m.root_device()); });
  	machine_type["slots"] = sol::property([](running_machine &m) { return devenum<slot_interface_enumerator>(m.root_device()); });
-@@ -1889,13 +1890,31 @@ void lua_engine::initialize()
- 	screen_dev_type.set_function(
- 			"pixels",
- 			[] (screen_device &sdev, sol::this_state s)
- 			{
- 				const rectangle &visarea = sdev.visible_area();
- 				luaL_Buffer buff;
- 				int size = visarea.height() * visarea.width() * 4;
- 				u32 *const ptr = reinterpret_cast<u32 *>(luaL_buffinitsize(s, &buff, size));
- 				sdev.pixels(ptr);
+@@ -1887,6 +1888,24 @@
  				luaL_pushresultsize(&buff, size);
  				return std::make_tuple(sol::make_reference(s, sol::stack_reference(s, -1)), visarea.width(), visarea.height());
  			});
@@ -121,3 +110,5 @@ diff --git a/src/frontend/mame/luaengine.cpp b/src/frontend/mame/luaengine.cpp
 +				return sdev.restore_presented_pixels(data.data(), data.size(), width, height);
 +			});
  	screen_dev_type["screen_type"] = sol::property(&screen_device::screen_type);
+ 	screen_dev_type["width"] = sol::property([] (screen_device &sdev) { return sdev.visible_area().width(); });
+ 	screen_dev_type["height"] = sol::property([] (screen_device &sdev) { return sdev.visible_area().height(); });

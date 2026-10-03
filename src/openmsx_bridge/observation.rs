@@ -37,6 +37,10 @@ const PACING_TCL: &str = r#"namespace eval ::emucap {
             [set ::pause] [debug breaked]] |]
     }
 
+    proc observe_policy {} {
+        return [join [list [boundary] [policy]] ";"]
+    }
+
     proc apply_policy {throttle speed} {
         set before [boundary]
         set previous [policy]
@@ -47,6 +51,13 @@ const PACING_TCL: &str = r#"namespace eval ::emucap {
             set ::fullspeedwhenloading false
             set ::speed $speed
             set ::throttle $throttle
+            if {![expr {
+                [set ::speed] == $speed &&
+                bool([set ::throttle]) == bool($throttle) &&
+                !bool([set ::fastforward]) && !bool([set ::fullspeedwhenloading])
+            }]} {
+                error "requested pacing settings were not applied"
+            }
         } message]} {
             lassign $values t s f l
             set restored [expr {![catch {
@@ -54,8 +65,19 @@ const PACING_TCL: &str = r#"namespace eval ::emucap {
                 set ::throttle $t
                 set ::fastforward $f
                 set ::fullspeedwhenloading $l
+                if {![expr {
+                    [set ::speed] == $s &&
+                    bool([set ::throttle]) == bool($t) &&
+                    bool([set ::fastforward]) == bool($f) &&
+                    bool([set ::fullspeedwhenloading]) == bool($l)
+                }]} {
+                    error "previous pacing settings were not restored"
+                }
             }]}]
-            error "emucap-policy-apply-failed restored=$restored: $message"
+            # These endpoints bound the whole apply/restore command, not only the
+            # partially applied policy interval. Restoring settings never rewinds time.
+            set after [boundary]
+            error "emucap-policy-apply-failed restored=$restored: $message; clock_domains=openmsx_emutime_seconds,emucap_frame_seq; before=$before; after=$after; previous=$previous; final=[policy]"
         }
         return [join [list $before $previous [policy] [boundary]] ";"]
     }
@@ -69,7 +91,7 @@ const PACING_TCL: &str = r#"namespace eval ::emucap {
         set ::throttle $throttle
         set ::fastforward $fastforward
         set ::fullspeedwhenloading $loading
-        return [policy]
+        return [join [list [policy] [boundary]] ";"]
     }
 }"#;
 
@@ -156,7 +178,11 @@ impl NativeBoundary {
         let [machine, time, frame, pause, breaked] = parts[..] else {
             return Err(invalid());
         };
-        if machine.is_empty() || time.parse::<f64>().is_err() {
+        if machine.is_empty()
+            || !time
+                .parse::<f64>()
+                .is_ok_and(|seconds| seconds.is_finite() && seconds >= 0.0)
+        {
             return Err(invalid());
         }
         Ok(Self {
@@ -376,41 +402,64 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         };
         self.drain_debug_events()?;
         self.refresh_execution_state()?;
+        // This pre-command observation survives response loss. It is not the
+        // transaction's previous value, which only the apply reply can establish.
+        let observed = self.control.command("::emucap::observe_policy")?;
+        let (boundary, policy) = observed
+            .split_once(';')
+            .ok_or_else(|| OpenMsxBridgeError::Protocol("invalid pacing observation".into()))?;
+        NativeBoundary::parse(boundary)?;
+        let observed_policy = NativePolicy::parse(policy)?;
+        let context = format!(
+            "clock_domains=openmsx_emutime_seconds,emucap_frame_seq; pre_command_observation={observed:?}; requested={params}; guest progress may have occurred"
+        );
         // Unlimited keeps the current `speed` setting; only the throttle governs it.
         let speed_arg = match speed {
             Some(speed) => speed,
-            None => self.native_policy()?.speed,
+            None => observed_policy.speed,
         };
-        let raw = match self
-            .control
-            .command(&format!("::emucap::apply_policy {throttle} {speed_arg}"))
-        {
+        let command = format!("::emucap::apply_policy {throttle} {speed_arg}");
+        let rejection_prefix = format!("openMSX rejected `{command}`: ");
+        let raw = match self.control.command(&command) {
             Ok(raw) => raw,
             // The native command restored the previous settings itself when it reports so.
             Err(OpenMsxBridgeError::Emulator(message))
-                if message.contains("emucap-policy-apply-failed restored=1") =>
+                if message.strip_prefix(&rejection_prefix).is_some_and(|native| {
+                    native.starts_with("emucap-policy-apply-failed restored=1:")
+                }) =>
             {
                 return Err(OpenMsxBridgeError::Emulator(format!(
                     "execution_speed failed_restored: {message}"
                 )))
             }
-            Err(OpenMsxBridgeError::Emulator(message))
-                if message.contains("emucap-policy-apply-failed") =>
-            {
-                return self.fail_debugger(format!("execution_speed unverified: {message}"))
+            Err(error) => {
+                return self.fail_debugger(format!("execution_speed unverified: {error}; {context}; native_result=unavailable; final_boundary=unknown"))
             }
-            Err(error) => return Err(error),
         };
+        let context = format!("{context}; native_transaction={raw:?}");
         let lines: Vec<_> = raw.trim().split(';').collect();
         let [before, previous, applied, after] = lines[..] else {
-            return self.fail_debugger(format!("invalid native pacing transaction reply {raw:?}"));
+            return self.fail_debugger(format!(
+                "execution_speed unverified: invalid native pacing transaction reply; {context}"
+            ));
         };
-        let (before, after) = (
-            NativeBoundary::parse(before)?,
-            NativeBoundary::parse(after)?,
-        );
-        let previous = NativePolicy::parse(previous)?;
-        let applied = NativePolicy::parse(applied)?;
+        // The command may already have changed native settings. A malformed receipt
+        // cannot establish either success or a safe revision-guarded rollback.
+        let decoded = (|| {
+            Ok::<_, OpenMsxBridgeError>((
+                NativeBoundary::parse(before)?,
+                NativeBoundary::parse(after)?,
+                NativePolicy::parse(previous)?,
+                NativePolicy::parse(applied)?,
+            ))
+        })();
+        let (before, after, previous, applied) = match decoded {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                return self
+                    .fail_debugger(format!("execution_speed unverified: {error}; {context}"))
+            }
+        };
         let public = applied.public(&capability);
         let confirmed = capability.verify_change(
             request,
@@ -420,7 +469,10 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
         // A frozen stop must be the same native stop after the transaction.
         let boundary_kept = !before.frozen || before == after;
         if confirmed.is_ok() && boundary_kept {
-            self.refresh_execution_state()?;
+            if let Err(error) = self.refresh_execution_state() {
+                return self
+                    .fail_debugger(format!("execution_speed unverified: {error}; {context}"));
+            }
             return Ok(json!({
                 "status": "completed",
                 "state": if self.frozen { "frozen" } else { "running" },
@@ -433,7 +485,7 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             Err(error) => error,
             Ok(()) => "frozen boundary changed during the pacing transaction".into(),
         };
-        self.restore_policy(&previous, &applied, &reason)
+        self.restore_policy(&previous, &applied, &format!("{reason}; {context}"))
     }
 
     /// Restore only while the applied revision is still current; a newer external change is kept.
@@ -451,11 +503,19 @@ impl<C: OpenMsxControl> OpenMsxBridge<C> {
             previous.fastforward,
             previous.loading
         );
-        match self.control.command(&command).map(|raw| NativePolicy::parse(&raw)) {
-            Ok(Ok(restored)) if restored.same_settings(previous) => Err(OpenMsxBridgeError::Emulator(
-                format!("execution_speed failed_restored: {reason}; previous policy verified"),
+        let rejection_prefix = format!("openMSX rejected `{command}`: ");
+        match self.control.command(&command).map(|raw| {
+            let (policy, boundary) = raw.split_once(';').ok_or_else(||
+                OpenMsxBridgeError::Protocol(format!("invalid pacing restoration result {raw:?}")))?;
+            Ok::<_, OpenMsxBridgeError>((NativePolicy::parse(policy)?, NativeBoundary::parse(boundary)?))
+        }) {
+            Ok(Ok((restored, boundary))) if restored.same_settings(previous) => Err(OpenMsxBridgeError::Emulator(
+                format!("execution_speed failed_restored: {reason}; restored_policy={restored:?}; restore_end={boundary:?}; previous policy verified"),
             )),
-            Err(OpenMsxBridgeError::Emulator(message)) if message.contains("emucap-policy-conflict") => {
+            Err(OpenMsxBridgeError::Emulator(message))
+                if message.strip_prefix(&rejection_prefix).is_some_and(|native| {
+                    native.starts_with("emucap-policy-conflict ")
+                }) => {
                 Err(OpenMsxBridgeError::BadState(format!(
                     "execution_speed conflict: {reason}; an external policy change was kept: {message}"
                 )))

@@ -1,0 +1,213 @@
+--- /dev/null
++++ b/pcsx2/GS/Renderers/Common/GSDeinterlaceHistory.h
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-3.0+
++#pragma once
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++// Optional GS-state trailer. All words are little-endian, independent of host alignment.
++struct GSDeinterlaceHistory
++{
++ struct Image { std::uint32_t width = 0, height = 0; std::vector<std::uint32_t> pixels; };
++ std::uint32_t index = 0;
++ std::array<Image, 2> images; // weave and motion-adaptive field history
++ static constexpr std::uint64_t MaxPixels = 64ull * 1024 * 1024;
++ static void Word(std::vector<std::uint8_t>& out, std::uint32_t value)
++ { for (unsigned n=0;n<4;n++) out.push_back(static_cast<std::uint8_t>(value >> (8*n))); }
++ std::vector<std::uint8_t> Encode() const
++ {
++  std::vector<std::uint8_t> out;
++  Word(out, 0x48494447); Word(out, 1); Word(out, index);
++  for (const Image& im : images) {
++   Word(out, im.width); Word(out, im.height);
++   for (auto pixel : im.pixels) Word(out, pixel);
++  }
++  return out;
++ }
++ static bool Decode(const std::uint8_t* data, std::size_t size, GSDeinterlaceHistory& output)
++ {
++  GSDeinterlaceHistory result;
++  if (!size) { output = std::move(result); return true; } // legacy GS state
++  auto word = [&](std::uint32_t& value) {
++   if (size < 4) return false;
++   value = std::uint32_t(data[0]) | (std::uint32_t(data[1]) << 8) |
++           (std::uint32_t(data[2]) << 16) | (std::uint32_t(data[3]) << 24);
++   data += 4; size -= 4; return true;
++  };
++  std::uint32_t magic, version;
++  if (!word(magic) || magic != 0x48494447 || !word(version) || version != 1 ||
++      !word(result.index) || result.index > 3) return false;
++  std::uint64_t total = 0;
++  for (Image& im : result.images) {
++   if (!word(im.width) || !word(im.height) || im.width > 16384 || im.height > 16384 ||
++       (im.width == 0) != (im.height == 0)) return false;
++   const std::uint64_t count = std::uint64_t(im.width) * im.height;
++   total += count;
++   if (total > MaxPixels || count > size / 4) return false;
++   im.pixels.resize(static_cast<std::size_t>(count));
++   for (auto& pixel : im.pixels) if (!word(pixel)) return false;
++  }
++  if (size) return false;
++  output = std::move(result); return true;
++ }
++};
+--- a/pcsx2/GS/Renderers/Common/GSDevice.h
++++ b/pcsx2/GS/Renderers/Common/GSDevice.h
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #pragma once
++#include "GSDeinterlaceHistory.h"
+ 
+ #include "common/HashCombine.h"
+ #include "common/WindowInfo.h"
+@@ -920,6 +921,7 @@
+ 	GSTexture* m_weavebob = nullptr;
+ 	GSTexture* m_blend = nullptr;
+ 	GSTexture* m_mad = nullptr;
++	int m_deinterlace_index = 0;
+ 	GSTexture* m_target_tmp = nullptr;
+ 	GSTexture* m_current = nullptr;
+ 	GSTexture* m_cas = nullptr;
+@@ -1093,6 +1095,8 @@
+ 
+ 	virtual void ClearSamplerCache() = 0;
+ 
++	bool CaptureDeinterlaceHistory(GSDeinterlaceHistory& history);
++	bool RestoreDeinterlaceHistory(const GSDeinterlaceHistory& history);
+ 	void ClearCurrent();
+ 	void Merge(GSTexture* sTex[3], GSVector4* sRect, GSVector4* dRect, const GSVector2i& fs, const GSRegPMODE& PMODE, const GSRegEXTBUF& EXTBUF, u32 c);
+ 	void Interlace(const GSVector2i& ds, int field, int mode, float yoffset);
+--- a/pcsx2/GS/Renderers/Common/GSDevice.cpp
++++ b/pcsx2/GS/Renderers/Common/GSDevice.cpp
+@@ -788,9 +788,52 @@
+ 	});
+ }
+ 
++bool GSDevice::CaptureDeinterlaceHistory(GSDeinterlaceHistory& history)
++{
++ GSDeinterlaceHistory captured;
++ captured.index = m_deinterlace_index;
++ GSTexture* textures[] = {m_weavebob, m_mad};
++ std::uint64_t total = 0;
++ for (unsigned i = 0; i < 2; i++) {
++  GSTexture* texture = textures[i];
++  if (!texture) continue;
++  auto& image = captured.images[i];
++  image.width = texture->GetWidth(); image.height = texture->GetHeight();
++  total += std::uint64_t(image.width) * image.height;
++  if (image.width > 16384 || image.height > 16384 || total > GSDeinterlaceHistory::MaxPixels) return false;
++  auto download = CreateDownloadTexture(image.width, image.height, GSTexture::Format::Color);
++  if (!download) return false;
++  const GSVector4i rect(0, 0, image.width, image.height);
++  download->CopyFromTexture(rect, texture, rect, 0); download->Flush();
++  if (!download->Map(rect)) return false;
++  image.pixels.resize(std::size_t(image.width) * image.height);
++  StringUtil::StrideMemCpy(image.pixels.data(), image.width * 4, download->GetMapPointer(),
++                         download->GetMapPitch(), image.width * 4, image.height);
++ }
++ history = std::move(captured); return true;
++}
++
++bool GSDevice::RestoreDeinterlaceHistory(const GSDeinterlaceHistory& history)
++{
++ // Allocate and upload before publishing either field history.
++ std::unique_ptr<GSTexture> restored[2];
++ for (unsigned i = 0; i < 2; i++) {
++  const auto& image = history.images[i];
++  if (!image.width) continue;
++  restored[i].reset(CreateRenderTarget(image.width, image.height, GSTexture::Format::Color, false));
++  if (!restored[i] || !restored[i]->Update(GSVector4i(0, 0, image.width, image.height),
++                                        image.pixels.data(), image.width * 4)) return false;
++ }
++ delete m_weavebob; delete m_mad;
++ m_weavebob = restored[0].release(); m_mad = restored[1].release();
++ m_deinterlace_index = history.index;
++ return true;
++}
++
+ void GSDevice::ClearCurrent()
+ {
+ 	m_current = nullptr;
++	m_deinterlace_index = 0;
+ 
+ 	delete m_merge;
+ 	delete m_weavebob;
+@@ -817,7 +860,7 @@
+ 
+ void GSDevice::Interlace(const GSVector2i& ds, int field, int mode, float yoffset)
+ {
+-	static int bufIdx = 0;
++	int& bufIdx = m_deinterlace_index;
+ 	float offset = yoffset * static_cast<float>(field);
+ 	offset = GSConfig.DisableInterlaceOffset ? 0.0f : offset;
+ 
+--- a/pcsx2/GS/GSState.h
++++ b/pcsx2/GS/GSState.h
+@@ -127,6 +127,7 @@
+ 
+ protected:
+ 	bool m_restored_display_pending[2] = {};
++	std::vector<u8> m_saved_deinterlace_history;
+ 	static constexpr int INVALID_ALPHA_MINMAX = 500;
+ 
+ 	GSVertex m_v = {};
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -2991,11 +2991,15 @@
+ 	const u32 version = STATE_VERSION;
+ 	if (sizeonly)
+ 	{
+-		fd->size = GetSaveStateSize(version);
++		GSDeinterlaceHistory history;
++		if (!g_gs_device->CaptureDeinterlaceHistory(history)) return -1;
++		m_saved_deinterlace_history = history.Encode();
++		fd->size = GetSaveStateSize(version) + static_cast<int>(m_saved_deinterlace_history.size());
+ 		return 0;
+ 	}
+ 
+-	if (!fd->data || fd->size < GetSaveStateSize(version))
++	if (!fd->data || m_saved_deinterlace_history.empty() ||
++		fd->size != GetSaveStateSize(version) + static_cast<int>(m_saved_deinterlace_history.size()))
+ 		return -1;
+ 
+ 	Flush(GSFlushReason::SAVESTATE);
+@@ -3076,13 +3080,15 @@
+ 	}
+ 
+ 	WriteState(data, &m_q);
++	WriteState(data, m_saved_deinterlace_history.data(), m_saved_deinterlace_history.size());
++	m_saved_deinterlace_history.clear();
+ 
+ 	return 0;
+ }
+ 
+ int GSState::Defrost(const freezeData* fd)
+ {
+-	if (!fd || !fd->data || fd->size == 0)
++	if (!fd || !fd->data || fd->size < static_cast<int>(sizeof(u32)))
+ 		return -1;
+ 
+ 	u8* data = fd->data;
+@@ -3099,6 +3105,10 @@
+ 		Console.Error("GS: Savestate version is incompatible.  Load aborted.");
+ 		return -1;
+ 	}
++
++	GSDeinterlaceHistory history;
++	const int base_size = GetSaveStateSize(version);
++	if (!GSDeinterlaceHistory::Decode(fd->data + base_size, fd->size - base_size, history)) return -1;
+ 
+ 	Flush(GSFlushReason::LOADSTATE);
+ 
+@@ -3225,6 +3235,7 @@
+ 
+ 	ResetPCRTC();
+ 	m_restored_display_pending[0] = m_restored_display_pending[1] = true;
++	if (!g_gs_device->RestoreDeinterlaceHistory(history)) return -1;
+ 
+ 	return 0;
+ }

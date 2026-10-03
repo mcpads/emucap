@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub mod desmume_nds;
+mod directory_replace;
 pub mod dolphin;
 pub mod flycast;
 pub mod mame;
@@ -419,6 +420,41 @@ pub(crate) fn copy_file_replace(src: &Path, dst: &Path) -> std::io::Result<()> {
     crate::path_safety::atomic_copy_file(src, dst).map(|_| ())
 }
 
+/// Preserve Windows' executable-relative dependency lookup in an isolated runtime.
+pub(crate) fn copy_adjacent_dlls(binary: &Path, destination: &Path) -> std::io::Result<()> {
+    if !binary
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(binary.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "binary has no parent directory",
+        )
+    })?)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("dll"))
+        {
+            if !entry.file_type()?.is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "native dependency must be a regular file: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            copy_file_replace(&path, &destination.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink())
@@ -469,7 +505,12 @@ pub(crate) fn copy_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
         if ty.is_dir() {
             copy_dir_contents(&src_path, &dst_path)?;
         } else if ty.is_file() {
-            copy_file_replace(&src_path, &dst_path)?;
+            copy_file_replace(&src_path, &dst_path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("copy {} to {}: {e}", src_path.display(), dst_path.display()),
+                )
+            })?;
         } else if ty.is_symlink() {
             #[cfg(unix)]
             {
@@ -477,7 +518,12 @@ pub(crate) fn copy_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
             }
             #[cfg(not(unix))]
             {
-                copy_file_replace(&src_path, &dst_path)?;
+                copy_file_replace(&src_path, &dst_path).map_err(|e| {
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("copy {} to {}: {e}", src_path.display(), dst_path.display()),
+                    )
+                })?;
             }
         }
     }
@@ -509,6 +555,12 @@ pub(crate) fn copy_dir_replace_preserving_dirs(
     dst: &Path,
     preserved_dirs: &[PathBuf],
 ) -> std::io::Result<()> {
+    let contextual = |operation: &str, path: &Path, error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("{operation} {}: {error}", path.display()),
+        )
+    };
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -530,12 +582,13 @@ pub(crate) fn copy_dir_replace_preserving_dirs(
 
     let tmp = unique_sibling_path(dst, "tmp");
     let backup = unique_sibling_path(dst, "old");
-    std::fs::create_dir(&tmp)?;
+    std::fs::create_dir(&tmp)
+        .map_err(|e| contextual("create runtime staging directory", &tmp, e))?;
     if let Err(e) = copy_dir_contents(src, &tmp) {
         // A partial recursive copy can already have created the staging temp; remove it so a failed
         // initial copy does not leak it, matching every other error path in this function.
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err(e);
+        return Err(contextual("copy runtime payload", src, e));
     }
 
     for relative in preserved_dirs {
@@ -593,33 +646,33 @@ pub(crate) fn copy_dir_replace_preserving_dirs(
         }
         if let Err(error) = copy_dir_contents(&old_data, &staged_data) {
             let _ = std::fs::remove_dir_all(&tmp);
-            return Err(error);
+            return Err(contextual("preserve runtime data", &old_data, error));
         }
     }
 
     if !dst.exists() {
-        return match std::fs::rename(&tmp, dst) {
+        return match directory_replace::rename(&tmp, dst) {
             Ok(()) => Ok(()),
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp);
-                Err(e)
+                Err(contextual("publish runtime directory", dst, e))
             }
         };
     }
 
-    if let Err(e) = std::fs::rename(dst, &backup) {
+    if let Err(e) = directory_replace::rename(dst, &backup) {
         let _ = std::fs::remove_dir_all(&tmp);
-        return Err(e);
+        return Err(contextual("retire previous runtime directory", dst, e));
     }
-    match std::fs::rename(&tmp, dst) {
+    match directory_replace::rename(&tmp, dst) {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&backup);
             Ok(())
         }
         Err(e) => {
-            let _ = std::fs::rename(&backup, dst);
+            let _ = directory_replace::rename(&backup, dst);
             let _ = std::fs::remove_dir_all(&tmp);
-            Err(e)
+            Err(contextual("publish replacement runtime directory", dst, e))
         }
     }
 }

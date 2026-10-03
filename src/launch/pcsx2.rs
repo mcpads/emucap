@@ -1,7 +1,7 @@
 //! PCSX2 launch preparation for PlayStation 2.
 //!
-//! The supported binary is built from the pinned fork under `adapters/pcsx2`. The fork extends
-//! PINE with terminally acknowledged debugger operations and accepts an emucap-owned data root.
+//! The supported binary uses pinned upstream source and maintained patches under `adapters/pcsx2`.
+//! The patch stack extends PINE with terminally acknowledged debugger operations and accepts an emucap-owned data root.
 //! Each launch therefore uses private settings, memory cards, caches, logs, and PINE endpoint while
 //! referring to the operator-supplied BIOS in place.
 
@@ -18,7 +18,7 @@ use super::{
     RuntimeEnv,
 };
 
-pub const REQUIRED_HOST_API: u32 = 7;
+pub const REQUIRED_HOST_API: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {

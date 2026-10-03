@@ -1,0 +1,165 @@
+name: Native MSYS2 adapter builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      adapter:
+        description: Build all adapters or retry one corrected recipe
+        type: choice
+        default: all
+        options: [all, mednafen, flycast, np2kai, mupen64plus, openmsx, mame-pc98, mame-neogeo, pcsx2, desmume-nds]
+  push:
+    branches: [main, next]
+    paths:
+      - 'adapters/mednafen/**'
+      - 'adapters/flycast/**'
+      - 'adapters/np2kai/**'
+      - 'adapters/mupen64plus/**'
+      - 'adapters/openmsx/**'
+      - 'adapters/mame-pc98/**'
+      - 'adapters/mame-neogeo/**'
+      - 'adapters/pcsx2/**'
+      - 'adapters/desmume-nds/**'
+      - 'adapters/_common/**'
+      - '_tests/adapters/build-lock-test.sh'
+      - '_tests/release/windows_native_payload*'
+      - '_tests/release/native_build.py'
+      - '!**/*.md'
+      - '.github/workflows/native-msys2.yml'
+  pull_request:
+    paths:
+      - 'adapters/mednafen/**'
+      - 'adapters/flycast/**'
+      - 'adapters/np2kai/**'
+      - 'adapters/mupen64plus/**'
+      - 'adapters/openmsx/**'
+      - 'adapters/mame-pc98/**'
+      - 'adapters/mame-neogeo/**'
+      - 'adapters/pcsx2/**'
+      - 'adapters/desmume-nds/**'
+      - 'adapters/_common/**'
+      - '_tests/adapters/build-lock-test.sh'
+      - '_tests/release/windows_native_payload*'
+      - '_tests/release/native_build.py'
+      - '!**/*.md'
+      - '.github/workflows/native-msys2.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-msys2-${{ github.ref }}${{ inputs.adapter && inputs.adapter != 'all' && format('-{0}', inputs.adapter) || '' }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: ${{ matrix.adapter == 'pcsx2' && 180 || 90 }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        adapter: ${{ fromJSON(inputs.adapter && inputs.adapter != 'all' && format('["{0}"]', inputs.adapter) || '["mednafen", "flycast", "np2kai", "mupen64plus", "openmsx", "mame-pc98", "mame-neogeo", "pcsx2", "desmume-nds"]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore canonical checkout bytes
+        shell: pwsh
+        run: |
+          git config core.autocrlf false
+          git rm --cached -r .
+          git reset --hard HEAD
+      - name: Parse Windows qualification scripts
+        shell: pwsh
+        run: |
+          foreach ($script in Get-ChildItem _tests/release -Filter '*.ps1') {
+            $tokens = $null
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$parseErrors)
+            if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          }
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          update: true
+          install: >-
+            git base-devel util-linux patch perl curl tar xz
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+            mingw-w64-x86_64-nasm
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-libsndfile
+            mingw-w64-x86_64-flac
+            mingw-w64-x86_64-lzo2
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-zstd
+            mingw-w64-x86_64-libzip
+            mingw-w64-x86_64-freetype
+            mingw-w64-x86_64-libpng
+            mingw-w64-x86_64-python
+            mingw-w64-x86_64-vulkan-headers
+            mingw-w64-x86_64-meson
+            mingw-w64-x86_64-glib2
+      - name: Verify native build lock ownership
+        shell: msys2 {0}
+        run: bash _tests/adapters/build-lock-test.sh
+      - name: Record toolchain and build pinned native source
+        shell: msys2 {0}
+        env:
+          ADAPTER: ${{ matrix.adapter }}
+        run: |
+          set -euo pipefail
+          pacman -Q > native-toolchain.txt
+          export EMUCAP_FLYCAST_BUILD_HOME="$(pwd)/adapters/flycast/work"
+          if [ "$ADAPTER" = mame-pc98 ]; then
+            export MAME_SOURCES=src/mame/nec/pc9801.cpp
+          fi
+          bash "adapters/$ADAPTER/build.sh" 2>&1 | tee native-build.log
+          payload_args=()
+          case "$ADAPTER" in
+            mednafen) binary=adapters/mednafen/work/mednafen/src/mednafen.exe ;;
+            flycast) binary=adapters/flycast/work/work/build/flycast.exe ;;
+            np2kai) binary=adapters/np2kai/work/np2kai/sdl/np2kai_libretro.dll ;;
+            mupen64plus)
+              . adapters/mupen64plus/upstream.lock
+              binary="adapters/mupen64plus/work/mupen64plus-bundle-src-$M64P_VERSION/test/mupen64plus.dll"
+              ;;
+            openmsx)
+              binary="$(find adapters/openmsx/work -type f -path '*/bindist/*' -name openmsx.exe -print -quit)"
+              ;;
+            mame-pc98|mame-neogeo) binary="adapters/$ADAPTER/work/mame.exe" ;;
+            pcsx2) binary=adapters/pcsx2/work/pcsx2/build-emucap/bin/pcsx2-qt.exe ;;
+            desmume-nds) binary=adapters/desmume-nds/work/src/desmume/src/frontend/posix/build-headless/cli/desmume-cli.exe ;;
+          esac
+          test -f "$binary"
+          sha256sum "$binary" > native-binary.sha256
+          case "$ADAPTER" in
+            mupen64plus|openmsx|pcsx2) payload_args+=(--tree) ;;
+            mednafen) payload_args+=(--include "${binary}.emucap-build.json") ;;
+            np2kai) payload_args+=(--include adapters/np2kai/work/np2kai/emucap-np2kai-build.json) ;;
+            mame-pc98|mame-neogeo) payload_args+=(--include "adapters/$ADAPTER/work/mame-src/hash") ;;
+          esac
+          python _tests/release/windows_native_payload_tests.py
+          python _tests/release/windows_native_payload.py --adapter "$ADAPTER" \
+            --binary "$binary" --dll-directory "$(cygpath -w /mingw64/bin)" "${payload_args[@]}"
+      - name: Retain native runtime payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-runtime-${{ matrix.adapter }}-windows-x86_64
+          path: native-payload/
+          retention-days: 7
+          if-no-files-found: error
+      - name: Retain build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-evidence-${{ matrix.adapter }}-windows-mingw64
+          path: |
+            native-build.log
+            native-toolchain.txt
+            native-binary.sha256
+          retention-days: 7
+          if-no-files-found: warn

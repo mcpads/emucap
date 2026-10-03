@@ -172,7 +172,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--profile', type=Path, required=True,
                         help='JSON: launch_plan, launch overrides, env, warmup_frames, tap_buttons, '
-                             'press_frames, after_frames')
+                             'press_frames, after_frames, origin_instructions, origin_breakpoint')
     args = parser.parse_args()
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -202,7 +202,34 @@ def main():
         ranges = [batch for window in ram_windows(capability) for batch in window_batches(capability, window)]
         result = {'buttons': buttons, 'press_frames': press, 'after_frames': after,
                   'hashed_windows': sorted({batch[0]['memory_type'] for batch in ranges})}
-        origin = Origin(w, out, status, profile.get('warmup_frames', 1), session)
+
+        def snapshot_origin():
+            selection = profile.get('origin_breakpoint')
+            if selection is not None:
+                # A halted CPU may count idle service as instruction steps. Observe its
+                # next execution before selecting the producer's serialization boundary.
+                from control_restore import cpu_state, program_counter, require_hit
+                pc = program_counter(cpu_state(w, status, selection), selection)
+                armed = w.call('set_breakpoint', {
+                    'kind': 'exec', 'start': pc, 'end': pc, 'pause_on_hit': True,
+                    'memory_type': selection.get('memory_type', status['memory_types'][0]),
+                })
+                try:
+                    require_hit(w, armed['id'], selection.get('breakpoint_frames', 60))
+                finally:
+                    w.call('clear_breakpoint', {'id': armed['id']})
+            # Some producers serialize only at an explicit main-CPU instruction halt.
+            instructions = profile.get('origin_instructions', 0)
+            assert isinstance(instructions, int) and instructions >= 0, instructions
+            if instructions:
+                stopped = w.call('step', {'unit': 'instructions', 'count': instructions})
+                assert stopped['status'] == 'completed' and stopped['count'] == instructions, stopped
+            saved = Origin(w, out, status, profile.get('warmup_frames', 1), session)
+            if instructions or selection is not None:
+                assert saved.path, saved.save_error
+            return saved
+
+        origin = snapshot_origin()
         ranges = readable(w, ranges)
         result['hashed_windows'] = sorted({batch[0]['memory_type'] for batch in ranges})
         result['hashed_bytes'] = sum(r['length'] for batch in ranges for r in batch)
@@ -230,7 +257,7 @@ def main():
             origin.restore()
             w.speed({'mode': 'unlimited'})
             warmup(w, status, profile.get('seek_frames', 300))
-            origin = Origin(w, out, status, profile.get('warmup_frames', 1), session)
+            origin = snapshot_origin()
             reference, repeat, control, mask, effect = baseline()
         result['seek_frames'] = seek * profile.get('seek_frames', 300)
         paced = [run(w, origin, ranges, policy, buttons, press, after)

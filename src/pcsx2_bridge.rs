@@ -13,6 +13,8 @@ mod input;
 mod media;
 mod memory;
 mod observation;
+mod owned_frame;
+mod temporal_owner;
 mod video;
 
 use std::collections::BTreeMap;
@@ -22,7 +24,7 @@ use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
@@ -34,7 +36,7 @@ const PINE_MAX_REPLY: usize = 450_000;
 const PCSX2_EE_RAM_SIZE: u64 = 0x0200_0000;
 const MAX_MEMORY_TRANSFER: usize = 0x2_0000;
 const MAX_INPUT_FRAMES: u64 = 240;
-pub const REQUIRED_HOST_API: u32 = 7;
+pub use crate::launch::pcsx2::REQUIRED_HOST_API;
 
 const MSG_VERSION: u8 = 0x08;
 const MSG_TITLE: u8 = 0x0b;
@@ -135,6 +137,10 @@ const UNSUPPORTED_METHODS: &[&str] = &[
 
 #[derive(Debug, thiserror::Error)]
 pub enum Pcsx2BridgeError {
+    #[error("producer is busy")]
+    Busy,
+    #[error("operation cancelled")]
+    Cancelled,
     #[error("{0}")]
     BadParams(String),
     #[error("{0}")]
@@ -155,186 +161,8 @@ pub enum Pcsx2BridgeError {
 
 type BridgeResult<T> = Result<T, Pcsx2BridgeError>;
 
-pub trait PineTransport {
-    fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>>;
-
-    fn transact_with_timeout(
-        &mut self,
-        request: &[u8],
-        _timeout: Duration,
-    ) -> BridgeResult<Vec<u8>> {
-        self.transact(request)
-    }
-
-    /// True once the current PINE stream can no longer preserve frame boundaries. A caller must
-    /// replace the bridge/backend generation rather than retrying on the same stream.
-    fn is_terminal(&self) -> bool {
-        false
-    }
-}
-
-enum PineStream {
-    #[cfg(windows)]
-    Tcp(TcpStream),
-    #[cfg(unix)]
-    Unix(UnixStream),
-}
-
-impl Read for PineStream {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(windows)]
-            Self::Tcp(stream) => stream.read(buffer),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.read(buffer),
-        }
-    }
-}
-
-impl Write for PineStream {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        match self {
-            #[cfg(windows)]
-            Self::Tcp(stream) => stream.write(buffer),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.write(buffer),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            #[cfg(windows)]
-            Self::Tcp(stream) => stream.flush(),
-            #[cfg(unix)]
-            Self::Unix(stream) => stream.flush(),
-        }
-    }
-}
-
-pub struct PineSocket {
-    stream: PineStream,
-    terminal: bool,
-}
-
-impl PineSocket {
-    pub fn connect(slot: u16, socket_path: Option<&Path>, timeout: Duration) -> BridgeResult<Self> {
-        #[cfg(windows)]
-        let stream = {
-            let _ = socket_path;
-            let stream = TcpStream::connect_timeout(
-                &std::net::SocketAddr::from(([127, 0, 0, 1], slot)),
-                timeout,
-            )?;
-            stream.set_read_timeout(Some(timeout))?;
-            stream.set_write_timeout(Some(timeout))?;
-            PineStream::Tcp(stream)
-        };
-
-        #[cfg(unix)]
-        let stream = {
-            let _ = slot;
-            let path = socket_path.ok_or_else(|| {
-                Pcsx2BridgeError::BadParams(
-                    "PINE socket path is required on this platform".to_string(),
-                )
-            })?;
-            let stream = UnixStream::connect(path)?;
-            stream.set_read_timeout(Some(timeout))?;
-            stream.set_write_timeout(Some(timeout))?;
-            PineStream::Unix(stream)
-        };
-
-        Ok(Self {
-            stream,
-            terminal: false,
-        })
-    }
-}
-
-impl PineTransport for PineSocket {
-    fn transact(&mut self, request: &[u8]) -> BridgeResult<Vec<u8>> {
-        if self.terminal {
-            return Err(Pcsx2BridgeError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "PINE transport is terminal",
-            )));
-        }
-        let outcome = (|| {
-            let packet_len = request
-                .len()
-                .checked_add(4)
-                .and_then(|length| u32::try_from(length).ok())
-                .ok_or_else(|| Pcsx2BridgeError::BadParams("PINE request is too large".into()))?;
-            self.stream.write_all(&packet_len.to_le_bytes())?;
-            self.stream.write_all(request)?;
-            self.stream.flush()?;
-
-            let mut header = [0u8; 5];
-            self.stream.read_exact(&mut header)?;
-            let reply_len =
-                u32::from_le_bytes(header[..4].try_into().expect("four bytes")) as usize;
-            if !(5..=PINE_MAX_REPLY).contains(&reply_len) {
-                return Err(Pcsx2BridgeError::Protocol(format!(
-                    "PINE reply length {reply_len} is outside 5..={PINE_MAX_REPLY}"
-                )));
-            }
-            let mut payload = vec![0u8; reply_len - 5];
-            self.stream.read_exact(&mut payload)?;
-            if header[4] != 0 {
-                return Err(Pcsx2BridgeError::Emulator(
-                    "PCSX2 rejected the PINE command".into(),
-                ));
-            }
-            Ok(payload)
-        })();
-        if outcome.as_ref().is_err_and(|error| {
-            matches!(
-                error,
-                Pcsx2BridgeError::Io(_) | Pcsx2BridgeError::Protocol(_)
-            )
-        }) {
-            self.terminal = true;
-        }
-        outcome
-    }
-
-    fn transact_with_timeout(
-        &mut self,
-        request: &[u8],
-        timeout: Duration,
-    ) -> BridgeResult<Vec<u8>> {
-        let previous = match &self.stream {
-            #[cfg(windows)]
-            PineStream::Tcp(stream) => {
-                let previous = stream.read_timeout()?;
-                stream.set_read_timeout(Some(timeout))?;
-                previous
-            }
-            #[cfg(unix)]
-            PineStream::Unix(stream) => {
-                let previous = stream.read_timeout()?;
-                stream.set_read_timeout(Some(timeout))?;
-                previous
-            }
-        };
-        let outcome = self.transact(request);
-        let restored = match &self.stream {
-            #[cfg(windows)]
-            PineStream::Tcp(stream) => stream.set_read_timeout(previous),
-            #[cfg(unix)]
-            PineStream::Unix(stream) => stream.set_read_timeout(previous),
-        };
-        if let Err(error) = restored {
-            self.terminal = true;
-            return Err(error.into());
-        }
-        outcome
-    }
-
-    fn is_terminal(&self) -> bool {
-        self.terminal
-    }
-}
+mod transport;
+pub use transport::{PineSocket, PineTransport};
 
 pub struct Pcsx2Bridge<T> {
     pine: T,
@@ -351,6 +179,13 @@ pub struct Pcsx2Bridge<T> {
     /// stop without changing the frame counter.
     boundary_seq: u64,
     control_unverified: bool,
+    owned_control: bool,
+    request_cancellation: Option<crate::live::link::RequestCancellation>,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
+    native_stop_deadline: Option<Instant>,
+    io_deadline: Option<Instant>,
+    last_native_id: u64,
+    last_native_generation: u64,
 }
 
 enum ContentSha1 {
@@ -419,6 +254,13 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             breakpoints: BTreeMap::new(),
             boundary_seq: 0,
             control_unverified: false,
+            owned_control: false,
+            request_cancellation: None,
+            producer_ownership: None,
+            native_stop_deadline: None,
+            io_deadline: None,
+            last_native_id: 0,
+            last_native_generation: 0,
         };
         bridge.host_api = bridge.read_u32_command(MSG_EMUCAP_VERSION, &[])?;
         if bridge.host_api != REQUIRED_HOST_API {
@@ -434,44 +276,68 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
         self.control_unverified || self.pine.is_terminal()
     }
 
+    pub fn handle_request_cancellable(
+        &mut self,
+        request: Request,
+        token: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = Some(token);
+        let response = self.handle_request(request);
+        self.remember_cancel_deadline();
+        self.request_cancellation = None;
+        response
+    }
+
     pub fn handle_request(&mut self, request: Request) -> Response {
         let id = request.id;
         if !OBSERVATION_METHODS.contains(&request.method.as_str()) {
             self.boundary_seq += 1;
         }
-        let result = match request.method.as_str() {
-            "hello" => self.hello(),
-            "status" => self.status(),
-            "get_rom_info" => self.get_rom_info(),
-            "change_media" => self.change_media(&request.params),
-            "read_memory" => self.read_memory(&request.params),
-            "write_memory" => self.write_memory(&request.params),
-            "find_pattern" => self.find_pattern(&request.params),
-            "dump_memory" => self.dump_memory(&request.params),
-            "probe" => self.probe(&request.params),
-            "get_state" => self.get_state(),
-            "pause" => self.pause(),
-            "resume" => self.resume(),
-            "step" => self.step(&request.params),
-            "disassemble" => self.disassemble(&request.params),
-            "save_state" => self.save_state(&request.params),
-            "load_state" => self.load_state(&request.params),
-            "screenshot" => self.screenshot(),
-            "set_input" => self.set_input(&request.params),
-            "press_buttons" => self.press_buttons(&request.params),
-            "set_breakpoint" => self.set_breakpoint(&request.params),
-            "clear_breakpoint" => self.clear_breakpoint(&request.params),
-            "clear_all_breakpoints" => self.clear_all_breakpoints(),
-            "list_breakpoints" => self.list_breakpoints(),
-            "poll_events" => self.poll_events(),
-            "call_stack" => self.call_stack(),
-            "reset" => self.reset(),
-            "read_memory_batch" => self.read_memory_batch(&request.params),
-            "execution_speed" => self.execution_speed(&request.params),
-            other if UNSUPPORTED_METHODS.contains(&other) => {
-                Err(Pcsx2BridgeError::Unsupported(other.into()))
+        let result = if self.backend_terminal() {
+            Err(Pcsx2BridgeError::BadState(
+                "native control is retired".into(),
+            ))
+        } else if self
+            .request_cancellation
+            .as_ref()
+            .is_some_and(|t| t.is_cancelled())
+        {
+            Err(Pcsx2BridgeError::Cancelled)
+        } else {
+            match request.method.as_str() {
+                "hello" => self.hello(),
+                "status" => self.status(),
+                "get_rom_info" => self.get_rom_info(),
+                "change_media" => self.change_media(&request.params),
+                "read_memory" => self.read_memory(&request.params),
+                "write_memory" => self.write_memory(&request.params),
+                "find_pattern" => self.find_pattern(&request.params),
+                "dump_memory" => self.dump_memory(&request.params),
+                "probe" => self.probe(&request.params),
+                "get_state" => self.get_state(),
+                "pause" => self.pause(),
+                "resume" => self.resume(),
+                "step" => self.step(&request.params),
+                "disassemble" => self.disassemble(&request.params),
+                "save_state" => self.save_state(&request.params),
+                "load_state" => self.load_state(&request.params),
+                "screenshot" => self.screenshot(),
+                "set_input" => self.set_input(&request.params),
+                "press_buttons" => self.press_buttons(&request.params),
+                "set_breakpoint" => self.set_breakpoint(&request.params),
+                "clear_breakpoint" => self.clear_breakpoint(&request.params),
+                "clear_all_breakpoints" => self.clear_all_breakpoints(),
+                "list_breakpoints" => self.list_breakpoints(),
+                "poll_events" => self.poll_events(),
+                "call_stack" => self.call_stack(),
+                "reset" => self.reset(),
+                "read_memory_batch" => self.read_memory_batch(&request.params),
+                "execution_speed" => self.execution_speed(&request.params),
+                other if UNSUPPORTED_METHODS.contains(&other) => {
+                    Err(Pcsx2BridgeError::Unsupported(other.into()))
+                }
+                other => Err(Pcsx2BridgeError::UnknownMethod(other.into())),
             }
-            other => Err(Pcsx2BridgeError::UnknownMethod(other.into())),
         };
         match result {
             Ok(value) => Response {
@@ -493,6 +359,22 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
     }
 
     fn command(&mut self, opcode: u8, params: &[u8]) -> BridgeResult<Vec<u8>> {
+        if self.owned_control {
+            self.remember_cancel_deadline();
+            let scoped = self.io_deadline.is_some()
+                || self.native_stop_deadline.is_some()
+                || self
+                    .producer_ownership
+                    .as_ref()
+                    .is_some_and(|owner| owner.active_parent_key().is_some());
+            if scoped {
+                let cap = Duration::from_millis(500);
+                let end = self
+                    .native_stop_deadline
+                    .unwrap_or_else(|| Instant::now() + cap);
+                return self.bounded_command(opcode, params, end, cap);
+            }
+        }
         let mut request = Vec::with_capacity(params.len() + 1);
         request.push(opcode);
         request.extend_from_slice(params);
@@ -725,6 +607,13 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
     }
 
     fn pause(&mut self) -> BridgeResult<Value> {
+        if self.owned_control {
+            let deadline = self
+                .native_stop_deadline
+                .unwrap_or_else(|| Instant::now() + owned_frame::STOP_BUDGET);
+            self.verify_owned_pause(deadline)?;
+            return Ok(json!({"state":"frozen","status":"completed"}));
+        }
         self.command(MSG_EMUCAP_PAUSE, &[])?;
         Ok(json!({ "state": "frozen", "status": "completed" }))
     }
@@ -751,6 +640,9 @@ impl<T: PineTransport> Pcsx2Bridge<T> {
             return Err(Pcsx2BridgeError::BadParams(format!(
                 "frame step count must be in 1..={MAX_SYNC_ADVANCE_COUNT}, got {count}"
             )));
+        }
+        if self.owned_control {
+            return self.owned_frame_step(count);
         }
         self.require_frozen("step")?;
         let mut request = vec![MSG_EMUCAP_FRAME_ADVANCE];
@@ -996,6 +888,8 @@ fn pcsx2_input_buttons_json() -> Value {
 
 fn error_kind(error: &Pcsx2BridgeError) -> &'static str {
     match error {
+        Pcsx2BridgeError::Busy => "busy",
+        Pcsx2BridgeError::Cancelled => "cancelled",
         Pcsx2BridgeError::BadParams(_) => "bad_params",
         Pcsx2BridgeError::BadState(_) => "bad_state",
         Pcsx2BridgeError::UnknownMethod(_) => "unknown_method",

@@ -22,7 +22,8 @@ class Witness:
     def __init__(self, out, env, binary=None):
         self.out = out
         self.rows = []
-        self.process = McpProcess(binary or ROOT / 'target/release/emucap-mcp', env)
+        name = 'emucap-mcp.exe' if os.name == 'nt' else 'emucap-mcp'
+        self.process = McpProcess(binary or ROOT / 'target/release' / name, env, out / 'mcp-stderr.log')
         self.revision = None
 
     def call_result(self, name, arguments=None):
@@ -32,6 +33,8 @@ class Witness:
         self.rows.append({'tool': name, 'arguments': arguments, 'seconds': elapsed, 'response': response})
         (self.out / 'requests.json').write_text(json.dumps(self.rows, indent=2))
         failed = bool(response.get('error') or response.get('result', {}).get('isError'))
+        if not failed and name in ('launch', 'reset', 'load_state'):
+            self.revision = None
         return response.get('result', {}).get('structuredContent', response), failed
 
     def call(self, name, arguments=None, error=False):

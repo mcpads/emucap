@@ -67,15 +67,35 @@ impl<G: GdbTransport> NdsBridge<G> {
         Ok(result)
     }
 
+    // Optional fields can be absent on older hosts. A failed transport leaves
+    // the stop authority unverified and must retain the original error.
+    fn optional_status_observation<T>(&mut self, result: NdsResult<T>) -> NdsResult<Option<T>> {
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(error)
+                if self.backend_terminal()
+                    || matches!(
+                        &error,
+                        NdsBridgeError::Gdb(GdbError::Io(_) | GdbError::Poisoned)
+                    ) =>
+            {
+                self.control_unverified = true;
+                Err(error)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     pub(super) fn status(&mut self) -> NdsResult<Value> {
         self.drain_scheduler_stops()?;
         // The fork owns persistent/timed overrides, so query it instead of trusting bridge-local
         // bookkeeping that would be lost on a bridge reconnect. Older binaries remain observable=false.
-        let input_override =
-            override_status_json(self.arm9.override_remaining("qEmucap,inputstatus").ok());
-        let touch_override =
-            override_status_json(self.arm9.override_remaining("qEmucap,touchstatus").ok());
-        let pacing = self.native_pacing().ok();
+        let input = self.arm9.override_remaining("qEmucap,inputstatus");
+        let input_override = override_status_json(self.optional_status_observation(input)?);
+        let touch = self.arm9.override_remaining("qEmucap,touchstatus");
+        let touch_override = override_status_json(self.optional_status_observation(touch)?);
+        let pacing = self.native_pacing();
+        let pacing = self.optional_status_observation(pacing)?;
         Ok(json!({
             "connected": true,
             "system": "nds",
@@ -442,6 +462,9 @@ impl<G: GdbTransport> NdsBridge<G> {
             )));
         }
 
+        if self.owned_control && self.request_cancellation.is_some() {
+            return self.owned_frame_step(count);
+        }
         self.drain_scheduler_stops()?;
         if !self.primary_frozen() {
             self.arm9.pause()?;
@@ -500,7 +523,7 @@ impl<G: GdbTransport> NdsBridge<G> {
         }
     }
 
-    fn finish_frame_step(
+    pub(super) fn finish_frame_step(
         &mut self,
         requested: u64,
         source: CpuId,

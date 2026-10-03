@@ -1,0 +1,18 @@
+--- a/src/debugger/dbg_decoder.h
++++ b/src/debugger/dbg_decoder.h
+@@ -22,15 +22,8 @@
+ #ifndef __DECODER_H__
+ #define __DECODER_H__
+ 
+-#if defined(WIN32)
+-typedef unsigned int uint32_t;
+-typedef unsigned char bool;
+-#define false 0
+-#define true 1
+-#else
+ #include <stdbool.h>
+ #include <stdint.h>
+-#endif
+ 
+ /* Disassembler lookup handler */
+ typedef char * (*r4k_lookup_func)(uint32_t, void *);

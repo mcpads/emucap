@@ -8,6 +8,16 @@ use std::sync::{
 
 #[test]
 fn reconnects_front_session_without_recreating_handler_state() {
+    const SESSIONS: u64 = 32;
+    #[cfg(unix)]
+    let count_fds = || {
+        let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        (0..limit)
+            .filter(|fd| unsafe { libc::fcntl(*fd as libc::c_int, libc::F_GETFD) } >= 0)
+            .count()
+    };
+    #[cfg(unix)]
+    let before = count_fds();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let worker = std::thread::spawn(move || {
@@ -24,11 +34,11 @@ fn reconnects_front_session_without_recreating_handler_state() {
                     error: None,
                 }
             },
-            Some(2),
+            Some(SESSIONS as usize),
         )
     });
 
-    for expected in [1, 2] {
+    for expected in 1..=SESSIONS {
         let (mut socket, _) = listener.accept().unwrap();
         socket
             .write_all(
@@ -45,6 +55,12 @@ fn reconnects_front_session_without_recreating_handler_state() {
         drop(socket);
     }
     worker.join().unwrap().unwrap();
+    drop(listener);
+    #[cfg(unix)]
+    eprintln!(
+        "{SESSIONS} bridge reconnects descriptor count: {before} -> {}",
+        count_fds()
+    );
 }
 
 #[test]
@@ -53,10 +69,14 @@ fn slow_backend_emits_working_before_terminal_response() {
     let endpoint = listener.local_addr().unwrap();
     let client = TcpStream::connect(endpoint).unwrap();
     let (server, _) = listener.accept().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
 
     let worker = std::thread::spawn(move || {
-        let mut handle = |request: Request| {
-            std::thread::sleep(Duration::from_millis(45));
+        let mut handle = move |request: Request| {
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             Response {
                 id: request.id,
                 ok: true,
@@ -73,6 +93,7 @@ fn slow_backend_emits_working_before_terminal_response() {
         .unwrap();
     let mut reader = BufReader::new(client.try_clone().unwrap());
     let mut saw_working = false;
+    let mut release_tx = Some(release_tx);
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).unwrap();
@@ -80,6 +101,9 @@ fn slow_backend_emits_working_before_terminal_response() {
         assert_eq!(response["id"], 7);
         if response["result"]["status"] == "working" {
             saw_working = true;
+            if let Some(release) = release_tx.take() {
+                release.send(()).unwrap();
+            }
             continue;
         }
         assert_eq!(response["result"]["status"], "completed");

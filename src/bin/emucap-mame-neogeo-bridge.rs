@@ -35,6 +35,30 @@ fn main() -> anyhow::Result<()> {
     let dependency =
         ProcessDependency::from_process_env().context("load emulator process dependency")?;
 
+    if let Some(runtime) = std::env::var("EMUCAP_LAUNCH_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        bridge
+            .enable_owned_control()
+            .map_err(|e| anyhow!(e.to_string()))?;
+        return emucap::live::reconnect::owned::serve_reconnecting_owned(
+            emucap_port,
+            "mame-neogeo-rust",
+            bridge,
+            move || {
+                dependency
+                    .as_ref()
+                    .and_then(ProcessDependency::terminal_reason)
+            },
+            emucap::live::reconnect::cancellation::TemporalAdmission {
+                runtime,
+                methods: vec!["step".into()],
+            },
+        )
+        .context("serve owned Neo Geo session");
+    }
+
     serve_reconnecting_controlled(
         emucap_port,
         "mame-neogeo-rust",

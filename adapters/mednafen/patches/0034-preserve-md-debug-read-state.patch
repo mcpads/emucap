@@ -1,0 +1,48 @@
+--- a/src/md/system.cpp
++++ b/src/md/system.cpp
+@@ -121,6 +121,9 @@
+ 
+ void MD_UpdateSubStuff(void)
+ {
++ // Debug peeks observe the parked devices without catching them up.
++ if(MD_HackyHackyMode)
++  return;
+  int32 max_md_timestamp;
+ 
+  max_md_timestamp = Main68K.timestamp * 7;
+--- a/src/md/mem68k.cpp
++++ b/src/md/mem68k.cpp
+@@ -34,7 +34,8 @@
+ {
+     uint16 temp = obsim_values[obsim]; //0x4e71;
+ 
+-    obsim = (obsim + 1) % 3;
++    if(!MD_HackyHackyMode)
++     obsim = (obsim + 1) % 3;
+ 
+     if(address >= 0xC00000)
+     {
+--- a/src/md/genio.cpp
++++ b/src/md/genio.cpp
+@@ -304,7 +304,8 @@
+ 	    {
+ 	     int wp = offset - 0x01;
+ 
+-	     UpdateBusThing(md_timestamp);
++	     if(!MD_HackyHackyMode)
++	      UpdateBusThing(md_timestamp);
+              ret = (PortDataBus[wp] & 0x7F) | (PortCtrl[wp] & 0x80);
+ 	    }
+ 	    break;
+--- a/src/md/sound.cpp
++++ b/src/md/sound.cpp
+@@ -80,7 +80,8 @@
+  if(FMReset)
+   return(0x00);
+ 
+- UpdateFM();
++ if(!MD_HackyHackyMode)
++  UpdateFM();
+ 
+  return(FMUnit.read());
+ }

@@ -33,6 +33,11 @@ fn peek_reply_must_carry_every_requested_byte() {
     let value = batch_reply(&ranges, reply, "launch-1".into());
     assert!(crate::live::memory_batch::verify_reply(&ranges, &value, Some("launch-1")).is_ok());
     for bad in [
+        "OK|4@1|700|abcd,ff,00",
+        "OK|4@1|700|ff,abcd",
+        "OK|4@1|700|abcd,ffff",
+        "OK|4@1|700|abcd,ff|extra",
+        "OK|4@1|-1|abcd,ff",
         "OK|4@1|700|abcd",
         "OK|4@1|700|abcd,f",
         "OK|4@1|700|abcd,zz",

@@ -1,0 +1,83 @@
+--- a/sdl/libretro/emucap_debug.h
++++ b/sdl/libretro/emucap_debug.h
+@@ -8,7 +8,7 @@
+ extern "C" {
+ #endif
+ 
+-#define EMUCAP_NP2_DEBUG_API_VERSION 2
++#define EMUCAP_NP2_DEBUG_API_VERSION 3
+ #define EMUCAP_NP2_BP_EXEC 0
+ #define EMUCAP_NP2_BP_READ 1
+ #define EMUCAP_NP2_BP_WRITE 2
+@@ -68,6 +68,11 @@
+ /* Debugger view without guest effects: no wait-state clock charge and no GRCG/EGC
+  * processing. Graphics planes are read raw from the current access page. Returns 0
+  * when any byte lies outside the supported view; the caller then discards output. */
++struct emucap_np2_peek_range { uint32_t address; uint32_t length; };
++/* Validate the complete batch against the current native view without reading
++ * payload. The frontend keeps the emulation owner parked through copy. */
++int emucap_np2_validate_peek_ranges(const struct emucap_np2_peek_range *ranges,
++                                  size_t count);
+ int emucap_np2_peek_memory(uint32_t address, uint8_t *output, size_t length);
+ int emucap_np2_write_memory(uint32_t address, const uint8_t *input, size_t length);
+ int emucap_np2_get_regs(struct emucap_np2_regs *output);
+--- a/sdl/libretro/emucap_debug.c
++++ b/sdl/libretro/emucap_debug.c
+@@ -120,24 +120,41 @@
+   return 1;
+ }
+ 
+-static int emucap_peek_byte(uint32_t address, uint8_t *value) {
++static int emucap_peek_offset(uint32_t address, uint32_t *offset) {
+   const UINT operate = vramop.operate;
+   const uint32_t page = (operate & (1U << VOPBIT_ACCESS)) ? VRAM_STEP : 0;
+   const int vga = (operate & (1U << VOPBIT_VGA)) != 0;
+   if (address < CPU_MEMREADMAX) {
+-    *value = mem[address];
++    *offset = address;
+     return 1;
+   }
+   if (!vga && address >= 0xA8000U && address < 0xC0000U) {
+-    *value = mem[address + page];
++    *offset = address + page;
+     return 1;
+   }
+   if (!vga && (operate & (1U << VOPBIT_ANALOG)) && address >= 0xE0000U &&
+       address < 0xE8000U) {
+-    *value = mem[address + page];
++    *offset = address + page;
+     return 1;
+   }
+   return 0;
++}
++
++int emucap_np2_validate_peek_ranges(const struct emucap_np2_peek_range *ranges,
++                                  size_t count) {
++  size_t i, total = 0;
++  if (!ranges || count == 0 || count > 64) return 0;
++  for (i = 0; i < count; i++) {
++    uint32_t offset, j;
++    const uint32_t address = ranges[i].address, length = ranges[i].length;
++    if (!length || length > 0x4000U || address >= EMUCAP_MEMORY_LIMIT ||
++        length > EMUCAP_MEMORY_LIMIT - address || length > 65536U - total)
++      return 0;
++    total += length;
++    for (j = 0; j < length; j++)
++      if (!emucap_peek_offset(address + j, &offset)) return 0;
++  }
++  return 1;
+ }
+ 
+ int emucap_np2_peek_memory(uint32_t address, uint8_t *output, size_t length) {
+@@ -146,8 +163,9 @@
+       length > EMUCAP_MEMORY_LIMIT - address)
+     return 0;
+   for (index = 0; index < length; index++) {
+-    if (!emucap_peek_byte(address + (uint32_t)index, &output[index]))
+-      return 0;
++    uint32_t offset;
++    if (!emucap_peek_offset(address + (uint32_t)index, &offset)) return 0;
++    output[index] = mem[offset];
+   }
+   return 1;
+ }

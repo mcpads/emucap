@@ -120,6 +120,35 @@ fn build_metadata_accepts_valid_sidecar() {
 }
 
 #[test]
+fn headless_discovery_requires_the_headless_frontend() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root
+        .path()
+        .join("adapters/dolphin/work/dolphin-src/Binary/x64");
+    std::fs::create_dir_all(&directory).unwrap();
+    let gui = directory.join("Dolphin.exe");
+    let headless = directory.join("DolphinNoGUI.exe");
+    std::fs::write(&gui, b"gui").unwrap();
+    #[cfg(unix)]
+    make_executable(&gui);
+    assert_eq!(
+        super::super::first_existing_file(local_build_candidates(root.path(), false)),
+        None
+    );
+    std::fs::write(&headless, b"headless").unwrap();
+    #[cfg(unix)]
+    make_executable(&headless);
+    assert_eq!(
+        super::super::first_existing_file(local_build_candidates(root.path(), false)),
+        Some(headless)
+    );
+    assert_eq!(
+        super::super::first_existing_file(local_build_candidates(root.path(), true)),
+        Some(gui)
+    );
+}
+
+#[test]
 fn resolve_binary_accepts_explicit_app_bundle() {
     let _guard = lock_env();
     let _env = EnvGuard::new(&[
@@ -174,6 +203,42 @@ fn runtime_plain_binary_is_copied_under_per_port_home() {
         .join("runtime/emucap-dolphin-build.json")
         .is_file());
     assert_eq!(std::fs::read(&binary).unwrap(), b"fake dolphin");
+}
+
+#[test]
+fn runtime_windows_distribution_preserves_dependencies_and_system_data() {
+    let _guard = lock_env();
+    let _env = EnvGuard::new(&["EMUCAP_EMU_HOME"]);
+    let source = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::env::set_var("EMUCAP_EMU_HOME", home.path());
+    let files = [
+        ("Dolphin.exe", "executable"),
+        ("Qt6Core.dll", "dependency"),
+        ("Sys/GC/font.bin", "system data"),
+        ("QtPlugins/platforms/qwindows.dll", "platform plugin"),
+        ("qt.conf", "[Paths]\nPlugins = QtPlugins"),
+    ];
+    for (name, content) in files {
+        let path = source.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    std::fs::create_dir(source.path().join("User")).unwrap();
+    std::fs::write(source.path().join("User/settings.ini"), "personal settings").unwrap();
+    let prepared = prepare_runtime_binary(&source.path().join("Dolphin.exe"), 47925).unwrap();
+    let runtime = prepared.binary.parent().unwrap();
+    for (name, content) in files {
+        assert_eq!(
+            std::fs::read_to_string(runtime.join(name)).unwrap(),
+            content
+        );
+    }
+    assert!(!runtime.join("User").exists());
+    assert_eq!(
+        std::fs::read_to_string(source.path().join("User/settings.ini")).unwrap(),
+        "personal settings"
+    );
 }
 
 #[test]

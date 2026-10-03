@@ -1,9 +1,9 @@
 use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -15,6 +15,7 @@ use super::link::{
 use super::protocol::{parse_response, read_ndjson_frame, to_line, Request, PROTOCOL_VERSION};
 
 mod call;
+mod preaccept;
 mod reattach;
 
 pub struct TcpLink {
@@ -300,16 +301,29 @@ fn handshake_stream(
     timeout: Duration,
     expected_session_token: Option<&str>,
 ) -> Result<(Conn, Capabilities), LinkError> {
-    stream.set_read_timeout(Some(timeout)).map_err(io_to_link)?;
-    // 쓰기에도 같은 상한을 건다 — 플러드된 emu가 recv를 안 비우면 write_all이 영원히 블록해
-    // raw_call(및 그것이 쥔 SharedLink mutex)이 통째 wedge된다. 소켓 옵션이라 try_clone한 writer에도
-    // 적용된다(hello write·이후 raw_call write 모두 이 상한을 받는다).
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(io_to_link)?;
-    stream.set_nonblocking(false).map_err(io_to_link)?;
+    handshake_stream_with_stop(stream, timeout, expected_session_token, None)
+}
 
+fn handshake_stream_with_stop(
+    stream: TcpStream,
+    timeout: Duration,
+    expected_session_token: Option<&str>,
+    stop: Option<&AtomicBool>,
+) -> Result<(Conn, Capabilities), LinkError> {
+    let deadline = std::time::Instant::now() + timeout;
+    let poll = timeout.min(Duration::from_millis(25));
+    stream.set_nonblocking(false).map_err(io_to_link)?;
     let mut writer = stream.try_clone().map_err(io_to_link)?;
+    // Configure the handles that perform I/O: Windows duplicates retain separate timeouts.
+    stream
+        .set_read_timeout(Some(if stop.is_some() { poll } else { timeout }))
+        .map_err(|error| socket_config_error(&stream, error))?;
+    writer
+        .set_write_timeout(Some(if stop.is_some() { poll } else { timeout }))
+        .map_err(|error| socket_config_error(&writer, error))?;
+    if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        return Err(LinkError::NotConnected);
+    }
     let mut reader = BufReader::new(stream);
     writer
         .write_all(
@@ -326,9 +340,33 @@ fn handshake_stream(
         .map_err(io_to_link)?;
 
     let mut pending = Vec::new();
-    let line = read_ndjson_frame(&mut reader, &mut pending)
-        .map_err(io_to_link)?
-        .ok_or(LinkError::NotConnected)?;
+    let line = if let Some(stop) = stop {
+        loop {
+            if stop.load(Ordering::Acquire) {
+                return Err(LinkError::NotConnected);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(LinkError::Timeout);
+            }
+            match super::protocol::read_ndjson_chunk(&mut reader, &mut pending) {
+                Ok(Some(line)) => break line,
+                Ok(None) => return Err(LinkError::NotConnected),
+                Err(error) if is_timeout(&error) => continue,
+                Err(error) => return Err(io_to_link(error)),
+            }
+        }
+    } else {
+        read_ndjson_frame(&mut reader, &mut pending)
+            .map_err(io_to_link)?
+            .ok_or(LinkError::NotConnected)?
+    };
+    reader
+        .get_ref()
+        .set_read_timeout(Some(timeout))
+        .map_err(|error| socket_config_error(reader.get_ref(), error))?;
+    writer
+        .set_write_timeout(Some(timeout))
+        .map_err(|error| socket_config_error(&writer, error))?;
 
     let resp = parse_response(line.trim()).map_err(|e| LinkError::Protocol(e.to_string()))?;
     if !resp.ok {
@@ -433,6 +471,13 @@ fn handshake_stream(
     ))
 }
 
+impl Drop for TcpLink {
+    fn drop(&mut self) {
+        self.cancel_preaccept();
+        self.drop_conn();
+    }
+}
+
 impl TcpLink {
     fn expected_session_token(&self) -> &str {
         self.staged_reclaim_token
@@ -452,6 +497,13 @@ impl TcpLink {
     #[cfg(test)]
     pub(crate) fn has_conn(&self) -> bool {
         self.conn.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preaccept_finished(&self) -> bool {
+        self.preaccept
+            .as_ref()
+            .is_some_and(|pre| pre.handle.is_finished())
     }
 
     #[cfg(test)]
@@ -484,99 +536,6 @@ impl TcpLink {
             .write()
             .unwrap_or_else(|e| e.into_inner()) = token.to_string();
         Ok(())
-    }
-
-    fn finish_preaccept(&mut self, wait: Duration) -> Result<bool, LinkError> {
-        let Some(pre) = self.preaccept.as_ref() else {
-            return Ok(false);
-        };
-        let msg = if wait.is_zero() {
-            match pre.rx.try_recv() {
-                Ok(v) => Some(v),
-                Err(TryRecvError::Empty) => None,
-                Err(TryRecvError::Disconnected) => Some(Err(LinkError::NotConnected)),
-            }
-        } else {
-            match pre.rx.recv_timeout(wait) {
-                Ok(v) => Some(v),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => Some(Err(LinkError::NotConnected)),
-            }
-        };
-
-        match msg {
-            Some(Ok((conn, caps, token))) if token == self.expected_session_token() => {
-                self.conn = Some(conn);
-                self.caps = caps;
-                self.runtime_candidates.clear();
-                self.preaccept = None;
-                Ok(true)
-            }
-            Some(Ok(_)) => {
-                self.preaccept = None;
-                Ok(false)
-            }
-            Some(Err(e)) => {
-                self.preaccept = None;
-                Err(e)
-            }
-            None => Ok(false),
-        }
-    }
-
-    fn arm_preaccept(&mut self) -> Result<(), LinkError> {
-        if self.preaccept.is_some() || self.conn.is_some() {
-            return Ok(());
-        }
-        let listener = self
-            .listener
-            .as_ref()
-            .ok_or(LinkError::NotConnected)?
-            .try_clone()
-            .map_err(io_to_link)?;
-        self.start_preaccept(listener);
-        Ok(())
-    }
-
-    fn start_preaccept(&mut self, listener: TcpListener) {
-        let timeout = self.timeout;
-        let token_source = Arc::clone(&self.preaccept_token);
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread_stop = Arc::clone(&stop);
-        let (tx, rx) = mpsc::channel();
-        let handle = thread::spawn(move || loop {
-            if thread_stop.load(Ordering::Acquire) {
-                return;
-            }
-            match listener.accept() {
-                Ok((stream, _)) => {
-                    let session_token = token_source
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone();
-                    let result = handshake_stream(stream, timeout, Some(&session_token))
-                        .map(|(conn, caps)| (conn, caps, session_token));
-                    let _ = tx.send(result);
-                    break;
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(io_to_link(e)));
-                    break;
-                }
-            }
-        });
-        self.preaccept = Some(Preaccept { rx, handle, stop });
-    }
-
-    fn cancel_preaccept(&mut self) {
-        let Some(preaccept) = self.preaccept.take() else {
-            return;
-        };
-        preaccept.stop.store(true, Ordering::Release);
-        let _ = preaccept.handle.join();
     }
 
     /// conn을 보유 중이라도, listener에 새 클라이언트가 대기하면(ROM 교체 relaunch 등 새 에뮬 접속)
@@ -795,6 +754,12 @@ impl TcpLink {
         // pending_client와 동일). 안 그러면 stale 카운트가 신규 conn 첫 타임아웃에 그대로 이어져 조기 드롭.
         self.consecutive_timeouts = 0;
         Ok(())
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn disable_test_send_buffer(&mut self) {
+        self.ensure_connected().unwrap();
+        super::protocol::disable_test_send_buffer(&self.conn.as_ref().unwrap().writer);
     }
 
     /// deferred 데드라인을 짧게 바꿔 테스트에서 working 플러드 컷오프를 빠르게 검증한다(프로덕션 미포함).
@@ -1146,6 +1111,16 @@ fn is_timeout(e: &std::io::Error) -> bool {
         e.kind(),
         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
     )
+}
+
+// A reset socket can lose its peer while setsockopt is in flight (Darwin returns EINVAL).
+// Keep configuration errors on a connected socket distinct from transport retirement.
+pub(super) fn socket_config_error(socket: &TcpStream, error: std::io::Error) -> LinkError {
+    if error.kind() == std::io::ErrorKind::InvalidInput && socket.peer_addr().is_err() {
+        LinkError::NotConnected
+    } else {
+        io_to_link(error)
+    }
 }
 
 fn io_to_link(e: std::io::Error) -> LinkError {

@@ -1,0 +1,92 @@
+--- a/Core/Shared/FrameLimiter.h
++++ b/Core/Shared/FrameLimiter.h
+@@ -14,6 +14,13 @@
+ 	{
+ 		_delay = delay;
+ 		_targetTime = _delay;
++		_resetRunTimers = false;
++	}
++
++	void ResumeFromPause()
++	{
++		_clockTimer.Reset();
++		_targetTime = 0;
+ 		_resetRunTimers = false;
+ 	}
+ 
+--- a/Core/Shared/Emulator.h
++++ b/Core/Shared/Emulator.h
+@@ -176,6 +176,7 @@
+ 	bool IsPaused();
+ 
+ 	void OnBeforePause(bool clearAudioBuffer);
++	void OnAfterPause();
+ 
+ 	bool LoadRom(VirtualFile romFile, VirtualFile patchFile, bool stopRom = true, bool forPowerCycle = false);
+ 	RomInfo& GetRomInfo() { return _rom; }
+--- a/Core/Shared/Emulator.cpp
++++ b/Core/Shared/Emulator.cpp
+@@ -849,6 +849,14 @@
+ 	KeyManager::SetForceFeedback(0);
+ }
+ 
++void Emulator::OnAfterPause()
++{
++	// Called on the emulation thread after releasing a native stop.
++	if(_frameLimiter) {
++		_frameLimiter->ResumeFromPause();
++	}
++}
++
+ void Emulator::WaitForPauseEnd()
+ {
+ 	_notificationManager->SendNotification(ConsoleNotificationType::GamePaused);
+@@ -875,6 +883,7 @@
+ 	while(!_stopFlag && !_runLock.TryAcquire(50)) {}
+ 
+ 	if(!_stopFlag) {
++		OnAfterPause();
+ 		_notificationManager->SendNotification(ConsoleNotificationType::GameResumed);
+ 	}
+ }
+@@ -938,6 +947,7 @@
+ 			_threadPaused = false;
+ 
+ 			_runLock.Acquire();
++			OnAfterPause();
+ 		}
+ 	}
+ }
+--- a/Core/Debugger/Debugger.cpp
++++ b/Core/Debugger/Debugger.cpp
+@@ -517,7 +517,9 @@
+ 		PlatformUtilities::EnableScreensaver();
+ 	}
+ 
++	bool waited = false;
+ 	while((_waitForBreakResume && !_suspendRequestCount) || _breakRequestCount) {
++		waited = true;
+ 		if(_waitForBreakResume && !_suspendRequestCount && !_breakRequestCount) {
+ 			// Scripts normally receive CodeBreak once, immediately before this native halt loop. An
+ 			// opt-in CodeBreakIdle callback lets a bounded control script service external commands
+@@ -542,6 +544,9 @@
+ 		_emu->GetNotificationManager()->SendNotification(ConsoleNotificationType::DebuggerResumed);
+ 	}
+ 
++	if(waited || notificationSent) {
++		_emu->OnAfterPause();
++	}
+ 	_executionStopped = false;
+ }
+ 
+--- a/Core/Shared/FrameLimiter.h
++++ b/Core/Shared/FrameLimiter.h
+@@ -32,7 +32,7 @@
+ 
+ 	void ProcessFrame()
+ 	{
+-		if(_resetRunTimers || (_clockTimer.GetElapsedMS() - _targetTime) > 100) {
++		if(_resetRunTimers || (_clockTimer.GetElapsedMS() - (_targetTime + _delay)) > 100) {
+ 			//Reset the timers, this can happen in 3 scenarios:
+ 			//1) Target frame rate changed
+ 			//2) The console was reset/power cycled or the emulation was paused (with or without the debugger)

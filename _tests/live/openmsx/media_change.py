@@ -22,9 +22,15 @@ from disk_state import fixture
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--content', type=Path)
-    parser.add_argument('--firmware', type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--content', type=Path)
+    mode.add_argument('--profile', type=Path, help='Batch profile; runs the synthetic disk witness')
+    parser.add_argument('--firmware', type=Path)
     args = parser.parse_args()
+    profile = json.loads(args.profile.read_text()) if args.profile else {}
+    firmware = args.firmware or profile.get('env', {}).get('EMUCAP_OPENMSX_FIRMWARE')
+    if not firmware:
+        parser.error('--firmware or a profile with EMUCAP_OPENMSX_FIRMWARE is required')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     disk = args.content.resolve() if args.content else out / 'boot.dsk'
@@ -34,8 +40,11 @@ def main():
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
     env = dict(os.environ, EMUCAP_REPO_ROOT=str(ROOT), EMUCAP_PORT=str(port),
-               EMUCAP_EMU_HOME=str(out / 'home'), EMUCAP_OPENMSX_FIRMWARE=str(args.firmware.resolve()))
-    process = McpProcess(ROOT / 'target/release/emucap-mcp', env)
+               EMUCAP_EMU_HOME=str(out / 'home'))
+    env.update(profile.get('env', {}))
+    env['EMUCAP_OPENMSX_FIRMWARE'] = str(Path(firmware).resolve(strict=True))
+    executable = 'emucap-mcp.exe' if os.name == 'nt' else 'emucap-mcp'
+    process = McpProcess(ROOT / 'target/release' / executable, env, out / 'mcp-stderr.log')
     launch = None
     rows = []
 
@@ -72,7 +81,8 @@ def main():
         call('bootstrap')
         plan = call('launch_plan', {'content_path': str(disk), 'system': 'msx2'})
         assert plan['ready_to_launch'], plan
-        launch = call('launch', {**plan['preferred_launcher']['args'], 'display': True, 'sound': False})
+        launch = call('launch', {**plan['preferred_launcher']['args'], 'display': True, 'sound': False,
+                                 **profile.get('launch', {})})
         status = call('status')
         assert status['connected'] and 'change_media' in status['methods'], status
         assert status['contracts']['state'] == 'validated', status
@@ -121,9 +131,12 @@ def main():
             (out / 'result.json').write_text(json.dumps({'passed': True, 'source_sha256': source_hash}, indent=2))
             print('Native disk swap/write/eject/restore/readback passed', flush=True)
     finally:
-        if launch:
-            call('stop', {'launch_id': launch['launch_id']})
-        process.close()
+        try:
+            if launch:
+                stopped = call('stop', {'launch_id': launch['launch_id']})
+                (out / 'stop.json').write_text(json.dumps(stopped, indent=2))
+        finally:
+            process.close()
 
 
 if __name__ == '__main__':

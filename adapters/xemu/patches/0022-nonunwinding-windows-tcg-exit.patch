@@ -1,0 +1,79 @@
+--- a/include/system/os-win32.h
++++ b/include/system/os-win32.h
+@@ -79,6 +79,9 @@
+  */
+ # undef setjmp
+ # define setjmp(env) _setjmp(env, NULL)
++/* Windows x64 emulation on ARM can unwind even with Frame == NULL.
++ * Both translation-time and generated-code exits need a register-only restore. */
++void __attribute__((noreturn)) qemu_win64_longjmp(jmp_buf env, int value);
+ #endif /* __aarch64__ */
+ /* QEMU uses sigsetjmp()/siglongjmp() as the portable way to specify
+  * "longjmp and don't touch the signal masks". Since we know that the
+@@ -87,7 +90,11 @@
+  */
+ #define sigjmp_buf jmp_buf
+ #define sigsetjmp(env, savemask) setjmp(env)
++#if defined(_WIN64) && defined(__x86_64__)
++#define siglongjmp(env, val) qemu_win64_longjmp(env, val)
++#else
+ #define siglongjmp(env, val) longjmp(env, val)
++#endif
+ 
+ /* Missing POSIX functions. Don't use MinGW-w64 macros. */
+ #ifndef _POSIX_THREAD_SAFE_FUNCTIONS
+--- a/util/meson.build
++++ b/util/meson.build
+@@ -26,6 +26,9 @@
+   util_ss.add(files('aio-win32.c'))
+   util_ss.add(files('event_notifier-win32.c'))
+   util_ss.add(files('oslib-win32.c'))
++  if host_arch == 'x86_64'
++    util_ss.add(files('longjmp-win64.S'))
++  endif
+   util_ss.add(files('qemu-thread-win32.c'))
+   util_ss.add(winmm, pathcch, synchronization)
+ endif
+--- /dev/null
++++ b/util/longjmp-win64.S
+@@ -0,0 +1,40 @@
++/*
++ * Derived from mingw-w64-crt/misc/longjmp.S, placed in the Public Domain.
++ * No warranty is given; see mingw-w64 DISCLAIMER.PD.
++ * Source revision: a20beb433824b6a0bbb3fed5b533fa45e907119e
++ * Restores the Windows x64 jmp_buf ABI without invoking the OS unwinder.
++ * QEMU signal jumps require register restoration without OS stack unwinding.
++ */
++.text
++.globl qemu_win64_longjmp
++.def qemu_win64_longjmp; .scl 2; .type 32; .endef
++qemu_win64_longjmp:
++        movl    %edx,%eax            /* retval; longjmp(0) returns 1 */
++        testl   %eax,%eax
++        jnz     1f
++        incl    %eax
++1:
++        movq    0x8(%rcx),%rbx       /* jmp_buf->Rbx */
++        movq    0x18(%rcx),%rbp      /* jmp_buf->Rbp */
++        movq    0x20(%rcx),%rsi      /* jmp_buf->Rsi */
++        movq    0x28(%rcx),%rdi      /* jmp_buf->Rdi */
++        movq    0x30(%rcx),%r12      /* jmp_buf->R12 */
++        movq    0x38(%rcx),%r13      /* jmp_buf->R13 */
++        movq    0x40(%rcx),%r14      /* jmp_buf->R14 */
++        movq    0x48(%rcx),%r15      /* jmp_buf->R15 */
++        ldmxcsr 0x58(%rcx)           /* jmp_buf->MxCsr */
++        fnclex
++        fldcw   0x5c(%rcx)           /* jmp_buf->FpCsr */
++        movdqa  0x60(%rcx),%xmm6     /* jmp_buf->Xmm6 */
++        movdqa  0x70(%rcx),%xmm7     /* jmp_buf->Xmm7 */
++        movdqa  0x80(%rcx),%xmm8     /* jmp_buf->Xmm8 */
++        movdqa  0x90(%rcx),%xmm9     /* jmp_buf->Xmm9 */
++        movdqa  0xa0(%rcx),%xmm10    /* jmp_buf->Xmm10 */
++        movdqa  0xb0(%rcx),%xmm11    /* jmp_buf->Xmm11 */
++        movdqa  0xc0(%rcx),%xmm12    /* jmp_buf->Xmm12 */
++        movdqa  0xd0(%rcx),%xmm13    /* jmp_buf->Xmm13 */
++        movdqa  0xe0(%rcx),%xmm14    /* jmp_buf->Xmm14 */
++        movdqa  0xf0(%rcx),%xmm15    /* jmp_buf->Xmm15 */
++        movq    0x50(%rcx),%rdx      /* jmp_buf->Rip */
++        movq    0x10(%rcx),%rsp      /* jmp_buf->Rsp */
++        jmp     *%rdx

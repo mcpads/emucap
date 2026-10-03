@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::{emu_home_dir, find_on_path, is_runnable_file, spawn_detached, LaunchSpec, RuntimeEnv};
 
-pub const REQUIRED_HOST_API: u32 = 6;
+pub const REQUIRED_HOST_API: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildMetadata {
@@ -48,7 +48,7 @@ fn binary_name() -> &'static str {
 }
 
 pub fn resolve_binary(repo_root: &Path) -> Option<PathBuf> {
-    if !cfg!(unix) {
+    if !cfg!(any(unix, windows)) {
         return None;
     }
     if let Some(explicit) = std::env::var_os("EMUCAP_M64P_BIN") {
@@ -103,9 +103,19 @@ fn required_lock_value(lock: &str, key: &str) -> io::Result<String> {
 }
 
 fn library_exists(root: &Path, stem: &str) -> bool {
+    library_path(root, stem).is_some()
+}
+
+pub(crate) fn library_path(root: &Path, stem: &str) -> Option<PathBuf> {
+    if cfg!(windows) {
+        let stem = stem.strip_prefix("lib").unwrap_or(stem);
+        let path = root.join(format!("{stem}.dll"));
+        return path.is_file().then_some(path);
+    }
     [".dylib", ".so", ".so.2"]
         .into_iter()
-        .any(|suffix| root.join(format!("{stem}{suffix}")).is_file())
+        .map(|suffix| root.join(format!("{stem}{suffix}")))
+        .find(|path| path.is_file())
 }
 
 pub fn require_compatible_root(

@@ -16,6 +16,17 @@ pub trait WsTransport {
         false
     }
 
+    /// A negotiated deferred native frame operation. Implementations without that
+    /// protocol reject before issuing a guest effect.
+    fn frame_step_cancellable(
+        &mut self,
+        _count: u64,
+        _timeout: Duration,
+        _cancellation: &crate::live::link::RequestCancellation,
+    ) -> BridgeResult<Value> {
+        Err(BridgeError::Unsupported("owned frame cancellation".into()))
+    }
+
     /// Send `{"event": event, ...params}` and block for the reply carrying the same event name and
     /// request identity. A correlated `{"event":"error", ...}` reply becomes `Err`. Any other
     /// event observed while waiting (a spontaneous notification or a late reply to an earlier
@@ -238,6 +249,160 @@ impl TungsteniteWs {
 }
 
 impl WsTransport for TungsteniteWs {
+    fn frame_step_cancellable(
+        &mut self,
+        count: u64,
+        timeout: Duration,
+        cancellation: &crate::live::link::RequestCancellation,
+    ) -> BridgeResult<Value> {
+        if self.terminal {
+            return Err(BridgeError::BadState("native transport is retired".into()));
+        }
+        if count == 0 || count > crate::live::temporal::MAX_SYNC_ADVANCE_COUNT {
+            return Err(BridgeError::BadParams("invalid frame count".into()));
+        }
+        if cancellation.is_cancelled() || timeout.is_zero() {
+            return Err(BridgeError::BadState(
+                "frame operation cancelled before admission".into(),
+            ));
+        }
+        let deadline = std::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| BridgeError::BadParams("frame deadline overflow".into()))?;
+        // Probe before mutation. An old host's unknown-event response is a safe rejection.
+        let capability = self.call_with_timeout(
+            "emucap.frameStep.capability",
+            json!({}),
+            timeout.min(Duration::from_secs(2)),
+        )?;
+        if capability
+            .get("memory_park_version")
+            .and_then(Value::as_u64)
+            != Some(1)
+            || capability.get("version").and_then(Value::as_u64) != Some(1)
+            || capability.get("connection_owned").and_then(Value::as_bool) != Some(true)
+        {
+            return Err(BridgeError::Unsupported(
+                "native owned frame protocol v1".into(),
+            ));
+        }
+        if cancellation.is_cancelled() || std::time::Instant::now() >= deadline {
+            return Err(BridgeError::BadState(
+                "frame operation cancelled before admission".into(),
+            ));
+        }
+        let ticket = self.mint_ticket();
+        let cancel_ticket = self.mint_ticket();
+        let operation = crate::live::temporal::fresh_identity();
+        let outcome = self.with_socket_timeout(Duration::from_millis(25), |transport| {
+            transport.send_request(
+                "emucap.frameStep",
+                json!({"count":count,"ticket":ticket,"operation_id":operation}),
+            )?;
+            let mut cancel_deadline = None;
+            let mut host_deadline = false;
+            let mut terminal = None;
+            let mut cancel_ack = false;
+            loop {
+                let now = std::time::Instant::now();
+                if cancel_deadline.is_none() && (cancellation.is_cancelled() || now >= deadline) {
+                    host_deadline = now >= deadline;
+                    transport.send_request(
+                        "emucap.frameStep.cancel",
+                        json!({"ticket":cancel_ticket,"operation_id":operation}),
+                    )?;
+                    cancel_deadline = Some(now + Duration::from_millis(2500));
+                }
+                if cancel_deadline.is_some_and(|until| now >= until) {
+                    return Err(BridgeError::Emulator(
+                        "frame cancellation stop was not verified within its deadline".into(),
+                    ));
+                }
+                let message = match transport.socket.read() {
+                    Ok(message) => message,
+                    Err(tungstenite::Error::Io(error))
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                match message {
+                    Message::Text(text) => {
+                        let value: Value = serde_json::from_str(text.as_str())?;
+                        let seen = value.get("ticket").and_then(Value::as_str);
+                        let event = value.get("event").and_then(Value::as_str);
+                        if seen == Some(ticket.as_str()) {
+                            if event != Some("emucap.frameStep") || terminal.is_some() {
+                                return Err(BridgeError::Emulator(
+                                    "invalid native frame terminal".into(),
+                                ));
+                            }
+                            let completed = value.get("completed").and_then(Value::as_u64);
+                            let status = value.get("status").and_then(Value::as_str);
+                            if value.get("operation_id").and_then(Value::as_str)
+                                != Some(operation.as_str())
+                                || value.get("state").and_then(Value::as_str) != Some("frozen")
+                                || value.get("unit").and_then(Value::as_str) != Some("frames")
+                                || value.get("count").and_then(Value::as_u64) != Some(count)
+                                || !completed.is_some_and(|n| n <= count)
+                                || !matches!(status, Some("completed" | "interrupted"))
+                                || (status == Some("completed") && completed != Some(count))
+                            {
+                                return Err(BridgeError::Emulator(
+                                    "unverified native frame terminal".into(),
+                                ));
+                            }
+                            terminal = Some(value);
+                        } else if seen == Some(cancel_ticket.as_str()) && cancel_deadline.is_some()
+                        {
+                            // Completion may have released the owner before cancel arrived.
+                            // A matching error is safe only once the original stop terminal exists.
+                            if cancel_ack
+                                || !(event == Some("error")
+                                    || (event == Some("emucap.frameStep.cancel")
+                                        && value.get("status").and_then(Value::as_str)
+                                            == Some("requested")))
+                            {
+                                return Err(BridgeError::Emulator(
+                                    "invalid native cancellation acknowledgement".into(),
+                                ));
+                            }
+                            cancel_ack = true;
+                        } else {
+                            transport.pending_events.push_back(value);
+                        }
+                        if terminal.is_some() && (cancel_deadline.is_none() || cancel_ack) {
+                            let mut value = terminal.take().unwrap();
+                            if host_deadline
+                                && value["status"] == "interrupted"
+                                && value["reason"] == "cancelled"
+                            {
+                                value["reason"] = json!("host_deadline");
+                            }
+                            return Ok(value);
+                        }
+                    }
+                    Message::Close(_) => {
+                        return Err(BridgeError::Emulator(
+                            "native frame connection closed before terminal".into(),
+                        ))
+                    }
+                    _ => (),
+                }
+            }
+        });
+        if outcome.is_err() {
+            // After dispatch, uncertainty retires the channel and invokes native EOF cleanup.
+            self.terminal = true;
+            let _ = self.socket.get_ref().shutdown(std::net::Shutdown::Both);
+        }
+        outcome
+    }
+
     fn is_terminal(&self) -> bool {
         self.terminal
     }

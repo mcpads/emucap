@@ -1,0 +1,155 @@
+--- a/core/hw/pvr/Renderer_if.cpp
++++ b/core/hw/pvr/Renderer_if.cpp
+@@ -14,6 +14,9 @@
+ 
+ #include <mutex>
+ #include <deque>
++#include "emucap_render_fence.h"
++#include "emucap.h"
++#include <exception>
+ 
+ #ifdef LIBRETRO
+ void retro_rend_present();
+@@ -45,16 +48,55 @@
+ 	using lock_guard = std::lock_guard<std::mutex>;
+ 
+ public:
+-	enum MessageType { NoMessage = -1, Render, RenderFramebuffer, Present, Stop };
++	enum MessageType { NoMessage = -1, Render, RenderFramebuffer, Present, Stop, Fence };
+ 	struct Message
+ 	{
+ 		Message() = default;
+ 		Message(MessageType type, FramebufferInfo config)
+ 			: type(type), config(config) {}
+ 
++		EmucapRenderFence::Ticket ticket;
+ 		MessageType type = NoMessage;
+ 		FramebufferInfo config;
+ 	};
++
++	// Called by the parked emulation owner, which submits no more guest work.
++	EmucapRenderFence::Result waitForWriters(unsigned timeoutMs)
++	{
++		const auto deadline = std::chrono::steady_clock::now()
++			+ std::chrono::milliseconds(timeoutMs);
++		EmucapRenderFence::Ticket ticket;
++		{
++			const lock_guard lock(mutex);
++			ticket = completion.issue(deadline);
++			if (completion.observe(ticket) != EmucapRenderFence::Result::pending)
++				return completion.observe(ticket);
++			if (config::ThreadedRendering) {
++				Message msg;
++				msg.type = Fence;
++				msg.ticket = ticket;
++				queue.push_back(msg);
++			} else {
++				// Inline rendering has returned on this owner. A mode switch with
++				// queued work needs native draining before an inline park is valid.
++				if (!queue.empty())
++					completion.fail();
++				else
++					completion.acknowledge(ticket);
++			}
++		}
++		enqueueEvent.Set();
++		const auto result = completion.wait_until(ticket, deadline);
++		if (result == EmucapRenderFence::Result::timed_out)
++			completion.fail();
++		return result;
++	}
++
++	void replaceGeneration() {
++		const lock_guard lock(mutex);
++		completion.new_generation(false);
++	}
++	void failWriters() { completion.fail(); }
+ 
+ 	void enqueue(MessageType type, FramebufferInfo config = FramebufferInfo())
+ 	{
+@@ -106,12 +148,15 @@
+ 
+ 	void reset() {
+ 		const lock_guard lock(mutex);
++		completion.new_generation();
+ 		queue.clear();
++		dequeueEvent.Set();
+ 	}
+ 
+ 	void cancelEnqueue()
+ 	{
+ 		const lock_guard lock(mutex);
++		completion.fail();
+ 		for (auto it = queue.begin(); it != queue.end(); )
+ 		{
+ 			if (it->type != Render)
+@@ -150,6 +195,21 @@
+ 	}
+ 
+ 	bool execute(Message msg)
++	{
++		try {
++			return executeMessage(msg);
++		} catch (const std::exception& error) {
++			emucap_renderer_failed(error.what());
++			completion.fail();
++			throw;
++		} catch (...) {
++			emucap_renderer_failed("unknown renderer exception");
++			completion.fail();
++			throw;
++		}
++	}
++
++	bool executeMessage(Message msg)
+ 	{
+ 		switch (msg.type)
+ 		{
+@@ -162,7 +222,12 @@
+ 		case Present:
+ 			present();
+ 			return true;
++		case Fence:
++			completion.acknowledge(msg.ticket);
++			return true;
+ 		case Stop:
++			completion.fail();
++			return false;
+ 		case NoMessage:
+ 		default:
+ 			return false;
+@@ -251,6 +316,7 @@
+ 		}
+ 	}
+ 
++	EmucapRenderFence completion;
+ 	std::mutex mutex;
+ 	cResetEvent enqueueEvent;
+ 	cResetEvent dequeueEvent;
+@@ -258,6 +324,14 @@
+ };
+ 
+ static PvrMessageQueue pvrQueue;
++
++EmucapRenderFence::Result rend_emucap_wait_writers(unsigned timeoutMs)
++{
++	return pvrQueue.waitForWriters(timeoutMs);
++}
++
++void rend_emucap_replace_generation() { pvrQueue.replaceGeneration(); }
++void rend_emucap_fail_writers() { pvrQueue.failWriters(); }
+ 
+ bool rend_single_frame(const bool& enabled)
+ {
+--- a/core/hw/pvr/Renderer_if.h
++++ b/core/hw/pvr/Renderer_if.h
+@@ -120,3 +120,9 @@
+ 	RendererException(const std::string& reason) : FlycastException(reason) {}
+ 	RendererException(const char *reason) : FlycastException(reason) {}
+ };
++
++// Emulation-owner barrier; guest submissions must remain stopped while observed.
++#include "emucap_render_fence.h"
++EmucapRenderFence::Result rend_emucap_wait_writers(unsigned timeoutMs);
++void rend_emucap_replace_generation();
++void rend_emucap_fail_writers();

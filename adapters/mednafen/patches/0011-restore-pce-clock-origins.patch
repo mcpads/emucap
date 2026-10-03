@@ -1,0 +1,169 @@
+--- a/src/pce/huc6280.cpp
++++ b/src/pce/huc6280.cpp
+@@ -783,10 +783,14 @@
+ void HuC6280::StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
+  uint16 tmp_PC = PC;
++ // Legacy files omitted these origins; never inherit the abandoned timeline.
++ if(load) timestamp = timer_lastts = 0;
+ 
+  SFORMAT StateRegs[]=
+  {
+   SFVAR(runrunrun),	// For the benefit of save states while in step mode in the debugger.
++  SFVAR(timestamp),
++  SFVAR(timer_lastts),
+ 
+   SFVARN(tmp_PC, "PC"),
+   SFVARN(A, "A"),
+--- a/src/pce/vce.cpp
++++ b/src/pce/vce.cpp
+@@ -879,9 +879,12 @@
+ 
+ void VCE::StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++ if(load) { last_ts = 0; cd_event = 1; }
+  SFORMAT VCE_StateRegs[] =
+  {
+   SFVARN(CR, "VCECR"),
++  SFVAR(last_ts),
++  SFVAR(cd_event),
+ 
+   SFVAR(ws_counter),
+ 
+--- a/src/hw_sound/pce_psg/pce_psg.h
++++ b/src/hw_sound/pce_psg/pce_psg.h
+@@ -131,7 +131,8 @@
+         PCE_PSG(int32* hr_l, int32* hr_r, int want_revision) MDFN_COLD;
+         ~PCE_PSG() MDFN_COLD;
+ 
+-	void StateAction(StateMem *sm, const unsigned load, const bool data_only);
++	// Callers that restore a saved CPU clock also restore the matching PSG origins.
++	void StateAction(StateMem *sm, const unsigned load, const bool data_only, bool restore_clock_origins = false);
+ 
+         void Power(const int32 timestamp) MDFN_COLD;
+         void Write(int32 timestamp, uint8 A, uint8 V);
+--- a/src/hw_sound/pce_psg/pce_psg.cpp
++++ b/src/hw_sound/pce_psg/pce_psg.cpp
+@@ -822,15 +822,19 @@
+  vol_update_which = 0;
+ }
+ 
+-void PCE_PSG::StateAction(StateMem *sm, const unsigned load, const bool data_only)
+-{
++void PCE_PSG::StateAction(StateMem *sm, const unsigned load, const bool data_only, bool restore_clock_origins)
++{
++ // PC-FX rebases restored devices onto the current CPU clock instead.
++ if(load && restore_clock_origins) ResetTS(0);
+  for(int ch = 0; ch < 6; ch++)
+  {
+   char tmpstr[5] = "SCHx";
+   psg_channel *pt = &channel[ch];
+ 
++  SFORMAT CH_ClockRegs[] = { SFVARN(pt->lastts, "lastts"), SFEND };
+   SFORMAT CH_StateRegs[] = 
+   {
++   SFLINK(restore_clock_origins ? CH_ClockRegs : nullptr),
+    SFVARN(pt->counter, "counter"),
+    SFVARN(pt->frequency, "frequency"),
+    SFVARN(pt->control, "control"),
+@@ -848,8 +852,10 @@
+   MDFNSS_StateAction(sm, load, data_only, CH_StateRegs, tmpstr);
+  }
+ 
++ SFORMAT ClockRegs[] = { SFVAR(lastts), SFEND };
+  SFORMAT PSG_StateRegs[] =
+  {
++  SFLINK(restore_clock_origins ? ClockRegs : nullptr),
+   SFVAR(select),
+   SFVAR(globalbalance),
+   SFVAR(lfofreq),
+--- a/src/pce/pce.cpp
++++ b/src/pce/pce.cpp
+@@ -831,6 +831,7 @@
+ #endif
+ 
+ static EmulateSpecStruct *es;
++static bool restored_clock = false;
+ static void Emulate(EmulateSpecStruct *espec)
+ {
+  es = espec;
+@@ -855,7 +856,9 @@
+  bool rp_rv;
+  do
+  {
+-  assert(HuCPU.Timestamp() < 12);
++  // A state saved at a CPU halt can resume the remainder of a partial frame.
++  assert(HuCPU.Timestamp() < 12 || restored_clock);
++  restored_clock = false;
+   //printf("ST: %d\n", HuCPU.Timestamp());
+ 
+   INPUT_Frame();
+@@ -1012,13 +1015,13 @@
+ 
+  HuCPU.StateAction(sm, load, data_only);
+  vce->StateAction(sm, load, data_only);
+- psg->StateAction(sm, load, data_only);
++ psg->StateAction(sm, load, data_only, true);
+  INPUT_StateAction(sm, load, data_only);
+  HuC_StateAction(sm, load, data_only);
+ 
+  if(load)
+  {
+-
++  restored_clock = true;
+  }
+ }
+ 
+--- a/src/pce/pcecd.cpp
++++ b/src/pce/pcecd.cpp
+@@ -1314,9 +1314,11 @@
+ 
+ void PCECD_StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++	if(load) lastts = 0;
+ 	SFORMAT StateRegs[] =
+ 	{
+ 	 SFVAR(bBRAMEnabled),
++	 SFVAR(lastts),
+ 	 SFVAR(ACKStatus),
+ 	 SFVAR(ClearACKDelay),
+ 	 SFVAR(RawPCMVolumeCache),
+@@ -1349,7 +1351,7 @@
+ 
+ 	 SubChannelFIFO.SaveStatePostLoad();
+ 	}
+-	SCSICD_StateAction(sm, load, data_only, "CDRM");
++	SCSICD_StateAction(sm, load, data_only, "CDRM", true);
+ 	ADPCM_StateAction(sm, load, data_only);
+ 
+ 	if(load)
+--- a/src/cdrom/scsicd.h
++++ b/src/cdrom/scsicd.h
+@@ -95,7 +95,8 @@
+ 
+ void SCSICD_SetTransferRate(uint32 TransferRate);
+ void SCSICD_SetCDDAVolume(double left, double right);
+-void SCSICD_StateAction(StateMem *sm, const unsigned load, const bool data_only, const char *sname);
++// Select saved-clock restoration only when the caller restores that CPU domain.
++void SCSICD_StateAction(StateMem *sm, const unsigned load, const bool data_only, const char *sname, bool restore_clock_origin = false);
+ 
+ void SCSICD_SetDisc(bool tray_open, CDInterface* cdif, bool no_emu_side_effects = false);
+ 
+--- a/src/cdrom/scsicd.cpp
++++ b/src/cdrom/scsicd.cpp
+@@ -3183,10 +3183,13 @@
+  FixOPV();
+ }
+ 
+-void SCSICD_StateAction(StateMem* sm, const unsigned load, const bool data_only, const char *sname)
+-{
++void SCSICD_StateAction(StateMem* sm, const unsigned load, const bool data_only, const char *sname, bool restore_clock_origin)
++{
++ if(load && restore_clock_origin) lastts = 0;
++ SFORMAT ClockRegs[] = { SFVAR(lastts), SFEND };
+  SFORMAT StateRegs[] = 
+  {
++  SFLINK(restore_clock_origin ? ClockRegs : nullptr),
+   SFVARN(cd_bus.DB, "DB"),
+   SFVARN(cd_bus.signals, "Signals"),
+   SFVAR(CurrentPhase),

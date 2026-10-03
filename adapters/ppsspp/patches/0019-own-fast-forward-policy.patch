@@ -1,0 +1,354 @@
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -7,6 +7,7 @@
+ // any core, audio, UI, socket or lifecycle operation.
+ struct EmucapPacingSnapshot {
+     int percent = 100;
++    bool fastForward = false;
+     uint32_t revision = 0;
+ };
+ 
+@@ -30,7 +31,25 @@
+         return {previous, policy_};
+     }
+ 
++    void InitializeFastForward(bool value) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        if (!initialized_) {
++            policy_.fastForward = value;
++            ++policy_.revision;
++            initialized_ = true;
++        }
++    }
++
++    EmucapPacingUpdate SetFastForward(bool value) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        const auto previous = policy_;
++        policy_.fastForward = value;
++        ++policy_.revision;
++        return {previous, policy_};
++    }
++
+ private:
++    bool initialized_ = false;
+     mutable std::mutex mutex_;
+     EmucapPacingSnapshot policy_;
+ };
+diff --git a/Core/CoreParameter.h b/Core/CoreParameter.h
+--- a/Core/CoreParameter.h
++++ b/Core/CoreParameter.h
+@@ -73,7 +73,8 @@
+ 	int pixelHeight = 0;
+ 
+ 	// Can be modified at runtime. Do not belong here.
+-	bool fastForward = false;
++	// Launch default only. Runtime fast-forward is owned by EmucapPacingOwner.
++	bool initialFastForward = false;
+ 	FPSLimit fpsLimit = FPSLimit::NORMAL;
+ 	int analogFpsLimit = 0;
+ 
+diff --git a/headless/Headless.cpp b/headless/Headless.cpp
+--- a/headless/Headless.cpp
++++ b/headless/Headless.cpp
+@@ -575,11 +575,11 @@
+ 	coreParameter.renderHeight = 272;
+ 	coreParameter.pixelWidth = 480;
+ 	coreParameter.pixelHeight = 272;
+-	coreParameter.fastForward = true;
++	coreParameter.initialFastForward = true;
+ 	// emucap fork: a debugger session is paced by the agent speed (launch default 100 percent)
+ 	// instead of running unthrottled like an autotest.
+ 	if (debuggerPort > 0)
+-		coreParameter.fastForward = false;
++		coreParameter.initialFastForward = false;
+ 
+ 	g_Config.RestoreDefaults(RestoreSettingsBits::SETTINGS | RestoreSettingsBits::CONTROLS, true);
+ 
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -17,6 +17,8 @@
+ 
+ #pragma once
+ 
++#include "Core/EmucapPacing.h"
++
+ #include "Core/MemMap.h"
+ 
+ void __DisplayInit();
+@@ -35,6 +37,10 @@
+ // emucap agent pacing: a percent of the PSP refresh used in place of the normal limit, 0 for
+ // unlimited. Held keys, custom limits and fast-forward still take precedence.
+ void __DisplaySetEmucapSpeed(int percent);
++EmucapPacingSnapshot __DisplayGetEmucapPacing();
++void __DisplayInitializeEmucapPacing(bool fastForward);
++void __DisplaySetEmucapFastForward(bool value);
++bool __DisplayGetEmucapFastForward();
+ int __DisplayGetEmucapSpeed();
+ // Changes whenever the agent speed changes, so a wait computed for the old target can end.
+ uint32_t __DisplayEmucapPacingGeneration();
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -360,6 +360,22 @@
+ 
+ static EmucapPacingOwner emucapPacing;
+ 
++EmucapPacingSnapshot __DisplayGetEmucapPacing() {
++    return emucapPacing.Read();
++}
++
++void __DisplayInitializeEmucapPacing(bool fastForward) {
++    emucapPacing.InitializeFastForward(fastForward);
++}
++
++void __DisplaySetEmucapFastForward(bool value) {
++    emucapPacing.SetFastForward(value);
++}
++
++bool __DisplayGetEmucapFastForward() {
++    return emucapPacing.Read().fastForward;
++}
++
+ void __DisplaySetEmucapSpeed(int percent) {
+ 	emucapPacing.SetPercent(percent);
+ }
+@@ -375,6 +391,7 @@
+ // TOOD: Should return 59.997?
+ // Frames per second; 0 is unthrottled. The normal limit follows the emucap agent speed.
+ static double FrameTimingLimit() {
++	const auto pacing = emucapPacing.Read();
+ 	if (!NetworkAllowSpeedControl()) {
+ 		return 60;
+ 	}
+@@ -391,7 +408,7 @@
+ 	};
+ 
+ 	// Note: Fast-forward is OK in hardcore mode.
+-	if (PSP_CoreParameter().fastForward)
++	if (pacing.fastForward)
+ 		return 0;
+ 	// Can't slow down in hardcore mode.
+ 	if (PSP_CoreParameter().fpsLimit == FPSLimit::CUSTOM1)
+@@ -400,7 +417,7 @@
+ 		return fixRate(g_Config.iFpsLimit2);
+ 	if (PSP_CoreParameter().fpsLimit == FPSLimit::ANALOG)
+ 		return fixRate(PSP_CoreParameter().analogFpsLimit);
+-	const int percent = emucapPacing.Read().percent;
++	const int percent = pacing.percent;
+ 	return percent == 0 ? 0.0 : framerate * percent / 100.0;
+ }
+ 
+diff --git a/Core/System.cpp b/Core/System.cpp
+--- a/Core/System.cpp
++++ b/Core/System.cpp
+@@ -55,6 +55,7 @@
+ #include "Core/MIPS/MIPSVFPUUtils.h"
+ #include "Core/Debugger/SymbolMap.h"
+ #include "Core/System.h"
++#include "Core/HLE/sceDisplay.h"
+ #include "Core/HLE/HLE.h"
+ #include "Core/HLE/Plugins.h"
+ #include "Core/HLE/ReplaceTables.h"
+@@ -617,6 +618,7 @@
+ 
+ 	GraphicsContext *temp = g_CoreParameter.graphicsContext;
+ 	g_CoreParameter = coreParam;
++	__DisplayInitializeEmucapPacing(coreParam.initialFastForward);
+ 	if (g_CoreParameter.graphicsContext == nullptr) {
+ 		g_CoreParameter.graphicsContext = temp;
+ 	}
+diff --git a/Core/HLE/sceIo.cpp b/Core/HLE/sceIo.cpp
+--- a/Core/HLE/sceIo.cpp
++++ b/Core/HLE/sceIo.cpp
+@@ -2065,9 +2065,9 @@
+ 		}
+ 		case EMULATOR_DEVCTL__TOGGLE_FASTFORWARD:
+ 			if (argAddr)
+-				PSP_CoreParameter().fastForward = true;
++				__DisplaySetEmucapFastForward(true);
+ 			else
+-				PSP_CoreParameter().fastForward = false;
++				__DisplaySetEmucapFastForward(false);
+ 			return hleLogDebug(Log::sceIo, 0);
+ 		case EMULATOR_DEVCTL__GET_ASPECT_RATIO:
+ 			// NOTE: This currently only works correctly in landscape mode!
+diff --git a/UI/EmuScreen.cpp b/UI/EmuScreen.cpp
+--- a/UI/EmuScreen.cpp
++++ b/UI/EmuScreen.cpp
+@@ -1094,9 +1094,9 @@
+ 				Core_Resume();
+ 			}
+ 			*/
+-			PSP_CoreParameter().fastForward = true;
++			__DisplaySetEmucapFastForward(true);
+ 		} else {
+-			PSP_CoreParameter().fastForward = false;
++			__DisplaySetEmucapFastForward(false);
+ 		}
+ 		break;
+ 
+diff --git a/Core/HW/StereoResampler.cpp b/Core/HW/StereoResampler.cpp
+--- a/Core/HW/StereoResampler.cpp
++++ b/Core/HW/StereoResampler.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2015- PPSSPP Project and Dolphin Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -261,14 +262,14 @@
+ 
+ 	u32 cap = maxBufsize_ * 2;
+ 	// If fast-forwarding, no need to fill up the entire buffer, just screws up timing after releasing the fast-forward button.
+-	if (PSP_CoreParameter().fastForward) {
++	if (__DisplayGetEmucapFastForward()) {
+ 		cap = targetBufsize_ * 2;
+ 	}
+ 
+ 	// Check if we have enough free space
+ 	// indexW == indexR_ results in empty buffer, so indexR must always be smaller than indexW
+ 	if (numSamples * 2 + ((indexW - indexR_.load()) & INDEX_MASK) >= cap) {
+-		if (!PSP_CoreParameter().fastForward) {
++		if (!__DisplayGetEmucapFastForward()) {
+ 			overrunCount_++;
+ 		}
+ 		// TODO: "Timestretch" by doing a windowed overlap with existing buffer content?
+diff --git a/Core/HLE/__sceAudio.cpp b/Core/HLE/__sceAudio.cpp
+--- a/Core/HLE/__sceAudio.cpp
++++ b/Core/HLE/__sceAudio.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -426,7 +427,7 @@
+ 
+ 	if (g_Config.bEnableSound) {
+ 		float multiplier = Volume100ToMultiplier(std::clamp(g_Config.iGameVolume, 0, VOLUMEHI_FULL));
+-		if (PSP_CoreParameter().fpsLimit != FPSLimit::NORMAL || PSP_CoreParameter().fastForward) {
++		if (PSP_CoreParameter().fpsLimit != FPSLimit::NORMAL || __DisplayGetEmucapFastForward()) {
+ 			if (g_Config.iAltSpeedVolume != -1) {
+ 				// Multiply in the alt speed volume instead of replacing like before.
+ 				multiplier *= Volume100ToMultiplier(g_Config.iAltSpeedVolume);
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -227,7 +227,7 @@
+ 		__DisplaySetEmucapSpeed((int)percent);
+ 	}
+ 	const int percent = __DisplayGetEmucapSpeed();
+-	const bool fastForward = PSP_CoreParameter().fastForward;
++	const bool fastForward = __DisplayGetEmucapFastForward();
+ 	const int fpsLimit = (int)PSP_CoreParameter().fpsLimit;
+ 	const bool networkForced = !NetworkAllowSpeedControl();
+ 	static std::string lastKey;
+diff --git a/UI/GamepadEmu.h b/UI/GamepadEmu.h
+--- a/UI/GamepadEmu.h
++++ b/UI/GamepadEmu.h
+@@ -16,6 +16,8 @@
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
+ #pragma once
++
++#include <functional>
+ 
+ #include "Common/Input/InputState.h"
+ #include "Common/Render/DrawBuffer.h"
+@@ -89,15 +91,21 @@
+ class BoolButton : public MultiTouchButton {
+ public:
+ 	BoolButton(bool *value, std::string_view key, ImageID bgImg, ImageID bgDownImg, ImageID img, float scale, UI::LayoutParams *layoutParams)
+-		: MultiTouchButton(key, bgImg, bgDownImg, img, scale, layoutParams), value_(value) {
+-	}
+-	bool Touch(const TouchInput &input) override;
+-	bool IsDownVisually() const override { return *value_; }
++        : BoolButton([value] { return *value; }, [value](bool down) { *value = down; },
++            key, bgImg, bgDownImg, img, scale, layoutParams) {
++    }
++    BoolButton(std::function<bool()> read, std::function<void(bool)> write, std::string_view key,
++        ImageID bgImg, ImageID bgDownImg, ImageID img, float scale, UI::LayoutParams *layoutParams)
++        : MultiTouchButton(key, bgImg, bgDownImg, img, scale, layoutParams), read_(read), write_(write) {
++    }
++	bool Touch(const TouchInput &input) override;
++	bool IsDownVisually() const override { return read_(); }
+ 
+ 	UI::Event OnChange;
+ 
+ private:
+-	bool *value_;
++	std::function<bool()> read_;
++    std::function<void(bool)> write_;
+ };
+ 
+ class PSPButton : public MultiTouchButton {
+diff --git a/UI/GamepadEmu.cpp b/UI/GamepadEmu.cpp
+--- a/UI/GamepadEmu.cpp
++++ b/UI/GamepadEmu.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -214,7 +215,7 @@
+ 	bool down = pointerDownMask_ != 0;
+ 
+ 	if (down != lastDown) {
+-		*value_ = down;
++		write_(down);
+ 		UI::EventParams params{ this };
+ 		params.a = down;
+ 		OnChange.Trigger(params);
+@@ -1056,7 +1057,13 @@
+ 	addPSPButton(CTRL_START, "Start button", rectImage, ImageID("I_RECT"), ImageID("I_START"), config.touchStartKey);
+ 	addPSPButton(CTRL_SELECT, "Select button", rectImage, ImageID("I_RECT"), ImageID("I_SELECT"), config.touchSelectKey);
+ 
+-	BoolButton *fastForward = addBoolButton(&PSP_CoreParameter().fastForward, "Fast-forward button", rectImage, ImageID("I_RECT"), ImageID("I_FAST_FORWARD_LINE"), config.touchFastForwardKey);
++	BoolButton *fastForward = nullptr;
++    if (config.touchFastForwardKey.show) {
++        const auto &touch = config.touchFastForwardKey;
++        fastForward = Add(new BoolButton(__DisplayGetEmucapFastForward, __DisplaySetEmucapFastForward,
++            "Fast-forward button", rectImage, ImageID("I_RECT"), ImageID("I_FAST_FORWARD_LINE"),
++            touch.scale, buttonLayoutParams(touch)));
++    }
+ 	if (fastForward) {
+ 		fastForward->OnChange.Add([](UI::EventParams &e) {
+ 			if (e.a && coreState == CORE_STEPPING_CPU) {
+diff --git a/unittest/JitHarness.cpp b/unittest/JitHarness.cpp
+--- a/unittest/JitHarness.cpp
++++ b/unittest/JitHarness.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -105,7 +106,7 @@
+ 	g_symbolMap = new SymbolMap();
+ 	Memory::g_MemorySize = Memory::RAM_NORMAL_SIZE;
+ 	PSP_CoreParameter().cpuCore = CPUCore::INTERPRETER;
+-	PSP_CoreParameter().fastForward = true;
++	__DisplaySetEmucapFastForward(true);
+ 
+ 	Memory::Init(Memory::MemMapSetupFlags::Default);
+ 	mipsr4k.Reset();
+diff --git a/libretro/libretro.cpp b/libretro/libretro.cpp
+--- a/libretro/libretro.cpp
++++ b/libretro/libretro.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ #include "ppsspp_config.h"
+ #include <cstring>
+ #include <cassert>
+@@ -480,8 +481,10 @@
+    if (g_Config.bForceLagSync)
+    {
+       bool isFastForwarding;
+-      if (environ_cb(RETRO_ENVIRONMENT_GET_FASTFORWARDING, &isFastForwarding))
+-         coreParam.fastForward = isFastForwarding;
++      if (environ_cb(RETRO_ENVIRONMENT_GET_FASTFORWARDING, &isFastForwarding)) {
++         coreParam.initialFastForward = isFastForwarding;
++         __DisplaySetEmucapFastForward(isFastForwarding);
++      }
+    }
+ }
+ 

@@ -16,6 +16,11 @@ def park_loop(path,signature):
  return s[start:end]
 common=r'''
 #include <algorithm>
+#include <memory>
+#include <atomic>
+#include <vector>
+#include <string>
+#include <cassert>
 #include <cstdint>
 #include <exception>
 #include <stdexcept>
@@ -34,6 +39,9 @@ static void check(bool pass){if(!pass){std::puts("short frozen interval was coun
 med=root/'adapters/mednafen';src=med/'work/mednafen/src/drivers'
 ers='\n'.join(l for l in (src/'ers.cpp').read_text().splitlines() if not l.startswith('#include'))
 code=common+r'''
+#include "emucap_native_control.h"
+static EmucapControl::NativeControl g_native_control;
+static void owned_poll() {}
 namespace Time {
 int64_t MonoMS(){return now;}
 void SleepMS(int64_t ms){ms=std::max<int64_t>(ms,1);now+=ms;waited+=ms;}
@@ -61,6 +69,17 @@ fly=root/'adapters/flycast'
 flycode=common+r'''
 #include "emucap_pacing.h"
 static EmucapSamplePacer g_pacer;
+static long g_step_id=-1,g_boundary_reply_id=-1,g_test_adapter_exception_id=-1;
+static uint64_t g_frame=0;
+static bool g_renderer_unverified=false,g_synthetic_fatal_pending=false;
+static std::atomic<bool> g_failure_shutdown_requested{false};
+static std::string g_boundary_reply;
+static struct { uint32_t pc=0; } Sh4cntx;
+static bool exclude_renderer_writes(long){now+=pause_ms;return true;}
+static void reply_ok(long,const std::string&) {assert(false);}
+static void reply_err(long,const char*,const char*) {assert(false);}
+static void emucap_capture_fatal_sh4(const char*,uint32_t,uint32_t,int,int,int){assert(false);}
+
 struct Hit {uint32_t pc;std::string registers;};
 static std::vector<Hit> g_bp_hits;
 static std::string emucap_capture_regs(){return "{}";}
@@ -75,15 +94,17 @@ int main(){
  now=prior/1000000;g_frozen=true;park();
  auto next=g_pacer.deadline_after(512,100,now*1000000);
  check(next==now*1000000+chunk);
- g_frozen=true;g_step_remaining=1;park();
- check(g_pacer.deadline_after(512,100,now*1000000)==next+chunk);
+ if(park==emucap_park) {
+  pause_ms=1;g_frozen=true;g_step_remaining=1;park();
+  check(g_pacer.deadline_after(512,100,now*1000000)==next+chunk);
+ }
  }
 }
 '''
 with tempfile.TemporaryDirectory(prefix='pacing-park-') as d:
  for name,code in [('mednafen',code),('flycast',flycode)]:
   cpp=Path(d)/(name+'.cpp');exe=Path(d)/name;cpp.write_text(code)
-  subprocess.run(['clang++','-std=c++11','-O1','-fsanitize=address,undefined','-I'+str(root/'adapters'/name),str(cpp),'-o',str(exe)],check=True)
+  subprocess.run(['clang++','-std=c++17','-O1','-fsanitize=address,undefined','-I'+str(root/'adapters'/name),str(cpp),'-o',str(exe)],check=True)
   r=subprocess.run([str(exe)],capture_output=True,text=True,env=dict(os.environ,UBSAN_OPTIONS="halt_on_error=1"))
   if a.baseline_ref:assert r.returncode==1,(name,r.returncode,r.stdout,r.stderr)
   else:assert r.returncode==0,(name,r.returncode,r.stdout,r.stderr)

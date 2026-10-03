@@ -1,0 +1,140 @@
+--- /dev/null
++++ b/desmume/src/gdbstub/EmucapPacing.h
+@@ -0,0 +1,51 @@
++#pragma once
++#include <cstdint>
++#include <mutex>
++
++struct EmucapPacingSnapshot {
++    uint32_t percent = 100;
++    bool nativeUnlimited = false;
++    uint64_t revision = 1;
++};
++struct EmucapPacingChange {
++    bool accepted;
++    EmucapPacingSnapshot previous;
++    EmucapPacingSnapshot applied;
++};
++class EmucapPacingOwner {
++public:
++    EmucapPacingSnapshot Read() const {
++        std::lock_guard<std::mutex> guard(mutex_);
++        return policy_;
++    }
++    // Publish source edges, not repeated samples of a cleared native override.
++    EmucapPacingSnapshot ObserveNative(bool unlimited) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        if (!initialized_ || unlimited != sourceUnlimited_) {
++            initialized_ = true;
++            sourceUnlimited_ = unlimited;
++            if (policy_.nativeUnlimited != unlimited) {
++                policy_.nativeUnlimited = unlimited;
++                ++policy_.revision;
++            }
++        }
++        return policy_;
++    }
++    EmucapPacingChange Apply(uint32_t percent) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        const auto previous = policy_;
++        if (percent > 10000)
++            return {false, previous, previous};
++        if (policy_.percent != percent || policy_.nativeUnlimited) {
++            policy_.percent = percent;
++            policy_.nativeUnlimited = false;
++            ++policy_.revision;
++        }
++        return {true, previous, policy_};
++    }
++private:
++    mutable std::mutex mutex_;
++    EmucapPacingSnapshot policy_;
++    bool initialized_ = false;
++    bool sourceUnlimited_ = false;
++};
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -42,6 +42,7 @@
+ #include <zlib.h>
+ #include <algorithm>
+ #include <atomic>
++#include "EmucapPacing.h"
+ #include <chrono>
+ #include <string>
+ #include <thread>
+@@ -98,13 +99,15 @@
+ // target is a percent of the DS refresh (560190 cycles at 33513982 Hz); 0 is unlimited. The stub
+ // thread changes it and reads it back while the guest runs, and a break request or a policy
+ // change ends the current wait so control does not queue behind a slow frame.
+-static std::atomic<uint32_t> emucap_pace_percent{100};
+-static std::atomic<bool> emucap_native_unlimited{false};
+-static std::atomic<uint64_t> emucap_pace_revision{1};
++static EmucapPacingOwner emucap_pacing;
+ static std::atomic<bool> emucap_pace_wake{false};
+ static std::atomic<bool> emucap_pace_reanchor{false};
+ static std::atomic<uint64_t> emucap_vblank_clock{0};
+ static std::atomic<uint64_t> emucap_memory_epoch{1};
++
++void emucap_pace_initialize(int native_unlimited) {
++  emucap_pacing.ObserveNative(native_unlimited != 0);
++}
+ 
+ void emucap_pace_frames(int frames, int native_unlimited) {
+   typedef std::chrono::steady_clock clock;
+@@ -112,10 +115,9 @@
+   static bool anchored = false;
+   if (emucap_pace_reanchor.exchange(false))
+     anchored = false;
+-  const bool native = native_unlimited != 0;
+-  if (emucap_native_unlimited.exchange(native) != native)
+-    emucap_pace_revision.fetch_add(1);
+-  const uint32_t percent = emucap_pace_percent.load();
++  const auto policy = emucap_pacing.ObserveNative(native_unlimited != 0);
++  const bool native = policy.nativeUnlimited;
++  const uint32_t percent = policy.percent;
+   if (native || percent == 0 || emucap_pace_wake.exchange(false)) {
+     anchored = false;
+     return;
+@@ -1349,10 +1351,11 @@
+     }
+     // Pacing readback: <percent, 0=unlimited>,<native unlimited 0/1>,<revision>,<VBlank clock>, hex.
+     else if ( strncmp( (const char *)packet, "qEmucap,pacing", 14) == 0) {
++      const auto policy = emucap_pacing.Read();
+       send_size = snprintf( (char *)out_ptr, BUFMAX, "%x,%x,%llx,%llx",
+-                            (unsigned)emucap_pace_percent.load(),
+-                            emucap_native_unlimited.load() ? 1u : 0u,
+-                            (unsigned long long)emucap_pace_revision.load(),
++                            (unsigned)policy.percent,
++                            policy.nativeUnlimited ? 1u : 0u,
++                            (unsigned long long)policy.revision,
+                             (unsigned long long)emucap_vblank_clock.load());
+     }
+     // One stopped-scheduler acquisition; the 8 KiB cap fits a single RSP reply.
+@@ -1412,8 +1415,7 @@
+       const uint8_t *p = &packet[15];
+       uint32_t percent = 0;
+       if ( hexToInt( &p, &percent) && percent <= 10000) {
+-        if ( emucap_pace_percent.exchange(percent) != percent)
+-          emucap_pace_revision.fetch_add(1);
++        emucap_pacing.Apply(percent);
+         emucap_pace_wake.store(true);
+         strcpy( (char *)out_ptr, "OK");
+         send_size = 2;
+--- a/desmume/src/frontend/posix/cli/main.cpp
++++ b/desmume/src/frontend/posix/cli/main.cpp
+@@ -60,6 +60,7 @@
+ #include "../gdbstub.h"
+ // Implemented by the GDB stub, which owns the agent pacing policy.
+ void emucap_pace_frames(int frames, int native_unlimited);
++void emucap_pace_initialize(int native_unlimited);
+ class CliDriver : public BaseDriver
+ {
+ private:
+@@ -443,6 +444,7 @@
+   driver = new CliDriver();
+ 
+ #ifdef GDB_STUB
++  emucap_pace_initialize(my_config.disable_limiter);
+   gdbstub_mutex_init();
+ 
+   /*

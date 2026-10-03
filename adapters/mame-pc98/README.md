@@ -526,3 +526,8 @@ device side effects disabled, the view MAME's debugger uses; `read_memory` uses 
 a non-unit throttle rate reads back as `custom`. Read-only requests are answered during throttle
 waits, so polling never advances a slow guest; a paced frame advance that would outlive its host
 budget stops with `reason: "host_deadline"`.
+
+With the patched scheduler boundary available, completed frame requests publish
+frozen state after the native timeslice and timer callbacks unwind. This applies
+to PC-98 and Neo Geo. Instruction breakpoints retain their explicit debugger halt;
+the PC-98 state-bundle format and media-binding requirements remain unchanged.

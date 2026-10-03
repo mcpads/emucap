@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub use super::capture_filesystem::FilesystemIdentity;
+use super::capture_filesystem::{create_staging_owner, staging_owner_matches};
 use super::continuity::LinkRecord;
 use super::runtime::{
     capture_process, control_session_key, process_state, ProcessIdentity, ProcessState,
@@ -30,6 +32,8 @@ pub struct CaptureCapsule {
     pub staging_path: String,
     pub output_root_identity: FilesystemIdentity,
     pub staging_identity: FilesystemIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging_owner: Option<String>,
     pub lease: CaptureLeaseIdentity,
     pub state: CaptureState,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,66 +69,6 @@ impl CaptureLeaseIdentity {
             control_session_key: control_session_key(),
             holder: capture_process(std::process::id()),
         }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FilesystemIdentity {
-    pub canonical_path: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub device: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inode: Option<u64>,
-    // Inodes can be reused as soon as a directory is removed. Missing birth
-    // time (including older capsules) cannot establish ownership for recovery.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub created_at: Option<std::time::SystemTime>,
-}
-
-impl FilesystemIdentity {
-    pub fn capture(path: &Path) -> io::Result<Self> {
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "capture-owned path is not a real directory: {}",
-                    path.display()
-                ),
-            ));
-        }
-        let canonical_path = fs::canonicalize(path)?.display().to_string();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(Self {
-                canonical_path,
-                device: Some(metadata.dev()),
-                inode: Some(metadata.ino()),
-                created_at: metadata.created().ok(),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(Self {
-                canonical_path,
-                device: None,
-                inode: None,
-                created_at: metadata.created().ok(),
-            })
-        }
-    }
-
-    pub fn matches(&self, path: &Path) -> io::Result<bool> {
-        let current = Self::capture(path)?;
-        Ok(self.canonical_path == current.canonical_path
-            && self.device.is_some()
-            && self.device == current.device
-            && self.inode.is_some()
-            && self.inode == current.inode
-            && self.created_at.is_some()
-            && self.created_at == current.created_at)
     }
 }
 
@@ -333,6 +277,7 @@ impl CaptureCapsuleRepository {
         }
         let output_root_identity = FilesystemIdentity::capture(&output_root)?;
         let staging_identity = FilesystemIdentity::capture(&preparation.staging_path)?;
+        let staging_owner = create_staging_owner(&preparation.staging_path)?;
         let destination_path = output_root
             .join(&preparation.capture_id)
             .display()
@@ -349,6 +294,7 @@ impl CaptureCapsuleRepository {
             staging_path: staging_identity.canonical_path.clone(),
             output_root_identity,
             staging_identity,
+            staging_owner: Some(staging_owner),
             lease: preparation.lease,
             state: CaptureState::Prepared,
             progress: None,
@@ -565,7 +511,9 @@ impl CaptureCapsuleRepository {
         terminal.integrity = Integrity::Unverifiable;
         let staging = Path::new(&capsule.staging_path);
         if staging.exists() {
-            if !capsule.staging_identity.matches(staging)? {
+            if !capsule.staging_identity.matches(staging)?
+                || !staging_owner_matches(staging, capsule.staging_owner.as_deref())?
+            {
                 return Err(CaptureCapsuleError::RecoveryBlocked(
                     "staging filesystem identity changed".into(),
                 ));

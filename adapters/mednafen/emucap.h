@@ -31,6 +31,10 @@ extern "C" double emucap_host_audio_ratio(void);
 // 입력 주입: 주입 입력이 있으면 포트0 버퍼를 덮어쓴다. namespace Mednafen 안(mednafen.cpp)과
 // 밖(드라이버) 양쪽에서 호출하므로 extern "C"로 linkage를 고정한다(C++ mangling 불일치 방지).
 extern "C" void emucap_apply_input(unsigned char* port0_data, unsigned port0_len);
+// Emulation-owner access to the current native button bytes. No retained device pointer.
+extern "C" bool emucap_native_input_read(unsigned port, unsigned short* value);
+extern "C" bool emucap_native_input_write(unsigned port, unsigned short mask, unsigned short buttons, unsigned short* observed);
+
 // Saturn SMPC game-visible input read diagnostics. Called from ss/smpc.cpp
 // after OREG/direct-port reads so status can distinguish "latched" from
 // "game-visible read".

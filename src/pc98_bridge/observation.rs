@@ -124,6 +124,7 @@ impl<G: GdbTransport> Bridge<G> {
             return self.execution_speed_value();
         };
         self.drain_stop()?;
+        let was_frozen = self.frozen;
         let raw = match self.lua_data_cmd_reply("setpacing", Some(&spec)) {
             Ok(raw) => raw,
             Err(BridgeError::Emulator(message)) if message.contains("E1D:restored") => {
@@ -134,11 +135,19 @@ impl<G: GdbTransport> Bridge<G> {
             Err(BridgeError::Emulator(message)) if message.contains("E1D") => {
                 return self.fail_control(format!("execution_speed unverified: {message}"))
             }
-            Err(error) => return Err(error),
+            Err(error) => return self.fail_control(format!("execution_speed unverified: {error}")),
         };
-        let reply = mame::parse_set_reply(&raw).ok_or_else(|| {
-            BridgeError::Emulator(format!("invalid MAME pacing transaction reply: {raw}"))
-        })?;
+        // Native settings may already have changed; malformed evidence cannot
+        // supply a verified previous policy or a safe rollback revision.
+        let Some(reply) = mame::parse_set_reply(&raw) else {
+            return self.fail_control(format!(
+                "execution_speed unverified: invalid MAME pacing transaction reply: {raw}"
+            ));
+        };
+        // Publish stops received while the native transaction was in flight.
+        if let Err(error) = self.drain_stop() {
+            return self.fail_control(format!("execution_speed unverified: {error}"));
+        }
         let previous = reply.previous.public(&capability);
         let applied = reply.applied.public(&capability);
         let confirmed = capability.verify_change(
@@ -146,7 +155,7 @@ impl<G: GdbTransport> Bridge<G> {
             &json!({"status":"completed", "state":"running", "previous": previous,
                 "execution_speed": applied}),
         );
-        let boundary_kept = !self.frozen || reply.boundary_kept;
+        let boundary_kept = !was_frozen || reply.boundary_kept;
         if confirmed.is_ok() && boundary_kept {
             return Ok(json!({
                 "status": "completed",

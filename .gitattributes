@@ -1,3 +1,5 @@
+# Keep hashed profiles and text sources identical on every host.
+* text=auto eol=lf
 # Patch bytes are pinned by upstream.lock; never normalize embedded upstream line endings.
 adapters/*/patches/*.patch -text -whitespace
 # Native diagnostic patches also preserve upstream context and line endings.

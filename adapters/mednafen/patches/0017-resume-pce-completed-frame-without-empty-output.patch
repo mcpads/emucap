@@ -1,0 +1,97 @@
+--- a/src/pce/huc6280.cpp
++++ b/src/pce/huc6280.cpp
+@@ -40,6 +40,7 @@
+ 
+ namespace MDFN_IEN_PCE
+ {
++bool PCE_ResumeCompletedFrame(void);
+ 
+ INLINE void HuC6280::LastCycle(void)
+ {
+@@ -606,7 +607,16 @@
+            do { old_PC = PC; }
+            while(emucap_native_restore_service(runrunrun && !in_block_move));
+            if(!runrunrun)
+-            return;
++           {
++            if(!PCE_ResumeCompletedFrame())
++             return;
++            // A completed-frame snapshot must start its next frame, not
++            // publish the abandoned caller's empty frame completion.
++            runrunrun = 1;
++            if(in_block_move)
++             goto IBM_Dispatch;
++            continue;
++           }
+            if(in_block_move)
+             goto IBM_Dispatch;
+           }
+--- a/src/pce/pce.cpp
++++ b/src/pce/pce.cpp
+@@ -832,7 +832,7 @@
+ 
+ static EmulateSpecStruct *es;
+ static bool restored_clock = false;
+-static void Emulate(EmulateSpecStruct *espec)
++static void BeginFrame(EmulateSpecStruct *espec, bool apply_formats = true)
+ {
+  es = espec;
+ 
+@@ -841,15 +841,35 @@
+ 
+  MDFNMP_ApplyPeriodicCheats();
+ 
+- if(espec->VideoFormatChanged)
++ if(apply_formats && espec->VideoFormatChanged)
+   vce->SetPixelFormat(espec->surface->format, espec->CustomPalette, espec->CustomPaletteNumEntries);
+ 
+- if(espec->SoundFormatChanged)
++ if(apply_formats && espec->SoundFormatChanged)
+   SetSoundRate(espec->SoundRate);
+ 
+  //int t = MDFND_GetTime();
+ 
+  vce->StartFrame(espec->surface, &espec->DisplayRect, espec->LineWidths, IsHES ? 1 : espec->skip);
++
++}
++
++bool PCE_ResumeCompletedFrame(void)
++{
++ if(!vce->FrameCompleted())
++  return false;
++ // The old destination's pending output belongs to its abandoned frame.
++ es->SoundBufSize_InternalProcessed = es->SoundBufSize_DriverProcessed = 0;
++ es->MasterCycles_InternalProcessed = es->MasterCycles_DriverProcessed = 0;
++ restored_clock = false;
++ // Output formats were already applied on entry to the suspended call.
++ BeginFrame(es, false);
++ INPUT_Frame();
++ return true;
++}
++
++static void Emulate(EmulateSpecStruct *espec)
++{
++ BeginFrame(espec);
+ 
+  // Begin loop here:
+  //for(int i = 0; i < 2; i++)
+--- a/src/pce/vce.cpp
++++ b/src/pce/vce.cpp
+@@ -214,6 +214,7 @@
+ void VCE::StartFrame(MDFN_Surface *surface, MDFN_Rect *DisplayRect, int32 *LineWidths, int skip)
+ {
+  FrameDone = false;
++ ws_counter = 0;
+ 
+  //printf("Clock divider: %d\n", clock_divider);
+ 
+--- a/src/pce/vce.h
++++ b/src/pce/vce.h
+@@ -41,6 +41,7 @@
+ 
+ 	void StartFrame(MDFN_Surface *surface, MDFN_Rect *DisplayRect, int32 *LineWidths, int skip);
+ 	bool RunPartial(void);
++	bool FrameCompleted(void) const { return FrameDone; }
+ 
+         void Update(const int32 timestamp);
+ 

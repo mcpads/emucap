@@ -20,8 +20,16 @@ pub fn resolve_binary(repo_root: &Path) -> Option<PathBuf> {
         let p = PathBuf::from(explicit);
         return is_runnable_file(&p).then_some(p);
     }
-    let local = repo_root.join("adapters/ppsspp/work/ppsspp/build-headless/PPSSPPHeadless");
-    is_runnable_file(&local).then_some(local)
+    let build = repo_root.join("adapters/ppsspp/work/ppsspp/build-headless");
+    let candidates = if cfg!(windows) {
+        vec![
+            build.join("Release/PPSSPPHeadless.exe"),
+            build.join("PPSSPPHeadless.exe"),
+        ]
+    } else {
+        vec![build.join("PPSSPPHeadless")]
+    };
+    candidates.into_iter().find(|path| is_runnable_file(path))
 }
 
 /// Resolve the GUI/SDL `PPSSPPSDL` binary — the HITL `display:true` build that opens a real window a
@@ -199,17 +207,9 @@ fn wait_ws_ready(pid: u32, port: u16, timeout: Duration) -> io::Result<()> {
 /// HITL `display:true` window the human plays with PPSSPP's own control mappings — reads and writes
 /// only isolated per-session state, never the operator's real PPSSPP config/saves. Applied to both
 /// the headless and GUI specs (uniform; harmless where a var is unused). Three redirects, because
-/// PPSSPP resolves its memory stick (config + saves) differently per build/OS:
-/// - `HOME`: headless keys its memstick off `$HOME/.ppsspp` (`headless/Headless.cpp`); the GUI keys
-///   its `defaultCurrentDirectory` (and, absent a stored preference, `$HOME/.config/ppsspp`) off it.
-/// - `XDG_CONFIG_HOME`/`XDG_DATA_HOME` (non-macOS): the SDL GUI's Linux memstick is
-///   `$XDG_CONFIG_HOME/ppsspp` (`UI/NativeApp.cpp`).
-/// - `EMUCAP_PPSSPP_MEMSTICK`: the emucap fork (`patches/0006-emucap-gui-isolated-memstick.patch`)
-///   pins the GUI's memory-stick root to this before its config `Load()`. This is the deterministic
-///   fix for macOS, where the stock memstick path comes from `NSUserDefaults`
-///   (`UserPreferredMemoryStickDirectoryPath`, else `defaultCurrentDirectory/.config/ppsspp`) which
-///   `HOME`/`XDG` cannot fully redirect — so a HITL window can never touch the real profile even if
-///   the operator configured a custom memory stick in their own PPSSPP.
+/// The maintained GUI and headless producers honor EMUCAP_PPSSPP_MEMSTICK before
+/// creating system directories. HOME and the XDG roots also isolate auxiliary
+/// configuration. Each managed generation supplies its own memory-stick root.
 fn isolation_env(port: u16) -> Vec<(String, String)> {
     let home = super::emu_home_dir("ppsspp", port);
     let memstick = home.join("memstick");

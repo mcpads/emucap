@@ -1,4 +1,4 @@
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn main() -> anyhow::Result<()> {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -31,6 +31,21 @@ fn main() -> anyhow::Result<()> {
     let host = Arc::new(Mutex::new(host));
     let server_host = Arc::clone(&host);
     let server = std::thread::spawn(move || {
+        if let Some(runtime) = std::env::var("EMUCAP_LAUNCH_ID")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            return emucap::live::reconnect::owned::serve_reconnecting_owned(
+                port,
+                "mupen64plus-native",
+                server_host,
+                Mupen64PlusHost::terminal_reason,
+                emucap::live::reconnect::cancellation::TemporalAdmission {
+                    runtime,
+                    methods: vec!["step".into()],
+                },
+            );
+        }
         serve_reconnecting_controlled(
             port,
             "mupen64plus-native",
@@ -80,7 +95,7 @@ fn main() -> anyhow::Result<()> {
     Ok(execute_result?)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() -> anyhow::Result<()> {
-    anyhow::bail!("the initial Mupen64Plus adapter currently supports Unix hosts only")
+    anyhow::bail!("the Mupen64Plus adapter requires a Unix or Windows host")
 }

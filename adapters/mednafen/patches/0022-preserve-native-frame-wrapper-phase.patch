@@ -1,0 +1,94 @@
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -16,6 +16,9 @@
+  */
+ 
+ #include "mednafen.h"
++#include "drivers/emucap_frame_call.h"
++
++static EmucapFrameCall EmucapOutputCall;
+ 
+ #include <mednafen/cdrom/CDUtility.h>
+ #include <mednafen/cdrom/CDInterface.h>
+@@ -1990,7 +1993,7 @@
+  //MDFND_MidLineUpdate(espec, y);
+ }
+ 
+-void MDFNI_Emulate(EmulateSpecStruct *espec)
++static void PrepareFrameOutput(EmulateSpecStruct *espec)
+ {
+ #if 0
+  {
+@@ -2075,6 +2078,14 @@
+   espec->NeedSoundReverse = false;
+  else
+   espec->NeedSoundReverse = MDFNSRW_Frame(espec->NeedRewind);
++
++}
++
++void MDFNI_Emulate(EmulateSpecStruct *espec)
++{
++ EmucapFrameCall::Scope output_call(EmucapOutputCall, *espec, MDFNGameInfo->soundchan);
++ if(!output_call.restored())
++  PrepareFrameOutput(espec);
+ 
+  MDFNGameInfo->Emulate(espec);
+ 
+@@ -2684,3 +2695,37 @@
+ std::string MDFNI_GetSettingDefault(const std::string& name) { return MDFNI_GetSettingDefault(name.c_str()); }
+ 
+ }
++
++
++EmucapFrameCall::Output emucap_capture_frame_output()
++{
++ return EmucapOutputCall.capture();
++}
++
++EmucapFrameCall::Replacement emucap_prepare_frame_output(
++    EmucapFrameCall::Output saved, const Mednafen::EmulateSpecStruct& binding, unsigned channels)
++{
++ return EmucapOutputCall.prepare(std::move(saved), binding, channels);
++}
++
++bool emucap_commit_frame_output(EmucapFrameCall::Replacement& replacement, unsigned channels) noexcept
++{
++ return EmucapOutputCall.commit(replacement, channels);
++}
++
++void emucap_invalidate_frame_output() noexcept { EmucapOutputCall.invalidate(); }
++bool emucap_frame_output_pending() noexcept { return EmucapOutputCall.pending(); }
++bool emucap_restored_frame_output_active() noexcept { return EmucapOutputCall.restored_active(); }
++
++void emucap_resume_frame_output()
++{
++ EmucapOutputCall.resume([](Mednafen::EmulateSpecStruct& spec) {
++  // The old call's processed output belongs to the abandoned destination frame.
++  spec.SoundBufSize_InternalProcessed = spec.SoundBufSize_DriverProcessed = 0;
++  spec.MasterCycles_InternalProcessed = spec.MasterCycles_DriverProcessed = 0;
++  spec.MasterCycles = 0;
++  spec.VideoFormatChanged = spec.SoundFormatChanged = false;
++  spec.InterlaceOn = spec.InterlaceField = false;
++  Mednafen::PrepareFrameOutput(&spec);
++ });
++}
+--- a/src/drivers/main.cpp
++++ b/src/drivers/main.cpp
+@@ -42,6 +42,7 @@
+ 
+ #include <atomic>
+ #include "emucap_driver_video.h"
++#include "emucap_frame_call.h"
+ 
+ #include "input.h"
+ #include "Joystick.h"
+@@ -1321,7 +1322,8 @@
+ 	 NeedFrameAdvance = false;
+ 	 //
+ 	 //
+-	 SoftFB[SoftFB_BackBuffer].lw[0] = ~0;
++	 if(!emucap_frame_output_pending())
++	  SoftFB[SoftFB_BackBuffer].lw[0] = ~0;
+ 
+ 	 //
+ 	 //

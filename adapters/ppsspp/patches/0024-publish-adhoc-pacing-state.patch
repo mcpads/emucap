@@ -1,0 +1,349 @@
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -23,6 +23,14 @@
+     bool allowNetworkSpeed = false;
+     uint32_t apctlState = 0;
+     bool apctlConnected = false;
++    int adhocState = 0;
++    bool adhocInited = false;
++    bool adhocctlInited = false;
++    bool adhocStateConnected = false;
++    bool NetworkConnected() const {
++        return apctlConnected || (adhocInited && adhocctlInited && adhocStateConnected);
++    }
++    bool NetworkForced() const { return NetworkConnected() && !allowNetworkSpeed; }
+     uint32_t revision = 0;
+ };
+ 
+@@ -128,6 +136,39 @@
+         }
+     }
+ 
++    void PublishAdhocState(int &nativeState, int next, bool connected) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        nativeState = next;
++        if (policy_.adhocState != next || policy_.adhocStateConnected != connected) {
++            policy_.adhocState = next;
++            policy_.adhocStateConnected = connected;
++            ++policy_.revision;
++        }
++    }
++
++    void PublishAdhocInit(bool &nativeFlag, bool value, bool control) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        nativeFlag = value;
++        bool &flag = control ? policy_.adhocctlInited : policy_.adhocInited;
++        if (flag != value) { flag = value; ++policy_.revision; }
++    }
++
++    void RestoreAdhoc(int &state, bool &initialized, bool &controlInitialized,
++        int next, bool connected, bool init, bool controlInit) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        state = next;
++        initialized = init;
++        controlInitialized = controlInit;
++        if (policy_.adhocState != next || policy_.adhocStateConnected != connected ||
++            policy_.adhocInited != init || policy_.adhocctlInited != controlInit) {
++            policy_.adhocState = next;
++            policy_.adhocStateConnected = connected;
++            policy_.adhocInited = init;
++            policy_.adhocctlInited = controlInit;
++            ++policy_.revision;
++        }
++    }
++
+ private:
+     bool initialized_ = false;
+     mutable std::mutex mutex_;
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -47,6 +47,10 @@
+ void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog, bool allowNetworkSpeed);
+ void __DisplaySetEmucapNetworkSpeedPermission(bool allowed);
+ void __DisplayPublishEmucapApctlState(uint32_t &nativeState, uint32_t next, bool connected);
++void __DisplayPublishEmucapAdhocState(int &nativeState, int next, bool connected);
++void __DisplayPublishEmucapAdhocInit(bool &nativeFlag, bool value, bool control);
++void __DisplayRestoreEmucapAdhoc(int &state, bool &initialized, bool &controlInitialized,
++    int next, bool connected, bool init, bool controlInit);
+ int __DisplayGetEmucapSpeed();
+ // Changes whenever the agent speed changes, so a wait computed for the old target can end.
+ uint32_t __DisplayEmucapPacingGeneration();
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -400,6 +400,17 @@
+     emucapPacing.SetNetworkSpeedPermission(allowed);
+ }
+ 
++void __DisplayPublishEmucapAdhocState(int &nativeState, int next, bool connected) {
++    emucapPacing.PublishAdhocState(nativeState, next, connected);
++}
++void __DisplayPublishEmucapAdhocInit(bool &nativeFlag, bool value, bool control) {
++    emucapPacing.PublishAdhocInit(nativeFlag, value, control);
++}
++void __DisplayRestoreEmucapAdhoc(int &state, bool &initialized, bool &controlInitialized,
++    int next, bool connected, bool init, bool controlInit) {
++    emucapPacing.RestoreAdhoc(state, initialized, controlInitialized, next, connected, init, controlInit);
++}
++
+ void __DisplaySetEmucapSpeed(int percent) {
+ 	emucapPacing.SetPercent(percent);
+ }
+@@ -416,7 +427,7 @@
+ // Frames per second; 0 is unthrottled. The normal limit follows the emucap agent speed.
+ static double FrameTimingLimit() {
+ 	const auto pacing = emucapPacing.Read();
+-	if (!NetworkAllowSpeedControl()) {
++	if (pacing.NetworkForced()) {
+ 		return 60;
+ 	}
+ 
+diff --git a/Core/HLE/sceNet.cpp b/Core/HLE/sceNet.cpp
+--- a/Core/HLE/sceNet.cpp
++++ b/Core/HLE/sceNet.cpp
+@@ -142,7 +142,7 @@
+ 
+ bool IsNetworkConnected() {
+ 	// TODO: Tweak this.
+-	return __NetApctlConnected() || __NetAdhocConnected();
++	return __DisplayGetEmucapPacing().NetworkConnected();
+ }
+ 
+ bool NetworkWarnUserIfOnlineAndCantSavestate() {
+@@ -156,7 +156,7 @@
+ }
+ 
+ bool NetworkWarnUserIfOnlineAndCantSpeed() {
+-	if (IsNetworkConnected() && !__DisplayGetEmucapPacing().allowNetworkSpeed) {
++	if (__DisplayGetEmucapPacing().NetworkForced()) {
+ 		auto nw = GetI18NCategory(I18NCat::NETWORKING);
+ 		g_OSD.Show(OSDType::MESSAGE_INFO, nw->T("Speed controls are not available when online"), 3.0f, "speedonline");
+ 		return true;
+@@ -166,7 +166,7 @@
+ }
+ 
+ bool NetworkAllowSpeedControl() {
+-	return !IsNetworkConnected() || __DisplayGetEmucapPacing().allowNetworkSpeed;
++	return !__DisplayGetEmucapPacing().NetworkForced();
+ }
+ 
+ bool NetworkAllowSaveState() {
+diff --git a/Core/HLE/sceNetAdhoc.h b/Core/HLE/sceNetAdhoc.h
+--- a/Core/HLE/sceNetAdhoc.h
++++ b/Core/HLE/sceNetAdhoc.h
+@@ -165,6 +165,7 @@
+ int NetAdhoc_Term();
+ 
+ // May need to use these from sceNet.cpp
++void __NetSetAdhocctlState(int state);
+ extern bool netAdhocInited; // TODO: keep here
+ extern bool netAdhocctlInited; // TODO: move to sceNetAdhocctl
+ 
+diff --git a/Core/HLE/sceNetAdhoc.cpp b/Core/HLE/sceNetAdhoc.cpp
+--- a/Core/HLE/sceNetAdhoc.cpp
++++ b/Core/HLE/sceNetAdhoc.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2013- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -70,6 +71,11 @@
+ // TODO: Make accessor functions instead, and throw all this state in a struct.
+ bool netAdhocInited;
+ bool netAdhocctlInited;
++
++void __NetSetAdhocctlState(int state) {
++    __DisplayPublishEmucapAdhocState(adhocctlState, state,
++        state == ADHOCCTL_STATE_CONNECTED || state == ADHOCCTL_STATE_GAMEMODE);
++}
+ 
+ #define DISCOVER_DURATION_US	2000000 // 2 seconds is probably the normal time it takes for PSP to connect to a group (ie. similar to NetconfigDialog time)
+ u64 netAdhocDiscoverStartTime = 0;
+@@ -318,7 +324,8 @@
+ void RestoreNetAdhocMatchingInited();
+ 
+ bool __NetAdhocConnected() {
+-	return netAdhocInited && netAdhocctlInited && (adhocctlState == ADHOCCTL_STATE_CONNECTED || adhocctlState == ADHOCCTL_STATE_GAMEMODE);
++	const auto pacing = __DisplayGetEmucapPacing();
++    return pacing.adhocInited && pacing.adhocctlInited && pacing.adhocStateConnected;
+ }
+ 
+ void __NetAdhocShutdown() {
+@@ -597,7 +604,7 @@
+ 
+ 	u32 waitVal = __KernelGetWaitValue(threadID, error);
+ 	if (error == 0) {
+-		adhocctlState = waitVal;
++		__NetSetAdhocctlState(waitVal);
+ 		// FIXME: It seems Adhocctl is still busy within the Adhocctl Handler function (ie. during callbacks),
+ 		// so we should probably set isAdhocctlBusy to false after mispscall are fully executed (ie. in afterAction).
+ 		// But since Adhocctl Handler is optional, there might be cases where there are no handler thus no callback/mipcall being triggered,
+@@ -1809,12 +1816,14 @@
+ 	if (!s)
+ 		return;
+ 
+-	auto cur_netAdhocInited = netAdhocInited;
+-	auto cur_netAdhocctlInited = netAdhocctlInited;
++    const auto livePacing = __DisplayGetEmucapPacing();
++    auto savedInitialized = livePacing.adhocInited;
++    auto savedControlInitialized = livePacing.adhocctlInited;
++    auto savedAdhocState = livePacing.adhocState;
+ 	SaveNetAdhocMatchingInited();
+ 
+-	Do(p, netAdhocInited);
+-	Do(p, netAdhocctlInited);
++	Do(p, savedInitialized);
++	Do(p, savedControlInitialized);
+ 	DoNetAdhocMatchingInited(p);
+ 	Do(p, adhocctlHandlers);
+ 
+@@ -1852,12 +1861,12 @@
+ 	}
+ 	if (s >= 5) {
+ 		Do(p, adhocConnectionType);
+-		Do(p, adhocctlState);
++		Do(p, savedAdhocState);
+ 		Do(p, adhocctlNotifyEvent);
+ 		Do(p, adhocSocketNotifyEvent);
+ 	} else {
+ 		adhocConnectionType = ADHOC_CONNECT;
+-		adhocctlState = ADHOCCTL_STATE_DISCONNECTED;
++        savedAdhocState = ADHOCCTL_STATE_DISCONNECTED;
+ 		adhocctlNotifyEvent = -1;
+ 		adhocSocketNotifyEvent = -1;
+ 	}
+@@ -1898,8 +1907,9 @@
+ 		// Let's not change "Inited" value when Loading SaveState to prevent memory & port leaks
+ 		RestoreNetAdhocMatchingInited();
+ 
+-		netAdhocctlInited = cur_netAdhocctlInited;
+-		netAdhocInited = cur_netAdhocInited;
++        __DisplayRestoreEmucapAdhoc(adhocctlState, netAdhocInited, netAdhocctlInited,
++            savedAdhocState, savedAdhocState == ADHOCCTL_STATE_CONNECTED || savedAdhocState == ADHOCCTL_STATE_GAMEMODE,
++            livePacing.adhocInited, livePacing.adhocctlInited);
+ 
+ 		isAdhocctlNeedLogin = false;
+ 	}
+@@ -1923,8 +1933,8 @@
+ 
+ void __NetAdhocInit() {
+ 	friendFinderRunning = false;
+-	netAdhocInited = false;
+-	netAdhocctlInited = false;
++	__DisplayPublishEmucapAdhocInit(netAdhocInited, false, false);
++	__DisplayPublishEmucapAdhocInit(netAdhocctlInited, false, true);
+ 	adhocctlHandlers.clear();
+ 	__AdhocNotifInit();
+ 	__AdhocServerInit();
+@@ -1939,7 +1949,7 @@
+ u32 sceNetAdhocInit() {
+ 	if (!netAdhocInited) {
+ 		// Library initialized
+-		netAdhocInited = true;
++		__DisplayPublishEmucapAdhocInit(netAdhocInited, true, false);
+ 		isAdhocctlBusy = false;
+ 
+ 		// FIXME: It seems official prx is using sceNetAdhocGameModeDeleteMaster in here?
+@@ -2001,7 +2011,7 @@
+ 	}
+ 
+ 	adhocctlEvents.clear();
+-	netAdhocctlInited = true; //needed for cleanup during AdhocctlTerm even when it failed to connect to Adhoc Server (since it's being faked as success)
++	__DisplayPublishEmucapAdhocInit(netAdhocctlInited, true, true); //needed for cleanup during AdhocctlTerm even when it failed to connect to Adhoc Server (since it's being faked as success)
+ 	isAdhocctlNeedLogin = true;
+ 
+ 	// Create fake PSP Thread for callback
+@@ -3131,7 +3141,7 @@
+ 		if (adhocctlState == ADHOCCTL_STATE_DISCONNECTED && !isAdhocctlBusy) {
+ 			isAdhocctlBusy = true;
+ 			isAdhocctlNeedLogin = true;
+-			adhocctlState = ADHOCCTL_STATE_SCANNING;
++			__NetSetAdhocctlState(ADHOCCTL_STATE_SCANNING);
+ 			adhocctlCurrentMode = ADHOCCTL_MODE_NORMAL;
+ 
+ 			// Reset Networks/Group list to prevent other threads from using these soon to be replaced networks
+@@ -3145,7 +3155,7 @@
+ 				return hleLogDebugOrError(Log::sceNet, WaitBlockingAdhocctlSocket(req, us, "adhocctl scan"));
+ 			}
+ 			else {
+-				adhocctlState = ADHOCCTL_STATE_DISCONNECTED;
++				__NetSetAdhocctlState(ADHOCCTL_STATE_DISCONNECTED);
+ 			}
+ 
+ 			// Return Success and let friendFinder thread to notify the handler when scan completed
+@@ -3341,7 +3351,7 @@
+ 				if (error != EAGAIN && error != EWOULDBLOCK) {
+ 					ERROR_LOG(Log::sceNet, "Socket error (%i) when sending", error);
+ 					// Set Disconnected State
+-					adhocctlState = ADHOCCTL_STATE_DISCONNECTED;
++					__NetSetAdhocctlState(ADHOCCTL_STATE_DISCONNECTED);
+ 				}
+ 				else if (friendFinderRunning) {
+ 					AdhocctlRequest req = { OPCODE_DISCONNECT, {0} };
+@@ -3454,7 +3464,7 @@
+ 		threadAdhocID = 0;
+ 		adhocctlCurrentMode = ADHOCCTL_MODE_NONE;
+ 		isAdhocctlBusy = false;
+-		netAdhocctlInited = false;
++		__DisplayPublishEmucapAdhocInit(netAdhocctlInited, false, true);
+ 	}
+ 
+ 	return 0;
+@@ -3641,11 +3651,11 @@
+ 				else {
+ 					adhocctlStartTime = (u64)(time_now_d() * 1000000.0);
+ 					if (adhocctlCurrentMode == ADHOCCTL_MODE_GAMEMODE) {
+-						adhocctlState = ADHOCCTL_STATE_GAMEMODE;
++						__NetSetAdhocctlState(ADHOCCTL_STATE_GAMEMODE);
+ 						notifyAdhocctlHandlers(ADHOCCTL_EVENT_GAME, 0);
+ 					}
+ 					else {
+-						adhocctlState = ADHOCCTL_STATE_CONNECTED;
++						__NetSetAdhocctlState(ADHOCCTL_STATE_CONNECTED);
+ 						// Notify Event Handlers, Needed for the Nickname to be shown on the screen when success is faked
+ 						// Connected Event's mipscall need be executed before returning from sceNetAdhocctlCreate (or before the next sceNet function?)
+ 						notifyAdhocctlHandlers(ADHOCCTL_EVENT_CONNECT, 0); //CoreTiming::ScheduleEvent_Threadsafe_Immediate(eventAdhocctlHandlerUpdate, join32(ADHOCCTL_EVENT_CONNECT, 0));
+@@ -3877,7 +3887,7 @@
+ 		// if (_manage_modules != 0) sceUtilityUnloadModule(PSP_MODULE_NET_INET);
+ 		// Library shutdown
+ 
+-		netAdhocInited = false;
++		__DisplayPublishEmucapAdhocInit(netAdhocInited, false, false);
+ 		//return hleLogSuccessInfoI(Log::sceNet, 0);
+ 	}
+ 	/*else {
+diff --git a/Core/HLE/proAdhoc.cpp b/Core/HLE/proAdhoc.cpp
+--- a/Core/HLE/proAdhoc.cpp
++++ b/Core/HLE/proAdhoc.cpp
+@@ -1409,7 +1409,7 @@
+ 					g_adhocServerConnected = true;
+ 					INFO_LOG(Log::sceNet, "FriendFinder: Network [RE]Initialized");
+ 					// At this point we are most-likely not in a Group within the Adhoc Server, so we should probably reset AdhocctlState
+-					adhocctlState = ADHOCCTL_STATE_DISCONNECTED;
++					__NetSetAdhocctlState(ADHOCCTL_STATE_DISCONNECTED);
+ 					netAdhocGameModeEntered = false;
+ 					isAdhocctlBusy = false;
+ 				} 
+@@ -1772,7 +1772,7 @@
+ 	// Groups/Networks should be deallocated isn't?
+ 
+ 	// Prevent the games from having trouble to reInitiate Adhoc (the next NetInit -> PdpCreate after NetTerm)
+-	adhocctlState = ADHOCCTL_STATE_DISCONNECTED;
++	__NetSetAdhocctlState(ADHOCCTL_STATE_DISCONNECTED);
+ 	friendFinderRunning = false;
+ 
+ 	// Log Shutdown
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -230,7 +230,7 @@
+ 	const int percent = pacing.percent;
+ 	const bool fastForward = pacing.fastForward;
+ 	const int fpsLimit = (int)pacing.fpsLimit;
+-	const bool networkForced = !NetworkAllowSpeedControl();
++	const bool networkForced = pacing.NetworkForced();
+ 	static std::string lastKey;
+ 	static uint32_t revision = 0;
+ 	const std::string key = StringFromFormat("%d|%d|%d|%d|%u", percent, fastForward, fpsLimit, networkForced, pacing.revision);

@@ -175,3 +175,36 @@ fn atomic_copy_rejects_a_destination_symlink_without_changing_its_target() {
     assert!(atomic_copy_file(&source, &output).is_err());
     assert_eq!(std::fs::read(outside).unwrap(), b"original");
 }
+
+#[cfg(windows)]
+#[test]
+fn long_windows_paths_preserve_atomic_file_and_directory_publication() {
+    let root = tempfile::tempdir().unwrap();
+    // Exercise ordinary DOS paths, not already-verbatim tempfile paths.
+    let mut parent =
+        std::path::PathBuf::from(root.path().to_str().unwrap().trim_start_matches(r"\\?\"));
+    while parent.as_os_str().len() < 300 {
+        parent.push("nested-session-directory");
+    }
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = parent.join("source.bin");
+    let output = parent.join("output.bin");
+    std::fs::write(&source, b"copied").unwrap();
+    atomic_write_file(&output, b"first").unwrap();
+    atomic_write_file(&output, b"replacement").unwrap();
+    assert_eq!(std::fs::read(&output).unwrap(), b"replacement");
+    atomic_copy_file(&source, &output).unwrap();
+    assert_eq!(std::fs::read(&output).unwrap(), b"copied");
+
+    let staged = parent.join("staged");
+    let published = parent.join("published");
+    std::fs::create_dir(&staged).unwrap();
+    std::fs::write(staged.join("member.bin"), b"member").unwrap();
+    super::path_safety::rename_directory(&staged, &published).unwrap();
+    assert_eq!(
+        std::fs::read(published.join("member.bin")).unwrap(),
+        b"member"
+    );
+    assert!(!staged.exists());
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), 3);
+}

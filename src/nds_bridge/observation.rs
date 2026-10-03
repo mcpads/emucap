@@ -102,18 +102,6 @@ impl<G: GdbTransport> NdsBridge<G> {
         })
     }
 
-    fn set_native_pacing(&mut self, percent: u64) -> NdsResult<()> {
-        let reply = self
-            .arm9
-            .query_running_safe(&format!("QEmucap,pacing:{percent:x}"))?;
-        if reply != "OK" {
-            return Err(NdsBridgeError::Emulator(format!(
-                "DeSmuME refused pacing {percent}: {reply}"
-            )));
-        }
-        Ok(())
-    }
-
     pub(super) fn execution_speed_value(&mut self) -> NdsResult<Value> {
         Ok(self.native_pacing()?.public())
     }
@@ -146,10 +134,38 @@ impl<G: GdbTransport> NdsBridge<G> {
             SpeedRequest::Limited { centi_percent } => centi_percent / 100,
         };
         self.drain_scheduler_stops()?;
-        let before = self.native_pacing()?;
+        let probe = self.arm9.query_running_safe("qEmucap,rateInfo")?;
+        let observed = match probe.split_once(';') {
+            Some(("1", policy)) => NdsPacing::parse(policy).ok_or_else(|| {
+                NdsBridgeError::Emulator("invalid native pacing capability observation".into())
+            })?,
+            _ => {
+                return Err(NdsBridgeError::Unsupported(
+                    "native pacing transaction version 1 is required; rebuild the NDS host".into(),
+                ))
+            }
+        };
+        let mut native_result = None;
         let outcome: NdsResult<Value> = (|| {
-            self.set_native_pacing(target)?;
-            let after = self.native_pacing()?;
+            let raw = self
+                .arm9
+                .query_running_safe(&format!("QEmucap,rate:{target:x}"))?;
+            native_result = Some(raw.clone());
+            let fields: Vec<_> = raw.split(';').collect();
+            let invalid = || NdsBridgeError::Emulator("invalid native pacing transaction".into());
+            let ["1", previous, applied] = fields[..] else {
+                return Err(invalid());
+            };
+            let before = NdsPacing::parse(previous).ok_or_else(invalid)?;
+            let after = NdsPacing::parse(applied).ok_or_else(invalid)?;
+            let changed = before.percent != after.percent
+                || before.native_unlimited != after.native_unlimited;
+            if after.revision != before.revision.wrapping_add(u64::from(changed)) {
+                return Err(invalid());
+            }
+            // ARM7 can stop the shared scheduler while the ARM9 pacing exchange runs.
+            // Retain its event and synchronize both CPU states before publishing success.
+            self.drain_scheduler_stops()?;
             let state = if self.primary_frozen() {
                 "frozen"
             } else {
@@ -168,10 +184,10 @@ impl<G: GdbTransport> NdsBridge<G> {
             Ok(reply)
         })();
         outcome.map_err(|error| {
-            // Separate native requests cannot exclude a concurrent human policy change.
-            // Do not overwrite it with a stale rollback or continue on an unknown policy.
+            // Preserve a later native policy change when transport or state verification fails.
+            // The pre-command observation is not transaction-bound previous policy.
             self.control_unverified = true;
-            NdsBridgeError::Emulator(format!("execution_speed unverified: {error}; last verified policy: {}; guest progress may have occurred", before.public()))
+            NdsBridgeError::Emulator(format!("execution_speed unverified: {error}; pre-command observation: {}; native transaction: {native_result:?}; clock_domain=nds.vblank_start; guest progress may have occurred", observed.public()))
         })
     }
 

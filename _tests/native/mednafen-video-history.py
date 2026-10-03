@@ -124,6 +124,8 @@ int main() {
  TBlur_Kill();deint.reset();MDFNGameInfo=nullptr;
 }
 '''
+composition = Path(__file__).with_name('mednafen-video-restore.cpp').read_text()
+code = code.replace('int main() {', composition + '\nint main() {\n test_composed_video();', 1)
 with tempfile.TemporaryDirectory(prefix='mednafen-video-history-') as temp:
     cpp = Path(temp) / 'test.cpp'
     executable = Path(temp) / 'test'
@@ -142,3 +144,5 @@ with tempfile.TemporaryDirectory(prefix='mednafen-video-history-') as temp:
         env=dict(os.environ, UBSAN_OPTIONS='halt_on_error=1:print_stacktrace=1'))
 print('Native video history: 90 configurations, eight continuations, interlace transitions, '
       'reversible commits, malformed blocks, read faults and configuration drift pass ASan/UBSan')
+print('Composed video restoration: 120 filter/role/image cases, four continuations, '
+      'allocation failures, unchanged-state rejection and one-shot publication pass ASan/UBSan')

@@ -258,7 +258,12 @@ fn resolve_binary_uses_repo_local_build_headless() {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir
         .path()
-        .join("adapters/ppsspp/work/ppsspp/build-headless/PPSSPPHeadless");
+        .join("adapters/ppsspp/work/ppsspp/build-headless")
+        .join(if cfg!(windows) {
+            "Release/PPSSPPHeadless.exe"
+        } else {
+            "PPSSPPHeadless"
+        });
     std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
     std::fs::write(&bin, b"fake PPSSPPHeadless").unwrap();
     #[cfg(unix)]

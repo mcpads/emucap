@@ -13,34 +13,36 @@ use crate::live::reconnect::cancellation::OperationKey;
 const POLL: Duration = Duration::from_millis(25);
 
 struct SocketTimeouts {
-    socket: TcpStream,
     read: Option<Duration>,
     write: Option<Duration>,
 }
 impl SocketTimeouts {
-    fn capture(socket: &TcpStream) -> Result<Self, LinkError> {
+    fn capture(reader: &TcpStream, writer: &TcpStream) -> Result<Self, LinkError> {
         Ok(Self {
-            socket: socket.try_clone().map_err(unverified)?,
-            read: socket.read_timeout().map_err(unverified)?,
-            write: socket.write_timeout().map_err(unverified)?,
+            read: reader.read_timeout().map_err(unverified)?,
+            write: writer.write_timeout().map_err(unverified)?,
         })
     }
-    fn clamp(&self, deadline: Instant) -> Result<(), LinkError> {
+    fn clamp(
+        &self,
+        reader: &TcpStream,
+        writer: &TcpStream,
+        deadline: Instant,
+    ) -> Result<(), LinkError> {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .max(Duration::from_millis(1));
-        self.socket
+        reader
             .set_read_timeout(Some(remaining.min(POLL)))
             .map_err(unverified)?;
-        self.socket
+        writer
             .set_write_timeout(Some(remaining.min(self.write.unwrap_or(POLL))))
             .map_err(unverified)
     }
-}
-impl Drop for SocketTimeouts {
-    fn drop(&mut self) {
-        let _ = self.socket.set_read_timeout(self.read);
-        let _ = self.socket.set_write_timeout(self.write);
+    fn restore(&self, reader: &TcpStream, writer: &TcpStream) -> Result<(), LinkError> {
+        let read = reader.set_read_timeout(self.read);
+        let write = writer.set_write_timeout(self.write);
+        read.and(write).map_err(unverified)
     }
 }
 
@@ -51,7 +53,14 @@ fn unverified(error: impl std::fmt::Display) -> LinkError {
     }
 }
 
-/// The caller allocates distinct stream IDs and poisons the connection on an error.
+/// A drained terminal preserves stream identity, including a producer rejection.
+/// Transport, deadline, malformed-terminal and abort-drain failures remain outer errors.
+#[derive(Debug)]
+pub(crate) struct TerminalResponse {
+    pub result: Result<Value, LinkError>,
+}
+
+/// The caller retires the connection only when the exchange itself is unverified.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exchange(
     reader: &mut BufReader<TcpStream>,
@@ -61,7 +70,26 @@ pub(crate) fn exchange(
     abort_id: u64,
     control: &ProgressCallControl,
     max_host: Duration,
-) -> Result<Value, LinkError> {
+) -> Result<TerminalResponse, LinkError> {
+    let timeouts = SocketTimeouts::capture(reader.get_ref(), writer)?;
+    let result = exchange_inner(
+        reader, writer, pending, request, abort_id, control, max_host, &timeouts,
+    );
+    timeouts.restore(reader.get_ref(), writer)?;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exchange_inner(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut TcpStream,
+    pending: &mut Vec<u8>,
+    request: Request,
+    abort_id: u64,
+    control: &ProgressCallControl,
+    max_host: Duration,
+    timeouts: &SocketTimeouts,
+) -> Result<TerminalResponse, LinkError> {
     let stop_ms = control
         .temporal_stop_ms
         .filter(|ms| *ms > 0 && *ms <= 300_000)
@@ -113,8 +141,7 @@ pub(crate) fn exchange(
     if Instant::now() >= operation_deadline {
         return Err(unverified("temporal deadline expired before dispatch"));
     }
-    let guard = SocketTimeouts::capture(reader.get_ref())?;
-    guard.clamp(operation_deadline)?;
+    timeouts.clamp(reader.get_ref(), writer, operation_deadline)?;
     writer
         .write_all(to_line(&request).as_bytes())
         .map_err(unverified)?;
@@ -129,25 +156,25 @@ pub(crate) fn exchange(
                 "host deadline expired before terminal/abort drain",
             ));
         }
-        guard.clamp(deadline)?;
-        if terminal.is_some() && (stop_deadline.is_none() || acknowledgement.is_some()) {
-            if let Some(Err(error)) = acknowledgement {
-                return Err(error);
-            }
-            let response = terminal.expect("terminal checked");
-            return if response.ok {
-                Ok(response.result.unwrap_or(Value::Null))
-            } else {
-                Err(response
-                    .error
-                    .map(|e| LinkError::Emulator {
-                        kind: e.kind,
-                        message: e.message,
-                    })
-                    .unwrap_or_else(|| {
+        timeouts.clamp(reader.get_ref(), writer, deadline)?;
+        if stop_deadline.is_none() || acknowledgement.is_some() {
+            if let Some(response) = terminal.take() {
+                if let Some(Err(error)) = acknowledgement {
+                    return Err(error);
+                }
+                let result = if response.ok {
+                    Ok(response.result.unwrap_or(Value::Null))
+                } else {
+                    let error = response.error.ok_or_else(|| {
                         LinkError::Protocol("terminal error omitted details".into())
-                    }))
-            };
+                    })?;
+                    Err(LinkError::Emulator {
+                        kind: error.kind,
+                        message: error.message,
+                    })
+                };
+                return Ok(TerminalResponse { result });
+            }
         }
         if stop_deadline.is_none() && control.cancellation.is_cancelled() {
             let at = control
@@ -159,7 +186,7 @@ pub(crate) fn exchange(
                 return Err(unverified("shared cancellation deadline already expired"));
             }
             stop_deadline = Some(at);
-            guard.clamp(at.min(operation_deadline))?;
+            timeouts.clamp(reader.get_ref(), writer, at.min(operation_deadline))?;
             writer
                 .write_all(
                     to_line(&Request::new(abort_id, &abort.method, abort.params.clone()))

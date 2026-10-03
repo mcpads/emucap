@@ -196,3 +196,81 @@ fn slow_frame_step_carries_a_deadline_and_reports_partial_progress() {
     assert_eq!(value["reason"], "host_deadline");
     assert_eq!(value["completed"], 118);
 }
+
+#[test]
+fn unverified_pacing_transaction_retires_control() {
+    for bad in [
+        "broken",
+        "E77",
+        "1|1|1000|1.0|0|0|0.1;broken;1@2.0|9;1@2.0|9",
+    ] {
+        let mut bridge = featured(vec![(lua("setpacing", "limited|500"), bad.into())]);
+        let reply = bridge.handle_request(Request::new(
+            901,
+            "execution_speed",
+            json!({"mode":"limited","percent":50}),
+        ));
+        assert!(!reply.ok && reply.result.is_none(), "{bad}");
+        assert!(bridge.backend_terminal(), "{bad}");
+    }
+}
+
+#[test]
+fn pacing_reports_a_stop_arriving_during_the_transaction() {
+    for boundary_after in ["1@2.0|9", "2@2.1|10"] {
+        let command = lua("setpacing", "limited|500");
+        let mut bridge = featured(vec![(
+            command.clone(),
+            format!(
+                "{};{};1@2.0|9;{boundary_after}",
+                pacing(1, 1, 1000),
+                pacing(2, 1, 500)
+            ),
+        )]);
+        bridge.frozen = false;
+        let interrupts_before = bridge.gdb.interrupts;
+        bridge.gdb.nonblocking_after.push((command, "S05".into()));
+        let result = bridge
+            .execution_speed(&json!({"mode":"limited","percent":50}))
+            .unwrap();
+        assert_eq!(result["state"], "frozen");
+        assert_eq!(result["execution_speed"]["percent"], 50);
+        assert_eq!(bridge.events.len(), 1);
+        assert!(bridge.gdb.nonblocking.is_empty());
+        assert!(bridge.gdb.replies.is_empty());
+        assert!(bridge.gdb.no_reply.is_empty());
+        assert_eq!(bridge.gdb.interrupts, interrupts_before);
+    }
+}
+
+#[test]
+fn batch_rejection_precedes_native_dispatch() {
+    let mut bridge = featured(vec![]);
+    bridge.frozen = true;
+    let before = bridge.gdb.calls.clone();
+    let interrupts_before = bridge.gdb.interrupts;
+    let good = json!({"memory_type":"cpu","address":0,"length":1});
+    let invalid = [
+        json!({"memory_type":"cpu","address":0,"length":0}),
+        json!({"memory_type":"cpu","address":-1,"length":1}),
+        json!({"memory_type":"cpu","address":u64::MAX,"length":2}),
+        json!({"memory_type":"cpu","address":0,"length":65536}),
+        json!({"memory_type":"device","address":0,"length":1}),
+    ];
+    let mut requests: Vec<Value> = invalid
+        .into_iter()
+        .map(|last| json!([good, last]))
+        .collect();
+    requests.push(json!([]));
+    requests.push(Value::Array(vec![good; 65]));
+    for ranges in requests {
+        assert!(matches!(
+            bridge.read_memory_batch(&json!({"ranges":ranges})),
+            Err(BridgeError::BadParams(_))
+        ));
+        assert_eq!(bridge.gdb.calls, before);
+        assert!(bridge.gdb.no_reply.is_empty());
+        assert_eq!(bridge.gdb.interrupts, interrupts_before);
+        assert!(bridge.frozen);
+    }
+}

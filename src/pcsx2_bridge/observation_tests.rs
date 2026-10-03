@@ -31,6 +31,21 @@ fn pacing_readback_maps_limiter_modes() {
         pacing(LIMITER_NOMINAL, 10_000, 0.0).public()["mode"],
         "custom"
     );
+    // The wire rounds nominal to hundredths of a percent; compare target in that domain.
+    for (percent, target) in [(1, 0.01), (137, 1.37), (10_000, 100.0)] {
+        assert_eq!(
+            pacing(LIMITER_NOMINAL, percent * 100, target).public()["percent"],
+            percent
+        );
+    }
+    for (mode, target) in [
+        (LIMITER_NOMINAL, 1.0),
+        (LIMITER_NOMINAL, f32::INFINITY),
+        (LIMITER_NOMINAL, f32::NAN),
+        (LIMITER_UNLIMITED, 0.5),
+    ] {
+        assert_eq!(pacing(mode, 5_000, target).public()["mode"], "custom");
+    }
     assert!(Pcsx2Pacing::parse(&[0; 27]).is_none());
 }
 

@@ -23,7 +23,21 @@ fn wire_percent_normalizes_exactly_or_is_rejected() {
     assert_eq!(centi_percent(0.01), Some(1));
     assert_eq!(centi_percent(0.1 + 0.2), Some(30));
     assert_eq!(centi_percent(12.34), Some(1234));
-    for rejected in [12.345, 0.0, -1.0, 0.001, f64::NAN, f64::INFINITY, 1e12] {
+    for centi in [1u64, 29, 1234, 99999, 100001, 1000001, 9999999, 10000000] {
+        assert_eq!(centi_percent(centi as f64 / 100.0), Some(centi));
+    }
+    for rejected in [
+        12.345,
+        1000.001,
+        10000.004,
+        99999.999,
+        0.0,
+        -1.0,
+        0.001,
+        f64::NAN,
+        f64::INFINITY,
+        1e12,
+    ] {
         assert_eq!(centi_percent(rejected), None, "{rejected}");
     }
     assert_eq!(percent_value(5000), json!(50));

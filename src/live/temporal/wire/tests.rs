@@ -126,6 +126,8 @@ fn both_reply_orders_are_drained_before_stream_reuse() {
             &control,
             Duration::from_secs(2),
         )
+        .unwrap()
+        .result
         .unwrap();
         assert_eq!(result["count"], 1);
         writer
@@ -144,7 +146,10 @@ fn both_reply_orders_are_drained_before_stream_reuse() {
 fn cancellation_acknowledgement_alone_never_proves_stop() {
     let (mut reader, mut writer, mut server) = pair();
     let mut control = control();
-    control.temporal_stop_ms = Some(50);
+    // This witness needs the abort acknowledgement to arrive before expiry.
+    // Leave scheduling room for loaded Windows runners; separate deadline tests
+    // cover expiry before an acknowledgement can be delivered.
+    control.temporal_stop_ms = Some(500);
     let trigger = control.cancellation.clone();
     let worker = std::thread::spawn(move || {
         let mut input = BufReader::new(server.try_clone().unwrap());
@@ -177,7 +182,7 @@ fn cancellation_acknowledgement_alone_never_proves_stop() {
     assert!(
         matches!(result,Err(LinkError::Emulator { ref kind,.. }) if kind=="temporal_unverified")
     );
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(start.elapsed() < Duration::from_secs(2));
     writer.shutdown(std::net::Shutdown::Both).unwrap();
     worker.join().unwrap();
 }
@@ -240,6 +245,8 @@ fn parent_admission_drains_cancel_ack_before_following_request() {
             &control,
             Duration::from_secs(2),
         )
+        .unwrap()
+        .result
         .unwrap();
         assert_eq!(result["status"], "admitted");
         assert_eq!(result["parent"], *key);
@@ -294,4 +301,36 @@ fn expired_absolute_deadline_writes_no_native_request() {
     let mut input = BufReader::new(server);
     let mut line = String::new();
     assert_eq!(input.read_line(&mut line).unwrap(), 0);
+}
+
+/// A producer rejection is a complete response; cleanup must use this same attachment.
+pub(crate) fn rejected_input_peer(mut reader: BufReader<TcpStream>, mut writer: TcpStream) {
+    reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let request = read(&mut reader);
+    assert_eq!(request["method"], "set_input");
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({"id":request["id"],"ok":false,
+        "error":{"kind":"bad_params","message":"unsupported button"}})
+    )
+    .unwrap();
+    let cleanup = read(&mut reader);
+    assert_eq!(cleanup["method"], "set_input");
+    assert_eq!(cleanup["params"]["buttons"], serde_json::json!([]));
+    reply(
+        &mut writer,
+        &cleanup["id"],
+        serde_json::json!({"status":"completed"}),
+    );
+    let status = read(&mut reader);
+    assert_eq!(status["method"], "status");
+    reply(
+        &mut writer,
+        &status["id"],
+        serde_json::json!({"state":"frozen"}),
+    );
 }

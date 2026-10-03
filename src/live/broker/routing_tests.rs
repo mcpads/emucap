@@ -184,3 +184,44 @@ fn lifecycle_opt_in_requires_a_bounded_runtime_identity() {
         assert!(control_session::advertised_runtime(&hello).is_err());
     }
 }
+
+#[test]
+fn pacing_routes_to_one_instance_and_stale_sessions_mutate_neither() {
+    let (reg, first, _peer, _frontend) = registry();
+    let (writer, _other_peer) = sockets();
+    let (session, _other_frontend) = sockets();
+    let (to_emu, second) = outbound::held_queue(writer);
+    lock(&reg).emus.insert(
+        "other".into(),
+        Emu {
+            to_emu,
+            lifecycle_runtime: None,
+            methods: vec![],
+            identity: serde_json::json!({}),
+            session: Some(session),
+            gen: 17,
+            session_gen: 18,
+        },
+    );
+    let speed = r#"{"id":1,"method":"execution_speed","params":{"mode":"limited","percent":50}}"#;
+    for (name, generation, session) in [
+        ("emu", 6, 8),
+        ("emu", 7, 6),
+        ("other", 7, 8),
+        ("other", 17, 8),
+    ] {
+        assert!(!enqueue_request(&reg, name, generation, session, speed.into()).unwrap());
+    }
+    assert!(first.try_recv().is_err() && second.try_recv().is_err());
+    assert!(enqueue_request(&reg, "emu", 7, 8, speed.into()).unwrap());
+    let first_change: serde_json::Value = serde_json::from_str(&first.recv().unwrap()).unwrap();
+    assert_eq!(first_change["params"]["percent"], 50);
+    assert!(
+        second.try_recv().is_err(),
+        "the other producer must receive no mutation"
+    );
+    assert!(enqueue_request(&reg, "other", 17, 18, speed.into()).unwrap());
+    let second_change: serde_json::Value = serde_json::from_str(&second.recv().unwrap()).unwrap();
+    assert_eq!(second_change["params"]["percent"], 50);
+    assert!(first.try_recv().is_err() && second.try_recv().is_err());
+}

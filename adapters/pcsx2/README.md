@@ -202,16 +202,18 @@ pending, ready, unavailable, or failed.
 
 Batch payloads are acquired by one native command into a private response buffer. The bridge
 validates its full length before exposing any ranges. Native stop epochs remain stable across
-repeated reads and pacing queries at the same halt. A pacing failure after an attempted mutation
-terminates the control channel with the last verified policy. Follow the recovery action in
+repeated reads and pacing queries at the same halt. A verified native restoration reports `failed_restored` and keeps control available. An uncertain
+pacing result terminates the control channel with a pre-command policy observation. Follow the recovery action in
 `status` before issuing further commands. It does not claim that the emulator process exited or
 that guest progress was undone.
 
 
 `read_memory_batch` reads up to 64 ranges (64 KiB) of `ee` at the paused CPU thread.
 `debug.execution_speed` sets the nominal speed to an integer 1–10000 percent or selects the
-unlimited limiter (host API 7); turbo, slow motion and a fast-boot override read back as
-`custom`. The agent speed survives the settings reload a reset performs. The frame limiter sleeps
+unlimited limiter (host API 8); turbo, slow motion and a fast-boot override read back as
+`custom`. A set returns native previous/final policies captured in one CPU-thread operation.
+The policy revision advances at native changes, including changes between queries.
+The agent speed survives the settings reload a reset performs. The frame limiter sleeps
 in 10 ms slices and serves CPU-thread requests between them, so status and input answer during a
 slow frame without shortening it. `status.frame` is the frame counter, and a frame advance that
 spends the host budget returns `reason: "host_deadline"`. The PINE socket lives under the runtime
@@ -223,3 +225,11 @@ The Rust bridge and launcher are separate processes licensed under the repositor
 GPL-2.0-or-later terms. The PCSX2 patch stack modifies GPL-3.0-or-later source and is distributed
 under GPL-3.0-or-later. This repository distributes source patches and a build recipe, not PCSX2
 binaries, BIOS files, or game media.
+
+Native GS snapshots include hardware target readback and the weave/MAD field
+history used by deinterlacing. Loading validates the optional history trailer
+before changing GS state and restores it without advancing guest frames. Legacy
+states without the trailer start with empty presentation history. Reset clears
+the field textures and their ring index. `_tests/native/ps2-deinterlace-history.py`
+checks the trailer's exact round trip and malformed-input rejection; ordered
+runtime images additionally verify the resumed renderer.

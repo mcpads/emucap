@@ -22,8 +22,10 @@ mod file_io;
 use file_io::{absolute_path, default_adapter_home, sha256_regular_file, state_partial_sibling};
 #[path = "neogeo_bridge/observation.rs"]
 mod observation;
+mod owned_frame;
 #[path = "neogeo_bridge/support.rs"]
 mod support;
+mod temporal_owner;
 use support::*;
 
 const METHODS: &[&str] = &[
@@ -131,6 +133,12 @@ impl NeoGeoProfile {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
+    #[error("producer operation is busy")]
+    Busy,
+    #[error("operation cancelled")]
+    Cancelled,
+    #[error("{0}")]
+    Unsupported(String),
     #[error("{0}")]
     BadParams(String),
     #[error("{0}")]
@@ -189,6 +197,11 @@ pub struct NeoGeoBridge<G> {
     adapter_home: PathBuf,
     mame_features: Option<std::collections::BTreeSet<String>>,
     control_fatal: Option<String>,
+    owned_control: bool,
+    producer_ownership: Option<crate::live::temporal::owner::ProducerOwnership>,
+    request_cancellation: Option<crate::live::link::RequestCancellation>,
+    owned_stops: Vec<String>,
+    owned_reply_deadline: Option<std::time::Instant>,
 }
 
 impl<G: GdbTransport> NeoGeoBridge<G> {
@@ -210,7 +223,23 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
                 .unwrap_or_else(default_adapter_home),
             mame_features: None,
             control_fatal: None,
+            owned_control: false,
+            producer_ownership: None,
+            request_cancellation: None,
+            owned_stops: Vec::new(),
+            owned_reply_deadline: None,
         })
+    }
+
+    pub fn handle_request_cancellable(
+        &mut self,
+        req: Request,
+        cancellation: crate::live::link::RequestCancellation,
+    ) -> Response {
+        self.request_cancellation = Some(cancellation);
+        let response = self.handle_request(req);
+        self.request_cancellation = None;
+        response
     }
 
     pub fn handle_request(&mut self, req: Request) -> Response {
@@ -673,6 +702,10 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
 
     fn pause(&mut self, params: &Value) -> BridgeResult<Value> {
         require_main_cpu(params)?;
+        if self.request_cancellation.is_some() && self.owned_control {
+            self.verify_owned_halt()?;
+            return Ok(json!({"state":"frozen"}));
+        }
         self.drain_breakpoint_packets()?;
         if !self.frozen {
             let response = self.gdb.interrupt()?;
@@ -707,7 +740,13 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             .and_then(Value::as_str)
             .unwrap_or("frames")
         {
-            "frames" => self.frame_step(count, true),
+            "frames" => {
+                if let Some(cancellation) = self.request_cancellation.clone() {
+                    self.owned_frame_step(count, cancellation)
+                } else {
+                    self.frame_step(count, true)
+                }
+            }
             "instructions" => self.instruction_step(count),
             unit => Err(BridgeError::BadParams(format!(
                 "unsupported Neo Geo step unit: {unit}"
@@ -881,7 +920,23 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
     fn set_input(&mut self, params: &Value) -> BridgeResult<Value> {
         require_port_zero(params)?;
         let buttons = normalize_buttons(self.profile, params.get("buttons"))?;
-        self.lua_cmd("setinput", Some(&buttons.join(",")))?;
+        if self.request_cancellation.is_some() && self.owned_control {
+            match self.frame_exchange("setinput", &buttons.join(",")) {
+                Ok(reply) if reply == "OK" => {}
+                Ok(reply) if reply.starts_with("E08:") => {
+                    return Err(BridgeError::BadParams(format!(
+                        "unavailable native input: {}",
+                        &reply[4..]
+                    )))
+                }
+                result => {
+                    return self
+                        .fail_control(format!("native input application unverified: {result:?}"))
+                }
+            }
+        } else {
+            self.lua_cmd("setinput", Some(&buttons.join(",")))?;
+        }
         Ok(
             json!({"buttons": buttons, "mode": if buttons.is_empty() { "native" } else { "persistent" }}),
         )
@@ -1003,7 +1058,7 @@ impl<G: GdbTransport> NeoGeoBridge<G> {
             Some(value) => format!("qEmucap,{name},{}", hex::encode(value.as_bytes())),
             None => format!("qEmucap,{name}"),
         };
-        let response = self.gdb.send(&payload)?;
+        let response = self.owned_aware_send(&payload)?;
         if response.starts_with('E') {
             Err(BridgeError::Emulator(format!(
                 "MAME {name} failed: {response}"

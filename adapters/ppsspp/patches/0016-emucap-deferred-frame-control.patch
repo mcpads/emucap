@@ -1,0 +1,192 @@
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -14,6 +14,10 @@
+ 
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
++
++#include <chrono>
++#include <cstdlib>
++#include <thread>
+ 
+ #include "Common/StringUtils.h"
+ #include "Core/Debugger/Breakpoints.h"
+@@ -32,11 +36,16 @@
+ 
+ using namespace MIPSAnalyst;
+ 
++struct WebSocketSteppingState;
++// All subscriber admission, polling and destruction runs under lifecycleLock.
++static WebSocketSteppingState *emucapFrameOwner = nullptr;
++
+ struct WebSocketSteppingState : public DebuggerSubscriber {
+ 	WebSocketSteppingState() {
+ 		g_disassemblyManager.setCpu(currentDebugMIPS);
+ 	}
+ 	~WebSocketSteppingState() {
++		CloseFrame();
+ 		g_disassemblyManager.clear();
+ 	}
+ 
+@@ -46,6 +55,13 @@
+ 	void RunUntil(DebuggerRequest &req);
+ 	void HLE(DebuggerRequest &req);
+ 	void Frame(DebuggerRequest &req);
++	void CancelFrame(DebuggerRequest &req);
++	void Broadcast(net::WebSocketServer *ws) override;
++	void CloseFrame();
++	void RequestFrameStop(const char *reason);
++	std::string frameTicket_, frameOperation_, frameStopReason_;
++	std::chrono::steady_clock::time_point frameDeadline_, frameStopDeadline_;
++	bool frameStopping_ = false;
+ 	void Pacing(DebuggerRequest &req);
+ 
+ protected:
+@@ -62,52 +78,123 @@
+ 	map["cpu.stepOut"]  = [p](DebuggerRequest &req) { p->Out(req); };
+ 	map["cpu.runUntil"] = [p](DebuggerRequest &req) { p->RunUntil(req); };
+ 	map["cpu.nextHLE"]  = [p](DebuggerRequest &req) { p->HLE(req); };
++	map["emucap.frameStep.capability"] = [](DebuggerRequest &req) {
++		JsonWriter &json = req.Respond();
++		json.writeUint("version", 1);
++		json.writeBool("connection_owned", true);
++		json.writeBool("inactive_cpu", coreState == CORE_STEPPING_CPU && Core_IsInactive());
++	};
+ 	map["emucap.frameStep"] = [p](DebuggerRequest &req) { p->Frame(req); };
++	map["emucap.frameStep.cancel"] = [p](DebuggerRequest &req) { p->CancelFrame(req); };
+ 	map["emucap.pacing"] = [p](DebuggerRequest &req) { p->Pacing(req); };
+ 	return p;
+ }
+ 
+-// Advance by an exact number of emulated PSP VBlank-start boundaries and halt again.  Host
+-// presentation is intentionally not part of this contract: headless and displayed runs share the
+-// same emulated clock.  A breakpoint or other Core_Break wins and reports an interrupted partial
+-// advance.  The bounded wait leaves enough time for the bridge to receive the terminal reply.
++// Keep the WebSocket dispatcher available while an exact VBlank operation runs.
++// The originating connection owns both the deferred reply and its cancellation.
+ void WebSocketSteppingState::Frame(DebuggerRequest &req) {
+-	if (!currentDebugMIPS->isAlive())
+-		return req.Fail("CPU not started");
+-	if (coreState != CORE_STEPPING_CPU)
+-		return req.Fail("CPU must be halted before emucap.frameStep");
+-
++	if (emucapFrameOwner)
++		return req.Fail("another frame advance owns native control");
++	if (!currentDebugMIPS->isAlive() || coreState != CORE_STEPPING_CPU || !Core_IsInactive())
++		return req.Fail("CPU must be inactive at an instruction halt before emucap.frameStep");
+ 	uint32_t count = 0;
+ 	if (!req.ParamU32("count", &count))
+ 		return;
+ 	if (count == 0 || count > 5000)
+ 		return req.Fail("count must be between 1 and 5000");
+-
+-	const u64 startVblank = (u64)__DisplayGetNumVblanks();
+-	if (!Core_EmucapBeginFrameStep(count, startVblank))
++	std::string operation;
++	if (!req.ParamString("operation_id", &operation, DebuggerParamType::OPTIONAL))
++		return;
++	if (req.HasParam("operation_id") && (operation.empty() || operation.size() > 256))
++		return req.Fail("operation_id must contain 1..256 bytes");
++	if (!Core_EmucapBeginFrameStep(count, (u64)__DisplayGetNumVblanks()))
+ 		return req.Fail("another frame advance is active or the CPU is not halted");
+-
++	const JsonNode *ticket = req.data.get("ticket");
++	frameTicket_ = ticket ? json_stringify(ticket) : "";
++	frameOperation_ = operation;
++	frameStopReason_.clear();
++	frameStopping_ = false;
++	frameDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(240);
++	emucapFrameOwner = this;
+ 	Core_Resume();
+-	EmucapFrameStepResult result = Core_EmucapWaitFrameStep(240000);
+-	const bool deadline = result.status == EmucapFrameStepStatus::TimedOut;
+-	if (deadline) {
+-		// A paced advance stops at the reached VBlank once its host budget is spent.
++}
++
++void WebSocketSteppingState::RequestFrameStop(const char *reason) {
++	if (frameStopping_)
++		return;
++	frameStopping_ = true;
++	frameStopDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++	// A completed advance or natural breakpoint keeps its original stop reason.
++	if (Core_EmucapWaitFrameStep(0).status == EmucapFrameStepStatus::TimedOut) {
++		frameStopReason_ = reason;
+ 		Core_Break(BreakReason::DebugBreak, 0);
+-		Core_WaitInactive();
++	}
++}
++
++void WebSocketSteppingState::CancelFrame(DebuggerRequest &req) {
++	std::string operation;
++	if (!req.ParamString("operation_id", &operation))
++		return;
++	if (emucapFrameOwner != this || operation.empty() || operation != frameOperation_)
++		return req.Fail("frame operation identity does not belong to this connection");
++	RequestFrameStop("cancelled");
++	// Intent acknowledgement only. The original ticket carries the verified terminal.
++	req.Respond().writeString("status", "requested");
++}
++
++void WebSocketSteppingState::Broadcast(net::WebSocketServer *ws) {
++	if (emucapFrameOwner != this)
++		return;
++	auto result = Core_EmucapWaitFrameStep(0);
++	if (std::chrono::steady_clock::now() >= frameDeadline_)
++		RequestFrameStop("host_deadline");
++	if (result.status != EmucapFrameStepStatus::TimedOut && !frameStopping_) {
++		frameStopping_ = true;
++		frameStopDeadline_ = std::chrono::steady_clock::now() + std::chrono::seconds(2);
++	}
++	if (!Core_IsInactive()) {
++		if (frameStopping_ && std::chrono::steady_clock::now() >= frameStopDeadline_)
++			std::abort();  // Dedicated producer cannot certify its native stop.
++		return;
++	}
++	if (coreState != CORE_STEPPING_CPU)
++		std::abort();  // Powerdown/GE stepping is not an exact CPU-frame terminal.
++	if (result.status == EmucapFrameStepStatus::TimedOut)
+ 		result = Core_EmucapCancelFrameStep();
+-	}
+-
+-	Core_WaitInactive();
+-	JsonWriter &json = req.Respond();
++	JsonWriter json;
++	json.begin();
++	json.writeString("event", "emucap.frameStep");
++	if (!frameTicket_.empty())
++		json.writeRaw("ticket", frameTicket_);
++	if (!frameOperation_.empty())
++		json.writeString("operation_id", frameOperation_);
+ 	json.writeString("status", result.status == EmucapFrameStepStatus::Completed ? "completed" : "interrupted");
+-	if (deadline)
+-		json.writeString("reason", "host_deadline");
++	if (!frameStopReason_.empty() && result.status != EmucapFrameStepStatus::Completed)
++		json.writeString("reason", frameStopReason_);
+ 	json.writeString("unit", "frames");
+ 	json.writeUint("count", result.requested);
+ 	json.writeUint("completed", result.completed);
+ 	json.writeUint("start_vblank", (uint32_t)result.startVblank);
+ 	json.writeUint("end_vblank", (uint32_t)result.endVblank);
+ 	json.writeString("state", "frozen");
++	json.end();
++	emucapFrameOwner = nullptr;
++	ws->Send(json.str());
++}
++
++void WebSocketSteppingState::CloseFrame() {
++	if (emucapFrameOwner != this)
++		return;
++	RequestFrameStop("connection_lost");
++	while (!Core_IsInactive()) {
++		if (std::chrono::steady_clock::now() >= frameStopDeadline_)
++			std::abort();
++		std::this_thread::sleep_for(std::chrono::milliseconds(1));
++	}
++	if (coreState != CORE_STEPPING_CPU)
++		std::abort();
++	Core_EmucapCancelFrameStep();
++	emucapFrameOwner = nullptr;
+ }
+ 
+ // Read or set agent pacing (emucap.pacing)

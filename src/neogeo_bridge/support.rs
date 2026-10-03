@@ -20,6 +20,9 @@ pub(super) fn required_path(params: &Value, key: &str) -> BridgeResult<PathBuf> 
 
 pub(super) fn error_kind(error: &BridgeError) -> &'static str {
     match error {
+        BridgeError::Busy => "busy",
+        BridgeError::Cancelled => "cancelled",
+        BridgeError::Unsupported(_) => "unsupported",
         BridgeError::BadParams(_) => "bad_params",
         BridgeError::BadState(_) => "bad_state",
         BridgeError::UnsafeHalt(_) => "unsafe_halt",

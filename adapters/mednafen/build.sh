@@ -128,10 +128,24 @@ GOT_MEDNAFEN_SHA256="$(sha256_path "$TARBALL")"
   exit 1
 }
 
+JSON_HEADER="$WORK/emucap-json-3.11.3.hpp"
+bash "$HERE/fetch-json.sh" "$JSON_HEADER"
+
 # 2. 깨끗이 추출
 echo "→ 추출"
 safe_rm_rf_under_work "$SRC"; mkdir -p "$SRC"
 tar xf "$TARBALL" -C "$SRC" --strip-components=1
+case "$(uname -s)" in
+  MINGW*|MSYS*)
+    # MSYS2 may extract include/mednafen -> ../src as a directory copy. Native
+    # compilers must see the patched source through this include alias.
+    safe_rm_rf_under_work "$SRC/include/mednafen"
+    EMUCAP_MEDNAFEN_INCLUDE="$(cygpath -w "$SRC/include/mednafen")" \
+      EMUCAP_MEDNAFEN_SOURCE="$(cygpath -w "$SRC/src")" \
+      powershell.exe -NoProfile -NonInteractive -Command \
+      '$ErrorActionPreference="Stop"; New-Item -ItemType Junction -Path $env:EMUCAP_MEDNAFEN_INCLUDE -Target $env:EMUCAP_MEDNAFEN_SOURCE | Out-Null'
+    ;;
+esac
 patch -d "$SRC" -p1 < "$HERE/patches/0001-restore-md-clock-origins.patch"
 patch -d "$SRC" -p1 < "$HERE/patches/0002-bound-resampler-decimation-read.patch"
 patch -d "$SRC" -p1 < "$HERE/patches/0003-preserve-deinterlacer-history.patch"
@@ -139,10 +153,41 @@ patch -d "$SRC" -p1 < "$HERE/patches/0004-preserve-temporal-blur-history.patch"
 patch -d "$SRC" -p1 < "$HERE/patches/0005-bind-native-video-processing-history.patch"
 patch -d "$SRC" -p1 < "$HERE/patches/0006-preserve-driver-surfaces-during-presentation.patch"
 patch -d "$SRC" -p1 < "$HERE/patches/0007-serialize-driver-restoration-with-presentation.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0008-expose-current-native-input-buffer.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0009-observe-native-generation-changes.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0010-separate-ws-idle-service.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0011-restore-pce-clock-origins.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0012-restore-ws-scanline-continuation.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0013-acknowledge-ws-restored-boundary.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0014-preserve-md-partial-frame-input-clocks.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0015-acknowledge-md-restored-boundary.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0016-acknowledge-pce-restored-continuation.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0017-resume-pce-completed-frame-without-empty-output.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0018-acknowledge-pcfx-restored-continuation.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0019-preserve-saturn-sound-clock-origins.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0020-restore-saturn-scheduler-continuation.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0021-preserve-saturn-cd-clock-ratio.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0022-preserve-native-frame-wrapper-phase.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0023-restore-ngp-frame-clock-origins.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0024-preserve-pcfx-device-clock-origins.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0025-observe-psx-native-callback-clock.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0026-share-driver-frame-binding.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0027-preserve-restored-saturn-frame-output.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0028-rebind-core-output-after-wrapper-restart.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0029-bind-native-format-for-restored-frame.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0030-preserve-live-input-on-external-load.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0031-preserve-native-frame-input-phase.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0032-preserve-wonderswan-sound-clock.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0033-preserve-pcfx-debug-read-state.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0034-preserve-md-debug-read-state.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0035-preserve-device-peek-latches.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0036-reject-pcfx-track-read-failure.patch"
+patch -d "$SRC" -p1 < "$HERE/patches/0037-support-current-mingw-crt.patch"
 
 # 3. emucap 소켓 클라이언트
-cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_pcfx.h" \
-  "$HERE/emucap_completed_frame.h" "$HERE/emucap_driver_frames.h" "$HERE/emucap_driver_video.h" "$HERE/emucap_driver_video.inc" "$HERE/emucap_presentation_surface.h" "$HERE/emucap_video_format.h" \
+cp "$JSON_HEADER" "$SRC/src/drivers/emucap_json.hpp"
+cp "$HERE/emucap.cpp" "$HERE/emucap.h" "$HERE/emucap_input.h" "$HERE/emucap_live_input.h" "$HERE/emucap_input_request.h" "$HERE/emucap_rx.h" "$HERE/emucap_control_wire.h" "$HERE/emucap_control_identity.h" "$HERE/emucap_native_control.h" "$HERE/emucap_control_owner.h" "$HERE/emucap_owned.inl" "$HERE/emucap_owned_advance.h" "$HERE/emucap_pcfx.h" "$HERE/emucap_psx.h" \
+  "$HERE/emucap_completed_frame.h" "$HERE/emucap_driver_frames.h" "$HERE/emucap_driver_video.h" "$HERE/emucap_driver_video.inc" "$HERE/emucap_video_restore.h" "$HERE/emucap_atomic_file.h" "$HERE/emucap_state_file.h" "$HERE/emucap_snapshot.h" "$HERE/emucap_frame_output.h" "$HERE/emucap_frame_call.h" "$HERE/emucap_presentation_surface.h" "$HERE/emucap_video_format.h" \
   "$HERE/emucap_recording.cpp" "$HERE/emucap_recording.h" \
   "$HERE/emucap_ngp.h" \
   "$HERE/emucap_json_num.h" "$HERE/emucap_json_strings.h" "$HERE/emucap_pacing.h" \
@@ -156,12 +201,42 @@ cp "$HERE/../_common/emucap_native_failure.cpp" "$HERE/../_common/emucap_native_
 # 안 하면 옛 hash 그대로다). 어댑터 production source가 HEAD와 다르면(미커밋) -dirty.
 BUILD_HASH="$(git -C "$HERE" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 git -C "$HERE" diff --quiet HEAD -- \
-  build.sh upstream.lock patches/0001-restore-md-clock-origins.patch patches/0002-bound-resampler-decimation-read.patch \
+  build.sh upstream.lock json.lock fetch-json.sh patches/0001-restore-md-clock-origins.patch patches/0002-bound-resampler-decimation-read.patch \
   patches/0003-preserve-deinterlacer-history.patch patches/0004-preserve-temporal-blur-history.patch \
     patches/0005-bind-native-video-processing-history.patch \
     patches/0006-preserve-driver-surfaces-during-presentation.patch \
     patches/0007-serialize-driver-restoration-with-presentation.patch \
-  emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+    patches/0008-expose-current-native-input-buffer.patch \
+    patches/0009-observe-native-generation-changes.patch \
+    patches/0010-separate-ws-idle-service.patch \
+    patches/0011-restore-pce-clock-origins.patch \
+    patches/0012-restore-ws-scanline-continuation.patch \
+    patches/0013-acknowledge-ws-restored-boundary.patch \
+    patches/0014-preserve-md-partial-frame-input-clocks.patch \
+    patches/0015-acknowledge-md-restored-boundary.patch \
+    patches/0016-acknowledge-pce-restored-continuation.patch \
+    patches/0017-resume-pce-completed-frame-without-empty-output.patch \
+    patches/0018-acknowledge-pcfx-restored-continuation.patch \
+    patches/0019-preserve-saturn-sound-clock-origins.patch \
+    patches/0020-restore-saturn-scheduler-continuation.patch \
+    patches/0021-preserve-saturn-cd-clock-ratio.patch \
+    patches/0022-preserve-native-frame-wrapper-phase.patch \
+    patches/0023-restore-ngp-frame-clock-origins.patch \
+    patches/0024-preserve-pcfx-device-clock-origins.patch \
+    patches/0025-observe-psx-native-callback-clock.patch \
+    patches/0026-share-driver-frame-binding.patch \
+    patches/0027-preserve-restored-saturn-frame-output.patch \
+    patches/0028-rebind-core-output-after-wrapper-restart.patch \
+    patches/0029-bind-native-format-for-restored-frame.patch \
+    patches/0030-preserve-live-input-on-external-load.patch \
+    patches/0031-preserve-native-frame-input-phase.patch \
+    patches/0032-preserve-wonderswan-sound-clock.patch \
+    patches/0033-preserve-pcfx-debug-read-state.patch \
+    patches/0034-preserve-md-debug-read-state.patch \
+    patches/0035-preserve-device-peek-latches.patch \
+    patches/0036-reject-pcfx-track-read-failure.patch \
+    patches/0037-support-current-mingw-crt.patch \
+  emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_video_restore.h emucap_atomic_file.h emucap_state_file.h emucap_snapshot.h emucap_frame_output.h emucap_frame_call.h emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_live_input.h emucap_input_request.h emucap_rx.h emucap_control_wire.h emucap_control_identity.h emucap_native_control.h emucap_control_owner.h emucap_owned.inl emucap_owned_advance.h emucap_pcfx.h emucap_psx.h emucap_ngp.h \
   emucap_recording.cpp emucap_recording.h md-repeatable-profile.json \
   emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
   emucap_pacing.h ../_common/emucap_native_failure.cpp ../_common/emucap_native_failure.h \
@@ -169,12 +244,42 @@ git -C "$HERE" diff --quiet HEAD -- \
 BUILD_HASH="${BUILD_HASH}@mednafen-$VER"
 PATCHSET_SHA256="$({
   for path in \
-    build.sh patches/0001-restore-md-clock-origins.patch patches/0002-bound-resampler-decimation-read.patch \
+    build.sh json.lock fetch-json.sh patches/0001-restore-md-clock-origins.patch patches/0002-bound-resampler-decimation-read.patch \
     patches/0003-preserve-deinterlacer-history.patch patches/0004-preserve-temporal-blur-history.patch \
     patches/0005-bind-native-video-processing-history.patch \
     patches/0006-preserve-driver-surfaces-during-presentation.patch \
     patches/0007-serialize-driver-restoration-with-presentation.patch \
-    emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_pcfx.h emucap_ngp.h \
+    patches/0008-expose-current-native-input-buffer.patch \
+    patches/0009-observe-native-generation-changes.patch \
+    patches/0010-separate-ws-idle-service.patch \
+    patches/0011-restore-pce-clock-origins.patch \
+    patches/0012-restore-ws-scanline-continuation.patch \
+    patches/0013-acknowledge-ws-restored-boundary.patch \
+    patches/0014-preserve-md-partial-frame-input-clocks.patch \
+    patches/0015-acknowledge-md-restored-boundary.patch \
+    patches/0016-acknowledge-pce-restored-continuation.patch \
+    patches/0017-resume-pce-completed-frame-without-empty-output.patch \
+    patches/0018-acknowledge-pcfx-restored-continuation.patch \
+    patches/0019-preserve-saturn-sound-clock-origins.patch \
+    patches/0020-restore-saturn-scheduler-continuation.patch \
+    patches/0021-preserve-saturn-cd-clock-ratio.patch \
+    patches/0022-preserve-native-frame-wrapper-phase.patch \
+    patches/0023-restore-ngp-frame-clock-origins.patch \
+    patches/0024-preserve-pcfx-device-clock-origins.patch \
+    patches/0025-observe-psx-native-callback-clock.patch \
+    patches/0026-share-driver-frame-binding.patch \
+    patches/0027-preserve-restored-saturn-frame-output.patch \
+    patches/0028-rebind-core-output-after-wrapper-restart.patch \
+    patches/0029-bind-native-format-for-restored-frame.patch \
+    patches/0030-preserve-live-input-on-external-load.patch \
+    patches/0031-preserve-native-frame-input-phase.patch \
+    patches/0032-preserve-wonderswan-sound-clock.patch \
+    patches/0033-preserve-pcfx-debug-read-state.patch \
+    patches/0034-preserve-md-debug-read-state.patch \
+    patches/0035-preserve-device-peek-latches.patch \
+    patches/0036-reject-pcfx-track-read-failure.patch \
+    patches/0037-support-current-mingw-crt.patch \
+    emucap.cpp emucap.h emucap_completed_frame.h emucap_driver_frames.h emucap_driver_video.h emucap_driver_video.inc emucap_video_restore.h emucap_atomic_file.h emucap_state_file.h emucap_snapshot.h emucap_frame_output.h emucap_frame_call.h emucap_presentation_surface.h emucap_video_format.h emucap_input.h emucap_live_input.h emucap_input_request.h emucap_rx.h emucap_control_wire.h emucap_control_identity.h emucap_native_control.h emucap_control_owner.h emucap_owned.inl emucap_owned_advance.h emucap_pcfx.h emucap_psx.h emucap_ngp.h \
     emucap_ngp_debug.h emucap_ngp_debug.inc emucap_json_num.h emucap_json_strings.h \
     emucap_pacing.h emucap_recording.cpp emucap_recording.h md-repeatable-profile.json; do
     printf '%s  %s\n' "$(sha256_path "$HERE/$path")" "$path"
@@ -682,7 +787,7 @@ inject_check '::emucap_game_data_store((unsigned short)WSButtonStatus)' "$SRC/sr
 #     of each emulated frame. Record that exact byte after the common PortData override is applied.
 perl -0777 -pi -e 's/(#include "neopop\.h"\n)/${1}\nextern "C" void emucap_game_data_store(unsigned short);\n/ unless m{emucap_game_data_store}' \
   "$SRC/src/ngp/neopop.cpp"
-perl -0777 -pi -e 's{(\tNGPJoyLatch = \*chee;\n)}{${1}\t::emucap_game_data_store((unsigned short)NGPJoyLatch);\n} unless m{::emucap_game_data_store}' \
+perl -0777 -pi -e 's{([ \t]+NGPJoyLatch = \*chee;\n)}{${1}\t::emucap_game_data_store((unsigned short)NGPJoyLatch);\n} unless m{::emucap_game_data_store}' \
   "$SRC/src/ngp/neopop.cpp"
 inject_check '::emucap_game_data_store((unsigned short)NGPJoyLatch)' "$SRC/src/ngp/neopop.cpp" "ngp/neopop.cpp input diagnostic injection failed"
 
@@ -733,7 +838,14 @@ fi
 # Windows(MSYS2/MinGW): 소켓이 winsock이라 링크에 ws2_32가 필요하다(emucap.cpp의 socket/WSAStartup 등).
 # autotools는 LIBS를 링크 커맨드에 붙이므로 configure 전에 주입한다.
 case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW*|MSYS*|CYGWIN*) export LIBS="-lws2_32 ${LIBS:-}" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    export LIBS="-lws2_32 ${LIBS:-}"
+    # Upstream's non-Unicode Windows driver targets Windows 9x and rejects NT.
+    export CPPFLAGS="-DUNICODE -D_UNICODE ${CPPFLAGS:-}"
+    # Keep C++ RTTI and exception support in the executable. Cross-DLL type-info
+    # references can overflow MinGW's 32-bit runtime pseudo-relocations.
+    export LDFLAGS="-static-libstdc++ -static-libgcc ${LDFLAGS:-}"
+    ;;
 esac
 ./configure --enable-ss --enable-psx --enable-pce --enable-pce-fast --enable-pcfx --enable-md --enable-wswan --enable-ngp --enable-debugger >/dev/null
 

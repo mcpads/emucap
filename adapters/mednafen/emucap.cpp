@@ -18,12 +18,25 @@
 #include "emucap.h"
 #include "emucap_completed_frame.h"
 #include "emucap_driver_frames.h"
+#include "emucap_video_restore.h"
+#include "emucap_frame_call.h"
+#include "emucap_state_file.h"
+#include "emucap_snapshot.h"
 #include "emucap_input.h"
+#include "emucap_live_input.h"
+#include "emucap_input_request.h"
+#include "emucap_rx.h"
+#include "emucap_control_wire.h"
+#include "emucap_native_control.h"
+#include "emucap_control_owner.h"
+#include "emucap_owned_advance.h"
+#include <climits>
 #include "emucap_json_num.h"
 #include "emucap_json_strings.h"
 #include "emucap_ngp.h"
 #include "emucap_pacing.h"
 #include "emucap_pcfx.h"
+#include "emucap_psx.h"
 #include "emucap_recording.h"
 #include "emucap_native_failure.h"
 
@@ -72,6 +85,7 @@ extern "C" int emucap_ngp_disasm_safe(unsigned address, unsigned length);
 #include <sys/stat.h>   // mkdir(dump_memory 디렉터리 생성)
 #include <unistd.h>     // getpid/unlink/close(파일) — MinGW도 제공
 #include <fcntl.h>
+#include "emucap_atomic_file.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -146,6 +160,7 @@ const char* system_shortname();
 bool is_ss();
 bool is_md();
 bool lookup_button_bit(const std::string& name, uint16_t& bit);
+uint16_t supported_button_bits();
 struct BP { long id; int type; uint32 a1, a2; uint32 public_a1, public_a2;
             bool logical = true; bool pause_on_hit = true;
             uint32 value = 0, value_mask = 0xFFFFFFFF; int val_len = 1; bool has_value = false;
@@ -189,19 +204,21 @@ bool g_bp_hit_has_value = false;
 uint32 g_bp_hit_value = 0;
 
 int g_fd = -1;
-std::string g_rx;
+EmucapReceiveBuffer g_rx;
 std::string g_tx;
 size_t g_tx_pos = 0;
 static const size_t TX_CAP = 8 * 1024 * 1024;
 static const long MAX_SYNC_ADVANCE = 5000;
 static const uint64_t PROGRESS_INTERVAL_MS = 1000;
 uint64_t g_frame = 0;
+EmucapControl::NativeControl g_native_control;
 std::unique_ptr<EmucapRecording> g_recording;
 bool g_recording_last_valid = false;
 std::string g_recording_last_capture_id;
 EmucapRecordingResult g_recording_last;
 long g_test_adapter_exception_id = -1;
 bool g_internal_failure_active = false;
+bool g_state_restore_unverified = false;
 char g_internal_failure_operation[128]{};
 char g_internal_failure_reason[512]{};
 
@@ -256,7 +273,8 @@ uint64_t g_step_progress_ms = 0;
 // PSX can replace CPU and device state while the game thread is parked in a debugger callback.
 // The patched CPU loop discards that callback's stale local execution state and invokes a fresh
 // callback at the restored PC. Keep the request open until that fresh instruction boundary exists.
-enum CoreRefreshReply { CORE_REFRESH_NONE, CORE_REFRESH_LOAD_STATE, CORE_REFRESH_RESET };
+enum CoreRefreshReply { CORE_REFRESH_NONE, CORE_REFRESH_LOAD_STATE,
+                        CORE_REFRESH_LOAD_STATE_WITH_OUTPUT, CORE_REFRESH_RESET };
 long g_core_refresh_id = -1;
 CoreRefreshReply g_core_refresh_reply = CORE_REFRESH_NONE;
 
@@ -306,9 +324,9 @@ uint32 g_reset_entry = 0;  // 리셋 진입 PC(enable 시 벡터에서 읽음)
 // 진입명령의 cb가 이미 일어난 상태라 resume이 그 명령을 '공짜로' 실행시킨다 → step(N)=정확히 N.
 // 그러나 pause/프레임-step로 *cold* frozen이면 진입명령 cb가 아직 안 일어났다 → 첫 continuous cb를
 // 1회 흡수(g_insn_skip_first)해야 cold도 공짜 진입명령을 갖고 정확히 N이 된다(안 그러면 N-1).
-// g_frozen_via_cb: "현재 진입명령의 cb가 이미 발화했나(=resume이 그 명령을 실행하나)". 일반적으로
-// park 위치가 정하지만 PSX load/reset은 예외다. 그 코어는 복원 전 callback의 로컬 timestamp와 pipeline을
-// 폐기한 뒤 복원된 PC에서 새 callback을 발화하므로, load/reset 응답도 그 새 boundary에서 완료한다.
+// g_frozen_via_cb marks a suspended core stack, including restored non-instruction
+// continuations. NativeControl::Context determines instruction-step cold entry.
+// Supported native owners defer replacement completion until the core acknowledges it.
 bool g_frozen_via_cb = false;
 bool g_insn_skip_first = false;
 
@@ -342,6 +360,9 @@ uint64_t monotonic_millis() {
 uint32_t g_base_percent = 100;
 bool g_speed_unlimited = false;
 uint64_t g_policy_revision = 0;
+// Process-lifetime control health; reconnect/reset cannot certify a failed pacing mutation.
+bool g_pacing_control_unverified = false;
+bool g_input_control_unverified = false;
 std::string g_policy_key;
 // Bumped by every request outside the observation set, since those can change memory or the stop
 // without changing the frame count.
@@ -408,13 +429,61 @@ EmucapPacingObservation observe_pacing() {
 
 
 void rearm_breakpoints();
+void owned_connected();
+void owned_disconnected();
+bool owned_has_parent();
+bool owned_busy();
+bool owned_needs_cpu();
+void owned_poll();
+void owned_service();
+bool owned_cpu_service();
+void owned_interrupt(uint32_t pc);
+
+bool owned_legacy_busy() {
+  return g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0 || g_insn_step_id >= 0 ||
+      g_core_refresh_id >= 0 || g_recording.get();
+}
+bool owned_native_callbacks_available() {
+  return CurGame && CurGame->Debugger && CurGame->Debugger->SetCPUCallback;
+}
+bool owned_control_discovery_available() {
+  const char* launch_id = getenv("EMUCAP_LAUNCH_ID");
+  // Match the complete identity published by hello; unmanaged callers keep the legacy path.
+  return owned_native_callbacks_available() && launch_id && launch_id[0]
+      && strlen(launch_id) <= 128;
+}
+void append_owned_control_capabilities(std::string& object) {
+  if (!owned_control_discovery_available()) return;
+  object.pop_back();
+  object += ",\"control_session_lifecycle\":true,"
+      "\"temporal_cancellation_capability\":{\"methods\":[\"step\",\"step_instructions\"],"
+      "\"control_service_ms\":50,\"stop_host_ms\":5000}}";
+}
+bool preflight_input_request(const EmucapControl::Request&, EmucapControl::InputRequest&);
+
+bool native_parked() {
+  return g_native_control.Parked(g_frozen && g_step_remaining == 0 && g_insn_remaining == 0
+      && g_def_remaining == 0 && g_probe_remaining == 0 && g_core_refresh_id < 0 && !g_recording);
+}
+
+bool apply_native_input(bool engaged, uint16_t mask) {
+  unsigned short observed = 0;
+  if (!emucap_native_input_write(0, engaged ? mask : 0, supported_button_bits(), &observed)) {
+    g_input_control_unverified = true;
+    g_frozen = true;
+    return false;
+  }
+  if (engaged) g_input_override.engage(mask);
+  else g_input_override.release();
+  return true;
+}
 
 void cancel_session_requests() {
   const bool had_request = g_def_id >= 0 || g_probe_id >= 0 || g_step_id >= 0
       || g_insn_step_id >= 0 || g_core_refresh_id >= 0
       || g_test_adapter_exception_id >= 0 || g_recording.get();
   cancel_recording_for_disconnect();
-  if (g_def_is_press) g_input_override.release();
+  if (g_def_is_press) apply_native_input(false, 0);
   g_def_id = -1;
   g_def_remaining = 0;
   g_def_progress_ms = 0;
@@ -442,6 +511,7 @@ void cancel_session_requests() {
 }
 
 void emucap_disconnect() {
+  owned_disconnected();
   // Never put an old response id ahead of the replacement session's hello. Persistent emulator,
   // breakpoint, explicit set_input, and freeze state survive; only the dead session's work is lost.
   cancel_session_requests();
@@ -497,6 +567,7 @@ void emucap_connect() {
   }
   emucap_set_nonblock(fd);  // recv는 논블로킹
   g_fd = fd;
+  owned_connected();
   g_rx.clear();
   g_tx.clear();
   g_tx_pos = 0;
@@ -856,10 +927,9 @@ bool recording_stop_condition(
 }
 
 bool recording_input_handler(bool engaged, std::uint16_t mask, std::string& error) {
-  (void)error;
-  if (engaged) g_input_override.engage(mask);
-  else g_input_override.release();
-  return true;
+  if (apply_native_input(engaged, mask)) return true;
+  error = "native input write/readback failed";
+  return false;
 }
 
 std::string recording_stop_event_json(const EmucapRecordingResult& result) {
@@ -1191,12 +1261,20 @@ void remember_active_native_failure(const char* operation, const char* reason) n
 }
 
 void recover_native_failure_after_status() noexcept {
-  if (!g_internal_failure_active) return;
+  if (!g_internal_failure_active || g_state_restore_unverified) return;
   const char* state = g_frozen ? "frozen" : "running";
   if (publish_native_failure(
           g_internal_failure_operation, g_internal_failure_reason, false, state)) {
     g_internal_failure_active = false;
   }
+}
+
+void quarantine_state_restore(const char* reason) noexcept {
+  g_state_restore_unverified = true;
+  g_native_control.Invalidate();
+  g_frozen = true;
+  g_step_remaining = g_insn_remaining = 0;
+  remember_active_native_failure("load_state", reason);
 }
 
 void flush_pending_internal_error(long id, const char* reason) noexcept {
@@ -1568,9 +1646,16 @@ bool ranges_overlap(uint32 a_start, uint32 a_len, uint32 b_start, uint32 b_end) 
 }
 
 void freeze_spin_until_resume() {
+  // Device-event hooks can park here without a main-CPU instruction boundary.
+  // Preserve the CPU scope's entry generation, including across state replacement.
+  std::unique_ptr<EmucapControl::NativeControl::Scope> device_scope;
+  if (g_native_control.CurrentContext() != EmucapControl::NativeControl::Context::Cpu
+      && g_native_control.CurrentContext() != EmucapControl::NativeControl::Context::Continuation)
+    device_scope.reset(new EmucapControl::NativeControl::Scope(
+        g_native_control, EmucapControl::NativeControl::Context::Device));
   g_frozen = true;
-  g_frozen_via_cb = true;     // cb 안 park(BP 히트/명령 카운트 0) — 진입명령 cb 발화함 → resume이 공짜
-                              // 실행 → step_instructions skip 안 함. park 위치가 권위(핸들러 아님).
+  owned_poll();
+  g_frozen_via_cb = true;  // Core stack remains suspended; native context owns step accounting.
   // resume까지 스핀. 단 step(g_step_remaining>0)이나 step_instructions(g_insn_remaining>0)이 들어오면
   // 빠져나와 진행시킨다 — 안 그러면 BP 히트/명령단위 freeze 상태에서 step이 게임을 못 돌려 frame hook이
   // 안 돌고 timeout 난다. 명령단위 step은 이 같은 스핀을 탈출해 continuous cb가 다음 N명령을 진행한다.
@@ -1587,7 +1672,9 @@ void freeze_spin_until_resume() {
         continue;
       }
     }
+    owned_poll();
     serve_socket_once();
+    owned_poll();
     usleep(2000);               // 2ms — busy-spin 방지
   }
   if (pacing_parked) emucap_ers_resync();
@@ -1602,13 +1689,16 @@ void freeze_spin_until_resume() {
 // id>=0으로 가드하므로 remaining=0·id=-1로 비우면 후속 self-complete가 안 일어난다. Rust는 interrupted를 정상
 // result로 반환한다(protocol::STATUS_INTERRUPTED). press면 입력을 뗀다.
 void flush_deferred_on_freeze(uint32 pc) {
+  owned_interrupt(pc);
   char buf[160];
   snprintf(buf, sizeof(buf),
            "{\"status\":\"interrupted\",\"reason\":\"breakpoint\",\"pc\":%u,\"frame\":%llu}",
            (unsigned)pc, (unsigned long long)g_frame);
   if (g_def_id >= 0) {
-    if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
-    reply_ok(g_def_id, buf);
+    const bool released = !g_def_is_press || apply_native_input(false, 0);
+    g_def_is_press = false;
+    if (released) reply_ok(g_def_id, buf);
+    else reply_err(g_def_id, "emulator_error", "native input release unverified");
     g_def_id = -1;
     g_def_remaining = 0;
     g_def_progress_ms = 0;
@@ -1703,14 +1793,14 @@ void rearm_breakpoints() {
   // 비용이라 도구 활성 구간만 무장한다(resume이 즉시 해제).
   // continuous(매 명령 cb) = 명령단위 step 또는 실행추적 또는 레지스터워치 중 하나라도 활성.
   // rearm은 flag에서 매번 재계산하므로 resume이 trace/watch를 끄지 않는다(set_trace(false)/clear까지 유지).
-  bool continuous = g_insn_remaining > 0 || g_core_refresh_id >= 0
+  bool continuous = g_insn_remaining > 0 || g_core_refresh_id >= 0 || owned_needs_cpu()
       || g_trace_enabled || g_watch_enabled || g_break_on_reset;
   g_insn_armed = continuous;
   CurGame->Debugger->SetCPUCallback((has_core_bp || continuous) ? emucap_cpu_cb : nullptr, continuous);
 }
 
-bool defer_psx_core_refresh(long id, CoreRefreshReply reply) {
-  if (!is_psx() || !g_frozen_via_cb) return false;
+bool defer_native_core_refresh(long id, CoreRefreshReply reply) {
+  if ((!is_psx() && !is_ws() && !is_ngp() && !is_md() && !is_pce() && !is_pcfx() && !is_ss()) || !g_frozen_via_cb) return false;
   g_core_refresh_id = id;
   g_core_refresh_reply = reply;
   g_frozen = false;
@@ -1718,7 +1808,7 @@ bool defer_psx_core_refresh(long id, CoreRefreshReply reply) {
   return true;
 }
 
-bool complete_psx_core_refresh() {
+bool complete_native_core_refresh() {
   if (g_core_refresh_id < 0) return false;
   const long id = g_core_refresh_id;
   const CoreRefreshReply reply = g_core_refresh_reply;
@@ -1726,11 +1816,14 @@ bool complete_psx_core_refresh() {
   g_core_refresh_reply = CORE_REFRESH_NONE;
   g_frozen = true;
   rearm_breakpoints();
-  if (reply == CORE_REFRESH_LOAD_STATE)
-    reply_ok(id, "{\"status\":\"completed\"}");
+  if (reply == CORE_REFRESH_LOAD_STATE || reply == CORE_REFRESH_LOAD_STATE_WITH_OUTPUT)
+    reply_ok(id, reply == CORE_REFRESH_LOAD_STATE_WITH_OUTPUT
+        ? "{\"status\":\"completed\",\"output_history\":\"restored\"}"
+        : "{\"status\":\"completed\",\"output_history\":\"unavailable\"}");
   else
     reply_ok(id, "{\"reset\":true}");
   freeze_spin_until_resume();
+  if (g_core_refresh_id < 0) emucap_resume_frame_output();
   return true;
 }
 
@@ -1748,6 +1841,8 @@ bool validate_aspace_range(const std::string& mt, uint32 addr, long len) {
   AddressSpaceType* sp = find_aspace(mt);
   if (!sp) return false;
   if (len <= 0 || len > MAX_READ_LEN) return false;
+  if (is_pcfx() && mt == "cpu" && !emucap_pcfx_cpu_peek_range(addr, len)) return false;
+  if (is_psx() && mt == "cpu" && !emucap_psx_cpu_peek_range(addr, len)) return false;
   uint64 end = (uint64)addr + (uint64)len;
   return end <= 0x100000000ULL && (!sp->size || end <= sp->size);
 }
@@ -1847,6 +1942,17 @@ void handle_find_pattern(long id, const std::string& line) {
   uint64 scan_len64 = truncated ? (uint64)MAX_FIND_LEN : requested;
   if (scan_len64 > 0xFFFFFFFFULL) scan_len64 = 0xFFFFFFFFULL;
   uint32 scan_len = (uint32)scan_len64;
+  if (is_pcfx() && mt == "cpu" && scan_len
+      && !emucap_pcfx_cpu_peek_range(start, scan_len)) {
+    reply_err(id, "unsupported", "PC-FX CPU device I/O has no side-effect-free peek");
+    return;
+  }
+
+  if (is_psx() && mt == "cpu" && scan_len
+      && !emucap_psx_cpu_peek_range(start, scan_len)) {
+    reply_err(id, "unsupported", "PSX CPU device registers have no native peek; use a supported memory window");
+    return;
+  }
 
   std::vector<uint8> buf(scan_len);
   if (scan_len)
@@ -1904,7 +2010,20 @@ std::string memory_batch_windows_json() {
   if (!CurGame || !CurGame->Debugger || !CurGame->Debugger->AddressSpaces) return windows;
   for (auto& as : *CurGame->Debugger->AddressSpaces) {
     if (!as.size || as.size > 0x100000000ULL || (is_ss() && as.name == "physical")) continue;
+    if (is_psx() && as.name == "cpu") {
+      for (const auto& window : emucap_psx_cpu_peek_windows()) {
+        if (!windows.empty()) windows += ",";
+        windows += "{\"memory_type\":\"cpu\",\"address\":" + std::to_string(window.address)
+            + ",\"length\":" + std::to_string(window.length) + "}";
+      }
+      continue;
+    }
     if (!windows.empty()) windows += ",";
+    if (is_pcfx() && as.name == "cpu") {
+      windows += "{\"memory_type\":\"cpu\",\"address\":0,\"length\":2147483648},"
+                 "{\"memory_type\":\"cpu\",\"address\":2155347968,\"length\":2139619328}";
+      continue;
+    }
     windows += "{\"memory_type\":\"" + json_escape(as.name) + "\",\"address\":0,\"length\":"
         + std::to_string((unsigned long long)as.size) + "}";
   }
@@ -1916,7 +2035,8 @@ std::string memory_batch_capability_json(const std::string& windows) {
       + std::to_string(EMUCAP_BATCH_MAX_BYTES) + ",\"max_total_bytes\":"
       + std::to_string(EMUCAP_BATCH_MAX_BYTES)
       + ",\"consistency\":\"frozen_boundary\",\"halt_kinds\":[\"frame_boundary_park\","
-        "\"cpu_callback_park\"],\"windows\":[" + windows + "]}";
+        "\"cpu_callback_park\"" + std::string((is_ws() || is_md() || is_pce() || is_pcfx() || is_ss()) ? ",\"restored_continuation_park\"" : "")
+      + "],\"windows\":[" + windows + "]}";
 }
 
 std::string runtime_generation() {
@@ -1994,6 +2114,7 @@ void handle_execution_speed(long id, const std::string& line) {
   }
   const uint32_t prior_percent = g_base_percent;
   const bool prior_unlimited = g_speed_unlimited;
+  g_pacing_control_unverified = true;
   g_speed_unlimited = request.unlimited;
   if (!request.unlimited) g_base_percent = request.percent;
   apply_agent_speed();
@@ -2003,6 +2124,7 @@ void handle_execution_speed(long id, const std::string& line) {
     apply_agent_speed();
     const bool restored = emucap_pacing_key(native_pacing()) == emucap_pacing_key(before);
     observe_pacing();
+    g_pacing_control_unverified = !restored;
     reply_err(id, "emulator_error", restored
         ? "execution_speed failed_restored: a held fast/slow-forward key, nothrottle or netplay "
           "owns the native speed"
@@ -2010,6 +2132,7 @@ void handle_execution_speed(long id, const std::string& line) {
     return;
   }
   const EmucapPacingObservation after = observe_pacing();
+  g_pacing_control_unverified = false;
   reply_ok(id, std::string("{\"status\":\"completed\",\"state\":\"")
       + (g_frozen ? "frozen" : "running") + "\",\"previous\":" + previous
       + ",\"execution_speed\":" + emucap_pacing_policy_json(after, g_policy_revision, audio)
@@ -2308,9 +2431,21 @@ void handle_save_state(long id, const std::string& line) {
   std::string path = json_str(line, "path");
   if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
   try {
-    FileStream fs(path, FileStream::MODE_WRITE);
-    MDFNSS_SaveSM(&fs);
-    fs.close();
+    MemoryStream staged;
+    MDFNSS_SaveSM(&staged);
+    EmucapSnapshot::Blocks blocks;
+    {
+      EmucapDriverVideo video;
+      auto visual = EmucapVideoRestore::capture(video, g_completed_frame);
+      blocks[0] = std::move(visual.raster);
+      blocks[1] = std::move(visual.filters);
+      blocks[2] = std::move(visual.completed);
+      auto output = emucap_capture_frame_output();
+      if (output) blocks[3] = output->encode();
+    }
+    const auto snapshot = EmucapSnapshot::encode(staged.map(), staged.map_size(),
+        EmucapSnapshot::identity(MDFNGameInfo->shortname, MDFNGameInfo->MD5), blocks);
+    EmucapAtomicFile::write(path, snapshot.data(), snapshot.size());
   } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
   reply_ok(id, "{\"status\":\"completed\"}");
 }
@@ -2318,16 +2453,60 @@ void handle_save_state(long id, const std::string& line) {
 void handle_load_state(long id, const std::string& line) {
   std::string path = json_str(line, "path");
   if (path.empty()) { reply_err(id, "bad_params", "path is required"); return; }
+  bool native_load_started = false;
+  bool output_history = false;
   try {
     FileStream fs(path, FileStream::MODE_READ);
-    MDFNSS_LoadSM(&fs);
+    const auto size = fs.size();
+    if (size < 32 || size > EmucapSnapshot::max_bytes)
+      throw std::runtime_error("native state file exceeds admission bounds");
+    MemoryStream staged(size, -1);
+    fs.read(staged.map(), size);
     fs.close();
-  } catch (std::exception& e) { reply_err(id, "io_error", e.what()); return; }
-  // PSX의 StateAction은 event scheduler를 timestamp 0으로 다시 맞춘다. BP callback의 복원 전
-  // timestamp/pipeline으로 돌아가면 다음 advance에서 PSX_EventHandler assertion이 난다. 패치된 CPU가
-  // 그 로컬 문맥을 버리고 복원 PC의 새 callback을 만든 뒤 이 요청을 완료한다.
-  if (defer_psx_core_refresh(id, CORE_REFRESH_LOAD_STATE)) return;
-  reply_ok(id, "{\"status\":\"completed\"}");
+    auto snapshot = EmucapSnapshot::decode(staged.map(), staged.map_size(),
+        EmucapSnapshot::identity(MDFNGameInfo->shortname, MDFNGameInfo->MD5));
+    staged.truncate(snapshot.native_size);
+    const auto live_input = emucap_capture_live_input();
+    const auto load_guest = [&]() {
+      native_load_started = true;
+      MDFNSS_LoadSM(&staged);
+      if (!emucap_restore_live_input(live_input))
+        throw std::runtime_error("live input configuration changed during state load");
+    };
+    if (snapshot.history) {
+      EmucapDriverVideo video;
+      EmucapVideoBlocks visual{std::move(snapshot.blocks[0]), std::move(snapshot.blocks[1]),
+                               std::move(snapshot.blocks[2])};
+      auto prepared_video = EmucapVideoRestore::prepare(visual, video);
+      EmucapFrameCall::Output output;
+      if (!snapshot.blocks[3].empty())
+        output.reset(new EmucapFrameOutput(EmucapFrameOutput::decode(snapshot.blocks[3])));
+      auto prepared_output = emucap_prepare_frame_output(std::move(output),
+          emucap_frame_binding(false), MDFNGameInfo->soundchan);
+      load_guest();
+      if (!emucap_commit_frame_output(prepared_output, MDFNGameInfo->soundchan)
+          || !prepared_video->commit(video, g_completed_frame))
+        throw std::runtime_error("snapshot history commit failed");
+      output_history = true;
+    } else {
+      load_guest();
+    }
+  } catch (std::exception& e) {
+    if (native_load_started) quarantine_state_restore(e.what());
+    reply_err(id, native_load_started ? "restore_unverified" : "io_error", e.what());
+    return;
+  } catch (...) {
+    if (native_load_started) quarantine_state_restore("unknown native state-load exception");
+    reply_err(id, native_load_started ? "restore_unverified" : "io_error",
+              "unknown native state-load exception");
+    return;
+  }
+  // The native CPU acknowledges replacement after discarding old callback locals.
+  // WS also distinguishes an exhausted/idle slice from an instruction-ready park.
+  if (defer_native_core_refresh(id, output_history ? CORE_REFRESH_LOAD_STATE_WITH_OUTPUT
+                                                 : CORE_REFRESH_LOAD_STATE)) return;
+  reply_ok(id, output_history ? "{\"status\":\"completed\",\"output_history\":\"restored\"}"
+                             : "{\"status\":\"completed\",\"output_history\":\"unavailable\"}");
 }
 
 // 바이너리를 base64로 인코딩(screenshot PNG 응답용). 표준 알파벳, 패딩 포함.
@@ -2434,7 +2613,7 @@ const BtnOff g_ngpbtn[] = {
   {nullptr, 0}
 };
 
-// 활성 시스템의 버튼 테이블(런타임 분기). buttons_to_mask/mask_to_buttons가 사용.
+// 활성 시스템의 버튼 테이블(런타임 분기). typed input decoding and mask_to_buttons share this table.
 const BtnOff* active_btntab() {
   if (is_psx()) return g_psxbtn;
   if (is_pce()) return g_pcebtn;
@@ -2445,6 +2624,12 @@ const BtnOff* active_btntab() {
   return g_satbtn;
 }
 
+uint16_t supported_button_bits() {
+  uint16_t bits = 0;
+  for (const BtnOff* p = active_btntab(); p->name; p++) bits |= uint16_t(1u << p->off);
+  return bits;
+}
+
 bool lookup_button_bit(const std::string& name, uint16_t& bit) {
   for (const BtnOff* p = active_btntab(); p->name; p++) {
     if (name == p->name) {
@@ -2453,41 +2638,6 @@ bool lookup_button_bit(const std::string& name, uint16_t& bit) {
     }
   }
   return false;
-}
-
-bool buttons_to_mask(const std::string& line, uint16_t& mask, std::string& err) {
-  mask = 0;
-  size_t b = line.find("\"buttons\"");
-  if (b == std::string::npos) return true;
-  size_t lb = line.find('[', b);
-  if (lb == std::string::npos) { err = "buttons must be a list"; return false; }
-  size_t rb = line.find(']', lb);
-  if (rb == std::string::npos || rb < lb) { err = "buttons must be a list"; return false; }
-  std::vector<std::string> unknown;
-  size_t i = lb + 1;
-  while (i < rb) {
-    size_t q1 = line.find('"', i);
-    if (q1 == std::string::npos || q1 >= rb) break;
-    size_t q2 = line.find('"', q1 + 1);
-    if (q2 == std::string::npos || q2 > rb) { err = "malformed buttons array"; return false; }
-    std::string tok = line.substr(q1 + 1, q2 - q1 - 1);
-    for (char& c : tok) c = (char)tolower((unsigned char)c);
-    uint16_t bit = 0;
-    if (lookup_button_bit(tok, bit)) mask |= bit;
-    else unknown.push_back(tok);
-    i = q2 + 1;
-  }
-  if (!unknown.empty()) {
-    err = std::string("unsupported ") + system_shortname() + " button";
-    if (unknown.size() > 1) err += "s";
-    err += ": ";
-    for (size_t n = 0; n < unknown.size(); n++) {
-      if (n) err += ",";
-      err += unknown[n];
-    }
-    return false;
-  }
-  return true;
 }
 
 // 마스크 → 버튼명 JSON 배열(역디코드). 응답에 적용된 비트를 사람이 읽을 버튼명으로 echo한다.
@@ -3227,11 +3377,17 @@ void handle_break_on_reset(long id, const std::string& line) {
   reply_ok(id, buf);
 }
 
-void handle(const std::string& line) {
-  std::string method = json_str(line, "method");
-  long id = 0;
-  json_num(line, "id", id);  // 봉투 id가 params보다 앞이라 첫 "id"가 봉투 id
+void handle_legacy(long id, const std::string& method, const std::string& line,
+                   const EmucapControl::InputRequest& input) {
 
+  if (g_input_control_unverified) {
+    reply_err(id, "emulator_error", "native input unverified: restart the managed session");
+    return;
+  }
+  if (g_pacing_control_unverified) {
+    reply_err(id, "emulator_error", "execution_speed unverified: restart the managed session");
+    return;
+  }
   // 어떤 핸들러 예외(std::bad_alloc 등)도 프레임 루프 밖으로 탈출시키지 않고 reply_err로
   // 변환한다 — 안 그러면 std::terminate로 에뮬레이터 프로세스가 죽는다.
   try {
@@ -3291,6 +3447,8 @@ void handle(const std::string& line) {
       methods += ",\"record_window\"";
     }
     methods += ",\"execution_speed\"";
+    const bool owned_control = owned_control_discovery_available();
+    if (owned_control) methods += ",\"cancel_operation\"";
     const std::string batch_windows = has_debugger ? memory_batch_windows_json() : "";
     if (!batch_windows.empty()) methods += ",\"read_memory_batch\"";
     const char* repeatability_conditions = recording_repeatable_conditions();
@@ -3379,6 +3537,7 @@ void handle(const std::string& line) {
           "\",\"patchset_sha256\":\"" + EMUCAP_MEDNAFEN_PATCHSET_SHA256 +
           "\",\"binary_sha256\":\"" + binary_sha256 + "\"}}";
     }
+    append_owned_control_capabilities(hello_resp);
     // broker 등록용 name(EMUCAP_NAME 설정 시 포함, 직접 모드는 무시됨).
     const char* emu_name = getenv("EMUCAP_NAME");
     const char* session_token = getenv("EMUCAP_SESSION_TOKEN");
@@ -3432,6 +3591,18 @@ void handle(const std::string& line) {
              g_def_is_press ? "timed" : (g_input_override.engaged() ? "persistent" : "native"),
              (unsigned)g_input_override.mask(), MAX_SYNC_ADVANCE);
     std::string resp(buf);
+    append_owned_control_capabilities(resp);
+    unsigned short native_mask = 0;
+    const bool native_input = emucap_native_input_read(0, &native_mask);
+    resp.pop_back();
+    resp += ",\"native_input_mask\":" + (native_input ? std::to_string(native_mask & supported_button_bits()) : "null") + "}";
+    resp.pop_back();
+    resp += ",\"native_control\":{\"generation\":" + std::to_string(g_native_control.Generation())
+        + ",\"context\":\"" + g_native_control.ContextName() + "\",\"parked\":"
+        + (native_parked() ? "true" : "false")
+        + ",\"valid\":" + (g_native_control.Valid() ? "true" : "false")
+        + ",\"completed_frames\":" + std::to_string(g_native_control.Frames())
+        + ",\"cpu_callbacks\":" + std::to_string(g_native_control.Callbacks()) + "}}";
     if (has_debugger) {
       resp.pop_back();
       resp += ",\"state_groups\":" + register_group_names_json() +
@@ -3533,16 +3704,11 @@ void handle(const std::string& line) {
     g_def_is_press = false;
     start_advance_clock();
   } else if (method == "set_input") {
-    long port = 0;
-    if (json_num(line, "port", port) && port != 0) {
-      reply_err(id, "bad_params", "Mednafen input supports only controller port 0");
+    const uint16_t m = input.mask;
+    if (!apply_native_input(m != 0, m)) {
+      reply_err(id, "emulator_error", "native input write/readback unverified");
       return;
     }
-    uint16_t m = 0;
-    std::string input_err;
-    if (!buttons_to_mask(line, m, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
-    if (m == 0) g_input_override.release();
-    else g_input_override.engage(m);
     reset_input_diagnostics();             // 이번 주입 이후 latch/read 진단만 모은다
     // 응답에 적용된 비트마스크·버튼명을 echo한다(보낸 버튼 ↔ 실제 비트 불일치를 즉시 확인).
     char rbuf[256];
@@ -3550,18 +3716,12 @@ void handle(const std::string& line) {
              (unsigned)m, mask_to_buttons(m).c_str());
     reply_ok(id, rbuf);
   } else if (method == "press_buttons") {
-    long port = 0;
-    if (json_num(line, "port", port) && port != 0) {
-      reply_err(id, "bad_params", "Mednafen input supports only controller port 0");
+    const uint16_t m = input.mask;
+    const long frames = input.frames;
+    if (!apply_native_input(true, m)) {
+      reply_err(id, "emulator_error", "native input write/readback unverified");
       return;
     }
-    long frames = 1;
-    json_num(line, "frames", frames);
-    if (!normalize_sync_advance(id, frames, false)) return;
-    uint16_t m = 0;
-    std::string input_err;
-    if (!buttons_to_mask(line, m, input_err)) { reply_err(id, "bad_params", input_err.c_str()); return; }
-    g_input_override.engage(m);
     reset_input_diagnostics(); // 이번 주입 이후 latch/read 진단만 모은다
     g_frozen = false;          // run_frames와 동일: 어댑터에서 직접 resume(재freeze 레이스로 g_def가 freeze_spin에 갇히는 timeout 방지)
     g_def_id = id;             // 지연: N프레임 누른 뒤 완료 응답 + 입력 해제(emucap_service)
@@ -3613,7 +3773,7 @@ void handle(const std::string& line) {
       g_insn_progress_ms = monotonic_millis();
       // cold(콜백 밖) 진입이면 첫 continuous cb를 흡수해 진입명령을 공짜 실행(BP 진입과 동형) → 정확히 N.
       // cb 안 진입(BP 히트/명령단위 연쇄)이면 진입명령이 이미 공짜 실행되므로 skip 안 함.
-      g_insn_skip_first = !g_frozen_via_cb;
+      g_insn_skip_first = g_native_control.CurrentContext() != EmucapControl::NativeControl::Context::Cpu;
       rearm_breakpoints();               // g_insn_remaining>0 → continuous 콜백 무장
       // 응답은 지연. 지금 frozen이면 현재 freeze 스핀(cb 내 freeze_spin_until_resume 또는 emucap_service
       // 스핀)이 g_insn_remaining>0 탈출조건으로 빠져나가 진행 → cb가 count 명령 후 재freeze하며 응답.
@@ -3629,6 +3789,9 @@ void handle(const std::string& line) {
     g_step_remaining = frames;
     g_step_requested = frames;
     g_step_progress_ms = monotonic_millis();
+    // Retire a completed instruction request's continuous callback. Preserve
+    // installed breakpoints, tracing and other current owners through rearm.
+    if (g_insn_armed) rearm_breakpoints();
     start_advance_clock();
   } else if (method == "probe") {
     // probe는 세이브스테이트를 로드해 프레임을 진행시키는 상태-파괴적 측정이다. frozen(pause)
@@ -4171,7 +4334,7 @@ void handle(const std::string& line) {
     reply_ok(id, "{\"events\":" + arr + tail);
   } else if (method == "reset") {
     MDFNI_Reset();
-    if (defer_psx_core_refresh(id, CORE_REFRESH_RESET)) return;
+    if (defer_native_core_refresh(id, CORE_REFRESH_RESET)) return;
     reply_ok(id, "{\"reset\":true}");
   } else if (method == "screenshot") {
     if (g_capture_failed) {
@@ -4201,37 +4364,109 @@ void handle(const std::string& line) {
     reply_err(id, "unknown_method", method.c_str());
   }
   } catch (const std::exception& e) {
-    reply_err(id, "internal_error", e.what());
+    reply_err(id, "internal_error", g_pacing_control_unverified
+    ? "execution_speed unverified: native pacing operation threw" : e.what());
   } catch (...) {
-    reply_err(id, "internal_error", "unknown exception");
+    reply_err(id, "internal_error", g_pacing_control_unverified
+    ? "execution_speed unverified: native pacing operation threw" : "unknown exception");
   }
 }
 
-// 소켓을 한 사이클 서비스(논블로킹 recv + 줄 단위 처리). 정상 경로와 frozen 스핀 양쪽에서 쓴다.
+#include "emucap_owned.inl"
+
+// Decode the envelope before routing; legacy field searches never select a method,
+// request ID or ownership identity. Invalid envelopes have no trustworthy reply ID.
+bool decode_message(const std::string& line, EmucapControl::Json& value,
+                    EmucapControl::Request& request, bool& event) {
+  try {
+    event = false;
+    if (EmucapControl::Parse(line, value)) {
+      if (value.contains("_control_session")) {
+        EmucapControl::SessionEvent decoded;
+        if (EmucapControl::ReadEvent(value, decoded)) { event = true; return true; }
+      } else if (EmucapControl::ReadRequest(value, request)) return true;
+    }
+  } catch (...) {}
+  emucap_disconnect();
+  return false;
+}
+
+bool preflight_input_request(const EmucapControl::Request& request, EmucapControl::InputRequest& input) {
+  if (request.method != "set_input" && request.method != "press_buttons") return true;
+  std::string error;
+  if (EmucapControl::ReadInputRequest(request.params, request.method == "press_buttons",
+          MAX_SYNC_ADVANCE, lookup_button_bit, system_shortname(), input, error)) return true;
+  reply_err(static_cast<long>(request.id), "bad_params", error.c_str());
+  return false;
+}
+
+void dispatch_request(EmucapControl::Json& value, EmucapControl::Request request) {
+  try {
+    if (g_state_restore_unverified && request.method != "hello" && request.method != "status") {
+      owned_error(request.id, "restore_unverified", "state restoration is unverified; restart the managed session");
+      return;
+    }
+    if (owned_dispatch(request)) return;
+    if (request.id > static_cast<uint64_t>(LONG_MAX)) {
+      const EmucapControl::Json response = {
+        {"id", request.id}, {"ok", false},
+        {"error", {{"kind", "unsupported"},
+                   {"message", "native owned control or request ID is not supported"}}}};
+      send_line(response.dump());
+      return;
+    }
+    EmucapControl::InputRequest input;
+    if (!preflight_input_request(request, input)) return;
+    value["params"] = request.params;
+    handle_legacy(static_cast<long>(request.id), request.method, value.dump(), input);
+  } catch (...) {
+    emucap_disconnect();
+  }
+}
+
+void handle(const std::string& line) {
+  EmucapControl::Json value;
+  EmucapControl::Request request;
+  bool event = false;
+  if (!decode_message(line, value, request, event)) return;
+  if (event) {
+    EmucapControl::SessionEvent decoded;
+    if (!EmucapControl::ReadEvent(value, decoded) || !owned_event(decoded)) emucap_disconnect();
+  } else dispatch_request(value, request);
+}
+
+// One receive and at most one complete request per service callback. A pacing
+// wait can inspect a request without consuming it, then wake the frame owner.
+bool receive_line_once(std::string& line) {
+  g_rx.set_limit(owned_has_parent() ? 4096 : 8 * 1024 * 1024);
+  EmucapReceiveBuffer::Result state = g_rx.peek(line);
+  if (state == EmucapReceiveBuffer::incomplete) {
+    char tmp[8192];
+    const ssize_t n = recv(g_fd, tmp, g_rx.read_limit(sizeof(tmp)), 0);
+    if (n == 0 || (n < 0 && !emucap_sock_wouldblock())) {
+      emucap_disconnect();
+      return false;
+    }
+    if (n > 0) g_rx.append(tmp, static_cast<size_t>(n));
+    state = g_rx.peek(line);
+  }
+  if (state == EmucapReceiveBuffer::oversized) {
+    emucap_disconnect();
+    return false;
+  }
+  return state == EmucapReceiveBuffer::ready;
+}
+
 void serve_socket_once() {
   if (g_fd < 0) return;
   if (!g_tx.empty()) {
     flush_tx_once();
-    if (g_fd < 0 || !g_tx.empty()) return;
+    if (g_fd < 0 || (!g_tx.empty() && !owned_has_parent())) return;
   }
-  char tmp[8192];
-  ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
-  if (n == 0) { emucap_disconnect(); return; }  // 상대 끊김
-  if (n < 0) {
-    // EAGAIN/EWOULDBLOCK/EINTR: no new data, but a pacing wait may have left a request buffered.
-    if (!emucap_sock_wouldblock()) {
-      emucap_disconnect();                        // ECONNRESET 등 hard error → 재접속
-      return;
-    }
-  } else {
-    g_rx.append(tmp, (size_t)n);
-  }
-  size_t pos;
-  while ((pos = g_rx.find('\n')) != std::string::npos) {
-    std::string l = g_rx.substr(0, pos);
-    g_rx.erase(0, pos + 1);
-    if (!l.empty()) handle(l);
-  }
+  std::string line;
+  if (!receive_line_once(line)) return;
+  g_rx.consume();
+  if (!line.empty()) handle(line);
 }
 
 // Requests a pacing wait answers in place. A wait can run between frames or, for cores that sync
@@ -4249,10 +4484,13 @@ bool pacing_wait_method(const std::string& method) {
 // CPU 콜백(BP 히트 시 코어가 호출, MDFNI_Emulate 내부). 히트 명령에서 정지해 소켓을 스핀
 // 서비스 → 에이전트가 정확히 그 명령 지점의 메모리·상태를 읽는다. resume(g_frozen=false)에서 복귀.
 void emucap_cpu_cb(uint32 PC, bool bpoint) {
+  EmucapControl::NativeControl::Scope native_scope(
+      g_native_control, EmucapControl::NativeControl::Context::Cpu);
+  g_native_control.CpuCallback();
   // load_state/reset from a PSX debugger halt completes only after the patched CPU has discarded
   // the pre-replacement timestamp/pipeline and called us again at the restored instruction.
   // This callback is the new linearization point; no guest instruction has executed in between.
-  if (complete_psx_core_refresh()) return;
+  if (is_psx() && complete_native_core_refresh()) return;
   if (!bpoint) {
     // 실행추적 + 콜스택: 매 명령 PC를 원형버퍼에 기록하고, call/return을 분류해 shadow stack을 유지.
     if (g_trace_enabled) {
@@ -4346,6 +4584,7 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
         reply_ok(g_insn_step_id, "{\"status\":\"working\"}");
       }
     }
+    if (owned_cpu_service()) freeze_spin_until_resume();
     return;
   }
   bool matched = false;
@@ -4385,6 +4624,7 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
   if (!matched) {
     g_bp_hit_valid = false;
     g_bp_hit_has_value = false;
+    if (owned_cpu_service()) freeze_spin_until_resume();
     return;
   }
   BPHit base_hit{};
@@ -4481,6 +4721,7 @@ void emucap_cpu_cb(uint32 PC, bool bpoint) {
   for (size_t index = 0; index < events.size(); index++) {
     enqueue_bp_hit(events[index], should_freeze && index + 1 == events.size());
   }
+  if (owned_cpu_service()) freeze_spin_until_resume();
 }
 
 }  // namespace
@@ -4492,10 +4733,43 @@ extern "C" bool emucap_unlimited(void) { return g_speed_unlimited; }
 // output buffer, so the real-time syncer paces the rest of the frame after the audio write.
 extern "C" bool emucap_audio_underpaced(void) { return !g_speed_unlimited && CurGameSpeed < 0.25; }
 
-// Called by the driver's real-time syncer between sleep slices of at most 10 ms. Returns true to
-// end the wait: a request that needs the frame service is buffered, the policy changed, or an
-// advance spent its host budget.
+// Called by native CPU owners after their old debugger callback has returned,
+// before any restored instruction, idle clocks or graphics phase executes.
+extern "C" bool emucap_native_restore_pending(void) { return g_core_refresh_id >= 0; }
+
+extern "C" bool emucap_native_restore_service(bool instruction_ready) {
+  if (g_core_refresh_id < 0) return false;
+  EmucapControl::NativeControl::Scope native_scope(g_native_control,
+      instruction_ready ? EmucapControl::NativeControl::Context::Cpu
+                        : EmucapControl::NativeControl::Context::Continuation);
+  complete_native_core_refresh();
+  // A second load/reset may have been serviced while frozen. Let the native
+  // caller reclassify its newly replaced state before acknowledging it.
+  return g_core_refresh_id >= 0;
+}
+
+extern "C" void emucap_native_generation_changed(void) {
+  emucap_invalidate_frame_output();
+  g_native_control.GenerationChanged();
+}
+
+// A native idle slice is a control-service point, not a retired instruction or
+// a park witness. The ordinary frame owner establishes the eventual stop.
+extern "C" void emucap_native_idle_service(void) {
+  EmucapControl::NativeControl::Scope native_scope(
+      g_native_control, EmucapControl::NativeControl::Context::Idle);
+  if (owned_busy()) owned_service();
+}
+
+// Called by the driver's real-time syncer between bounded sleep slices. A pending
+// frame-service request, policy change or expired advance budget ends the wait.
 extern "C" bool emucap_pacing_idle(void) {
+  EmucapControl::NativeControl::Scope native_scope(
+      g_native_control, EmucapControl::NativeControl::Context::Pacing);
+  if (owned_busy()) {
+    owned_service();
+    return g_pacing_released;
+  }
   if (g_pacing_released) return true;
   try {
     long* active_id = g_def_id >= 0 ? &g_def_id : g_step_id >= 0 ? &g_step_id
@@ -4523,22 +4797,33 @@ extern "C" bool emucap_pacing_idle(void) {
       flush_tx_once();
       if (g_fd < 0 || !g_tx.empty()) return false;
     }
-    char tmp[8192];
-    const ssize_t n = recv(g_fd, tmp, sizeof(tmp), 0);
-    if (n == 0 || (n < 0 && !emucap_sock_wouldblock())) {
-      emucap_disconnect();
+    std::string line;
+    if (!receive_line_once(line)) return false;
+    if (line.empty()) { g_rx.consume(); return false; }
+    EmucapControl::Json value;
+    EmucapControl::Request request;
+    bool event = false;
+    if (!decode_message(line, value, request, event)) return false;
+    if (event) {
+      g_rx.consume();
+      EmucapControl::SessionEvent decoded;
+      if (!EmucapControl::ReadEvent(value, decoded) || !owned_event(decoded)) emucap_disconnect();
       return false;
     }
-    if (n > 0) g_rx.append(tmp, (size_t)n);
-    size_t pos;
-    while (!g_pacing_released && (pos = g_rx.find('\n')) != std::string::npos) {
-      const std::string line = g_rx.substr(0, pos);
-      if (!line.empty() && !pacing_wait_method(json_str(line, "method"))) {
-        g_pacing_released = true;
-        break;
-      }
-      g_rx.erase(0, pos + 1);
-      if (!line.empty()) handle(line);
+    const bool legacy_request = !EmucapControl::HasControl(request) && request.id <= static_cast<uint64_t>(LONG_MAX);
+    EmucapControl::InputRequest input;
+    if (legacy_request && !preflight_input_request(request, input)) {
+      g_rx.consume();
+      return false; // Reject invalid input without ending the current pacing wait.
+    }
+    if (legacy_request && owned_has_parent() && !owned_observation(request.method)) {
+      g_rx.consume();
+      dispatch_request(value, request);
+    } else if ((legacy_request || owned_observation(request.method)) && !pacing_wait_method(request.method)) {
+      g_pacing_released = true;
+    } else {
+      g_rx.consume();
+      dispatch_request(value, request);
     }
   } catch (const std::exception& error) {
     contain_service_exception("pacing_wait", error.what());
@@ -4634,6 +4919,10 @@ extern "C" void emucap_md_vdp_write(const char* memory_type, unsigned address, u
     hit.has_source_addr = true;
     hit.source_addr = source_address;
   }
+  // A device event remains a device context even when reached from a debugger
+  // mutation nested inside an already parked CPU callback.
+  EmucapControl::NativeControl::Scope native_scope(
+      g_native_control, EmucapControl::NativeControl::Context::Device);
   enqueue_bp_hit(hit, should_freeze);
 }
 
@@ -4643,10 +4932,11 @@ extern "C" void emucap_apply_input(unsigned char* port0_data, unsigned port0_len
   // 포트0 버퍼는 active-high(눌림=1)로 SS·PSX·PCE·MD 공통이다 — 코어가 읽을 때만 반전한다
   // (Saturn: ~(data[0]|data[1]<<8); PSX gamepad/DualShock: 전송 시 0xFF^buttons). 따라서
   // 마스크를 그대로 기록한다. PSX DualShock의 analog/axis(바이트2~)는 안 건드려 보존된다.
-  g_input_override.apply(port0_data, port0_len);
+  g_input_override.apply(port0_data, port0_len, supported_button_bits());
 }
 
 bool emucap_frame_consumer_active() {
+  if (owned_busy()) return true;
   return g_fd >= 0 || g_launch_start_controlled || bool(g_recording);
 }
 
@@ -4669,6 +4959,8 @@ void emucap_capture(const void* surface, const void* rect, const void* line_widt
 }
 
 void emucap_pre_first_frame() {
+  EmucapControl::NativeControl::Scope native_scope(
+      g_native_control, EmucapControl::NativeControl::Context::Frame);
   static bool first = true;
   if (!first) return;
   first = false;
@@ -4691,7 +4983,9 @@ void emucap_pre_first_frame() {
     pacing_parked = true;
     try {
       if (g_fd < 0) emucap_connect();
+      owned_poll();
       if (g_fd >= 0) serve_socket_once();
+      owned_poll();
     } catch (const std::exception& error) {
       contain_service_exception("pre_first_frame", error.what());
     } catch (...) {
@@ -4705,9 +4999,13 @@ void emucap_pre_first_frame() {
 // Called after native output, time accounting and buffer selection settle.
 // A frozen frame park has no pending output from the completed driver iteration.
 void emucap_service(uint64_t frame) {
+  EmucapControl::NativeControl::Scope native_scope(
+      g_native_control, EmucapControl::NativeControl::Context::Frame);
+  g_native_control.FrameCompleted();
   try {
   g_frame = frame;
   g_pacing_released = false;
+  if (owned_busy()) owned_service();
   if (g_fd < 0) {
     if (!g_frozen) {
       emucap_connect();  // While running, retry each frame; a missing server is rejected immediately.
@@ -4731,18 +5029,22 @@ void emucap_service(uint64_t frame) {
     if (g_def_id < 0) return;
     g_def_remaining--;
     if (g_def_remaining > 0 && advance_expired()) {
-      if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
-      reply_ok(g_def_id, deadline_reply(g_def_requested, g_def_remaining));
+      const bool released = !g_def_is_press || apply_native_input(false, 0);
+      g_def_is_press = false;
+      if (released) reply_ok(g_def_id, deadline_reply(g_def_requested, g_def_remaining));
+      else reply_err(g_def_id, "emulator_error", "native input release unverified");
       g_def_id = -1;
       g_def_remaining = 0;
       g_def_progress_ms = 0;
       g_frozen = true;
     } else if (g_def_remaining <= 0) {
-      if (g_def_is_press) { g_input_override.release(); g_def_is_press = false; }
+      const bool released = !g_def_is_press || apply_native_input(false, 0);
+      g_def_is_press = false;
       char buf[96];
       snprintf(buf, sizeof(buf), "{\"status\":\"completed\",\"frame\":%llu}",
                (unsigned long long)g_frame);
-      reply_ok(g_def_id, buf);
+      if (released) reply_ok(g_def_id, buf);
+      else reply_err(g_def_id, "emulator_error", "native input release unverified");
       g_def_id = -1;
       g_def_progress_ms = 0;
     } else if (g_tx.empty()
@@ -4837,7 +5139,9 @@ void emucap_service(uint64_t frame) {
     bool pacing_parked = false;
     while (g_frozen && g_step_remaining == 0 && g_probe_id < 0 && g_insn_remaining == 0) {
       pacing_parked = true;
+      owned_poll();
       serve_socket_once();
+      owned_poll();
       // A dead control socket is not permission to advance one guest frame. Reconnect inside the
       // same frozen park; returning here would let MDFNI_Emulate run once before the next service
       // call and would move the exact observation boundary merely because the MCP restarted.

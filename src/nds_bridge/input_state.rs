@@ -35,7 +35,18 @@ impl<G: GdbTransport> NdsBridge<G> {
     pub(super) fn set_input(&mut self, params: &Value) -> NdsResult<Value> {
         require_input_port_zero(params)?;
         let (mask, buttons) = buttons_to_mask(params.get("buttons"))?;
-        self.arm9.send_input(mask, None)?;
+        if self.owned_control && self.request_cancellation.is_some() {
+            self.verify_owned_halt()?;
+            let result = self.owned_exchange(&format!("QEmucap,input:{mask:x}"));
+            if !matches!(&result, Ok(reply) if reply == "OK") {
+                self.control_unverified = true;
+                return Err(NdsBridgeError::Emulator(format!(
+                    "unverified native input: {result:?}"
+                )));
+            }
+        } else {
+            self.arm9.send_input(mask, None)?;
+        }
         Ok(json!({
             "buttons": buttons,
             "cpu": "arm9",

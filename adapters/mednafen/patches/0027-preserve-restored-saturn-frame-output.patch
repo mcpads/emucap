@@ -1,0 +1,38 @@
+--- a/src/ss/ss.cpp
++++ b/src/ss/ss.cpp
+@@ -43,6 +43,7 @@
+ using namespace Mednafen;
+ 
+ #include "ss.h"
++#include "../drivers/emucap_frame_call.h"
+ #include "sound.h"
+ #include "scsp.h"	// For debug.inc
+ #include "smpc.h"
+@@ -905,8 +906,11 @@
+   VDP2::ResumeFrame(espec);
+  SOUND_StartFrame(espec->SoundRate / espec->soundmultiplier, MDFN_GetSettingUI("ss.scsp.resamp_quality"));
+  CART_SetCPUClock(MDFNGameInfo->MasterClock / MDFN_MASTERCLOCK_FIXED(1), cur_clock_div);
+- espec->SoundBufSize = 0;
+- espec->MasterCycles = 0;
++ if(!emucap_restored_frame_output_active())
++ {
++  espec->SoundBufSize = 0;
++  espec->MasterCycles = 0;
++ }
+  espec->soundmultiplier = 1;
+  //
+  //
+@@ -945,8 +949,11 @@
+   // The acknowledged instruction entry has already consumed its callback.
+   SkipRestoredCPUHook = instruction_ready;
+   ResumeDispatch = FrameActive;
+-  espec->SoundBufSize_InternalProcessed = espec->SoundBufSize_DriverProcessed = 0;
+-  espec->MasterCycles_InternalProcessed = espec->MasterCycles_DriverProcessed = 0;
++  if(!emucap_restored_frame_output_active())
++  {
++   espec->SoundBufSize_InternalProcessed = espec->SoundBufSize_DriverProcessed = 0;
++   espec->MasterCycles_InternalProcessed = espec->MasterCycles_DriverProcessed = 0;
++  }
+  }
+  }
+  assert(end_ts >= 0);

@@ -187,7 +187,7 @@ impl Np2kaiHost {
         Ok(json!({
             "status":if stop.is_none() {"completed"} else {"interrupted"},
             "reason":AdvanceStop::reason(stop),
-            "unit":"frames", "count":count, "completed":completed,
+            "unit":"frames", "count":completed, "requested":count, "completed":completed,
             "frame_before":before, "frame":self.frame, "state":"frozen"
         }))
     }
@@ -202,7 +202,7 @@ impl Np2kaiHost {
         Ok(json!({
             "status":if stop.is_none() {"completed"} else {"interrupted"},
             "reason":AdvanceStop::reason(stop),
-            "unit":"frames", "count":count, "completed":completed,
+            "unit":"frames", "count":completed, "requested":count, "completed":completed,
             "frame_before":before, "frame":self.frame,
             "state":if self.frozen {"frozen"} else {"running"}
         }))

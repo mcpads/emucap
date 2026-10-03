@@ -2,12 +2,15 @@
 #
 # Requirements: Visual Studio 2022 with MSVC and a Windows SDK, plus Git.
 #
-#   build.ps1 [-Src C:\dolphin-build\dolphin-src]
+#   build.ps1 [-Src <source-directory>] [-Jobs 2]
 param(
-  [string]$Src = "C:\dolphin-build\dolphin-src"
+  [string]$Src = "",
+  [ValidateRange(1, 64)]
+  [int]$Jobs = 2
 )
 $ErrorActionPreference = "Stop"
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
+if (-not $Src) { $Src = Join-Path $here "work\dolphin-src" }
 
 $lock = @{}
 foreach ($line in Get-Content -LiteralPath (Join-Path $here "upstream.lock")) {
@@ -55,6 +58,7 @@ $owned = @(
   "Source/Core/Common/Config/Layer.cpp",
   "Source/Core/Common/Config/Config.cpp",
   "Source/Core/Common/ChunkFile.h",
+  "Source/Core/Common/x64CPUDetect.cpp",
   "Source/Core/VideoCommon/TextureCacheBase.cpp",
   "Source/Core/VideoCommon/TextureCacheBase.h",
   "Source/Core/VideoCommon/TextureConfig.cpp",
@@ -64,6 +68,9 @@ $owned = @(
   "Source/Core/DolphinQt/Config/SDLHints/SDLHintsWindow.cpp",
   "Source/Core/Core/CMakeLists.txt",
   "Source/Core/Core/DSPEmulator.h",
+  "Source/Core/Core/HW/DSPLLE/DSPLLE.cpp",
+  "Source/Core/VideoCommon/Fifo.cpp",
+  "Source/Core/VideoCommon/Fifo.h",
   "Source/Core/Core/HW/DSPLLE/DSPLLE.h",
   "Source/Core/Core/Core.cpp",
   "Source/Core/Core/Core.h",
@@ -101,7 +108,7 @@ $owned = @(
 git -C $Src checkout -- $owned
 if ($LASTEXITCODE -ne 0) { throw "failed to restore files owned by the patch stack" }
 git -C $Src clean -fdq -- Source/Core/Core/EmuCap.cpp Source/Core/Core/EmuCap.h `
-  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h Source/Core/Core/EmuCapTemporal.h Source/Core/Core/EmuCapPacing.h Source/Core/Core/EmuCapAudio.h
+  Source/Core/Core/EmuCapInput.cpp Source/Core/Core/EmuCapInput.h Source/Core/Core/EmuCapTemporal.h Source/Core/Core/EmuCapOwner.h Source/Core/Core/EmuCapWire.h Source/Core/Core/EmuCapOwned.inl Source/Core/Core/EmuCapPacing.h Source/Core/Core/EmuCapAudio.h
 if ($LASTEXITCODE -ne 0) { throw "failed to clean stale adapter sources" }
 
 Copy-Item -LiteralPath (Join-Path $here "EmuCap.cpp") `
@@ -114,14 +121,20 @@ Copy-Item -LiteralPath (Join-Path $here "EmuCapInput.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapInput.h") -Force
 Copy-Item -LiteralPath (Join-Path $here "EmuCapTemporal.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapTemporal.h") -Force
+foreach ($source in @("EmuCapOwner.h", "EmuCapWire.h", "EmuCapOwned.inl")) {
+  Copy-Item -LiteralPath (Join-Path $here $source) -Destination (Join-Path $Src "Source\Core\Core\$source") -Force
+}
 Copy-Item -LiteralPath (Join-Path $here "EmuCapPacing.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapPacing.h") -Force
 
 Copy-Item -LiteralPath (Join-Path $here "EmuCapAudio.h") `
   -Destination (Join-Path $Src "Source\Core\Core\EmuCapAudio.h") -Force
 
-foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
-    Sort-Object Name) {
+# Match the bytewise patch order used by the Unix recipe and lock manifest.
+[string[]]$patchNames = @(Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" | ForEach-Object { $_.Name })
+[Array]::Sort($patchNames, [StringComparer]::Ordinal)
+foreach ($patchName in $patchNames) {
+  $patch = Get-Item -LiteralPath (Join-Path (Join-Path $here "patches") $patchName)
   Write-Output "[patch] applying $($patch.Name)"
   git -C $Src apply --check $patch.FullName
   if ($LASTEXITCODE -ne 0) { throw "patch does not apply cleanly: $($patch.Name)" }
@@ -129,21 +142,24 @@ foreach ($patch in Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filte
   if ($LASTEXITCODE -ne 0) { throw "failed to apply patch: $($patch.Name)" }
 }
 
-$vcvarsCandidates = @(
-  "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
-  "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
-  "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat",
-  "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-)
-$vcvars = $vcvarsCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
-  Select-Object -First 1
-if (-not $vcvars) { throw "Visual Studio 2022 vcvars64.bat was not found" }
+$vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+  throw "Visual Studio Installer vswhere.exe was not found"
+}
+$installation = & $vswhere -latest -products "*" -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+if ($LASTEXITCODE -ne 0 -or -not $installation) { throw "Visual Studio 2022 C++ tools were not found" }
+$vcvars = Join-Path $installation "VC\Auxiliary\Build\vcvars64.bat"
+if (-not (Test-Path -LiteralPath $vcvars -PathType Leaf)) { throw "Visual Studio vcvars64.bat was not found" }
 
 $bat = @"
 @echo off
 call "$vcvars"
+if errorlevel 1 exit /b %ERRORLEVEL%
 cd /d "$Src"
-msbuild Source\dolphin-emu.sln /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+msbuild Source\dolphin-emu.sln /p:Configuration=Release /p:Platform=x64 /m:$Jobs /p:CL_MPCount=1 /v:minimal /nologo
+if errorlevel 1 exit /b %ERRORLEVEL%
+rem Upstream excludes DolphinNoGUI from the default solution configuration.
+msbuild Source\Core\DolphinNoGUI\DolphinNoGUI.vcxproj /p:Configuration=Release /p:Platform=x64 /m:$Jobs /p:CL_MPCount=1 /v:minimal /nologo
 exit /b %ERRORLEVEL%
 "@
 $tmp = Join-Path $env:TEMP "emucap-dolphin-build-$PID.bat"
@@ -159,10 +175,8 @@ function Get-LowerSha256([string]$Path) {
   (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
-$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h", "EmuCapPacing.h", "EmuCapAudio.h")
-$digestInputs += Get-ChildItem -LiteralPath (Join-Path $here "patches") -Filter "*.patch" |
-  Sort-Object Name |
-  ForEach-Object { "patches/$($_.Name)" }
+$digestInputs = @("EmuCap.cpp", "EmuCap.h", "EmuCapInput.cpp", "EmuCapInput.h", "EmuCapTemporal.h", "EmuCapPacing.h", "EmuCapAudio.h", "EmuCapOwner.h", "EmuCapWire.h", "EmuCapOwned.inl")
+$digestInputs += $patchNames | ForEach-Object { "patches/$_" }
 $manifestLines = foreach ($relative in $digestInputs) {
   $nativePath = Join-Path $here ($relative -replace '/', [System.IO.Path]::DirectorySeparatorChar)
   "$(Get-LowerSha256 $nativePath)  $relative"
@@ -184,8 +198,11 @@ if ($lock.DOLPHIN_PATCHSET_SHA256 -ne "pending" -and
 }
 
 $binary = Join-Path $Src "Binary\x64\Dolphin.exe"
-if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-  throw "Dolphin build completed without the expected binary: $binary"
+foreach ($name in @('Dolphin.exe', 'DolphinNoGUI.exe')) {
+  $required = Join-Path $Src "Binary\x64\$name"
+  if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+    throw "Dolphin build completed without the expected binary: $required"
+  }
 }
 $metadata = [ordered]@{
   upstream = $lock.DOLPHIN_REPO

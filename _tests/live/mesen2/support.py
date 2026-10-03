@@ -76,7 +76,16 @@ def terminate_owned(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        pass
+        return
+    # Signal delivery is asynchronous. Return only after the owned process has
+    # disappeared, rather than racing each caller's immediate exit assertion.
+    for _ in range(30):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"owned process {pid} still exists after SIGKILL")
 
 
 def require_ok(response: dict, operation: str) -> dict:
@@ -132,16 +141,23 @@ class RecordingSink:
 
 
 class McpProcess:
-    def __init__(self, binary: Path, env: dict[str, str]):
-        self.process = subprocess.Popen(
-            [str(binary)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=env,
-        )
+    def __init__(self, binary: Path, env: dict[str, str], stderr_path: Path | None = None):
+        self.stderr_log = stderr_path.open("w+", encoding="utf-8") if stderr_path else None
+        try:
+            self.process = subprocess.Popen(
+                [str(binary)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=self.stderr_log or subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                bufsize=1,
+                env=env,
+            )
+        except Exception:
+            if self.stderr_log:
+                self.stderr_log.close()
+            raise
         self.responses: queue.Queue[str] = queue.Queue()
         self.reader = threading.Thread(target=self._read_stdout, daemon=True)
         self.reader.start()
@@ -209,9 +225,17 @@ class McpProcess:
             self.process.kill()
             self.process.wait()
         self.reader.join(timeout=2)
+        error = ""
+        try:
+            if self.process.returncode not in {0, None}:
+                if self.stderr_log:
+                    self.stderr_log.seek(0)
+                    error = self.stderr_log.read()[-8192:]
+                elif self.process.stderr:
+                    error = self.process.stderr.read()[-8192:]
+        finally:
+            for stream in (self.process.stdout, self.process.stderr, self.stderr_log):
+                if stream:
+                    stream.close()
         if self.process.returncode not in {0, None}:
-            assert self.process.stderr is not None
-            error = self.process.stderr.read()
-            raise RuntimeError(
-                f"MCP process exited with {self.process.returncode}: {error}"
-            )
+            raise RuntimeError(f"MCP process exited with {self.process.returncode}: {error}")

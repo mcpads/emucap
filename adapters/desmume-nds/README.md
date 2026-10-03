@@ -31,7 +31,8 @@ Clones TASEmulators/desmume into an emucap-owned work tree (`adapters/desmume-nd
 known-good commit, applies the patch stack in order (`0001` headless → `0002` screenshot/input →
 `0003` savestate/disasm → `0004` reset → `0005` touch → `0006` GDB buffers → `0007` input status →
 `0008` GDB I/O deadlines → `0009` SIGPIPE suppression → `0010` shared-scheduler GDB state →
-`0011` exact VBlank frame step),
+`0011` exact VBlank frame step → `0012` pacing → `0013` memory batch →
+`0014` resume pacing anchor → `0015` shared-scheduler halt proof),
 and builds `desmume-cli` with meson
 (`-Dfrontend-cli -Dgdb-stub`; the gdb-stub build disables the JIT and runs the interpreter). Because
 later patches extend the same `gdbstub.cpp` regions, build.sh resets the tree and re-applies the whole
@@ -106,7 +107,9 @@ adapter's `step_instructions` wire method), `set_breakpoint`
 - `save_state` / `load_state` — the fork's `QEmucap,{save,load}state:<hexpath>` calls DeSmuME's native
   `savestate_save` / `savestate_load` (saves.cpp). The path is hex-encoded to be RSP-safe. Returns
   `{path, status}`. A savestate is global state (both cores + PPU/SPU), so it rides the ARM9
-  connection — call it while stopped.
+  connection — call it while stopped. Native geometry chunk 5 preserves distinct pending/applied
+  lists and latched render state, rebuilding derived clipping without guest advancement. Legacy
+  chunks 0–4 remain readable with their original rendering-state limitations.
 - public `probe` — Control freezes the shared scheduler, loads the global state, advances the exact
   ARM9 VBlank clock, and reads memory while holding one generation link. It is a real atomic
   operation even though the RSP fork has no separate `probe` packet.
@@ -153,6 +156,16 @@ The fork keeps both stub states synchronized without sending duplicate stop pack
 Reads, writes, registers, disassembly, breakpoints, and stepping are still routed to a selected CPU.
 A temporary routed stop guards shared Main RAM without a second interrupt, then restores the
 session's prior running or frozen state. `status.cpus` reports both endpoint states explicitly.
+
+The native `qEmucap,haltstate` query returns `HALT|1|parked|<hex VBlank clock>`
+when both CPUs are stalled and the shared scheduler has entered its debugger idle
+gate. Otherwise it returns `HALT|1|running|<hex VBlank clock>`. Publication and
+readback share the scheduler mutex. Resume invalidates the proof before releasing
+the CPUs. Managed launches negotiate this proof before advertising frame-request
+cancellation (50 ms control service, 5000 ms stop/cleanup bound). Cancellation
+watches both CPU endpoints, verifies exact partial VBlank progress, and releases
+parent-owned input with native readback. Controller loss runs the same cleanup;
+a replacement controller must recover the unfinished parent before mutating it.
 
 ## Batched memory and execution speed
 

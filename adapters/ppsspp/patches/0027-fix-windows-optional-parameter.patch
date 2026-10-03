@@ -1,0 +1,11 @@
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -104,7 +104,7 @@
+ 	if (count == 0 || count > 5000)
+ 		return req.Fail("count must be between 1 and 5000");
+ 	std::string operation;
+-	if (!req.ParamString("operation_id", &operation, DebuggerParamType::OPTIONAL))
++	if (req.HasParam("operation_id") && !req.ParamString("operation_id", &operation))
+ 		return;
+ 	if (req.HasParam("operation_id") && (operation.empty() || operation.size() > 256))
+ 		return req.Fail("operation_id must contain 1..256 bytes");

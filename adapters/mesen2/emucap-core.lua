@@ -41,6 +41,9 @@ local HAS_SNES_DEEP_EVENTS = SYS.system == "snes"
 
 local socket = require("socket.core")
 local Tx = require("emucap_tx")
+local Rx = require("emucap_rx")
+local Json = require("emucap_json")
+local Input = require("emucap_input")
 local StateIo = require("emucap_state_io")
 local Snapshot = require("emucap_snapshot")
 local Dump = require("emucap_dump")
@@ -51,6 +54,8 @@ local Memory = require("emucap_memory")
 local Recording = require("emucap_recording")
 local NativeCallstack = require("emucap_native_callstack")
 local Pacing = require("emucap_pacing")
+local Control = require("emucap_control")
+local control = nil
 
 assert(emu.eventType and emu.eventType.codeBreakIdle ~= nil
     and emu.eventType.codeBreakIdleSavestate ~= nil,
@@ -95,7 +100,12 @@ local HALT_SERVICE_INTERVAL_MS = 10  -- native SleepUntilResume의 idle callback
 -- sink failure. Permit one short bounded drain interval while staying well below Mesen's one-second
 -- Lua callback watchdog; an actual stalled sink still fail-stops the capture.
 local RECORDING_SINK_WRITE_TIMEOUT_SECONDS = 0.1
-local function wall_ms() return socket.gettime() * 1000 end
+local function wall_ms()
+  if type(emu.getControlState) == "function" then
+    return emu.getControlState().monotonicMs
+  end
+  return socket.gettime() * 1000
+end
 -- freeze 중 연결끊김(서버 재시작//mcp 재연결) 시 freeze를 유지한 채 재접속을 시도해 장면을 보존한다.
 -- transport loss만으로 guest 실행을 바꾸지 않는 것이 기본이다. 양수를 명시한 launch만 그 시간 뒤
 -- auto-resume하고, 0은 재접속까지 무기한 freeze 유지다.
@@ -132,7 +142,7 @@ local TX_CAP = tonumber(os.getenv("EMUCAP_TX_CAP") or "") or (8 * 1024 * 1024)
 if TX_CAP < 1024 then TX_CAP = 1024 end
 local conn = nil
 local session_epoch = 0       -- response IDs are scoped to one accepted frontend connection
-local rx_buf = ""
+local rx = Rx.new(8 * 1024 * 1024)
 local tx = Tx.new(TX_CAP)
 local frame = 0
 
@@ -146,6 +156,7 @@ local advance_deadline_ms = nil
 local pending_line = nil       -- request read during a pacing wait, handled at the next frame
 local boundary_seq = 0         -- bumped by every request that can change memory or the stop
 local pacing_state = Pacing.new_state()
+local pacing_control_unverified = false
 local HOST_AUDIO = os.getenv("EMUCAP_MESEN_AUDIO") ~= "0"
 
 local function start_deferred(...)
@@ -259,10 +270,12 @@ end
 local ARRAY_MT = {}
 local function as_array(t) return setmetatable(t or {}, ARRAY_MT) end
 
-local JSON_NULL = setmetatable({}, {})
+local JSON_NULL = Json.null
 
 local function jvalue(v)
   if v == JSON_NULL then return "null" end
+  local unsigned = Json.raw_unsigned(v)
+  if unsigned then return unsigned end
   local t = type(v)
   if t == "number" then
     return (v == math.floor(v)) and string.format("%d", v) or tostring(v)
@@ -272,7 +285,7 @@ local function jvalue(v)
     -- dense 정수키(1..n) 또는 as_array 마커 → JSON 배열. 그 외는 객체.
     local n = #v
     local is_arr
-    if getmetatable(v) == ARRAY_MT then
+    if getmetatable(v) == ARRAY_MT or Json.is_array(v) then
       is_arr = true
     else
       is_arr = n > 0
@@ -297,95 +310,16 @@ local function jvalue(v)
   end
 end
 
--- 범용 JSON 디코더(요청 줄 파싱). 객체·배열·문자열·숫자·true/false/null. 키마다 정규식을
--- 하드코딩하지 않으므로 새 파라미터가 중앙 파서를 건드리지 않는다.
-local function json_decode(s)
-  local i = 1
-  local parse_value
-  local function skip_ws()
-    while i <= #s and s:sub(i, i):match("%s") do i = i + 1 end
-  end
-  local function parse_string()
-    i = i + 1
-    local out = {}
-    while i <= #s do
-      local c = s:sub(i, i)
-      if c == '"' then
-        i = i + 1
-        return table.concat(out)
-      elseif c == '\\' then
-        local n = s:sub(i + 1, i + 1)
-        if n == 'u' then
-          out[#out + 1] = utf8.char(tonumber(s:sub(i + 2, i + 5), 16) or 0)
-          i = i + 6
-        else
-          local map = { ['"'] = '"', ['\\'] = '\\', ['/'] = '/', b = '\b', f = '\f', n = '\n', r = '\r', t = '\t' }
-          out[#out + 1] = map[n] or n
-          i = i + 2
-        end
-      else
-        out[#out + 1] = c
-        i = i + 1
-      end
-    end
-    error("unterminated string")
-  end
-  local function parse_number()
-    local j = i
-    while i <= #s and s:sub(i, i):match("[%d%.eE%+%-]") do i = i + 1 end
-    return tonumber(s:sub(j, i - 1))
-  end
-  local function parse_object()
-    i = i + 1
-    local obj = {}
-    skip_ws()
-    if s:sub(i, i) == '}' then i = i + 1; return obj end
-    while true do
-      skip_ws()
-      local key = parse_string()
-      skip_ws()
-      i = i + 1 -- ':'
-      obj[key] = parse_value()
-      skip_ws()
-      local c = s:sub(i, i)
-      if c == ',' then i = i + 1
-      elseif c == '}' then i = i + 1; return obj
-      else error("expected , or }") end
-    end
-  end
-  local function parse_array()
-    i = i + 1
-    local arr = {}
-    skip_ws()
-    if s:sub(i, i) == ']' then i = i + 1; return arr end
-    while true do
-      arr[#arr + 1] = parse_value()
-      skip_ws()
-      local c = s:sub(i, i)
-      if c == ',' then i = i + 1
-      elseif c == ']' then i = i + 1; return arr
-      else error("expected , or ]") end
-    end
-  end
-  parse_value = function()
-    skip_ws()
-    local c = s:sub(i, i)
-    if c == '{' then return parse_object()
-    elseif c == '[' then return parse_array()
-    elseif c == '"' then return parse_string()
-    elseif c == 't' then i = i + 4; return true
-    elseif c == 'f' then i = i + 5; return false
-    elseif c == 'n' then i = i + 4; return nil
-    else return parse_number() end
-  end
-  return parse_value()
-end
+local json_decode = Json.decode
 
 -- 요청 파싱: 봉투를 통째로 디코드해 params를 일반 테이블로 돌려준다. 중첩 덕에 envelope id와
 -- params.id가 자연히 구분된다.
 local function parse_request(line)
   local ok, env = pcall(json_decode, line)
   if not ok or type(env) ~= "table" then return nil, nil, {} end
+  if math.type(env.id) ~= "integer" or env.id < 0 or type(env.method) ~= "string" then
+    return nil, nil, {}
+  end
   local p = type(env.params) == "table" and env.params or {}
   return env.id, env.method, p
 end
@@ -394,19 +328,23 @@ end
 local function disconnect()
   local old = conn
   conn = nil
-  rx_buf = ""
+  pending_line = nil
+  Rx.reset(rx)
   Tx.reset(tx)
+  if control then control:disconnected() end
   if abort_inflight then abort_inflight() end
   if old then pcall(function() old:close() end) end
 end
 
 local function connect()
+  if control and (control:busy() or control:retired()) then return end
   local c = socket.tcp()
   c:settimeout(0)
   c:connect(HOST, PORT)
   session_epoch = session_epoch + 1
+  if control then control:connected(session_epoch) end
   conn = c
-  rx_buf = ""
+  Rx.reset(rx)
   Tx.reset(tx)
 end
 
@@ -442,21 +380,15 @@ local function flush_tx()
   return status
 end
 
-local function poll_line()
-  -- 호스트는 한 요청씩 직렬 호출한다. 이전 응답이 남은 동안 새 요청을 읽지 않아
-  -- 여러 응답 queue와 무제한 메모리 증가를 만들지 않는다.
-  if not conn or Tx.pending(tx) then return nil end
-  local line, err, partial = conn:receive("*l", rx_buf)
-  if line then
-    rx_buf = ""
-    return line
-  elseif err == "timeout" then
-    rx_buf = partial or ""
-    return nil
-  else
-    disconnect()
-    return nil
-  end
+local function poll_line(allow_pending_tx)
+  if not conn or (Tx.pending(tx) and not allow_pending_tx) then return nil end
+  -- Owned control envelopes fit 4 KiB, including maximal identities and broker
+  -- stamps. Reject oversized traffic promptly instead of buffering a legacy
+  -- 8-MiB frame ahead of cancellation or owner-loss cleanup.
+  local owned = control and (control:busy() or control:owns_parent())
+  local line, err = Rx.poll(rx, conn, owned and 4096 or nil)
+  if err then disconnect(); return nil end
+  return line
 end
 
 -- 호스트 freeze 핫키 상태. 무효 키 이름은 isKeyPressed가 에러를 던지므로 pcall로 감싸고,
@@ -515,7 +447,7 @@ end
 -- 적용해야 ROM이 읽기 전에 반영된다(문서 명시). startFrame 적용은 물리 폴링에 덮인다.
 local function apply_input()
   if not input_hold then return true end
-  local ok, err = pcall(emu.setInput, input_hold.tbl, input_hold.port)
+  local ok, err = Input.apply(emu, VALID_BUTTONS, input_hold.tbl, input_hold.port)
   if not ok then
     pcall(emu.log, "emucap: setInput failed: " .. tostring(err))
     return false, tostring(err)
@@ -642,6 +574,8 @@ function handlers.execution_speed(p)
     return false, "bad_state", "rewind is active; release it before changing pacing"
   end
   -- One emulation-thread call applies and reads back; nothing else runs in between.
+  -- Stay unusable if a setter or its readback throws after changing native policy.
+  pacing_control_unverified = true
   local applied = emu.setPacing(request.speed)
   pacing_state = Pacing.observe(pacing_state, applied)
   if not Pacing.confirms(request, applied) then
@@ -649,11 +583,13 @@ function handlers.execution_speed(p)
     pacing_state = Pacing.observe(pacing_state, restored)
     if restored.emulationSpeed == before.emulationSpeed
         and restored.maximumSpeed == before.maximumSpeed then
+      pacing_control_unverified = false
       return false, "emulator_error",
         "execution_speed failed_restored: a held turbo or rewind override replaced the target"
     end
     return false, "emulator_error", "execution_speed unverified: previous policy was not restored"
   end
+  pacing_control_unverified = false
   return true, {
     status = "completed",
     state = STATE == "frozen" and "frozen" or "running",
@@ -830,6 +766,7 @@ function handlers.hello()
   if content then result.content = content end
   local launch_id = os.getenv("EMUCAP_LAUNCH_ID")
   if launch_id then result.launch_id = launch_id end
+  if control then control:decorate(result) end
   return true, result
 end
 
@@ -1046,6 +983,7 @@ function handlers.status()
     bank_tag_active = (SYS.bank_tagging_active and SYS.bank_tagging_active(emu.getState())) or false
   end
   r.bank_tagging = bank_tag_active
+  if control then control:decorate(r) end
   return true, r
 end
 
@@ -1158,6 +1096,7 @@ end
 -- while exact step chunks run, so active operation ownership—not the display state—decides whether
 -- breakExecution must abort the current chunk.
 local function halt_for_debug_stop(reason, bp_id)
+  if control and control:interrupt(reason, bp_id) then return true end
   local step_active = Step.active(step_operation)
   local deferred_active = deferred ~= nil
   if STATE == "frozen" and not step_active and not deferred_active then return false end
@@ -1271,6 +1210,12 @@ local function frozen_state_io(method, id, p)
     }
   end
 
+  -- Restoration can replace RAM/mapping at the same PC and frame, including a
+  -- native failure after partial mutation. Retire the old observation first.
+  if method ~= "save_state" then
+    boundary_seq = boundary_seq + 1
+    freeze_snapshot = nil
+  end
   local ok, bytes_or_err = pcall(function()
     if method == "save_state" then
       return StateIo.save(emu, path, id)
@@ -2569,11 +2514,69 @@ function handlers.disassemble(p)
   return true, as_array(SYS.disassemble(read_byte, addr, count, p.mode))
 end
 
+-- Managed native control is additive; older/manual hosts keep legacy dispatch.
+do
+  local runtime = os.getenv("EMUCAP_LAUNCH_ID")
+  if runtime and #runtime > 0 and #runtime <= 256 and HAS_AGENT_PACING
+    and type(emu.getControlState) == "function" and emu.eventType.controlIdle ~= nil then
+    control = Control.new(runtime, emu, {
+      array = as_array, reply = reply_ok, error = reply_err, disconnect = disconnect,
+      validate = normalize_debug_selection,
+      healthy = function() return not pacing_control_unverified end,
+      frame = function() return frame end,
+      legacy_busy = function()
+        return Step.active(step_operation) or deferred ~= nil or recording ~= nil
+          or recording_reset ~= nil or pending_io ~= nil
+      end,
+      validate_input = function(p)
+        if p.buttons ~= nil and not Json.is_array(p.buttons) then return false, "buttons must be an array" end
+        local port = p.port
+        if port == nil then port = 0 end
+        if math.type(port) ~= "integer" or port < 0 or port > 255 then return false, "invalid input port" end
+        local tbl, err = buttons_to_table(p.buttons)
+        return tbl ~= nil, err
+      end,
+      release = function(port)
+        local ok, err = Input.apply(emu, VALID_BUTTONS, {}, port)
+        if ok and input_hold and input_hold.port == port then input_hold = nil end
+        return ok, err
+      end,
+      advancing = function()
+        boundary_seq = boundary_seq + 1
+        freeze_snapshot = nil
+        freeze_state = FreezeState.halt("step", false)
+        STATE = "frozen"
+      end,
+      stopped = function(r)
+        STATE = "frozen"
+        freeze_snapshot = nil
+        freeze_start_ms = wall_ms()
+        freeze_state = r.status == "completed" and FreezeState.after_step(r.unit)
+          or FreezeState.halt(r.reason or "paused", false)
+      end,
+      retired = function(message)
+        pacing_control_unverified = true
+        emu.log("[emucap] native control retired: " .. tostring(message))
+      end,
+    })
+  end
+end
+
 -- ── 디스패치 ─────────────────────────────────────────────────
 -- RUNNING에서 한 줄 처리. pause면 freeze 진입.
 local function dispatch(line)
+  if control then
+    local request = control:dispatch(line)
+    if not request then return end
+    line = jvalue({v=1, id=request.id, method=request.method,
+      params=require("emucap_control_wire").native_params(request)})
+  end
   local id, method, p = parse_request(line)
   id = id or 0
+  if pacing_control_unverified then
+    reply_err(id, "emulator_error", "execution_speed unverified: restart the managed session")
+    return nil
+  end
   local selection_error = normalize_debug_selection(method, p)
   if selection_error then reply_err(id, "bad_params", selection_error); return end
   if method == "record_window" then
@@ -2612,14 +2615,27 @@ local function dispatch(line)
   if not h then reply_err(id, "unknown_method", tostring(method)); return end
   -- handler 규약: 성공은 (true, result), 실패는 (false, kind, msg) 3-tuple.
   local ok, a, b, c = pcall(h, p)
-  if not ok then reply_err(id, "emulator_error", a); return end
+  if not ok then
+    reply_err(id, "emulator_error", pacing_control_unverified and ("execution_speed unverified: " .. tostring(a)) or a)
+    return
+  end
   if a == true then reply_ok(id, b) else reply_err(id, b, c) end
 end
 
 -- FROZEN에서 한 줄 처리. step/resume면 동작 지시 반환.
 local function handle_in_freeze(line)
+  if control then
+    local request = control:dispatch(line)
+    if not request then return end
+    line = jvalue({v=1, id=request.id, method=request.method,
+      params=require("emucap_control_wire").native_params(request)})
+  end
   local id, method, p = parse_request(line)
   id = id or 0
+  if pacing_control_unverified then
+    reply_err(id, "emulator_error", "execution_speed unverified: restart the managed session")
+    return nil
+  end
   local selection_error = normalize_debug_selection(method, p)
   if selection_error then reply_err(id, "bad_params", selection_error); return nil end
   if method == "record_window" then
@@ -2664,7 +2680,8 @@ local function handle_in_freeze(line)
     if not h then reply_err(id, "unknown_method", tostring(method))
     else
       local ok, a, b, c = pcall(h, p)
-      if not ok then reply_err(id, "emulator_error", a)
+      if not ok then
+        reply_err(id, "emulator_error", pacing_control_unverified and ("execution_speed unverified: " .. tostring(a)) or a)
       elseif a == true then reply_ok(id, b) else reply_err(id, b, c) end
     end
   end
@@ -2726,6 +2743,13 @@ local function service_frozen_once()
   -- 미완성 response cursor를 한 번만 전진시킨다. would-block이면 다음 idle event까지 기다린다.
   if conn and Tx.pending(tx) and flush_tx() == "restarting" then return end
 
+  if control and (control:busy() or control:owns_parent()) then
+    local line = poll_line(true)
+    if line then handle_in_freeze(line) end
+    control:poll()
+    return
+  end
+
   -- 직전 explicit step 청크가 다시 halt한 지점. response가 막혀 있으면 guest를 더 진행하지 않는다.
   if Step.active(step_operation) then
     if Tx.pending(tx) then return end
@@ -2772,6 +2796,10 @@ local function service_frozen_once()
     local act = handle_in_freeze(line)
     if act == "resume" then resume_from_freeze(); return end
     if act == "step" then do_step_chunk(); return end
+  end
+  if control then
+    control:poll()
+    if control:busy() or control:owns_parent() or control:retired() then return end
   end
 
   now = wall_ms()
@@ -2852,6 +2880,7 @@ end, emu.eventType.reset)
 -- 입력 적용: ROM이 읽기 직전인 inputPolled에서 주입한 입력을 덮어쓴다.
 emu.addEventCallback(function()
   local ok, err = apply_input()
+  if not ok and control and control:owns_parent() then control:input_failure(err) end
   if not ok and recording then
     local effect
     recording, effect = Recording.fail_input(recording, frame, err)
@@ -2863,6 +2892,7 @@ end, emu.eventType.inputPolled)
 emu.addEventCallback(function()
   halt_savestate_safe = false
   frame = frame + 1
+  if control and (control:busy() or control:owns_parent()) then return end
   if not conn then connect(); return end
   if Tx.pending(tx) and flush_tx() == "restarting" then return end
   -- A startFrame while frozen means the host was resumed outside the adapter. Explicit adapter
@@ -2937,6 +2967,13 @@ local WAIT_SAFE_METHODS = {
 
 if HAS_AGENT_PACING then
   emu.addEventCallback(function()
+    if control and (control:busy() or control:owns_parent()) then
+      if conn then flush_tx() end
+      local line = poll_line(true)
+      if line then dispatch(line) end
+      control:poll()
+      return
+    end
     if deferred or Step.active(step_operation) then
       if advance_expired() then emu.endPacingWait() end
       return
@@ -2954,6 +2991,16 @@ if HAS_AGENT_PACING then
     if dispatch(line) == "freeze" then emu.breakExecution() end
     if STATE ~= "running" then emu.endPacingWait() end
   end, emu.eventType.pacingIdle)
+end
+
+if control then
+  emu.addEventCallback(function()
+    if not control:busy() and not control:owns_parent() then return end
+    if conn then flush_tx() end
+    local line = poll_line(true)
+    if line then dispatch(line) end
+    control:poll()
+  end, emu.eventType.controlIdle)
 end
 
 CPU = emu.cpuType[SYS.cpu_type]   -- 브레이크포인트/세이브스테이트 exec 콜백용

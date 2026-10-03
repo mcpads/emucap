@@ -1,0 +1,11 @@
+diff --git a/pcsx2/GS/Renderers/DX12/D3D12ShaderCache.h b/pcsx2/GS/Renderers/DX12/D3D12ShaderCache.h
+--- a/pcsx2/GS/Renderers/DX12/D3D12ShaderCache.h
++++ b/pcsx2/GS/Renderers/DX12/D3D12ShaderCache.h
+@@ -10,6 +10,7 @@
+ 
+ #include <cstdio>
+ #include <d3d12.h>
++#include <string>
+ #include <string_view>
+ #include <unordered_map>
+ #include <vector>

@@ -67,7 +67,7 @@ pub(super) fn describe(status: &Value, operations: &mut Map<String, Value>) {
         operations,
         status,
         "set_input",
-        "Hold a persistent button, key, or advertised controller-axis state; empty buttons and axes release native ownership.",
+        "Set button, key, or advertised controller-axis state across separate debugger calls. The caller owns release: empty buttons and axes release native ownership. For timed button/key holds and simultaneous buttons, use tap.",
     );
     add::<HoldTouchArgs>(
         operations,

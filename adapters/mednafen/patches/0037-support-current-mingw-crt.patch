@@ -1,0 +1,13 @@
+--- a/src/drivers/main.cpp
++++ b/src/drivers/main.cpp
+@@ -2191,6 +2191,10 @@
+ 
+ 
+ #ifdef WIN32
++// MinGW-w64 10 renamed the CRT application-type symbol.
++#if defined(__MINGW64_VERSION_MAJOR) && __MINGW64_VERSION_MAJOR >= 10
++ #define mingw_app_type __mingw_app_type
++#endif
+ extern "C"
+ {
+  void __set_app_type(int);

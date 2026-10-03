@@ -74,7 +74,9 @@ void emucap_pre_first_frame() {
   if (!emulated && scenario=="startup_policy") ratio=0.25;
 }
 bool emucap_frame_consumer_active() { return scenario!="no_consumer"; }
+bool emucap_frame_output_pending() { return scenario=="restored_partial"; }
 void MDFNI_Emulate(EmulateSpecStruct* spec) {
+  assert(spec->LineWidths[0]==(scenario=="restored_partial" ? 123 : -1));
   if (scenario=="startup_policy") assert(spec->soundmultiplier==0.25);
   if (scenario=="render_consumer") assert(!spec->skip);
   if (scenario=="no_consumer") assert(spec->skip);
@@ -139,6 +141,7 @@ int main(int argc,char** argv) {
   assert(argc==2);
   scenario=argv[1];
   if (scenario=="render_consumer" || scenario=="no_consumer") NoWaiting=1;
+  if (scenario=="restored_partial") SoftFB[0].lw[0]=123;
   assert(GameLoop(nullptr)==1);
   assert(emulated==(scenario=="count" ? 3U : 1U));
   assert(captured==emulated && submitted==emulated && serviced==emulated);
@@ -154,10 +157,10 @@ with tempfile.TemporaryDirectory(prefix='mednafen-frame-boundary-') as temp:
     cpp.write_text(prefix + body + suffix)
     subprocess.run(['clang++', '-std=c++11', '-O1', '-fsanitize=address,undefined',
                     '-fno-omit-frame-pointer', str(cpp), '-o', str(executable)], check=True)
-    for scenario in ['frame_boundary', 'startup_policy', 'render_consumer', 'no_consumer', 'count']:
+    for scenario in ['frame_boundary', 'startup_policy', 'render_consumer', 'no_consumer', 'count', 'restored_partial']:
         result = subprocess.run([str(executable), scenario], stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
                                 env=dict(os.environ, UBSAN_OPTIONS='halt_on_error=1'))
-        expect_failure = args.baseline and scenario in ['frame_boundary', 'startup_policy', 'render_consumer']
+        expect_failure = args.baseline and scenario in ['frame_boundary', 'startup_policy', 'render_consumer', 'restored_partial']
         assert (result.returncode != 0) == expect_failure, (scenario, result.returncode, result.stdout)
         print(scenario, 'counterexample reproduced' if expect_failure else 'passed')

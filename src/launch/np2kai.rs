@@ -88,6 +88,8 @@ pub fn inspect_hdi_geometry(path: &Path) -> std::io::Result<Option<HdiGeometry>>
 pub fn default_core_path(repo_root: &Path) -> PathBuf {
     let name = if cfg!(target_os = "macos") {
         "np2kai_libretro.dylib"
+    } else if cfg!(windows) {
+        "np2kai_libretro.dll"
     } else {
         "np2kai_libretro.so"
     };
@@ -407,7 +409,7 @@ fn lock_value(key: &str) -> Option<&str> {
 fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {

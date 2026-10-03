@@ -51,8 +51,9 @@ fn member_sink_rejects_reordered_or_short_members() {
     )
     .unwrap();
     writeln!(stream, "{{\"label\":\"second\",\"bytes\":2}}").unwrap();
-    stream.write_all(b"XX").unwrap();
-    stream.shutdown(Shutdown::Write).unwrap();
+    // The invalid header is sufficient for rejection. The receiver may already
+    // have closed its socket before the sender attempts another operation.
+    drop(stream);
 
     let outcome = server.finish(1000);
     assert!(outcome.members.is_empty());

@@ -209,11 +209,16 @@ fn broker_attach_preserves_contract_advertisement() {
             "nds.call-stack.best-effort"
         ])
     );
-    assert_eq!(value["result"]["temporal_cancellation_capability"],
-        serde_json::json!({"methods":["step"],"control_service_ms":25,"stop_host_ms":1000}));
-    assert_eq!(value["result"]["producer_extension"],serde_json::json!({"nested":[1,"two",{"three":true}]}));
-    assert_eq!(value["result"]["attached_name"],"nds-contracts");
-    assert_ne!(value["result"]["broker_registration_id"],999999);
+    assert_eq!(
+        value["result"]["temporal_cancellation_capability"],
+        serde_json::json!({"methods":["step"],"control_service_ms":25,"stop_host_ms":1000})
+    );
+    assert_eq!(
+        value["result"]["producer_extension"],
+        serde_json::json!({"nested":[1,"two",{"three":true}]})
+    );
+    assert_eq!(value["result"]["attached_name"], "nds-contracts");
+    assert_ne!(value["result"]["broker_registration_id"], 999999);
     emulator.join().unwrap();
 }
 

@@ -675,10 +675,7 @@ impl Mupen64PlusHost {
     }
 
     fn capture_snapshot(&self, snapshot: &SnapshotSpec) -> N64Result<Value> {
-        let address = RDRAM_BASE + snapshot.offset;
-        let data = (0..snapshot.length)
-            .map(|index| unsafe { (self.api.debug_mem_read8)((address + index) as u32) })
-            .collect::<Vec<_>>();
+        let data = self.read_rdram_bytes(snapshot.offset, snapshot.length)?;
         Ok(json!({
             "memory_type":"rdram",
             "address":snapshot.offset,
@@ -777,6 +774,19 @@ impl Mupen64PlusHost {
         }))
     }
 
+    fn read_debug_bytes(&self, address: u32, length: u32) -> N64Result<Vec<u8>> {
+        if let Some(offset) = r4300_rdram_offset(address) {
+            if u64::from(offset) + u64::from(length) <= RDRAM_SIZE {
+                return self.read_rdram_bytes(u64::from(offset), u64::from(length));
+            }
+        }
+        // Preserve the existing debugger's virtual/ROM/SP address semantics.
+        // The pure RDRAM guarantee applies only to the direct storage window.
+        Ok((0..length)
+            .map(|offset| unsafe { (self.api.debug_mem_read8)(address + offset) })
+            .collect())
+    }
+
     pub(super) fn disassemble(&self, params: &Value) -> N64Result<Value> {
         self.require_frozen("disassemble")?;
         let count = optional_num(params, "count")?.unwrap_or(8);
@@ -789,9 +799,7 @@ impl Mupen64PlusHost {
         let mut instructions = Vec::with_capacity(count as usize);
         for index in 0..count {
             let address = base + index * 4;
-            let bytes = (0..4)
-                .map(|byte| unsafe { (self.api.debug_mem_read8)((address + byte) as u32) })
-                .collect::<Vec<_>>();
+            let bytes = self.read_debug_bytes(address as u32, 4)?;
             let opcode =
                 u32::from_be_bytes(bytes.as_slice().try_into().expect("four opcode bytes"));
             let mut mnemonic: [c_char; 128] = [0; 128];
@@ -834,12 +842,19 @@ impl Mupen64PlusHost {
         let pc = unsafe { *pc_ptr };
         let sp = unsafe { *regs_ptr.add(29) } as u32;
         let ra = unsafe { *regs_ptr.add(31) } as u32;
+        let mut read_error = None;
         let frames = walk_r4300_stack(pc, ra, sp, |address| {
-            let bytes = (0..4)
-                .map(|byte| unsafe { (self.api.debug_mem_read8)(address + byte) })
-                .collect::<Vec<_>>();
-            u32::from_be_bytes(bytes.try_into().expect("four R4300 bytes"))
+            match self.read_debug_bytes(address, 4) {
+                Ok(bytes) => u32::from_be_bytes(bytes.try_into().expect("four R4300 bytes")),
+                Err(error) => {
+                    read_error = Some(error);
+                    0
+                }
+            }
         });
+        if let Some(error) = read_error {
+            return Err(error);
+        }
         let output = frames
             .iter()
             .map(|frame| {

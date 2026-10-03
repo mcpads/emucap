@@ -1,0 +1,87 @@
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+new file mode 100644
+--- /dev/null
++++ b/Core/EmucapPacing.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cstdint>
++#include <mutex>
++
++// Host pacing state. Readers take a value snapshot and release the lock before
++// any core, audio, UI, socket or lifecycle operation.
++struct EmucapPacingSnapshot {
++    int percent = 100;
++    uint32_t revision = 0;
++};
++
++struct EmucapPacingUpdate {
++    EmucapPacingSnapshot previous;
++    EmucapPacingSnapshot applied;
++};
++
++class EmucapPacingOwner {
++public:
++    EmucapPacingSnapshot Read() const {
++        std::lock_guard<std::mutex> guard(mutex_);
++        return policy_;
++    }
++
++    EmucapPacingUpdate SetPercent(int percent) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        const auto previous = policy_;
++        policy_.percent = percent;
++        ++policy_.revision;
++        return {previous, policy_};
++    }
++
++private:
++    mutable std::mutex mutex_;
++    EmucapPacingSnapshot policy_;
++};
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -15,7 +15,7 @@
+ // Official git repository and contact information can be found at
+ // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
+ 
+-#include <atomic>
++#include "Core/EmucapPacing.h"
+ #include <algorithm>
+ #include <cmath>
+ #include <map>
+@@ -358,20 +358,18 @@
+ 	wasPaused = true;
+ }
+ 
+-static std::atomic<int> emucapSpeedPercent{100};
+-static std::atomic<uint32_t> emucapPacingGeneration{0};
++static EmucapPacingOwner emucapPacing;
+ 
+ void __DisplaySetEmucapSpeed(int percent) {
+-	emucapSpeedPercent = percent;
+-	emucapPacingGeneration++;
++	emucapPacing.SetPercent(percent);
+ }
+ 
+ int __DisplayGetEmucapSpeed() {
+-	return emucapSpeedPercent;
++	return emucapPacing.Read().percent;
+ }
+ 
+ uint32_t __DisplayEmucapPacingGeneration() {
+-	return emucapPacingGeneration;
++	return emucapPacing.Read().revision;
+ }
+ 
+ // TOOD: Should return 59.997?
+@@ -402,7 +400,7 @@
+ 		return fixRate(g_Config.iFpsLimit2);
+ 	if (PSP_CoreParameter().fpsLimit == FPSLimit::ANALOG)
+ 		return fixRate(PSP_CoreParameter().analogFpsLimit);
+-	const int percent = emucapSpeedPercent;
++	const int percent = emucapPacing.Read().percent;
+ 	return percent == 0 ? 0.0 : framerate * percent / 100.0;
+ }
+ 

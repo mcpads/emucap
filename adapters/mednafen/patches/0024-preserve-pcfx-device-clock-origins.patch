@@ -1,0 +1,123 @@
+--- a/src/pcfx/pcfx.cpp
++++ b/src/pcfx/pcfx.cpp
+@@ -1037,10 +1037,17 @@
+ 
+ static void StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
+- const v810_timestamp_t timestamp = PCFX_V810.v810_timestamp;
++ v810_timestamp_t timestamp = PCFX_V810.v810_timestamp;
++ bool ClockOriginsPresent = !load;
+ 
+  SFORMAT StateRegs[] =
+  {
++  SFVAR(ClockOriginsPresent),
++  SFVAR(timestamp),
++  SFVAR(next_pad_ts),
++  SFVAR(next_timer_ts),
++  SFVAR(next_adpcm_ts),
++  SFVAR(next_king_ts),
+   SFPTR8(RAM, 0x200000),
+   SFVAR(Last_VDC_AR),
+   SFVAR(RAM_LPA),
+@@ -1054,6 +1061,7 @@
+  };
+ 
+  MDFNSS_StateAction(sm, load, data_only, StateRegs, "MAIN");
++ if(load && ClockOriginsPresent) PCFX_V810.v810_timestamp = timestamp;
+ 
+  for(int i = 0; i < 2; i++)
+   fx_vdc_chips[i]->StateAction(sm, load, data_only, i ? "VDC1" : "VDC0");
+@@ -1063,17 +1071,15 @@
+  KING_StateAction(sm, load, data_only);
+  PCFX_V810.StateAction(sm, load, data_only);
+  FXTIMER_StateAction(sm, load, data_only);
+- SoundBox_StateAction(sm, load, data_only);
+- SCSICD_StateAction(sm, load, data_only, "CDRM");
++ SoundBox_StateAction(sm, load, data_only, ClockOriginsPresent);
++ SCSICD_StateAction(sm, load, data_only, "CDRM", ClockOriginsPresent);
+  RAINBOW_StateAction(sm, load, data_only);
+ 
+  if(load)
+  {
+-  //
+-  // Rather than bothering to store next event timestamp deltas in save states, we'll just recalculate next event times on save state load as a side effect
+-  // of this call.
+-  //
+-  ForceEventUpdates(timestamp);
++  // Legacy snapshots omit coordinated clocks and scheduler events.
++  // New snapshots restore both without advancing devices during load.
++  if(!ClockOriginsPresent) ForceEventUpdates(timestamp);
+ 
+   if(!BRAMDisabled)
+   {
+--- a/src/pcfx/king.cpp
++++ b/src/pcfx/king.cpp
+@@ -3148,6 +3148,7 @@
+ {
+  SFORMAT KINGStateRegs[] =
+  {
++  SFVARN(king->lastts, "lastts"),
+   SFVARN(king->AR, "AR"),
+   SFVARN(king->KRAM[0], "KRAM0"),
+   SFVARN(king->KRAM[1], "KRAM1"),
+--- a/src/pcfx/timer.cpp
++++ b/src/pcfx/timer.cpp
+@@ -123,6 +123,7 @@
+ {
+  SFORMAT StateRegs[] =
+  {
++  SFVAR(lastts),
+   SFVAR(counter),
+   SFVAR(period),
+   SFVAR(control),
+--- a/src/pcfx/input.cpp
++++ b/src/pcfx/input.cpp
+@@ -376,6 +376,7 @@
+ {
+  SFORMAT StateRegs[] =
+  {
++  SFVAR(lastts),
+   SFVAR(TapCounter),
+   SFVAR(LatchPending),
+   SFVAR(control),
+--- a/src/pcfx/soundbox.cpp
++++ b/src/pcfx/soundbox.cpp
+@@ -706,12 +706,13 @@
+  sbox.smalldiv = 0;
+ }
+ 
+-void SoundBox_StateAction(StateMem *sm, const unsigned load, const bool data_only)
+-{
+- pce_psg->StateAction(sm, load, data_only);
++void SoundBox_StateAction(StateMem *sm, const unsigned load, const bool data_only, bool restore_clock_origins)
++{
++ pce_psg->StateAction(sm, load, data_only, restore_clock_origins);
+ 
+  SFORMAT SoundBox_StateRegs[] =
+  {
++  SFVAR(adpcm_lastts),
+   SFVARN(sbox.ADPCMControl, "ADPCMControl"),
+   SFVARN(sbox.ADPCMVolume, "ADPCMVolume"),
+   SFVARN(sbox.CDDAVolume, "CDDAVolume"),
+--- a/src/pcfx/soundbox.h
++++ b/src/pcfx/soundbox.h
+@@ -33,7 +33,7 @@
+ 
+ void SoundBox_Reset(const v810_timestamp_t timestamp) MDFN_COLD;
+ 
+-void SoundBox_StateAction(StateMem *sm, const unsigned load, const bool data_only);
++void SoundBox_StateAction(StateMem *sm, const unsigned load, const bool data_only, bool restore_clock_origins);
+ 
+ void SoundBox_SetKINGADPCMControl(uint32);
+ 
+--- a/src/hw_sound/pce_psg/pce_psg.cpp
++++ b/src/hw_sound/pce_psg/pce_psg.cpp
+@@ -824,7 +824,7 @@
+ 
+ void PCE_PSG::StateAction(StateMem *sm, const unsigned load, const bool data_only, bool restore_clock_origins)
+ {
+- // PC-FX rebases restored devices onto the current CPU clock instead.
++ // Legacy callers retain destination clocks; exact snapshots restore origins.
+  if(load && restore_clock_origins) ResetTS(0);
+  for(int ch = 0; ch < 6; ch++)
+  {

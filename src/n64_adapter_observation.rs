@@ -1,5 +1,4 @@
-//! Frozen RDRAM batches and Mupen64Plus-native pacing through the core state commands.
-use std::sync::Mutex;
+//! Frozen RDRAM batches and the versioned Mupen64Plus native pacing owner.
 
 use super::*;
 
@@ -9,10 +8,6 @@ use crate::live::memory_batch::{
 };
 use crate::live::pacing::{self, ExecutionSpeedCapability, PercentDomain, SpeedRequest};
 
-const M64CMD_CORE_STATE_QUERY: c_int = 9;
-const M64CMD_CORE_STATE_SET: c_int = 17;
-const M64CORE_SPEED_FACTOR: c_int = 4;
-const M64CORE_SPEED_LIMITER: c_int = 5;
 /// The core's own speed-factor domain.
 const PACING_MIN_PERCENT: u64 = 1;
 const PACING_MAX_PERCENT: u64 = 1_000;
@@ -22,9 +17,6 @@ const BATCH_MAX_BYTES: u64 = 65_536;
 /// Bumped by every request outside the observation set, since those can change memory or the
 /// stop without changing the frame counter.
 pub(super) static BOUNDARY_SEQ: AtomicU64 = AtomicU64::new(0);
-/// Last observed native pacing tuple and its revision.
-static PACING_REVISION: Mutex<(Option<(c_int, c_int)>, u64)> = Mutex::new((None, 0));
-
 const OBSERVATION_METHODS: &[&str] = &[
     "hello",
     "status",
@@ -54,24 +46,93 @@ pub(super) struct N64Pacing {
     pub(super) factor: c_int,
     pub(super) limiter: bool,
     pub(super) revision: u64,
+    fast_forward: bool,
+    netplay: bool,
+}
+
+/// Version 1 native ABI. Rust never synthesizes this owner's revision.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NativePolicy {
+    factor: i32,
+    limiter: i32,
+    fast_forward: i32,
+    netplay: i32,
+    netplay_lag: i32,
+    reserved: u32,
+    revision: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct NativePacingResult {
+    version: u32,
+    outcome: u32,
+    previous: NativePolicy,
+    applied: NativePolicy,
+}
+
+impl NativePolicy {
+    fn pacing(self) -> N64Result<N64Pacing> {
+        if !(1..=1000).contains(&self.factor)
+            || ![
+                self.limiter,
+                self.fast_forward,
+                self.netplay,
+                self.netplay_lag,
+            ]
+            .into_iter()
+            .all(|flag| matches!(flag, 0 | 1))
+            || self.reserved != 0
+        {
+            return Err(N64Error::BadState("invalid native pacing snapshot".into()));
+        }
+        Ok(N64Pacing {
+            factor: self.factor,
+            limiter: self.limiter != 0,
+            revision: self.revision,
+            fast_forward: self.fast_forward != 0,
+            netplay: self.netplay != 0,
+        })
+    }
+
+    fn same_policy(self, other: Self) -> bool {
+        Self {
+            revision: 0,
+            ..self
+        } == Self {
+            revision: 0,
+            ..other
+        }
+    }
+}
+
+impl NativePacingResult {
+    fn validate(self, operation: u32) -> N64Result<Self> {
+        if self.version != 1 || self.outcome > 1 {
+            return Err(N64Error::BadState(
+                "unsupported native pacing response".into(),
+            ));
+        }
+        self.previous.pacing()?;
+        self.applied.pacing()?;
+        if operation == 0 || self.outcome == 1 {
+            if self.previous != self.applied || (operation == 0 && self.outcome != 0) {
+                return Err(N64Error::BadState(
+                    "native pacing rejection/query changed policy".into(),
+                ));
+            }
+        } else {
+            let changed = !self.previous.same_policy(self.applied);
+            if self.applied.revision != self.previous.revision.wrapping_add(u64::from(changed)) {
+                return Err(N64Error::BadState("invalid native pacing revision".into()));
+            }
+        }
+        Ok(self)
+    }
 }
 
 impl N64Pacing {
-    fn observe(factor: c_int, limiter: c_int) -> Self {
-        let mut revision = PACING_REVISION
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if revision.0 != Some((factor, limiter)) {
-            revision.0 = Some((factor, limiter));
-            revision.1 += 1;
-        }
-        Self {
-            factor,
-            limiter: limiter != 0,
-            revision: revision.1,
-        }
-    }
-
     /// Longest wait for one frame: `base` at full speed, stretched by a slower limited target.
     pub(super) fn frame_wait(&self, base: Duration) -> Duration {
         match u32::try_from(self.factor) {
@@ -96,8 +157,8 @@ impl N64Pacing {
             "percent": value,
             "source": "native",
             "policy_revision": self.revision.to_string(),
-            "host_constraints": [],
-            "diagnostics": {"speed_factor": self.factor, "speed_limiter": self.limiter},
+            "host_constraints": if self.netplay { vec!["netplay"] } else { vec![] },
+            "diagnostics": {"speed_factor": self.factor, "speed_limiter": self.limiter, "fast_forward": self.fast_forward},
         })
     }
 }
@@ -135,42 +196,23 @@ impl Mupen64PlusHost {
         }
     }
 
-    fn core_state(&self, param: c_int) -> N64Result<c_int> {
-        let mut value: c_int = 0;
-        check_core("CoreDoCommand(state query)", unsafe {
-            (self.api.core_do_command)(
-                M64CMD_CORE_STATE_QUERY,
-                param,
-                (&mut value as *mut c_int).cast(),
+    fn pacing_transaction(&self, operation: u32, percent: i32) -> N64Result<NativePacingResult> {
+        self.require_connected()?;
+        let mut result = NativePacingResult::default();
+        check_core("CoreEmucapPacing", unsafe {
+            (self.api.core_emucap_pacing)(
+                1,
+                operation,
+                percent,
+                &mut result,
+                std::mem::size_of::<NativePacingResult>() as u32,
             )
         })?;
-        Ok(value)
-    }
-
-    fn set_core_state(&self, param: c_int, value: c_int) -> N64Result<()> {
-        let mut value = value;
-        check_core("CoreDoCommand(state set)", unsafe {
-            (self.api.core_do_command)(
-                M64CMD_CORE_STATE_SET,
-                param,
-                (&mut value as *mut c_int).cast(),
-            )
-        })
+        Ok(result)
     }
 
     pub(super) fn native_pacing(&self) -> N64Result<N64Pacing> {
-        self.require_connected()?;
-        Ok(N64Pacing::observe(
-            self.core_state(M64CORE_SPEED_FACTOR)?,
-            self.core_state(M64CORE_SPEED_LIMITER)?,
-        ))
-    }
-
-    fn apply_pacing(&self, limiter: bool, factor: Option<c_int>) -> N64Result<()> {
-        if let Some(factor) = factor {
-            self.set_core_state(M64CORE_SPEED_FACTOR, factor)?;
-        }
-        self.set_core_state(M64CORE_SPEED_LIMITER, c_int::from(limiter))
+        self.pacing_transaction(0, 0)?.validate(0)?.applied.pacing()
     }
 
     pub(super) fn execution_speed(&mut self, params: &Value) -> N64Result<Value> {
@@ -193,23 +235,45 @@ impl Mupen64PlusHost {
         };
         let request = pacing::parse_request(mode, percent).map_err(N64Error::BadParams)?;
         capability.admit(request).map_err(N64Error::BadParams)?;
+        let frame_before = self.public_frame();
         let before = self.native_pacing()?;
         if matches!(request, SpeedRequest::Query) {
             return Ok(before.public());
         }
+        let mut unchanged_rejection = false;
+        let mut native_result = None;
         let outcome: N64Result<Value> = (|| {
-            match request {
+            let percent = match request {
                 SpeedRequest::Query => unreachable!("handled before mutation"),
-                SpeedRequest::Unlimited => self.apply_pacing(false, None)?,
-                SpeedRequest::Limited { centi_percent } => {
-                    self.apply_pacing(true, Some((centi_percent / 100) as c_int))?
-                }
+                SpeedRequest::Unlimited => 0,
+                SpeedRequest::Limited { centi_percent } => (centi_percent / 100) as i32,
+            };
+            let raw = self.pacing_transaction(1, percent)?;
+            native_result = Some(format!("{raw:?}"));
+            let native = raw.validate(1)?;
+            if native.outcome == 1 {
+                unchanged_rejection = true;
+                return Err(N64Error::BadState(format!(
+                    "native pacing change rejected without mutation: {}",
+                    native.previous.pacing()?.public()
+                )));
             }
-            let after = self.native_pacing()?;
+            let previous = native.previous.pacing()?;
+            let after = native.applied.pacing()?;
+            if after.fast_forward || after.netplay {
+                return Err(N64Error::BadState(
+                    "native pacing override remains active".into(),
+                ));
+            }
+            // The emulation thread can hit a breakpoint while native pacing is applied.
+            self.drain_debug_update()?;
+            self.frozen = (self.frame_paused && frame_gate_is_blocked())
+                || unsafe { (self.api.debug_get_state)(M64P_DBG_RUN_STATE) }
+                    == M64P_DBG_RUNSTATE_PAUSED;
             let reply = json!({
                 "status": "completed",
                 "state": if self.frozen { "frozen" } else { "running" },
-                "previous": before.public(),
+                "previous": previous.public(),
                 "execution_speed": after.public(),
                 "frame": self.public_frame(),
             });
@@ -219,9 +283,22 @@ impl Mupen64PlusHost {
             Ok(reply)
         })();
         outcome.map_err(|error| {
+            if unchanged_rejection { return error; }
             CONTROL_UNVERIFIED.store(true, Ordering::Release);
-            N64Error::BadState(format!("execution_speed unverified: {error}; last verified policy: {}; guest progress may have occurred", before.public()))
+            let domain = if self.display { "n64.rendered_frame" } else { "n64.vi" };
+            N64Error::BadState(format!("execution_speed unverified: {error}; last verified policy: {}; pre-command frame: {frame_before}; current frame: {}; frame domain: {domain}; native transaction: {native_result:?}; guest progress may have occurred", before.public(), self.public_frame()))
         })
+    }
+
+    pub(super) fn read_rdram_bytes(&self, offset: u64, length: u64) -> N64Result<Vec<u8>> {
+        if !matches!(offset.checked_add(length), Some(end) if end <= RDRAM_SIZE) {
+            return Err(N64Error::BadParams("RDRAM read exceeds storage".into()));
+        }
+        let mut bytes = vec![0; length as usize];
+        check_core("DebugMemReadRdram", unsafe {
+            (self.api.debug_mem_read_rdram)(offset as u32, bytes.as_mut_ptr(), length as u32)
+        })?;
+        Ok(bytes)
     }
 
     pub(super) fn read_memory_batch(&self, params: &Value) -> N64Result<Value> {
@@ -251,17 +328,13 @@ impl Mupen64PlusHost {
             .iter()
             .enumerate()
             .map(|(index, range)| {
-                let bytes: Vec<u8> = (0..range.length)
-                    .map(|offset| unsafe {
-                        (self.api.debug_mem_read8)((RDRAM_BASE + range.address + offset) as u32)
-                    })
-                    .collect();
-                json!({
+                let bytes = self.read_rdram_bytes(range.address, range.length)?;
+                Ok(json!({
                     "index": index, "memory_type": range.memory_type, "address": range.address,
                     "length": range.length, "hex": hex::encode(bytes),
-                })
+                }))
             })
-            .collect();
+            .collect::<N64Result<_>>()?;
         let epoch = format!("f{frame}#s{}", BOUNDARY_SEQ.load(Ordering::Acquire));
         Ok(json!({
             "state": "frozen",

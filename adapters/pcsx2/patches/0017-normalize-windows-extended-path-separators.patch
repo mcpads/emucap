@@ -1,0 +1,33 @@
+diff --git a/common/FileSystem.cpp b/common/FileSystem.cpp
+--- a/common/FileSystem.cpp
++++ b/common/FileSystem.cpp
+@@ -235,6 +235,10 @@
+ 		_freea(wstr_buf);
+ 		return false;
+ 	}
++
++	// Extended-length paths bypass Win32 slash normalization. Canonicalize
++	// separators before PathCch adds the extended-length prefix.
++	std::replace(wstr_buf, wstr_buf + wlen, L'/', L'\\');
+ 
+ 	// And use PathCchCanonicalizeEx() to fix up any non-direct elements.
+ 	wstr_buf[wlen] = '\0';
+diff --git a/tests/ctest/common/filesystem_tests.cpp b/tests/ctest/common/filesystem_tests.cpp
+--- a/tests/ctest/common/filesystem_tests.cpp
++++ b/tests/ctest/common/filesystem_tests.cpp
+@@ -56,3 +56,15 @@
+ }
+ 
+ #endif
++
++#ifdef _WIN32
++TEST(FileSystem, ExtendedLengthPathsNormalizeSeparators)
++{
++	EXPECT_EQ(FileSystem::GetWin32Path("C:/games/test image.iso"),
++		FileSystem::GetWin32Path(R"(C:\games\test image.iso)"));
++	EXPECT_EQ(FileSystem::GetWin32Path("C:/games/sub/../test.iso"),
++		FileSystem::GetWin32Path(R"(C:\games\test.iso)"));
++	EXPECT_EQ(FileSystem::GetWin32Path(R"(\\server\share/folder/test.iso)"),
++		FileSystem::GetWin32Path(R"(\\server\share\folder\test.iso)"));
++}
++#endif

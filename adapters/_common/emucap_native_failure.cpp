@@ -128,6 +128,7 @@ bool atomic_replace(
     const std::string& target,
     const std::string& parent) {
 #ifdef _WIN32
+  (void)parent;
   std::wstring wide_source;
   std::wstring wide_target;
   return utf8_to_wide(source, wide_source) && utf8_to_wide(target, wide_target)

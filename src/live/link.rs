@@ -183,6 +183,20 @@ impl FeatureCapabilities {
         methods: &[String],
         memory_types: &[String],
     ) -> Result<Self, LinkError> {
+        if hello.get("adapter").and_then(Value::as_str) == Some("flycast-native")
+            && !hello
+                .get("host_features")
+                .and_then(Value::as_array)
+                .is_some_and(|features| {
+                    features
+                        .iter()
+                        .any(|feature| feature.as_str() == Some("native_renderer_fence"))
+                })
+        {
+            return Err(LinkError::Protocol(
+                "flycast-patch-required: hello lacks native_renderer_fence; rebuild the maintained Flycast adapter".into(),
+            ));
+        }
         let advertised = |method: &str| methods.iter().any(|name| name == method);
         let paired = |method: &str, field: &str| match (advertised(method), hello.get(field)) {
             (true, Some(value)) => Ok(Some(value)),
@@ -589,3 +603,7 @@ impl EmulatorLink for FakeLink {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "link_host_features_tests.rs"]
+mod host_features_tests;

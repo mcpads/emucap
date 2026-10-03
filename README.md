@@ -14,13 +14,13 @@ Neo Geo Pocket/Color), Flycast
 NP2kai compatibility backend (PC-98), MAME (experimental Neo Geo
 MVS/AES/CD), an experimental Mupen64Plus frontend (Nintendo 64), and a pinned
 xemu fork (original Xbox, experimental).
-A pinned openMSX 21.0 source build with four emucap host patches provides
+A pinned openMSX 21.0 source build with the maintained emucap host patches provides
 experimental C-BIOS MSX2+ and real-firmware MSX1/MSX2/MSX2+ cartridge profiles
 through a separate Rust XML-control bridge.
 
-**v0.18.0 — beta.** This repository remains under active development; interfaces and
-behavior may change in later releases. Adapter availability is host-dependent and is
-reported by `status`.
+**v1.0.0-rc.1 — release candidate.** The proposed 1.x compatibility boundary is defined in
+[COMPATIBILITY.md](COMPATIBILITY.md). Adapter availability and supported operations are
+reported by the connected runtime’s `status`; experimental profiles retain their stated scope.
 
 The Core and otherwise unmarked project source are GPL-2.0-or-later. Native emulator
 patch stacks follow their adapter-specific upstream license boundary. See
@@ -102,7 +102,7 @@ them (see §2b).
   state, and screen; controls input, save-states, and breakpoints; and returns
   results from optional analysis operations. Its static tool list is a compact
   basic remote. Use `tap` for button/key input, mouse controls with
-  `pointer(operation="describe")`; persistent input, touch, and composite debugger operations with
+  `pointer(operation="describe")`; input held across debugger calls, touch, and composite debugger operations with
   `debug(operation="describe")`, and reproducibility analysis with
   `analysis(operation="describe")`. Each drawer returns only the current
   runtime's operations and schemas; execute through that same tool. Core
@@ -111,7 +111,8 @@ them (see §2b).
   frozen guest plus a device ID from `status.media_devices`. Exact guest-time
   advance uses `step`, which returns the guest frozen; adapter free-running frame waits are
   compatibility wire operations and are not exposed to MCP agents.
-  Exact bounded button input uses direct `tap`, which releases input and returns frozen. A
+  `tap` holds one or more buttons together for `press_frames`, releases them, advances
+  `after_frames`, and returns frozen. This covers short presses and long holds. A
   real-time pulse that leaves the guest running is available only as the explicitly named
   `pulse_while_running` operation in the debug drawer when the runtime supports it.
 - **Tracking MCP** (`emucap-track-mcp`) — the experiment ledger (`.emucap/`).
@@ -122,8 +123,8 @@ them (see §2b).
 
 Upgrading to 0.17: install the matching core package or build the release, then reconnect both
 servers and refresh MCP discovery.
-Button/key actions use `tap`, mouse actions use `pointer`, and persistent input or touch uses
-`debug`. Rebuild the maintained openMSX host to API 5 and the PPSSPP host to apply their native
+Button/key actions use `tap`, mouse actions use `pointer`, and input held across debugger calls or touch uses
+`debug`. Rebuild the maintained openMSX host to API 6 and the PPSSPP host to apply their native
 fixes. See [the changelog](CHANGELOG.md) for state compatibility and other changes.
 
 **Claude Code:**
@@ -426,7 +427,7 @@ debugger halt to service requests without advancing the guest.
 - **openMSX (MSX profiles, experimental)** — run
   `adapters/openmsx/build.sh`, then build `emucap-openmsx-bridge`. The official
   launcher accepts only the pinned openMSX 21.0 sidecar built with the recorded
-  upstream compatibility backport and four emucap host patches. It runs that host
+  upstream compatibility backport and the maintained emucap host patches. It runs that host
   with an emucap-owned per-port `HOME` and does not read the user's emulator
   profile. `msx` is C-BIOS MSX2+; `msx1`, `msx2`, and `msx2p` select
   explicit user-supplied real-firmware profiles. The cartridge surface includes Z80

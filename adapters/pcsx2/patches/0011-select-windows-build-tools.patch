@@ -1,0 +1,13 @@
+--- a/.github/workflows/scripts/windows/build-dependencies.bat
++++ b/.github/workflows/scripts/windows/build-dependencies.bat
+@@ -2,7 +2,9 @@
+ setlocal enabledelayedexpansion
+ 
+ echo Setting environment...
+-if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
++if defined EMUCAP_PCSX2_VCVARS (
++  call "%EMUCAP_PCSX2_VCVARS%"
++) else if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" (
+   call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+ ) else if exist "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" (
+   call "%ProgramFiles%\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat"

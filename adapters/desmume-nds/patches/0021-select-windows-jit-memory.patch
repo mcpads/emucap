@@ -1,0 +1,11 @@
+--- a/desmume/src/arm_jit.cpp
++++ b/desmume/src/arm_jit.cpp
+@@ -24,7 +24,7 @@
+ #error "ERROR: JIT compiler - unsupported target platform"
+ #endif
+ 
+-#ifdef HOST_WINDOWS
++#ifdef _WIN32
+ // **** Windows port
+ #else
+ #include <sys/mman.h>

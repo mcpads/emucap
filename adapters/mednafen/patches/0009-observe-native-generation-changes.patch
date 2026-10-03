@@ -1,0 +1,63 @@
+--- a/src/mednafen.cpp
++++ b/src/mednafen.cpp
+@@ -54,6 +54,8 @@
+ #include "tests.h"
+ #include "video/tblur.h"
+ #include "qtrecord.h"
++
++extern "C" void emucap_native_generation_changed(void);
+ 
+ namespace Mednafen
+ {
+@@ -565,6 +567,7 @@
+ {
+  if(MDFNGameInfo)
+  {
++  emucap_native_generation_changed();
+   MDFNI_NetplayDisconnect();
+   //
+   // Redundant with Cleanup(), but freeing up memory before
+@@ -1386,6 +1389,7 @@
+ 
+ MDFNGI *MDFNI_LoadGame(const char *force_module, VirtualFS* vfs, const char* path, bool force_cd)
+ {
++ emucap_native_generation_changed();
+  assert(path != nullptr);
+ 
+  MDFNI_CloseGame();
+@@ -2359,6 +2363,8 @@
+ 
+ void MDFN_DoSimpleCommand(int cmd)
+ {
++ if(cmd == MDFN_MSC_POWER || cmd == MDFN_MSC_RESET)
++  emucap_native_generation_changed();
+  MDFNGameInfo->DoSimpleCommand(cmd);
+ }
+ 
+--- a/src/state.cpp
++++ b/src/state.cpp
+@@ -31,6 +31,8 @@
+ 
+ #include "MemoryStream.h"
+ #include "compress/GZFileStream.h"
++
++extern "C" void emucap_native_generation_changed(void);
+ 
+ namespace Mednafen
+ {
+@@ -588,6 +590,7 @@
+ 
+ void MDFNSS_LoadSM(Stream *st, bool data_only, const int fuzz)
+ {
++ emucap_native_generation_changed();
+ 	if(!MDFNGameInfo->StateAction)
+ 	{
+ 	 throw MDFN_Error(0, _("Module \"%s\" doesn't support save states."), MDFNGameInfo->shortname);
+@@ -657,6 +660,7 @@
+ 
+ void MDFNSS_LoadInternal(Stream* st, void (*safunc)(StateMem*, const unsigned, const bool))
+ {
++ emucap_native_generation_changed();
+  if(!MDFNGameInfo->StateAction)
+   throw MDFN_Error(0, _("Module \"%s\" doesn't support save states."), MDFNGameInfo->shortname);
+  //

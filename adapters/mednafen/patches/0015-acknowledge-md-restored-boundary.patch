@@ -1,0 +1,32 @@
+--- a/src/md/system.cpp
++++ b/src/md/system.cpp
+@@ -24,6 +24,9 @@
+ #include <mednafen/mempatcher.h>
+ 
+ #include <trio/trio.h>
++
++extern "C" bool emucap_native_restore_service(bool instruction_ready);
++extern "C" void emucap_native_idle_service(void);
+ 
+ namespace MDFN_IEN_MD
+ {
+@@ -173,8 +176,17 @@
+  while(run_cpu > 0)
+  {
+   #ifdef WANT_DEBUGGER
+-  if(MDFN_UNLIKELY(MD_DebugMode) && MDFN_UNLIKELY(!suspend68k))
+-   MDDBG_CPUHook();
++  if(MDFN_UNLIKELY(MD_DebugMode))
++  {
++   // InternalStep returns without fetching an opcode for every pending
++   // reset/exception/interrupt or halted state. These are not instructions.
++   if(!suspend68k && !Main68K.XPending)
++    MDDBG_CPUHook();
++   else
++    emucap_native_idle_service();
++   // No execution operand is cached across the debugger callback.
++   while(emucap_native_restore_service(!suspend68k && !Main68K.XPending)) {}
++  }
+   #endif
+ 
+   Main68K.Step();

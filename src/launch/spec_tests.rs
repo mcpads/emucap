@@ -49,6 +49,10 @@ fn saturn_spec_has_module_and_content_and_headless() {
     assert!(spec
         .env
         .contains(&("EMUCAP_START_FROZEN".to_string(), "1".to_string())));
+    #[cfg(windows)]
+    for name in ["MEDNAFEN_NOPOPUPS", "MEDNAFEN_NOSTDREDIR"] {
+        assert!(spec.env.contains(&(name.into(), "1".into())));
+    }
 }
 
 #[test]
@@ -374,6 +378,10 @@ fn mame_spec_isolates_dirs_and_loads_floppy() {
         .windows(2)
         .any(|w| w == ["-flop1".to_string(), "game.hdm".to_string()]));
     assert!(!spec.args.iter().any(|a| a == "-hard"));
+    assert_eq!(
+        spec.args.iter().any(|v| v == "-videodriver"),
+        !cfg!(windows)
+    );
 }
 
 #[test]

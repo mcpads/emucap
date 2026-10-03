@@ -599,7 +599,7 @@ impl Emucap {
     }
 
     #[tool(
-        description = "Use for ordinary button/key input: tap for an exact frame count and return frozen with input released. Read button names from full status."
+        description = "Press one or more buttons/keys together for press_frames (including long holds), release them, then advance after_frames. Returns frozen with input released. Read button names and limits from full status."
     )]
     async fn tap(
         &self,

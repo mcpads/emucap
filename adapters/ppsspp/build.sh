@@ -66,13 +66,13 @@ done
 cmake -S "$SRC" -B "$SRC/build-headless" -DHEADLESS=ON -DCMAKE_BUILD_TYPE=Release \
   -U 'Fontconfig_*' -U '*FONTCONFIG*'
 # PPSSPPHeadless is the guaranteed default target — a failure here fails the build (set -e).
-cmake --build "$SRC/build-headless" --target PPSSPPHeadless -j
+cmake --build "$SRC/build-headless" --target PPSSPPHeadless -j "${PPSSPP_JOBS:-2}"
 echo "built: $SRC/build-headless/PPSSPPHeadless"
 # PPSSPPSDL (the HITL display:true window) needs SDL3 + sdl3_ttf, which a headless-only host may not
 # have. Build it best-effort so a missing GUI toolchain never fails an otherwise-good headless build.
 # Opt out entirely with EMUCAP_PPSSPP_BUILD_GUI=0.
 if [ "${EMUCAP_PPSSPP_BUILD_GUI:-1}" != "0" ]; then
-  if cmake --build "$SRC/build-headless" --target PPSSPPSDL -j; then
+  if cmake --build "$SRC/build-headless" --target PPSSPPSDL -j "${PPSSPP_JOBS:-2}"; then
     echo "built: $SRC/build-headless/PPSSPPSDL.app (HITL display:true)"
   else
     echo "WARNING: PPSSPPSDL (GUI/display:true) target failed to build — PPSSPPHeadless is ready for headless debugging." >&2

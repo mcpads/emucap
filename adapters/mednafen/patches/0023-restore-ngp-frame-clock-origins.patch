@@ -1,0 +1,118 @@
+--- a/src/ngp/neopop.cpp
++++ b/src/ngp/neopop.cpp
+@@ -73,6 +73,18 @@
+ int32 ngpc_soundTS = 0;
+ //static int32 main_timeaccum;
+ static int32 z80_runtime;
++static bool FrameActive = false;
++
++static void BeginFrame(void)
++{
++ if(FrameActive)
++  return;
++ NGPJoyLatch = *chee;
++ storeB(0x6F82, *chee);
++ MDFNMP_ApplyPeriodicCheats();
++ ngpc_soundTS = 0;
++ FrameActive = true;
++}
+ 
+ static void Emulate(EmulateSpecStruct *espec)
+ {
+@@ -90,12 +102,7 @@
+ 	 MDFNNGPC_SetSoundRate(espec->SoundRate);
+ 
+ 
+-	NGPJoyLatch = *chee;
+-	storeB(0x6F82, *chee);
+-
+-	MDFNMP_ApplyPeriodicCheats();
+-
+-	ngpc_soundTS = 0;
++	BeginFrame();
+ 	NGPFrameSkip = espec->skip;
+ 
+ 	do
+@@ -159,6 +166,7 @@
+ 
+ 	espec->MasterCycles = ngpc_soundTS;
+ 	espec->SoundBufSize = MDFNNGPCSOUND_Flush(espec->SoundBuf, espec->SoundBufMaxSize);
++	FrameActive = false;
+ }
+ 
+ static bool TestMagic(GameFile* gf)
+@@ -226,6 +234,8 @@
+ 
+   //main_timeaccum = 0;
+   z80_runtime = 0;
++  FrameActive = false;
++  ngpc_soundTS = 0;
+ 
+   reset();
+  }
+@@ -258,9 +268,19 @@
+ 
+ static void StateAction(StateMem *sm, const unsigned load, const bool data_only)
+ {
++ // Legacy snapshots describe frame boundaries and omit these origins.
++ if(load)
++ {
++  FrameActive = false;
++  ngpc_soundTS = 0;
++  NGPJoyLatch = *chee;
++ }
+  SFORMAT StateRegs[] =
+  {
+   SFVAR(z80_runtime),
++  SFVAR(FrameActive),
++  SFVAR(ngpc_soundTS),
++  SFVAR(NGPJoyLatch),
+   SFVAR(CPUExRAM),
+   SFVAR(FlashStatusEnable),
+   SFEND
+--- a/src/ngp/T6W28_Apu.h
++++ b/src/ngp/T6W28_Apu.h
+@@ -24,6 +24,7 @@
+ 	uint32 noise_shifter;
+ 	uint32 noise_tap;
+ 
++	int32 last_time;
+ 	int32 delay[4];
+ 	int32 volume_left[4];
+ 	int32 volume_right[4];
+--- a/src/ngp/T6W28_Apu.cpp
++++ b/src/ngp/T6W28_Apu.cpp
+@@ -374,6 +374,7 @@
+ 
+ void T6W28_Apu::save_state(T6W28_ApuState *ret)
+ {
++ ret->last_time = last_time;
+  for(int x = 0; x < 4; x++)
+  {
+   ret->delay[x] = oscs[x]->delay;
+@@ -403,6 +404,7 @@
+ 
+ void T6W28_Apu::load_state(const T6W28_ApuState *state)
+ {
++ last_time = state->last_time;
+  for(int x = 0; x < 4; x++)
+  {
+   oscs[x]->delay = state->delay[x] & ((x == 3) ? 0x7FFF : 0x3FFF);
+--- a/src/ngp/sound.cpp
++++ b/src/ngp/sound.cpp
+@@ -118,6 +118,7 @@
+  T6W28_ApuState sn_state;
+ 
+  apu.save_state(&sn_state);
++ if(load) sn_state.last_time = 0;
+ 
+  SFORMAT StateRegs[] =
+  {
+@@ -126,6 +127,7 @@
+ 
+   SFVAR(schipenable),
+ 
++  SFVARN(sn_state.last_time, "LastTime"),
+   SFVARN(sn_state.delay, "Delay"),
+   SFVARN(sn_state.volume_left, "VolumeLeft"),
+   SFVARN(sn_state.volume_right, "VolumeRight"),

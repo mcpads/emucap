@@ -398,6 +398,7 @@ fn recording_capture_status_is_bounded_and_omits_private_staging_paths() {
             inode: Some(2),
             created_at: None,
         },
+        staging_owner: None,
         staging_identity: FilesystemIdentity {
             canonical_path: "/private/evidence/.capture-test.staging-secret".into(),
             device: Some(1),

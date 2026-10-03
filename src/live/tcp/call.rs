@@ -1,33 +1,11 @@
 use super::*;
 
-struct SocketDeadlineGuard {
-    socket: TcpStream,
-    restore: Duration,
-}
-
-impl SocketDeadlineGuard {
-    fn new(socket: &TcpStream, restore: Duration) -> Result<Self, LinkError> {
-        Ok(Self {
-            socket: socket.try_clone().map_err(io_to_link)?,
-            restore,
-        })
-    }
-
-    fn clamp(&self, deadline: std::time::Instant) -> Result<(), LinkError> {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let timeout = self.restore.min(remaining).max(Duration::from_millis(1));
-        self.socket
-            .set_read_timeout(Some(timeout))
-            .and_then(|_| self.socket.set_write_timeout(Some(timeout)))
-            .map_err(io_to_link)
-    }
-}
-
-impl Drop for SocketDeadlineGuard {
-    fn drop(&mut self) {
-        let _ = self.socket.set_read_timeout(Some(self.restore));
-        let _ = self.socket.set_write_timeout(Some(self.restore));
-    }
+fn set_socket_timeout(conn: &Conn, timeout: Duration) -> Result<(), LinkError> {
+    conn.reader
+        .get_ref()
+        .set_read_timeout(Some(timeout))
+        .and_then(|_| conn.writer.set_write_timeout(Some(timeout)))
+        .map_err(|error| socket_config_error(&conn.writer, error))
 }
 
 impl TcpLink {
@@ -57,7 +35,7 @@ impl TcpLink {
         &mut self,
         method: &str,
         params: Value,
-        mut observer: Option<&mut ProgressObserver<'_>>,
+        observer: Option<&mut ProgressObserver<'_>>,
         control: Option<&ProgressCallControl>,
     ) -> Result<Value, LinkError> {
         if let Some(control) = control.filter(|control| control.temporal_stop_ms.is_some()) {
@@ -79,8 +57,31 @@ impl TcpLink {
             if result.is_err() {
                 self.drop_conn();
             }
-            return result;
+            return result.and_then(|terminal| terminal.result);
         }
+        let result = self.raw_call_bounded(method, params, observer, control);
+        if let Some(conn) = self.conn.as_ref() {
+            if let Err(error) = set_socket_timeout(conn, self.timeout) {
+                self.drop_conn();
+                return Err(error);
+            }
+        }
+        result
+    }
+
+    fn clamp_socket_deadline(&self, deadline: std::time::Instant) -> Result<(), LinkError> {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let timeout = self.timeout.min(remaining).max(Duration::from_millis(1));
+        set_socket_timeout(self.conn.as_ref().ok_or(LinkError::NotConnected)?, timeout)
+    }
+
+    fn raw_call_bounded(
+        &mut self,
+        method: &str,
+        params: Value,
+        mut observer: Option<&mut ProgressObserver<'_>>,
+        control: Option<&ProgressCallControl>,
+    ) -> Result<Value, LinkError> {
         // Start the admitted host deadline before the request write. Socket reads and writes are
         // clamped to the remaining time so a short recording deadline cannot be exceeded by the
         // link's ordinary per-I/O timeout.
@@ -90,11 +91,7 @@ impl TcpLink {
             .unwrap_or(self.deferred_deadline)
             .min(self.deferred_deadline);
         let deadline = std::time::Instant::now() + call_deadline;
-        let deadline_guard = {
-            let conn = self.conn.as_ref().ok_or(LinkError::NotConnected)?;
-            SocketDeadlineGuard::new(conn.reader.get_ref(), self.timeout)?
-        };
-        deadline_guard.clamp(deadline)?;
+        self.clamp_socket_deadline(deadline)?;
 
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
@@ -131,7 +128,7 @@ impl TcpLink {
             }
             let read_is_deadline_clamped =
                 deadline.saturating_duration_since(std::time::Instant::now()) <= self.timeout;
-            deadline_guard.clamp(deadline)?;
+            self.clamp_socket_deadline(deadline)?;
             let read_result = {
                 let conn = self.conn.as_mut().ok_or(LinkError::NotConnected)?;
                 read_ndjson_frame(&mut conn.reader, &mut conn.pending)

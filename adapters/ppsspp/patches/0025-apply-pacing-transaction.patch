@@ -1,0 +1,148 @@
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -39,8 +39,26 @@
+     EmucapPacingSnapshot applied;
+ };
+ 
++struct EmucapPacingApply {
++    bool accepted;
++    EmucapPacingSnapshot previous;
++    EmucapPacingSnapshot applied;
++};
++
+ class EmucapPacingOwner {
+ public:
++    EmucapPacingApply ApplySpeed(int percent) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        const auto previous = policy_;
++        if (percent < 0 || percent > 10000 || policy_.NetworkForced())
++            return {false, previous, previous};
++        policy_.percent = percent;
++        policy_.fastForward = false;
++        policy_.fpsLimit = FPSLimit::NORMAL;
++        ++policy_.revision;
++        return {true, previous, policy_};
++
++    }
+     EmucapPacingSnapshot Read() const {
+         std::lock_guard<std::mutex> guard(mutex_);
+         return policy_;
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -37,6 +37,7 @@
+ // emucap agent pacing: a percent of the PSP refresh used in place of the normal limit, 0 for
+ // unlimited. Held keys, custom limits and fast-forward still take precedence.
+ void __DisplaySetEmucapSpeed(int percent);
++EmucapPacingApply __DisplayApplyEmucapSpeed(int percent);
+ EmucapPacingSnapshot __DisplayGetEmucapPacing();
+ void __DisplayInitializeEmucapPacing(bool fastForward);
+ void __DisplaySetEmucapFastForward(bool value);
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -411,6 +411,10 @@
+     emucapPacing.RestoreAdhoc(state, initialized, controlInitialized, next, connected, init, controlInit);
+ }
+ 
++EmucapPacingApply __DisplayApplyEmucapSpeed(int percent) {
++    return emucapPacing.ApplySpeed(percent);
++}
++
+ void __DisplaySetEmucapSpeed(int percent) {
+ 	emucapPacing.SetPercent(percent);
+ }
+diff --git a/Core/Debugger/WebSocket/SteppingSubscriber.cpp b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+--- a/Core/Debugger/WebSocket/SteppingSubscriber.cpp
++++ b/Core/Debugger/WebSocket/SteppingSubscriber.cpp
+@@ -206,45 +206,50 @@
+ // Response: percent (0 is unlimited), fast_forward, fps_limit (0 normal, 1/2 custom, 3 analog),
+ // network_forced, revision (changes with any of these), vblank.
+ void WebSocketSteppingState::Pacing(DebuggerRequest &req) {
+-	const bool unlimited = req.HasParam("unlimited");
+-	if (unlimited && req.HasParam("percent"))
+-		return req.Fail("use percent or unlimited, not both");
+-	if (unlimited) {
+-		bool value = false;
+-		if (!req.ParamBool("unlimited", &value) || !value)
+-			return req.Fail("unlimited must be true");
+-		if (!NetworkAllowSpeedControl())
+-			return req.Fail("network policy prevents speed control");
+-		__DisplaySetEmucapSpeed(0);
+-	} else if (req.HasParam("percent")) {
+-		uint32_t percent = 0;
+-		if (!req.ParamU32("percent", &percent))
+-			return;
+-		if (percent == 0 || percent > 10000)
+-			return req.Fail("percent must be between 1 and 10000");
+-		if (!NetworkAllowSpeedControl())
+-			return req.Fail("network policy prevents speed control");
+-		__DisplaySetEmucapSpeed((int)percent);
+-	}
+-    const auto pacing = __DisplayGetEmucapPacing();
+-	const int percent = pacing.percent;
+-	const bool fastForward = pacing.fastForward;
+-	const int fpsLimit = (int)pacing.fpsLimit;
+-	const bool networkForced = pacing.NetworkForced();
+-	static std::string lastKey;
+-	static uint32_t revision = 0;
+-	const std::string key = StringFromFormat("%d|%d|%d|%d|%u", percent, fastForward, fpsLimit, networkForced, pacing.revision);
+-	if (key != lastKey) {
+-		lastKey = key;
+-		revision++;
+-	}
+-	JsonWriter &json = req.Respond();
+-	json.writeUint("percent", (uint32_t)percent);
+-	json.writeBool("fast_forward", fastForward);
+-	json.writeUint("fps_limit", (uint32_t)fpsLimit);
+-	json.writeBool("network_forced", networkForced);
+-	json.writeUint("revision", revision);
+-	json.writeUint("vblank", (uint32_t)__DisplayGetNumVblanks());
++    const bool unlimited = req.HasParam("unlimited");
++    const bool setting = unlimited || req.HasParam("percent");
++    if (unlimited && req.HasParam("percent"))
++        return req.Fail("use percent or unlimited, not both");
++    uint32_t percent = 0;
++    if (unlimited) {
++        bool value = false;
++        if (!req.ParamBool("unlimited", &value) || !value)
++            return req.Fail("unlimited must be true");
++    } else if (setting) {
++        if (!req.ParamU32("percent", &percent))
++            return;
++        if (percent == 0 || percent > 10000)
++            return req.Fail("percent must be between 1 and 10000");
++    }
++    const uint32_t beginFrame = (uint32_t)__DisplayGetNumVblanks();
++    EmucapPacingApply change{};
++    EmucapPacingSnapshot current;
++    if (setting) {
++        change = __DisplayApplyEmucapSpeed((int)percent);
++        current = change.applied;
++    } else {
++        current = __DisplayGetEmucapPacing();
++    }
++    const uint32_t endFrame = (uint32_t)__DisplayGetNumVblanks();
++    JsonWriter &json = req.Respond();
++    auto writePolicy = [&](const EmucapPacingSnapshot &policy, uint32_t frame) {
++        json.writeUint("percent", (uint32_t)policy.percent);
++        json.writeBool("fast_forward", policy.fastForward);
++        json.writeUint("fps_limit", (uint32_t)policy.fpsLimit);
++        json.writeBool("network_forced", policy.NetworkForced());
++        json.writeUint("revision", policy.revision);
++        json.writeUint("vblank", frame);
++    };
++    json.writeUint("transaction_version", 1);
++    writePolicy(current, endFrame);
++    if (setting) {
++        json.writeString("outcome", change.accepted ? "completed" : "rejected");
++        json.pushDict("previous");
++        writePolicy(change.previous, beginFrame);
++        json.pop();
++        json.writeString("clock_domain", "psp_vblank");
++        json.writeUint("begin_vblank", beginFrame);
++    }
+ }
+ 
+ static DebugInterface *CPUFromRequest(DebuggerRequest &req, uint32_t *threadID = nullptr) {

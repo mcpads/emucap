@@ -1,0 +1,315 @@
+--- a/src/ss/ss.cpp
++++ b/src/ss/ss.cpp
+@@ -139,6 +139,17 @@
+ static uint32 SH7095_DB;
+ #include "scu.inc"
+ 
++// The native dispatcher owns the continuation across debugger replacement.
++struct RestoredDispatch { };
++static bool FrameActive = false;
++static bool FrameDebugMode = false;
++static uint32 DispatchCPU = 0;
++static sscpu_timestamp_t SchedulerTime = 0;
++static bool ResumeDispatch = false;
++static bool SkipRestoredCPUHook = false;
++extern "C" bool emucap_native_restore_pending(void);
++extern "C" bool emucap_native_restore_service(bool instruction_ready);
++
+ #include "debug.inc"
+ 
+ static sha256_digest BIOS_SHA256;	// SHA-256 hash of the currently-loaded BIOS; used for save state sanity checks.
+@@ -697,11 +708,18 @@
+ template<bool EmulateICache, bool DebugMode>
+ static INLINE int32 RunLoop_INLINE(EmulateSpecStruct* espec)
+ {
+- sscpu_timestamp_t eff_ts = 0;
++ sscpu_timestamp_t& eff_ts = SchedulerTime;
+ 
+  for(unsigned c = 0; c < 2; c++)
+   CPU[c].SetDebugMode(DebugMode);
+ 
++ if(ResumeDispatch)
++ {
++  ResumeDispatch = false;
++  if(DispatchCPU == 1)
++   goto SlaveDispatch;
++  goto MasterDispatch;
++ }
+  //printf("%d %d\n", SH7095_mem_timestamp, CPU[0].timestamp);
+  do
+  {
+@@ -714,6 +732,8 @@
+   {
+    do
+    {
++    MasterDispatch:
++    DispatchCPU = 0;
+     if(DebugMode)
+     {
+      DBG_SetEffTS(eff_ts);
+@@ -723,6 +743,8 @@
+     CPU[0].Step<0, EmulateICache, DebugMode>();
+     CPU[0].DMA_BusTimingKludge();
+ 
++    SlaveDispatch:
++    DispatchCPU = 1;
+     if(EmulateICache)
+     {
+      if(DebugMode)
+@@ -773,6 +795,8 @@
+ // Must not be called within an event or read/write handler.
+ void SS_Reset(bool powering_up)
+ {
++ DispatchCPU = 0;
++ ResumeDispatch = FrameActive;
+  SH7095_BusLock = 0;
+ 
+  if(powering_up)
+@@ -859,12 +883,26 @@
+  int32 end_ts;
+ 
+  espec = espec_arg;
+- AllowMidSync = true;
+  MDFNGameInfo->mouse_sensitivity = MDFN_GetSettingF("ss.input.mouse_sensitivity");
+ 
+- cur_clock_div = SMPC_StartFrame(espec);
+- UpdateSMPCInput(0);
+- VDP2::StartFrame(espec, cur_clock_div == 61);
++ for(;;)
++ {
++ try
++ {
++ if(!FrameActive)
++ {
++  FrameDebugMode = DBG_NeedCPUHooks();
++  AllowMidSync = true;
++  cur_clock_div = SMPC_StartFrame(espec);
++  UpdateSMPCInput(0);
++  VDP2::StartFrame(espec, cur_clock_div == 61);
++  SchedulerTime = 0;
++  DispatchCPU = 0;
++  ResumeDispatch = false;
++  FrameActive = true;
++ }
++ else
++  VDP2::ResumeFrame(espec);
+  SOUND_StartFrame(espec->SoundRate / espec->soundmultiplier, MDFN_GetSettingUI("ss.scsp.resamp_quality"));
+  CART_SetCPUClock(MDFNGameInfo->MasterClock / MDFN_MASTERCLOCK_FIXED(1), cur_clock_div);
+  espec->SoundBufSize = 0;
+@@ -885,7 +923,32 @@
+   { RunLoop<true>,  RLTDAT(true)  },	// EmulateICache=true
+  };
+ #undef RLTDAT
+- end_ts = rltab[NeedEmuICache][DBG_NeedCPUHooks()](espec);
++ end_ts = rltab[NeedEmuICache][FrameDebugMode](espec);
++ break;
++ }
++ catch(const RestoredDispatch&)
++ {
++  // Both master and cache/non-cache slave stacks have unwound here.
++  bool instruction_ready;
++  do
++  {
++   DBG_SetEffTS(SchedulerTime);
++   instruction_ready = FrameActive
++#ifdef WANT_DEBUGGER
++      && DispatchCPU == DBG.ActiveCPU
++#endif
++      && (CPU[DispatchCPU].Pipe_ID >> 24) != 0x7E
++      && (CPU[DispatchCPU].Pipe_ID >> 24) != 0xFE
++      && (CPU[DispatchCPU].Pipe_ID >> 24) != 0x7F
++      && (CPU[DispatchCPU].Pipe_ID >> 24) != 0xFF;
++  } while(emucap_native_restore_service(instruction_ready));
++  // The acknowledged instruction entry has already consumed its callback.
++  SkipRestoredCPUHook = instruction_ready;
++  ResumeDispatch = FrameActive;
++  espec->SoundBufSize_InternalProcessed = espec->SoundBufSize_DriverProcessed = 0;
++  espec->MasterCycles_InternalProcessed = espec->MasterCycles_DriverProcessed = 0;
++ }
++ }
+  assert(end_ts >= 0);
+  ForceEventUpdates(end_ts);
+  //
+@@ -968,6 +1031,11 @@
+    }
+   }
+  }
++ FrameActive = false;
++ FrameDebugMode = false;
++ DispatchCPU = 0;
++ SchedulerTime = 0;
++ ResumeDispatch = false;
+ }
+ 
+ static void OutputMIDI(uint8 v)
+@@ -2136,6 +2204,13 @@
+  //
+  //
+  //
++ if(load)
++ {
++  FrameActive = false;
++  FrameDebugMode = false;
++  DispatchCPU = 0;
++  SchedulerTime = 0;
++ }
+  bool RecordedNeedEmuICache = load ? false : NeedEmuICache;
+  EventsPacker ep;
+  ep.Save();
+@@ -2144,7 +2219,13 @@
+ 
+  SFORMAT StateRegs[] = 
+  {
+-  // cur_clock_div
++  SFVAR(FrameActive),
++  SFVAR(FrameDebugMode),
++  SFVAR(Running),
++  SFVAR(DispatchCPU),
++  SFVAR(SchedulerTime),
++  SFVAR(cur_clock_div),
++  SFVAR(AllowMidSync),
+   SFVAR(UpdateInputLastBigTS),
+ 
+   SFVAR(next_event_ts),
+@@ -2204,6 +2285,9 @@
+    InitEvents();
+   }
+ 
++  if(DispatchCPU > 1)
++   throw MDFN_Error(0, "Invalid Saturn dispatch CPU");
++  ResumeDispatch = FrameActive;
+   CPU[0].PostStateLoad(load, RecordedNeedEmuICache, NeedEmuICache);
+   CPU[1].PostStateLoad(load, RecordedNeedEmuICache, NeedEmuICache);
+  }
+--- a/src/ss/debug.inc
++++ b/src/ss/debug.inc
+@@ -478,6 +478,16 @@
+   return;
+  }
+ 
++ if(SkipRestoredCPUHook && DispatchCPU == which)
++ {
++  SkipRestoredCPUHook = false;
++  return;
++ }
++ // Pseudo pipeline operations service reset/exception/idle work, not an opcode.
++ const uint32 pipe_op = CPU[which].Pipe_ID >> 24;
++ if(pipe_op == 0x7E || pipe_op == 0xFE || pipe_op == 0x7F || pipe_op == 0xFF)
++  return;
++
+ #if 0
+  if(LogFunc)
+  {
+@@ -528,6 +538,8 @@
+  //
+  // No, no, this isn't right for dual-CPUs(FIXME):
+  DBG.CurPC[which] = CPU[which].GetRegister(SH7095::GSREG_PC_ID, NULL, 0);
++ if(emucap_native_restore_pending())
++  throw RestoredDispatch{};
+ }
+ 
+ 
+--- a/src/ss/vdp2.cpp
++++ b/src/ss/vdp2.cpp
+@@ -347,6 +347,11 @@
+ void GetGunXTranslation(const bool clock28m, float* scale, float* offs)
+ {
+  VDP2REND_GetGunXTranslation(clock28m, scale, offs);
++}
++
++void ResumeFrame(EmulateSpecStruct* espec)
++{
++ VDP2REND_ResumeFrame(espec);
+ }
+ 
+ void StartFrame(EmulateSpecStruct* espec, const bool clock28m)
+--- a/src/ss/vdp2.h
++++ b/src/ss/vdp2.h
+@@ -43,6 +43,7 @@
+ void AdjustTS(const int32 delta);
+ 
+ void GetGunXTranslation(const bool clock28m, float* scale, float* offs);
++void ResumeFrame(EmulateSpecStruct* espec);
+ void StartFrame(EmulateSpecStruct* espec, const bool clock28m);
+ 
+ INLINE bool GetVBOut(void) { MDFN_HIDE extern bool VBOut; return VBOut; }
+--- a/src/ss/vdp2_render.cpp
++++ b/src/ss/vdp2_render.cpp
+@@ -45,6 +45,9 @@
+ static bool DoHBlend;
+ static int LineVisFirst, LineVisLast;
+ static uint32 NextOutLine;
++static MDFN_Rect RestoredRect;
++static bool RestoredInterlace;
++static int RestoredField;
+ static bool Clock28M;
+ static unsigned VisibleLines;
+ static VDP2Rend_LIB LIB[256];
+@@ -3400,6 +3403,14 @@
+  }
+ }
+ 
++void VDP2REND_ResumeFrame(EmulateSpecStruct* target)
++{
++ espec = target;
++ espec->DisplayRect = RestoredRect;
++ espec->InterlaceOn = RestoredInterlace;
++ espec->InterlaceField = RestoredField;
++}
++
+ void VDP2REND_StartFrame(EmulateSpecStruct* espec_arg, const bool clock28m, const int SurfInterlaceField)
+ {
+  NextOutLine = 0;
+@@ -3449,6 +3460,9 @@
+   } while(++NextOutLine < VisibleLines);
+  }
+ 
++ RestoredRect = espec->DisplayRect;
++ RestoredInterlace = espec->InterlaceOn;
++ RestoredField = espec->InterlaceField;
+  espec = NULL;
+ }
+ 
+@@ -3528,8 +3542,23 @@
+  //
+  //
+  //
++ if(!load && espec)
++ {
++  RestoredRect = espec->DisplayRect;
++  RestoredInterlace = espec->InterlaceOn;
++  RestoredField = espec->InterlaceField;
++ }
++ if(load)
++  NextOutLine = 0;
+  SFORMAT StateRegs[] =
+  {
++  SFVAR(NextOutLine),
++  SFVAR(RestoredRect.x),
++  SFVAR(RestoredRect.y),
++  SFVAR(RestoredRect.w),
++  SFVAR(RestoredRect.h),
++  SFVAR(RestoredInterlace),
++  SFVAR(RestoredField),
+   SFVAR(Clock28M),	// DUBIOUS
+ 
+   SFVAR(MosaicVCount),
+@@ -3576,6 +3605,8 @@
+ 
+  if(load)
+  {
++  if(espec)
++   VDP2REND_ResumeFrame(espec);
+   memcpy(VRAM, vr, sizeof(VRAM));
+   memcpy(CRAM, cr, sizeof(CRAM));
+ 
+--- a/src/ss/vdp2_render.h
++++ b/src/ss/vdp2_render.h
+@@ -29,6 +29,7 @@
+ void VDP2REND_SetGetVideoParams(MDFNGI* gi, const bool caspect, const int sls, const int sle, const bool show_h_overscan, const bool dohblend) MDFN_COLD;
+ void VDP2REND_Kill(void) MDFN_COLD;
+ void VDP2REND_GetGunXTranslation(const bool clock28m, float* scale, float* offs);
++void VDP2REND_ResumeFrame(EmulateSpecStruct* espec);
+ void VDP2REND_StartFrame(EmulateSpecStruct* espec, const bool clock28m, const int SurfInterlaceField);
+ void VDP2REND_EndFrame(void);
+ void VDP2REND_Reset(bool powering_up) MDFN_COLD;

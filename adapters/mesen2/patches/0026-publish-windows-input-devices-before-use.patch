@@ -1,0 +1,77 @@
+--- a/Windows/WindowsKeyManager.h
++++ b/Windows/WindowsKeyManager.h
+@@ -30,6 +30,7 @@
+ 
+ 	thread _updateDeviceThread;
+ 	atomic<bool> _stopUpdateDeviceThread = false;
++	atomic<bool> _devicesReady = false;
+ 	bool _disableAllKeys = false;
+ 
+ 	void StartUpdateDeviceThread();
+--- a/Windows/WindowsKeyManager.cpp
++++ b/Windows/WindowsKeyManager.cpp
+@@ -63,6 +63,7 @@
+ 	_updateDeviceThread = std::thread([=]() {
+ 		_xInput.reset(new XInputManager(_emu));
+ 		_directInput.reset(new DirectInputManager(_emu, _hWnd));
++		_devicesReady.store(true, std::memory_order_release);
+ 
+ 		while(!_stopUpdateDeviceThread) {
+ 			//Check for newly plugged in XInput controllers every 5 secs
+@@ -77,7 +78,7 @@
+ 
+ void WindowsKeyManager::RefreshState()
+ {
+-	if(!_xInput || !_directInput) {
++	if(!_devicesReady.load(std::memory_order_acquire)) {
+ 		return;
+ 	}
+ 
+@@ -92,7 +93,7 @@
+ 	}
+ 
+ 	if(key >= WindowsKeyManager::BaseGamepadIndex) {
+-		if(!_xInput || !_directInput) {
++		if(!_devicesReady.load(std::memory_order_acquire)) {
+ 			return false;
+ 		}
+ 
+@@ -116,7 +117,7 @@
+ optional<int16_t> WindowsKeyManager::GetAxisPosition(uint16_t key)
+ {
+ 	if(key >= WindowsKeyManager::BaseGamepadIndex) {
+-		if(!_xInput || !_directInput) {
++		if(!_devicesReady.load(std::memory_order_acquire)) {
+ 			return std::nullopt;
+ 		}
+ 
+@@ -143,7 +144,7 @@
+ vector<uint16_t> WindowsKeyManager::GetPressedKeys()
+ {
+ 	vector<uint16_t> result;
+-	if(!_xInput || !_directInput) {
++	if(!_devicesReady.load(std::memory_order_acquire)) {
+ 		return result;
+ 	}
+ 
+@@ -193,7 +194,7 @@
+ 
+ void WindowsKeyManager::UpdateDevices()
+ {
+-	if(!_xInput || !_directInput) {
++	if(!_devicesReady.load(std::memory_order_acquire)) {
+ 		return;
+ 	}
+ 
+@@ -217,7 +218,10 @@
+ 
+ void WindowsKeyManager::SetForceFeedback(uint16_t magnitudeRight, uint16_t magnitudeLeft)
+ {
+-	_xInput->SetForceFeedback(magnitudeRight, magnitudeLeft);
++	// ROM loading can stop rumble before asynchronous device discovery completes.
++	if(_devicesReady.load(std::memory_order_acquire)) {
++		_xInput->SetForceFeedback(magnitudeRight, magnitudeLeft);
++	}
+ }
+ 
+ void WindowsKeyManager::ResetKeyState()

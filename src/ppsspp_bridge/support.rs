@@ -36,6 +36,8 @@ pub(super) fn error_kind(err: &BridgeError) -> &'static str {
     match err {
         BridgeError::BadParams(_) => "bad_params",
         BridgeError::BadState(_) => "bad_state",
+        BridgeError::Busy => "busy",
+        BridgeError::Cancelled => "cancelled",
         BridgeError::UnknownMethod(_) => "unknown_method",
         BridgeError::Unsupported(_) => "unsupported",
         BridgeError::Emulator(_) => "emulator_error",
@@ -231,7 +233,7 @@ pub(super) fn required_str<'a>(params: &'a Value, key: &str) -> BridgeResult<&'a
 pub(super) fn sha1_file(path: &Path) -> std::io::Result<String> {
     let mut hasher = Sha1::new();
     let mut file = File::open(path)?;
-    let mut buf = [0u8; 1024 * 1024];
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {

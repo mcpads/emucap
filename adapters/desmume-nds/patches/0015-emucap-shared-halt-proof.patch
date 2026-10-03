@@ -1,0 +1,70 @@
+--- a/desmume/src/gdbstub/gdbstub.cpp
++++ b/desmume/src/gdbstub/gdbstub.cpp
+@@ -140,9 +140,20 @@
+   }
+ }
+ 
++// Accessed only with cpu_mutex held. A requested CPU stall is not a parked scheduler.
++static bool emucap_scheduler_parked = false;
++void emucap_gdbstub_scheduler_parked(bool parked) {
++  emucap_scheduler_parked = parked;
++}
++static bool emucap_shared_halt_verified() {
++  return emucap_scheduler_parked && emucap_gdb_stubs[0] != NULL &&
++      emucap_gdb_stubs[1] != NULL && NDS_ARM9.stalled && NDS_ARM7.stalled;
++}
++
+ // Requests the stub answers while the guest runs: they read or set pacing and override counters
+ // only, so they neither touch guest state nor need a stopped CPU.
+ static bool emucap_running_safe_packet(const uint8_t *packet) {
++  if (strcmp((const char *)packet, "qEmucap,haltstate") == 0) return true;
+   static const char *const prefixes[] = {
+     "qEmucap,batch:", "qEmucap,pacing", "QEmucap,pacing:", "qEmucap,inputstatus", "qEmucap,touchstatus",
+   };
+@@ -443,6 +454,7 @@
+ }
+ 
+ static void emucap_start_gdb_stubs() {
++  emucap_gdbstub_scheduler_parked(false);
+   for (int i = 0; i < 2; i++) {
+     struct gdb_stub_state *stub = emucap_gdb_stubs[i];
+     if (stub == NULL) continue;
+@@ -1314,6 +1326,12 @@
+         send_reply = 0;
+       }
+       /* else: fall through to the empty reply, which the bridge reads as an error */
++    }
++    // processPacket holds cpu_mutex; the scheduler publishes only at its debug idle gate.
++    else if (strcmp((const char *)packet, "qEmucap,haltstate") == 0) {
++      send_size = snprintf((char *)out_ptr, BUFMAX, "HALT|1|%s|%llx",
++          emucap_shared_halt_verified() ? "parked" : "running",
++          (unsigned long long)emucap_vblank_clock.load());
+     }
+     // Timed override status: 0=terminal/released, -1=persistent hold, >0=frames remaining.
+     else if ( strncmp( (const char *)packet, "qEmucap,inputstatus", 19) == 0) {
+--- a/desmume/src/NDSSystem.cpp
++++ b/desmume/src/NDSSystem.cpp
+@@ -70,6 +70,7 @@
+ // Implemented by the GDB stub; advances emucap's shared-scheduler frame clock
+ // after this file completes one VBlank-start event.
+ void emucap_gdbstub_vblank_start_complete();
++void emucap_gdbstub_scheduler_parked(bool parked);
+ #define GDBSTUB_MUTEX_LOCK() gdbstub_mutex_lock()
+ #define GDBSTUB_MUTEX_UNLOCK() gdbstub_mutex_unlock()
+ #else
+@@ -2147,9 +2148,15 @@
+ 
+ 					while((NDS_ARM9.stalled || NDS_ARM7.stalled) && execute)
+ 					{
++#ifdef GDB_STUB
++                        emucap_gdbstub_scheduler_parked(true);
++#endif
+ 						GDBSTUB_MUTEX_UNLOCK();
+ 						driver->EMU_DebugIdleUpdate();
+ 						GDBSTUB_MUTEX_LOCK();
++#ifdef GDB_STUB
++                        emucap_gdbstub_scheduler_parked(false);
++#endif
+ 						nds_debug_continuing[0] = nds_debug_continuing[1] = true;
+ 					}
+ 

@@ -1,0 +1,61 @@
+--- a/pcsx2/SaveState.cpp
++++ b/pcsx2/SaveState.cpp
+@@ -13,6 +13,8 @@
+ #include "Elfheader.h"
+ #include "GS.h"
+ #include "GS/GS.h"
++#include "GS/Renderers/Common/GSDeinterlaceHistory.h"
++#include <array>
+ #include "Host.h"
+ #include "MTGS.h"
+ #include "MTVU.h"
+@@ -643,13 +645,33 @@
+ 	bool IsRequired() const override { return true; }
+ };
+ 
++// GS history is variable-sized. The current renderer cannot determine a saved
++// entry's length, especially after reset, a resolution change or a legacy load.
++static bool SysState_GSFreezeIn(zip_file_t* zf)
++{
++ if (!zf) return true;
++ constexpr std::size_t limit = GSDeinterlaceHistory::MaxPixels * sizeof(u32) + 16 * 1024 * 1024;
++ std::vector<u8> data;
++ std::array<u8, 64 * 1024> block;
++ for (;;) {
++  const zip_int64_t count = zip_fread(zf, block.data(), block.size());
++  if (count < 0) return false;
++  if (!count) break;
++  if (static_cast<std::size_t>(count) > limit - data.size()) return false;
++  data.insert(data.end(), block.data(), block.data() + count);
++ }
++ if (data.empty()) return false;
++ freezeData state = {static_cast<int>(data.size()), data.data()};
++ return SysState_MTGSFreeze(FreezeAction::Load, &state) == 0;
++}
++
+ class SavestateEntry_GS final : public BaseSavestateEntry
+ {
+ public:
+ 	~SavestateEntry_GS() = default;
+ 
+ 	const char* GetFilename() const { return "GS.bin"; }
+-	bool FreezeIn(zip_file_t* zf) const { return SysState_ComponentFreezeIn(zf, GS); }
++	bool FreezeIn(zip_file_t* zf) const { return SysState_GSFreezeIn(zf); }
+ 	bool FreezeOut(SaveStateBase& writer) const { return SysState_ComponentFreezeOut(writer, GS); }
+ 	bool IsRequired() const { return true; }
+ };
+--- a/pcsx2/GS/GS.cpp
++++ b/pcsx2/GS/GS.cpp
+@@ -462,10 +462,8 @@
+ 	}
+ 	else // if (mode == FreezeAction::Load)
+ 	{
+-		// Since Defrost doesn't do a hardware reset (since it would be clearing
+-		// local memory just before it's overwritten), we have to manually wipe
+-		// out the current textures.
+-		g_gs_device->ClearCurrent();
++		// Defrost validates the complete history before its virtual Reset(true)
++		// clears current textures. Malformed data must not clear them early.
+ 
+ 		// Dump audio frames in video capture if it's been started, otherwise we get
+ 		// a buildup of audio frames from the CPU thread.

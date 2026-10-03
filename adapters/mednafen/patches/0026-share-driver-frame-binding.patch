@@ -1,0 +1,45 @@
+--- a/src/drivers/main.cpp
++++ b/src/drivers/main.cpp
+@@ -1284,6 +1284,23 @@
+  return true;
+ }
+ 
++EmulateSpecStruct emucap_frame_binding(bool skip)
++{
++ EmulateSpecStruct espec;
++
++ espec.surface = SoftFB[SoftFB_BackBuffer].surface.get();
++ espec.LineWidths = SoftFB[SoftFB_BackBuffer].lw.get();
++ espec.skip = skip;
++ espec.soundmultiplier = CurGameSpeed;
++ espec.NeedRewind = DNeedRewind;
++
++ espec.SoundRate = Sound_GetRate();
++ espec.SoundBuf = Sound_GetEmuModBuffer(&espec.SoundBufMaxSize);
++ espec.SoundVolume = (double)MDFN_GetSettingUI("sound.volume") / 100;
++
++ return espec;
++}
++
+ static int GameLoop(void *arg)
+ {
+ 	while(GameThreadRun)
+@@ -1328,17 +1345,7 @@
+ 	 //
+ 	 //
+ 	 //
+-	 EmulateSpecStruct espec;
+-
+-         espec.surface = SoftFB[SoftFB_BackBuffer].surface.get();
+-         espec.LineWidths = SoftFB[SoftFB_BackBuffer].lw.get();
+-	 espec.skip = fskip;
+-	 espec.soundmultiplier = CurGameSpeed;
+-	 espec.NeedRewind = DNeedRewind;
+-
+- 	 espec.SoundRate = Sound_GetRate();
+-	 espec.SoundBuf = Sound_GetEmuModBuffer(&espec.SoundBufMaxSize);
+- 	 espec.SoundVolume = (double)MDFN_GetSettingUI("sound.volume") / 100;
++	 EmulateSpecStruct espec = emucap_frame_binding(fskip);
+ 
+ 	 if(MDFN_UNLIKELY(StateFuzzTest))
+ 	 {

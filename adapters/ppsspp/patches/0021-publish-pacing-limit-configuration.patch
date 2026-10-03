@@ -1,0 +1,209 @@
+diff --git a/Core/EmucapPacing.h b/Core/EmucapPacing.h
+--- a/Core/EmucapPacing.h
++++ b/Core/EmucapPacing.h
+@@ -17,6 +17,9 @@
+     bool fastForward = false;
+     FPSLimit fpsLimit = FPSLimit::NORMAL;
+     int analogFpsLimit = 0;
++    int customFps1 = 0;
++    int customFps2 = -1;
++    int analogTargetFps = 240;
+     uint32_t revision = 0;
+ };
+ 
+@@ -66,12 +69,12 @@
+         return true;
+     }
+ 
+-    void CycleLimit(bool custom1Enabled, bool custom2Enabled) {
++    void CycleLimit() {
+         std::lock_guard<std::mutex> guard(mutex_);
+         const auto previous = policy_.fpsLimit;
+-        if (previous == FPSLimit::NORMAL && custom1Enabled)
++        if (previous == FPSLimit::NORMAL && policy_.customFps1 >= 0)
+             policy_.fpsLimit = FPSLimit::CUSTOM1;
+-        else if (previous == FPSLimit::CUSTOM1 && custom2Enabled)
++        else if (previous == FPSLimit::CUSTOM1 && policy_.customFps2 >= 0)
+             policy_.fpsLimit = FPSLimit::CUSTOM2;
+         else if (previous == FPSLimit::CUSTOM1 || previous == FPSLimit::CUSTOM2)
+             policy_.fpsLimit = FPSLimit::NORMAL;
+@@ -79,14 +82,28 @@
+             ++policy_.revision;
+     }
+ 
+-    bool SetAnalogLimit(int fps) {
++    bool SetAnalogInput(float amount) {
+         std::lock_guard<std::mutex> guard(mutex_);
+         if (policy_.fpsLimit != FPSLimit::NORMAL && policy_.fpsLimit != FPSLimit::ANALOG)
+             return false;
++        if (policy_.analogTargetFps <= 0)
++            return false;
++        const int fps = 60 + (int)((policy_.analogTargetFps - 60) * amount);
+         policy_.analogFpsLimit = fps;
+         policy_.fpsLimit = fps == 60 ? FPSLimit::NORMAL : FPSLimit::ANALOG;
+         ++policy_.revision;
+         return true;
++    }
++
++    void ConfigureLimits(int custom1, int custom2, int analog) {
++        std::lock_guard<std::mutex> guard(mutex_);
++        if (policy_.customFps1 == custom1 && policy_.customFps2 == custom2 &&
++            policy_.analogTargetFps == analog)
++            return;
++        policy_.customFps1 = custom1;
++        policy_.customFps2 = custom2;
++        policy_.analogTargetFps = analog;
++        ++policy_.revision;
+     }
+ 
+ private:
+diff --git a/Core/HLE/sceDisplay.h b/Core/HLE/sceDisplay.h
+--- a/Core/HLE/sceDisplay.h
++++ b/Core/HLE/sceDisplay.h
+@@ -42,8 +42,9 @@
+ void __DisplaySetEmucapFastForward(bool value);
+ bool __DisplayGetEmucapFastForward();
+ bool __DisplayChangeEmucapLimit(FPSLimit expected, FPSLimit next);
+-void __DisplayCycleEmucapLimit(bool custom1Enabled, bool custom2Enabled);
+-bool __DisplaySetEmucapAnalogLimit(int fps);
++void __DisplayCycleEmucapLimit();
++bool __DisplaySetEmucapAnalogInput(float amount);
++void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog);
+ int __DisplayGetEmucapSpeed();
+ // Changes whenever the agent speed changes, so a wait computed for the old target can end.
+ uint32_t __DisplayEmucapPacingGeneration();
+diff --git a/Core/HLE/sceDisplay.cpp b/Core/HLE/sceDisplay.cpp
+--- a/Core/HLE/sceDisplay.cpp
++++ b/Core/HLE/sceDisplay.cpp
+@@ -380,12 +380,16 @@
+     return emucapPacing.ChangeLimit(expected, next);
+ }
+ 
+-void __DisplayCycleEmucapLimit(bool custom1Enabled, bool custom2Enabled) {
+-    emucapPacing.CycleLimit(custom1Enabled, custom2Enabled);
+-}
+-
+-bool __DisplaySetEmucapAnalogLimit(int fps) {
+-    return emucapPacing.SetAnalogLimit(fps);
++void __DisplayCycleEmucapLimit() {
++    emucapPacing.CycleLimit();
++}
++
++bool __DisplaySetEmucapAnalogInput(float amount) {
++    return emucapPacing.SetAnalogInput(amount);
++}
++
++void __DisplayConfigureEmucapLimits(int custom1, int custom2, int analog) {
++    emucapPacing.ConfigureLimits(custom1, custom2, analog);
+ }
+ 
+ void __DisplaySetEmucapSpeed(int percent) {
+@@ -424,9 +428,9 @@
+ 		return 0;
+ 	// Can't slow down in hardcore mode.
+ 	if (pacing.fpsLimit == FPSLimit::CUSTOM1)
+-		return fixRate(g_Config.iFpsLimit1);
++		return fixRate(pacing.customFps1);
+ 	if (pacing.fpsLimit == FPSLimit::CUSTOM2)
+-		return fixRate(g_Config.iFpsLimit2);
++		return fixRate(pacing.customFps2);
+ 	if (pacing.fpsLimit == FPSLimit::ANALOG)
+ 		return fixRate(pacing.analogFpsLimit);
+ 	const int percent = pacing.percent;
+diff --git a/Core/Config.cpp b/Core/Config.cpp
+--- a/Core/Config.cpp
++++ b/Core/Config.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ // Copyright (c) 2012- PPSSPP Project.
+ 
+ // This program is free software: you can redistribute it and/or modify
+@@ -1282,6 +1283,7 @@
+ 
+ 	INFO_LOG(Log::Loader, "Loaded appended config '%s'.", appendedConfigFileName_.c_str());
+ 
++	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
+ 	Save("Loaded appended config"); // Let's prevent reset
+ 	return true;
+ }
+@@ -1625,6 +1627,7 @@
+ 
+ 	// Clamp save state slot count to somewhat sane limits.
+ 	g_Config.iSaveStateSlotCount = std::clamp(g_Config.iSaveStateSlotCount, 1, 100);
++	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
+ }
+ 
+ void Config::PreSaveCleanup() {
+@@ -1795,6 +1798,7 @@
+ 			currentDirectory = defaultCurrentDirectory;
+ 		}
+ 	}
++	__DisplayConfigureEmucapLimits(iFpsLimit1, iFpsLimit2, iAnalogFpsLimit);
+ }
+ 
+ bool Config::HasGameConfig(std::string_view gameId) {
+diff --git a/UI/GameSettingsScreen.cpp b/UI/GameSettingsScreen.cpp
+--- a/UI/GameSettingsScreen.cpp
++++ b/UI/GameSettingsScreen.cpp
+@@ -1,3 +1,4 @@
++#include "Core/HLE/sceDisplay.h"
+ 
+ // Copyright (c) 2013- PPSSPP Project.
+ 
+@@ -1664,6 +1665,7 @@
+ 		g_Config.iFpsLimit1 = iAlternateSpeedPercent1_ < 0 ? -1 : (iAlternateSpeedPercent1_ * 60) / 100;
+ 		g_Config.iFpsLimit2 = iAlternateSpeedPercent2_ < 0 ? -1 : (iAlternateSpeedPercent2_ * 60) / 100;
+ 		g_Config.iAnalogFpsLimit = (iAlternateSpeedPercentAnalog_ * 60) / 100;
++        __DisplayConfigureEmucapLimits(g_Config.iFpsLimit1, g_Config.iFpsLimit2, g_Config.iAnalogFpsLimit);
+ 		recreate = true;
+ 	}
+ 
+diff --git a/UI/EmuScreen.cpp b/UI/EmuScreen.cpp
+--- a/UI/EmuScreen.cpp
++++ b/UI/EmuScreen.cpp
+@@ -735,12 +735,13 @@
+ static void ShowFpsLimitNotice() {
+ 	int fpsLimit = 60;
+ 
+-	switch (__DisplayGetEmucapPacing().fpsLimit) {
++	const auto pacing = __DisplayGetEmucapPacing();
++	switch (pacing.fpsLimit) {
+ 	case FPSLimit::CUSTOM1:
+-		fpsLimit = g_Config.iFpsLimit1;
++		fpsLimit = pacing.customFps1;
+ 		break;
+ 	case FPSLimit::CUSTOM2:
+-		fpsLimit = g_Config.iFpsLimit2;
++		fpsLimit = pacing.customFps2;
+ 		break;
+ 	default:
+ 		break;
+@@ -1004,7 +1005,7 @@
+ 	case VIRTKEY_SPEED_TOGGLE:
+ 		if (down) {
+ 			if (!NetworkWarnUserIfOnlineAndCantSpeed()) {
+-				__DisplayCycleEmucapLimit(g_Config.iFpsLimit1 >= 0, g_Config.iFpsLimit2 >= 0);
++				__DisplayCycleEmucapLimit();
+ 
+ 				ShowFpsLimitNotice();
+ 			}
+@@ -1140,17 +1141,11 @@
+ 	static constexpr float DEADZONE_THRESHOLD = 0.2f;
+ 	static constexpr float DEADZONE_SCALE = 1.0f / (1.0f - DEADZONE_THRESHOLD);
+ 
+-	// Don't even try if the limit is invalid.
+-	if (g_Config.iAnalogFpsLimit <= 0)
+-		return;
+-
+ 	// Apply a small deadzone (against the resting position.)
+ 	value = std::max(0.0f, (value - DEADZONE_THRESHOLD) * DEADZONE_SCALE);
+ 
+-	// If target is above 60, value is how much to speed up over 60.  Otherwise, it's how much slower.
+-	// So normalize the target.
+-	int target = g_Config.iAnalogFpsLimit - 60;
+-	__DisplaySetEmucapAnalogLimit(60 + (int)(target * value));
++	// Target selection and mode update share the native pacing owner.
++	__DisplaySetEmucapAnalogInput(value);
+ 
+ }
+ 

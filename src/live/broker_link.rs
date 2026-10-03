@@ -63,6 +63,10 @@ fn connect_expected(
     // 블록해 링크 뮤텍스를 쥔 채 MCP를 wedge한다. 쓰기 실패는 poison → NotConnected로 처리한다.
     stream.set_write_timeout(Some(timeout)).map_err(io_e)?;
     let reader = BufReader::new(stream.try_clone().map_err(io_e)?);
+    reader
+        .get_ref()
+        .set_read_timeout(Some(timeout))
+        .map_err(io_e)?;
     let mut link = BrokerLink {
         reader,
         writer: Mutex::new(stream),
@@ -168,6 +172,11 @@ fn io_e(e: std::io::Error) -> LinkError {
 }
 
 impl BrokerLink {
+    #[cfg(all(test, windows))]
+    pub(crate) fn disable_test_send_buffer(&self) {
+        super::protocol::disable_test_send_buffer(&self.writer.lock().unwrap());
+    }
+
     /// 테스트용 — deferred 데드라인을 짧게 설정한다(working-flood 컷오프 검증).
     #[cfg(test)]
     pub(crate) fn set_deferred_deadline(&mut self, d: Duration) {
@@ -221,7 +230,7 @@ impl BrokerLink {
             if result.is_err() {
                 self.close_session();
             }
-            return result;
+            return result.and_then(|terminal| terminal.result);
         }
         // id 불일치 프레임을 무제한 버리면, 악성·버그 피어가 매칭 안 되는 프레임을 스트림하는 것만으로
         // raw_call을 영구 wedge시킨다(이 호출은 outer SharedLink mutex를 쥐고 있어 MCP 전체가 정지).

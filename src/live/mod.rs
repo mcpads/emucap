@@ -1,6 +1,7 @@
 pub mod broker;
 pub mod broker_link;
 pub mod capture_capsule;
+mod capture_filesystem;
 pub mod continuity;
 pub mod control_session;
 mod evidence_identity;

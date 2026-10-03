@@ -81,7 +81,7 @@ impl Collector<'_> {
                 format!("M3U playlist cycle detected at {}", playlist.display()),
             ));
         }
-        let result = self.collect_playlist_contents(&playlist, Path::new(relative_playlist), depth);
+        let result = self.collect_playlist_contents(&playlist, relative_playlist, depth);
         self.active_playlists.remove(&playlist);
         result
     }
@@ -89,7 +89,7 @@ impl Collector<'_> {
     fn collect_root(&mut self, entry: &Path) -> io::Result<()> {
         let canonical = entry.canonicalize()?;
         self.active_playlists.insert(canonical.clone());
-        let result = self.collect_playlist_contents(entry, Path::new(""), 0);
+        let result = self.collect_playlist_contents(entry, "", 0);
         self.active_playlists.remove(&canonical);
         result
     }
@@ -97,7 +97,7 @@ impl Collector<'_> {
     fn collect_playlist_contents(
         &mut self,
         playlist: &Path,
-        relative_playlist: &Path,
+        relative_playlist: &str,
         depth: usize,
     ) -> io::Result<()> {
         let bytes = crate::media_graph::read_descriptor(
@@ -107,7 +107,8 @@ impl Collector<'_> {
         )?;
         let text = crate::media_graph::descriptor_text(&bytes, "M3U")?;
         let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-        let relative_parent = relative_playlist.parent().unwrap_or_else(|| Path::new(""));
+        // Descriptor members use portable separators, independently of the host OS.
+        let relative_parent = relative_playlist.rsplit_once('/').map(|(parent, _)| parent);
         let mut found_entry = false;
         for (line_index, line) in text.lines().enumerate() {
             let line = line.trim_end();
@@ -124,10 +125,10 @@ impl Collector<'_> {
                     ),
                 ));
             }
-            let nested = relative_parent.join(line);
-            let nested = nested.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "M3U member path is not UTF-8")
-            })?;
+            let nested_member = relative_parent
+                .map(|parent| format!("{parent}/{line}"))
+                .unwrap_or_else(|| line.to_string());
+            let nested = nested_member.as_str();
             if !crate::path_safety::is_portable_relative_member(nested) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -187,15 +188,13 @@ impl Collector<'_> {
         descriptor: &str,
         direct: Vec<crate::cue::CueReference>,
     ) -> io::Result<()> {
-        let parent = Path::new(descriptor)
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
+        let parent = descriptor.rsplit_once('/').map(|(parent, _)| parent);
         for reference in direct {
-            let nested = parent.join(reference.declared_name);
-            let nested = nested.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "M3U CUE member is not UTF-8")
-            })?;
-            self.add_reference(nested.to_string())?;
+            let nested = match parent {
+                Some(parent) => format!("{parent}/{}", reference.declared_name),
+                None => reference.declared_name,
+            };
+            self.add_reference(nested)?;
         }
         Ok(())
     }
@@ -205,15 +204,13 @@ impl Collector<'_> {
         descriptor: &str,
         direct: Vec<MediaReference>,
     ) -> io::Result<()> {
-        let parent = Path::new(descriptor)
-            .parent()
-            .unwrap_or_else(|| Path::new(""));
+        let parent = descriptor.rsplit_once('/').map(|(parent, _)| parent);
         for reference in direct {
-            let nested = parent.join(reference.declared_name);
-            let nested = nested.to_str().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "M3U media member is not UTF-8")
-            })?;
-            self.add_reference(nested.to_string())?;
+            let nested = match parent {
+                Some(parent) => format!("{parent}/{}", reference.declared_name),
+                None => reference.declared_name,
+            };
+            self.add_reference(nested)?;
         }
         Ok(())
     }

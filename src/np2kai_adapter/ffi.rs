@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) const RETRO_API_VERSION: u32 = 1;
-pub(super) const DEBUG_API_VERSION: u32 = 2;
+pub(super) const DEBUG_API_VERSION: u32 = 3;
 pub(super) const BP_EXEC: u32 = 0;
 pub(super) const BP_READ: u32 = 1;
 pub(super) const BP_WRITE: u32 = 2;
@@ -173,6 +173,13 @@ type RetroSerializeSize = unsafe extern "C" fn() -> usize;
 type RetroSerialize = unsafe extern "C" fn(*mut c_void, usize) -> bool;
 type RetroUnserialize = unsafe extern "C" fn(*const c_void, usize) -> bool;
 type DebugApiVersion = unsafe extern "C" fn() -> u32;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct PeekRange {
+    pub(super) address: u32,
+    pub(super) length: u32,
+}
+type DebugValidatePeekRanges = unsafe extern "C" fn(*const PeekRange, usize) -> i32;
 type DebugReadMemory = unsafe extern "C" fn(u32, *mut u8, usize) -> i32;
 type DebugWriteMemory = unsafe extern "C" fn(u32, *const u8, usize) -> i32;
 type DebugGetRegisters = unsafe extern "C" fn(*mut NativeRegisters) -> i32;
@@ -211,6 +218,7 @@ pub(super) struct CoreApi {
     pub(super) unserialize: RetroUnserialize,
     pub(super) debug_read_memory: DebugReadMemory,
     pub(super) debug_peek_memory: DebugReadMemory,
+    pub(super) debug_validate_peek_ranges: DebugValidatePeekRanges,
     pub(super) debug_write_memory: DebugWriteMemory,
     pub(super) debug_get_registers: DebugGetRegisters,
     pub(super) debug_step_instruction: DebugStepInstruction,
@@ -260,13 +268,32 @@ pub(super) fn callback_slot() -> &'static Mutex<Option<CallbackState>> {
 
 impl CoreApi {
     pub(super) unsafe fn load(path: &Path) -> Np2kaiResult<Self> {
+        #[cfg(unix)]
         let library =
             Library::new(path).map_err(|error| Np2kaiError::Dynamic(error.to_string()))?;
+        #[cfg(windows)]
+        let library: Library = {
+            use libloading::os::windows::{
+                Library as WindowsLibrary, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+            };
+            WindowsLibrary::load_with_flags(
+                // LoadLibrary requires an absolute path for DLL_LOAD_DIR. Keep the
+                // Win32 spelling: canonicalize adds a verbatim prefix which can
+                // bypass loaded system-module identity and fail with error 487.
+                std::path::absolute(path)?,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+            .map_err(|error| Np2kaiError::Dynamic(format!("{}: {error:?}", path.display())))?
+            .into()
+        };
         macro_rules! symbol {
             ($name:literal, $kind:ty) => {{
                 *library
                     .get::<$kind>(concat!($name, "\0").as_bytes())
-                    .map_err(|error| Np2kaiError::Dynamic(error.to_string()))?
+                    .map_err(|error| {
+                        Np2kaiError::Dynamic(format!("{}: {}: {error}", path.display(), $name))
+                    })?
             }};
         }
         let debug_api_version = symbol!("emucap_np2_debug_api_version", DebugApiVersion);
@@ -298,6 +325,10 @@ impl CoreApi {
             unserialize: symbol!("retro_unserialize", RetroUnserialize),
             debug_read_memory: symbol!("emucap_np2_read_memory", DebugReadMemory),
             debug_peek_memory: symbol!("emucap_np2_peek_memory", DebugReadMemory),
+            debug_validate_peek_ranges: symbol!(
+                "emucap_np2_validate_peek_ranges",
+                DebugValidatePeekRanges
+            ),
             debug_write_memory: symbol!("emucap_np2_write_memory", DebugWriteMemory),
             debug_get_registers: symbol!("emucap_np2_get_regs", DebugGetRegisters),
             debug_step_instruction: symbol!("emucap_np2_step_instruction", DebugStepInstruction),

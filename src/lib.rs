@@ -14,14 +14,15 @@ pub mod launch;
 pub mod live;
 pub mod m3u;
 pub(crate) mod mame_observation;
+pub(crate) mod mame_owned_frames;
 pub mod mcp_result;
 pub mod mcp_stdio;
 pub mod media_graph;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod n64_adapter;
 pub mod nds_bridge;
 pub mod neogeo_bridge;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub mod np2kai_adapter;
 pub mod numparse;
 pub mod offload;

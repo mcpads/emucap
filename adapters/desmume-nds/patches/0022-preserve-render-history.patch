@@ -1,0 +1,175 @@
+--- a/desmume/src/gfx3d.cpp
++++ b/desmume/src/gfx3d.cpp
+@@ -3921,10 +3921,99 @@
+ 	memcpy(gfx3d.legacySave.stateApplied.toonTable16, gfx3d.appliedState.toonTable16, sizeof(gfx3d.appliedState.toonTable16));
+ }
+ 
++// Exact geometry and latched rendering state. Derived clipping is rebuilt on load.
++static bool gfx3d_hasExactLoadedState = false;
++
++static void GFX3D_SaveExactState(const GFX3D_State &s, EMUFILE &os)
++{
++	os.write_32LE(s.DISP3DCNT.value);
++	os.write_16LE(s.clearImageOffset.value);
++	os.write_32LE(s.clearColor);
++	os.write_32LE(s.clearDepth);
++	os.write_32LE(s.fogColor);
++	os.write_16LE(s.fogOffset);
++	os.write_u8(s.fogShift);
++	os.write_u8(s.alphaTestRef);
++	os.write_32LE(s.SWAP_BUFFERS.value);
++	for (size_t i = 0; i < 32; ++i) os.write_u8(s.fogDensityTable[i]);
++	for (size_t i = 0; i < 32; ++i) os.write_16LE(s.toonTable16[i]);
++	for (size_t i = 0; i < 16; ++i) os.write_16LE(s.edgeMarkColorTable[i]);
++}
++
++static bool GFX3D_LoadExactState(GFX3D_State &s, EMUFILE &is)
++{
++	if (!is.read_32LE(s.DISP3DCNT.value) || !is.read_16LE(s.clearImageOffset.value) ||
++		!is.read_32LE(s.clearColor) || !is.read_32LE(s.clearDepth) ||
++		!is.read_32LE(s.fogColor) || !is.read_16LE(s.fogOffset) ||
++		!is.read_u8(s.fogShift) || !is.read_u8(s.alphaTestRef) ||
++		!is.read_32LE(s.SWAP_BUFFERS.value)) return false;
++	for (size_t i = 0; i < 32; ++i) if (!is.read_u8(s.fogDensityTable[i])) return false;
++	for (size_t i = 0; i < 32; ++i) if (!is.read_16LE(s.toonTable16[i])) return false;
++	for (size_t i = 0; i < 16; ++i) if (!is.read_16LE(s.edgeMarkColorTable[i])) return false;
++	return s.fogShift <= 11 && s.alphaTestRef <= 31;
++}
++
++static void GFX3D_SaveExactList(const GFX3D_GeometryList &list, EMUFILE &os)
++{
++	os.write_32LE((u32)list.rawVertCount);
++	for (size_t i = 0; i < list.rawVertCount; ++i)
++	{
++		const NDSVertex &v = list.rawVtxList[i];
++		os.write_32LE(v.position.x); os.write_32LE(v.position.y);
++		os.write_32LE(v.position.z); os.write_32LE(v.position.w);
++		os.write_32LE(v.texCoord.s); os.write_32LE(v.texCoord.t);
++		os.write_u8(v.color.r); os.write_u8(v.color.g);
++		os.write_u8(v.color.b); os.write_u8(v.color.a);
++	}
++	os.write_32LE((u32)list.rawPolyCount);
++	for (size_t i = 0; i < list.rawPolyCount; ++i)
++	{
++		const POLY &p = list.rawPolyList[i];
++		GFX3D_SaveStatePOLY(p, os);
++		os.write_32LE((u32)p.vtxFormat);
++		os.write_16LE(p.viewport.x); os.write_16LE(p.viewport.y);
++		os.write_16LE(p.viewport.width); os.write_16LE(p.viewport.height);
++	}
++}
++
++static bool GFX3D_LoadExactList(GFX3D_GeometryList &list, EMUFILE &is)
++{
++	u32 count = 0;
++	if (!is.read_32LE(count) || count > VERTLIST_SIZE) return false;
++	list.rawVertCount = count;
++	for (size_t i = 0; i < list.rawVertCount; ++i)
++	{
++		NDSVertex &v = list.rawVtxList[i];
++		if (!is.read_32LE(v.position.x) || !is.read_32LE(v.position.y) ||
++			!is.read_32LE(v.position.z) || !is.read_32LE(v.position.w) ||
++			!is.read_32LE(v.texCoord.s) || !is.read_32LE(v.texCoord.t) ||
++			!is.read_u8(v.color.r) || !is.read_u8(v.color.g) ||
++			!is.read_u8(v.color.b) || !is.read_u8(v.color.a)) return false;
++	}
++	if (!is.read_32LE(count) || count > POLYLIST_SIZE) return false;
++	list.rawPolyCount = count;
++	for (size_t i = 0; i < list.rawPolyCount; ++i)
++	{
++		POLY &p = list.rawPolyList[i];
++		u32 type = 0, primitive = 0;
++		if (!is.read_32LE(type) || (type != POLYGON_TYPE_TRIANGLE && type != POLYGON_TYPE_QUAD)) return false;
++		p.type = (PolygonType)type;
++		for (size_t j = 0; j < 4; ++j)
++			if (!is.read_16LE(p.vertIndexes[j]) || (j < type && p.vertIndexes[j] >= list.rawVertCount)) return false;
++		if (!is.read_32LE(p.attribute.value) || !is.read_32LE(p.texParam.value) ||
++			!is.read_32LE(p.texPalette) || !is.read_32LE(primitive) || primitive > 7 ||
++			!is.read_16LE(p.viewport.x) || !is.read_16LE(p.viewport.y) ||
++			!is.read_16LE(p.viewport.width) || !is.read_16LE(p.viewport.height)) return false;
++		p.vtxFormat = (PolygonPrimitiveType)primitive;
++	}
++	list.clippedPolyCount = list.clippedPolyOpaqueCount = 0;
++	return true;
++}
++
+ void gfx3d_savestate(EMUFILE &os)
+ {
+ 	//version
+-	os.write_32LE(4);
++	os.write_32LE(5);
+ 
+ 	//dump the render lists
+ 	os.write_32LE((u32)gfx3d.gList[gfx3d.pendingListIndex].rawVertCount);
+@@ -3945,13 +4034,19 @@
+ 	_gEngine.SaveState_v2(os);
+ 	gxf_hardware.savestate(os);
+ 	_gEngine.SaveState_v4(os);
++	GFX3D_SaveExactState(gfx3d.pendingState, os);
++	GFX3D_SaveExactState(gfx3d.appliedState, os);
++	GFX3D_SaveExactList(gfx3d.gList[gfx3d.pendingListIndex], os);
++	GFX3D_SaveExactList(gfx3d.gList[gfx3d.appliedListIndex], os);
+ }
+ 
+ bool gfx3d_loadstate(EMUFILE &is, int size)
+ {
++	gfx3d_hasExactLoadedState = false;
+ 	int version;
+ 	if (is.read_32LE(version) != 1) return false;
+ 	if (size == 8) version = 0;
++	if (version < 0 || version > 5) return false;
+ 
+ 	if (CurrentRenderer->GetRenderNeedsFinish())
+ 	{
+@@ -3967,7 +4062,7 @@
+ 		float loadingSortYMin = 0.0f;
+ 		float loadingSortYMax = 0.0f;
+ 		
+-		is.read_32LE(vertListCount32);
++		if (!is.read_32LE(vertListCount32) || vertListCount32 > VERTLIST_SIZE) return false;
+ 		gfx3d.gList[gfx3d.pendingListIndex].rawVertCount = vertListCount32;
+ 		gfx3d.gList[gfx3d.appliedListIndex].rawVertCount = vertListCount32;
+ 		for (size_t i = 0; i < gfx3d.gList[gfx3d.appliedListIndex].rawVertCount; i++)
+@@ -3976,7 +4071,7 @@
+ 			gfx3d.gList[gfx3d.appliedListIndex].rawVtxList[i] = gfx3d.gList[gfx3d.pendingListIndex].rawVtxList[i];
+ 		}
+ 		
+-		is.read_32LE(polyListCount32);
++		if (!is.read_32LE(polyListCount32) || polyListCount32 > POLYLIST_SIZE) return false;
+ 		gfx3d.gList[gfx3d.pendingListIndex].rawPolyCount = polyListCount32;
+ 		gfx3d.gList[gfx3d.appliedListIndex].rawPolyCount = polyListCount32;
+ 		for (size_t i = 0; i < gfx3d.gList[gfx3d.appliedListIndex].rawPolyCount; i++)
+@@ -4010,8 +4105,16 @@
+ 	{
+ 		_gEngine.LoadState_v4(is);
+ 	}
+-
+-	return true;
++	if (version == 5)
++	{
++		if (!GFX3D_LoadExactState(gfx3d.pendingState, is) ||
++			!GFX3D_LoadExactState(gfx3d.appliedState, is) ||
++			!GFX3D_LoadExactList(gfx3d.gList[gfx3d.pendingListIndex], is) ||
++			!GFX3D_LoadExactList(gfx3d.gList[gfx3d.appliedListIndex], is)) return false;
++		gfx3d_hasExactLoadedState = true;
++	}
++
++	return !is.fail();
+ }
+ 
+ void gfx3d_FinishLoadStateBufferRead()
+@@ -4027,6 +4130,14 @@
+ 	gfx3d.isSwapBuffersPending = (gfx3d.legacySave.isSwapBuffersPending) ? true : false;
+ 	gfx3d.isDrawPending = (gfx3d.legacySave.isDrawPending) ? true : false;
+ 	
++	if (gfx3d_hasExactLoadedState)
++	{
++		GFX3D_GenerateRenderLists(CurrentRenderer->GetPreferredPolygonClippingMode(),
++			gfx3d.appliedState, gfx3d.gList[gfx3d.appliedListIndex]);
++		gfx3d_hasExactLoadedState = false;
++		return;
++	}
++
+ 	gfx3d.pendingState.DISP3DCNT = GPUREG.DISP3DCNT;
+ 	gfx3d_parseCurrentDISP3DCNT();
+ 	

@@ -17,9 +17,13 @@ does not expose the native halt service events and is rejected with `mesen-patch
 adapters/mesen2/build.sh
 ```
 
-On Windows, run `adapters/mesen2/build.ps1` from PowerShell with Visual Studio 2022 available. The
+On Windows, run `adapters/mesen2/build.ps1` from PowerShell with Visual Studio 2022
+(or Build Tools with C++ and .NET SDK components) and the .NET 8 SDK installed. The
 POSIX build needs the upstream Mesen prerequisites (C++ toolchain, SDL2, and .NET 8). On macOS the
 script uses Homebrew's keg-only `dotnet@8` automatically when present.
+
+The Windows output requires the x64 .NET 8 runtime on the execution machine.
+The SDK supplies it on a build machine; a fresh runtime-only machine needs it installed separately.
 
 The build scripts fetch the commit pinned in `upstream.lock`, apply every patch in the declared order
 after `git apply --check`, remove old native objects, and build only inside ignored

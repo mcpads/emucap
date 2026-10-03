@@ -1,5 +1,5 @@
-pub(crate) mod wire;
 pub mod owner;
+pub(crate) mod wire;
 
 use std::time::{Duration, Instant};
 

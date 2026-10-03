@@ -1,0 +1,53 @@
+--- a/build/3rdparty.mk
++++ b/build/3rdparty.mk
+@@ -157,17 +157,18 @@
+ 	mkdir -p $(@D)
+ 	touch $@
+ 
+-# Configure pkg-config.
++# Configure pkg-config. MinGW uses the toolchain GLib; the bundled legacy
++# GLib assumes obsolete Windows stat layouts. Other hosts keep bundled GLib.
+ $(BUILD_DIR)/$(PACKAGE_PKG_CONFIG)/Makefile: \
+   $(SOURCE_DIR)/$(PACKAGE_PKG_CONFIG)/.extracted
+ 	mkdir -p $(@D)
+ 	cd $(@D) && $(PWD)/$(<D)/configure \
+-		--with-internal-glib \
++		$(if $(filter mingw-w64,$(OPENMSX_TARGET_OS)),PKG_CONFIG=pkg-config,--with-internal-glib) \
+ 		--disable-host-tool \
+ 		--program-prefix=$(TARGET_TRIPLE)- \
+ 		--prefix=$(PWD)/$(TOOLS_DIR) \
+ 		--libdir=$(PWD)/$(INSTALL_DIR)/lib \
+-		CFLAGS="-Wno-error=int-conversion" \
++		CFLAGS="-std=gnu17 -Wno-error=int-conversion" \
+ 		CC= LD= AR= RANLIB= STRIP=
+ 
+ # Configure SDL2.
+--- a/build/libraries.py
++++ b/build/libraries.py
+@@ -23,7 +23,7 @@
+ 	elif distroRoot.startswith('derived/'):
+ 		toolsDir = '%s/../tools/bin' % distroRoot
+ 		for name in listdir(toolsDir):
+-			if name.endswith('-pkg-config'):
++			if name.endswith(('-pkg-config', '-pkg-config.exe')):
+ 				return toolsDir + '/' + name
+ 		raise RuntimeError('No cross-pkg-config found in 3rdparty build')
+ 	else:
+@@ -169,6 +169,7 @@
+ 	makeName = 'FREETYPE'
+ 	header = ('<ft2build.h>', 'FT_FREETYPE_H')
+ 	configScriptName = 'freetype-config'
++	staticLibsOption = '--static --libs'
+ 	function = 'FT_Open_Face'
+ 
+ 	@classmethod
+@@ -189,7 +190,8 @@
+ 	@classmethod
+ 	def getVersion(cls, platform, linkStatic, distroRoot):
+ 		configScript = cls.getConfigScript(platform, linkStatic, distroRoot)
+-		return '`%s --ftversion`' % configScript
++		option = '--modversion' if 'pkg-config' in configScript else '--ftversion'
++		return '`%s %s`' % (configScript, option)
+ 
+ class GL(Library):
+ 	libName = 'GL'
