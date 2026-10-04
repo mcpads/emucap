@@ -17,7 +17,7 @@ on:
       platform:
         type: choice
         default: all
-        options: [all, linux, macos, windows]
+        options: [all, linux, macos, windows, assemble]
       runtime_run:
         description: Successful Windows build to package when platform is windows
         type: string
@@ -30,6 +30,10 @@ on:
         type: choice
         default: macos
         options: [linux, macos]
+      packages:
+        description: JSON array of adapter, platform and run for assembling all native packages
+        type: string
+        default: ''
 permissions:
   contents: read
   actions: read
@@ -38,7 +42,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
-    if: inputs.platform != 'windows'
+    if: inputs.platform != 'windows' && inputs.platform != 'assemble'
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -181,6 +185,37 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: native-package-${{ inputs.adapter }}-windows
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+  assemble:
+    if: inputs.platform == 'assemble'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: packaging
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          path: source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify collection boundaries
+        run: python packaging/_tests/release/collect_native_tests.py
+      - name: Collect verified native release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_SELECTION: ${{ inputs.packages }}
+        run: |
+          python -c 'import os,pathlib; pathlib.Path("selection.json").write_text(os.environ["PACKAGE_SELECTION"])'
+          python packaging/_tests/release/collect_native.py --selection selection.json \
+            --source source --output artifacts --repo "$GITHUB_REPOSITORY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-release-packages
           path: artifacts/*
           if-no-files-found: error
           retention-days: 14
