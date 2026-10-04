@@ -78,7 +78,10 @@ else
     git -C "$upstream" checkout -q FETCH_HEAD
     deps="$source_root/native-dependencies/pcsx2"
     mkdir -p "$source_root/native-dependency-sources/pcsx2"
-    (cd "$source_root/native-dependency-sources/pcsx2"; BUILD_FFMPEG=1 bash "$upstream/.github/workflows/scripts/linux/build-dependencies-qt.sh" "$deps")
+    if [ ! -f "$deps/.emucap-complete" ]; then
+      (cd "$source_root/native-dependency-sources/pcsx2"; BUILD_FFMPEG=1 bash "$upstream/.github/workflows/scripts/linux/build-dependencies-qt.sh" "$deps")
+      touch "$deps/.emucap-complete"
+    fi
     export CMAKE_PREFIX_PATH="$deps"
     export PKG_CONFIG_PATH="$deps/lib/pkgconfig"
     export LD_LIBRARY_PATH="$deps/lib:${LD_LIBRARY_PATH:-}"

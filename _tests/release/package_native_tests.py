@@ -7,7 +7,8 @@ import json
 import tarfile
 import plistlib
 import sys
-from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive, restore_package, sha, select_outputs
+import shutil
+from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive, restore_package, sha, select_outputs, linux_dependencies
 
 
 class PackageBoundaries(unittest.TestCase):
@@ -144,6 +145,32 @@ class PackageBoundaries(unittest.TestCase):
             linux = build / 'pcsx2-qt/pcsx2-qt'
             linux.write_bytes(b'native')
             self.assertEqual(select_outputs(root, 'pcsx2', False)[2:], (linux.parent, linux))
+
+    @unittest.skipUnless(sys.platform == 'linux' and shutil.which('patchelf'), 'ELF loader fixture')
+    def test_linux_closure_uses_producer_libraries_for_transitive_imports(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            producer, system, stage = root / 'producer', root / 'system', root / 'stage'
+            for p in (producer, system, stage): p.mkdir()
+            for directory, value in ((producer, 7), (system, 99)):
+                code = directory / 'value.c'
+                code.write_text(f'int value(void) {{ return {value}; }}')
+                subprocess.run(['cc', '-shared', '-fPIC', str(code), '-Wl,-soname,libvalue.so.1',
+                                '-o', str(directory / 'libvalue.so.1')], check=True)
+            wrapper = system / 'wrapper.c'
+            wrapper.write_text('int value(void); int wrapper(void) { return value(); }')
+            subprocess.run(['cc', '-shared', '-fPIC', str(wrapper), str(system / 'libvalue.so.1'),
+                            '-Wl,-soname,libwrapper.so.1', '-Wl,-rpath,' + str(system),
+                            '-o', str(system / 'libwrapper.so.1')], check=True)
+            main = root / 'main.c'
+            main.write_text('int value(void); int wrapper(void); int main(void) { return value()!=7 || wrapper()!=7; }')
+            binary = stage / 'probe'
+            subprocess.run(['cc', str(main), str(producer / 'libvalue.so.1'), str(system / 'libwrapper.so.1'),
+                            '-Wl,-rpath,' + str(producer), '-Wl,-rpath,' + str(system), '-o', str(binary)], check=True)
+            linux_dependencies(stage, [producer])
+            producer.rename(root / 'unavailable-producer')
+            system.rename(root / 'unavailable-system')
+            subprocess.run([str(binary)], check=True)
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:

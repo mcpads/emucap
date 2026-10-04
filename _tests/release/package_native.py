@@ -126,9 +126,15 @@ def copy_library(source, target, origins):
     return True
 
 
-def linux_dependencies(stage):
+def linux_dependencies(stage, library_dirs=()):
     lib = stage / 'lib'
     lib.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    # Resolve the complete closure against the producer's library set before
+    # system fallbacks, including dependencies discovered through system libraries.
+    paths = [str(lib.resolve()), *(str(p.resolve()) for p in library_dirs)]
+    if env.get('LD_LIBRARY_PATH'): paths.append(env['LD_LIBRARY_PATH'])
+    env['LD_LIBRARY_PATH'] = os.pathsep.join(paths)
     queue = [p for p in stage.rglob('*') if format_of(p) == 'elf']
     seen = set()
     origins = {p.resolve(): sha(p) for p in queue}
@@ -137,7 +143,7 @@ def linux_dependencies(stage):
         if binary in seen:
             continue
         seen.add(binary)
-        result = subprocess.run(['ldd', str(binary)], text=True, capture_output=True)
+        result = subprocess.run(['ldd', str(binary)], text=True, capture_output=True, env=env)
         if 'not found' in result.stdout:
             raise ValueError(f'unresolved dependency: {binary}\n{result.stdout}')
         for line in result.stdout.splitlines():
@@ -385,7 +391,8 @@ def main():
             if args.adapter.startswith('mame-'):
                 copy(src / 'hash', stage / 'hash')
         move_app_metadata(stage)
-        native_files = macho_dependencies(stage, executable) if mac else linux_dependencies(stage)
+        library_dirs = [p for p in (source / 'native-dependencies' / args.adapter / 'lib',) if p.is_dir()]
+        native_files = macho_dependencies(stage, executable) if mac else linux_dependencies(stage, library_dirs)
         for p in native_files:
             arches = run('lipo', '-archs', p) if mac else run('file', p)
             expected = 'x86_64' if mac and args.adapter == 'pcsx2' else ('arm64' if mac else 'x86-64')

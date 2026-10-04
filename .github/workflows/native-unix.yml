@@ -87,12 +87,54 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y patchelf
           fi
+      - name: Identify PCSX2 dependency cache
+        if: inputs.reuse_run == '' && matrix.adapter == 'pcsx2' && matrix.platform == 'linux'
+        id: dependency-key
+        shell: bash
+        run: |
+          identity=$( { printf '%s\n' "$ImageOS" "$ImageVersion"; sha256sum source/adapters/pcsx2/upstream.lock packaging/_tests/release/native_unix_build.sh; } | sha256sum | cut -d ' ' -f1 )
+          echo "key=pcsx2-linux-dependencies-$identity" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v4
+        if: steps.dependency-key.outputs.key != ''
+        id: dependencies
+        with:
+          path: |
+            source/native-dependencies/pcsx2
+            source/native-dependency-sources/pcsx2/**/*.tar.*
+          key: ${{ steps.dependency-key.outputs.key }}
       - name: Build pinned native adapter
         if: inputs.reuse_run == ''
         shell: bash
         run: |
           set -o pipefail
           bash packaging/_tests/release/native_unix_build.sh '${{ matrix.adapter }}' source 2>&1 | tee native-build.log
+      - uses: actions/cache/save@v4
+        if: always() && steps.dependency-key.outputs.key != '' && steps.dependencies.outputs.cache-hit != 'true' && hashFiles('source/native-dependencies/pcsx2/.emucap-complete') != ''
+        with:
+          path: |
+            source/native-dependencies/pcsx2
+            source/native-dependency-sources/pcsx2/**/*.tar.*
+          key: ${{ steps.dependency-key.outputs.key }}
+      - name: Verify Linux dependency closure
+        if: matrix.platform == 'linux' && inputs.reuse_run == ''
+        run: python packaging/_tests/release/package_native_tests.py
+      - name: Preserve compiled PCSX2 inputs before packaging
+        if: inputs.reuse_run == '' && matrix.adapter == 'pcsx2' && matrix.platform == 'linux'
+        shell: bash
+        run: |
+          tar --exclude='.git' --exclude=CMakeFiles --exclude='*.o' --exclude='*.obj' \
+            --exclude=target -I 'gzip -1' -cf pcsx2-build.tar.gz -C source \
+            adapters/pcsx2/work native-dependencies/pcsx2 native-dependency-sources/pcsx2
+          sha256sum pcsx2-build.tar.gz > pcsx2-build.sha256
+      - uses: actions/upload-artifact@v4
+        if: inputs.reuse_run == '' && matrix.adapter == 'pcsx2' && matrix.platform == 'linux'
+        with:
+          name: native-build-pcsx2-linux
+          path: |
+            pcsx2-build.tar.gz
+            pcsx2-build.sha256
+          retention-days: 14
+          if-no-files-found: error
       - name: Stage and verify runtime and source packages
         run: python packaging/_tests/release/package_native.py --source source --adapter '${{ matrix.adapter }}' --platform '${{ matrix.platform }}' --output artifacts ${{ inputs.reuse_run != '' && '--reuse previous' || '' }}
       - uses: actions/upload-artifact@v4
