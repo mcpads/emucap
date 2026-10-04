@@ -89,10 +89,7 @@ pub fn build_metadata_path(binary: &Path) -> PathBuf {
     {
         return dist.join("emucap-xemu-build.json");
     }
-    binary
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("emucap-xemu-build.json")
+    crate::launch::native_build_metadata_path(binary, "emucap-xemu-build.json")
 }
 
 pub fn read_build_metadata(binary: &Path) -> io::Result<BuildMetadata> {

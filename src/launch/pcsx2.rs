@@ -45,10 +45,7 @@ fn lock_value(lock: &str, key: &str) -> Option<String> {
 }
 
 pub fn build_metadata_path(binary: &Path) -> PathBuf {
-    binary
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("emucap-pcsx2-build.json")
+    super::native_build_metadata_path(binary, "emucap-pcsx2-build.json")
 }
 
 pub fn read_build_metadata(binary: &Path) -> io::Result<BuildMetadata> {

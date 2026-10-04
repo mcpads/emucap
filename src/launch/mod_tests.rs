@@ -466,3 +466,27 @@ fn persistent_windows_directory_lock_preserves_previous_runtime() {
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
     drop(held);
 }
+
+#[test]
+fn native_metadata_accepts_legacy_and_prefers_external_app_receipt() {
+    let root = tempfile::tempdir().unwrap();
+    let binary = root.path().join("Game.app/Contents/MacOS/game");
+    let legacy = binary.parent().unwrap().join("build.json");
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "legacy").unwrap();
+    assert_eq!(
+        super::native_build_metadata_path(&binary, "build.json"),
+        legacy
+    );
+    let external = root.path().join("build.json");
+    std::fs::write(&external, "package").unwrap();
+    assert_eq!(
+        super::native_build_metadata_path(&binary, "build.json"),
+        external
+    );
+    let standalone = root.path().join("game");
+    assert_eq!(
+        super::native_build_metadata_path(&standalone, "build.json"),
+        external
+    );
+}

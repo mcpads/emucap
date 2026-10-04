@@ -31,6 +31,25 @@ pub mod xemu;
 #[path = "mod_tests.rs"]
 mod tests;
 
+/// Prefer package metadata outside an app's signed resources; accept legacy builds.
+pub(crate) fn native_build_metadata_path(binary: &Path, filename: &str) -> PathBuf {
+    if let Some(app) = binary
+        .ancestors()
+        .find(|p| p.extension().is_some_and(|x| x == "app"))
+    {
+        if let Some(parent) = app.parent() {
+            let external = parent.join(filename);
+            if std::fs::symlink_metadata(&external).is_ok() {
+                return external;
+            }
+        }
+    }
+    binary
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(filename)
+}
+
 /// Base directory for emucap-owned emulator data, per OS. `EMUCAP_EMU_HOME` overrides it.
 pub(crate) fn emu_home_base() -> PathBuf {
     if let Some(base) = std::env::var_os("EMUCAP_EMU_HOME") {

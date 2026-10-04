@@ -111,9 +111,8 @@ fn collect_openmsx_binaries(root: &Path, output: &mut Vec<PathBuf>) {
                     name == "openmsx"
                 }
             });
-        let has_sidecar = path
-            .parent()
-            .is_some_and(|parent| parent.join("emucap-openmsx-build.json").is_file());
+        let has_sidecar =
+            super::native_build_metadata_path(&path, "emucap-openmsx-build.json").is_file();
         if name_matches && has_sidecar && is_runnable_file(&path) {
             output.push(path);
         }
@@ -164,10 +163,7 @@ pub fn require_compatible_build(repo_root: &Path, binary: &Path) -> io::Result<B
             format!("openMSX executable is not runnable: {}", binary.display()),
         ));
     }
-    let metadata_path = binary
-        .parent()
-        .ok_or_else(|| io::Error::other("openMSX binary has no parent directory"))?
-        .join("emucap-openmsx-build.json");
+    let metadata_path = super::native_build_metadata_path(binary, "emucap-openmsx-build.json");
     let metadata_bytes =
         crate::path_safety::read_bounded_regular_file_no_follow(&metadata_path, 256 * 1024)?;
     let metadata: BuildMetadata = serde_json::from_slice(&metadata_bytes).map_err(|error| {

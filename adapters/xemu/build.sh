@@ -151,7 +151,7 @@ export PATH="$(dirname "$PYTHON"):$PATH"
 JOBS="${EMUCAP_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 (
   cd "$SRC"
-  ./build.sh "${PLATFORM_ARGS[@]}" -j"$JOBS"
+  ./build.sh ${PLATFORM_ARGS[@]+"${PLATFORM_ARGS[@]}"} -j"$JOBS"
 )
 
 if [ "$(uname -s)" = "Darwin" ] && [ "$BUILD_PLATFORM" = native ]; then

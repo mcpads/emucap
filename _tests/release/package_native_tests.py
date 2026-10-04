@@ -2,7 +2,7 @@
 import tempfile
 from pathlib import Path
 import unittest
-from package_native import files_manifest, one, format_of, copy_library
+from package_native import files_manifest, one, format_of, copy_library, move_app_metadata
 
 
 class PackageBoundaries(unittest.TestCase):
@@ -46,6 +46,22 @@ class PackageBoundaries(unittest.TestCase):
             source.write_bytes(b'different library')
             with self.assertRaisesRegex(ValueError, 'dependency collision'):
                 copy_library(source, target, origins)
+
+    def test_app_metadata_is_outside_resource_seal(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            metadata = root / 'Game.app/Contents/MacOS/emucap-game-build.json'
+            metadata.parent.mkdir(parents=True)
+            metadata.write_bytes(b'identity')
+            binary = metadata.parent / 'game'
+            binary.write_bytes(b'executable')
+            move_app_metadata(root)
+            self.assertFalse(metadata.exists())
+            self.assertEqual((root / metadata.name).read_bytes(), b'identity')
+            self.assertEqual(binary.read_bytes(), b'executable')
+            metadata.write_bytes(b'conflicting identity')
+            with self.assertRaisesRegex(ValueError, 'conflicting app metadata'):
+                move_app_metadata(root)
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:

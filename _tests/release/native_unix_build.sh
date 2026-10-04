@@ -83,6 +83,13 @@ else
     export LD_LIBRARY_PATH="$deps/lib:${LD_LIBRARY_PATH:-}"
   fi
 fi
+if [ "$adapter" = xemu ]; then
+  # Match the Python chosen by the producer recipe and its Meson environment.
+  export EMUCAP_XEMU_PYTHON="$(command -v python3.13)"
+  "$EMUCAP_XEMU_PYTHON" -m venv "$source_root/native-python"
+  export EMUCAP_XEMU_PYTHON="$source_root/native-python/bin/python3"
+  "$EMUCAP_XEMU_PYTHON" -m pip install 'PyYAML==6.0.2'
+fi
 bash _tests/adapters/build-lock-test.sh
 bash "adapters/$adapter/build.sh"
 if [ "$adapter" = np2kai ]; then

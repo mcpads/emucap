@@ -266,6 +266,20 @@ def source_archive(source, src, adapter, output, name):
     return path
 
 
+def move_app_metadata(stage):
+    # Build metadata binds the signed executable digest and must not be part of
+    # that executable's resource seal. Keep legacy recipe output unchanged.
+    for metadata in list(stage.rglob('*emucap*build.json')):
+        app = next((p for p in metadata.parents if p.suffix == '.app'), None)
+        if app is None:
+            continue
+        target = app.parent / metadata.name
+        if target.exists() and sha(target) != sha(metadata):
+            raise ValueError(f'conflicting app metadata: {metadata.name}')
+        shutil.copy2(metadata, target)
+        metadata.unlink()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
@@ -303,6 +317,7 @@ def main():
                 if p.exists(): copy(p, stage / extra)
         if args.adapter.startswith('mame-'):
             copy(src / 'hash', stage / 'hash')
+        move_app_metadata(stage)
         native_files = macho_dependencies(stage, executable) if mac else linux_dependencies(stage)
         for p in native_files:
             arches = run('lipo', '-archs', p) if mac else run('file', p)
