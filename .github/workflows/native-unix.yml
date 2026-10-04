@@ -1,0 +1,68 @@
+name: Native Unix adapter packages
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Exact producer commit to build
+        type: string
+        required: true
+      adapter:
+        type: choice
+        default: all
+        options: [all, mesen2, dolphin, ppsspp, mednafen, flycast, np2kai, mupen64plus, openmsx, mame-pc98, mame-neogeo, pcsx2, desmume-nds, xemu]
+      platform:
+        type: choice
+        default: all
+        options: [all, linux, macos]
+permissions:
+  contents: read
+concurrency:
+  group: native-unix-${{ inputs.revision }}-${{ inputs.adapter }}-${{ inputs.platform }}
+  cancel-in-progress: false
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        adapter: ${{ fromJSON(inputs.adapter != 'all' && format('["{0}"]', inputs.adapter) || '["mesen2","dolphin","ppsspp","mednafen","flycast","np2kai","mupen64plus","openmsx","mame-pc98","mame-neogeo","pcsx2","desmume-nds","xemu"]') }}
+        platform: ${{ fromJSON(inputs.platform != 'all' && format('["{0}"]', inputs.platform) || '["linux","macos"]') }}
+    runs-on: ${{ matrix.platform == 'macos' && 'macos-14' || 'ubuntu-24.04' }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: packaging
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.revision }}
+          path: source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-dotnet@v4
+        if: matrix.adapter == 'mesen2'
+        with:
+          dotnet-version: '8.0.x'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build pinned native adapter
+        shell: bash
+        run: |
+          set -o pipefail
+          bash packaging/_tests/release/native_unix_build.sh '${{ matrix.adapter }}' source 2>&1 | tee native-build.log
+      - name: Stage and verify runtime and source packages
+        run: python packaging/_tests/release/package_native.py --source source --adapter '${{ matrix.adapter }}' --platform '${{ matrix.platform }}' --output artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-package-${{ matrix.adapter }}-${{ matrix.platform }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-build-log-${{ matrix.adapter }}-${{ matrix.platform }}
+          path: |
+            native-build.log
+            source/native-toolchain.txt
+          retention-days: 14
