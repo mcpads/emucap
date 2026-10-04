@@ -50,16 +50,49 @@ override를 우선한다.
 
 **소스 빌드:** 설치할 릴리스 태그 또는 개발 커밋을 체크아웃한다. Git, Rust 1.88 이상,
 SQLite 번들 빌드용 C 컴파일러를 준비한다. macOS는 Xcode Command Line Tools, Linux는 배포판의
-C 빌드 도구, Windows는 MSVC C++ Build Tools를 사용한다. 저장소 루트에서 코어 네 개를 빌드한다.
+C 빌드 도구, Windows는 MSVC C++ Build Tools를 사용한다. 저장소 루트에서 코어와 어댑터 호스트를 빌드한다.
 
 ```sh
-cargo build --locked --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
+cargo build --locked --release --bins
 ```
 
 두 경로 모두 `target/release/`에 `emucap-mcp`(제어 MCP), `emucap-track-mcp`(추적 MCP),
 `emucap`(번들·추적 CLI), `emucap-broker`(다중 세션 broker)를 준비한다(Windows는 `.exe`).
-어댑터 브리지와 에뮬레이터 호스트는 선택한 시스템의 `adapters/<adapter>/README.md`와
-빌드 요구사항에 따라 별도로 준비한다.
+Rust 어댑터 브리지와 호스트도 함께 제공한다. 선택한 네이티브 에뮬레이터는 아래 패키지 설치
+절차로 준비한다.
+
+### 네이티브 에뮬레이터 패키지
+
+Core와 같은 릴리스에서 선택한 어댑터 압축 파일, JSON manifest, `.sha256` 파일을 내려받는다.
+파일명은 `emucap-<version>-<adapter>-<target>` 형태다. 해시를 확인하고 계속 사용할 디렉터리에
+압축 전체를 해제한다. 라이브러리·assets·빌드 메타데이터를 함께 유지한다.
+`NATIVE-PACKAGE.json`의 executable은 해당 디렉터리 기준 실행 파일 경로다.
+
+제어 MCP 서버의 환경 변수에 아래 실행 파일의 절대 경로를 설정한 뒤 MCP 서버를 재시작한다.
+Mupen64Plus는 실행 파일 대신 네이티브 코어와 플러그인이 있는 디렉터리를 지정한다.
+NP2kai는 `EMUCAP_NP2KAI_BUILD_INFO`에도 패키지의 `emucap-np2kai-build.json` 경로를 설정한다.
+
+| 어댑터 | 환경 변수 |
+| --- | --- |
+| Mesen2 | `MESEN_BIN` |
+| Mednafen | `MEDNAFEN_BIN` |
+| Flycast | `FLYCAST_APP` |
+| MAME PC-98 | `MAME_BIN` |
+| MAME Neo Geo | `EMUCAP_NEOGEO_MAME_BIN` |
+| NP2kai | `EMUCAP_NP2KAI_CORE` |
+| Mupen64Plus | `EMUCAP_M64P_ROOT` |
+| PPSSPP | `EMUCAP_PPSSPP_BIN` |
+| Dolphin | `EMUCAP_DOLPHIN_BIN` |
+| openMSX | `EMUCAP_OPENMSX_BIN` |
+| PCSX2 | `EMUCAP_PCSX2_BIN` |
+| DeSmuME | `EMUCAP_DESMUME_BIN` |
+| xemu | `EMUCAP_XEMU_BIN` |
+
+패키지에 포함된 GUI 실행 파일은 `EMUCAP_PPSSPP_GUI_BIN` 또는 `EMUCAP_DOLPHIN_GUI_BIN`으로
+지정한다. Dolphin headless 실행 파일은 `EMUCAP_DOLPHIN_HEADLESS_BIN`으로 지정할 수 있다.
+macOS 패키지는 Apple Silicon용이며, PCSX2는 Rosetta로 Intel 빌드를 실행한다.
+게임 ROM과 필요한 펌웨어는 별도로 준비한다. 소스 빌드는 각 어댑터의 빌드 스크립트를 사용한다.
+릴리스에는 패치가 적용된 네이티브 소스와 빌드 스크립트도 제공한다.
 
 ### 3. MCP 서버 등록 (두 MCP)
 
@@ -144,9 +177,8 @@ Windows에서는 PowerShell에서 `tools/register-codex-mcp.ps1`을 실행한다
 
 ### 4. 첫 동작 (에이전트가 bootstrap으로 시작)
 
-설치 경로와 선택한 시스템을 바탕으로 해당 어댑터 README에 따라 브리지와 에뮬레이터 호스트를
-준비한 뒤 managed launch로 진행한다. Core 설치는 MCP 서버를 준비하는 단계이며, 어댑터의
-실행 준비 여부는 별도로 확인한다.
+아래 절차로 선택한 네이티브 에뮬레이터를 설치한 뒤 managed launch로 진행한다.
+`bootstrap(include=["installation"])`에서 확인된 경로와 빠진 실행 준비물을 확인한다.
 
 모든 emucap 작업은 `bootstrap`으로 시작한다. 에이전트에게 "emucap `bootstrap`을 호출해줘"라고
 하면, 기본 응답이 `listener.port`·system ID·catalog revision·그리고 무엇을 켤지 물어볼 질문을
@@ -246,12 +278,12 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
 
 ## 에뮬레이터별 어댑터 (필요할 때 에이전트가 설치)
 
-하나만 먼저 골라 시작하면 된다. MesenCE는 guest를 전진시키지 않는 native debugger halt에서 요청을
-처리해야 하므로 로컬 소스 빌드를 사용한다.
+하나만 먼저 골라 시작하면 된다. 같은 릴리스의 네이티브 패키지 또는 아래 빌드 스크립트를 사용한다.
+emucap 패치는 guest가 정지한 상태에서도 네이티브 제어 요청을 처리한다.
 
 - **Mesen2 (SNES·Game Gear·Game Boy·GBC·GBA·NES)** — `adapters/mesen2/build.sh`(Windows:
   `build.ps1`)를 실행한다. 고정 MesenCE 2.2.1을 Git에서 제외된 빌드 디렉터리에 받고 GPLv3 patch stack을
-  적용해 로컬에서 빌드하며 에뮬레이터 바이너리는 배포하지 않는다. 시스템별 Lua 엔트리로 처리한다
+  적용해 빌드한다. 릴리스 패키지에도 이 패치가 적용된 빌드를 제공한다. 시스템별 Lua 엔트리로 처리한다
   (SNES는 65816, Game Gear/Master System은 Z80, Game Boy/GBC는 SM83, GBA는 ARM7, NES는 6502). GBA는
   실 BIOS(`gba_bios.bin`, 비커밋)가 필요하고 SNES/Game Gear/GB/GBC/NES는 필요 없다. 수정되지 않은
   Mesen 빌드는 native halt service와 안전한 savestate event가 없어 live control에서 명시적으로 거부한다.

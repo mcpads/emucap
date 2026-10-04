@@ -2,10 +2,10 @@ emucap — third-party attributions
 ==================================
 
 emucap integrates with, patches, or loads code into the retro-emulators below.
-emucap does NOT redistribute these emulators; each adapter's build.sh downloads
-the pinned upstream release and builds it on your machine. The attributions are
-provided because emucap's adapter code is a derivative of, or a plugin for, these
-projects. Each project remains under its own copyright and license.
+Releases provide patched native emulator packages alongside their sources and
+build recipes. Each adapter's build script also supports building the pinned
+upstream source locally. Each project and its bundled dependencies remain under
+their own copyright and license; retain the notices supplied with each package.
 
 Mednafen
   Upstream: https://mednafen.github.io/
@@ -34,8 +34,8 @@ NP2kai
            sound, DOSBox FPU, legacy SoftFloat, and Trident TGUI; it retains
            the root MIT code, BSD MAME sound, SoftFloat 3, and their notices.
   Used by: adapters/np2kai and emucap-np2kai (direct libretro host; PC-98 HDI)
-  Distribution: emucap ships a pinned source-build recipe and host source, not
-                the generated core, firmware, rhythm samples, or game media.
+  Distribution: the supported core profile, matching source-build recipe, and
+                host source. Firmware, rhythm samples, and game media are separate.
 
 MesenCE
   Upstream: https://github.com/nesdev-org/MesenCE

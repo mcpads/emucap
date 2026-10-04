@@ -58,16 +58,50 @@ This route is ready for step 3; compiler tools are installed later if the chosen
 **Source build:** Check out the intended release tag or development revision. Install Git,
 Rust 1.88 or newer, and a C compiler for bundled SQLite. On macOS use Xcode Command Line Tools;
 on Linux use the distribution's C build tools; on Windows use MSVC C++ Build Tools. From the
-repository root, build the four core executables:
+repository root, build the core and adapter host executables:
 
 ```sh
-cargo build --locked --release --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
+cargo build --locked --release --bins
 ```
 
 Both routes place `emucap-mcp` (Control MCP), `emucap-track-mcp` (Tracking MCP), `emucap`
 (bundle/tracking CLI) and `emucap-broker` (multi-session broker) in `target/release/`
-(with `.exe` on Windows). Adapter bridges and emulator hosts are prepared separately for the
-selected system, following `adapters/<adapter>/README.md` and its build requirements.
+(with `.exe` on Windows), alongside the Rust adapter bridges and hosts. Install the selected
+native emulator package as described below.
+
+### Native emulator packages
+
+Download the selected adapter archive and its JSON manifest and `.sha256` file from the same
+release as the Core. Native filenames include the adapter name: `emucap-<version>-<adapter>-<target>`.
+Verify the archive hash, then extract the entire package into a stable directory. Keep its libraries,
+assets and build metadata together. `NATIVE-PACKAGE.json` gives the executable path relative to that directory.
+
+Set the corresponding variable in the Control MCP server's environment to the absolute executable
+path, then restart that MCP server. For Mupen64Plus, use the directory containing the native core and
+plugins instead. For NP2kai, also set `EMUCAP_NP2KAI_BUILD_INFO` to the packaged
+`emucap-np2kai-build.json` file.
+
+| Adapter | Environment variable |
+| --- | --- |
+| Mesen2 | `MESEN_BIN` |
+| Mednafen | `MEDNAFEN_BIN` |
+| Flycast | `FLYCAST_APP` |
+| MAME PC-98 | `MAME_BIN` |
+| MAME Neo Geo | `EMUCAP_NEOGEO_MAME_BIN` |
+| NP2kai | `EMUCAP_NP2KAI_CORE` |
+| Mupen64Plus | `EMUCAP_M64P_ROOT` |
+| PPSSPP | `EMUCAP_PPSSPP_BIN` |
+| Dolphin | `EMUCAP_DOLPHIN_BIN` |
+| openMSX | `EMUCAP_OPENMSX_BIN` |
+| PCSX2 | `EMUCAP_PCSX2_BIN` |
+| DeSmuME | `EMUCAP_DESMUME_BIN` |
+| xemu | `EMUCAP_XEMU_BIN` |
+
+For a packaged GUI executable, use `EMUCAP_PPSSPP_GUI_BIN` or `EMUCAP_DOLPHIN_GUI_BIN`;
+Dolphin's headless executable can be selected with `EMUCAP_DOLPHIN_HEADLESS_BIN`.
+macOS packages target Apple Silicon; PCSX2 uses its Intel build through Rosetta.
+Provide the game's ROM and required firmware separately. Use the adapter's build recipe when
+compiling from source; the release also provides the patched native sources and recipes.
 
 ### 3. Register the MCP servers (two of them)
 
@@ -175,9 +209,8 @@ The two MCPs never call each other — **the agent composes them**:
 
 ### 4. First run (the agent starts with bootstrap)
 
-Use the installation paths and selected system to prepare the required adapter bridge and emulator
-host from its adapter README, then continue through managed launch. Core installation alone
-establishes the MCP servers; adapter readiness is checked separately.
+Install the selected native emulator package below, then use managed launch.
+`bootstrap(include=["installation"])` reports the resolved paths and missing runtime inputs.
 
 Every emucap task starts with `bootstrap`. Ask the agent to "call emucap
 `bootstrap`", and its compact response returns `listener.port`, system IDs, a
@@ -307,13 +340,13 @@ unmanaged processes instead of asking the agent to kill by process name.
 
 ## Per-emulator adapters (the agent installs when needed)
 
-Pick one to start. MesenCE uses a local source build because live control requires its native
-debugger halt to service requests without advancing the guest.
+Pick one to start. Use the matching native package from the same release, or the listed build recipe.
+The emucap patches provide native control while the guest is halted.
 
 - **Mesen2 (SNES · Game Gear · Game Boy · GBC · GBA · NES)** — run
   `adapters/mesen2/build.sh` (Windows: `build.ps1`). It fetches pinned MesenCE 2.2.1 into a
-  local directory excluded from version control, applies the GPLv3 patch stack, and builds locally;
-  no emulator binary is distributed. Per-system Lua entries cover them (65816 for SNES,
+  local directory excluded from version control and applies the GPLv3 patch stack. The release
+  package includes this patched build. Per-system Lua entries cover them (65816 for SNES,
   Z80 for Game Gear / Master System, SM83 for Game Boy / GBC, ARM7 for GBA, 6502 for
   NES). An unmodified Mesen build is rejected for live control because it lacks the patched native
   halt service and safe savestate event.
