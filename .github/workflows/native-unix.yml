@@ -115,11 +115,8 @@ jobs:
             source/native-dependencies/pcsx2
             source/native-dependency-sources/pcsx2/**/*.tar.*
           key: ${{ steps.dependency-key.outputs.key }}
-      - name: Verify Linux dependency closure
-        if: matrix.platform == 'linux' && inputs.reuse_run == ''
-        run: python packaging/_tests/release/package_native_tests.py
       - name: Preserve compiled PCSX2 inputs before packaging
-        if: inputs.reuse_run == '' && matrix.adapter == 'pcsx2' && matrix.platform == 'linux'
+        if: always() && inputs.reuse_run == '' && matrix.adapter == 'pcsx2' && matrix.platform == 'linux' && hashFiles('source/adapters/pcsx2/work/pcsx2/build-emucap/*/pcsx2-qt') != ''
         shell: bash
         run: |
           tar --exclude='.git' --exclude=CMakeFiles --exclude='*.o' --exclude='*.obj' \
@@ -127,7 +124,7 @@ jobs:
             adapters/pcsx2/work native-dependencies/pcsx2 native-dependency-sources/pcsx2
           sha256sum pcsx2-build.tar.gz > pcsx2-build.sha256
       - uses: actions/upload-artifact@v4
-        if: inputs.reuse_run == '' && matrix.adapter == 'pcsx2' && matrix.platform == 'linux'
+        if: always() && hashFiles('pcsx2-build.tar.gz') != ''
         with:
           name: native-build-pcsx2-linux
           path: |
@@ -135,6 +132,9 @@ jobs:
             pcsx2-build.sha256
           retention-days: 14
           if-no-files-found: error
+      - name: Verify Linux dependency closure
+        if: matrix.platform == 'linux' && inputs.reuse_run == ''
+        run: python packaging/_tests/release/package_native_tests.py
       - name: Stage and verify runtime and source packages
         run: python packaging/_tests/release/package_native.py --source source --adapter '${{ matrix.adapter }}' --platform '${{ matrix.platform }}' --output artifacts ${{ inputs.reuse_run != '' && '--reuse previous' || '' }}
       - uses: actions/upload-artifact@v4
