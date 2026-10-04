@@ -69,7 +69,7 @@ Intel macOS는 소스 빌드로 사용할 수 있습니다. 에뮬레이터 어�
 
 ## 프로젝트 상태
 
-**1.0.0-rc.1은 출시 후보입니다.** 1.x의 공개 호환성 계약은
+**1.0.0이 출시되었습니다.** 1.x의 공개 호환성 계약은
 [COMPATIBILITY.md](COMPATIBILITY.md), 변경 사항은 [CHANGELOG.md](CHANGELOG.md)에 있습니다.
 
 코어와 별도 표시가 없는 소스의 라이선스는 **GPL-2.0-or-later**입니다.

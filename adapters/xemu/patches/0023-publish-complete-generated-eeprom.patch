@@ -1,0 +1,21 @@
+--- a/hw/xbox/eeprom_generation.c
++++ b/hw/xbox/eeprom_generation.c
+@@ -128,13 +128,9 @@
+     rc4_init(&rctx, seed, sizeof(seed));
+     rc4_crypt(&rctx, e.confounder, 0x1C);
+ 
+-    // save to file
+-    FILE *fd = qemu_fopen(file, "wb");
+-    if (fd == NULL) {
+-        return false;
+-    }
+-
+-    bool success = fwrite(&e, sizeof(e), 1, fd) == 1;
+-    fclose(fd);
+-    return success;
++    /* Publish only a complete EEPROM: the managed launcher may read it as
++     * soon as the path exists. GLib writes and closes a sibling temporary
++     * file before renaming it, including when the destination is new. */
++    return g_file_set_contents_full(file, (const gchar *)&e, sizeof(e),
++                                    G_FILE_SET_CONTENTS_CONSISTENT, 0666, NULL);
+ }

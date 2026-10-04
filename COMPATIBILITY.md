@@ -1,7 +1,6 @@
 # Compatibility policy
 
-This policy takes effect with stable 1.0.0. Release candidates qualify that boundary;
-changes between candidates are recorded in the changelog.
+This policy applies from 1.0.0. Changes are recorded in the changelog.
 
 ## Stable 1.x surface
 

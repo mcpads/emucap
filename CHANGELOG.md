@@ -2,37 +2,23 @@
 
 Release compatibility is defined in [COMPATIBILITY.md](COMPATIBILITY.md).
 
-## 1.0.0-rc.1
+## 1.0.0
 
 ### Changed
-- Define the proposed stable 1.x consumer boundary for MCP, CLI and versioned records;
-  retain explicit capability and experimental-profile limits.
-- Qualify memory batches and agent pacing across 13 maintained adapters at shared,
-  native-owner, fault-injection and selected-runtime layers.
-- Require matched rebuilt native hosts for the updated patch stacks, including Dolphin
-  and Mupen64Plus host API 8. Build the adapter host and its bridge from this release.
-- Release CI validates Windows x64, Linux x64 and Apple Silicon core packages. Candidate
-  releases are prereleases and do not replace the latest stable release.
+- Establish the stable 1.x MCP, CLI and versioned-record compatibility policy.
+- Provide core binary packages for Windows x64, Linux x64 and Apple Silicon.
+- Separate the project overview from the agent installation and operation guide.
+- Update native adapter patch stacks. Rebuild adapter hosts and bridges together;
+  Dolphin and Mupen64Plus now use host API 8.
 
 ### Fixed
-- Bind abandoned capture recovery to retained staging ownership, including native
-  Windows directory identity; reject replaced or unverifiable staging directories.
-- Preserve profile hashes across Windows checkouts and use native directory publication
-  operations. Validate candidate source before tagging through the shared package job.
-- Release TCP preaccept listeners, handshake sockets and worker threads with their link.
-- Preserve native memory-writer exclusion and pure observation across batch paths,
-  including Dolphin CPU/DSP/FIFO, PPSSPP asynchronous I/O, N64 RDRAM watchpoints,
-  Mesen GBA input bookkeeping and MAME device peeks.
-- Apply and verify pacing changes at their native policy owner, preserve replacement
-  epochs, and retire uncertain sessions after transport or restoration failures.
-- Keep control service responsive at minimum pacing rates and release request-owned
-  input on cancellation, including Dolphin, Flycast and xemu.
-
-### Validation scope
-- The preceding shared audit passed 1,767 tests; native fixtures and selected-game
-  evidence are distinct. Candidate source and packaged-core checks are release gates.
-- Experimental profile promotion and exhaustive game/platform coverage remain separate
-  from the stable core contract. Native Windows emulator execution is not claimed.
+- Publish newly generated Xbox EEPROM files only after writing is complete.
+- Release TCP listeners, handshake sockets and worker threads with their connection.
+- Preserve native memory-writer exclusion and pure observation across memory batches.
+- Apply pacing changes through the native emulator and keep control responsive at
+  minimum speeds, including cancellation and input release.
+- Bind abandoned capture recovery to its staging directory and ownership record.
+- Preserve profile hashes across Windows checkouts and use native directory publication.
 
 ## 0.18.0
 

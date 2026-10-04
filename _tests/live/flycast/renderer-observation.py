@@ -30,8 +30,11 @@ def advance(w, count):
 def check_partial_load_failure(w, out, checkpoint, ranges):
     """Distinguish harmless envelope rejection from a partially applied native load."""
     original = Path(checkpoint).read_bytes()
-    assert original[:8] == b'EMUCAPFC' and len(original) > 48
-    payload = bytearray(original[:len(original)//2])
+    # TA-context sizing reserves capacity; half the file can still contain the
+    # entire serialized state. Cut inside the mandatory AICA data instead.
+    cut = 24 + 4096
+    assert original[:8] == b'EMUCAPFC' and len(original) > cut
+    payload = bytearray(original[:cut])
     damaged = out/'truncated.state'
     damaged.write_bytes(payload)
     before = w.call('get_state')['state']
@@ -59,7 +62,8 @@ def check_partial_load_failure(w, out, checkpoint, ranges):
         current = w.call('status')
         assert current['state'] == 'unknown' and current['frame'] == quarantined['frame']
     assert not (out/'must-not-exist.state').exists()
-    return {'preflight_rejected_without_cpu_change': rejected, 'native_load_failure': failure,
+    return {'original_bytes': len(original), 'truncated_bytes': len(payload),
+            'preflight_rejected_without_cpu_change': rejected, 'native_load_failure': failure,
             'denied': denied, 'status_did_not_recover': True}
 
 

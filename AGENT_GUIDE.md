@@ -429,6 +429,13 @@ debugger halt to service requests without advancing the guest.
   produced audible output with `sound:true`; this is not a broad game-compatibility claim.
   → `adapters/xemu/README.md`
 
+## Known issues
+
+On Windows, DeSmuME may intermittently time out while verifying a halt, and MAME
+PC-98 may time out when restoring a state. If this occurs, preserve the checkpoint,
+check `status` and `get_failure_context()`, and relay the symptom to the user. If
+control is unavailable, stop the affected managed `launch_id` and relaunch.
+
 ## Learn more
 
 - What is built and why, and the binaries → `CLAUDE.md`

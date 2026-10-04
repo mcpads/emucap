@@ -357,3 +357,9 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   조작, stdio), `emucap-track-mcp`(추적 MCP — 실험 원장, emulator-less, stdio),
   `emucap-broker`(다중 세션 연결 공유), N64 frontend, 그리고 빌드 절에 적은 PC-98/Neo Geo/NDS/PSP/PS2/MSX/Xbox
   launch bridge.
+
+## 알려진 문제
+
+Windows에서 DeSmuME의 정지 확인이나 MAME PC-98의 상태 복원이 간헐적으로 시간 초과될 수 있다.
+해당 증상이 나타나면 체크포인트를 보존하고 `status`와 `get_failure_context()`를 확인한 뒤
+사용자에게 증상을 전달한다. 제어할 수 없으면 해당 managed `launch_id`를 stop하고 다시 실행한다.

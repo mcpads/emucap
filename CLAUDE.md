@@ -31,7 +31,8 @@ its live windows and limits. For collection speed or human handoff, describe `de
 
 Wait for each dependent call's terminal response and check its execution state and cleanup
 outcome. On timeout or disconnect, inspect continuity and `get_failure_context()` before choosing
-recovery. Establish process exit from process evidence. Use managed lifecycle tools for attachment
+recovery. Consult [known issues](AGENT_GUIDE.md#known-issues) for adapter-specific symptoms.
+Establish process exit from process evidence. Use managed lifecycle tools for attachment
 and replacement; end a generation with `stop(status.runtime_instance.launch_id)`.
 
 Pass `get_rom_info.rom_sha1` unchanged to Tracking `run_start`. Record relevant mutations with
