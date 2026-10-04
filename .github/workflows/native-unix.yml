@@ -17,7 +17,19 @@ on:
       platform:
         type: choice
         default: all
-        options: [all, linux, macos]
+        options: [all, linux, macos, windows]
+      runtime_run:
+        description: Successful Windows build to package when platform is windows
+        type: string
+        default: ''
+      source_run:
+        description: Successful Unix package with matching Windows source inputs
+        type: string
+        default: ''
+      source_platform:
+        type: choice
+        default: macos
+        options: [linux, macos]
 permissions:
   contents: read
   actions: read
@@ -26,6 +38,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
+    if: inputs.platform != 'windows'
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -99,4 +112,75 @@ jobs:
           path: |
             native-build.log
             source/native-toolchain.txt
+          retention-days: 14
+  package:
+    if: inputs.platform == 'windows'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: packaging
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Verify package boundaries
+        run: python packaging/_tests/release/package_windows_tests.py
+      - name: Resolve successful producer run
+        id: producer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNTIME_RUN: ${{ inputs.runtime_run }}
+          SOURCE_RUN: ${{ inputs.source_run }}
+        run: |
+          python - <<'PY'
+          import json, os, subprocess
+          for key in ('RUNTIME_RUN', 'SOURCE_RUN'):
+              run_id = os.environ[key]
+              if not run_id.isdecimal(): raise ValueError('run ID must be numeric')
+              result = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run_id}']))
+              if result['conclusion'] != 'success' or result['event'] == 'pull_request':
+                  raise ValueError('requires successful trusted producer run')
+              if key == 'RUNTIME_RUN':
+                  with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+                      out.write('revision=' + result['head_sha'] + '\n')
+          PY
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.producer.outputs.revision }}
+          path: source
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-runtime-${{ inputs.adapter }}-windows-x86_64
+          path: payload
+          run-id: ${{ inputs.runtime_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-package-${{ inputs.adapter }}-${{ inputs.source_platform }}
+          path: native-source
+          run-id: ${{ inputs.source_run }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        if: inputs.adapter == 'xemu'
+        with:
+          name: native-evidence-xemu-windows-x86_64
+          path: evidence
+          run-id: ${{ inputs.runtime_run }}
+          github-token: ${{ github.token }}
+      - name: Verify and archive native payload
+        env:
+          ADAPTER: ${{ inputs.adapter }}
+        run: |
+          args=()
+          if [ "$ADAPTER" = xemu ]; then
+            args+=(--binary-digest "$(cut -d ' ' -f1 evidence/native-binary.sha256)")
+          fi
+          python packaging/_tests/release/package_windows.py --adapter "$ADAPTER" \
+            --source source --payload payload --native-source native-source --output artifacts "${args[@]}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-package-${{ inputs.adapter }}-windows
+          path: artifacts/*
+          if-no-files-found: error
           retention-days: 14
