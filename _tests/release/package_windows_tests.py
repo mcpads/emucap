@@ -43,25 +43,31 @@ class WindowsPackageTests(unittest.TestCase):
             (payload / 'NATIVE-BUILD.json').write_text(json.dumps(record))
             with self.assertRaisesRegex(ValueError, 'escapes payload'): verify_payload(payload, source, 'example')
 
+    def test_shared_mame_source_authority(self):
+        self.check_source('mame-neogeo', 'mame-pc98')
+
     def test_source_digest_and_patch_identity_required(self):
+        self.check_source('example', 'example')
+
+    def check_source(self, adapter, owner):
         with tempfile.TemporaryDirectory() as d:
             root = Path(d)
             source, _, _ = self.fixture(root)
-            lock = source / 'adapters/example/upstream.lock'
+            lock = source / f'adapters/{owner}/upstream.lock'
             lock.parent.mkdir(parents=True)
             lock.write_text('COMMIT=pinned\n')
             subprocess.run(['git', '-C', str(source), 'add', '.'], check=True)
             upstream, output = root / 'upstream', root / 'output'
             upstream.mkdir(); output.mkdir()
             (upstream / 'source.c').write_text('source')
-            archive = source_archive(source, upstream, 'example', output, 'emucap-example')
-            record = dict(adapter='example', artifacts={archive.name: sha(archive)})
+            archive = source_archive(source, upstream, adapter, output, 'emucap-example')
+            record = dict(adapter=adapter, artifacts={archive.name: sha(archive)})
             (output / 'emucap-example.json').write_text(json.dumps(record))
-            self.assertEqual(matching_source(output, source, 'example')[0], archive)
+            self.assertEqual(matching_source(output, source, adapter)[0], archive)
             lock.write_text('COMMIT=other\n')
-            with self.assertRaisesRegex(ValueError, 'source input mismatch'): matching_source(output, source, 'example')
+            with self.assertRaisesRegex(ValueError, 'source input mismatch'): matching_source(output, source, adapter)
             archive.write_bytes(b'changed')
-            with self.assertRaisesRegex(ValueError, 'archive digest mismatch'): matching_source(output, source, 'example')
+            with self.assertRaisesRegex(ValueError, 'archive digest mismatch'): matching_source(output, source, adapter)
 
 
 if __name__ == '__main__': unittest.main()

@@ -60,9 +60,12 @@ def matching_source(directory, source, adapter):
     archive = directory / names[0]
     if sha(archive) != record['artifacts'][archive.name]:
         raise ValueError('native source archive digest mismatch')
-    required = run('git', '-C', source, 'ls-files', f'adapters/{adapter}/upstream.lock',
-                   f'adapters/{adapter}/patches').splitlines()
-    if f'adapters/{adapter}/upstream.lock' not in required:
+    owner = 'mame-pc98' if adapter == 'mame-neogeo' else adapter
+    tracked = run('git', '-C', source, 'ls-files', f'adapters/{owner}', f'adapters/{adapter}').splitlines()
+    # Native code can be copied into upstream directly, not only applied as patches.
+    # Platform build recipes are supplied separately from the exact Windows commit.
+    required = [p for p in tracked if Path(p).suffix not in ('.md', '.sh', '.ps1')]
+    if f'adapters/{owner}/upstream.lock' not in required:
         raise ValueError('missing upstream lock')
     with tarfile.open(archive) as packed:
         for rel in required:
