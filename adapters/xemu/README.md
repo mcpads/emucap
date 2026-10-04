@@ -73,7 +73,7 @@ are parked for the copy. Repeated and overlapping ranges retain request order. T
 the generation, stop epoch, frame counter and guest virtual clock. Rebuild with
 `adapters/xemu/build.sh`.
 
-The experimental Xbox profile uses host API 3 and fixed instruction-count scheduling for
+The Xbox profile uses host API 3 and fixed instruction-count scheduling for
 `debug.execution_speed`: integer 1–1000% or unlimited, while running or frozen. Managed launch
 selects single-thread TCG with `shift=3,align=off,sleep=off`; pacing changes only host waits.
 The bridge verifies the complete native clock profile against the managed generation.

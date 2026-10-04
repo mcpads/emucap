@@ -419,7 +419,7 @@ The emucap patches provide native control while the guest is halted.
   frame control, frozen-frame screenshots, port-0 input, and native save/load (CDZ through
   a maintained MAME patch).
   → `adapters/mame-neogeo/README.md`
-- **Mupen64Plus (Nintendo 64, experimental; Unix)** — run
+- **Mupen64Plus (Nintendo 64)** — run
   `adapters/mupen64plus/build.sh`, then build `emucap-mupen64plus`. Standard cartridge
   ROMs need no BIOS. The current pure-interpreter adapter supports isolated headless or
   visible launch, pause/resume, R4300 instruction stepping, CPU state, and bounded frozen
@@ -445,7 +445,7 @@ The emucap patches provide native control while the guest is halted.
   Other disk profiles and cassette runtime remain unproven; turboR/R800 is not implemented. Generic `.rom` files require an explicit
   MSX system ID.
   → `adapters/openmsx/README.md`
-- **xemu (original Xbox, experimental)** — build the pinned GPLv2 fork with
+- **xemu (original Xbox)** — build the pinned GPLv2 fork with
   `adapters/xemu/build.sh`, then build `emucap-xemu-bridge`. Set
   `EMUCAP_XEMU_FIRMWARE` to an operator-owned directory containing the required MCPX,
   flash ROM, and HDD template; an EEPROM image is optional. Managed launch copies the

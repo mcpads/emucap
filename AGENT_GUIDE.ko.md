@@ -344,7 +344,7 @@ emucap 패치는 guest가 정지한 상태에서도 네이티브 제어 요청�
   입력, native save/load(CDZ는 유지보수 MAME patch로)를 제공한다. 파일 확장자만 보고 어느
   Neo Geo profile로도 자동 판정하지 않는다.
   → `adapters/mame-neogeo/README.md`
-- **Mupen64Plus Nintendo 64 (실험적, Unix)** — `adapters/mupen64plus/build.sh`를 실행하고
+- **Mupen64Plus Nintendo 64** — `adapters/mupen64plus/build.sh`를 실행하고
   `emucap-mupen64plus`를 빌드한다. 일반 카트리지 ROM은 BIOS가 필요 없다. 현재 pure interpreter로
   격리된 headless/창 실행, pause/resume, R4300 명령 스텝, CPU 상태, frozen RDRAM 제한 읽기·쓰기를
   지원한다. 두 모드 모두 port-0 입력 hold와 명시적인 native 입력권 반환을 제공한다. 창 실행은
@@ -366,7 +366,7 @@ emucap 패치는 guest가 정지한 상태에서도 네이티브 제어 요청�
   세대 간 상태 복원을 검증했다. 다른 디스크 profile과 cassette runtime은 아직 검증하지 않았고
   turboR/R800은 미구현이다.
   일반 `.rom` 파일은 MSX system ID를 명시한다. → `adapters/openmsx/README.md`
-- **xemu 원본 Xbox (실험적)** — `adapters/xemu/build.sh`로 고정된 GPLv2 포크를 빌드하고
+- **xemu 원본 Xbox** — `adapters/xemu/build.sh`로 고정된 GPLv2 포크를 빌드하고
   `emucap-xemu-bridge`를 빌드한다. 사용자가 준비한 MCPX·flash ROM·HDD template 디렉터리를
   `EMUCAP_XEMU_FIRMWARE`로 지정하며 EEPROM은 선택 사항이다. 관리형 실행은 기기 입력을 세대별
   격리 디렉터리로 복사하고 사용자의 일반 xemu profile을 열지 않는다. 제어된 frozen 시작,

@@ -60,9 +60,9 @@ Intel macOS는 소스 빌드로 사용할 수 있습니다. 에뮬레이터 어�
 | Dolphin | GameCube, Wii |
 | MAME / NP2kai | PC-98 |
 | MAME | Neo Geo MVS / AES / CD |
-| Mupen64Plus | Nintendo 64 — 실험 지원 |
+| Mupen64Plus | Nintendo 64 |
 | openMSX | MSX1 / MSX2 / MSX2+ |
-| xemu | 원본 Xbox — 실험 지원 |
+| xemu | 원본 Xbox |
 
 설치 방법과 프로필별 지원 범위는 [어댑터 가이드](AGENT_GUIDE.ko.md#에뮬레이터별-어댑터-필요할-때-에이전트가-설치)를
 참고하세요. 제어와 관찰에 에뮬레이터 내부 수정이 필요한 경우 emucap이 소스 패치를 유지합니다.
