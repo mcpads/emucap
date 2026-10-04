@@ -27,7 +27,7 @@ jobs:
       matrix:
         adapter: ${{ fromJSON(inputs.adapter != 'all' && format('["{0}"]', inputs.adapter) || '["mesen2","dolphin","ppsspp","mednafen","flycast","np2kai","mupen64plus","openmsx","mame-pc98","mame-neogeo","pcsx2","desmume-nds","xemu"]') }}
         platform: ${{ fromJSON(inputs.platform != 'all' && format('["{0}"]', inputs.platform) || '["linux","macos"]') }}
-    runs-on: ${{ matrix.platform == 'macos' && 'macos-14' || 'ubuntu-24.04' }}
+    runs-on: ${{ matrix.platform == 'macos' && 'macos-15' || 'ubuntu-24.04' }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4

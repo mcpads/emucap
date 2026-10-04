@@ -61,6 +61,7 @@ PATCHES=(
   "$HERE/patches/0007-preflight-native-peek-ranges.patch"
   "$HERE/patches/0008-initialize-wide-graphics-setting.patch"
   "$HERE/patches/0009-export-windows-debug-api.patch"
+  "$HERE/patches/0010-export-elf-debug-api.patch"
 )
 ACTUAL_PATCHSET_SHA256="$(for source_patch in "${PATCHES[@]}"; do cat "$source_patch"; done | sha256_path /dev/stdin)"
 if [ "$ACTUAL_PATCHSET_SHA256" != "$NP2KAI_PATCHSET_SHA256" ]; then
@@ -180,7 +181,11 @@ make -s -C "$SRC/sdl" -f Makefile.libretro "${MAKE_ENV[@]}" -j "$JOBS"
   echo "ERROR: NP2kai libretro core was not produced: $CORE" >&2
   exit 1
 }
-DEBUG_SYMBOLS="$(nm -g "$CORE")"
+if [ "$(uname -s)" = Linux ]; then
+  DEBUG_SYMBOLS="$(nm -D --defined-only "$CORE")"
+else
+  DEBUG_SYMBOLS="$(nm -g "$CORE")"
+fi
 for required_symbol in \
   emucap_np2_debug_api_version \
   emucap_np2_read_memory \

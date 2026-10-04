@@ -1,0 +1,8 @@
+--- a/sdl/link.T
++++ b/sdl/link.T
+@@ -1,4 +1,4 @@
+ {
+-   global: retro_*;
++   global: retro_*; emucap_np2_*;
+    local: *;
+ };

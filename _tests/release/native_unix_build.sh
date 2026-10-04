@@ -61,7 +61,7 @@ else
       libxcb-xkb-dev libxext-dev libxkbcommon-x11-dev libxrandr-dev lld llvm) ;;
     desmume-nds) packages+=(libsdl2-dev libglib2.0-dev libpcap-dev) ;;
     xemu) packages+=(libsdl2-dev libepoxy-dev libpixman-1-dev libgtk-3-dev libssl-dev libsamplerate0-dev
-      libpcap-dev libslirp-dev libusb-1.0-0-dev libpulse-dev libglib2.0-dev libcurl4-openssl-dev) ;;
+      libpcap-dev libslirp-dev libvulkan-dev libusb-1.0-0-dev libpulse-dev libglib2.0-dev libcurl4-openssl-dev) ;;
     *) exit 2 ;;
   esac
   sudo apt-get update -qq
@@ -85,3 +85,8 @@ else
 fi
 bash _tests/adapters/build-lock-test.sh
 bash "adapters/$adapter/build.sh"
+if [ "$adapter" = np2kai ]; then
+  extension=so
+  if [ "$(uname -s)" = Darwin ]; then extension=dylib; fi
+  python3 _tests/native/np2kai-load-api.py "adapters/np2kai/work/np2kai/sdl/np2kai_libretro.$extension"
+fi
