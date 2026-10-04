@@ -77,8 +77,12 @@ def select_outputs(root, adapter, mac):
         binary = (work / 'mame.raw').resolve()
         output = binary
     elif adapter == 'pcsx2':
-        output = one(src, 'build-emucap/bin/*.app') if mac else src / 'build-emucap/bin'
-        binary = app_executable(output) if mac else output / 'pcsx2-qt'
+        if mac:
+            output = one(src, 'build-emucap/*/*.app')
+            binary = app_executable(output)
+        else:
+            binary = one(src, 'build-emucap/*/pcsx2-qt')
+            output = binary.parent
     elif adapter == 'desmume-nds':
         binary = src / 'desmume/src/frontend/posix/build-headless/cli/desmume-cli'
         output = binary

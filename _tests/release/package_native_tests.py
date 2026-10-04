@@ -5,8 +5,9 @@ import unittest
 import subprocess
 import json
 import tarfile
+import plistlib
 import sys
-from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive, restore_package, sha
+from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive, restore_package, sha, select_outputs
 
 
 class PackageBoundaries(unittest.TestCase):
@@ -129,6 +130,20 @@ class PackageBoundaries(unittest.TestCase):
             archive.write_bytes(b'tampered')
             with self.assertRaisesRegex(ValueError, 'digest mismatch'):
                 restore_package(inputs, 'example', 'revision', root / 'tampered' / 'example')
+
+    def test_pcsx2_outputs_follow_recipe_layout(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            build = root / 'adapters/pcsx2/work/pcsx2/build-emucap'
+            app = build / 'pcsx2-qt/PCSX2.app'
+            binary = app / 'Contents/MacOS/PCSX2'
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'native')
+            (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleExecutable': 'PCSX2'}))
+            self.assertEqual(select_outputs(root, 'pcsx2', True)[2:], (app, binary))
+            linux = build / 'pcsx2-qt/pcsx2-qt'
+            linux.write_bytes(b'native')
+            self.assertEqual(select_outputs(root, 'pcsx2', False)[2:], (linux.parent, linux))
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:
