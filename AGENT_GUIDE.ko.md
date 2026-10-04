@@ -302,7 +302,7 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   받는다. read breakpoint는 권위 있는 접근 값을 제공하지 않으며, write breakpoint만 값 필터를
   지원한다.
   → `adapters/np2kai/README.md`
-- **MAME Neo Geo MVS/AES/CD (실험적)** — `adapters/mame-neogeo/build.sh`로 전용 고정 MAME subset을
+- **MAME Neo Geo MVS/AES/CD** — `adapters/mame-neogeo/build.sh`로 전용 고정 MAME subset을
   빌드하고 `emucap-mame-neogeo-bridge`를 빌드한다. MVS는 사용자가 준비한 `neogeo.zip` BIOS와
   해당 MAME 버전에 맞는 게임 ROM set을 사용한다. AES는 `aes.zip`과 ZIP stem이 고정된 MAME
   Neo Geo software list의 AES 호환 항목을 가리키는 cartridge set을 사용한다. CD는 공식 BIOS가 든
@@ -322,7 +322,7 @@ process-start identity를 확인한 뒤 emulator와 기록된 bridge의 실제 �
   headless는 rendered-frame 기능을 노출하지 않는다.
   RSP 상태는 이 profile의 범위가 아니다.
   → `adapters/mupen64plus/README.md`
-- **openMSX MSX profile (실험적)** — `adapters/openmsx/build.sh`를 실행하고
+- **openMSX MSX profile** — `adapters/openmsx/build.sh`를 실행하고
   `emucap-openmsx-bridge`를 빌드한다. 공식 launcher는 기록된 upstream compatibility backport와
   emucap host patch를 적용해 만든 고정 openMSX 21.0 sidecar만 받아 emucap 소유 per-port
   `HOME`에서 실행하며 사용자의 emulator profile을 읽지 않는다. `msx`는 C-BIOS MSX2+,

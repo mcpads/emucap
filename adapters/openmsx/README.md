@@ -1,6 +1,6 @@
 # openMSX adapter
 
-This directory pins openMSX 21.0 for the experimental `msx`, `msx1`, `msx2`, and `msx2p`
+This directory pins openMSX 21.0 for the `msx`, `msx1`, `msx2`, and `msx2p`
 system profiles.
 `emucap-openmsx-bridge` remains a separate Rust process that owns the emulator's XML stdio
 control channel. Four pinned host patches add readback-checked joystick ownership, a renderer-independent

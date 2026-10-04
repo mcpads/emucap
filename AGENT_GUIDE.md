@@ -375,7 +375,7 @@ debugger halt to service requests without advancing the guest.
   claim an authoritative access value, while write breakpoints support value
   filters.
   → `adapters/np2kai/README.md`
-- **MAME (Neo Geo MVS/AES/CD, experimental)** — build the dedicated pinned MAME subset with
+- **MAME (Neo Geo MVS/AES/CD)** — build the dedicated pinned MAME subset with
   `adapters/mame-neogeo/build.sh`, then build `emucap-mame-neogeo-bridge`. Launch
   requires an explicit system ID. MVS uses a user-supplied `neogeo.zip` plus a matching
   game ROM set. AES uses `aes.zip` and a cartridge set whose ZIP stem names an
@@ -397,7 +397,7 @@ debugger halt to service requests without advancing the guest.
   completion-checked native save/load. Headless launch remains instruction-only and omits those
   rendered-frame operations. RSP state remains outside this profile.
   → `adapters/mupen64plus/README.md`
-- **openMSX (MSX profiles, experimental)** — run
+- **openMSX (MSX profiles)** — run
   `adapters/openmsx/build.sh`, then build `emucap-openmsx-bridge`. The official
   launcher accepts only the pinned openMSX 21.0 sidecar built with the recorded
   upstream compatibility backport and the maintained emucap host patches. It runs that host

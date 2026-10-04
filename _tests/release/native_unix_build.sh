@@ -13,7 +13,7 @@ if [ "$(uname -s)" = Darwin ]; then
   packages=(cmake ninja pkgconf meson autoconf automake libtool dylibbundler python@3.13)
   case "$adapter" in
     mesen2) packages+=(sdl2-compat) ;;
-    dolphin) packages+=(qt@6 libusb libevdev sfml ffmpeg miniupnpc pugixml) ;;
+    dolphin) packages+=(qt@6 libusb sfml ffmpeg miniupnpc pugixml) ;;
     ppsspp) packages+=(sdl3 sdl3_ttf fontconfig) ;;
     mednafen) packages+=(sdl2-compat libsndfile flac zlib lzo) ;;
     flycast) packages+=(sdl2-compat libzip) ;;
