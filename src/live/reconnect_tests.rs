@@ -121,12 +121,16 @@ fn frontend_disconnect_does_not_abandon_backend_terminal_cleanup() {
     let endpoint = listener.local_addr().unwrap();
     let client = TcpStream::connect(endpoint).unwrap();
     let (server, _) = listener.accept().unwrap();
+    let write_control = server.try_clone().unwrap();
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
     let completed = Arc::new(AtomicBool::new(false));
     let completed_in_handler = Arc::clone(&completed);
 
     let worker = std::thread::spawn(move || {
         let mut handle = move |request: Request| {
-            std::thread::sleep(Duration::from_millis(35));
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
             completed_in_handler.store(true, Ordering::SeqCst);
             Response {
                 id: request.id,
@@ -142,7 +146,13 @@ fn frontend_disconnect_does_not_abandon_backend_terminal_cleanup() {
     client
         .write_all(b"{\"v\":1,\"id\":9,\"method\":\"press_buttons\",\"params\":{}}\n")
         .unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // A peer FIN can still allow the final write to succeed. Close the local
+    // write half so this fixture deterministically exercises transport failure
+    // while a backend handler owns terminal cleanup.
+    write_control.shutdown(std::net::Shutdown::Write).unwrap();
     drop(client);
+    release_tx.send(()).unwrap();
 
     assert!(worker.join().unwrap().is_err());
     assert!(
