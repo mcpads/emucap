@@ -6,6 +6,10 @@ on:
         description: Exact producer commit to build
         type: string
         required: true
+      reuse_run:
+        description: Optional completed package run to repackage without compiling
+        type: string
+        default: ''
       adapter:
         type: choice
         default: all
@@ -16,6 +20,7 @@ on:
         options: [all, linux, macos]
 permissions:
   contents: read
+  actions: read
 concurrency:
   group: native-unix-${{ inputs.revision }}-${{ inputs.adapter }}-${{ inputs.platform }}
   cancel-in-progress: false
@@ -47,13 +52,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Verify packaging boundaries
         run: python packaging/_tests/release/package_native_tests.py
+      - name: Download completed package for reuse
+        if: inputs.reuse_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: native-package-${{ matrix.adapter }}-${{ matrix.platform }}
+          path: previous
+          run-id: ${{ inputs.reuse_run }}
+          github-token: ${{ github.token }}
+      - name: Prepare package tooling
+        if: inputs.reuse_run != ''
+        shell: bash
+        run: |
+          if [ '${{ matrix.platform }}' = macos ]; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install sdl3 pkgconf
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -y patchelf
+          fi
       - name: Build pinned native adapter
+        if: inputs.reuse_run == ''
         shell: bash
         run: |
           set -o pipefail
           bash packaging/_tests/release/native_unix_build.sh '${{ matrix.adapter }}' source 2>&1 | tee native-build.log
       - name: Stage and verify runtime and source packages
-        run: python packaging/_tests/release/package_native.py --source source --adapter '${{ matrix.adapter }}' --platform '${{ matrix.platform }}' --output artifacts
+        run: python packaging/_tests/release/package_native.py --source source --adapter '${{ matrix.adapter }}' --platform '${{ matrix.platform }}' --output artifacts ${{ inputs.reuse_run != '' && '--reuse previous' || '' }}
       - uses: actions/upload-artifact@v4
         with:
           name: native-package-${{ matrix.adapter }}-${{ matrix.platform }}

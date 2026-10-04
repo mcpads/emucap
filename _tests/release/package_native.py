@@ -311,12 +311,37 @@ def move_app_metadata(stage):
         metadata.unlink()
 
 
+def restore_package(directory, name, revision, stage):
+    stage = stage.resolve()
+    record = json.loads((directory / (name + '.json')).read_text())
+    if record['source_revision'] != revision:
+        raise ValueError('reused package producer revision mismatch')
+    for filename in (name + '.tar.gz', name + '-source.tar.gz'):
+        if record['artifacts'].get(filename) != sha(directory / filename):
+            raise ValueError(f'reused package digest mismatch: {filename}')
+    with tarfile.open(directory / (name + '.tar.gz')) as archive:
+        archive.extractall(stage.parent, filter='data')
+    manifest = json.loads((stage / 'NATIVE-PACKAGE.json').read_text())
+    actual = files_manifest(stage)
+    del actual['NATIVE-PACKAGE.json']
+    if actual != manifest['files']:
+        raise ValueError('reused package file manifest mismatch')
+    if any(manifest[k] != record[k] for k in ('adapter', 'target', 'source_revision', 'version', 'executable')):
+        raise ValueError('reused package identity mismatch')
+    executable = stage / manifest['executable']
+    if not executable.resolve().is_relative_to(stage) or not executable.is_file():
+        raise ValueError('reused package executable escapes package')
+    (stage / 'NATIVE-PACKAGE.json').unlink()
+    return executable
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, required=True)
     parser.add_argument('--adapter', required=True)
     parser.add_argument('--platform', choices=['linux', 'macos'], required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--reuse', type=Path, help='Verified complete package directory to repackage without compilation')
     args = parser.parse_args()
     source = args.source.resolve()
     output = args.output.resolve()
@@ -326,31 +351,35 @@ def main():
     mac = args.platform == 'macos'
     target = 'x86_64-apple-darwin' if mac and args.adapter == 'pcsx2' else ('aarch64-apple-darwin' if mac else 'x86_64-unknown-linux-gnu')
     name = f'emucap-{version}-{args.adapter}-{target}'
-    work, src, original, binary = select_outputs(source, args.adapter, mac)
+    if not args.reuse:
+        work, src, original, binary = select_outputs(source, args.adapter, mac)
     with tempfile.TemporaryDirectory(prefix='emucap-native-') as temporary:
         stage = Path(temporary).resolve() / name
-        stage.mkdir()
-        dest = stage / original.name if original.suffix == '.app' or original.is_file() else stage / 'runtime'
-        copy(original, dest)
-        executable = dest / binary.relative_to(original) if original.is_dir() else dest
-        # Build sidecars may sit beside a standalone executable or outside its app.
-        for parent in (binary.parent, original.parent, work, src):
-            for metadata in parent.glob('*emucap*build.json'):
-                target_meta = executable.parent / metadata.name
-                if not target_meta.exists():
-                    shutil.copy2(metadata, target_meta)
-        if args.adapter == 'openmsx' and not mac:
-            metadata = one(src, 'derived/**/emucap-openmsx-build.json')
-            shutil.copy2(metadata, executable.parent / metadata.name)
-        if args.adapter == 'dolphin':
-            gui = src / 'build-emucap-gui/Binaries'
-            if gui.is_dir(): copy(gui, stage / 'gui')
-        if args.adapter == 'ppsspp':
-            for extra in ('assets', 'PPSSPPSDL', 'PPSSPPSDL.app'):
-                p = binary.parent / extra
-                if p.exists(): copy(p, stage / extra)
-        if args.adapter.startswith('mame-'):
-            copy(src / 'hash', stage / 'hash')
+        if args.reuse:
+            executable = restore_package(args.reuse.resolve(), name, revision, stage)
+        else:
+            stage.mkdir()
+            dest = stage / original.name if original.suffix == '.app' or original.is_file() else stage / 'runtime'
+            copy(original, dest)
+            executable = dest / binary.relative_to(original) if original.is_dir() else dest
+            # Build sidecars may sit beside a standalone executable or outside its app.
+            for parent in (binary.parent, original.parent, work, src):
+                for metadata in parent.glob('*emucap*build.json'):
+                    target_meta = executable.parent / metadata.name
+                    if not target_meta.exists():
+                        shutil.copy2(metadata, target_meta)
+            if args.adapter == 'openmsx' and not mac:
+                metadata = one(src, 'derived/**/emucap-openmsx-build.json')
+                shutil.copy2(metadata, executable.parent / metadata.name)
+            if args.adapter == 'dolphin':
+                gui = src / 'build-emucap-gui/Binaries'
+                if gui.is_dir(): copy(gui, stage / 'gui')
+            if args.adapter == 'ppsspp':
+                for extra in ('assets', 'PPSSPPSDL', 'PPSSPPSDL.app'):
+                    p = binary.parent / extra
+                    if p.exists(): copy(p, stage / extra)
+            if args.adapter.startswith('mame-'):
+                copy(src / 'hash', stage / 'hash')
         move_app_metadata(stage)
         native_files = macho_dependencies(stage, executable) if mac else linux_dependencies(stage)
         for p in native_files:
@@ -363,15 +392,19 @@ def main():
             if 'binary_sha256' in value:
                 value['binary_sha256'] = sha(executable)
                 p.write_text(json.dumps(value, indent=2) + '\n')
-        notices = stage / 'licenses'
-        notices.mkdir()
-        copy(source / 'NOTICE', notices / 'EMUCAP-NOTICE')
-        for p in src.iterdir():
-            if p.is_file() and any(word in p.name.lower() for word in ('license', 'copying', 'copyright', 'notice')):
-                copy(p, notices / p.name)
+        if not args.reuse:
+            notices = stage / 'licenses'
+            notices.mkdir()
+            copy(source / 'NOTICE', notices / 'EMUCAP-NOTICE')
+            for p in src.iterdir():
+                if p.is_file() and any(word in p.name.lower() for word in ('license', 'copying', 'copyright', 'notice')):
+                    copy(p, notices / p.name)
         manifest = {'adapter': args.adapter, 'target': target, 'source_revision': revision,
                     'version': version, 'executable': executable.relative_to(stage).as_posix(),
+                    'packaging_revision': run('git', '-C', Path(__file__).resolve().parent, 'rev-parse', 'HEAD'),
                     'files': files_manifest(stage)}
+        if args.reuse:
+            manifest['repackaged_from_sha256'] = sha(args.reuse / (name + '.tar.gz'))
         (stage / 'NATIVE-PACKAGE.json').write_text(json.dumps(manifest, indent=2) + '\n')
         archive_path = output / (name + '.tar.gz')
         with tarfile.open(archive_path, 'w:gz', compresslevel=3) as archive:
@@ -400,7 +433,11 @@ def main():
         restored = files_manifest(verify / name)
         del restored['NATIVE-PACKAGE.json']
         assert restored == manifest['files'], 'extracted native package mismatch'
-        sources = source_archive(source, src, args.adapter, output, name)
+        if args.reuse:
+            sources = output / (name + '-source.tar.gz')
+            shutil.copy2(args.reuse / sources.name, sources)
+        else:
+            sources = source_archive(source, src, args.adapter, output, name)
         record = {**{k: v for k, v in manifest.items() if k != 'files'},
                   'artifacts': {p.name: sha(p) for p in (archive_path, sources)}}
         (output / (name + '.json')).write_text(json.dumps(record, indent=2) + '\n')

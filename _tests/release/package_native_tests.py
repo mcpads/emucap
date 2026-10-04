@@ -6,7 +6,7 @@ import subprocess
 import json
 import tarfile
 import sys
-from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive
+from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive, restore_package, sha
 
 
 class PackageBoundaries(unittest.TestCase):
@@ -105,6 +105,30 @@ class PackageBoundaries(unittest.TestCase):
                 self.assertEqual(data, {'system-headers': '../host-header'})
                 packed.extractall(root / 'restored', filter='data')
             self.assertFalse((root / 'restored/example-source/upstream/system-headers').exists())
+
+    def test_reuse_requires_matching_revision_and_archive_bytes(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            old, inputs = root / 'old' / 'example', root / 'inputs'
+            old.mkdir(parents=True)
+            inputs.mkdir()
+            (old / 'game').write_bytes(b'executable')
+            identity = dict(source_revision='revision', adapter='example', target='test',
+                            version='1.0.0', executable='game')
+            (old / 'NATIVE-PACKAGE.json').write_text(json.dumps(dict(identity, files=files_manifest(old))))
+            archive = inputs / 'example.tar.gz'
+            with tarfile.open(archive, 'w:gz') as packed: packed.add(old, arcname='example')
+            sources = inputs / 'example-source.tar.gz'
+            sources.write_bytes(b'preserved upstream source archive')
+            record = dict(identity, artifacts={p.name: sha(p) for p in (archive, sources)})
+            (inputs / 'example.json').write_text(json.dumps(record))
+            stage = root / 'restored' / 'example'
+            self.assertEqual(restore_package(inputs, 'example', 'revision', stage).read_bytes(), b'executable')
+            with self.assertRaisesRegex(ValueError, 'producer revision mismatch'):
+                restore_package(inputs, 'example', 'other', root / 'wrong' / 'example')
+            archive.write_bytes(b'tampered')
+            with self.assertRaisesRegex(ValueError, 'digest mismatch'):
+                restore_package(inputs, 'example', 'revision', root / 'tampered' / 'example')
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:

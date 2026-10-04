@@ -68,6 +68,7 @@ else
   sudo apt-get install -y --no-install-recommends "${packages[@]}"
   dpkg-query -W > native-toolchain.txt
   if [ "$adapter" = pcsx2 ]; then
+    export CC=clang CXX=clang++
     . adapters/pcsx2/upstream.lock
     upstream="$source_root/adapters/pcsx2/work/pcsx2"
     mkdir -p "$upstream"
