@@ -241,6 +241,18 @@ pub fn launch_spec(
             launch.content.to_string_lossy().into_owned(),
         )
         .env("EMUCAP_SYSTEM", launch.system);
+    if let Some(bin) = launch
+        .binary
+        .parent()
+        .filter(|p| p.file_name().is_some_and(|n| n == "bin"))
+    {
+        if let Some(prefix) = bin.parent() {
+            let share = prefix.join("share");
+            if share.join("machines").is_dir() && share.join("scripts").is_dir() {
+                spec = spec.env("OPENMSX_SYSTEM_DATA", share.to_string_lossy().into_owned());
+            }
+        }
+    }
     if let Some(name) = launch.name {
         spec = spec.env("EMUCAP_NAME", name);
     }

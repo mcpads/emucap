@@ -45,6 +45,8 @@ jobs:
         with:
           dotnet-version: '8.0.x'
       - uses: dtolnay/rust-toolchain@stable
+      - name: Verify packaging boundaries
+        run: python packaging/_tests/release/package_native_tests.py
       - name: Build pinned native adapter
         shell: bash
         run: |
@@ -58,6 +60,14 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
           retention-days: 14
+      - name: Retain incomplete packages for packaging recovery
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: native-incomplete-${{ matrix.adapter }}-${{ matrix.platform }}
+          path: artifacts/*
+          if-no-files-found: ignore
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         if: always()
         with:

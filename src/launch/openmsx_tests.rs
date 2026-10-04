@@ -99,7 +99,9 @@ fn resolver_finds_only_repo_build_or_explicit_override() {
 #[test]
 fn launch_spec_isolates_and_passes_exact_process_identity_inputs() {
     let temp = tempfile::tempdir().unwrap();
-    let binary = temp.path().join("openmsx");
+    let binary = temp.path().join("bin/openmsx");
+    std::fs::create_dir_all(temp.path().join("share/machines")).unwrap();
+    std::fs::create_dir_all(temp.path().join("share/scripts")).unwrap();
     let bridge = temp.path().join("emucap-openmsx-bridge");
     let rom = temp.path().join("game.rom");
     let log = temp.path().join("openmsx.log");
@@ -121,6 +123,10 @@ fn launch_spec_isolates_and_passes_exact_process_identity_inputs() {
     };
     let session_manifest = runtime_home.join("generation/session.json");
     let spec = launch_spec(&launch, &session_manifest, &runtime_home, &pid_file);
+    assert!(spec.env.contains(&(
+        "OPENMSX_SYSTEM_DATA".into(),
+        temp.path().join("share").to_string_lossy().into_owned()
+    )));
     assert_eq!(
         spec.args,
         vec![

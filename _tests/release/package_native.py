@@ -2,6 +2,7 @@
 """Package a clean CI native build, its runtime dependencies and matching sources."""
 import argparse
 import hashlib
+import io
 import json
 import os
 import plistlib
@@ -9,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -160,11 +162,20 @@ def macho_dependencies(stage, executable):
     queue = [p for p in stage.rglob('*') if format_of(p) == 'macho']
     seen = set()
     origins = {p.resolve(): sha(p) for p in queue}
+    source_paths = {}
     while queue:
         binary = queue.pop()
         if binary in seen:
             continue
         seen.add(binary)
+        original = source_paths.get(binary.resolve(), binary)
+        # SDL2-compat opens SDL3 dynamically, outside the Mach-O load commands.
+        if binary.name.startswith('libSDL2') and b'@loader_path/libSDL3.dylib' in binary.read_bytes():
+            sdl3 = Path(run('pkg-config', '--variable=libdir', 'sdl3')) / 'libSDL3.dylib'
+            target = binary.parent / 'libSDL3.dylib'
+            if copy_library(sdl3, target, origins):
+                source_paths[target.resolve()] = sdl3.resolve()
+                queue.append(target)
         details = run('otool', '-l', binary)
         rpaths = re.findall(r'cmd LC_RPATH\s+cmdsize \d+\s+path (.*?) \(offset', details)
         owner = next((p for p in binary.parents if p.suffix == '.app'), None)
@@ -177,6 +188,8 @@ def macho_dependencies(stage, executable):
             def expand(value):
                 return value.replace('@loader_path', str(binary.parent)).replace('@executable_path', str(entry.parent))
             candidates = [Path(expand(dep))]
+            if dep.startswith('@loader_path/'):
+                candidates.append(original.parent / dep[len('@loader_path/'):])
             if dep.startswith('@rpath/'):
                 candidates = [Path(expand(r)) / dep[7:] for r in rpaths]
                 candidates += [stage / 'lib' / Path(dep).name, Path('/opt/homebrew/lib') / dep[7:]]
@@ -197,11 +210,13 @@ def macho_dependencies(stage, executable):
                         copy(framework, dest)
                         members = [p for p in dest.rglob('*') if format_of(p) == 'macho']
                         origins.update({p.resolve(): sha(p) for p in members})
+                        source_paths.update({p.resolve(): framework / p.relative_to(dest) for p in members})
                         queue += members
                     target = dest / found.relative_to(framework)
                 else:
                     target = lib / found.name
                     if copy_library(found, target, origins):
+                        source_paths[target.resolve()] = found
                         queue.append(target)
             rewritten = '@loader_path/' + os.path.relpath(target, binary.parent)
             if dep != rewritten:
@@ -242,6 +257,7 @@ def source_archive(source, src, adapter, output, name):
                   'ppsspp': {'build-headless'}, 'flycast': {'build'}, 'mupen64plus': {'test'},
                   'openmsx': {'derived', 'install'}, 'mame-pc98': {'build'}, 'mame-neogeo': {'build'},
                   'pcsx2': {'build-emucap'}, 'xemu': {'build', 'dist', 'macos-libs'}}.get(adapter, set())
+    external_links = {}
     def include(info):
         rel = Path(info.name).parts[2:]
         if any(p in excluded for p in rel) or (rel and rel[0] in build_dirs):
@@ -249,13 +265,28 @@ def source_archive(source, src, adapter, output, name):
         if info.issym():
             target = (src.joinpath(*rel).parent / info.linkname).resolve()
             if not target.is_relative_to(src.resolve()):
-                raise ValueError(f'escaping source symlink: {info.name}')
+                # Preserve the upstream reference without exporting host files or
+                # creating an unsafe link during source archive extraction.
+                external_links['/'.join(rel)] = info.linkname
+                return None
         if info.isfile() and Path(info.name).suffix in ('.o', '.obj', '.pdb', '.exe', '.dll', '.dylib', '.so', '.a'):
             return None
         return info
     path = output / (name + '-source.tar.gz')
     with tarfile.open(path, 'w:gz', compresslevel=3) as archive:
         archive.add(src, arcname=name + '-source/upstream', filter=include)
+        if external_links:
+            data = (json.dumps(external_links, indent=2) + '\n').encode()
+            info = tarfile.TarInfo(name + '-source/EXTERNAL-SYMLINKS.json')
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+            data = ("EXTERNAL-SYMLINKS.json records upstream symlinks whose targets are outside "
+                    "the source tree. They are not followed or created in this archive. Paths "
+                    "are relative to upstream/. Restore a listed link when building its component "
+                    "against the corresponding system headers.\n").encode()
+            info = tarfile.TarInfo(name + '-source/SOURCE-LAYOUT.txt')
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
         tracked = run('git', '-C', source, 'ls-files', 'adapters/' + adapter, 'adapters/_common',
                       'LICENSE', 'NOTICE', 'licenses').splitlines()
         if adapter == 'mame-neogeo':
@@ -308,6 +339,9 @@ def main():
                 target_meta = executable.parent / metadata.name
                 if not target_meta.exists():
                     shutil.copy2(metadata, target_meta)
+        if args.adapter == 'openmsx' and not mac:
+            metadata = one(src, 'derived/**/emucap-openmsx-build.json')
+            shutil.copy2(metadata, executable.parent / metadata.name)
         if args.adapter == 'dolphin':
             gui = src / 'build-emucap-gui/Binaries'
             if gui.is_dir(): copy(gui, stage / 'gui')
@@ -349,8 +383,20 @@ def main():
             for binary in native_files:
                 restored_binary = verify / name / binary.relative_to(stage)
                 subprocess.run(['codesign', '--verify', str(restored_binary)], check=True)
+                if restored_binary.name.startswith('libSDL2') and b'@loader_path/libSDL3.dylib' in restored_binary.read_bytes():
+                    subprocess.run([sys.executable, '-c', 'import ctypes,sys; ctypes.CDLL(sys.argv[1])',
+                                    str(restored_binary)], check=True, timeout=30)
             for app in (verify / name).rglob('*.app'):
                 subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
+        if args.adapter == 'openmsx':
+            home = Path(temporary) / 'smoke-home'
+            home.mkdir()
+            env = dict(os.environ, HOME=str(home), OPENMSX_HOME=str(home),
+                       OPENMSX_USER_DATA=str(home / 'share'))
+            if not mac:
+                env['OPENMSX_SYSTEM_DATA'] = str(verify / name / 'runtime/share')
+            subprocess.run([str(verify / name / executable.relative_to(stage)), '-testconfig'],
+                           env=env, stdin=subprocess.DEVNULL, check=True, timeout=30)
         restored = files_manifest(verify / name)
         del restored['NATIVE-PACKAGE.json']
         assert restored == manifest['files'], 'extracted native package mismatch'

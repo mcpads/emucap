@@ -2,7 +2,11 @@
 import tempfile
 from pathlib import Path
 import unittest
-from package_native import files_manifest, one, format_of, copy_library, move_app_metadata
+import subprocess
+import json
+import tarfile
+import sys
+from package_native import files_manifest, one, format_of, copy_library, move_app_metadata, macho_dependencies, source_archive
 
 
 class PackageBoundaries(unittest.TestCase):
@@ -62,6 +66,45 @@ class PackageBoundaries(unittest.TestCase):
             metadata.write_bytes(b'conflicting identity')
             with self.assertRaisesRegex(ValueError, 'conflicting app metadata'):
                 move_app_metadata(root)
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'Mach-O loader fixture')
+    def test_relocated_library_resolves_original_loader_relative_dependency(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d).resolve()
+            original, stage = root / 'original', root / 'package'
+            original.mkdir()
+            stage.mkdir()
+            (original / 'leaf.c').write_text('int leaf(void) { return 42; }')
+            (original / 'parent.c').write_text('int leaf(void); int parent(void) { return leaf(); }')
+            (root / 'main.c').write_text('int parent(void); int main(void) { return parent() != 42; }')
+            leaf, parent = original / 'libleaf.dylib', original / 'libparent.dylib'
+            subprocess.run(['cc', '-dynamiclib', str(original / 'leaf.c'), '-o', str(leaf),
+                            '-Wl,-install_name,@loader_path/libleaf.dylib'], check=True)
+            subprocess.run(['cc', '-dynamiclib', str(original / 'parent.c'), str(leaf),
+                            '-o', str(parent), '-Wl,-install_name,' + str(parent)], check=True)
+            binary = stage / 'probe'
+            subprocess.run(['cc', str(root / 'main.c'), str(parent), '-o', str(binary)], check=True)
+            macho_dependencies(stage, binary)
+            # Removing the build directory proves the original library is no longer needed.
+            original.rename(root / 'unavailable')
+            subprocess.run([str(binary)], check=True)
+
+    def test_external_source_reference_is_preserved_without_host_content(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            repo, src, output = root / 'repo', root / 'upstream', root / 'output'
+            for p in (repo, src, output): p.mkdir()
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (root / 'host-header').write_text('private host bytes')
+            (src / 'system-headers').symlink_to('../host-header')
+            (src / 'source.c').write_text('int main(void) { return 0; }')
+            archive = source_archive(repo, src, 'xemu', output, 'example')
+            with tarfile.open(archive) as packed:
+                self.assertNotIn('example-source/upstream/system-headers', packed.getnames())
+                data = json.load(packed.extractfile('example-source/EXTERNAL-SYMLINKS.json'))
+                self.assertEqual(data, {'system-headers': '../host-header'})
+                packed.extractall(root / 'restored', filter='data')
+            self.assertFalse((root / 'restored/example-source/upstream/system-headers').exists())
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:
