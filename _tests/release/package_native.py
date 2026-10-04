@@ -46,7 +46,9 @@ def select_outputs(root, adapter, mac):
     src = work / names[adapter] if adapter in names else next(p for p in work.glob(adapter + '-*') if p.is_dir())
     if adapter == 'mesen2':
         binary = one(src, 'bin/**/publish/Mesen.app/Contents/MacOS/Mesen' if mac else 'bin/**/publish/Mesen')
-        output = binary.parents[2] if mac else binary.parent
+        # The managed launcher already uses this portable runtime directory.
+        # Keep the mutable build sidecar outside an app resource seal.
+        output = binary.parent
     elif adapter == 'dolphin':
         output = src / 'build-emucap-headless/Binaries'
         binary = output / 'dolphin-emu-nogui'
@@ -204,12 +206,18 @@ def macho_dependencies(stage, executable):
             rewritten = '@loader_path/' + os.path.relpath(target, binary.parent)
             if dep != rewritten:
                 subprocess.run(['install_name_tool', '-change', dep, rewritten, str(binary)], check=True)
+    apps = sorted(stage.rglob('*.app'), key=lambda p: len(p.parts), reverse=True)
+    app_mains = {app_executable(app).resolve() for app in apps}
     for binary in sorted(seen):
+        # Signing a bundle main executable validates the whole bundle. Defer it
+        # until nested code has been signed, then sign through the bundle path.
+        if binary.resolve() in app_mains:
+            continue
         command = ['codesign', '--force', '--sign', '-']
         if subprocess.run(['codesign', '-dv', str(binary)], capture_output=True).returncode == 0:
             command += ['--preserve-metadata=entitlements,requirements,flags,runtime']
         subprocess.run([*command, str(binary)], check=True)
-    for app in sorted(stage.rglob('*.app'), key=lambda p: len(p.parts), reverse=True):
+    for app in apps:
         subprocess.run(['codesign', '--force', '--deep', '--sign', '-',
                         '--preserve-metadata=entitlements,requirements,flags,runtime', str(app)], check=True)
     return seen
@@ -322,6 +330,12 @@ def main():
         verify = Path(temporary) / 'verify'
         with tarfile.open(archive_path) as archive:
             archive.extractall(verify, filter='data')
+        if mac:
+            for binary in native_files:
+                restored_binary = verify / name / binary.relative_to(stage)
+                subprocess.run(['codesign', '--verify', str(restored_binary)], check=True)
+            for app in (verify / name).rglob('*.app'):
+                subprocess.run(['codesign', '--verify', '--deep', '--strict', str(app)], check=True)
         restored = files_manifest(verify / name)
         del restored['NATIVE-PACKAGE.json']
         assert restored == manifest['files'], 'extracted native package mismatch'

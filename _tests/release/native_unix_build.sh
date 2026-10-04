@@ -45,7 +45,7 @@ else
     mednafen) packages+=(libsdl2-dev libsndfile1-dev libflac-dev liblzo2-dev libasound2-dev) ;;
     flycast) packages+=(libsdl2-dev libzip-dev libcurl4-openssl-dev libpulse-dev libudev-dev libvulkan-dev) ;;
     np2kai) ;;
-    mupen64plus) packages+=(libsdl2-dev libpng-dev libfreetype-dev binutils-dev libglu1-mesa-dev) ;;
+    mupen64plus) packages+=(libsdl2-dev libpng-dev libfreetype-dev binutils-dev libglu1-mesa-dev libvulkan-dev) ;;
     openmsx) packages+=(libsdl2-dev libsdl2-ttf-dev libglew-dev libtheora-dev libvorbis-dev libogg-dev
       libpng-dev libfreetype-dev tcl8.6-dev libasound2-dev) ;;
     mame-pc98|mame-neogeo) packages+=(libsdl2-dev libsdl2-ttf-dev libfontconfig1-dev libexpat1-dev
