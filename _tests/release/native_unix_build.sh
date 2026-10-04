@@ -10,7 +10,7 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5
 if [ "$adapter" = mame-pc98 ]; then export MAME_SOURCES=src/mame/nec/pc9801.cpp; fi
 if [ "$(uname -s)" = Darwin ]; then
   export HOMEBREW_NO_AUTO_UPDATE=1
-  packages=(cmake ninja pkgconf meson autoconf automake libtool dylibbundler python@3.13)
+  packages=(flock cmake ninja pkgconf meson autoconf automake libtool dylibbundler python@3.13)
   case "$adapter" in
     mesen2) packages+=(sdl2-compat) ;;
     dolphin) packages+=(qt@6 libusb sfml ffmpeg miniupnpc pugixml) ;;
@@ -40,20 +40,20 @@ else
     mesen2) packages+=(libsdl2-dev libasound2-dev) ;;
     dolphin) packages+=(qt6-base-dev qt6-tools-dev libqt6svg6-dev libusb-1.0-0-dev libevdev-dev
       libsfml-dev libavcodec-dev libavformat-dev libswscale-dev libminiupnpc-dev libpugixml-dev
-      libudev-dev libcurl4-openssl-dev liblzma-dev libbz2-dev libxxhash-dev libfmt-dev libxrandr-dev) ;;
+      libudev-dev libcurl4-openssl-dev liblzma-dev libbz2-dev libxxhash-dev libfmt-dev libxrandr-dev libxi-dev) ;;
     ppsspp) packages+=(libsdl2-dev libfontconfig1-dev libfreetype-dev libvulkan-dev libglew-dev libsnappy-dev) ;;
     mednafen) packages+=(libsdl2-dev libsndfile1-dev libflac-dev liblzo2-dev libasound2-dev) ;;
     flycast) packages+=(libsdl2-dev libzip-dev libcurl4-openssl-dev libpulse-dev libudev-dev libvulkan-dev) ;;
     np2kai) ;;
-    mupen64plus) packages+=(libsdl2-dev libpng-dev libfreetype-dev binutils-dev) ;;
+    mupen64plus) packages+=(libsdl2-dev libpng-dev libfreetype-dev binutils-dev libglu1-mesa-dev) ;;
     openmsx) packages+=(libsdl2-dev libsdl2-ttf-dev libglew-dev libtheora-dev libvorbis-dev libogg-dev
       libpng-dev libfreetype-dev tcl8.6-dev libasound2-dev) ;;
     mame-pc98|mame-neogeo) packages+=(libsdl2-dev libsdl2-ttf-dev libfontconfig1-dev libexpat1-dev
-      libflac-dev libportmidi-dev libasound2-dev) ;;
+      libflac-dev libportmidi-dev libasound2-dev qt6-base-dev) ;;
     pcsx2) packages+=(extra-cmake-modules libasound2-dev libaio-dev libcurl4-openssl-dev libdbus-1-dev
       libdecor-0-dev libevdev-dev libfontconfig-dev libfreetype-dev libgtk-3-dev libgudev-1.0-dev
       libharfbuzz-dev libinput-dev libopengl-dev libopus-dev libpcap-dev libpipewire-0.3-dev
-      libpulse-dev libssl-dev libudev-dev libva-dev libwayland-dev libx11-dev libx11-xcb-dev
+      libpulse-dev libssl-dev libudev-dev libvpl-dev libva-dev libwayland-dev libx11-dev libx11-xcb-dev
       libx264-dev libxcb1-dev libxcb-composite0-dev libxcb-cursor-dev libxcb-damage0-dev
       libxcb-glx0-dev libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev libxcb-present-dev
       libxcb-randr0-dev libxcb-render0-dev libxcb-render-util0-dev libxcb-shape0-dev
@@ -83,4 +83,5 @@ else
     export LD_LIBRARY_PATH="$deps/lib:${LD_LIBRARY_PATH:-}"
   fi
 fi
+bash _tests/adapters/build-lock-test.sh
 bash "adapters/$adapter/build.sh"

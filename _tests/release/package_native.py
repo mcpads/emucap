@@ -107,11 +107,23 @@ def format_of(path):
     return None
 
 
+def copy_library(source, target, origins):
+    original = sha(source)
+    if target.exists():
+        if origins.get(target.resolve(), sha(target)) != original:
+            raise ValueError(f'dependency collision: {source.name}')
+        return False
+    copy(source, target)
+    origins[target.resolve()] = original
+    return True
+
+
 def linux_dependencies(stage):
     lib = stage / 'lib'
     lib.mkdir(exist_ok=True)
     queue = [p for p in stage.rglob('*') if format_of(p) == 'elf']
     seen = set()
+    origins = {p.resolve(): sha(p) for p in queue}
     while queue:
         binary = queue.pop()
         if binary in seen:
@@ -130,11 +142,8 @@ def linux_dependencies(stage):
             if dep.is_relative_to(stage):
                 continue
             target = lib / dep.name
-            if not target.exists():
-                shutil.copy2(dep, target)
+            if copy_library(dep, target, origins):
                 queue.append(target)
-            elif sha(target) != sha(dep):
-                raise ValueError(f'dependency collision: {dep.name}')
         rel = os.path.relpath(lib, binary.parent)
         # Static ELF files have no dynamic section and need no relocation.
         dynamic = subprocess.run(['patchelf', '--print-rpath', str(binary)], capture_output=True)
@@ -148,6 +157,7 @@ def macho_dependencies(stage, executable):
     lib.mkdir(exist_ok=True)
     queue = [p for p in stage.rglob('*') if format_of(p) == 'macho']
     seen = set()
+    origins = {p.resolve(): sha(p) for p in queue}
     while queue:
         binary = queue.pop()
         if binary in seen:
@@ -183,15 +193,14 @@ def macho_dependencies(stage, executable):
                     dest = lib / framework.name
                     if not dest.exists():
                         copy(framework, dest)
-                        queue += [p for p in dest.rglob('*') if format_of(p) == 'macho']
+                        members = [p for p in dest.rglob('*') if format_of(p) == 'macho']
+                        origins.update({p.resolve(): sha(p) for p in members})
+                        queue += members
                     target = dest / found.relative_to(framework)
                 else:
                     target = lib / found.name
-                    if not target.exists():
-                        copy(found, target)
+                    if copy_library(found, target, origins):
                         queue.append(target)
-                    elif sha(found) != sha(target):
-                        raise ValueError(f'dependency collision: {found.name}')
             rewritten = '@loader_path/' + os.path.relpath(target, binary.parent)
             if dep != rewritten:
                 subprocess.run(['install_name_tool', '-change', dep, rewritten, str(binary)], check=True)
@@ -277,6 +286,9 @@ def main():
                 target_meta = executable.parent / metadata.name
                 if not target_meta.exists():
                     shutil.copy2(metadata, target_meta)
+        if args.adapter == 'dolphin':
+            gui = src / 'build-emucap-gui/Binaries'
+            if gui.is_dir(): copy(gui, stage / 'gui')
         if args.adapter == 'ppsspp':
             for extra in ('assets', 'PPSSPPSDL', 'PPSSPPSDL.app'):
                 p = binary.parent / extra

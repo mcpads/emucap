@@ -2,7 +2,7 @@
 import tempfile
 from pathlib import Path
 import unittest
-from package_native import files_manifest, one, format_of
+from package_native import files_manifest, one, format_of, copy_library
 
 
 class PackageBoundaries(unittest.TestCase):
@@ -34,6 +34,18 @@ class PackageBoundaries(unittest.TestCase):
             (root / 'lib.so.other').write_bytes(b'different')
             with self.assertRaisesRegex(ValueError, 'expected one'):
                 one(root, 'lib.so*')
+
+    def test_shared_dependency_reuses_original_identity_after_relocation(self):
+        with tempfile.TemporaryDirectory() as d:
+            source, target = Path(d) / 'source', Path(d) / 'target'
+            source.write_bytes(b'original library')
+            origins = {}
+            self.assertTrue(copy_library(source, target, origins))
+            target.write_bytes(b'relocated library')
+            self.assertFalse(copy_library(source, target, origins))
+            source.write_bytes(b'different library')
+            with self.assertRaisesRegex(ValueError, 'dependency collision'):
+                copy_library(source, target, origins)
 
     def test_file_type_uses_header(self):
         with tempfile.TemporaryDirectory() as d:
