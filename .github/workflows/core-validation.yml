@@ -79,9 +79,9 @@ jobs:
       - name: Check lints
         working-directory: source
         run: cargo clippy --locked --release --target ${{ matrix.target }} --all-targets -- -D warnings
-      - name: Build only the four core executables
+      - name: Build core and adapter host executables
         working-directory: source
-        run: cargo build --locked --release --target ${{ matrix.target }} --bin emucap --bin emucap-mcp --bin emucap-track-mcp --bin emucap-broker
+        run: cargo build --locked --release --target ${{ matrix.target }} --bins
       - name: Package and validate on the target OS
         run: python packaging/_tests/release/package_core.py --source source --target ${{ matrix.target }} --version ${{ needs.resolve.outputs.version }} --revision ${{ needs.resolve.outputs.revision }} --output artifacts
       - uses: actions/upload-artifact@v4
@@ -89,10 +89,6 @@ jobs:
           name: core-${{ matrix.target }}
           path: artifacts/*
           if-no-files-found: error
-      - name: Build Windows adapter hosts for runtime qualification
-        if: runner.os == 'Windows'
-        working-directory: source
-        run: cargo build --locked --release --target ${{ matrix.target }} --bins
       - name: Stage Windows adapter hosts
         if: runner.os == 'Windows'
         shell: pwsh

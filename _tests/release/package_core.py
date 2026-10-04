@@ -1,4 +1,4 @@
-"""Package tagged public source plus core binaries; smoke-test the extracted payload."""
+"""Package public source, core and adapter host binaries; smoke-test the extracted payload."""
 
 import argparse
 import hashlib
@@ -123,7 +123,11 @@ def main():
         bindir = stage / "target/release"
         bindir.mkdir(parents=True)
         digests = {}
-        for binary in CORE:
+        metadata = json.loads(run("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1", cwd=source))
+        package_metadata = next(p for p in metadata["packages"] if p["name"] == "emucap")
+        binaries = sorted(t["name"] for t in package_metadata["targets"] if "bin" in t["kind"])
+        assert set(CORE).issubset(binaries)
+        for binary in binaries:
             path = bindir / (binary + suffix)
             shutil.copy2(source / "target" / args.target / "release" / path.name, path)
             digests[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -133,13 +137,11 @@ def main():
         (stage / "CORE-BUILD.json").write_text(json.dumps(manifest, indent=2) + "\n")
         (stage / "PREBUILT-CORE.md").write_text(
             "# Prebuilt emucap core\n\n"
-            "The four core executables are in `target/release/`. Keep this directory tree intact.\n"
+            "Core and adapter host executables are in `target/release/`. Keep this directory tree intact.\n"
             "Run `sh tools/register-codex-mcp.sh` (macOS/Linux) or "
             "`pwsh -File tools/register-codex-mcp.ps1` (Windows), then reconnect both MCP servers.\n"
-            "The core build step in AGENT_GUIDE.md can be skipped. Adapter bridges and emulator hosts "
-            "are separate builds; follow the selected adapter's README. Rust and C/C++ tools "
-            "may still be required for those builds. No emulator, firmware or game is bundled.\n"
-            "Apple Silicon binaries are not Developer ID signed or notarized.\n")
+            "The Rust build step in AGENT_GUIDE.md can be skipped. Install the matching native "
+            "emulator package separately. Firmware and games are supplied by the user.\n")
         if suffix:
             package = Path(shutil.make_archive(str(output / name), "zip", temporary, name))
         else:
