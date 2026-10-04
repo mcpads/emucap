@@ -136,6 +136,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUNTIME_RUN: ${{ inputs.runtime_run }}
           SOURCE_RUN: ${{ inputs.source_run }}
+          ADAPTER: ${{ inputs.adapter }}
+          SOURCE_PLATFORM: ${{ inputs.source_platform }}
         run: |
           python - <<'PY'
           import json, os, subprocess
@@ -143,8 +145,16 @@ jobs:
               run_id = os.environ[key]
               if not run_id.isdecimal(): raise ValueError('run ID must be numeric')
               result = json.loads(subprocess.check_output(['gh', 'api', f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run_id}']))
-              if result['conclusion'] != 'success' or result['event'] == 'pull_request':
-                  raise ValueError('requires successful trusted producer run')
+              if result['status'] != 'completed' or result['event'] == 'pull_request':
+                  raise ValueError('requires completed trusted producer run')
+              if key == 'SOURCE_RUN':
+                  pages = json.loads(subprocess.check_output(['gh', 'api', '--paginate', '--slurp', f'repos/{os.environ["GITHUB_REPOSITORY"]}/actions/runs/{run_id}/jobs']))
+                  expected = f'build ({os.environ["ADAPTER"]}, {os.environ["SOURCE_PLATFORM"]})'
+                  jobs = [job for page in pages for job in page['jobs'] if job['name'] == expected]
+                  if len(jobs) != 1 or jobs[0]['conclusion'] != 'success':
+                      raise ValueError('native source packaging job did not succeed')
+              elif result['conclusion'] != 'success':
+                  raise ValueError('Windows runtime producer did not succeed')
               if key == 'RUNTIME_RUN':
                   with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
                       out.write('revision=' + result['head_sha'] + '\n')

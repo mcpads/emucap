@@ -14,13 +14,16 @@ from package_native import run, sha
 ADAPTERS = ('mesen2', 'dolphin', 'ppsspp', 'mednafen', 'flycast', 'np2kai',
             'mupen64plus', 'openmsx', 'mame-pc98', 'mame-neogeo', 'pcsx2', 'desmume-nds', 'xemu')
 PLATFORMS = ('linux', 'macos', 'windows')
+# Linux PCSX2 remains available through its source recipe; its binary follows later.
+PREBUILT_PLATFORMS = {a: PLATFORMS for a in ADAPTERS}
+PREBUILT_PLATFORMS['pcsx2'] = ('macos', 'windows')
 
 
 def validate_selection(selection):
-    expected = {(a, p) for a in ADAPTERS for p in PLATFORMS}
+    expected = {(a, p) for a in ADAPTERS for p in PREBUILT_PLATFORMS[a]}
     actual = [(r['adapter'], r['platform']) for r in selection]
     if set(actual) != expected or len(actual) != len(expected):
-        raise ValueError('release requires one package for every adapter and platform')
+        raise ValueError('release requires one package for every adapter and selected platform')
     for record in selection:
         if not str(record['run']).isdecimal(): raise ValueError('invalid run ID')
 

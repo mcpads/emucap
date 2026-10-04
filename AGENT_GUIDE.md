@@ -100,6 +100,7 @@ plugins instead. For NP2kai, also set `EMUCAP_NP2KAI_BUILD_INFO` to the packaged
 For a packaged GUI executable, use `EMUCAP_PPSSPP_GUI_BIN` or `EMUCAP_DOLPHIN_GUI_BIN`;
 Dolphin's headless executable can be selected with `EMUCAP_DOLPHIN_HEADLESS_BIN`.
 macOS packages target Apple Silicon; PCSX2 uses its Intel build through Rosetta.
+The Linux PCSX2 binary will be added later; use its source build recipe in the meantime.
 Provide the game's ROM and required firmware separately. Use the adapter's build recipe when
 compiling from source; the release also provides the patched native sources and recipes.
 

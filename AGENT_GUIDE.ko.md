@@ -91,6 +91,7 @@ NP2kai는 `EMUCAP_NP2KAI_BUILD_INFO`에도 패키지의 `emucap-np2kai-build.jso
 패키지에 포함된 GUI 실행 파일은 `EMUCAP_PPSSPP_GUI_BIN` 또는 `EMUCAP_DOLPHIN_GUI_BIN`으로
 지정한다. Dolphin headless 실행 파일은 `EMUCAP_DOLPHIN_HEADLESS_BIN`으로 지정할 수 있다.
 macOS 패키지는 Apple Silicon용이며, PCSX2는 Rosetta로 Intel 빌드를 실행한다.
+Linux용 PCSX2 바이너리는 추후 추가한다. 그전에는 해당 소스 빌드 스크립트를 사용한다.
 게임 ROM과 필요한 펌웨어는 별도로 준비한다. 소스 빌드는 각 어댑터의 빌드 스크립트를 사용한다.
 릴리스에는 패치가 적용된 네이티브 소스와 빌드 스크립트도 제공한다.
 
